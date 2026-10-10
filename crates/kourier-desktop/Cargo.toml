@@ -1,0 +1,47 @@
+[package]
+name = "kourier-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# `kourier_desktop::testing`: a private dbus-daemon and mock notification / tray hosts for
+# tests of this crate and of the crates above it.
+testing = ["dep:serde", "dep:tempfile"]
+
+[dependencies]
+futures-util.workspace = true
+ksni.workspace = true
+oo7.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+serde = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tracing.workspace = true
+# Not `zbus.workspace`: the workspace entry keeps zbus's default features (async-io), and the
+# whole graph (oo7, ksni) runs zbus on tokio only.
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+uuid.workspace = true
+
+# Every D-Bus test runs on a private dbus-daemon the test binary starts itself (never the
+# user's session bus): one binary that sets DBUS_SESSION_BUS_ADDRESS before any thread starts.
+[[test]]
+name = "dbus"
+harness = false
+required-features = ["testing"]
+
+# A private desktop session (mock notification server and tray watcher) to try Kourier against.
+[[test]]
+name = "hints"
+required-features = ["testing"]
+
+[[example]]
+name = "mock_session"
+required-features = ["testing"]

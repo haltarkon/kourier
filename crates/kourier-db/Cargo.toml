@@ -1,0 +1,23 @@
+[package]
+name = "kourier-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Compile `failpoint::hit` into release builds too (debug builds always have it, §10.4).
+failpoints = []
+
+[dependencies]
+rusqlite.workspace = true
+libsqlite3-sys.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

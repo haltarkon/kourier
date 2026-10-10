@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo for a local install (cargo xtask install). Minimal on purpose: the
+     release gate (docs/architecture.md §14.2 item 7) adds screenshots, releases, branding
+     colors and the project URLs once the name and the hosting are decided. -->
+<component type="desktop-application">
+  <id>app.kourier.Kourier</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+  <name>Kourier</name>
+  <summary>Unofficial messenger compatible with Signal</summary>
+  <description>
+    <p>
+      Kourier is a messenger for the Linux desktop, written in Rust with a Qt Quick and Kirigami
+      interface. It links to a Signal account as a secondary device, like Signal Desktop, and is
+      built to start fast, use little memory and fit into KDE Plasma on Wayland.
+    </p>
+    <p>
+      Messages and attachments are stored in an encrypted local database. Kourier is an
+      independent project and is not affiliated with Signal Messenger.
+    </p>
+  </description>
+  <developer id="app.kourier">
+    <name>The Kourier developers</name>
+  </developer>
+  <!-- No homepage yet: the project has no site or domain of its own (the application id is
+       a placeholder). The release gate puts the project page here. -->
+  <launchable type="desktop-id">app.kourier.Kourier.desktop</launchable>
+  <provides>
+    <binary>kourier</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+    <category>Chat</category>
+  </categories>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+</component>

@@ -1,0 +1,19 @@
+[package]
+name = "kourier-blob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+aead-stream.workspace = true
+libc.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,3 @@
+# The languages of the application: one code per line, each with a po/<code>.po.
+# The codes are the ones of glibc and KDE (de, pt_BR, zh_CN, sr@latin), not BCP 47.
+uk

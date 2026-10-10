@@ -1,0 +1,67 @@
+name: Bug report
+description: Something does not work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. If the problem is a security vulnerability, **do not post it
+        here**: follow SECURITY.md. If sending or receiving stopped working for everyone, say so:
+        Signal can change its servers without notice.
+
+        Do not paste message texts, names, phone numbers, keys or QR codes. Logs are redacted, but
+        read them before you paste them.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: As short as you can make them. Say if it happens every time.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Kourier version or commit
+      description: The output of `git describe --always` in your checkout, or the version of the release.
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: How you installed it
+      description: Built from source (release or debug), or a package.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution, desktop and session
+      description: For example "KDE neon, Plasma 6.x, Wayland". Add the Qt and Kirigami versions if you know them.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: |
+        From `~/.local/state/kourier/logs/` (or the crash report that Kourier offers to copy).
+        Keep only the lines around the problem. Remove anything private.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you send
+      options:
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+        - label: I removed message texts, names, numbers and keys from what I pasted.
+          required: true

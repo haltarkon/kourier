@@ -1,0 +1,1758 @@
+//! The delivery of a committed history import to the core (docs/architecture.md §14.2 item
+//! 14; `transfer.rs`, "The import").
+//!
+//! After the commit zone the stage is whole and authentic. Delivery hands it to the core in
+//! small rows of `core_outbox`, with back-pressure and a durable cursor, and a quit or a
+//! kill goes on where the cursor stands.
+//!
+//! # The feeder and the zones
+//!
+//! A **feeder** on a blocking thread opens the stage read-only and builds typed chunks from
+//! where the stored cursor stands ([`feed`]); it hands them over a channel that holds
+//! [`DeliveryBounds::window`] of them, so it reads no further than the account's thread
+//! takes. The account's thread runs ONE zone per chunk ([`append`]):
+//!
+//! 1. the look at the cursor: the chunk must begin exactly where the stored cursor stands
+//!    (or, for a piece that is appended again, at the stored piece), else the zone fails
+//!    and nothing is written;
+//! 2. the chunk's backend rows (`peers` and a profile fetch for a person, as the live path
+//!    writes them when it first meets one);
+//! 3. the chunk's events as ONE `core_outbox` row, after `Envelope::validate`;
+//! 4. the row's entry in `history_delivery`;
+//! 5. the cursor, moved past the chunk, and the counts.
+//!
+//! So after a kill at any point every chunk was appended exactly once: the zone either
+//! committed (row, entry and cursor together) or did not (none of them), and the next
+//! feeder starts from the stored cursor.
+//!
+//! Order: the people (their `ContactUpsert`), then the chats that are shown, each as a
+//! `ConversationUpsert` with its features in front (`features::with_features`), then per
+//! chat, the most recent first, its rows in the stage's order as `HistoryBatch`. The
+//! upserts go the LEAST recent chat first: the core lists a chat without rows by when it
+//! first heard of it, the newest on top, so the list stands in the phone's order before it
+//! fills.
+//!
+//! NO UNREAD COUNT IS SENT (`ConversationPatch::unread_hint` is never set here). The
+//! archive says of every message whether the phone had read it, the rows carry that as
+//! `IncomingMessage::read`, and the core counts the unread rows (the contract: the hint is
+//! only for unread messages a backend has no rows for). A count sent beside the rows came
+//! back after the chat was read here while it filled, counted rows that were dropped, and
+//! was not lowered when the phone read the chat.
+//!
+//! # Back-pressure
+//!
+//! Before the next chunk is taken, fewer than [`DeliveryBounds::window`] delivery rows may
+//! be unsettled ([`settle`]): `backend.db` holds two delivery rows at most, of at most 500
+//! messages and about 1 MiB each, however large the history is.
+//!
+//! # Bounds (a delivery never holds receiving back for good)
+//!
+//! A delivery row is settled when it left `core_outbox`. Its sequence number is then looked
+//! up in `core_outbox_poison`: a row the core refused for good is appended again as single
+//! messages (it becomes a piece without a row, `history_delivery.seq` NULL, which the next
+//! feeder cuts into singles), and a single message the core refuses is dropped and counted
+//! (its copy in the poison table is deleted: a refused history must not pile up in
+//! `backend.db` with its content). A row that is found unacknowledged at more than
+//! [`DeliveryBounds::max_starts`] delivery starts, and the unsettled rows once the delivery
+//! has RUN for [`DeliveryBounds::idle`] without any acknowledgement (running time, stored
+//! now and then, never the wall clock), are taken back the same way, but ONE row at a time,
+//! the oldest: the forwarder ships in order and the core stops at the first job that fails,
+//! so the row behind the oldest was never tried (see [`strike`]).
+//!
+//! Three things end the transfer as `HistoryTransferFailure::Incomplete` (what was delivered
+//! stays, receiving starts), each for a core that makes no progress in its own way:
+//!
+//! - [`DeliveryBounds::max_strikes`] takings back in a row with no answer of the core in
+//!   between (a core that answers nothing);
+//! - [`DeliveryBounds::max_refused`] single units refused in a row, with no acknowledged row
+//!   in between (a core that refuses everything; the bare end of a chat does not count as
+//!   an acknowledged row, because a core that refuses every message accepts an empty batch);
+//! - [`DeliveryBounds::stuck`]: the total running time all the takings back of the delivery
+//!   waited, which nothing resets (a core that cannot store a message here and another
+//!   there: each costs two bounds of waiting, and the rows acknowledged around it must not
+//!   make the next one free).
+//!
+//! A dropped unit alone does NOT end the transfer: it ends `done`, with the drops counted
+//! (`deliver_dropped`, and in the log).
+//!
+//! What a zone of a chunk writes into `peers` stays when its row is taken back: a redo of a
+//! row of chats forgets that the core has their features first ([`events_of`]), or they
+//! would come again without them.
+//!
+//! # What a start verifies of the stage
+//!
+//! It opens the stage with the transfer's key (SQLCipher checks the first page), reads its
+//! format and its `complete` mark, and compares its totals and frame count with the
+//! recorded ones. It does NOT count the rows or check every page: every page carries a
+//! check value under the stage's key and is refused when it is read, so a damaged stage is
+//! found at the row that needs the damaged page, before that row is handed on, and a stage
+//! that cannot be read to its end is a lost stage (below). At its end the feeder compares
+//! the rows it read with the stage's own counters.
+//!
+//! # A lost stage
+//!
+//! Nothing of a committed import is ever withdrawn. A stage that is gone or cannot be read
+//! is forgotten ([`forget`]): the record is taken back, the cursor set to its start, and
+//! the archive is read again, which counts as a start of the read. Message ids are
+//! deterministic and the core's ingest is idempotent, so what was delivered before is not
+//! doubled. The same happens at a start with a rebuilt `core.db` ([`rebuild`]).
+//!
+//! Nothing of a row is logged: counts and static reasons only.
+
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
+
+use kourier_backend_api::{BackendEvent, Envelope, IncomingMessage, MAX_HISTORY_BATCH};
+use kourier_db::rusqlite::{Connection, OptionalExtension as _};
+use kourier_db::{Tx, ZoneDb};
+use kourier_model::{
+    CannotSend, ContactPatch, ConvKey, ConversationFeatures, ConversationPatch, Identifier,
+    IdentifierKind, Patch,
+};
+use libsignal_core::{Aci, Pni, ServiceId};
+use tokio::sync::mpsc;
+use zeroize::Zeroizing;
+
+use super::stage::{StageError, StageKey, StageReader, StagedChatRow, StagedContact};
+use super::{Recorded, to_i64, to_u64};
+use crate::actor::Shared;
+use crate::error::{Error, Result};
+use crate::net::SignalTransport;
+use crate::{features, outbox, peers, profile};
+
+/// A kill point where a chunk is about to be appended: nothing of it is written.
+pub(crate) const FAILPOINT_BEFORE_CHUNK: &str = "history_delivery_before_chunk";
+
+/// A kill point right after a chunk's zone: its row, its entry and the cursor are durable.
+pub(crate) const FAILPOINT_AFTER_CHUNK: &str = "history_delivery_after_chunk";
+
+/// A kill point INSIDE a chunk's zone, after its row and its entry are written and before
+/// the cursor is: the transaction is not committed, so a kill here leaves nothing of the
+/// chunk (it is hit once per chunk that has a row).
+pub(crate) const FAILPOINT_INSIDE_CHUNK: &str = "history_delivery_inside_chunk";
+
+/// A kill point at the commit of a chunk's zone: hit by the commit's own callback, before the
+/// zone returns, so it lies between the chunk's row and anything a second zone might write
+/// after it (the cursor). A kill here finds the row, its entry AND the cursor durable
+/// together (it is hit once per chunk that has a row).
+pub(crate) const FAILPOINT_AT_COMMIT: &str = "history_delivery_at_commit";
+
+/// A kill point right after the zone that settles acknowledged rows.
+pub(crate) const FAILPOINT_AFTER_SETTLE: &str = "history_delivery_after_settle";
+
+/// A kill point where every row is acknowledged and `done` is not written yet.
+pub(crate) const FAILPOINT_BEFORE_DONE: &str = "history_delivery_before_done";
+
+/// The staged bytes one delivery row holds at most (a message larger than this travels
+/// alone). The core commits a row in one transaction; a megabyte keeps that transaction and
+/// the two rows `backend.db` holds small. Kourier's own bound (architecture §13).
+pub(crate) const MAX_ROW_BYTES: u64 = 1024 * 1024;
+
+/// Delivery rows that may be unacknowledged at a time.
+pub(crate) const WINDOW: usize = 2;
+
+/// People per delivery row.
+const CONTACTS_PER_ROW: u32 = 200;
+
+/// Chats per delivery row.
+const CHATS_PER_ROW: usize = 50;
+
+/// A delivery row found unacknowledged at more delivery starts than this is taken back.
+pub(crate) const MAX_STARTS: u32 = 3;
+
+/// The running time without any acknowledgement after which the unsettled rows are taken
+/// back.
+pub(crate) const IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// How often the running time without an acknowledgement is stored.
+const IDLE_STORED_EVERY: Duration = Duration::from_secs(30);
+
+/// Takings back in a row, without an acknowledgement between them, that end the transfer
+/// as incomplete.
+pub(crate) const MAX_STRIKES: u32 = 3;
+
+/// Single units (a person, a chat, a message) the core refused in a row, with no row that is
+/// not the bare end of a chat acknowledged in between, after which the transfer ends as
+/// incomplete: a core that refuses what it is given is not going to take the rest.
+pub(crate) const MAX_REFUSED_RUN: u32 = 20;
+
+/// The most RUNNING time a whole delivery may spend waiting for an acknowledgement that came
+/// no more (every taking back adds the time it waited), after which the transfer ends as
+/// incomplete. Nothing resets it: each message the core cannot store costs two waits of
+/// [`IDLE`] (its row, then itself), and an acknowledgement of the rows around it must not
+/// make the next one free. Kourier's own bound: receiving stays held back for at most this
+/// much stuck time, however many messages the core cannot store.
+pub(crate) const STUCK: Duration = Duration::from_secs(60 * 60);
+
+/// Chunks in a row that did not begin where the stored cursor stands, after which the
+/// delivery gives up (a fault of this program; it must not hold receiving back for good).
+const MAX_OUT_OF_STEP: u32 = 3;
+
+/// The bounds of a delivery; tests shorten them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeliveryBounds {
+    /// Messages per row.
+    pub(crate) max_messages: usize,
+    /// Staged bytes per row.
+    pub(crate) max_bytes: u64,
+    /// Unacknowledged rows at a time.
+    pub(crate) window: usize,
+    /// [`MAX_STARTS`].
+    pub(crate) max_starts: u32,
+    /// [`IDLE`].
+    pub(crate) idle: Duration,
+    /// [`IDLE_STORED_EVERY`].
+    pub(crate) idle_stored_every: Duration,
+    /// [`MAX_STRIKES`].
+    pub(crate) max_strikes: u32,
+    /// [`MAX_REFUSED_RUN`].
+    pub(crate) max_refused: u32,
+    /// [`STUCK`].
+    pub(crate) stuck: Duration,
+}
+
+impl DeliveryBounds {
+    /// What the app uses.
+    pub(crate) const DEFAULT: Self = Self {
+        max_messages: MAX_HISTORY_BATCH,
+        max_bytes: MAX_ROW_BYTES,
+        window: WINDOW,
+        max_starts: MAX_STARTS,
+        idle: IDLE,
+        idle_stored_every: IDLE_STORED_EVERY,
+        max_strikes: MAX_STRIKES,
+        max_refused: MAX_REFUSED_RUN,
+        stuck: STUCK,
+    };
+}
+
+const PHASE_CONTACTS: i64 = 0;
+const PHASE_CHATS: i64 = 1;
+const PHASE_MESSAGES: i64 = 2;
+
+const KIND_CONTACTS: i64 = 0;
+const KIND_CHATS: i64 = 1;
+const KIND_MESSAGES: i64 = 2;
+/// The end of a chat whose last row was dropped, owed on its own: an empty batch that says
+/// nothing follows. (The value was the kind of the "unread count" piece until step S3a.)
+const KIND_END: i64 = 3;
+
+/// The stored cursor (migration 0019).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cursor {
+    phase: i64,
+    pos: i64,
+    n: i64,
+}
+
+impl Cursor {
+    #[cfg(any(test, feature = "testing"))]
+    const START: Self = Self {
+        phase: PHASE_CONTACTS,
+        pos: 0,
+        n: -1,
+    };
+}
+
+/// A piece of the stage that was taken back and is appended again as singles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Piece {
+    id: i64,
+    kind: i64,
+    chat: i64,
+    after_n: i64,
+    through_n: i64,
+    ends_chat: bool,
+}
+
+/// Where a feeder starts: one consistent look at `backend.db`.
+#[derive(Clone, Debug)]
+struct FeedStart {
+    cursor: Cursor,
+    redo: Vec<Piece>,
+    delivered: u64,
+}
+
+/// Where a chunk stands in the delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// The next piece after the cursor.
+    Advance {
+        /// Where the cursor must stand for this chunk.
+        before: Cursor,
+        /// Where it stands after it.
+        after: Cursor,
+    },
+    /// One single of a piece that is appended again.
+    Redo {
+        piece: i64,
+        /// The piece's `after_n` this chunk continues from.
+        before: i64,
+        /// The piece ends with this chunk.
+        last: bool,
+    },
+}
+
+/// What a chunk carries.
+enum Payload {
+    Contacts(Vec<StagedContact>),
+    /// Chats with whether the peer is blocked.
+    Chats(Vec<(StagedChatRow, bool)>),
+    Messages {
+        conv: ConvKey,
+        messages: Vec<IncomingMessage>,
+        has_more: bool,
+        /// `delivered / total` after this chunk.
+        progress: Option<f32>,
+    },
+    /// Nothing follows for the chat (its last row was dropped).
+    End {
+        conv: ConvKey,
+    },
+}
+
+/// One delivery row to be: a typed piece of the stage.
+struct Chunk {
+    place: Place,
+    kind: i64,
+    /// `chats.idx` for messages and the end of a chat.
+    chat: i64,
+    after_n: i64,
+    through_n: i64,
+    ends_chat: bool,
+    single: bool,
+    payload: Payload,
+}
+
+impl Chunk {
+    fn units(&self) -> u64 {
+        match &self.payload {
+            Payload::Contacts(list) => list.len() as u64,
+            Payload::Chats(list) => list.len() as u64,
+            Payload::Messages { messages, .. } => messages.len() as u64,
+            Payload::End { .. } => 1,
+        }
+    }
+}
+
+/// What the feeder hands over.
+enum Fed {
+    Chunk(Box<Chunk>),
+    /// Everything after the cursor was handed over; `whole` says that the rows the feeder
+    /// read agree with the stage's own counters.
+    End {
+        whole: bool,
+    },
+    /// The stage cannot be read.
+    Failed(StageError),
+}
+
+/// How a delivery ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivered {
+    /// Every row was acknowledged.
+    Done {
+        /// The frames the archive held.
+        frames: u64,
+    },
+    /// The stage is lost; its record is taken back and the archive must be read again.
+    StageLost,
+    /// The delivery cannot finish (the bounds).
+    Incomplete,
+    /// `backend.db` failed.
+    Internal,
+}
+
+/// What [`rebuild`] and [`forget`] reset of the cursor. `deliver_stuck_ms` stays on purpose
+/// in [`forget`] (module docs, the migration). The column `deliver_hinted` of migration
+/// 0019 (how many chats had been given their unread count) is no longer read or written
+/// since no count is sent: it stays in the schema, whatever a transfer that began under
+/// the earlier code left in it.
+const RESET_CURSOR: &str = "deliver_phase = 0, deliver_pos = 0, deliver_n = -1,
+    delivered_messages = 0, deliver_idle_ms = 0, deliver_strikes = 0, deliver_refused = 0";
+
+/// Takes the record of the stage back and sets the cursor to its start: the stage is lost
+/// (or was read for a core that is gone), and the archive is read again from its first
+/// frame. The read is marked open, so that read counts as a start (`note_read_start`).
+/// `deliver_stuck_ms` stays (module docs): the total of the stuck time is the delivery's,
+/// however many times the stage was read.
+/// The delivery rows that are still in `core_outbox` stay there and reach the core; they
+/// are no longer waited for.
+pub(crate) fn forget(conn: &Connection, now: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE history_transfer
+                SET import_staged = 0, stage_messages = 0, stage_chats = 0, stage_frames = 0,
+                    read_open = 1, {RESET_CURSOR}, updated_at = ?1
+              WHERE id = 1 AND state = 'reading'"
+        ),
+        [now],
+    )?;
+    conn.execute("DELETE FROM history_delivery", [])?;
+    Ok(())
+}
+
+/// A start with a rebuilt `core.db` (`StartMode::Rebuild`): the new core has nothing of the
+/// import, so an import that is being delivered starts over as a whole, and whatever comes
+/// of it is no longer "incomplete" (the core is empty).
+pub(crate) fn rebuild(conn: &Connection, now: i64) -> Result<bool> {
+    let touched = conn.execute(
+        &format!(
+            "UPDATE history_transfer
+                SET import_staged = 0, stage_messages = 0, stage_chats = 0, stage_frames = 0,
+                    read_open = 1, {RESET_CURSOR}, deliver_began = 0,
+                    deliver_stuck_ms = 0, updated_at = ?1
+              WHERE id = 1 AND state = 'reading' AND (import_staged = 1 OR deliver_began = 1)"
+        ),
+        [now],
+    )?;
+    conn.execute("DELETE FROM history_delivery", [])?;
+    Ok(touched > 0)
+}
+
+/// Whether the core was given anything of this import.
+pub(crate) fn began(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT deliver_began = 1 FROM history_transfer WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn load_cursor(conn: &Connection) -> Result<Cursor> {
+    Ok(conn.query_row(
+        "SELECT deliver_phase, deliver_pos, deliver_n FROM history_transfer WHERE id = 1",
+        [],
+        |r| {
+            Ok(Cursor {
+                phase: r.get(0)?,
+                pos: r.get(1)?,
+                n: r.get(2)?,
+            })
+        },
+    )?)
+}
+
+fn load_start(conn: &Connection) -> Result<FeedStart> {
+    let cursor = load_cursor(conn)?;
+    let delivered: i64 = conn.query_row(
+        "SELECT delivered_messages FROM history_transfer WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    let redo = conn
+        .prepare(
+            "SELECT id, kind, chat, after_n, through_n, ends_chat FROM history_delivery
+              WHERE seq IS NULL ORDER BY id",
+        )?
+        .query_map([], |r| {
+            Ok(Piece {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                chat: r.get(2)?,
+                after_n: r.get(3)?,
+                through_n: r.get(4)?,
+                ends_chat: r.get(5)?,
+            })
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    Ok(FeedStart {
+        cursor,
+        redo,
+        delivered: to_u64(delivered),
+    })
+}
+
+/// The feeder (blocking): everything from `start` on, as chunks into `out`. Ends when the
+/// receiver is gone.
+fn feed(
+    dir: &std::path::Path,
+    key: &StageKey,
+    recorded: Recorded,
+    start: &FeedStart,
+    bounds: DeliveryBounds,
+    out: &mpsc::Sender<Fed>,
+) {
+    let end = match feed_all(dir, key, recorded, start, bounds, out) {
+        Ok(Some(whole)) => Fed::End { whole },
+        // The receiver is gone.
+        Ok(None) => return,
+        Err(e) => Fed::Failed(e),
+    };
+    let _ = out.blocking_send(end);
+}
+
+/// `Ok(None)`: the receiver is gone.
+fn feed_all(
+    dir: &std::path::Path,
+    key: &StageKey,
+    recorded: Recorded,
+    start: &FeedStart,
+    bounds: DeliveryBounds,
+    out: &mpsc::Sender<Fed>,
+) -> std::result::Result<Option<bool>, StageError> {
+    let reader = StageReader::open(dir, key)?;
+    let totals = reader.totals()?;
+    if totals.messages != recorded.messages
+        || totals.chats != recorded.chats
+        || reader.frames()? != recorded.frames
+    {
+        // Not the stage that was recorded.
+        return Err(StageError::Unreadable);
+    }
+    let shown: Vec<StagedChatRow> = reader
+        .chats()?
+        .into_iter()
+        .filter(|chat| chat.counters.n_loud > 0)
+        .collect();
+    let total: u64 = shown.iter().map(|chat| chat.counters.n_rows).sum();
+    let send = |chunk: Chunk| out.blocking_send(Fed::Chunk(Box::new(chunk))).is_ok();
+    // The chats are UPSERTED the least recent first and FILLED the most recent first. The
+    // core lists chats by their newest row and, among chats without a row, the one it was
+    // told of last on top (`kourier-core/src/query.rs`, the list's order): told in this
+    // order, the list stands in the phone's order of recency before the first batch
+    // arrives, and a chat that fills never changes its place.
+    let upsert_at = |place: usize| {
+        shown
+            .len()
+            .checked_sub(place + 1)
+            .and_then(|i| shown.get(i))
+    };
+    let blocked_peer = |chat: &StagedChatRow| -> std::result::Result<bool, StageError> {
+        let Some(peer) = chat.op.peer else {
+            return Ok(false);
+        };
+        let row = reader.contacts(peer.checked_sub(1), 1)?;
+        Ok(row.first().is_some_and(|(n, c)| *n == peer && c.blocked))
+    };
+
+    // First what was taken back, one unit per row.
+    for piece in &start.redo {
+        let mut after = piece.after_n;
+        match piece.kind {
+            KIND_CONTACTS => {
+                while after < piece.through_n {
+                    let rows = reader.contacts(u32::try_from(after).ok(), 1)?;
+                    let Some((n, contact)) = rows.into_iter().next() else {
+                        return Err(StageError::Unreadable);
+                    };
+                    let through = i64::from(n);
+                    let chunk = Chunk {
+                        place: Place::Redo {
+                            piece: piece.id,
+                            before: after,
+                            last: through >= piece.through_n,
+                        },
+                        kind: KIND_CONTACTS,
+                        chat: 0,
+                        after_n: after,
+                        through_n: through,
+                        ends_chat: false,
+                        single: true,
+                        payload: Payload::Contacts(vec![contact]),
+                    };
+                    if !send(chunk) {
+                        return Ok(None);
+                    }
+                    after = through;
+                }
+            }
+            KIND_CHATS => {
+                while after < piece.through_n {
+                    let through = after + 1;
+                    let Some(chat) = usize::try_from(after).ok().and_then(upsert_at) else {
+                        return Err(StageError::Unreadable);
+                    };
+                    let chunk = Chunk {
+                        place: Place::Redo {
+                            piece: piece.id,
+                            before: after,
+                            last: through >= piece.through_n,
+                        },
+                        kind: KIND_CHATS,
+                        chat: 0,
+                        after_n: after,
+                        through_n: through,
+                        ends_chat: false,
+                        single: true,
+                        payload: Payload::Chats(vec![(chat.clone(), blocked_peer(chat)?)]),
+                    };
+                    if !send(chunk) {
+                        return Ok(None);
+                    }
+                    after = through;
+                }
+            }
+            KIND_MESSAGES | KIND_END => {
+                let Some(chat) = shown
+                    .iter()
+                    .find(|chat| i64::from(chat.counters.idx) == piece.chat)
+                else {
+                    return Err(StageError::Unreadable);
+                };
+                if piece.kind == KIND_END {
+                    // The end of a chat whose last message was dropped.
+                    let chunk = Chunk {
+                        place: Place::Redo {
+                            piece: piece.id,
+                            before: piece.after_n,
+                            last: true,
+                        },
+                        kind: KIND_END,
+                        chat: piece.chat,
+                        after_n: piece.after_n,
+                        through_n: piece.through_n,
+                        ends_chat: false,
+                        single: true,
+                        payload: Payload::End {
+                            conv: chat.conv.clone(),
+                        },
+                    };
+                    if !send(chunk) {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                while after < piece.through_n {
+                    let rows = reader.items(chat.counters.idx, u64::try_from(after).ok(), 1, 0)?;
+                    let Some(item) = rows.into_iter().next() else {
+                        return Err(StageError::Unreadable);
+                    };
+                    let through = to_i64(item.n);
+                    let last = through >= piece.through_n;
+                    let ends = last && piece.ends_chat;
+                    let chunk = Chunk {
+                        place: Place::Redo {
+                            piece: piece.id,
+                            before: after,
+                            last,
+                        },
+                        kind: KIND_MESSAGES,
+                        chat: piece.chat,
+                        after_n: after,
+                        through_n: through,
+                        ends_chat: ends,
+                        single: true,
+                        payload: Payload::Messages {
+                            conv: chat.conv.clone(),
+                            messages: vec![item.msg],
+                            has_more: !ends,
+                            progress: None,
+                        },
+                    };
+                    if !send(chunk) {
+                        return Ok(None);
+                    }
+                    after = through;
+                }
+            }
+            _ => return Err(StageError::Unreadable),
+        }
+    }
+
+    // Then on from the cursor.
+    let mut cursor = start.cursor;
+    if cursor.phase == PHASE_CONTACTS {
+        loop {
+            let after = u32::try_from(cursor.pos - 1).ok();
+            let rows = reader.contacts(after, CONTACTS_PER_ROW)?;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            let next = Cursor {
+                phase: PHASE_CONTACTS,
+                pos: i64::from(*last) + 1,
+                n: -1,
+            };
+            let chunk = Chunk {
+                place: Place::Advance {
+                    before: cursor,
+                    after: next,
+                },
+                kind: KIND_CONTACTS,
+                chat: 0,
+                after_n: cursor.pos - 1,
+                through_n: i64::from(*last),
+                ends_chat: false,
+                single: rows.len() == 1,
+                payload: Payload::Contacts(rows.into_iter().map(|(_, c)| c).collect()),
+            };
+            if !send(chunk) {
+                return Ok(None);
+            }
+            cursor = next;
+        }
+        // The step into the next phase rides on the first chunk of it: the feeder only
+        // names where the cursor must stand.
+        let next = Cursor {
+            phase: PHASE_CHATS,
+            pos: 0,
+            n: -1,
+        };
+        if !send(step(cursor, next)) {
+            return Ok(None);
+        }
+        cursor = next;
+    }
+    if cursor.phase == PHASE_CHATS {
+        while let Some(rows) = usize::try_from(cursor.pos)
+            .ok()
+            .filter(|from| *from < shown.len())
+            .map(|from| {
+                (from..shown.len().min(from + CHATS_PER_ROW))
+                    .filter_map(upsert_at)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|rows| !rows.is_empty())
+        {
+            let next = Cursor {
+                phase: PHASE_CHATS,
+                pos: cursor.pos + to_i64(rows.len() as u64),
+                n: -1,
+            };
+            let mut chats = Vec::with_capacity(rows.len());
+            for chat in &rows {
+                chats.push(((*chat).clone(), blocked_peer(chat)?));
+            }
+            let chunk = Chunk {
+                place: Place::Advance {
+                    before: cursor,
+                    after: next,
+                },
+                kind: KIND_CHATS,
+                chat: 0,
+                after_n: cursor.pos,
+                through_n: next.pos,
+                ends_chat: false,
+                single: rows.len() == 1,
+                payload: Payload::Chats(chats),
+            };
+            if !send(chunk) {
+                return Ok(None);
+            }
+            cursor = next;
+        }
+        let next = Cursor {
+            phase: PHASE_MESSAGES,
+            pos: 0,
+            n: -1,
+        };
+        if !send(step(cursor, next)) {
+            return Ok(None);
+        }
+        cursor = next;
+    }
+    let mut delivered = start.delivered;
+    let mut whole = true;
+    while let Some(chat) = usize::try_from(cursor.pos).ok().and_then(|i| shown.get(i)) {
+        let idx = chat.counters.idx;
+        let read = |after: i64| {
+            reader.items(
+                idx,
+                u64::try_from(after).ok(),
+                bounds.max_messages.clamp(1, MAX_HISTORY_BATCH),
+                bounds.max_bytes,
+            )
+        };
+        let from_first = cursor.n < 0;
+        let mut rows_of_chat = 0u64;
+        // One batch ahead, to know whether a batch is the chat's last.
+        let mut batch = read(cursor.n)?;
+        loop {
+            let through = batch.last().map_or(cursor.n, |item| to_i64(item.n));
+            let ahead = if batch.is_empty() {
+                Vec::new()
+            } else {
+                read(through)?
+            };
+            let ends = ahead.is_empty();
+            rows_of_chat += batch.len() as u64;
+            delivered += batch.len() as u64;
+            let next = if ends {
+                Cursor {
+                    phase: PHASE_MESSAGES,
+                    pos: cursor.pos + 1,
+                    n: -1,
+                }
+            } else {
+                Cursor {
+                    phase: PHASE_MESSAGES,
+                    pos: cursor.pos,
+                    n: through,
+                }
+            };
+            #[allow(clippy::cast_precision_loss, reason = "a fraction for a progress bar")]
+            let progress = (total > 0).then(|| (delivered as f32 / total as f32).min(1.0));
+            let chunk = Chunk {
+                place: Place::Advance {
+                    before: cursor,
+                    after: next,
+                },
+                kind: KIND_MESSAGES,
+                chat: i64::from(idx),
+                after_n: cursor.n,
+                through_n: through,
+                ends_chat: ends,
+                single: batch.len() <= 1,
+                payload: Payload::Messages {
+                    conv: chat.conv.clone(),
+                    messages: batch.into_iter().map(|item| item.msg).collect(),
+                    has_more: !ends,
+                    progress,
+                },
+            };
+            if !send(chunk) {
+                return Ok(None);
+            }
+            cursor = next;
+            if ends {
+                break;
+            }
+            batch = ahead;
+        }
+        // A chat read from its first row must hold what its counter says.
+        whole &= !from_first || rows_of_chat == chat.counters.n_rows;
+    }
+    Ok(Some(whole))
+}
+
+/// A chunk that carries nothing and moves the cursor into the next phase.
+fn step(before: Cursor, after: Cursor) -> Chunk {
+    Chunk {
+        place: Place::Advance { before, after },
+        kind: KIND_CONTACTS,
+        chat: 0,
+        after_n: 0,
+        through_n: 0,
+        ends_chat: false,
+        single: false,
+        payload: Payload::Contacts(Vec::new()),
+    }
+}
+
+/// The service id a person's row of `peers` is kept under: the ACI, else the PNI.
+fn service_id_of(contact: &StagedContact) -> Option<ServiceId> {
+    contact
+        .aci
+        .map(|aci| ServiceId::from(Aci::from(aci)))
+        .or_else(|| contact.pni.map(|pni| ServiceId::from(Pni::from(pni))))
+}
+
+/// A person of the import as the core is told. `fetched`: the person's profile was fetched
+/// before; then the archive's profile name is left out (a stage that is read again must not
+/// put an old name over a fetched one). Only what the archive states is set.
+fn contact_patch(contact: &StagedContact, fetched: bool) -> ContactPatch {
+    let mut patch = ContactPatch::new(contact.user.clone());
+    if let Some(name) = contact.profile_name.clone().filter(|_| !fetched) {
+        patch.profile_name = Patch::Set(name);
+    }
+    if let Some(name) = contact.system_name.clone() {
+        patch.system_name = Patch::Set(name);
+    }
+    if let Some(name) = contact.nickname.clone() {
+        patch.nickname = Patch::Set(name);
+    }
+    if contact.blocked {
+        patch.blocked = Some(true);
+    }
+    if contact.hidden {
+        patch.hidden = Some(true);
+    }
+    if let Some(at) = contact.unregistered_at {
+        patch.unregistered_at = Patch::Set(at);
+    }
+    if let Some(number) = contact.e164.clone() {
+        patch.identifiers = Some(vec![Identifier {
+            kind: IdentifierKind::Phone,
+            value: number,
+        }]);
+    }
+    patch
+}
+
+/// A person of the import: this backend's own rows, as the live path writes them when it
+/// first meets a person (`storage::merge_contact`, `groups::apply`), and the event for the
+/// core. A flag the archive does not state is left as it is (the syncs that follow the
+/// transfer own it).
+fn contact_event(tx: &Tx<'_>, contact: &StagedContact, now: i64) -> Result<BackendEvent> {
+    let sid = service_id_of(contact).map(|id| id.service_id_string());
+    let mut fetched = false;
+    if let Some(sid) = &sid {
+        peers::ensure(tx, sid, now)?;
+        if let (Some(aci), Some(key)) = (contact.aci, contact.profile_key.as_ref()) {
+            let key = Zeroizing::new(*key);
+            if peers::store_profile_key(tx, Aci::from(aci), key.as_slice(), now)? {
+                profile::request(tx, sid, now)?;
+            }
+        }
+        if contact.profile_sharing {
+            peers::set_profile_sharing(tx, sid, true, now)?;
+        }
+        if contact.system_name.is_some() {
+            peers::set_system_contact(tx, sid, true, now)?;
+        }
+        if contact.blocked {
+            peers::set_blocked(tx, sid, true, now)?;
+        }
+        if contact.unregistered_at.is_some() {
+            peers::mark_unregistered(tx, sid, now)?;
+        }
+        fetched = profile::fetched(tx, sid)?;
+    }
+    Ok(BackendEvent::ContactUpsert(contact_patch(contact, fetched)))
+}
+
+/// The features of the chat of a person known only by a number: nothing can be sent there
+/// (this backend sends to an ACI or a PNI), and the chat says so instead of offering a
+/// composer that fails. Every other switch is the most restrictive default.
+fn number_only_features() -> ConversationFeatures {
+    ConversationFeatures {
+        cannot_send: Some(CannotSend::NotAccepted),
+        ..ConversationFeatures::default()
+    }
+}
+
+/// The upsert of one shown chat (its features are put in front by the caller).
+fn chat_event(chat: &StagedChatRow, blocked: bool) -> BackendEvent {
+    let mut patch = ConversationPatch::new(chat.conv.clone());
+    if chat.op.is_self {
+        patch.is_self = Some(true);
+    }
+    if blocked {
+        patch.blocked = Some(true);
+    }
+    if let ConvKey::Direct(user) = &chat.conv
+        && user.scheme() == "e164"
+    {
+        patch.features = Some(number_only_features());
+    }
+    BackendEvent::ConversationUpsert(patch)
+}
+
+/// Whether `events` pass the contract check the core runs on an envelope; gives them back.
+fn valid(events: Vec<BackendEvent>) -> (Vec<BackendEvent>, bool) {
+    let (envelope, _waiter) = Envelope::durable(events);
+    let ok = envelope.validate().is_ok();
+    (envelope.events, ok)
+}
+
+/// What a chunk became in its zone.
+#[derive(Clone, Copy, Debug, Default)]
+struct Appended {
+    /// The row's seq, when there was something to append.
+    seq: Option<i64>,
+    /// Units the contract check refused.
+    dropped: u64,
+    /// Rows that were due under a confirmed clock.
+    expired: u64,
+}
+
+/// The chunk's events, built inside its zone. Units that do not pass the contract check
+/// are left out and counted: a refused row would be quarantined by the forwarder for good.
+fn events_of<T: SignalTransport>(
+    tx: &Tx<'_>,
+    shared: &Shared<T>,
+    chunk: Chunk,
+    now: i64,
+    done: &mut Appended,
+) -> Result<Vec<BackendEvent>> {
+    // A chunk of a row that was taken back: what the zone of that row recorded in `peers`
+    // (the core has these chats' features) is not true, the core never took the row.
+    let redo = matches!(chunk.place, Place::Redo { .. });
+    let mut checked = |units: Vec<BackendEvent>| -> Vec<BackendEvent> {
+        let (units, ok) = valid(units);
+        if ok {
+            return units;
+        }
+        let mut kept = Vec::with_capacity(units.len());
+        for unit in units {
+            let (mut unit, ok) = valid(vec![unit]);
+            if ok {
+                kept.append(&mut unit);
+            } else {
+                done.dropped += 1;
+            }
+        }
+        kept
+    };
+    Ok(match chunk.payload {
+        Payload::Contacts(contacts) => {
+            let mut events = Vec::with_capacity(contacts.len());
+            for contact in &contacts {
+                events.push(contact_event(tx, contact, now)?);
+            }
+            checked(events)
+        }
+        Payload::Chats(chats) => {
+            let Some(account) = shared.account() else {
+                return Err(Error::Internal("a delivery without an account"));
+            };
+            let events = checked(
+                chats
+                    .iter()
+                    .map(|(chat, blocked)| chat_event(chat, *blocked))
+                    .collect(),
+            );
+            // Chat by chat, each with its features right in front of it: the core makes a
+            // chat at the first event that names it, and the order in which it makes them
+            // is the order of the list until they fill (the feeder's `upsert_at`).
+            let mut out = Vec::with_capacity(events.len() * 2);
+            for event in events {
+                if redo
+                    && let BackendEvent::ConversationUpsert(patch) = &event
+                    && let ConvKey::Direct(user) = &patch.key
+                {
+                    features::forget_features(tx, &account, user)?;
+                }
+                out.extend(features::with_features(tx, &account, vec![event], now)?);
+            }
+            out
+        }
+        Payload::Messages {
+            conv,
+            mut messages,
+            has_more,
+            progress,
+        } => {
+            // A row that is due is not delivered, but only under a clock the server
+            // confirmed in this run; otherwise it goes on with its expiry and the core's
+            // policy for an unconfirmed clock deals with it.
+            if shared.clock_confirmed.get() {
+                let before = messages.len();
+                messages.retain(|m| {
+                    m.expiry
+                        .as_ref()
+                        .and_then(kourier_model::Expiry::expires_at)
+                        .is_none_or(|at| at > now)
+                });
+                done.expired += (before - messages.len()) as u64;
+            }
+            let batch = |messages: Vec<IncomingMessage>| BackendEvent::HistoryBatch {
+                conv: conv.clone(),
+                messages,
+                has_more,
+                progress,
+            };
+            let mut events = Vec::with_capacity(2);
+            if !messages.is_empty() {
+                let (whole, ok) = valid(vec![batch(messages)]);
+                if ok {
+                    events = whole;
+                } else {
+                    // Cut into single messages; the ones that fail are dropped.
+                    let Some(BackendEvent::HistoryBatch { messages, .. }) =
+                        whole.into_iter().next()
+                    else {
+                        return Err(Error::Internal("a history batch"));
+                    };
+                    let mut kept = Vec::with_capacity(messages.len());
+                    for message in messages {
+                        let (single, ok) = valid(vec![batch(vec![message])]);
+                        match single.into_iter().next() {
+                            Some(BackendEvent::HistoryBatch { mut messages, .. }) if ok => {
+                                kept.append(&mut messages);
+                            }
+                            _ => done.dropped += 1,
+                        }
+                    }
+                    if !kept.is_empty() {
+                        events.push(batch(kept));
+                    }
+                }
+            }
+            if events.is_empty() && !has_more {
+                // The chat's last row was not delivered (it was due, or it is not valid):
+                // every batch the core heard of the chat said more follows, so say that
+                // nothing does. The contract allows an empty batch.
+                events.push(batch(Vec::new()));
+            }
+            events
+        }
+        Payload::End { conv } => {
+            // The last row of the chat was dropped: nothing follows.
+            vec![BackendEvent::HistoryBatch {
+                conv,
+                messages: Vec::new(),
+                has_more: false,
+                progress: None,
+            }]
+        }
+    })
+}
+
+/// THE ZONE OF ONE CHUNK (module docs): the look at the cursor, the backend rows, one
+/// `core_outbox` row, its entry, the cursor. `Err(Error::Internal("out of step"))` when
+/// the chunk does not begin where the stored state stands: nothing is written.
+fn append<T: SignalTransport>(shared: &Shared<T>, chunk: Chunk, now: i64) -> Result<Appended> {
+    let wake = shared.wake.clone();
+    let jobs_wake = shared.jobs_wake.clone();
+    shared.db.zone(|tx| -> Result<Appended> {
+        // 1. Exactly once: the chunk continues the stored state, or it is not appended.
+        match chunk.place {
+            Place::Advance { before, .. } => {
+                if load_cursor(tx)? != before {
+                    return Err(Error::Internal("out of step"));
+                }
+            }
+            Place::Redo { piece, before, .. } => {
+                let stands: Option<i64> = tx
+                    .query_row(
+                        "SELECT after_n FROM history_delivery WHERE id = ?1 AND seq IS NULL",
+                        [piece],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if stands != Some(before) {
+                    return Err(Error::Internal("out of step"));
+                }
+            }
+        }
+        let (place, kind, chat) = (chunk.place, chunk.kind, chunk.chat);
+        let (after_n, through_n) = (chunk.after_n, chunk.through_n);
+        let (ends_chat, single, units) = (chunk.ends_chat, chunk.single, chunk.units());
+        let is_messages = matches!(chunk.payload, Payload::Messages { .. });
+        let is_contacts = matches!(chunk.payload, Payload::Contacts(_));
+        let mut done = Appended::default();
+        // 2. and 3. The backend rows and the events.
+        let events = events_of(tx, shared, chunk, now, &mut done)?;
+        // The row as a whole, as the core will check it (the features were put beside units
+        // that passed alone). A row that fails here is not appended:
+        // the forwarder would quarantine it for good.
+        let events = if events.is_empty() {
+            events
+        } else {
+            let (events, ok) = valid(events);
+            if ok {
+                events
+            } else {
+                tracing::error!("a delivery row did not pass the contract check; dropped");
+                done.dropped += units;
+                Vec::new()
+            }
+        };
+        if is_contacts {
+            // Profile fetches the people of this chunk need run beside the import.
+            let jobs_wake = jobs_wake.clone();
+            tx.on_commit(move || jobs_wake.notify_one());
+        }
+        if !events.is_empty() {
+            let seq = outbox::append_events(tx, &events, now, &wake)?;
+            // 4. The entry of the row.
+            tx.execute(
+                "INSERT INTO history_delivery(seq, kind, chat, after_n, through_n, ends_chat,
+                   single, messages) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    seq,
+                    kind,
+                    chat,
+                    after_n,
+                    through_n,
+                    ends_chat,
+                    single,
+                    to_i64(units),
+                ),
+            )?;
+            done.seq = Some(seq);
+            // Not durable yet: a kill here is a rollback of the row, the entry and
+            // everything else of this zone (tests: `AT_COMMIT` lies after the commit).
+            kourier_db::failpoint::hit(FAILPOINT_INSIDE_CHUNK);
+            tx.on_commit(|| kourier_db::failpoint::hit(FAILPOINT_AT_COMMIT));
+        }
+        // 5. The cursor (or the piece), and the counts.
+        match place {
+            Place::Advance { after, .. } => {
+                tx.execute(
+                    "UPDATE history_transfer
+                        SET deliver_phase = ?1, deliver_pos = ?2, deliver_n = ?3,
+                            delivered_messages = delivered_messages + ?4,
+                            deliver_rows = deliver_rows + ?5,
+                            deliver_dropped = deliver_dropped + ?6,
+                            deliver_expired = deliver_expired + ?7,
+                            deliver_began = max(deliver_began, ?5), updated_at = ?8
+                      WHERE id = 1",
+                    (
+                        after.phase,
+                        after.pos,
+                        after.n,
+                        if is_messages { to_i64(units) } else { 0 },
+                        i64::from(done.seq.is_some()),
+                        to_i64(done.dropped),
+                        to_i64(done.expired),
+                        now,
+                    ),
+                )?;
+            }
+            Place::Redo { piece, last, .. } => {
+                if last {
+                    tx.execute("DELETE FROM history_delivery WHERE id = ?1", [piece])?;
+                } else {
+                    tx.execute(
+                        "UPDATE history_delivery SET after_n = ?2 WHERE id = ?1",
+                        (piece, through_n),
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE history_transfer
+                        SET deliver_rows = deliver_rows + ?1,
+                            deliver_dropped = deliver_dropped + ?2,
+                            deliver_expired = deliver_expired + ?3, updated_at = ?4
+                      WHERE id = 1",
+                    (
+                        i64::from(done.seq.is_some()),
+                        to_i64(done.dropped),
+                        to_i64(done.expired),
+                        now,
+                    ),
+                )?;
+            }
+        }
+        Ok(done)
+    })
+}
+
+/// What a look at the unsettled rows found.
+#[derive(Clone, Copy, Debug, Default)]
+struct Settled {
+    /// Rows the core answered for (acknowledged or refused).
+    answered: usize,
+    /// Rows still waiting in `core_outbox`.
+    waiting: usize,
+    /// Pieces to append again were made by this look: the feeder must start anew.
+    new_pieces: bool,
+    /// Pieces to append again exist.
+    pending: bool,
+    /// The core has refused [`DeliveryBounds::max_refused`] single units in a row.
+    refused_out: bool,
+}
+
+/// One unsettled delivery row.
+struct Entry {
+    id: i64,
+    seq: i64,
+    kind: i64,
+    chat: i64,
+    ends_chat: bool,
+    single: bool,
+    messages: i64,
+    starts: u32,
+    /// Still in `core_outbox`.
+    waiting: bool,
+    /// In `core_outbox_poison`.
+    poisoned: bool,
+}
+
+fn entries(conn: &Connection) -> Result<Vec<Entry>> {
+    Ok(conn
+        .prepare(
+            "SELECT d.id, d.seq, d.kind, d.chat, d.ends_chat, d.single, d.messages, d.starts,
+               EXISTS (SELECT 1 FROM core_outbox o WHERE o.seq = d.seq),
+               EXISTS (SELECT 1 FROM core_outbox_poison p WHERE p.seq = d.seq)
+               FROM history_delivery d WHERE d.seq IS NOT NULL ORDER BY d.id",
+        )?
+        .query_map([], |r| {
+            Ok(Entry {
+                id: r.get(0)?,
+                seq: r.get(1)?,
+                kind: r.get(2)?,
+                chat: r.get(3)?,
+                ends_chat: r.get(4)?,
+                single: r.get(5)?,
+                messages: r.get(6)?,
+                starts: r.get(7)?,
+                waiting: r.get(8)?,
+                poisoned: r.get(9)?,
+            })
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?)
+}
+
+/// A row the core will not take as it is (refused, or not acknowledged within the bounds)
+/// is taken back: a row of several units becomes a piece to append again as singles; a
+/// single is dropped and counted (its copy in `core_outbox_poison`, if the core refused it,
+/// goes: a refused history must not pile up in `backend.db` with its content), and when it
+/// was the last row of its chat the chat's end is owed on its own (a piece of kind
+/// [`KIND_END`]). Returns whether a piece to append again was made.
+fn take_back(tx: &Tx<'_>, entry: &Entry) -> Result<bool> {
+    tx.execute("DELETE FROM core_outbox WHERE seq = ?1", [entry.seq])?;
+    // The refused row's copy is not kept: its content is appended again, or dropped.
+    tx.execute("DELETE FROM core_outbox_poison WHERE seq = ?1", [entry.seq])?;
+    if entry.single {
+        tx.execute("DELETE FROM history_delivery WHERE id = ?1", [entry.id])?;
+        tx.execute(
+            "UPDATE history_transfer SET deliver_dropped = deliver_dropped + ?1 WHERE id = 1",
+            [entry.messages.max(1)],
+        )?;
+        tracing::warn!(
+            kind = entry.kind,
+            "a history unit the core would not take was dropped"
+        );
+        if entry.kind == KIND_MESSAGES && entry.ends_chat {
+            tx.execute(
+                "INSERT INTO history_delivery(seq, kind, chat, after_n, through_n, single)
+                 VALUES (NULL, ?1, ?2, 0, 0, 1)",
+                (KIND_END, entry.chat),
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    } else {
+        tx.execute(
+            "UPDATE history_delivery SET seq = NULL, starts = 0 WHERE id = ?1",
+            [entry.id],
+        )?;
+        Ok(true)
+    }
+}
+
+/// Looks at the unsettled rows: one that left `core_outbox` is settled, and its sequence
+/// number is looked up in `core_outbox_poison` (a refused row is taken back). An answer of
+/// the core, of either kind, ends the count of the time without one. Refused single units
+/// are counted in a row; a row that is acknowledged (the bare end of a chat aside: it is
+/// not what a core that refuses messages refuses) ends the run, and `max_refused` of them
+/// end the delivery.
+fn settle(db: &ZoneDb, max_refused: u32) -> Result<Settled> {
+    let found = db.zone(|tx| -> Result<Settled> {
+        let mut found = Settled::default();
+        let mut run: u32 = tx.query_row(
+            "SELECT deliver_refused FROM history_transfer WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        for entry in entries(tx)? {
+            if entry.waiting {
+                found.waiting += 1;
+                continue;
+            }
+            found.answered += 1;
+            if entry.poisoned {
+                found.new_pieces |= take_back(tx, &entry)?;
+                if entry.single {
+                    run = run.saturating_add(1);
+                }
+            } else {
+                tx.execute("DELETE FROM history_delivery WHERE id = ?1", [entry.id])?;
+                if entry.kind != KIND_END {
+                    run = 0;
+                }
+            }
+        }
+        if found.answered > 0 {
+            tx.execute(
+                "UPDATE history_transfer SET deliver_idle_ms = 0, deliver_strikes = 0,
+                   deliver_refused = ?1 WHERE id = 1",
+                [run],
+            )?;
+        }
+        found.refused_out = run >= max_refused.max(1);
+        found.pending = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM history_delivery WHERE seq IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(found)
+    })?;
+    if found.answered > 0 {
+        kourier_db::failpoint::hit(FAILPOINT_AFTER_SETTLE);
+    }
+    Ok(found)
+}
+
+/// A delivery start: the rows an earlier run left unacknowledged are counted (and one that
+/// was found so too often is then taken back, [`strike`]).
+fn note_start(db: &ZoneDb) -> Result<usize> {
+    db.zone(|tx| -> Result<usize> {
+        Ok(tx.execute(
+            "UPDATE history_delivery SET starts = starts + 1
+              WHERE seq IS NOT NULL AND seq IN (SELECT seq FROM core_outbox)",
+            [],
+        )?)
+    })
+}
+
+/// What a taking back came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Struck {
+    /// Takings back in a row without an answer of the core, this one included (0: nothing
+    /// was taken back).
+    strikes: u32,
+    /// 1 when the oldest waiting row was taken back (dropped if it is a single, split if it
+    /// has several units), else 0. Rows of several units behind it that were split too are
+    /// not counted.
+    taken: usize,
+    /// The running time all the takings back of this delivery waited, this one included.
+    stuck: Duration,
+    /// A piece to append again was made.
+    piece: bool,
+}
+
+/// Takes back the OLDEST row that is still unacknowledged (`over_starts`: only if it was
+/// found so at more than that many delivery starts) and counts a strike. Only the oldest
+/// can be DROPPED: the forwarder ships in order and the core stops at the first failing job
+/// of an envelope (`kourier-core/src/supervisor.rs`, `apply`: later jobs are skipped), so of
+/// two waiting rows only the first can be what the core is stuck on; the one behind it was
+/// never tried, and when it is a single, dropping it would lose a good message beside the
+/// bad one. It goes next, if it is stuck too, at the next bound.
+///
+/// A waiting row of SEVERAL units behind the oldest is split into singles all the same (it
+/// loses nothing: its content is appended again, and what the core already has is ignored).
+/// Left whole, it would be shipped in one envelope with the first singles of the oldest
+/// row's content, and when the bad message is the first of those, it could not be
+/// acknowledged either, would be the oldest at the next bound, and would cost a strike for a
+/// row that is not at fault.
+///
+/// `waited` is the running time spent without an acknowledgement; it is added to the total
+/// nothing ever resets.
+fn strike(db: &ZoneDb, over_starts: Option<u32>, waited: Duration) -> Result<Struck> {
+    db.zone(|tx| -> Result<Struck> {
+        let over = |entry: &Entry| over_starts.is_none_or(|max| entry.starts > max);
+        let mut waiting = entries(tx)?.into_iter().filter(|entry| entry.waiting);
+        let Some(oldest) = waiting.next().filter(over) else {
+            return Ok(Struck::default());
+        };
+        let mut piece = take_back(tx, &oldest)?;
+        for behind in waiting.filter(|entry| !entry.single && over(entry)) {
+            piece |= take_back(tx, &behind)?;
+        }
+        let waited = to_i64(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        let (strikes, stuck_ms): (u32, i64) = tx.query_row(
+            "UPDATE history_transfer SET deliver_strikes = deliver_strikes + 1,
+               deliver_idle_ms = 0, deliver_stuck_ms = deliver_stuck_ms + ?1
+              WHERE id = 1 RETURNING deliver_strikes, deliver_stuck_ms",
+            [waited],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(Struck {
+            strikes,
+            taken: 1,
+            stuck: Duration::from_millis(to_u64(stuck_ms)),
+            piece,
+        })
+    })
+}
+
+/// The running time without an acknowledgement: what was stored of earlier runs and, on a
+/// monotonic clock, this run since the last answer. The time the application was closed is
+/// in neither (as the download's `Ran`).
+struct Idle {
+    before: Duration,
+    since: tokio::time::Instant,
+}
+
+impl Idle {
+    fn so_far(&self) -> Duration {
+        self.before.saturating_add(self.since.elapsed())
+    }
+
+    fn reset(&mut self) {
+        self.before = Duration::ZERO;
+        self.since = tokio::time::Instant::now();
+    }
+}
+
+fn store_idle<T: SignalTransport>(shared: &Shared<T>, idle: Duration) {
+    let ms = to_i64(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
+    let stored = shared.db.zone(|tx| -> Result<usize> {
+        Ok(tx.execute(
+            "UPDATE history_transfer SET deliver_idle_ms = ?1 WHERE id = 1",
+            [ms],
+        )?)
+    });
+    if let Err(e) = stored {
+        tracing::warn!(error = %e, "storing the delivery's idle time failed");
+    }
+}
+
+/// A running feeder.
+struct Feeder {
+    rx: mpsc::Receiver<Fed>,
+}
+
+fn start_feeder<T: SignalTransport>(
+    shared: &Shared<T>,
+    key: &Zeroizing<[u8; 32]>,
+    recorded: Recorded,
+) -> Result<Feeder> {
+    let start = shared.db.read(load_start)?;
+    let bounds = shared.tuning.transfer_delivery;
+    let (tx, rx) = mpsc::channel(bounds.window.max(1));
+    let dir: PathBuf = shared.transfer.dir().to_owned();
+    let key = key.clone();
+    // Not awaited: it ends when its channel does (a stop drops the receiver).
+    drop(tokio::task::spawn_blocking(move || {
+        let key = StageKey::derive(&key);
+        feed(&dir, &key, recorded, &start, bounds, &tx);
+    }));
+    Ok(Feeder { rx })
+}
+
+/// DELIVERY (module docs): the recorded stage to the core, from where the cursor stands,
+/// until every row was acknowledged.
+pub(crate) async fn deliver<T: SignalTransport>(
+    shared: &Rc<Shared<T>>,
+    key: &Zeroizing<[u8; 32]>,
+    recorded: Recorded,
+) -> Delivered {
+    match run(shared, key, recorded).await {
+        Ok(end) => end,
+        Err(e) => {
+            tracing::error!(error = %e, "the delivery of the history import failed");
+            Delivered::Internal
+        }
+    }
+}
+
+async fn run<T: SignalTransport>(
+    shared: &Rc<Shared<T>>,
+    key: &Zeroizing<[u8; 32]>,
+    recorded: Recorded,
+) -> Result<Delivered> {
+    let bounds = shared.tuning.transfer_delivery;
+    note_start(&shared.db)?;
+    let before: i64 = shared.db.read(|c| -> Result<i64> {
+        Ok(c.query_row(
+            "SELECT deliver_idle_ms FROM history_transfer WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?)
+    })?;
+    let mut idle = Idle {
+        before: Duration::from_millis(to_u64(before)),
+        since: tokio::time::Instant::now(),
+    };
+    let struck = strike(&shared.db, Some(bounds.max_starts), idle.so_far())?;
+    if struck.taken > 0 {
+        tracing::warn!(
+            rows = struck.taken,
+            strikes = struck.strikes,
+            "a delivery row stayed unacknowledged over too many starts; taken back"
+        );
+        idle.reset();
+        if struck.strikes >= bounds.max_strikes || struck.stuck >= bounds.stuck {
+            return Ok(Delivered::Incomplete);
+        }
+    }
+    tracing::info!(
+        messages = recorded.messages,
+        chats = recorded.chats,
+        "delivering the history import"
+    );
+    let mut acked = shared.acked.clone();
+    let mut feeder = start_feeder(shared, key, recorded)?;
+    let mut ended: Option<bool> = None;
+    let mut stored_idle = tokio::time::Instant::now();
+    let mut restart = false;
+    let mut out_of_step = 0u32;
+    loop {
+        // Back-pressure: fewer than the window of rows may be unsettled before the next
+        // chunk is taken, and at the end none.
+        let found = settle(&shared.db, bounds.max_refused)?;
+        if found.answered > 0 {
+            idle.reset();
+        }
+        if found.refused_out {
+            tracing::warn!(
+                refused = bounds.max_refused,
+                "the core refused one unit of the history import after another; giving up"
+            );
+            return Ok(Delivered::Incomplete);
+        }
+        if found.new_pieces || restart {
+            // Pieces were taken back: a new feeder cuts them into singles first, then goes
+            // on from the cursor.
+            feeder = start_feeder(shared, key, recorded)?;
+            ended = None;
+            restart = false;
+        }
+        let room = found.waiting < bounds.window.max(1);
+        if let Some(whole) = ended
+            && found.waiting == 0
+            && !found.pending
+        {
+            if !whole {
+                tracing::warn!("the stage holds other rows than its counters say");
+                return lost(shared);
+            }
+            break;
+        }
+        if room && ended.is_none() {
+            match feeder.rx.recv().await {
+                Some(Fed::Chunk(chunk)) => {
+                    kourier_db::failpoint::hit(FAILPOINT_BEFORE_CHUNK);
+                    let now = shared.now();
+                    match append(shared, *chunk, now) {
+                        Ok(done) => {
+                            out_of_step = 0;
+                            if done.seq.is_some() {
+                                kourier_db::failpoint::hit(FAILPOINT_AFTER_CHUNK);
+                            }
+                        }
+                        Err(Error::Internal("out of step")) => {
+                            // A chunk of a feeder the stored state has moved away from.
+                            // A feeder that starts from the stored state cannot be out of
+                            // step with it: when it is all the same, time after time, the
+                            // delivery ends instead of turning in a circle for good.
+                            out_of_step += 1;
+                            if out_of_step > MAX_OUT_OF_STEP {
+                                return Err(Error::Internal("the delivery cannot find its place"));
+                            }
+                            tracing::warn!("a delivery chunk was out of step; feeding anew");
+                            feeder = start_feeder(shared, key, recorded)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // Let the forwarder and the other tasks of the account run.
+                    tokio::task::yield_now().await;
+                }
+                Some(Fed::End { whole }) => ended = Some(whole),
+                Some(Fed::Failed(e)) => {
+                    tracing::warn!(error = %e, "the recorded stage cannot be read");
+                    return lost(shared);
+                }
+                None => {
+                    tracing::warn!("the feeder of the history import ended without a word");
+                    return lost(shared);
+                }
+            }
+            continue;
+        }
+        // Wait for the core: an acknowledgement, or the next look at the bounds.
+        let left = bounds.idle.saturating_sub(idle.so_far());
+        if left.is_zero() {
+            let struck = strike(&shared.db, None, idle.so_far())?;
+            tracing::warn!(
+                rows = struck.taken,
+                strikes = struck.strikes,
+                "the core acknowledged nothing of the history import for too long; its oldest \
+                 waiting row is taken back"
+            );
+            idle.reset();
+            stored_idle = tokio::time::Instant::now();
+            if struck.strikes >= bounds.max_strikes || struck.stuck >= bounds.stuck {
+                return Ok(Delivered::Incomplete);
+            }
+            restart = struck.piece;
+            continue;
+        }
+        tokio::select! {
+            changed = acked.changed() => {
+                if changed.is_err() {
+                    // The forwarder is gone: the account is going away, nothing will be
+                    // acknowledged in this run, and this is no failure of the delivery.
+                    std::future::pending::<()>().await;
+                }
+            }
+            () = tokio::time::sleep(left.min(bounds.idle_stored_every)) => {
+                if stored_idle.elapsed() >= bounds.idle_stored_every {
+                    stored_idle = tokio::time::Instant::now();
+                    store_idle(shared, idle.so_far());
+                }
+            }
+        }
+    }
+    let (rows, dropped, expired): (i64, i64, i64) = shared.db.read(|c| -> Result<_> {
+        Ok(c.query_row(
+            "SELECT deliver_rows, deliver_dropped, deliver_expired FROM history_transfer
+              WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    })?;
+    tracing::info!(
+        rows,
+        dropped,
+        expired,
+        messages = recorded.messages,
+        "the history import is delivered: the core acknowledged every row"
+    );
+    kourier_db::failpoint::hit(FAILPOINT_BEFORE_DONE);
+    Ok(Delivered::Done {
+        frames: recorded.frames,
+    })
+}
+
+/// The stage is lost: its record is taken back and the cursor reset; the caller reads the
+/// archive again.
+fn lost<T: SignalTransport>(shared: &Shared<T>) -> Result<Delivered> {
+    let now = shared.now();
+    shared.db.zone(|tx| forget(tx, now))?;
+    Ok(Delivered::StageLost)
+}
+
+/// The delivery rows of the stage in `dir`, in the order a delivery appends them, with no
+/// account behind them: no row of `backend.db` is written, a chat's features are not put
+/// in front, nothing is dropped for being due. For tests that feed a core directly
+/// (`archive_testing::delivery_rows`).
+#[cfg(feature = "testing")]
+pub(crate) fn plain_rows(
+    dir: &std::path::Path,
+    key: &StageKey,
+    bounds: DeliveryBounds,
+) -> std::result::Result<Vec<Vec<BackendEvent>>, StageError> {
+    let recorded = {
+        let reader = StageReader::open(dir, key)?;
+        let totals = reader.totals()?;
+        Recorded {
+            messages: totals.messages,
+            chats: totals.chats,
+            frames: reader.frames()?,
+        }
+    };
+    let start = FeedStart {
+        cursor: Cursor::START,
+        redo: Vec::new(),
+        delivered: 0,
+    };
+    // Everything at once: a test's stage is small.
+    let (tx, mut rx) = mpsc::channel(1 << 20);
+    feed(dir, key, recorded, &start, bounds, &tx);
+    drop(tx);
+    let mut rows = Vec::new();
+    while let Ok(fed) = rx.try_recv() {
+        let chunk = match fed {
+            Fed::Chunk(chunk) => *chunk,
+            Fed::End { whole: true } => break,
+            Fed::End { whole: false } => return Err(StageError::Unreadable),
+            Fed::Failed(e) => return Err(e),
+        };
+        let events = match chunk.payload {
+            Payload::Contacts(contacts) => contacts
+                .iter()
+                .map(|contact| BackendEvent::ContactUpsert(contact_patch(contact, false)))
+                .collect(),
+            Payload::Chats(chats) => chats
+                .iter()
+                .map(|(chat, blocked)| chat_event(chat, *blocked))
+                .collect(),
+            Payload::Messages {
+                conv,
+                messages,
+                has_more,
+                progress,
+            } => {
+                let mut events = Vec::with_capacity(1);
+                if !messages.is_empty() {
+                    events.push(BackendEvent::HistoryBatch {
+                        conv,
+                        messages,
+                        has_more,
+                        progress,
+                    });
+                }
+                events
+            }
+            Payload::End { .. } => Vec::new(),
+        };
+        if !events.is_empty() {
+            rows.push(events);
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests;

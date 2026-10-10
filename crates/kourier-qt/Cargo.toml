@@ -1,0 +1,117 @@
+[package]
+name = "kourier-qt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+# Lets dependent crates link the QML module's object files (cxx-qt multi-crate export).
+links = "kourier_qt"
+
+[features]
+# A measuring build (`cargo xtask perf`, architecture §1.3): bundles the scripted session
+# `perf/PerfDriver.qml` and takes its name in `UiOptions::perf_scenario`.
+perf = ["kourier-app/perf"]
+
+[dependencies]
+# The binary picks the networks (`signal`, `fake`); the UI needs only what every build has.
+kourier-app = { path = "../kourier-app", default-features = false }
+kourier-model.workspace = true
+kourier-viewmodel.workspace = true
+cxx.workspace = true
+cxx-qt.workspace = true
+cxx-qt-lib.workspace = true
+cxx-qt-lib-extras.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tracing.workspace = true
+# The development control channel of debug builds (`--dev-control`, src/dev/).
+serde_json.workspace = true
+thiserror.workspace = true
+# Decrypted media bytes on their way to Qt (the image provider, src/media.rs).
+zeroize.workspace = true
+
+[dev-dependencies]
+# `tests/core_ui.rs` runs the real core over the fake network.
+kourier-app = { path = "../kourier-app", default-features = false, features = ["fake"] }
+# `tests/folder_ui.rs` reads back the archive a folder was sent as.
+zip.workspace = true
+
+[build-dependencies]
+cxx-qt-build.workspace = true
+
+[[test]]
+name = "models"
+harness = false
+
+[[test]]
+name = "qml_smoke"
+harness = false
+
+[[test]]
+name = "core_ui"
+harness = false
+
+[[test]]
+name = "desktop"
+harness = false
+
+[[test]]
+name = "media_ui"
+harness = false
+
+[[test]]
+name = "actions_ui"
+harness = false
+
+[[test]]
+name = "files_ui"
+harness = false
+
+[[test]]
+name = "account_ui"
+harness = false
+
+[[test]]
+name = "input_ui"
+harness = false
+
+[[test]]
+name = "chat_ui"
+harness = false
+
+[[test]]
+name = "release_ui"
+harness = false
+
+[[test]]
+name = "folder_ui"
+harness = false
+
+[[test]]
+name = "settings_ui"
+harness = false
+
+[[test]]
+name = "scroll_ui"
+harness = false
+
+[[test]]
+name = "readmore_ui"
+harness = false
+
+[[test]]
+name = "shortcuts_ui"
+harness = false
+
+[[test]]
+name = "transfer_ui"
+harness = false
+
+# The independent review of the history transfer's screens (target/h3-context/review.md).
+[[test]]
+name = "transfer_review_ui"
+harness = false
+
+[[test]]
+name = "kde"
+harness = false

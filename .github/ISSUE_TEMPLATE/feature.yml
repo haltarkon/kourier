@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest something Kourier should do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kourier is a client for Signal's linked-device protocol. Features that need the phone's
+        role (registering an account, calls, stories) are outside its scope today; the list of
+        what is left out is in README.md and `docs/architecture.md` section 1.2. Please check
+        both first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: The need first, not the solution. What are you trying to get done, and what stops you now?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you imagine
+      description: How it could work. Name another client that does it if one does.
+    validations:
+      required: false
+  - type: textarea
+    id: limits
+    attributes:
+      label: Does the server or another client limit it?
+      description: |
+        Kourier follows the reference apps for the protocol, not for their limits (CONTRIBUTING.md).
+        If another client refuses something, say whether the server enforces it or the app only chose to.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you send
+      options:
+        - label: I searched the open and closed issues and found no duplicate.
+          required: true

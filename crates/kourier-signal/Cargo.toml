@@ -1,0 +1,81 @@
+[package]
+name = "kourier-signal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Test support for the history-transfer archive (`archive::writer`: frames in, an encrypted
+# archive file out, and `archive_testing` for other crates' tests). Never in a release build.
+testing = ["dep:flate2"]
+
+[dependencies]
+kourier-model.workspace = true
+kourier-backend-api.workspace = true
+kourier-db.workspace = true
+# Avatars into the account's blob directory (§5.8, §6.10)
+kourier-blob.workspace = true
+# Outgoing image re-encode (Signal's level three, metadata stripped; §5.8, §6.7 step 2)
+kourier-media.workspace = true
+
+# libsignal (one tag for all crates, architecture §6.15); libsignal-net stays inside `net/`
+libsignal-core.workspace = true
+libsignal-protocol.workspace = true
+libsignal-account-keys.workspace = true
+signal-crypto.workspace = true
+# Profile key versions and, from S10, group secret params (§6.8, §6.10)
+zkgroup.workspace = true
+libsignal-net.workspace = true
+# Typed chat APIs: the multi-recipient (sender key) send over gRPC (§6.7 step 5)
+libsignal-net-chat.workspace = true
+# History-transfer archive (`archive`): the HMAC pass, AES-256-CBC and gzip of Signal's backup
+# stream through its public `frame` and `key` modules; nothing of its closed typed model.
+libsignal-message-backup.workspace = true
+
+aes.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+# Streamed upload bodies (`reqwest::Body::wrap_stream` over a channel)
+futures-util.workspace = true
+futures.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+http.workspace = true
+prost.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+# The test archive writer (feature `testing`)
+flate2 = { workspace = true, optional = true }
+
+[build-dependencies]
+prost-build.workspace = true
+
+[dev-dependencies]
+# The crate's own mock tests of the history transfer write archives (tests/history_transfer.rs):
+# the `testing` feature for this crate's test builds only.
+kourier-signal = { path = ".", features = ["testing"] }
+# The writer's gzip in unit tests (the archive module's `cfg(test)` writer)
+flate2.workspace = true
+# The kill test (tests/mock_server.rs) needs its failpoints in release test builds too (§10.4).
+kourier-db = { workspace = true, features = ["failpoints"] }
+# Mock-server harness driver (tests/support/harness.rs, architecture §10.3)
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tracing-subscriber.workspace = true

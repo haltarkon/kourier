@@ -1,0 +1,114 @@
+# NOT YET RUN. This workflow was written before the project is hosted anywhere; nothing has
+# executed it, so expect to fix small things on its first run (action inputs, the toolchain
+# step, the time cargo needs to fetch libsignal). The pinned actions below were looked up by
+# tag on 2026-10-08 (commit SHAs in the lines, versions in the comments).
+#
+# Only the light jobs are here: format, REUSE compliance, and cargo-deny (licenses, bans,
+# advisories, sources). Clippy is present but runs on manual dispatch only, because it compiles
+# the build scripts and needs Qt.
+#
+# What the full check (`cargo xtask ci`: build, tests, qmllint, screenshots) would need before
+# it can run on a hosted runner:
+# - Disk. A public-repository Linux runner has about 14 GB free; a workspace build tree with
+#   libsignal and cxx-qt is 15 to 40 GB. It needs CARGO_INCREMENTAL=0, no debug info in the CI
+#   profile, one profile per job, and cleanup of the runner image; or the build runs inside
+#   the Flatpak SDK on a bigger machine.
+# - Qt 6.11 and KDE Frameworks 6 (Kirigami, Kirigami Addons, the desktop style, Prison, KI18n,
+#   KWindowSystem). The hosted Ubuntu image ships Qt 6.4. It needs a pinned container image or
+#   the org.kde.Platform//6.11 Flatpak runtime and SDK.
+# - Time. A cold build is about 15 minutes on six cores, the tests about 9 minutes more.
+# - Node.js 24 for the Signal mock-server suites, a D-Bus session bus, and an offscreen Qt.
+# - The screenshot step compares against pictures stored on the developer's machine (they
+#   depend on fonts, Qt and Breeze), so it stays local or needs its own baseline in CI.
+# Until then `cargo xtask ci` is run by the maintainer before each commit.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # New security advisories appear without any change to the code.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml names the toolchain (1.99) and its components.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+  reuse:
+    name: REUSE compliance
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
+
+  deny:
+    name: Dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal
+      # deny.toml holds the policy. The git dependencies (libsignal, its BoringSSL fork, the
+      # SQLCipher fork, ksni) are fetched while cargo-deny reads the workspace.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features --workspace
+
+  clippy:
+    name: Clippy (manual until a Qt 6.11 runner exists)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install --profile minimal
+      # TODO(maintainer): this does not build yet. The workspace needs Qt 6.11 development
+      # files, protoc, cmake, clang and lld (README.md), and about 15 GB of build output.
+      # Replace this step with the container image or the Flatpak SDK the project settles on.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            protobuf-compiler cmake clang libclang-dev perl pkg-config lld \
+            qt6-base-dev qt6-declarative-dev
+      - name: clippy
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo clippy --workspace --all-targets -- -D warnings

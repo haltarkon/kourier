@@ -1,0 +1,28 @@
+[package]
+name = "kourier-e2e"
+description = "Test-only: the real kourier-core with real backends against local test servers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Everything lives in tests/; the library is empty.
+[dev-dependencies]
+kourier-core.workspace = true
+# `testing`: archives for the history transfer's tests (tests/signal_history_transfer.rs).
+kourier-signal = { workspace = true, features = ["testing"] }
+# The kill test (tests/signal_core.rs) needs the failpoints in release test builds too (§10.4).
+kourier-db = { workspace = true, features = ["failpoints"] }
+kourier-backend-api.workspace = true
+kourier-model.workspace = true
+# Sample pictures for the attachment tests (tests/signal_attachments.rs).
+kourier-media.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+# The mock-server harness driver, shared with kourier-signal's tests (tests/signal_core.rs).
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing-subscriber.workspace = true

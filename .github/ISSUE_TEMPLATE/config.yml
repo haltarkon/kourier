@@ -1,0 +1,5 @@
+# Issue forms for GitHub. Written before the project is hosted anywhere; not yet used.
+# A vulnerability is not reported here: SECURITY.md says how.
+blank_issues_enabled: false
+# TODO(maintainer): contact_links (security policy page, discussion forum or chat room) go here
+# once those addresses exist.

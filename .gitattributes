@@ -1,0 +1,3 @@
+# Left out of the source archive (`git archive`, `cargo xtask dist`) and of the exported
+# public tree: the working notes for the AI assistant, which name the maintainer's machine.
+CLAUDE.md export-ignore

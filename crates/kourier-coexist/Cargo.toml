@@ -1,0 +1,18 @@
+[package]
+name = "kourier-coexist"
+description = "Test-only: BoringSSL (libsignal-net), SQLCipher and Qt's OpenSSL TLS backend in one process (architecture §5.3, S1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kourier-db.workspace = true
+libsignal-net-infra.workspace = true
+rustls.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time"] }
+
+[build-dependencies]
+cxx-qt-build.workspace = true

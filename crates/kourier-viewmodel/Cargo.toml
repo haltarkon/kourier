@@ -1,0 +1,20 @@
+[package]
+name = "kourier-viewmodel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kourier-model.workspace = true
+# Only `kourier_core::facade` (cargo xtask deps-check).
+kourier-core.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+# Grapheme clusters, for the cut of a long text ("Read more"). Already in the lock file
+# (through cxx-qt's build dependencies).
+unicode-segmentation = "1"
+
+[dev-dependencies]
+proptest.workspace = true

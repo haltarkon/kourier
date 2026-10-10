@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# posix_fadvise: `cargo xtask perf` evicts Kourier's own files from the page cache.
+libc.workspace = true
+# `cargo xtask shots`: decode the rendered pictures, write the diff pictures.
+png.workspace = true
+serde_json.workspace = true

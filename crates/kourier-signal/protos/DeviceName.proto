@@ -1,0 +1,14 @@
+// Copied verbatim from Signal-Desktop protos/DeviceName.proto at commit 832279c2
+// (v8.32.0-alpha.1, 2026-10-01). Do not edit: re-copy on every Desktop/libsignal bump
+// (docs/architecture.md §6.15) and keep this header.
+
+// Copyright 2018 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package signalservice;
+
+message DeviceName {
+  optional bytes ephemeralPublic = 1;
+  optional bytes syntheticIv     = 2;
+  optional bytes ciphertext      = 3;
+}

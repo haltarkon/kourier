@@ -1,0 +1,19 @@
+{
+  "name": "kourier-mock-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JSON-lines driver around @signalapp/mock-server for Kourier's Signal integration tests",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "harness.mjs",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node harness.mjs",
+    "test": "node --test smoke.mjs"
+  },
+  "dependencies": {
+    "@signalapp/mock-server": "27.0.0"
+  }
+}

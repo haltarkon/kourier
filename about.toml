@@ -1,0 +1,38 @@
+# cargo-about configuration: `cargo about generate about.hbs > THIRD-PARTY.html` writes the
+# notices for the libraries linked into the program, which their licenses require a binary
+# distribution to carry. The output is generated, not committed.
+
+# Every license that appears in the graph must be listed, or the generation fails: this is the
+# same list as `licenses.allow` in deny.toml.
+accepted = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+]
+
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# Tools used only to build or test are not part of what is shipped.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+# Kourier's own crates (publish = false) are not third parties.
+private = { ignore = true }
+
+# The SQLCipher crypto provider in the pinned rusqlite fork has no license field; the repository
+# it lives in is MIT (its LICENSE file, at the repository root). The checksum stops the
+# clarification from applying if that file ever changes.
+[sqlcipher-crypto-provider.clarify]
+license = "MIT"
+
+[[sqlcipher-crypto-provider.clarify.files]]
+path = "../LICENSE"
+license = "MIT"
+checksum = "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"

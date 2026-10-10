@@ -1,0 +1,137 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+kourier-model = { path = "crates/kourier-model" }
+kourier-backend-api = { path = "crates/kourier-backend-api" }
+kourier-db = { path = "crates/kourier-db" }
+kourier-blob = { path = "crates/kourier-blob" }
+kourier-media = { path = "crates/kourier-media" }
+kourier-core = { path = "crates/kourier-core" }
+kourier-fake = { path = "crates/kourier-fake" }
+kourier-signal = { path = "crates/kourier-signal" }
+kourier-desktop = { path = "crates/kourier-desktop" }
+kourier-app = { path = "crates/kourier-app" }
+kourier-viewmodel = { path = "crates/kourier-viewmodel" }
+kourier-qt = { path = "crates/kourier-qt" }
+
+# Qt (cxx-qt 0.10; build against system Qt 6.11, see .cargo/config.toml)
+cxx = "1.0.176"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
+cxx-qt-lib-extras = "0.10"
+cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"] }
+
+# libsignal: ONE tag for every crate, bumped together (docs/architecture.md §6.15).
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+signal-crypto = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-net-infra = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+libsignal-net-grpc = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+signal-media = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+# The reader of Signal's history-transfer archive: only its public `frame` and `key` modules are
+# used (kourier-signal `archive`, docs/architecture.md §14.2 item 14); its typed model is closed.
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+prost = "0.14"
+prost-build = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
+
+# Storage (SQLCipher with a RustCrypto provider, see [patch] below and architecture §5.3)
+rusqlite = "0.38"
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-custom-crypto"] }
+
+# Desktop integration
+zbus = "5"
+oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
+# StatusNotifierItem tray. Pinned to the commit that adds `Tray::provide_xdg_activation_token`
+# (merged 2026-09-30, not in 0.3.6); switch to the release that ships it (§8.8).
+ksni = { git = "https://github.com/iovxw/ksni", rev = "547cc42b9e24ed58c20e7643644184bc2264c9b0", default-features = false, features = ["tokio"] }
+# zbus signal streams (StreamExt); the version zbus itself uses.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The async readers of libsignal-message-backup, driven to completion on a blocking thread
+# (kourier-signal `archive`); libsignal's crate already pulls this in with its default features.
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+# kourier.toml (app preferences, §8.9).
+toml = "1"
+
+# General
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1", features = ["derive"] }
+proptest = "1"
+# libsignal's store traits are `#[async_trait(?Send)]` (same version as libsignal's graph)
+async-trait = "0.1"
+# Crypto helpers at the versions libsignal v0.104.0 uses (no duplicate crates in the graph)
+base64 = "0.22"
+bytes = "1"
+hkdf = "0.13"
+hmac = "0.13"
+# Raw AES blocks for streaming AES-256-CBC attachment decryption (kourier-signal, §6.11).
+aes = "0.9"
+http = "1"
+rand = "0.9"
+sha2 = "0.11"
+# Storage and key crypto (kourier-db, kourier-blob, kourier-app; aead 0.6 like libsignal)
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aead-stream = { version = "0.6", features = ["alloc"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+libc = "0.2"
+tempfile = "3"
+# A folder sent as one archive (kourier-app `folders`): the ZIP container, with deflate from the
+# pure-Rust zlib-rs that flate2 already brings (no C library, no other codec, no encryption).
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# gzip for the test archive writer (kourier-signal `archive::writer`, feature `testing`); the
+# zlib-rs backend `zip` already uses, so no crate is added.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# Media (kourier-media, §5.8): pure-Rust codecs only (no C libraries, no AVIF/rav1e).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# `cargo xtask shots` decodes its pictures to compare them with the stored ones, and writes the
+# side-by-side diff pictures (xtask): the PNG codec the image crate uses.
+png = "0.18"
+blurhash = "0.2"
+
+[patch.crates-io]
+# Mirrors libsignal's own Cargo.toml: a single BoringSSL (`links = "boringssl"`).
+boring = { git = "https://github.com/signalapp/boring", tag = "signal-v5.2.0" }
+boring-sys = { git = "https://github.com/signalapp/boring", tag = "signal-v5.2.0" }
+# SQLCipher with a RustCrypto crypto provider (no OpenSSL next to BoringSSL) + atexit fix;
+# the rev gurk-rs ships.
+libsqlite3-sys = { git = "https://github.com/boxdot/rusqlite", rev = "a2f393913d9994645c94810498bef07b2183b3dc" }
+
+[profile.dev.package.sqlcipher-crypto-provider]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+# No DWARF in the release binary. With `debug = "line-tables-only"` the C and C++ parts
+# (BoringSSL, SQLCipher, the cxx-qt glue) were still compiled with full `-g` (the cc crate
+# knows only on and off) and the binary was 260 MB, 210 MB of it debug sections. The symbol
+# table stays (`strip = "debuginfo"`, not "symbols"): a panic backtrace in a bug report names
+# its functions, and the table is not loaded into memory. Measured in S16 (architecture §13).
+debug = false
+strip = "debuginfo"

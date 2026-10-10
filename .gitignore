@@ -1,0 +1,10 @@
+/target
+# cxx-qt writes generated files below the crate when CARGO_TARGET_DIR is relative
+/crates/*/target/
+**/*.rs.bk
+*.swp
+.idea/
+.vscode/
+/dev-data/
+.qmlls.ini
+tests/mock-harness/node_modules/

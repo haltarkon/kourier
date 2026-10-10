@@ -1,0 +1,76 @@
+# cargo-deny policy: `cargo deny check` (licenses, bans, advisories, sources).
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# The one platform Kourier is built for today; add the others when a packaging target exists.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+# The RustSec database. An ignore needs a reason and a date to look at it again.
+ignore = [
+    # bincode 1.3.3 is "unmaintained" because its authors stopped development; they call 1.3.3
+    # complete. It is not a vulnerability. It comes in through zkgroup, which libsignal pins and
+    # Kourier cannot change. Look at it again on every libsignal upgrade
+    # (docs/architecture.md section 6.15); first listed 2026-10-08.
+    { id = "RUSTSEC-2025-0141", reason = "unmaintained, no vulnerability; only through libsignal's zkgroup" },
+]
+
+[licenses]
+# Licenses that may appear in the dependency graph of an AGPL-3.0-only program. Everything here
+# is permissive, or (MPL-2.0) a file-level copyleft that GPLv3 and AGPLv3 allow to combine.
+# Not allowed on purpose: GPL-2.0-only (cannot combine with AGPL-3.0-only), proprietary and
+# source-available licenses, and any license with an advertising or a field-of-use clause.
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+]
+confidence-threshold = 0.9
+
+# The SQLCipher crypto provider in the rusqlite fork Kourier pins (workspace Cargo.toml,
+# [patch.crates-io]) has no license field. The repository it lives in is MIT (its LICENSE file at
+# the repository root, which the sibling crates' `license = "MIT"` fields repeat).
+[[licenses.clarify]]
+crate = "sqlcipher-crypto-provider"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x8f1765a2 }]
+
+[bans]
+# Two versions of one crate are common in a graph this size; they are listed, not refused.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # Two TLS/crypto stacks in one process clash: libsignal-net links BoringSSL statically and
+    # SQLCipher is built with a RustCrypto provider so that no OpenSSL is linked
+    # (docs/architecture.md section 5.3). `cargo xtask symbols-check` guards the binary; this
+    # guards the dependency graph.
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "openssl-src" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The git dependencies are expected: libsignal and what it pins, one SQLCipher fork, and the
+# StatusNotifierItem crate at a commit newer than its release (workspace Cargo.toml).
+allow-git = [
+    "https://github.com/signalapp/libsignal",
+    "https://github.com/signalapp/boring",
+    "https://github.com/signalapp/SparsePostQuantumRatchet.git",
+    "https://github.com/boxdot/rusqlite",
+    "https://github.com/iovxw/ksni",
+]

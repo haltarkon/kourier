@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Third-party licenses</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: sans-serif; line-height: 1.45; margin: 0 auto; max-width: 52rem; padding: 0 1rem 3rem; }
+  .license-used-by { columns: 2 16rem; padding-left: 1.2rem; }
+  .license-text { max-height: 18rem; overflow: auto; white-space: pre-wrap; border: 1px solid; padding: .6rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>Third-party licenses</h1>
+<p>Kourier is licensed under AGPL-3.0-only (see the LICENSE file). It is built from the libraries
+listed here, each under the license shown. Their license texts follow, as their licenses require.</p>
+
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+
+<h2>License texts</h2>
+{{#each licenses}}
+<section>
+  <h3 id="{{id}}">{{name}}</h3>
+  <p>Used by:</p>
+  <ul class="license-used-by">
+  {{#each used_by}}
+    <li>{{#if crate.repository}}<a href="{{crate.repository}}">{{crate.name}} {{crate.version}}</a>{{else}}<a href="https://crates.io/crates/{{crate.name}}">{{crate.name}} {{crate.version}}</a>{{/if}}</li>
+  {{/each}}
+  </ul>
+  <pre class="license-text">{{text}}</pre>
+</section>
+{{/each}}
+</main>
+</body>
+</html>

@@ -1,0 +1,36 @@
+[package]
+name = "kourier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["signal", "fake"]
+# The Signal backend.
+signal = ["kourier-app/signal"]
+# The scripted test network: `--fixture`, `--fixture-link`, `cargo xtask shots` and the
+# "Test network" on the welcome page. A user build may leave it out.
+fake = ["kourier-app/fake"]
+# Leaves the release build dumpable so its memory can be measured (architecture §9.4). Only
+# `cargo xtask perf` builds with it.
+dumpable = ["kourier-app/dumpable"]
+# A measuring build: the reference profile of the quality targets and its scripted session
+# (architecture §1.3). Only `cargo xtask perf` builds with it.
+perf = ["dumpable", "fake", "kourier-app/perf", "kourier-qt/perf"]
+
+[dependencies]
+kourier-app = { path = "../kourier-app", default-features = false }
+kourier-qt.workspace = true
+cxx-qt.workspace = true
+
+[dev-dependencies]
+# tests/dev_control.rs speaks the development channel's JSON lines.
+serde_json.workspace = true
+
+# The development channel is driven on fixture data: a build without the test network (what
+# `cargo xtask dist` builds) has none and leaves this test out.
+[[test]]
+name = "dev_control"
+required-features = ["fake"]

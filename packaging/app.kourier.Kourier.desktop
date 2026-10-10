@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Kourier
+GenericName=Messenger
+Comment=Unofficial messenger compatible with Signal
+Exec=kourier %U
+TryExec=kourier
+Icon=app.kourier.Kourier
+Terminal=false
+Categories=Network;InstantMessaging;Chat;Qt;
+Keywords=chat;messenger;signal;
+MimeType=x-scheme-handler/sgnl;x-scheme-handler/signalcaptcha;
+StartupNotify=true
+StartupWMClass=kourier
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true

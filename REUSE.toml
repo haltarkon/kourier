@@ -1,0 +1,118 @@
+version = 1
+SPDX-PackageName = "Kourier"
+# TODO(maintainer): the project's final name, its download location and a contact go here
+# (SPDX-PackageDownloadLocation, SPDX-PackageSupplier) once the name and the hosting are chosen.
+
+# How this tree is annotated for the REUSE specification (https://reuse.software). Files are
+# annotated here by path, not by a header line in each file, so a source file stays free of
+# boilerplate. A file that carries its own SPDX header (the .proto files, the mock harness's
+# .mjs files) keeps it: the header wins over a path annotation.
+#
+# Three licenses are in use (texts in LICENSES/):
+#   AGPL-3.0-only  the code, the documents and the icons. libsignal is AGPL-3.0-only, and the
+#                  project takes contributions under the license it ships under.
+#   CC0-1.0        build and tool configuration, package metadata, generated data and test
+#                  fixtures: nothing in them is worth a license condition, and AppStream and
+#                  desktop-file metadata is conventionally public domain.
+#   CC-BY-4.0      CODE_OF_CONDUCT.md only (the Contributor Covenant text).
+#
+# TODO(maintainer): the copyright holder below is the "The Kourier developers" the AppStream
+# metainfo names. Replace it with the name the project goes by (under a DCO sign-off every
+# contributor keeps their copyright, so a collective name is the usual choice).
+
+# The code, the documents and the icons.
+[[annotations]]
+path = [
+    "crates/**/*.rs",
+    "xtask/**/*.rs",
+    "fuzz/**/*.rs",
+    "crates/**/*.qml",
+    "crates/**/*.cpp",
+    "crates/**/*.h",
+    "crates/**/*.sql",
+    "tests/**/*.mjs",
+    "scripts/*.sh",
+    "**/*.md",
+    "crates/kourier-qt/icons/*.svg",
+    "packaging/*.svg",
+    "po/**",
+    "docs/screenshots/*.png",
+]
+SPDX-FileCopyrightText = "2026 The Kourier developers"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Build and tool configuration, package metadata and generated data.
+[[annotations]]
+path = [
+    ".cargo/config.toml",
+    ".gitattributes",
+    ".gitignore",
+    "**/Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "crates/kourier-qt/clippy.toml",
+    "deny.toml",
+    "about.toml",
+    "about.hbs",
+    "cliff.toml",
+    "tests/mock-harness/package.json",
+    "tests/mock-harness/package-lock.json",
+    "crates/kourier-core/tests/ingest.proptest-regressions",
+    "packaging/*.desktop",
+    "packaging/*.metainfo.xml",
+    ".github/**",
+]
+SPDX-FileCopyrightText = "2026 The Kourier developers"
+SPDX-License-Identifier = "CC0-1.0"
+
+# Throwaway certificates and keys generated for the coexistence test (kourier-coexist); they
+# protect nothing.
+[[annotations]]
+path = "crates/kourier-coexist/fixtures/*.der"
+SPDX-FileCopyrightText = "2026 The Kourier developers"
+SPDX-License-Identifier = "CC0-1.0"
+
+# The Contributor Covenant text, with the project's contact line filled in.
+[[annotations]]
+path = "CODE_OF_CONDUCT.md"
+SPDX-FileCopyrightText = "2021 Organization for Ethical Source (Contributor Covenant)"
+SPDX-License-Identifier = "CC-BY-4.0"
+precedence = "override"
+
+# Third-party files that were copied into the tree. The five Signal .proto files carry their
+# own SPDX headers (Signal Messenger, LLC, AGPL-3.0-only) and need no entry here.
+
+# Signal Messenger's certificate authority for its storage and CDN hosts, taken from Signal
+# Desktop's config/default.json (AGPL-3.0-only). A public certificate, trusted by
+# kourier-signal/src/net/env.rs and nothing else.
+[[annotations]]
+path = "crates/kourier-signal/src/net/signal-messenger-ca.pem"
+SPDX-FileCopyrightText = "Signal Messenger, LLC"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# A known-answer test vector (a 32-byte plaintext, encrypted by Signal's client library),
+# copied from libsignal-service-rs src/kat.bin.rs (AGPL-3.0-only); the copyright holders are
+# those that project's README lists.
+[[annotations]]
+path = "crates/kourier-signal/testdata/lss_attachment_kat.in"
+SPDX-FileCopyrightText = [
+    "2015-2019 Open Whisper Systems",
+    "2020-2023 Signal Messenger, LLC",
+    "2019-2025 Ruben De Smet",
+    "2019-2025 Gabriel Féron",
+    "2019-2025 Whisperfish contributors",
+]
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Signal's backup format, copied unchanged from libsignal at tag v0.104.0
+# (rust/message-backup/src/proto/backup.proto; the file has no header of its own) and two of
+# libsignal's encrypted test archives from the same tag (rust/message-backup/tests/res/test-cases/
+# valid-encrypted/), which the reader's tests open (kourier-signal `archive`). AGPL-3.0-only,
+# copyright as the project states it (libsignal README: 2020-2026; this file since 2023).
+[[annotations]]
+path = [
+    "crates/kourier-signal/protos/backup.proto",
+    "crates/kourier-signal/testdata/libsignal/*.encrypted",
+]
+SPDX-FileCopyrightText = "2023-2026 Signal Messenger, LLC"
+SPDX-License-Identifier = "AGPL-3.0-only"

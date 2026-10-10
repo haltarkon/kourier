@@ -1,0 +1,59 @@
+[package]
+name = "kourier-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Both are on by default during M1 development; a user build may drop `fake`.
+default = ["signal", "fake"]
+# The Signal backend (libsignal).
+signal = ["dep:kourier-signal"]
+# The scripted test network: `--fixture`, `--fixture-link` and the "Test network" on the
+# welcome page.
+fake = ["dep:kourier-fake", "dep:tempfile"]
+# Leaves a release build dumpable, so its memory can be read from /proc/<pid>/smaps_rollup
+# (architecture §1.3, §9.4). For measuring only: `cargo xtask perf`.
+dumpable = []
+# The reference profile of the quality targets on the fake network (`Launch::Perf`, src/perf.rs).
+# For measuring only: `cargo xtask perf`.
+perf = ["dumpable", "fake"]
+
+[dependencies]
+kourier-model.workspace = true
+kourier-backend-api.workspace = true
+kourier-core.workspace = true
+kourier-db.workspace = true
+# Decrypted avatar copies for the UI (`avatars`, §8.6).
+kourier-blob.workspace = true
+kourier-desktop.workspace = true
+kourier-fake = { workspace = true, optional = true }
+kourier-signal = { workspace = true, optional = true }
+aes-gcm.workspace = true
+argon2.workspace = true
+hkdf.workspace = true
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log"] }
+uuid.workspace = true
+zeroize.workspace = true
+# A folder packed for the composer (`folders`).
+zip.workspace = true
+
+[dev-dependencies]
+# tests/desktop.rs: a private dbus-daemon with a mock notification server.
+kourier-desktop = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,0 +1,5 @@
+# The Qt thread never blocks (architecture §2.3, §8.5): results come back as events.
+disallowed-methods = [
+    { path = "tokio::runtime::Runtime::block_on", reason = "the Qt thread never blocks (§8.5)" },
+    { path = "tokio::runtime::Handle::block_on", reason = "the Qt thread never blocks (§8.5)" },
+]
