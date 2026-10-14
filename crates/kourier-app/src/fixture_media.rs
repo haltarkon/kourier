@@ -11,8 +11,8 @@ use kourier_blob::FileKey;
 use kourier_fake::attachments::{synthetic_file, synthetic_image};
 use kourier_fake::{Script, Step};
 use kourier_model::{
-    AttachmentKind, BlobKey, BlobRef, Body, ContactPatch, ConvKey, ConversationPatch, MsgTarget,
-    Patch, Placeholder, Text, UserId,
+    Attachment, AttachmentKind, BlobKey, BlobRef, Body, ContactPatch, ConvKey, ConversationPatch,
+    MsgTarget, Patch, Placeholder, Text, UserId,
 };
 
 /// One more message in the showcase chat with the timer: received, read (so its time runs
@@ -503,6 +503,186 @@ pub(crate) fn with_calls(
         script = script.deliver(delivery);
     }
     script.steps.extend(last_step);
+    (script, Some(peer))
+}
+
+/// How the page of attachments that cannot be had is made ([`with_unavailable`]).
+///
+/// What an import brings, in one of the generated direct chats, for `--page=unavailable`: the
+/// lowest direct chat of the conversation list's body (not archived, not pinned to its top)
+/// that no other page opens (not the chat of [`with_calls`], nor the one that has the
+/// fixture's file and voice note, `--page=media`), below the fold of the list in every
+/// window size, so no other picture shows what is added (not even a thumb of the list's
+/// scroll bar: no chat is added). The messages are delivered as ONE history batch after the
+/// chat's own messages, so they are its newest rows; the chat keeps its place in the list
+/// (minutes after its newest message, days before the next chat). History never downloads by
+/// itself, so the one picture the server may still have stays a click away.
+///
+/// Oldest first: an album of four, a picture, a file and a sticker "Not available on this
+/// device" (the import knows the server keeps them no more), a picture and a file "No longer
+/// available" (the server said so), a picture the user's phone is being asked for, a file and
+/// a picture it did not answer for, a picture whose message it no longer has and a file it
+/// does not have either (S6; the fixture account can ask its phone,
+/// `Script::with_backfill`: the gone ones and those not answered offer Download, those being
+/// asked for and the final ones do not), and a picture that downloads on a click. Returns the
+/// script and the chat's peer.
+pub(crate) fn with_unavailable(
+    script: Script,
+    calls_peer: Option<&UserId>,
+) -> (Script, Option<UserId>) {
+    use kourier_model::AskFailure::{NoAnswer, NoFile, NoMessage};
+    use kourier_model::AttachmentState::{AskFailed, Asking, Expired, Unavailable};
+    let events: Vec<BackendEvent> = script.deliveries().into_iter().flatten().collect();
+    let mut newest: std::collections::HashMap<UserId, i64> = std::collections::HashMap::new();
+    // The chat `with_fixture_media` puts its file and voice note into: the first with a photo.
+    let mut photo_chat: Option<UserId> = None;
+    // Chats that are not in the list's body: archived, or pinned to its top.
+    let mut apart: std::collections::HashSet<UserId> = std::collections::HashSet::new();
+    for e in &events {
+        match e {
+            BackendEvent::Message(m) => {
+                if let ConvKey::Direct(peer) = &m.conv {
+                    let at = newest.entry(peer.clone()).or_insert(m.sent_at);
+                    *at = (*at).max(m.sent_at);
+                    if photo_chat.is_none() && matches!(m.body, Body::Media { .. }) {
+                        photo_chat = Some(peer.clone());
+                    }
+                }
+            }
+            BackendEvent::ConversationUpsert(p)
+                if p.archived == Some(true) || matches!(p.pinned_order, Patch::Set(_)) =>
+            {
+                if let ConvKey::Direct(peer) = &p.key {
+                    apart.insert(peer.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ranked: Vec<(UserId, i64)> = newest.into_iter().collect();
+    ranked.sort_by_key(|(peer, at)| (std::cmp::Reverse(*at), peer.clone()));
+    let Some((peer, last)) = ranked
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(n, (peer, _))| {
+            *n >= 8
+                && !apart.contains(peer)
+                && Some(peer) != calls_peer
+                && Some(peer) != photo_chat.as_ref()
+        })
+        .map(|(_, chat)| chat.clone())
+    else {
+        return (script, None);
+    };
+    let key = ConvKey::Direct(peer.clone());
+    let at = |n: i64| last + 5 * 60_000 + n * 40_000;
+    let gone = |kind: AttachmentKind,
+                mime: &str,
+                name: Option<&str>,
+                dims: Option<(u32, u32)>,
+                state: kourier_model::AttachmentState| Attachment {
+        kind,
+        mime: mime.to_owned(),
+        size: 48_213,
+        file_name: name.map(str::to_owned),
+        dims,
+        state,
+        ..Attachment::default()
+    };
+    let picture = |state| {
+        gone(
+            AttachmentKind::Image,
+            "image/jpeg",
+            None,
+            Some((200, 90)),
+            state,
+        )
+    };
+    let media = |attachments: Vec<Attachment>, caption: Option<&str>| Body::Media {
+        attachments,
+        caption: caption.map(Text::plain),
+    };
+    // (The page opens at the newest row: what fits above the composer is what the pictures
+    // show, so the album, the tallest, comes first: its lower tiles, with their notes, are
+    // the top of the picture.)
+    let bodies = [
+        media(vec![picture(Unavailable); 4], None),
+        media(vec![picture(Unavailable)], None),
+        media(
+            vec![gone(
+                AttachmentKind::File,
+                "application/pdf",
+                Some("flight-plan.pdf"),
+                None,
+                Unavailable,
+            )],
+            None,
+        ),
+        Body::Sticker(Box::new(gone(
+            AttachmentKind::Image,
+            "image/webp",
+            None,
+            Some((512, 512)),
+            Unavailable,
+        ))),
+        media(vec![picture(Expired)], None),
+        media(
+            vec![gone(
+                AttachmentKind::File,
+                "application/gpx+xml",
+                Some("ridge-track.gpx"),
+                None,
+                Expired,
+            )],
+            None,
+        ),
+        // The user's phone asked for a lost file (S6): still asking, then each way it ends.
+        media(vec![picture(Asking)], None),
+        media(
+            vec![gone(
+                AttachmentKind::File,
+                "application/pdf",
+                Some("checklist.pdf"),
+                None,
+                AskFailed { why: NoAnswer },
+            )],
+            None,
+        ),
+        media(vec![picture(AskFailed { why: NoAnswer })], None),
+        media(vec![picture(AskFailed { why: NoMessage })], None),
+        media(
+            vec![gone(
+                AttachmentKind::File,
+                "application/zip",
+                Some("logs.zip"),
+                None,
+                AskFailed { why: NoFile },
+            )],
+            None,
+        ),
+        media(vec![synthetic_image(200, 90, 61)], None),
+    ];
+    let messages = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(n, body)| {
+            let n = i64::try_from(n).unwrap_or(0);
+            let mut m = kourier_fake::scripts::remote(&key, &peer, &at(n).to_string(), at(n), "");
+            m.body = body;
+            m.read = true;
+            m
+        })
+        .collect();
+    let script = deliver_before_final_state(
+        script,
+        vec![BackendEvent::HistoryBatch {
+            conv: key,
+            messages,
+            has_more: false,
+            progress: None,
+        }],
+    );
     (script, Some(peer))
 }
 

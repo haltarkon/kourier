@@ -510,6 +510,15 @@ describe('mock harness', () => {
       groups: [{ id: group.id, archived: true, pinned: true }],
     });
     assert.deepEqual(stored, { version: 1, records: 2 }, 'account + group');
+    assert.deepEqual(await harness.request('failStorageManifest', {}), { refused: 0 });
+    assert.equal(
+      (await harness.request('storageVersion', { primary: dana.ref })).version,
+      1,
+      'the primary still sees its manifest while linked devices are refused',
+    );
+    await harness.request('failStorageManifest', { fail: false });
+    assert.deepEqual(await harness.request('limitProfileFetches', { retryAfter: 5 }), { refused: 0 });
+    assert.deepEqual(await harness.request('limitProfileFetches', { stop: true }), { refused: 0 });
   });
 
   test('send controls: rate limits, token checks, stats, lost sender keys, group filter', async () => {
@@ -530,6 +539,7 @@ describe('mock harness', () => {
     assert.equal(stats.unexpectedAnswers, 0);
     assert.equal(stats.groupFetches[group.id], 0);
     assert.equal(stats.uploads, 0, 'no client uploaded anything');
+    assert.deepEqual(stats.certificateRequests, [], 'no client fetched a sender certificate');
 
     // Hal holds Gus's sender key after a sender-key text; forgetting it is counted.
     await harness.request('sendGroupText', { from: gus.ref, group: group.id, to: [hal.ref], text: 'hi', senderKey: true });
@@ -799,6 +809,9 @@ describe('mock harness', () => {
     assert.deepEqual(await harness.request('delayLink', { ms: 5 }), {});
     assert.deepEqual(await harness.request('delayLink', {}), {});
     await assert.rejects(harness.request('delayLink', { ms: -1 }), { code: 'badRequest' });
+    assert.deepEqual(await harness.request('setLatency', { ms: 5 }), {});
+    assert.deepEqual(await harness.request('setLatency', {}), {});
+    await assert.rejects(harness.request('setLatency', { ms: -1 }), { code: 'badRequest' });
 
     // Challenges: set, listed with their token, lifted.
     const target = await harness.request('createPrimary', { profileName: 'Challenged' });
@@ -956,6 +969,45 @@ describe('mock harness', () => {
       }),
       { code: 'badRequest' },
     );
+    // The phone's answer to a request for lost files: each entry form; the uploaded pointers
+    // come back in entry order (long text last) and decrypt to what was uploaded.
+    const backfill = (spec) =>
+      harness.request('sendSync', {
+        from: ivy.aci,
+        to: linked.ref,
+        attachmentBackfillResponse: { conversation: { aci: jack.aci }, author: jack.aci, timestamp: 21, ...spec },
+      });
+    const uuid = Buffer.alloc(16, 3).toString('base64');
+    const answered = await backfill({
+      attachments: [
+        { status: 'pending' },
+        { data: Buffer.from('again').toString('base64'), contentType: 'image/png', clientUuid: uuid },
+        { status: 'terminalError' },
+        { empty: true },
+        { data: Buffer.from('bare').toString('base64'), forge: { digest: 'none' } },
+      ],
+      longText: { data: Buffer.from('the rest').toString('base64'), contentType: 'text/x-signal-plain' },
+    });
+    assert.equal(answered.pointers.length, 3);
+    assert.equal(answered.pointers[0].clientUuid, uuid);
+    assert.equal(answered.pointers[1].digest ?? null, null, 'no digest');
+    assert.equal(
+      Buffer.from((await harness.request('fetchAttachment', { pointer: answered.pointers[0] })).data, 'base64').toString(),
+      'again',
+    );
+    const again = await backfill({ attachments: [{ pointer: answered.pointers[0] }] });
+    assert.deepEqual(again.pointers, [answered.pointers[0]]);
+    for (const spec of [{ error: 'messageNotFound' }, { error: 7 }, { empty: true }]) {
+      assert.deepEqual(Object.keys(await backfill(spec)).sort(), ['pointers', 'timestamp', 'to']);
+    }
+    for (const spec of [
+      { attachments: [{ status: 'later' }] },
+      { attachments: [{}] },
+      { error: 'messageNotFound', attachments: [] },
+      {},
+    ]) {
+      await assert.rejects(backfill(spec), { code: 'badRequest' }, JSON.stringify(spec));
+    }
     await harness.request('unlink', { primary: ivy.aci, device: linked.ref, closeSocket: false });
 
     // The multi-recipient challenge of the websocket route is set and lifted.

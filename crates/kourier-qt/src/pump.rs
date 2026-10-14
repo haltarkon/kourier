@@ -12,7 +12,7 @@
 //! This module is Qt-free so the scheduling logic is tested with plain threads.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,25 @@ use kourier_app::facade::UiEvent;
 
 /// How long one drain may run on the Qt thread before it yields to the event loop.
 pub const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// How long the producer task waits after it queued an event before it posts the drain, in ms
+/// (0: it does not). A test sets it to widen the time between the core's `emit` and the front-end's
+/// reaction, which is what a screenshot has to wait for (`App::screenshot_holds`).
+static TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// TEST ONLY: the Qt thread hears of a queued event `delay` late (the queue holds it
+/// meanwhile, the next ones wait in the channel).
+pub fn set_test_delay(delay: Duration) {
+    TEST_DELAY_MS.store(
+        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The delay of [`set_test_delay`].
+pub(crate) fn test_delay() -> Duration {
+    Duration::from_millis(TEST_DELAY_MS.load(Ordering::Relaxed))
+}
 
 /// One thing for the Qt thread.
 #[derive(Debug)]

@@ -2509,6 +2509,197 @@ mod mapping {
         assert!(attachments[0].remote.is_some(), "the core can download it");
     }
 
+    /// `SyncMessage.attachmentBackfillResponse`: only the primary's (device 1 of our ACI) is
+    /// news for the core, named WITH its conversation (binary or string ids); one from another
+    /// of our devices, one naming its chat or author by number alone, an empty one and every
+    /// request (only the primary answers) are dropped with a reason.
+    #[test]
+    fn backfill_answers_come_only_from_the_primary() {
+        use kourier_backend_api::{RestoreSlot, RestoreUpdate};
+        use proto::addressable_message::Author;
+        use proto::conversation_identifier::Identifier;
+        use proto::sync_message::AttachmentBackfillResponse as Response;
+        use proto::sync_message::attachment_backfill_response::{
+            AttachmentData, AttachmentDataList, Data,
+        };
+        let fixture = fixture();
+        let me: ServiceId = fixture.account.aci.into();
+        let them: ServiceId = peer().into();
+        let answer = |author: Author, thread: Identifier, data: Option<Data>| {
+            sync(proto::SyncMessage {
+                content: Some(proto::sync_message::Content::AttachmentBackfillResponse(
+                    Response {
+                        target_message: Some(proto::AddressableMessage {
+                            author: Some(author),
+                            sent_timestamp: Some(10),
+                        }),
+                        target_conversation: Some(proto::ConversationIdentifier {
+                            identifier: Some(thread),
+                        }),
+                        data,
+                    },
+                )),
+                ..Default::default()
+            })
+        };
+        let pending = || {
+            Some(Data::Attachments(AttachmentDataList {
+                attachments: vec![AttachmentData {
+                    data: Some(
+                        proto::sync_message::attachment_backfill_response::attachment_data::Data::Status(0),
+                    ),
+                }],
+                long_text: None,
+            }))
+        };
+        let binary = answer(
+            Author::AuthorServiceIdBinary(them.service_id_binary()),
+            Identifier::ThreadServiceIdBinary(them.service_id_binary()),
+            pending(),
+        );
+        let chat = Some(ConvKey::Direct(aci_user(peer())));
+        match &events_of(map(&fixture, &row(me, 1, T, &binary), false))[..] {
+            [BackendEvent::AttachmentRestore { target, update, .. }] => {
+                assert_eq!(target.conv, chat);
+                assert_eq!(target.author, TargetAuthor::User(aci_user(peer())));
+                assert_eq!(target.local.to_string(), "10");
+                assert_eq!(
+                    *update,
+                    RestoreUpdate::Answer {
+                        attachments: vec![RestoreSlot::Pending],
+                        long_text: None
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Desktop's string forms; our own message is `Own`; `error` = 0 is "not found".
+        let strings = answer(
+            Author::AuthorServiceId(me.service_id_string()),
+            Identifier::ThreadServiceId(them.service_id_string()),
+            Some(Data::Error(0)),
+        );
+        match &events_of(map(&fixture, &row(me, 1, T, &strings), false))[..] {
+            [BackendEvent::AttachmentRestore { target, update, .. }] => {
+                assert_eq!((&target.conv, &target.author), (&chat, &TargetAuthor::Own));
+                assert_eq!(*update, RestoreUpdate::MessageNotFound);
+            }
+            other => panic!("{other:?}"),
+        }
+        let dropped = |content: &proto::Content, device: u32| {
+            matches!(
+                map(&fixture, &row(me, device, T, content), false),
+                Outcome::Handled { events, note: Some(_), .. } if events.is_empty()
+            )
+        };
+        // Device 2 is this device in the fixture (its own sync is dropped before): another
+        // linked device is 3.
+        assert!(dropped(&binary, 3), "a linked device does not answer");
+        assert!(dropped(
+            &answer(
+                Author::AuthorE164("+15550100".to_owned()),
+                Identifier::ThreadServiceIdBinary(them.service_id_binary()),
+                pending()
+            ),
+            1
+        ));
+        assert!(dropped(
+            &answer(
+                Author::AuthorServiceIdBinary(them.service_id_binary()),
+                Identifier::ThreadE164("+15550100".to_owned()),
+                pending()
+            ),
+            1
+        ));
+        assert!(dropped(
+            &answer(
+                Author::AuthorServiceIdBinary(them.service_id_binary()),
+                Identifier::ThreadServiceIdBinary(them.service_id_binary()),
+                None
+            ),
+            1
+        ));
+        let request = sync(proto::SyncMessage {
+            content: Some(proto::sync_message::Content::AttachmentBackfillRequest(
+                proto::sync_message::AttachmentBackfillRequest::default(),
+            )),
+            ..Default::default()
+        });
+        assert!(dropped(&request, 1), "only the primary answers a request");
+        // From anyone but our own account it is not a sync message at all.
+        assert!(events_of(map(&fixture, &row(them, 1, T, &binary), false)).is_empty());
+    }
+
+    /// What `backfill::request` names, `backfill_response` places again: for every shape of
+    /// chat and author a request can carry, the phone's answer (which echoes the request's
+    /// target) reaches the core as the very message it asked about. A shape the answer could
+    /// not be placed for (a chat or an author known by phone number alone, an author nobody
+    /// knows) gets no request, so the phone is not asked to upload for nothing.
+    #[test]
+    fn a_requests_answer_finds_the_message_again_for_every_shape() {
+        use proto::sync_message::AttachmentBackfillResponse as Response;
+        use proto::sync_message::attachment_backfill_response::{
+            AttachmentData, AttachmentDataList, Data,
+        };
+        let fixture = fixture();
+        let me: ServiceId = fixture.account.aci.into();
+        let alice = aci_user(peer());
+        let pni = crate::service_id::pni_user_id(Pni::from(Uuid::from_u128(0xb0b))).unwrap();
+        let number = kourier_model::UserId::parse("e164:+15550100").unwrap();
+        let group = crate::groups::conv_key_of_id(&[7; 32]);
+        let direct = |user: &kourier_model::UserId| ConvKey::Direct(user.clone());
+        let notes = direct(&aci_user(fixture.account.aci));
+        let shapes = [
+            (direct(&alice), TargetAuthor::User(alice.clone()), true),
+            (direct(&alice), TargetAuthor::Own, true),
+            (direct(&pni), TargetAuthor::User(pni.clone()), true),
+            (notes, TargetAuthor::Own, true),
+            (group.clone(), TargetAuthor::User(alice.clone()), true),
+            (group.clone(), TargetAuthor::Own, true),
+            (direct(&number), TargetAuthor::User(number.clone()), false),
+            (direct(&number), TargetAuthor::Own, false),
+            (direct(&alice), TargetAuthor::User(number.clone()), false),
+            (group, TargetAuthor::User(number), false),
+            (direct(&alice), TargetAuthor::Unknown, false),
+        ];
+        for (n, (conv, author, named)) in shapes.into_iter().enumerate() {
+            let target = kourier_model::MsgTarget {
+                conv: Some(conv.clone()),
+                author: author.clone(),
+                local: "1700000000123".into(),
+                alternates: Vec::new(),
+            };
+            let Some(request) = crate::backfill::request(&fixture.account, &conv, &target) else {
+                assert!(!named, "shape {n}: a request was expected");
+                continue;
+            };
+            assert!(named, "shape {n}: no request was expected");
+            let answer = sync(proto::SyncMessage {
+                content: Some(proto::sync_message::Content::AttachmentBackfillResponse(
+                    Response {
+                        target_message: request.target_message,
+                        target_conversation: request.target_conversation,
+                        data: Some(Data::Attachments(AttachmentDataList {
+                            attachments: vec![AttachmentData {
+                                data: Some(proto::sync_message::attachment_backfill_response::attachment_data::Data::Status(0)),
+                            }],
+                            long_text: None,
+                        })),
+                    },
+                )),
+                ..Default::default()
+            });
+            match &events_of(map(&fixture, &row(me, 1, T, &answer), false))[..] {
+                [BackendEvent::AttachmentRestore { target: found, .. }] => {
+                    assert_eq!(found.conv, Some(conv), "shape {n}");
+                    assert_eq!(found.author, author, "shape {n}");
+                    assert_eq!(found.local, target.local, "shape {n}");
+                }
+                other => panic!("shape {n}: {other:?}"),
+            }
+        }
+    }
+
     /// `SyncMessage.deleteForMe`, `viewed` and `viewOnceOpen` from our phone: message deletes
     /// become deletes for me by our own account (in 1:1 chats, Note to Self and groups);
     /// conversation and attachment deletes have no event and change nothing; views raise the
@@ -2658,7 +2849,8 @@ mod mapping {
                     fallback_digest: Some(digest.to_vec()),
                     fallback_plaintext_hash: Some(vec![9; 32]),
                 },
-                // Only the plaintext hash, which nothing here knows: left out.
+                // Only the plaintext hash: the name of an imported attachment of a file the
+                // phone had downloaded.
                 proto::sync_message::delete_for_me::AttachmentDelete {
                     conversation: thread(Identifier::ThreadServiceIdBinary(
                         them.service_id_binary(),
@@ -2719,7 +2911,16 @@ mod mapping {
                     net_ids: kourier_model::Redacted::new(vec![
                         format!("uuid:{}", "ab".repeat(16)),
                         format!("digest:{}", "cd".repeat(32)),
+                        format!("plaintext:{}", "09".repeat(32)),
                     ]),
+                    at,
+                },
+                BackendEvent::AttachmentDeleted {
+                    target: anchor(&chat, them_user(), "41"),
+                    net_ids: kourier_model::Redacted::new(vec![format!(
+                        "plaintext:{}",
+                        "09".repeat(32)
+                    )]),
                     at,
                 },
             ]
@@ -2741,7 +2942,13 @@ mod mapping {
         let BackendEvent::AttachmentDeleted { net_ids, .. } = &events[3] else {
             panic!("{events:?}");
         };
-        assert_eq!(&attachment.net_ids, net_ids.expose());
+        assert!(
+            attachment
+                .net_ids
+                .iter()
+                .all(|name| net_ids.expose().contains(name)),
+            "the core finds the attachment by any of its names"
+        );
         assert!(
             !format!("{attachment:?}").contains("abab"),
             "names of content stay out of logs"

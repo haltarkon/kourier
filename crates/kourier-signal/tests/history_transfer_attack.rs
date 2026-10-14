@@ -561,6 +561,34 @@ async fn a_start_after_a_kill_at_the_end_removes_the_key_from_the_database_files
 /// A text that is in every message and every name of the test archive, and nowhere else.
 const MARKER: &str = "attack-marker-93e7";
 
+/// The invite link's password of the test archive's group: a needle of its own (the
+/// marker is in the group's title and every text, so a look for the marker would pass
+/// whether or not the password was kept). The import never reads it: it must be in no page
+/// of the stage, no file of the transfer, no page of `backend.db`.
+const GROUP_PASSWORD: &str = "attack-password-71fa";
+
+/// The password as a look must search for it: its bytes, and the numbers the stage's JSON
+/// writes a byte string as (`[97,116,…]`; a copy kept in the stage would stand so, which a
+/// look for the bytes alone does not find).
+fn password_needles() -> [Vec<u8>; 2] {
+    [
+        GROUP_PASSWORD.as_bytes().to_vec(),
+        serde_json::to_vec(GROUP_PASSWORD.as_bytes()).expect("json"),
+    ]
+}
+
+/// The master key of the test archive's group (step S4b): a secret of the group that must
+/// never stand in the clear in any file, as its bytes or as the numbers of the stage's JSON.
+fn group_master_key() -> [u8; 32] {
+    std::array::from_fn(|i| 0xd0 + i as u8)
+}
+
+/// The master key as the stage's JSON spells it (`[208,209,…]`), the needle for a look at
+/// decrypted pages and at files.
+fn group_master_key_json() -> Vec<u8> {
+    serde_json::to_vec(&group_master_key()).expect("json")
+}
+
 /// The test archive of the import: people, chats and `generated` more messages, each with
 /// [`MARKER`] in its text; with `broken_before_the_end` a frame that does not decode stands
 /// in front of its last messages. Returns its frames.
@@ -572,8 +600,8 @@ fn write_marked_archive(
     broken_before_the_end: bool,
 ) -> u64 {
     use kourier_signal::archive_testing::{
-        ChatSpec, ChatWith, ContactSpec, GeneratedSpec, HistorySpec, SendStatusSpec, TextSpec,
-        write_history_archive,
+        ChatSpec, ChatWith, ContactSpec, GeneratedSpec, GroupSpec, HistorySpec, Party,
+        SendStatusSpec, SnapshotSpec, TextSpec, Who, write_history_archive,
     };
     let text = |outgoing: bool, n: u64| TextSpec {
         outgoing,
@@ -600,12 +628,37 @@ fn write_marked_archive(
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: (0..40).map(|n| text(n % 2 == 0, n)).collect(),
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::NoteToSelf,
                 texts: vec![text(true, 100)],
+                ..ChatSpec::default()
+            },
+            // A group whose title carries the marker, with two texts.
+            ChatSpec {
+                with: ChatWith::Group(0),
+                texts: vec![
+                    text(true, 200),
+                    TextSpec {
+                        author: Some(Who::Contact(0)),
+                        ..text(false, 201)
+                    },
+                ],
+                ..ChatSpec::default()
             },
         ],
+        groups: vec![GroupSpec {
+            master_key: group_master_key().to_vec(),
+            whitelisted: true,
+            blocked: false,
+            snapshot: Some(SnapshotSpec {
+                title: Some(format!("{MARKER} group title")),
+                members: vec![(Party::Own, true), (Party::Contact(0), false)],
+                invite_link_password: GROUP_PASSWORD.as_bytes().to_vec(),
+                ..SnapshotSpec::default()
+            }),
+        }],
         interleaved: true,
         generated: Some(GeneratedSpec {
             chats: 4,
@@ -796,7 +849,17 @@ async fn nothing_of_an_aborted_import_is_readable() {
     // The control. The stage holds the archive: read as a stage, and looked at page by
     // page with its key, where the look finds the marker.
     let dump = read_stage(&transfer, &key).expect("the whole stage");
-    assert_eq!(dump.messages, 41 + u64::from(generated));
+    assert_eq!(dump.messages, 43 + u64::from(generated));
+    assert!(
+        dump.chats.iter().any(|chat| chat
+            .group
+            .as_ref()
+            .is_some_and(|g| g.title.as_deref() == Some(&format!("{MARKER} group title")))),
+        "the group is staged with its title"
+    );
+    // The group's master key is in the stage (decrypted with its key), as JSON numbers.
+    let master_json = group_master_key_json();
+    let master_raw = group_master_key();
     let stage_db = std::fs::read(transfer.join(STAGE_FILE)).expect("the stage");
     let stage_wal = std::fs::read(transfer.join(format!("{STAGE_FILE}-wal"))).unwrap_or_default();
     let staged = raw_look(&stage_db, &stage_wal, &stage_key(&key), needle);
@@ -806,6 +869,19 @@ async fn nothing_of_an_aborted_import_is_readable() {
         staged.with_needle,
         staged.pages
     );
+    assert!(
+        raw_look(&stage_db, &stage_wal, &stage_key(&key), &master_json).with_needle > 0,
+        "the look finds the master key in the stage"
+    );
+    // The invite link's password is in the archive and in none of the stage's pages, as its
+    // bytes or as the numbers of the stage's JSON.
+    for password in password_needles() {
+        assert_eq!(
+            raw_look(&stage_db, &stage_wal, &stage_key(&key), &password).with_needle,
+            0,
+            "the stage holds the invite link's password"
+        );
+    }
     // With any other key the same pages are noise.
     assert_eq!(
         raw_look(&stage_db, &stage_wal, &[0x33; 32], needle).with_needle,
@@ -830,6 +906,20 @@ async fn nothing_of_an_aborted_import_is_readable() {
         plain, 0,
         "{plain} of {files} files hold the marker in the clear"
     );
+    for master in [&master_json[..], &master_raw[..]] {
+        assert_eq!(
+            files_holding(&transfer, master).0,
+            0,
+            "a file of the transfer holds the master key in the clear"
+        );
+    }
+    for password in password_needles() {
+        assert_eq!(
+            files_holding(&transfer, &password).0,
+            0,
+            "a file of the transfer holds the invite link's password in the clear"
+        );
+    }
     // And backend.db has none of it, in any page of either file.
     let look_at_backend = |when: &str| {
         let (db, wal) = files_now(&world.files);
@@ -845,6 +935,20 @@ async fn nothing_of_an_aborted_import_is_readable() {
              archive",
             raw.with_needle, raw.pages
         );
+        for master in [&master_json[..], &master_raw[..]] {
+            assert_eq!(
+                raw_look(&db, &wal, &world.files.key, master).with_needle,
+                0,
+                "{when}: backend.db holds the archive's group master key"
+            );
+        }
+        for password in password_needles() {
+            assert_eq!(
+                raw_look(&db, &wal, &world.files.key, &password).with_needle,
+                0,
+                "{when}: backend.db holds the archive's invite link password"
+            );
+        }
     };
     println!(
         "control: the marker is in {} of {} decrypted pages of the stage, in 0 of {files} \
@@ -855,6 +959,20 @@ async fn nothing_of_an_aborted_import_is_readable() {
     // (review) And no file anywhere under the test's directory holds it as its bytes stand:
     // the account's other files, its blob store, what the core was given (the sink).
     let (plain, files) = tree_holding(world.tmp.path(), needle);
+    for master in [&master_json[..], &master_raw[..]] {
+        assert_eq!(
+            tree_holding(world.tmp.path(), master).0,
+            0,
+            "a file holds the group's master key in the clear"
+        );
+    }
+    for password in password_needles() {
+        assert_eq!(
+            tree_holding(world.tmp.path(), &password).0,
+            0,
+            "a file holds the invite link's password in the clear"
+        );
+    }
     println!("control: {plain} of {files} files under the test's directory hold the marker");
     assert!(
         files > 4,

@@ -120,6 +120,14 @@ pub enum ErrorKind {
     Unsupported,
     /// The remote content is gone (expired attachment, §7.1).
     Expired,
+    /// A link was refused because the identity it brought is already an account of this
+    /// profile (the same primary own id: Signal's ACI). `logged_out`: that account is logged
+    /// out, so "Link Again" on it is the way back.
+    AlreadyAdded {
+        /// The existing account is logged out.
+        #[serde(default)]
+        logged_out: bool,
+    },
     /// A bug.
     Internal,
 }
@@ -154,6 +162,7 @@ impl ErrorKind {
             Self::InvalidInput => "InvalidInput",
             Self::Unsupported => "Unsupported",
             Self::Expired => "Expired",
+            Self::AlreadyAdded { .. } => "AlreadyAdded",
             Self::Internal => "Internal",
         }
     }

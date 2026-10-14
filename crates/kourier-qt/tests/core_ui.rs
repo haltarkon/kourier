@@ -5,6 +5,8 @@
 //! new row once it has). Driven from QML through the same invokables the pages use; offscreen,
 //! `harness = false`.
 
+mod support;
+
 use std::time::Duration;
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -235,6 +237,7 @@ Item {
 "#;
 
 fn main() {
+    support::answer_list("core_ui");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before the app and Qt start.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

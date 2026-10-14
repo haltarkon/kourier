@@ -92,6 +92,10 @@ pub mod qt {
             count: u64,
         ) -> QString;
 
+        /// A count as KI18n writes the `%1` of a plural (the locale's digit groups).
+        #[cxx_name = "formatNumber"]
+        fn format_number(n: u64) -> QString;
+
         /// Tests: one more directory to look for catalogs of `domain` in.
         #[cxx_name = "addLocaleDir"]
         fn add_locale_dir(domain: &str, dir: &QString);

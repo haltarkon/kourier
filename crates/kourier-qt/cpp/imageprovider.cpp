@@ -6,19 +6,25 @@
 #include <QtCore/QMutex>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QRunnable>
+#include <QtCore/QScopeGuard>
 #include <QtCore/QThreadPool>
 #include <QtCore/QUrl>
 #include <QtGui/QClipboard>
+#include <QtGui/QFont>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QImageReader>
+#include <QtGui/QImageWriter>
 #include <QtGui/QLinearGradient>
 #include <QtGui/QPainter>
 #include <QtGui/QPainterPath>
 #include <QtQuick/QQuickImageProvider>
 #include <QtQuick/QQuickTextureFactory>
 
+#include <atomic>
+#include <cmath>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 namespace kourier {
 
@@ -30,6 +36,21 @@ constexpr int kWorkers = 3;
 
 // Bytes before the file of an encoded payload: format, flags, codec, corner radius (u16).
 constexpr size_t kEncodedHeader = 5;
+
+// Requests that were asked for and whose worker has not finished (queued or running), also those
+// whose view cancelled or went away meanwhile: a re-created delegate's request is still counted
+// here while no Image says "loading" any more (`pendingImageRequests`).
+std::atomic<int> g_pending{0};
+
+// Test probe: the requests (`id WxH`, the size Qt asked for) while `logImageRequests(true)`.
+std::atomic<bool> g_logRequests{false};
+QMutex g_logMutex;
+std::vector<QString> g_requestLog;
+
+// Test probes of the thread that decodes (`decodeProbe`): how many pictures were scaled AFTER
+// the reader had decoded them whole (the slow path), and how many pixels the last decode made.
+thread_local int t_scaledAfterDecode = 0;
+thread_local long long t_decodedPixels = 0;
 
 uint32_t readU32(const rust::Vec<uint8_t>& v, size_t at)
 {
@@ -186,7 +207,15 @@ public:
         auto* response = new Response(job);
         const QByteArray utf8 = id.toUtf8();
         const MediaReader reader = m_reader;
+        g_pending.fetch_add(1, std::memory_order_seq_cst);
+        if (g_logRequests.load(std::memory_order_relaxed)) {
+            QMutexLocker lock(&g_logMutex);
+            g_requestLog.push_back(id + QLatin1Char(' ') + QString::number(requestedSize.width()) + QLatin1Char('x')
+                + QString::number(requestedSize.height()));
+        }
         m_pool.start([job, utf8, requestedSize, reader]() {
+            // Counted down on every way out, after `finished` was emitted.
+            const auto done = qScopeGuard([] { g_pending.fetch_sub(1, std::memory_order_seq_cst); });
             {
                 QMutexLocker lock(&job->mutex);
                 if (job->cancelled) {
@@ -222,6 +251,30 @@ private:
 
 } // namespace
 
+int pendingImageRequests()
+{
+    return g_pending.load(std::memory_order_seq_cst);
+}
+
+void logImageRequests(bool on)
+{
+    QMutexLocker lock(&g_logMutex);
+    g_requestLog.clear();
+    g_logRequests.store(on, std::memory_order_relaxed);
+}
+
+rust::Vec<rust::String> takeImageRequestLog()
+{
+    QMutexLocker lock(&g_logMutex);
+    rust::Vec<rust::String> out;
+    for (const QString& line : g_requestLog) {
+        const QByteArray utf8 = line.toUtf8();
+        out.push_back(rust::String(utf8.constData(), static_cast<size_t>(utf8.size())));
+    }
+    g_requestLog.clear();
+    return out;
+}
+
 QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
 {
     if (payload.size() < 2) {
@@ -247,23 +300,31 @@ QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
         reader.setAutoDetectImageFormat(false);
         reader.setDecideFormatFromContent(false);
         reader.setAutoTransform(true);
+        // The reader scales in the file's own orientation and turns the result afterwards: for
+        // a picture stored sideways (EXIF 90/270) the size to ask it for is the transposed one.
+        const bool rotated = reader.transformation().testFlag(QImageIOHandler::TransformationRotate90);
         QSize natural = reader.size();
-        if (natural.isValid() && reader.transformation().testFlag(QImageIOHandler::TransformationRotate90)) {
+        if (natural.isValid() && rotated) {
             natural.transpose();
         }
-        const QSize target = cornered ? QSize() : coverSize(natural, requested);
-        if (target.isValid() && target != natural && reader.supportsOption(QImageIOHandler::ScaledSize)
-            && !reader.transformation().testFlag(QImageIOHandler::TransformationRotate90)) {
-            reader.setScaledSize(target);
+        // An avatar is cut to a square afterwards: its shorter side has to cover the side asked
+        // for (decoding it whole costs twice as much for a 2 MP photo of a contact).
+        const int asked = qMax(requested.width(), requested.height());
+        const QSize cover = cornered ? QSize(asked, asked) : requested;
+        const QSize target = coverSize(natural, cover);
+        if (target.isValid() && target != natural && reader.supportsOption(QImageIOHandler::ScaledSize)) {
+            reader.setScaledSize(rotated ? target.transposed() : target);
         }
         image = reader.read();
+        t_decodedPixels = static_cast<long long>(image.width()) * image.height();
         // Formats that do not report their size before decoding, decoders that cannot scale
         // and rotated pictures are scaled afterwards. `wanted` has the picture's proportions
         // already; scaling to exactly it (not "keeping" the ratio, which truncates one side
         // and can come out a pixel short of what was asked for) gives QML the size it laid
         // the picture out for.
-        const QSize wanted = target.isValid() || cornered ? target : coverSize(image.size(), requested);
+        const QSize wanted = target.isValid() ? target : coverSize(image.size(), cover);
         if (!image.isNull() && wanted.isValid() && image.size() != wanted) {
+            ++t_scaledAfterDecode;
             image = image.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
         }
     } else if (format == 2 && payload.size() >= 10) {
@@ -456,6 +517,294 @@ rust::Vec<uint8_t> sampleImage(int32_t width, int32_t height, int32_t hue, rust:
     for (const char c : encoded) {
         out.push_back(static_cast<uint8_t>(c));
     }
+    return out;
+}
+
+rust::Vec<uint8_t> detailImage(int32_t width, int32_t height, rust::Str format)
+{
+    rust::Vec<uint8_t> out;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+        return out;
+    }
+    const QByteArray name(format.data(), static_cast<qsizetype>(format.size()));
+    QImage image(width, height, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    {
+        QPainter p(&image);
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setRenderHint(QPainter::TextAntialiasing, true);
+        p.setPen(Qt::NoPen);
+        p.setBrush(Qt::black);
+        const int band = qMax(1, height / 8);
+        // Two bands of vertical stripes, 8 px black and 8 px white: still 4 px a period when
+        // the picture is drawn at 27 % of its size (a phone screenshot in the timeline), so
+        // no scaler turns them into moire. (Stripes of 3 px were tried: they measure the
+        // scaler, not the picture.)
+        for (int x = 0; x < width; x += 16) {
+            p.drawRect(x, 0, 8, 2 * band);
+        }
+        // One band of horizontal stripes, 6 px and 6 px.
+        for (int y = 2 * band; y < 3 * band; y += 12) {
+            p.drawRect(0, y, width, 6);
+        }
+        // A big line of text and a small one, black on white.
+        p.setPen(Qt::black);
+        QFont big;
+        big.setPixelSize(qMax(12, width / 8));
+        big.setBold(true);
+        p.setFont(big);
+        p.drawText(QRect(0, 3 * band, width, 2 * band), Qt::AlignCenter, QStringLiteral("KOURIER"));
+        QFont small;
+        small.setPixelSize(qMax(8, width / 50));
+        p.setFont(small);
+        p.drawText(QRect(0, 5 * band, width, band), Qt::AlignCenter, QStringLiteral("The quick brown fox 0123456789"));
+        // Thin diagonals in the rest.
+        p.setPen(QPen(Qt::black, 3));
+        for (int d = -height; d < width; d += 16) {
+            p.drawLine(d, 6 * band, d + 2 * band, height);
+        }
+    }
+    QByteArray encoded;
+    QBuffer buffer(&encoded);
+    buffer.open(QIODevice::WriteOnly);
+    const int quality = name == "jpeg" || name == "jpg" ? 92 : -1;
+    if (!image.save(&buffer, name.constData(), quality)) {
+        return out;
+    }
+    out.reserve(static_cast<size_t>(encoded.size()));
+    for (const char c : encoded) {
+        out.push_back(static_cast<uint8_t>(c));
+    }
+    return out;
+}
+
+namespace {
+
+// Rec. 601 luma of every pixel of an RGB32 image, row by row.
+std::vector<double> lumaOf(const QImage& rgb)
+{
+    std::vector<double> luma;
+    luma.reserve(static_cast<size_t>(rgb.width()) * static_cast<size_t>(rgb.height()));
+    for (int y = 0; y < rgb.height(); ++y) {
+        const auto* line = reinterpret_cast<const QRgb*>(rgb.constScanLine(y));
+        for (int x = 0; x < rgb.width(); ++x) {
+            luma.push_back(0.299 * qRed(line[x]) + 0.587 * qGreen(line[x]) + 0.114 * qBlue(line[x]));
+        }
+    }
+    return luma;
+}
+
+// Variance of the 4-neighbour Laplacian over the interior of a `w` x `h` luma plane: the usual
+// measure of how much fine detail a picture holds (a blur lowers it).
+double laplacianVariance(const std::vector<double>& luma, int w, int h)
+{
+    if (w < 3 || h < 3) {
+        return 0;
+    }
+    double sum = 0;
+    double sumSquares = 0;
+    double count = 0;
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+            const double l = luma[i - 1] + luma[i + 1] + luma[i - static_cast<size_t>(w)] + luma[i + static_cast<size_t>(w)] - 4 * luma[i];
+            sum += l;
+            sumSquares += l * l;
+            count += 1;
+        }
+    }
+    const double mean = sum / count;
+    return sumSquares / count - mean * mean;
+}
+
+// PSNR (dB, 99 for identical) of two luma planes of `w` x `h` after each is averaged in blocks
+// of 8 x 8 pixels: it tells the right picture, at the right place, from a wrong one, and
+// does not care for the fine stripes, which move by a fraction of a pixel with the rounding
+// of a crop and are what `laplacianVariance` is for.
+double coarsePsnr(const std::vector<double>& a, const std::vector<double>& b, int w, int h)
+{
+    constexpr int block = 8;
+    double squares = 0;
+    double count = 0;
+    for (int by = 0; by + block <= h; by += block) {
+        for (int bx = 0; bx + block <= w; bx += block) {
+            double sa = 0;
+            double sb = 0;
+            for (int y = by; y < by + block; ++y) {
+                for (int x = bx; x < bx + block; ++x) {
+                    const size_t i = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+                    sa += a[i];
+                    sb += b[i];
+                }
+            }
+            const double d = (sa - sb) / (block * block);
+            squares += d * d;
+            count += 1;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+    const double mse = squares / count;
+    return mse <= 0 ? 99.0 : qMin(99.0, 10.0 * std::log10(255.0 * 255.0 / mse));
+}
+
+} // namespace
+
+rust::Vec<double> cornerProbe(rust::Vec<uint8_t> grab)
+{
+    rust::Vec<double> out;
+    QImage got;
+    if (!got.loadFromData(grab.data(), static_cast<qsizetype>(grab.size()), "PNG") || got.isNull()) {
+        return out;
+    }
+    got = got.convertToFormat(QImage::Format_ARGB32);
+    double area = 0;
+    for (int y = 0; y < got.height() / 2; ++y) {
+        for (int x = 0; x < got.width() / 2; ++x) {
+            area += 1.0 - qAlpha(got.pixel(x, y)) / 255.0;
+        }
+    }
+    out.push_back(got.width());
+    out.push_back(got.height());
+    out.push_back(area);
+    return out;
+}
+
+rust::Vec<double> pictureProbe(rust::Vec<uint8_t> file, uint8_t codec, rust::Vec<uint8_t> grab)
+{
+    rust::Vec<double> out;
+    const char* format = codecFormat(codec);
+    if (format == nullptr) {
+        return out;
+    }
+    QImage got;
+    if (!got.loadFromData(grab.data(), static_cast<qsizetype>(grab.size()), "PNG") || got.isNull()) {
+        return out;
+    }
+    got = got.convertToFormat(QImage::Format_RGB32);
+    // Both references are cut in the middle to the grab's size, as PreserveAspectCrop does.
+    const auto cut = [&got](const QImage& image) {
+        return image.copy((image.width() - got.width()) / 2, (image.height() - got.height()) / 2, got.width(), got.height())
+            .convertToFormat(QImage::Format_RGB32);
+    };
+    // The file decoded whole and scaled by Qt's smooth scaling (nothing of the provider in it).
+    QByteArray fileBytes(reinterpret_cast<const char*>(file.data()), static_cast<qsizetype>(file.size()));
+    QBuffer fileBuffer(&fileBytes);
+    fileBuffer.open(QIODevice::ReadOnly);
+    QImageReader reader(&fileBuffer, format);
+    reader.setAutoDetectImageFormat(false);
+    reader.setDecideFormatFromContent(false);
+    reader.setAutoTransform(true);
+    const QImage whole = reader.read();
+    if (whole.isNull()) {
+        return out;
+    }
+    const QImage smooth = cut(whole.scaled(got.size(), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation));
+    // The file as the provider decodes it for a request of the grab's size (what the item
+    // draws when the file is served, one to one).
+    rust::Vec<uint8_t> payload;
+    payload.reserve(file.size() + kEncodedHeader);
+    for (const uint8_t head : {uint8_t(1), uint8_t(0), codec, uint8_t(0), uint8_t(0)}) {
+        payload.push_back(head);
+    }
+    for (const uint8_t b : file) {
+        payload.push_back(b);
+    }
+    const QImage decoded = decodeMediaPayload(payload, got.size());
+    if (decoded.isNull()) {
+        return out;
+    }
+    const QImage provided = cut(decoded);
+    const std::vector<double> a = lumaOf(got);
+    const std::vector<double> b = lumaOf(provided);
+    const std::vector<double> c = lumaOf(smooth);
+    const auto psnr = [&a, &got](const std::vector<double>& other) {
+        return coarsePsnr(a, other, got.width(), got.height());
+    };
+    out.push_back(psnr(b));
+    out.push_back(laplacianVariance(a, got.width(), got.height()));
+    out.push_back(laplacianVariance(c, got.width(), got.height()));
+    out.push_back(got.width());
+    out.push_back(got.height());
+    out.push_back(psnr(c));
+    out.push_back(laplacianVariance(b, got.width(), got.height()));
+    return out;
+}
+
+
+rust::Vec<uint8_t> orientedImage(int32_t width, int32_t height, int32_t orientation)
+{
+    rust::Vec<uint8_t> out;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || orientation < 1 || orientation > 8) {
+        return out;
+    }
+    // Stored left half red, right half blue, with a few thin lines so a decoder has work.
+    QImage image(width, height, QImage::Format_RGB32);
+    image.fill(QColor(220, 30, 30));
+    {
+        QPainter p(&image);
+        p.fillRect(QRect(width / 2, 0, width - width / 2, height), QColor(30, 30, 220));
+        p.setPen(QPen(Qt::white, 2));
+        for (int x = 0; x < width; x += 24) {
+            p.drawLine(x, 0, x, height / 6);
+        }
+    }
+    QByteArray encoded;
+    QBuffer buffer(&encoded);
+    buffer.open(QIODevice::WriteOnly);
+    QImageWriter writer(&buffer, "jpeg");
+    writer.setQuality(95);
+    if (!writer.write(image) || encoded.size() < 2) {
+        return out;
+    }
+    // Qt's writer would turn the pixels itself for a transformation; the orientation has to be
+    // a tag, as a phone writes it: an Exif APP1 segment (big-endian TIFF, one entry, tag 0x0112)
+    // right after the SOI marker.
+    const unsigned char exif[] = {
+        0xff, 0xe1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0x00, 0x00, // marker, length 34, "Exif\0\0"
+        'M', 'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08, // TIFF header, IFD0 at 8
+        0x00, 0x01, // one entry
+        0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, static_cast<unsigned char>(orientation), 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, // no next IFD
+    };
+    out.reserve(static_cast<size_t>(encoded.size()) + sizeof(exif));
+    out.push_back(static_cast<uint8_t>(encoded[0]));
+    out.push_back(static_cast<uint8_t>(encoded[1]));
+    for (const unsigned char c : exif) {
+        out.push_back(c);
+    }
+    for (qsizetype i = 2; i < encoded.size(); ++i) {
+        out.push_back(static_cast<uint8_t>(encoded[i]));
+    }
+    return out;
+}
+
+rust::Vec<int32_t> decodeProbe(rust::Vec<uint8_t> file, uint8_t codec, int32_t width, int32_t height, bool cornered)
+{
+    rust::Vec<int32_t> out;
+    rust::Vec<uint8_t> payload;
+    payload.reserve(file.size() + kEncodedHeader);
+    for (const uint8_t head : {uint8_t(1), uint8_t(cornered ? 1 : 0), codec, uint8_t(0), uint8_t(0)}) {
+        payload.push_back(head);
+    }
+    for (const uint8_t b : file) {
+        payload.push_back(b);
+    }
+    t_scaledAfterDecode = 0;
+    t_decodedPixels = 0;
+    const QImage image = decodeMediaPayload(payload, QSize(width, height));
+    if (image.isNull()) {
+        return out;
+    }
+    out.push_back(image.width());
+    out.push_back(image.height());
+    out.push_back(t_scaledAfterDecode);
+    // The middle of the top tenth and of the bottom tenth, as 0xRRGGBB.
+    const auto rgb = [&image](int y) { return static_cast<int32_t>(image.pixel(image.width() / 2, y) & 0xffffff); };
+    out.push_back(rgb(image.height() / 10));
+    out.push_back(rgb(image.height() - 1 - image.height() / 10));
+    out.push_back(static_cast<int32_t>(qMin<long long>(t_decodedPixels, INT32_MAX)));
     return out;
 }
 

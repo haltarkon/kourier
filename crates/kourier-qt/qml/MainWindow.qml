@@ -61,10 +61,11 @@ Kirigami.ApplicationWindow {
     globalDrawer: AccountsDrawer {
         id: accountsDrawer
         window: root
-        enabled: App.hasAccounts
+        // A moment late when the last account goes (see `accountsShown`).
+        enabled: accountsDrawer.accountsShown
         settingsKeys: root.settingsKeys
-        onOpenSettings: root.openSettings()
-        onAddAccount: root.openWelcome()
+        onOpenSettings: root.leavingLink(root.openSettings)
+        onAddAccount: root.leavingLink(root.openWelcome)
     }
 
     // Pages are single instances; the stack shows them in columns (wide) or one at a time.
@@ -78,8 +79,9 @@ Kirigami.ApplicationWindow {
         // In a narrow window the list is on screen only while the chat is not.
         showsNotice: !root.wideScreen || App.timeline.conversationId === 0 || App.timeline.cannotSend !== ""
         searchKeys: root.searchKeys
-        onOpenConversation: id => root.openConversation(id)
+        onOpenConversation: id => root.openingChat(id)
         onSwitchedByKeyboard: id => root.switchTo(id)
+        onBannerActivated: root.bannerPressed()
     }
 
     property ChatPage chatPage: null
@@ -171,6 +173,71 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // Whether `page` is one of the stack's pages now.
+    function inStack(page: Item): bool {
+        for (let i = 0; i < pageStack.depth; ++i) {
+            if (pageStack.get(i) === page) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Down to the list, which stays. Popping and not clearing: a clear takes the list out of
+    // the stack and puts it back, and Kirigami then evaluates the headers of pages that have
+    // no page row (TypeErrors in NavigationButtons, ToolBarPageHeader warnings). Only a stack
+    // that does not start with the list is built anew.
+    function popToList(): void {
+        if (pageStack.depth > 0 && pageStack.get(0) === listPage) {
+            while (pageStack.depth > 1) {
+                pageStack.pop();
+            }
+        } else {
+            pageStack.clear();
+            pageStack.push(listPage);
+        }
+    }
+
+    // The pages below are pushed through these: a page that left the stack is made anew
+    // first, because one that is pushed back makes Kirigami create its header while the page
+    // has no page row (`Unable to assign [undefined] to bool`, ToolBarPageHeader.qml:61).
+    // (The pages hold no state of their own that the new one lacks, but the chat page's
+    // composer text: it is saved as the draft first, as when the conversation changes.)
+    function pushWelcome(): void {
+        if (root.welcomePage !== null && !root.inStack(root.welcomePage)) {
+            root.welcomePage.destroy();
+            root.welcomePage = null;
+        }
+        pageStack.push(root.ensureWelcome());
+    }
+
+    function pushLink(): void {
+        if (root.linkPage !== null && !root.inStack(root.linkPage)) {
+            root.linkPage.destroy();
+            root.linkPage = null;
+        }
+        pageStack.push(root.ensureLink());
+    }
+
+    function pushSettings(): void {
+        if (root.settingsPage !== null && !root.inStack(root.settingsPage)) {
+            root.settingsPage.destroy();
+            root.settingsPage = null;
+        }
+        pageStack.push(root.ensureSettings());
+    }
+
+    // The chat page to put into the stack: the existing one, or a new one when it left the
+    // stack.
+    function freshChat(): ChatPage {
+        if (root.chatPage !== null && !root.inStack(root.chatPage)) {
+            root.chatPage.composer.switchTo(0);
+            root.chatPage.destroy();
+            root.chatPage = null;
+        }
+        return root.ensureChat();
+    }
+
     // The list, and beside it in a wide window the chat column. (Also called by name from
     // the development channel: no arguments.)
     function showList(): void {
@@ -182,15 +249,15 @@ Kirigami.ApplicationWindow {
     // empty state stands in its column (`attachChat`).
     function showListWith(later: bool): void {
         root.dropStandIn();
-        pageStack.clear();
-        pageStack.push(listPage);
+        // (After a link, the welcome and link pages are popped.)
+        root.popToList();
         if (root.wideScreen) {
             if (later && !root.framed && root.chatPage === null) {
                 root.chatPending = true;
                 root.standIn = standInComponent.createObject(root) as Kirigami.Page;
                 pageStack.push(root.standIn);
             } else {
-                pageStack.push(root.ensureChat());
+                pageStack.push(root.freshChat());
             }
             pageStack.currentIndex = 0;
         }
@@ -225,34 +292,47 @@ Kirigami.ApplicationWindow {
             // (`replace` acts on the current page and drops what follows it: with the list
             // current it would replace the list.)
             pageStack.currentIndex = 1;
-            pageStack.replace(root.ensureChat());
+            pageStack.replace(root.freshChat());
             pageStack.currentIndex = 0;
             page.destroy();
             return;
         }
         root.dropStandIn();
         if (pageStack.depth === 1 && pageStack.lastItem === listPage) {
-            pageStack.push(root.ensureChat());
+            pageStack.push(root.freshChat());
             pageStack.currentIndex = 0;
         }
     }
 
     function openConversation(id: real): void {
         App.openConversation(id);
-        // Keep the chat page when it already follows the list. Otherwise rebuild the stack in
-        // one go: pushing the chat page back on its own, after it left the stack, re-creates its
-        // header while it has no page row (a Kirigami binding warning, ToolBarPageHeader.qml:61).
-        const chat = root.ensureChat();
         root.chatPending = false;
         root.dropStandIn();
-        if (root.pageStack.depth > 1 && root.pageStack.get(1) === chat) {
+        // Keep the chat page when it already follows the list. Otherwise pop down to the list
+        // (a clear is what printed the NavigationButtons TypeErrors) and push a chat page:
+        // one that left the stack is made anew (`freshChat`).
+        const chat = root.chatPage;
+        if (chat !== null && root.pageStack.depth > 1 && root.pageStack.get(1) === chat) {
             root.popAfter(chat);
         } else {
-            pageStack.clear();
-            pageStack.push(listPage);
-            pageStack.push(chat);
+            root.popToList();
+            pageStack.push(root.freshChat());
         }
         pageStack.currentIndex = 1;
+    }
+
+    // The user chose chat `id` (a click on the list, the step keys, the quick switch, a
+    // notification): in a wide window the list stands beside a link page, and opening a
+    // chat rebuilds the stack, which cancels a link waiting at its QR code. Never silently
+    // (F3): `leavingLink` asks first when something would be lost, and acts at once
+    // otherwise. `then` runs after the chat is open.
+    function openingChat(id: real, then: var): void {
+        root.leavingLink(() => {
+            root.openConversation(id);
+            if (then) {
+                then();
+            }
+        });
     }
 
     // A notification click or a link: open `id` now, or once the start page is up.
@@ -261,7 +341,7 @@ Kirigami.ApplicationWindow {
             return;
         }
         if (root.started && App.hasAccounts) {
-            root.openConversation(id);
+            root.openingChat(id, null);
         } else {
             root.pendingConversation = id;
         }
@@ -279,14 +359,14 @@ Kirigami.ApplicationWindow {
         } else {
             root.popAfter(listPage);
         }
-        pageStack.push(root.ensureWelcome());
+        root.pushWelcome();
     }
 
     function openLink(network: string): void {
         // Pop an open link page first: that abandons its login (onPageRemoved below).
         root.popAfter(root.ensureWelcome());
         App.login.start(network);
-        pageStack.push(root.ensureLink());
+        root.pushLink();
     }
 
     // Back from linking: the welcome page, or the list when accounts exist.
@@ -305,7 +385,7 @@ Kirigami.ApplicationWindow {
     function openSettings(): void {
         root.attachOrDrop();
         root.popAfter(listPage);
-        pageStack.push(root.ensureSettings());
+        root.pushSettings();
     }
 
     // Before another page takes the place after the list: the stand-in does not wait there.
@@ -372,7 +452,7 @@ Kirigami.ApplicationWindow {
             // The page Settings > "About Kourier" opens, on top of the settings page.
             root.openSettings();
             root.openAbout();
-        } else if (page === "transferbanner" || page === "transferfailed") {
+        } else if (page === "transferbanner" || page === "transferfailed" || page === "transferupdate") {
             // The backend says where the transfer stands once it may connect.
             pageSetup.start();
         } else if (page === "transferask") {
@@ -409,6 +489,13 @@ Kirigami.ApplicationWindow {
         if (root.trayAvailable && !root.quitting) {
             close.accepted = false;
             root.hideToTray();
+        } else if (!root.quitting && !root.quitAgreed && App.quitQuestion()) {
+            // Work still runs (F8): asked first, the window stays meanwhile. Not for the
+            // tray's Quit (`quitting`: it was chosen, and the window may be hidden, where a
+            // question could not be read) and not while the session ends (`quitQuestion` is
+            // empty then).
+            close.accepted = false;
+            root.quitAsking();
         } else {
             root.closedForGood();
         }
@@ -450,14 +537,27 @@ Kirigami.ApplicationWindow {
     function stepConversation(step: int): void {
         const id = App.adjacentConversation(App.timeline.conversationId, step);
         if (id !== 0 && id !== App.timeline.conversationId) {
-            root.openConversation(id);
+            root.openingChat(id, null);
         }
     }
 
     // The quick switch opened `id`: the composer takes the keyboard once the chat is there.
     function switchTo(id: real): void {
-        root.openConversation(id);
-        Qt.callLater(() => root.chatPage?.composer.focusInput());
+        root.openingChat(id, () => {
+            listPage.searchField.text = "";
+            Qt.callLater(() => root.chatPage?.composer.focusInput());
+        });
+    }
+
+    // The banner's button. Only "Link Again" of a logged-out account takes the link page's
+    // place (a relink cancels the login that waits at its QR code); the other kinds
+    // (challenge, restart) leave the link page where it is, so they never ask.
+    function bannerPressed(): void {
+        if (App.bannerKind === "loggedOut") {
+            root.leavingLink(() => App.bannerActivate());
+        } else {
+            App.bannerActivate();
+        }
     }
 
     Shortcut {
@@ -480,7 +580,7 @@ Kirigami.ApplicationWindow {
         id: settingsKey
         sequences: [StandardKey.Preferences, "Ctrl+,"]
         enabled: root.keysActive
-        onActivated: root.openSettings()
+        onActivated: root.leavingLink(root.openSettings)
     }
     // Close follows the close button (to the tray, or quit); quit always quits, also from
     // a dialog.
@@ -491,7 +591,7 @@ Kirigami.ApplicationWindow {
     }
     Shortcut {
         sequences: [StandardKey.Quit, "Ctrl+Q"]
-        onActivated: root.closedForGood()
+        onActivated: root.quitAsking()
     }
 
     // Tab walks a wide window the way the eye does: the search field, the conversations, the
@@ -770,8 +870,14 @@ Kirigami.ApplicationWindow {
         target: App
         function onRelinkStarted(): void {
             root.attachOrDrop();
+            // A link page in the stack shows the login the relink has just replaced (and
+            // cancelled, after the question of `leavingLink`): its leaving the stack must
+            // not cancel the relink that just began. A new page object, as in
+            // `onReplaceStarted`.
+            root.restacking = true;
             root.popAfter(listPage);
-            root.pageStack.push(root.ensureLink());
+            root.restacking = false;
+            root.pushLink();
         }
         function onChallengeRequested(account: real, url: string): void {
             const dialog = challengeComponent.createObject(root, {
@@ -788,27 +894,16 @@ Kirigami.ApplicationWindow {
         }
         // "Transfer History from Phone…", or "Try Again…" of a failed transfer.
         function onReplaceAsked(question: var): void {
-            if (root.replaceDialog !== null) {
-                return;
-            }
-            const component = Qt.createComponent(Qt.resolvedUrl("dialogs/ReplaceAccountDialog.qml"));
-            if (component.status !== Component.Ready) {
-                console.error("the question could not be made: " + component.errorString());
-                App.cancelReplace();
-                return;
-            }
-            const dialog = component.createObject(root, {
-                "question": question
-            }) as Kirigami.PromptDialog;
-            if (dialog === null) {
-                App.cancelReplace();
-                return;
-            }
-            root.replaceDialog = dialog;
-            dialog.closed.connect(() => {
-                root.replaceDialog = null;
-            });
-            dialog.open();
+            root.askAboutAccount(question, () => App.cancelReplace());
+        }
+        // "Remove Account…" or "Unlink…" of an account (Settings, the drawer's menu).
+        function onAccountActionAsked(question: var): void {
+            root.askAboutAccount(question, () => App.cancelAccountAction());
+        }
+        // What became of a removed or unlinked account's device, told once: in passing when
+        // nothing is left to do, else in a notice that stays (what to do on the phone).
+        function onLogoutNotice(text: string, onPhone: string, title: string): void {
+            root.takeLogoutNotice(text, onPhone, title);
         }
         // The account was removed and its new link started: the link page, over the
         // welcome page as for a first link (the account may have been the only one).
@@ -848,30 +943,212 @@ Kirigami.ApplicationWindow {
     // when it is asked (by name: nothing of it is read at the start); it destroys itself
     // when it closes.
     property Kirigami.PromptDialog replaceDialog: null
+    // The notice that stays after a removal or an unlink the network did not confirm.
+    property Kirigami.PromptDialog logoutDialog: null
+    // How many notices about removed or unlinked accounts were told (tests count them).
+    property int logoutNotices: 0
+    // The notices not shown yet (link feedback L5): one that stays waits for the one open
+    // before it to close (two at once would stack, and `logoutDialog` would lose the first),
+    // and none is shown while the window is hidden (in the tray): a passing one would pass
+    // unseen. Told when the window shows again.
+    property var pendingLogoutNotices: []
+    // The notice whose dialog is open (a notice leaves the queue when its dialog opens): a
+    // window released with its dialog open hands this one over too (`unshownLogoutNotices`).
+    property var openLogoutNotice: null
+
+    // What this window told no one yet or not to the end: the open dialog's notice, then the
+    // waiting ones. The shell takes them over when it releases the window (link feedback L5).
+    function unshownLogoutNotices(): var {
+        return root.openLogoutNotice !== null ? [root.openLogoutNotice].concat(root.pendingLogoutNotices) : root.pendingLogoutNotices;
+    }
+
+    onVisibleChanged: {
+        if (root.visible) {
+            root.tellLogoutNotices();
+        }
+    }
+
+    // A notice about a removed or unlinked account (`App.logoutNotice`; tests call it too).
+    function takeLogoutNotice(text: string, onPhone: string, title: string): void {
+        root.logoutNotices += 1;
+        root.pendingLogoutNotices.push({
+            "text": text,
+            "onPhone": onPhone,
+            "title": title
+        });
+        root.tellLogoutNotices();
+    }
+
+    // Shows the waiting notices: the passing ones at once, those that stay one at a time.
+    function tellLogoutNotices(): void {
+        while (root.visible && root.logoutDialog === null && root.pendingLogoutNotices.length > 0) {
+            const n = root.pendingLogoutNotices.shift();
+            if (n.onPhone === "") {
+                root.showPassiveNotification(Style.plain(n.text), "long");
+                continue;
+            }
+            const component = Qt.createComponent(Qt.resolvedUrl("dialogs/LogoutNoticeDialog.qml"));
+            const dialog = component.status === Component.Ready ? component.createObject(root, {
+                "title": n.title,
+                "text": n.text,
+                "onPhone": n.onPhone
+            }) as Kirigami.PromptDialog : null;
+            if (dialog === null) {
+                // (Never silent: the instruction goes out in passing at least.)
+                root.showPassiveNotification(Style.plain(n.text + " " + n.onPhone), "long");
+                continue;
+            }
+            root.logoutDialog = dialog;
+            root.openLogoutNotice = n;
+            dialog.closed.connect(() => {
+                if (root.logoutDialog === dialog) {
+                    root.logoutDialog = null;
+                    root.openLogoutNotice = null;
+                }
+                // (After this dialog is gone: the next one opens on its own.)
+                Qt.callLater(root.tellLogoutNotices);
+            });
+            dialog.open();
+        }
+    }
+
+    // Puts a question about an account (`ReplaceAccountDialog.qml`: "Remove and Link
+    // Again?", "Remove Account?", "Unlink This Computer?"); one at a time. `cancel` tells
+    // the viewmodel when it cannot be shown.
+    function askAboutAccount(question: var, cancel: var): void {
+        if (root.replaceDialog !== null) {
+            // (A modal question is open: a second trigger is dropped, as before.)
+            return;
+        }
+        const component = Qt.createComponent(Qt.resolvedUrl("dialogs/ReplaceAccountDialog.qml"));
+        if (component.status !== Component.Ready) {
+            console.error("the question could not be made: " + component.errorString());
+            cancel();
+            return;
+        }
+        const dialog = component.createObject(root, {
+            "question": question
+        }) as Kirigami.PromptDialog;
+        if (dialog === null) {
+            cancel();
+            return;
+        }
+        root.replaceDialog = dialog;
+        dialog.closed.connect(() => {
+            root.replaceDialog = null;
+        });
+        dialog.open();
+    }
     // The page stack is being rebuilt for a replaced account's new link.
     property bool restacking: false
+
+    // ---- Quitting while work runs asks first (F8) ------------------------------------
+    // The question "Quit While …?" while it is open (tests read it).
+    property Kirigami.PromptDialog quitDialog: null
+    // The user agreed to quit: the close that follows asks nothing more.
+    property bool quitAgreed: false
+
+    // Quits (`closedForGood`): at once, or after the user agreed when a history transfer or
+    // the update after a new link still runs (they go on at the next start). The default
+    // answer keeps the application open. (The tray's own Quit asks nothing: the window may
+    // be hidden or not exist then.)
+    function quitAsking(): void {
+        const question = root.quitAgreed ? undefined : App.quitQuestion();
+        if (question === undefined || question === null) {
+            root.closedForGood();
+            return;
+        }
+        if (root.quitDialog !== null) {
+            return;
+        }
+        const component = Qt.createComponent(Qt.resolvedUrl("dialogs/StopLinkingDialog.qml"));
+        if (component.status !== Component.Ready) {
+            console.error("the question could not be made: " + component.errorString());
+            return;
+        }
+        const dialog = component.createObject(root, {
+            "question": question,
+            "confirmIcon": "application-exit",
+            "action": () => {
+                root.quitAgreed = true;
+                root.closedForGood();
+            }
+        }) as Kirigami.PromptDialog;
+        if (dialog === null) {
+            return;
+        }
+        root.quitDialog = dialog;
+        dialog.closed.connect(() => {
+            root.quitDialog = null;
+        });
+        dialog.open();
+    }
+
+    // ---- A link in progress is never cancelled silently (F3) -------------------------
+    // The question "Stop Linking?" while it is open (tests read it).
+    property Kirigami.PromptDialog stopLinkingDialog: null
+
+    // Runs `action`, which would leave the link page and so cancel a link that has not
+    // finished (opening Settings, "Add Account", "Link Again" of the banner, a chat from
+    // the list beside the link page), after the user agreed to stop that link. Nothing to
+    // lose (no login, or one that is done, or an account the core has taken: Active, or
+    // its history transfer runs): at once.
+    function leavingLink(action: var): void {
+        const question = App.abandonQuestion();
+        if (question === undefined || question === null) {
+            action();
+            return;
+        }
+        // Asked already: the newest thing the user asked for (another chat, a notification,
+        // a shortcut) is what "Stop Linking" then opens; one question stays.
+        if (root.stopLinkingDialog !== null) {
+            root.stopLinkingDialog.action = action;
+            return;
+        }
+        const component = Qt.createComponent(Qt.resolvedUrl("dialogs/StopLinkingDialog.qml"));
+        if (component.status !== Component.Ready) {
+            console.error("the question could not be made: " + component.errorString());
+            return;
+        }
+        const dialog = component.createObject(root, {
+            "question": question,
+            "action": action
+        }) as Kirigami.PromptDialog;
+        if (dialog === null) {
+            return;
+        }
+        root.stopLinkingDialog = dialog;
+        dialog.closed.connect(() => {
+            root.stopLinkingDialog = null;
+        });
+        dialog.open();
+    }
     // How many passing notices about ended transfers were shown (tests count them).
     property int transferNotices: 0
 
     // The fixture pages of the message actions: each opens a chat (`App` does that) and, for
     // `setupPages`, one of its popups or composer modes once the rows are there.
-    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment"]
-    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "transferwait", "transferdownload", "transferread", "transferbanner", "transferfailed", "transferask"]
-    // The fixture pages of the link page in a state of a history transfer, with that state.
+    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment"]
+    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask"]
+    // The fixture pages of a link in a state of a history transfer, with that state.
     readonly property list<string> transferLinkPages: ["transferwait", "transferdownload", "transferread"]
-    readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferbanner", "transferfailed", "transferask"]
+    readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask"]
     property bool pageReady: false
     // The page `transferask` asked its question (once).
     property bool transferAsked: false
     // The fixture pages of the history transfer: whether what the page shows is there.
     function transferPageReady(): bool {
         switch (App.startPage) {
+        // (A link's transfer is in the banner: the link page closed when the core took the
+        // account.)
         case "transferwait":
-            return App.linkTransfer.phase === "waiting";
+            return App.bannerTransfer.phase === "waiting";
         case "transferdownload":
-            return App.linkTransfer.phase === "downloading";
+            return App.bannerTransfer.phase === "downloading" && App.bannerTransfer.progress > 0;
         case "transferread":
-            return App.linkTransfer.phase === "reading";
+            return App.bannerTransfer.phase === "reading" && App.bannerTransfer.progress > 0;
+        case "transferupdate":
+            return App.bannerTransfer.phase === "updating" && App.bannerTransfer.progress > 0;
         case "transferbanner":
             // (The backend says where the transfer stands once it may connect.)
             return App.bannerTransfer.phase === "downloading";
@@ -1056,13 +1333,73 @@ Kirigami.ApplicationWindow {
         }
     }
 
-    // --screenshot=<png>: let data arrive (all of the history for `history`; downloads, the
-    // own picture's send and the viewer for the media pages), layout and animations settle,
-    // grab the whole window, quit.
-    readonly property bool mediaShot: ["media", "viewer", "compose", "files", "originals", "folder", "folderfiles", "folderzip", "album", "albumviewer", "mediamenu", "deleteattachment", "quotes", "menu", "react", "edit", "reply", "delete"].indexOf(App.startPage) >= 0
+    // --screenshot=<png>: the picture is taken when it is FINAL, not after a fixed wait. From the
+    // page's ready moment (what must be on screen: the menu open, the viewer at picture 2, the
+    // banner's phase), every 50 ms after a floor of 300 ms (delayed one-shots get to start), the
+    // grab waits while anything holds it: pictures loading (the Images, the provider's
+    // requests), thumbnails the core still derives while a picture of an attachment is shown
+    // (they change the URLs once more), the events and reads that bring those URLs to the
+    // models, downloads running, the page row sliding, the link page not gone yet (the link
+    // pages of a transfer). When nothing holds it, the window is grabbed twice in a row (50 ms
+    // apart): two equal frames are saved, so no animation is still going. At 30 s from the
+    // first start of the timer the frame is saved as it is and Rust says
+    // `shot: unsettled <what held>` (a failed render for `cargo xtask shots`). The 30 s run
+    // from the FIRST start: when the start condition flips (a history that loads more), the
+    // cap does not begin again. Spinners stand still in these runs (`Spinner.qml`).
     Timer {
-        running: App.screenshot !== "" && root.started && !(App.startPage === "history" && (App.timeline.hasOlder || App.timeline.loading)) && (App.startPage !== "viewer" || root.viewerShown) && (root.setupPages.indexOf(App.startPage) < 0 || root.pageReady)
-        interval: root.mediaShot ? 2500 : 1200
-        onTriggered: Qt.exit(App.saveScreenshot(root, App.screenshot) ? 0 : 1)
+        id: shotTimer
+
+        // The first ready moment, in ms: the 30 s cap counts from it, whatever the timer does
+        // after.
+        property double began: 0
+        // The latest ready moment, in ms: the floor of 300 ms counts from it.
+        property double resumed: 0
+        property bool done: false
+
+        running: !shotTimer.done && App.screenshot !== "" && root.started && !(App.startPage === "history" && (App.timeline.hasOlder || App.timeline.loading)) && (App.startPage !== "viewer" || root.viewerShown) && (root.setupPages.indexOf(App.startPage) < 0 || root.pageReady)
+        interval: 50
+        repeat: true
+        onRunningChanged: {
+            if (shotTimer.running) {
+                shotTimer.resumed = Date.now();
+                if (shotTimer.began === 0) {
+                    shotTimer.began = shotTimer.resumed;
+                }
+            }
+        }
+        onTriggered: {
+            const waited = Math.round(Date.now() - shotTimer.began);
+            if (Date.now() - shotTimer.resumed < 300) {
+                return;
+            }
+            const holds = [];
+            const loading = App.screenshotHolds(root);
+            if (loading !== "") {
+                holds.push(loading);
+            }
+            const downloading = App.timeline.downloadingAttachments();
+            if (downloading > 0) {
+                holds.push("downloading " + downloading);
+            }
+            if (root.pageStack.columnView.moving) {
+                holds.push("moving");
+            }
+            if (root.transferLinkPages.indexOf(App.startPage) >= 0 && root.linkPage !== null && root.inStack(root.linkPage)) {
+                holds.push("link page");
+            }
+            if (holds.length === 0) {
+                const luma = App.saveScreenshotIfStable(root, App.screenshot, waited);
+                if (luma >= 0 || luma === -1) {
+                    shotTimer.done = true;
+                    Qt.exit(luma >= 0 ? 0 : 1);
+                    return;
+                }
+                holds.push("frames differ");
+            }
+            if (waited >= 30000) {
+                shotTimer.done = true;
+                Qt.exit(App.saveUnsettledScreenshot(root, App.screenshot, holds.join(", "), waited) >= 0 ? 0 : 1);
+            }
+        }
     }
 }

@@ -31,6 +31,15 @@ const FIRST_BACKOFFS_MS: [u64; 2] = [0, 190];
 const BACKOFF_FACTOR: f64 = 1.9;
 /// Longest wait between attempts (`MAX_BACKOFF`).
 const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+/// Most profile fetches that run at once. A history import or a first Storage Service sync
+/// queues one per contact, hundreds, and one after another (a request, then the avatar from
+/// the CDN) they took many minutes (the user's report, 2026-10-10). Desktop's
+/// `ProfileService` runs 30 (`PROFILE_FETCH_CONCURRENCY`); fewer here, because the other
+/// jobs wait for the slowest fetch of a batch (an avatar has up to 30 s).
+const PROFILE_FETCH_BATCH: usize = 10;
+/// How long every profile fetch waits after a 413 or 429 without a `Retry-After`
+/// (Desktop's `DEFAULT_RETRY_AFTER`, `SD/ts/util/parseRetryAfter.std.ts`).
+const PROFILE_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
 /// What a job does. Stored as text in `jobs.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -83,11 +92,15 @@ pub(crate) enum JobKind {
     /// command ([`crate::delete_sync`]); `key` is the command id with a digest of `payload`,
     /// the message without its padding.
     DeleteSync,
+    /// The `SyncMessage.attachmentBackfillRequest` of a durable `RequestAttachments` command
+    /// ([`crate::backfill`]); `key` is the command id with a digest of `payload`, the
+    /// message's conversation and reference (JSON). Expires an hour after the click.
+    BackfillRequest,
 }
 
 impl JobKind {
     /// Every kind, for parsing.
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::RemoteConfig,
         Self::Capabilities,
         Self::SyncRequest,
@@ -107,6 +120,7 @@ impl JobKind {
         Self::TimerUpdate,
         Self::KeyMaintenance,
         Self::DeleteSync,
+        Self::BackfillRequest,
     ];
 
     /// The `jobs.kind` value.
@@ -131,6 +145,7 @@ impl JobKind {
             Self::TimerUpdate => "timer_update",
             Self::KeyMaintenance => "key_maintenance",
             Self::DeleteSync => "delete_sync",
+            Self::BackfillRequest => "backfill_request",
         }
     }
 
@@ -141,9 +156,13 @@ impl JobKind {
             Self::RemoteConfig => 0,
             // Before anything that sends: a peer who answers needs prekeys to answer with.
             Self::Capabilities | Self::KeyMaintenance => 1,
+            // The phone's contact sync is what the link waits for (names in the list): ahead
+            // of the group refreshes an imported archive queues, one per group (link
+            // feedback L2: it waited ~9 s behind 50 refreshes at 150 ms round trip).
             Self::SyncRequest | Self::SentTranscript | Self::ContactSyncWait => 2,
-            Self::TimerUpdate | Self::DeleteSync => 2,
-            Self::StorageSync | Self::ContactSync | Self::GroupRefresh => 3,
+            Self::ContactSync => 2,
+            Self::TimerUpdate | Self::DeleteSync | Self::BackfillRequest => 2,
+            Self::StorageSync | Self::GroupRefresh => 3,
             Self::RetryRequest | Self::Resend => 4,
             Self::ReadSync | Self::Receipts => 4,
             Self::DeliveryReceipts | Self::ProfileFetch => 5,
@@ -151,9 +170,21 @@ impl JobKind {
         }
     }
 
+    /// How many due jobs of this kind [`run`] starts together. Only kinds whose jobs are
+    /// independent of each other (one profile each) run more than one.
+    const fn batch(self) -> usize {
+        match self {
+            Self::ProfileFetch => PROFILE_FETCH_BATCH,
+            _ => 1,
+        }
+    }
+
     /// The job of a core durable command (`enqueue_command`).
     pub(crate) const fn is_command(self) -> bool {
-        matches!(self, Self::Receipts | Self::ReadSync | Self::DeleteSync)
+        matches!(
+            self,
+            Self::Receipts | Self::ReadSync | Self::DeleteSync | Self::BackfillRequest
+        )
     }
 
     /// Kinds that send a message to another account. While the server's send challenge
@@ -437,7 +468,7 @@ pub(crate) fn request(
 /// The job key of the core's durable command `cmd` with `payload`: the id plus a digest of the
 /// work, because the core reuses a command id once the command is confirmed
 /// (`pending_commands.id` has no AUTOINCREMENT), while a resent command carries the same work.
-fn command_key(cmd: i64, payload: &[u8]) -> String {
+pub(crate) fn command_key(cmd: i64, payload: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
     let digest = Sha256::digest(payload);
@@ -543,20 +574,54 @@ pub(crate) fn next_due(
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query((now, online, held))?;
     while let Some(row) = rows.next()? {
-        let kind: String = row.get(1)?;
-        if let Some(kind) = JobKind::parse(&kind) {
-            return Ok(Some(Job {
-                id: row.get(0)?,
-                kind,
-                key: row.get(2)?,
-                attempts: row.get(3)?,
-                expires_at: row.get(4)?,
-                payload: row.get(5)?,
-                requests: row.get(6)?,
-            }));
+        if let Some(job) = job_of_row(row)? {
+            return Ok(Some(job));
         }
     }
     Ok(None)
+}
+
+/// The job of a row of `SELECT id, kind, key, attempts, expires_at, payload, requests`, or
+/// `None` for a kind this build does not know.
+fn job_of_row(row: &kourier_db::rusqlite::Row<'_>) -> Result<Option<Job>> {
+    let kind: String = row.get(1)?;
+    let Some(kind) = JobKind::parse(&kind) else {
+        return Ok(None);
+    };
+    Ok(Some(Job {
+        id: row.get(0)?,
+        kind,
+        key: row.get(2)?,
+        attempts: row.get(3)?,
+        expires_at: row.get(4)?,
+        payload: row.get(5)?,
+        requests: row.get(6)?,
+    }))
+}
+
+/// Up to `limit` more due jobs of `first`'s kind, to run beside it ([`JobKind::batch`]), in
+/// the order [`next_due`] would pick them. The kinds that run in batches neither wait for the
+/// catch-up nor for a history transfer, so `first`'s filter is the kind alone.
+fn more_due(conn: &Connection, first: &Job, now: i64, limit: usize) -> Result<Vec<Job>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, kind, key, attempts, expires_at, payload, requests FROM jobs
+         WHERE kind = ?1 AND next_at <= ?2 AND id != ?3 ORDER BY next_at, id LIMIT ?4",
+    )?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut rows = stmt.query((first.kind.as_str(), now, first.id, limit))?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next()? {
+        jobs.extend(job_of_row(row)?);
+    }
+    Ok(jobs)
+}
+
+/// Holds every queued job of `kind` until `until` (ms) at the latest; one that is due later
+/// keeps its time. Returns how many were moved.
+fn pause_kind(conn: &Connection, kind: JobKind, until: i64) -> Result<usize> {
+    Ok(conn
+        .prepare_cached("UPDATE jobs SET next_at = ?2 WHERE kind = ?1 AND next_at < ?2")?
+        .execute((kind.as_str(), until))?)
 }
 
 /// When the next job is due (ms), if any job that may run now (see [`next_due`]) is queued.
@@ -733,6 +798,10 @@ pub(crate) fn count(conn: &Connection, kind: JobKind) -> Result<i64> {
 /// or libsignal refused the content. Network trouble, 5xx and rate limits are retried.
 pub(crate) fn is_permanent(error: &Error) -> bool {
     match error {
+        // The credential of "today" was refused (the credentials are forgotten at the 401, so
+        // the next attempt fetches fresh ones). Desktop fails and tries again later too: "we
+        // don't know if we have access or not". See [`gives_up`] for how long.
+        error if is_group_auth_refusal(error) => false,
         Error::Status { status, .. } => {
             (400..500).contains(status) && !matches!(status, 408 | 413 | 425 | 429)
         }
@@ -751,13 +820,43 @@ pub(crate) fn is_permanent(error: &Error) -> bool {
     }
 }
 
+/// Whether `error` is the group server refusing our credential (401): the request for the
+/// group state or the request for the credentials themselves.
+pub(crate) fn is_group_auth_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Status {
+            what: "group fetch" | "group credentials",
+            status: 401,
+        }
+    )
+}
+
+/// How many times a job may fail, the last time with a refused group credential
+/// ([`is_group_auth_refusal`]), before it is dropped: about four hours with the backoff, long
+/// enough for a clock that was wrong to be put right. The group refresh jobs carry no expiry,
+/// so without this a credential that is never accepted would be asked for every fifteen
+/// minutes for good. A group imported from the phone's history that loses its refresh here
+/// gets one again at the next start (`maintenance::enqueue_stranded_group_refreshes`).
+pub(crate) const GROUP_AUTH_ATTEMPTS: u32 = 30;
+
+/// Whether a job that failed with `error` after `attempts` earlier failures is dropped
+/// instead of retried: the error is [permanent](is_permanent), or a group credential was
+/// refused [`GROUP_AUTH_ATTEMPTS`] times.
+pub(crate) fn gives_up(error: &Error, attempts: u32) -> bool {
+    is_permanent(error)
+        || (is_group_auth_refusal(error) && attempts.saturating_add(1) >= GROUP_AUTH_ATTEMPTS)
+}
+
 /// Runs due jobs on `socket` until the task is aborted (the socket closed); returns only the
-/// error that stopped it (`backend.db` failed, or the core is gone). `idle` runs whenever no job
-/// is due (the post-link gate, §6.5 step 8).
+/// error that stopped it (`backend.db` failed, or the core is gone). `gate` (the post-link
+/// gate, §6.5 step 8) runs whenever no job is due AND after every batch: the link must not wait
+/// for jobs it does not need (every profile fetch and group refresh a big account queues; a
+/// queue that keeps getting due jobs would put it off again and again; link feedback L2, F1).
 pub(crate) async fn run<T, F, Fut>(
     shared: &Rc<Shared<T>>,
     socket: &Arc<T::Socket>,
-    mut idle: F,
+    mut gate: F,
 ) -> Result<Infallible>
 where
     T: SignalTransport,
@@ -770,7 +869,7 @@ where
         // A history transfer that is not over; its end wakes this loop (`jobs_wake`).
         let held = shared.transfer.holds();
         let Some(job) = shared.db.read(|c| next_due(c, now, online, held))? else {
-            idle().await?;
+            gate().await?;
             let wake_at = shared.db.read(|c| next_at(c, online, held))?;
             let sleep = wake_at.map(|at| shared.clock.sleep_until(u64::try_from(at).unwrap_or(0)));
             match sleep {
@@ -782,6 +881,21 @@ where
             }
             continue;
         };
+        // A request for an old file's re-upload that waited for a connection longer than
+        // its lifetime (a computer offline for hours) is not one the user still waits for:
+        // the core ended that wait at its own bound. It is dropped here, before it can wake
+        // the phone for nothing, and the core hears of it.
+        if expired_before_run(&job, now) {
+            let dropped = shared
+                .db
+                .zone(|tx| drop_expired(tx, &job, now, &shared.wake))?;
+            tracing::info!(
+                kind = job.kind.as_str(),
+                dropped,
+                "job dropped: it expired before it ran"
+            );
+            continue;
+        }
         // The send challenge stands: a job that would only be refused with the same 428
         // waits for it without a request (one queued after the challenge was met).
         if job.kind.sends_to_others()
@@ -797,56 +911,145 @@ where
             );
             continue;
         }
-        let outcome = crate::maintenance::run_job(shared, socket, &job).await;
-        let now = shared.now();
-        match outcome {
-            Ok(done) => {
-                shared.db.zone(|tx| finish(tx, &job, done, now))?;
+        let mut batch = vec![job];
+        let limit = batch[0].kind.batch().saturating_sub(1);
+        if limit > 0 {
+            let more = shared.db.read(|c| more_due(c, &batch[0], now, limit))?;
+            batch.extend(more);
+        }
+        let outcomes = futures::future::join_all(
+            batch
+                .iter()
+                .map(|job| crate::maintenance::run_job(shared, socket, job)),
+        )
+        .await;
+        let mut failed = 0_usize;
+        for (job, outcome) in batch.iter().zip(outcomes) {
+            failed += usize::from(!settle(shared, job, outcome)?);
+        }
+        if batch.len() > 1 {
+            let kind = batch[0].kind;
+            let left = shared.db.read(|c| count(c, kind))?;
+            tracing::info!(
+                kind = kind.as_str(),
+                ran = batch.len(),
+                failed,
+                left,
+                "jobs done"
+            );
+        }
+        gate().await?;
+    }
+}
+
+/// Whether `job` is one whose time ran out before it was tried: only a backfill request is
+/// judged so (the user waits for its answer); every other kind keeps trying, and
+/// [`retry`] judges its expiry after a failed attempt.
+pub(crate) fn expired_before_run(job: &Job, now: i64) -> bool {
+    job.kind == JobKind::BackfillRequest && job.expires_at.is_some_and(|at| now > at)
+}
+
+/// Deletes the expired `job` that was never tried and tells the core what that leaves undone
+/// ([`crate::backfill::dropped`]: the wait ends), in this zone. Returns whether it was deleted
+/// (a job asked for again meanwhile is a new one and stays).
+pub(crate) fn drop_expired(
+    tx: &mut kourier_db::Tx<'_>,
+    job: &Job,
+    now: i64,
+    wake: &Rc<tokio::sync::Notify>,
+) -> Result<bool> {
+    let deleted = tx
+        .prepare_cached("DELETE FROM jobs WHERE id = ?1 AND requests = ?2")?
+        .execute((job.id, job.requests))?;
+    if deleted == 0 {
+        return Ok(false);
+    }
+    crate::maintenance::job_dropped(tx, job)?;
+    if job.kind == JobKind::BackfillRequest {
+        crate::backfill::dropped(tx, job, now, wake)?;
+    }
+    Ok(true)
+}
+
+/// Records how one job of a batch ended; returns whether it succeeded. Fails only with the
+/// errors that stop [`run`] (`backend.db` failed, or the core is gone).
+fn settle<T: SignalTransport>(
+    shared: &Rc<Shared<T>>,
+    job: &Job,
+    outcome: Result<Done>,
+) -> Result<bool> {
+    let now = shared.now();
+    let e = match outcome {
+        Ok(done) => {
+            shared.db.zone(|tx| finish(tx, job, done, now))?;
+            // A batch is summed up by `run`: a line per profile is hundreds after an import.
+            if job.kind.batch() > 1 {
+                tracing::debug!(kind = job.kind.as_str(), key = %job.log_key(), "job done");
+            } else {
                 tracing::info!(kind = job.kind.as_str(), key = %job.log_key(), "job done");
             }
-            Err(e @ (Error::CoreGone | Error::Db(_))) => return Err(e),
-            Err(e) => {
-                let detail = e.to_string();
-                let permanent = is_permanent(&e);
-                // A send challenge met by a job (a receipt, a read sync, a timer update, a
-                // sync transcript): the account shows it like the challenge of a message, and
-                // the job waits for the server's time instead of knocking again at once.
-                // The challenge is announced once while it stands, whatever the number of
-                // jobs and tries that meet it, and the jobs that would meet it too are held.
-                let challenge_wait = match e.challenge() {
-                    Some(challenge) => Some(crate::challenge::announce(shared, &challenge, now)?),
-                    None => None,
-                };
-                let wait = challenge_wait.or_else(|| e.server_wait());
-                let retried = shared.db.zone(|tx| -> Result<Retry> {
-                    let retried = retry(tx, &job, now, &detail, permanent, wait)?;
-                    if let (Some(wait), Retry::At(_)) = (challenge_wait, retried) {
-                        let held = hold_for_challenge(tx, &job, now.saturating_add(ms(wait)))?;
-                        if held > 0 {
-                            tracing::info!(held, "jobs held while the send challenge stands");
-                        }
-                    }
-                    Ok(retried)
-                })?;
-                match retried {
-                    Retry::At(at) => tracing::warn!(
-                        kind = job.kind.as_str(),
-                        key = %job.log_key(),
-                        error = %detail,
-                        retry_in_ms = at.saturating_sub(now),
-                        "job failed"
-                    ),
-                    Retry::Dropped => tracing::warn!(
-                        kind = job.kind.as_str(),
-                        key = %job.log_key(),
-                        error = %detail,
-                        attempts = job.attempts + 1,
-                        "job dropped"
-                    ),
-                }
+            return Ok(true);
+        }
+        Err(e @ (Error::CoreGone | Error::Db(_))) => return Err(e),
+        Err(e) => e,
+    };
+    let detail = e.to_string();
+    let permanent = gives_up(&e, job.attempts);
+    // A send challenge met by a job (a receipt, a read sync, a timer update, a
+    // sync transcript): the account shows it like the challenge of a message, and
+    // the job waits for the server's time instead of knocking again at once.
+    // The challenge is announced once while it stands, whatever the number of
+    // jobs and tries that meet it, and the jobs that would meet it too are held.
+    let challenge_wait = match e.challenge() {
+        Some(challenge) => Some(crate::challenge::announce(shared, &challenge, now)?),
+        None => None,
+    };
+    // A rate limit of a profile fetch holds every profile fetch, as Desktop's
+    // `ProfileService` pauses its queue: the next ones would only be refused too.
+    let rate_wait = (job.kind == JobKind::ProfileFetch && matches!(e, Error::RateLimited { .. }))
+        .then(|| e.server_wait().unwrap_or(PROFILE_RATE_LIMIT_WAIT));
+    let wait = challenge_wait.or(rate_wait).or_else(|| e.server_wait());
+    let retried = shared.db.zone(|tx| -> Result<Retry> {
+        let retried = retry(tx, job, now, &detail, permanent, wait)?;
+        if retried == Retry::Dropped && job.kind == JobKind::BackfillRequest {
+            // The core ends the wait in the zone that drops the request.
+            crate::backfill::dropped(tx, job, now, &shared.wake)?;
+        }
+        if let (Some(wait), Retry::At(_)) = (challenge_wait, retried) {
+            let held = hold_for_challenge(tx, job, now.saturating_add(ms(wait)))?;
+            if held > 0 {
+                tracing::info!(held, "jobs held while the send challenge stands");
             }
         }
+        if let Some(wait) = rate_wait {
+            let held = pause_kind(tx, job.kind, now.saturating_add(ms(wait)))?;
+            if held > 0 {
+                tracing::info!(
+                    held,
+                    wait_s = wait.as_secs(),
+                    "profile fetches wait for the rate limit"
+                );
+            }
+        }
+        Ok(retried)
+    })?;
+    match retried {
+        Retry::At(at) => tracing::warn!(
+            kind = job.kind.as_str(),
+            key = %job.log_key(),
+            error = %detail,
+            retry_in_ms = at.saturating_sub(now),
+            "job failed"
+        ),
+        Retry::Dropped => tracing::warn!(
+            kind = job.kind.as_str(),
+            key = %job.log_key(),
+            error = %detail,
+            attempts = job.attempts + 1,
+            "job dropped"
+        ),
     }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -861,6 +1064,85 @@ mod tests {
         )
         .unwrap();
         (dir, db)
+    }
+
+    /// Profile fetches run in batches of [`PROFILE_FETCH_BATCH`]: the batch is the due jobs of
+    /// the first one's kind, in the order they would be picked, never one twice, never one
+    /// that is not due, never another kind; every other kind runs alone.
+    #[test]
+    fn due_profile_fetches_run_together_and_other_kinds_alone() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(enqueue(tx, JobKind::DeliveryReceipts, "", 0, None)?);
+            for i in 0..25 {
+                assert!(enqueue(
+                    tx,
+                    JobKind::ProfileFetch,
+                    &format!("p{i:02}"),
+                    i,
+                    None
+                )?);
+            }
+            assert!(enqueue(tx, JobKind::ProfileFetch, "later", 1_000, None)?);
+            assert!(enqueue(tx, JobKind::ReadSync, "1:a", 0, None)?);
+            let first = next_due(tx, 100, true, false)?.expect("due");
+            assert_eq!(first.kind, JobKind::ReadSync, "priority first");
+            assert_eq!(first.kind.batch(), 1);
+            finish(tx, &first, Done::Finished, 100)?;
+            // Delivery receipts share the profile fetches' priority and were queued first.
+            let first = next_due(tx, 100, true, false)?.expect("due");
+            assert_eq!(first.kind, JobKind::DeliveryReceipts);
+            finish(tx, &first, Done::Finished, 100)?;
+            let first = next_due(tx, 100, true, false)?.expect("due");
+            assert_eq!(
+                (first.kind, first.key.as_str()),
+                (JobKind::ProfileFetch, "p00")
+            );
+            let more = more_due(tx, &first, 100, first.kind.batch() - 1)?;
+            let keys: Vec<_> = more.iter().map(|j| j.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                [
+                    "p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08", "p09"
+                ]
+            );
+            for job in std::iter::once(&first).chain(&more) {
+                finish(tx, job, Done::Finished, 100)?;
+            }
+            let first = next_due(tx, 100, true, false)?.expect("due");
+            assert_eq!(first.key, "p10");
+            let more = more_due(tx, &first, 100, 100)?;
+            assert_eq!(more.len(), 14, "p11..p24; not the one due later");
+            assert!(
+                more.iter()
+                    .all(|j| j.kind == JobKind::ProfileFetch && j.key != "later")
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A rate limit holds every queued job of the kind until its end; a job due later keeps
+    /// its time, and other kinds are not touched.
+    #[test]
+    fn a_rate_limit_holds_every_profile_fetch() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(enqueue(tx, JobKind::ProfileFetch, "a", 0, None)?);
+            assert!(enqueue(tx, JobKind::ProfileFetch, "b", 5_000, None)?);
+            assert!(enqueue(tx, JobKind::ProfileFetch, "c", 90_000, None)?);
+            assert!(enqueue(tx, JobKind::DeliveryReceipts, "", 0, None)?);
+            assert_eq!(pause_kind(tx, JobKind::ProfileFetch, 60_000)?, 2);
+            let due = next_due(tx, 59_999, true, false)?.expect("due");
+            assert_eq!(due.kind, JobKind::DeliveryReceipts);
+            finish(tx, &due, Done::Finished, 0)?;
+            assert!(next_due(tx, 59_999, true, false)?.is_none());
+            let due = next_due(tx, 60_000, true, false)?.expect("due");
+            assert_eq!(due.kind, JobKind::ProfileFetch);
+            assert_eq!(more_due(tx, &due, 60_000, 9)?.len(), 1, "c is due at 90 s");
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// A job the server told to wait (a rate limit, a challenge) is not tried again before
@@ -1086,6 +1368,81 @@ mod tests {
             total += backoff(attempts);
         }
         assert!((105..=115).contains(&attempts), "{attempts}");
+    }
+
+    /// The post-link gate is looked at after every batch, not only when no job is due (link
+    /// feedback L2, F1): a queue that keeps having due jobs (every profile fetch and group
+    /// refresh of a big account) must not put off the login's `Done`. Three due local jobs;
+    /// the gate stops the runner the first time it is called, with two of them still due.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_link_gate_is_looked_at_after_every_batch() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = crate::actor::testing::shared(
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = Rc::new(test.shared);
+                let now = shared.now();
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        tx.execute("DELETE FROM jobs", [])?;
+                        for key in ["a", "b", "c"] {
+                            enqueue(tx, JobKind::MslPurge, key, now, None)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let (socket, _remote, _events) =
+                    crate::net::libsignal::fake_chat(tokio::runtime::Handle::current());
+                let socket = Arc::new(socket);
+                let due_at_gate = Rc::new(std::cell::RefCell::new(Vec::new()));
+                let seen = due_at_gate.clone();
+                let db = shared.db.clone();
+                let stopped = run(&shared, &socket, move || {
+                    let due: i64 = db
+                        .read(|c| -> Result<i64> {
+                            Ok(c.query_row(
+                                "SELECT count(*) FROM jobs WHERE next_at <= ?1",
+                                [now],
+                                |r| r.get(0),
+                            )?)
+                        })
+                        .unwrap();
+                    seen.borrow_mut().push(due);
+                    async { Err(Error::NotLinked) }
+                })
+                .await;
+                assert!(matches!(stopped, Err(Error::NotLinked)), "{stopped:?}");
+                assert_eq!(
+                    *due_at_gate.borrow(),
+                    [2],
+                    "the gate ran after the first job, with two still due"
+                );
+            })
+            .await;
+    }
+
+    /// The phone's contact sync, which the link waits for, runs ahead of the group refreshes an
+    /// imported archive queues (one per group), even when they were due first (link feedback
+    /// L2: it waited ~9 s behind 50 refreshes at 150 ms round trip).
+    #[test]
+    fn the_contact_sync_runs_ahead_of_group_refreshes() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            for group in ["g1", "g2", "g3"] {
+                enqueue(tx, JobKind::GroupRefresh, group, 100, None)?;
+            }
+            enqueue(tx, JobKind::ContactSync, "", 150, None)?;
+            Ok(())
+        })
+        .unwrap();
+        let first = db.read(|c| next_due(c, 200, true, false)).unwrap().unwrap();
+        assert_eq!(first.kind, JobKind::ContactSync);
+        assert!(JobKind::ContactSync.priority() < JobKind::GroupRefresh.priority());
     }
 
     #[test]
@@ -1316,6 +1673,136 @@ mod tests {
         assert!(!is_permanent(&status(500)));
         assert!(!is_permanent(&Error::Transport(TransportError::Timeout)));
         assert!(!is_permanent(&Error::Internal("x")));
+    }
+
+    /// A group server that refuses the credential of the day (401) is not a refusal of the
+    /// request: the credentials are forgotten and the job tries again with fresh ones, for a
+    /// while. Any other 401 stays permanent, as does a 403 or 404 of the group server.
+    #[test]
+    fn a_refused_group_credential_is_trouble_for_a_while_not_a_refusal() {
+        let group = |what, status| Error::Status { what, status };
+        for what in ["group fetch", "group credentials"] {
+            assert!(!is_permanent(&group(what, 401)), "{what}");
+            assert!(is_group_auth_refusal(&group(what, 401)));
+            assert!(is_permanent(&group(what, 403)), "{what}");
+            assert!(is_permanent(&group(what, 404)), "{what}");
+            assert!(!is_group_auth_refusal(&group(what, 403)));
+        }
+        assert!(is_permanent(&group("profile", 401)));
+        assert!(!is_group_auth_refusal(&group("profile", 401)));
+        // For a while: the 30th failure in a row drops the job, the 29th does not.
+        let refused = group("group fetch", 401);
+        assert!(!gives_up(&refused, 0));
+        assert!(!gives_up(&refused, GROUP_AUTH_ATTEMPTS - 2));
+        assert!(gives_up(&refused, GROUP_AUTH_ATTEMPTS - 1));
+        assert!(gives_up(&group("group fetch", 403), 0));
+        assert!(!gives_up(
+            &group("group fetch", 503),
+            GROUP_AUTH_ATTEMPTS * 2
+        ));
+        // About four hours of backoff (the doc says so).
+        let total: Duration = (1..=GROUP_AUTH_ATTEMPTS).map(backoff).sum();
+        let hours = total.as_secs_f64() / 3600.0;
+        assert!((3.0..=5.5).contains(&hours), "{hours}");
+    }
+
+    /// The job of a refused group credential stays queued, backed off, until the budget is
+    /// spent; then it is deleted. A refresh of a group that was imported from the phone and
+    /// never fetched comes back at the next start.
+    #[test]
+    fn a_group_refresh_survives_refused_credentials_and_is_dropped_after_the_budget() {
+        let (_dir, db) = db();
+        let refused = Error::Status {
+            what: "group fetch",
+            status: 401,
+        };
+        db.zone(|tx| -> Result<()> {
+            assert!(enqueue(tx, JobKind::GroupRefresh, "g", 0, None)?);
+            let mut now = 0;
+            for failure in 1..=GROUP_AUTH_ATTEMPTS {
+                let job = next_due(tx, i64::MAX, true, false)?.expect("still queued");
+                assert_eq!(job.attempts, failure - 1);
+                let retried = retry(
+                    tx,
+                    &job,
+                    now,
+                    "refused",
+                    gives_up(&refused, job.attempts),
+                    None,
+                )?;
+                if failure < GROUP_AUTH_ATTEMPTS {
+                    let Retry::At(at) = retried else {
+                        panic!("dropped at failure {failure}");
+                    };
+                    assert!(at >= now);
+                    now = at;
+                } else {
+                    assert_eq!(retried, Retry::Dropped);
+                }
+            }
+            assert_eq!(count(tx, JobKind::GroupRefresh)?, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The wiring: the job loop's [`settle`] decides by [`gives_up`] with the job's own count of
+    /// failures, not by [`is_permanent`] alone, so the 401 of the group server (not permanent)
+    /// ends the job after [`GROUP_AUTH_ATTEMPTS`] failures and cannot loop for good. The 403 of
+    /// the same server is a refusal at the first failure, a 503 never one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn settle_drops_a_group_job_after_the_budget_of_refused_credentials() {
+        let fixture = crate::receive::tests::fixture();
+        let test =
+            crate::actor::testing::shared(fixture.db.clone(), fixture.account.clone(), Vec::new());
+        let shared = Rc::new(test.shared);
+        let status = |status| Error::Status {
+            what: "group fetch",
+            status,
+        };
+        let queued = || {
+            fixture
+                .db
+                .read(|c| count(c, JobKind::GroupRefresh))
+                .unwrap()
+        };
+        // The queued refresh, as the job loop would pick it, with `attempts` earlier failures.
+        let picked = |key: &str, attempts: u32| -> Job {
+            fixture
+                .db
+                .zone(|tx| -> Result<()> {
+                    // (A second enqueue of a queued job is a no-op.)
+                    enqueue(tx, JobKind::GroupRefresh, key, 0, None)?;
+                    tx.execute(
+                        "UPDATE jobs SET attempts = ?2, next_at = 0 WHERE key = ?1",
+                        (key, attempts),
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            fixture
+                .db
+                .read(|c| next_due(c, i64::MAX, true, false))
+                .unwrap()
+                .expect("queued")
+        };
+
+        // A refused credential: backed off, not dropped, until the failure that spends the
+        // budget; then the job is gone.
+        let job = picked("g", GROUP_AUTH_ATTEMPTS - 2);
+        assert!(!settle(&shared, &job, Err(status(401))).unwrap());
+        assert_eq!(queued(), 1, "the {}th failure is retried", job.attempts + 1);
+        let job = picked("g", GROUP_AUTH_ATTEMPTS - 1);
+        assert!(!settle(&shared, &job, Err(status(401))).unwrap());
+        assert_eq!(queued(), 0, "the {GROUP_AUTH_ATTEMPTS}th failure drops it");
+
+        // The group server's other refusals end a job at once, its trouble never does.
+        let job = picked("h", 0);
+        assert!(!settle(&shared, &job, Err(status(403))).unwrap());
+        assert_eq!(queued(), 0, "a 403 is a refusal");
+        let job = picked("i", 0);
+        assert!(!settle(&shared, &job, Err(status(503))).unwrap());
+        assert_eq!(queued(), 1, "a 503 is retried");
     }
 
     #[test]

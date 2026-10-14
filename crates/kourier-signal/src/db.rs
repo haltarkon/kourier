@@ -40,6 +40,9 @@ pub(crate) const MIGRATIONS: Migrations = Migrations::new(
         migration!(17, "0017_history_transfer_bounds"),
         migration!(18, "0018_history_import"),
         migration!(19, "0019_history_delivery"),
+        migration!(20, "0020_group_requesting"),
+        migration!(21, "0021_number_links"),
+        migration!(22, "0022_device_name"),
     ],
 );
 
@@ -425,7 +428,7 @@ mod tests {
         assert_eq!(versions.len(), 2, "{versions:?}");
         assert_eq!(versions[0].0, "core_outbox");
         assert!(versions[0].1 >= 1);
-        assert_eq!(versions[1], ("signal".to_owned(), 19));
+        assert_eq!(versions[1], ("signal".to_owned(), 22));
         assert!(db.read(Account::load).unwrap().is_none());
     }
 }

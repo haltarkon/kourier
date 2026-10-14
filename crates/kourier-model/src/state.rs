@@ -94,6 +94,7 @@ impl From<&ErrorKind> for FailReason {
             ErrorKind::Unsupported => Self::Unsupported,
             ErrorKind::InvalidInput => Self::Other("invalid input".into()),
             ErrorKind::Expired => Self::Other("expired".into()),
+            ErrorKind::AlreadyAdded { .. } => Self::Other("already added".into()),
             ErrorKind::Internal => Self::Other("internal error".into()),
         }
     }
@@ -147,6 +148,36 @@ impl RecipientState {
     pub fn needs_send(&self) -> bool {
         !matches!(self, Self::Sent { .. })
     }
+}
+
+/// What a running send of an own message is doing (link feedback L6): ephemeral, reported by
+/// the backend while an attempt runs and never stored. A restart starts the attempt over and
+/// the phases come again. Counts only, log-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendPhase {
+    /// Uploading the attachments (the share is `TransmitProgress::progress`).
+    Uploading,
+    /// Fetching the group's current state before sending.
+    RefreshingGroup,
+    /// Setting up encryption with members that have no keys from us yet: `done` of `of`
+    /// members (key fetches, then the sender key handed out).
+    SettingUpKeys {
+        /// Members done.
+        done: u32,
+        /// Members that need it.
+        of: u32,
+    },
+    /// The server named devices that changed: updating them and sending again.
+    RepairingDevices,
+    /// Sending to the members: `done` of `of` the server took it for.
+    Sending {
+        /// Members the server took it for.
+        done: u32,
+        /// Members of this send.
+        of: u32,
+    },
+    /// Sent to the members; telling our other devices.
+    SyncingOwnDevices,
 }
 
 #[cfg(test)]

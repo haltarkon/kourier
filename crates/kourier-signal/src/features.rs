@@ -585,15 +585,19 @@ pub(crate) fn direct_features(
 
 /// The features of a group conversation (§6.8): like a 1:1 chat's, plus mentions and (once the
 /// config allows it) admin deletes, and without a timer menu: the timer is part of the group
-/// state, which Kourier cannot write in M1. `cannot_send` is `NotMember` when we are not a full
-/// member and `AdminsOnly` in an announcement-only group we do not administer. Group sends go
-/// out through `send::group` (S11).
+/// state, which Kourier cannot write in M1. `cannot_send` says why we cannot send: `StillLoading`
+/// for a group known only from a history import, `InvitationPending` while we are invited and
+/// `JoinRequestPending` while we wait for an administrator (neither is "not a member"),
+/// `NotMember` when we are out of it (or it was ended), and `AdminsOnly` in an
+/// announcement-only group we do not administer. Group sends go out through `send::group`
+/// (S11).
 pub(crate) fn group_features(
     snapshot: Option<&crate::groups::Snapshot>,
     membership: crate::groups::Membership,
     account: &Account,
     limits: &Limits,
 ) -> ConversationFeatures {
+    use crate::groups::Membership;
     let mut features = direct_features(true, false, false, limits);
     features
         .formatting
@@ -604,9 +608,22 @@ pub(crate) fn group_features(
     let admin = snapshot
         .and_then(|s| s.member(account.aci))
         .is_some_and(|m| m.admin);
-    features.cannot_send = if membership != crate::groups::Membership::Member
-        || snapshot.is_none_or(|s| s.terminated)
-    {
+    features.cannot_send = if snapshot.is_none() && membership == Membership::Unknown {
+        // Known only from a history import so far (`transfer::deliver`): the members and our
+        // place come with the first fetch, and sending waits for them. A group that is left
+        // or gone stays "not a member" without a snapshot too.
+        Some(CannotSend::StillLoading)
+    } else if snapshot.is_some_and(|s| s.terminated) {
+        // Nothing to accept or to wait for in a group that was ended.
+        Some(CannotSend::NotMember)
+    } else if membership == Membership::Pending {
+        // Invited, not a member: Kourier cannot accept an invitation, the phone does. Not
+        // "no longer a member": we never were one.
+        Some(CannotSend::InvitationPending)
+    } else if membership == Membership::Requesting {
+        // We asked to join and an administrator has not answered.
+        Some(CannotSend::JoinRequestPending)
+    } else if membership != Membership::Member || snapshot.is_none() {
         Some(CannotSend::NotMember)
     } else if snapshot.is_some_and(|s| s.announcements_only) && !admin {
         Some(CannotSend::AdminsOnly)
@@ -685,6 +702,12 @@ fn direct_peer(account: &Account, user: &UserId) -> Option<(ServiceId, bool)> {
     Some((service_id, service_id == ServiceId::from(account.aci)))
 }
 
+/// The service id the `peers` row of the 1:1 chat with `user` is kept under (Note to Self:
+/// our ACI); `None` for a person known only by a number.
+pub(crate) fn direct_service_id(account: &Account, user: &UserId) -> Option<ServiceId> {
+    direct_peer(account, user).map(|(service_id, _)| service_id)
+}
+
 /// Whether a 1:1 chat with `peer` is accepted: Note to Self always, others with profile sharing.
 pub(crate) fn is_accepted(conn: &Connection, account: &Account, peer: ServiceId) -> Result<bool> {
     if peer == ServiceId::from(account.aci) {
@@ -693,15 +716,80 @@ pub(crate) fn is_accepted(conn: &Connection, account: &Account, peer: ServiceId)
     Ok(peers::load(conn, &peer.service_id_string())?.accepted())
 }
 
+/// The service id the `peers` row of the 1:1 chat with `user` is kept under (the ACI or the
+/// PNI the key names); `None` for a person known only by a number.
+fn peer_row_of(user: &UserId) -> Option<ServiceId> {
+    match parse_user_id(user).ok()? {
+        SignalUser::Aci(aci) => Some(ServiceId::from(aci)),
+        SignalUser::Pni(pni) => Some(ServiceId::from(pni)),
+        SignalUser::E164(_) => None,
+    }
+}
+
 /// Forgets that the core has the features of the 1:1 chat with `user`, so that the next
 /// [`features_event`] states them again. For an event that carried them and was taken back
 /// before the core took it (a history delivery row): the record of the zone that built it
 /// said the core had them, and the core never did. Nothing for a chat without a service id.
-pub(crate) fn forget_features(conn: &Connection, account: &Account, user: &UserId) -> Result<()> {
-    if let Some((peer, _)) = direct_peer(account, user) {
+/// Only this chat's flag is cleared, never another's.
+pub(crate) fn forget_features(conn: &Connection, user: &UserId) -> Result<()> {
+    if let Some(peer) = peer_row_of(user) {
         peers::clear_features_hash(conn, &peer.service_id_string())?;
     }
     Ok(())
+}
+
+/// Forgets that the core has the group of `conv` (`groups.features_hash`), as
+/// [`forget_features`] does for a 1:1 chat: a history delivery row that upserted it was taken
+/// back before the core took it. Nothing for a key that names no stored group.
+pub(crate) fn forget_group_features(conn: &Connection, conv: &ConvKey) -> Result<()> {
+    if let Some(id) = crate::groups::id_of_conv(conv) {
+        conn.prepare_cached("UPDATE groups SET features_hash = NULL WHERE group_id = ?1")?
+            .execute([&id[..]])?;
+    }
+    Ok(())
+}
+
+/// Forgets that the core has the chat `conv`, of either kind ([`forget_features`],
+/// [`forget_group_features`]).
+pub(crate) fn forget_chat_features(conn: &Connection, conv: &ConvKey) -> Result<()> {
+    match conv {
+        ConvKey::Direct(user) => forget_features(conn, user),
+        ConvKey::Group(_) => forget_group_features(conn, conv),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the backend's records say that the core was given the chat `conv`: for a 1:1 chat
+/// [`core_has_direct`], for a group `groups.features_hash` (`Some(false)` also for a group
+/// that is not stored); `None` for a chat the records cannot speak for.
+pub(crate) fn core_has_chat(conn: &Connection, conv: &ConvKey) -> Result<Option<bool>> {
+    match conv {
+        ConvKey::Direct(user) => core_has_direct(conn, user),
+        ConvKey::Group(_) => {
+            let Some(id) = crate::groups::id_of_conv(conv) else {
+                return Ok(Some(false));
+            };
+            Ok(Some(
+                crate::groups::load_by_id(conn, &id)?
+                    .is_some_and(|row| row.features_hash.is_some()),
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether the backend's records say that the core was given the 1:1 chat with `user`
+/// (`peers.features_hash`): `Some(false)` for a chat whose delivery was taken back and not
+/// made good, `None` for a chat the records cannot speak for (known only by a number).
+pub(crate) fn core_has_direct(conn: &Connection, user: &UserId) -> Result<Option<bool>> {
+    let Some(peer) = peer_row_of(user) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        peers::load(conn, &peer.service_id_string())?
+            .features_hash
+            .is_some(),
+    ))
 }
 
 /// The `ConversationUpsert{features}` the chat with `user` needs, if the core does not have its
@@ -956,7 +1044,7 @@ mod tests {
                 let bob = libsignal_core::Aci::from(uuid::Uuid::from_u128(0xb0b));
                 let bob_user = aci_user_id(bob).unwrap();
                 let bob_sid = ServiceId::from(bob).service_id_string();
-                peers::reset_expire_timer(tx, &bob_sid, 3600, 4, 9)?;
+                peers::set_expire_timer_unless_older(tx, &bob_sid, 3600, 4, 9)?;
                 let BackendEvent::ConversationUpsert(patch) =
                     features_event(tx, account, &bob_user, 9)?.expect("first features")
                 else {

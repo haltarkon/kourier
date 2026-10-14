@@ -20,6 +20,8 @@
 //!
 //! The core is asked directly at the end: the option it holds, and what its timeline has.
 
+mod support;
+
 use std::time::Duration;
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -298,6 +300,7 @@ fn policy(app: &kourier_app::AppHandle) -> ExpiryPolicy {
 }
 
 fn main() {
+    support::answer_list("settings_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

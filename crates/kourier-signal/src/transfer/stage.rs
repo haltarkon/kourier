@@ -24,18 +24,21 @@
 //! ```sql
 //! meta(k TEXT PRIMARY KEY, v)             -- 'format' at creation; the totals at the commit
 //! contacts(n INTEGER PRIMARY KEY, op)     -- one person that something shown uses
-//! chats(idx INTEGER PRIMARY KEY, conv UNIQUE, op, pinned,
-//!       last_at, n_rows, n_loud)          -- one conversation that has a row; the three
-//!                                         -- counters are written at the commit
+//! chats(idx INTEGER PRIMARY KEY, conv UNIQUE, op, pinned, invited,
+//!       last_at, n_rows, n_loud)          -- one conversation that has a row, is pinned or
+//!                                         -- is a group we are invited to (`pinned`: the
+//!                                         -- phone's order); the three counters are
+//!                                         -- written at the commit
 //! items(chat, n, bytes, msg, PRIMARY KEY(chat, n)) WITHOUT ROWID
 //! ```
 //!
 //! `op` is the JSON of a private type of this crate ([`StagedContact`], [`StagedChat`]);
 //! `msg` is one `IncomingMessage` of the contract as JSON, `bytes` its length; `n` is the
-//! running number of the frame the row came from. One row per MESSAGE: an archive holds the
-//! items of all chats in one sequence (Android: by received time over all chats), and the
-//! key `(chat, n)` gives each chat's rows back in frame order whatever the interleaving, so
-//! the reading thread keeps no buffer per chat.
+//! running number of the frame the row came from times `map::ROWS_PER_FRAME`, plus the
+//! row's place among that frame's rows (a group change makes several). One row per
+//! MESSAGE: an archive holds the items of all chats in one sequence (Android: by received
+//! time over all chats), and the key `(chat, n)` gives each chat's rows back in frame order
+//! whatever the interleaving, so the reading thread keeps no buffer per chat.
 //!
 //! # Bounds
 //!
@@ -46,9 +49,10 @@
 //!
 //! # Secrets
 //!
-//! The stage holds message bodies, names and profile keys. Nothing of a row is logged or
-//! put into an error: a [`StageError`] is a static reason, and the `Debug` of the staged
-//! types prints ids and counts only.
+//! The stage holds message bodies, names, profile keys, the master keys of groups and the
+//! keys of attachments (in their pointers).
+//! Nothing of a row is logged or put into an error: a [`StageError`] is a static reason, and
+//! the `Debug` of the staged types prints ids and counts only.
 
 use std::path::{Path, PathBuf};
 
@@ -73,7 +77,26 @@ pub(crate) const FILE: &str = "stage.db";
 /// `read` says it), an own item that was not sent keeps its timer without a start, and an
 /// own item the phone calls sent whose timer has no start keeps its timer started at the
 /// import's time.
-pub(crate) const FORMAT: i64 = 2;
+///
+/// 3 (step S3b): the mapper maps formatting and mentions, quotes, reactions, the ids of an
+/// edited message's later versions, stickers (not available), the placeholders of the kinds
+/// Kourier does not show (with their raw item), the notices of 1:1 chats and call lines.
+///
+/// 4 (step S4a): a chat's `op` has a kind (`StagedKind`) and what its chat frame carried
+/// (archived, marked unread, muted until, the 1:1 timer and its version, `ChatFrame`);
+/// `chats.pinned` is the phone's pinned order, and a pinned chat is staged and shown even
+/// without a loud row (or without any row).
+///
+/// 5 (step S4b): groups. A chat's kind can be a group (`StagedKind::Group`: master key,
+/// title, members, our membership, blocked, accepted), a group's `ChatFrame::timer_secs` is
+/// its timer (the chat frame's, else the snapshot's), `chats.invited` lists a group we are
+/// invited to, and the mapper maps the items of group chats (authors, quotes, reactions and
+/// send states of any staged person, group changes, group calls).
+///
+/// 6 (step S5): attachment pointers. A message's attachments, its long text and a sticker's
+/// image are attachments with a `remote` (`BackendBlob` v 3, the trimmed `FilePointer`)
+/// while the server may still have them, else `AttachmentState::Unavailable` without one.
+pub(crate) const FORMAT: i64 = 6;
 
 /// The HKDF info of the stage's key.
 const KEY_INFO: &[u8] = b"kourier history stage 1";
@@ -202,17 +225,175 @@ impl std::fmt::Debug for StagedContact {
     }
 }
 
-/// A conversation the import has at least one row for. Direct chats only so far;
-/// later steps add what a chat frame carries (timer, roaming flags) and groups, as fields
-/// with a default.
+/// A conversation the import stages: one that has a row, that the phone pinned, or a group we
+/// are invited to. Its kind and what its chat frame carried.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StagedChat {
-    /// The chat is Note to Self.
+    /// Whom the conversation is with.
+    pub(crate) kind: StagedKind,
+    /// What its chat frame carried (the first frame of the conversation).
     #[serde(default)]
-    pub(crate) is_self: bool,
-    /// The `n` of the peer's row in `contacts`; `None` for Note to Self.
+    pub(crate) frame: ChatFrame,
+}
+
+impl StagedChat {
+    /// The chat with the person staged as row `peer` of `contacts`, with a chat frame that
+    /// says nothing.
+    #[cfg(test)]
+    pub(crate) fn direct(peer: u32) -> Self {
+        Self {
+            kind: StagedKind::Direct { peer },
+            frame: ChatFrame::default(),
+        }
+    }
+
+    /// The chat is Note to Self.
+    pub(crate) fn is_self(&self) -> bool {
+        matches!(self.kind, StagedKind::NoteToSelf)
+    }
+
+    /// The `n` of the peer's row in `contacts`, for a chat with one person.
+    pub(crate) fn peer(&self) -> Option<u32> {
+        match &self.kind {
+            StagedKind::Direct { peer } => Some(*peer),
+            StagedKind::NoteToSelf | StagedKind::Group(_) => None,
+        }
+    }
+
+    /// The group, for a group's chat.
+    pub(crate) fn group(&self) -> Option<&StagedGroup> {
+        match &self.kind {
+            StagedKind::Group(group) => Some(group),
+            StagedKind::NoteToSelf | StagedKind::Direct { .. } => None,
+        }
+    }
+
+    /// A group we are invited to: listed whatever it holds (its one item, the invitation, is
+    /// no notice of the contract), with the request to accept, as Android and Desktop list it.
+    pub(crate) fn invited(&self) -> bool {
+        self.group()
+            .is_some_and(|group| group.membership == GroupMembership::Invited)
+    }
+}
+
+/// The kind of a staged conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum StagedKind {
+    /// Note to Self.
+    NoteToSelf,
+    /// A chat with one person.
+    Direct {
+        /// The `n` of the person's row in `contacts`.
+        peer: u32,
+    },
+    /// A group's chat.
+    Group(Box<StagedGroup>),
+}
+
+/// A group of the archive, as the phone's snapshot of it says (step S4b). Delivery writes the
+/// `groups` row WITHOUT this snapshot (the server's state comes with the first fetch) and
+/// upserts the chat with what is here. `Debug` prints the membership and counts only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StagedGroup {
+    /// The master key (a secret of the group).
+    pub(crate) master_key: MasterKey,
+    /// The title, when the snapshot has one that is not empty (cut at the mapper's bound).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) peer: Option<u32>,
+    pub(crate) title: Option<String>,
+    /// Full members, invited and requesting people with their roles; `None` for an empty
+    /// snapshot (the phone had no state of the group), which must not empty a list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) members: Option<Vec<kourier_model::Member>>,
+    /// Our place in the group by the snapshot.
+    pub(crate) membership: GroupMembership,
+    /// Blocked on the phone.
+    #[serde(default)]
+    pub(crate) blocked: bool,
+    /// Accepted on the phone (the group's message request: `Group.whitelisted`).
+    #[serde(default)]
+    pub(crate) whitelisted: bool,
+}
+
+impl std::fmt::Debug for StagedGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedGroup")
+            .field("membership", &self.membership)
+            .field("title", &self.title.is_some())
+            .field("members", &self.members.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Our place in a group by the phone's snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum GroupMembership {
+    /// A full member.
+    Member,
+    /// Invited (by our ACI or our PNI).
+    Invited,
+    /// We asked to join and wait for an administrator.
+    Requesting,
+    /// A snapshot without us: we left or were removed.
+    Left,
+    /// An empty snapshot: the phone had no state of the group.
+    Unknown,
+}
+
+/// A group's master key. Wiped on drop; `Debug` prints nothing.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MasterKey(pub(crate) [u8; 32]);
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MasterKey(<redacted>)")
+    }
+}
+
+/// What a chat frame of the archive says of its conversation, as the import delivers it.
+/// The pinned order is not here: it is the `pinned` column of `chats`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChatFrame {
+    /// Archived on the phone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) archived: bool,
+    /// Marked unread on the phone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) marked_unread: bool,
+    /// Muted until (ms; `i64::MAX` is for ever), converted as the Storage Service sync
+    /// converts it (`storage::muted_until`). A mute that ran out is a time in the past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) muted_until: Option<i64>,
+    /// The chat's disappearing timer in seconds (at most `i32::MAX`); `None` when it is off.
+    /// A group's: the chat frame's when it has one, else the snapshot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) timer_secs: Option<u32>,
+    /// The version of the chat's timer (Signal `expireTimerVersion`), at least 1: the phone
+    /// writes it also when the timer is off, and what Kourier sends carries it.
+    #[serde(default = "first_version")]
+    pub(crate) timer_version: u32,
+}
+
+impl Default for ChatFrame {
+    /// A chat frame that says nothing: no flag, no mute, no timer, the first version.
+    fn default() -> Self {
+        Self {
+            archived: false,
+            marked_unread: false,
+            muted_until: None,
+            timer_secs: None,
+            timer_version: first_version(),
+        }
+    }
+}
+
+fn first_version() -> u32 {
+    1
 }
 
 /// One chat's counters, known when the last frame was mapped and written at the commit.
@@ -235,7 +416,8 @@ pub(crate) struct StageTotals {
     pub(crate) messages: u64,
     /// Rows of `chats`.
     pub(crate) chats: u64,
-    /// Chats with at least one loud row: the ones delivery shows.
+    /// Chats with at least one loud row, a pinned order or an invitation: the ones delivery
+    /// shows.
     pub(crate) shown_chats: u64,
     /// Rows of `contacts`.
     pub(crate) contacts: u64,
@@ -250,11 +432,25 @@ pub(crate) struct StagedChatRow {
     pub(crate) conv: ConvKey,
     /// What the chat frame carried.
     pub(crate) op: StagedChat,
-    /// `Chat.pinnedOrder` when set and not 0 (not mapped in this step: always `None`).
+    /// `Chat.pinnedOrder` when set and not 0: the place in the phone's list of pinned chats
+    /// (ascending; there may be gaps).
     pub(crate) pinned: Option<u32>,
     /// Its counters.
     pub(crate) counters: ChatCounters,
 }
+
+impl StagedChatRow {
+    /// Whether delivery shows the chat: it has a row that makes a chat show (`map`, "quiet
+    /// and loud"), the phone pinned it (Android and Desktop list a pinned chat whatever it
+    /// holds), or it is a group we are invited to ([`StagedChat::invited`]). [`SHOWN`] is the
+    /// same rule in SQL.
+    pub(crate) fn shown(&self) -> bool {
+        self.counters.n_loud > 0 || self.pinned.is_some() || self.op.invited()
+    }
+}
+
+/// [`StagedChatRow::shown`] as a condition on `chats`.
+const SHOWN: &str = "n_loud > 0 OR pinned IS NOT NULL OR invited = 1";
 
 /// A row of a chat as the stage gives it back.
 #[derive(Clone, Debug, PartialEq)]
@@ -388,6 +584,7 @@ impl StageWriter {
                conv TEXT NOT NULL UNIQUE,
                op BLOB NOT NULL,
                pinned INTEGER,
+               invited INTEGER NOT NULL DEFAULT 0,
                last_at INTEGER NOT NULL DEFAULT 0,
                n_rows INTEGER NOT NULL DEFAULT 0,
                n_loud INTEGER NOT NULL DEFAULT 0);
@@ -462,15 +659,36 @@ impl StageWriter {
         chat: &StagedChat,
         pinned: Option<u32>,
     ) -> Result<(), StageError> {
-        let op = serde_json::to_vec(chat).map_err(|_| StageError::Db("encoding a chat"))?;
+        // A group's holds its master key.
+        let op = Zeroizing::new(
+            serde_json::to_vec(chat).map_err(|_| StageError::Db("encoding a chat"))?,
+        );
         let conv = conv.encode();
         self.account(op.len() + conv.len())?;
         self.conn
-            .prepare_cached("INSERT INTO chats(idx, conv, op, pinned) VALUES (?1, ?2, ?3, ?4)")
-            .and_then(|mut stmt| stmt.execute((idx, &conv, &op, pinned)))
+            .prepare_cached(
+                "INSERT INTO chats(idx, conv, op, pinned, invited) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .and_then(|mut stmt| stmt.execute((idx, &conv, op.as_slice(), pinned, chat.invited())))
             .map_err(db("writing a chat"))?;
         self.chats += 1;
         self.settle()
+    }
+
+    /// Takes the pin off a staged chat (the pin list is bounded, `MapLimits::max_pins`); the
+    /// chat stays, shown when it has a loud row.
+    pub(crate) fn unpin(&mut self, idx: u32) -> Result<(), StageError> {
+        if !self.in_tx {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(db("beginning a transaction"))?;
+            self.in_tx = true;
+        }
+        self.conn
+            .prepare_cached("UPDATE chats SET pinned = NULL WHERE idx = ?1")
+            .and_then(|mut stmt| stmt.execute([idx]))
+            .map_err(db("unpinning a chat"))?;
+        Ok(())
     }
 
     /// Stages a message as row `n` of chat `chat`.
@@ -528,7 +746,6 @@ impl StageWriter {
                 .map_err(db("beginning a transaction"))?;
             self.in_tx = true;
         }
-        let mut shown = 0;
         {
             let mut stmt = self
                 .conn
@@ -548,9 +765,17 @@ impl StageWriter {
                 if changed != 1 {
                     return Err(StageError::Db("writing the counters"));
                 }
-                shown += u64::from(chat.n_loud > 0);
             }
         }
+        let shown: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM chats WHERE {SHOWN}"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db("writing the counters"))?;
+        let shown = to_u64(shown);
         let totals = StageTotals {
             messages: self.messages,
             chats: self.chats,
@@ -710,7 +935,7 @@ impl StageReader {
         Ok(StageTotals {
             messages: to_u64(messages),
             chats: one("SELECT count(*) FROM chats")?,
-            shown_chats: one("SELECT count(*) FROM chats WHERE n_loud > 0")?,
+            shown_chats: one(&format!("SELECT count(*) FROM chats WHERE {SHOWN}"))?,
             contacts: one("SELECT count(*) FROM contacts")?,
             bytes: to_u64(item_bytes) + other_bytes,
         })
@@ -771,6 +996,7 @@ impl StageReader {
         for row in rows {
             let (idx, conv, op, pinned, last_at, n_rows, n_loud) =
                 row.map_err(db("reading chats"))?;
+            let op = Zeroizing::new(op);
             out.push(StagedChatRow {
                 conv: ConvKey::parse(&conv).map_err(|_| StageError::Unreadable)?,
                 op: serde_json::from_slice(&op).map_err(|_| StageError::Unreadable)?,

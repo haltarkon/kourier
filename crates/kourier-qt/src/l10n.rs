@@ -30,6 +30,10 @@ impl Translator for KdeTranslator {
             DOMAIN, context, singular, plural, count,
         ))
     }
+
+    fn number(&self, n: u64) -> Option<String> {
+        Some(String::from(&qt::format_number(n)))
+    }
 }
 
 /// Makes `kourier` KI18n's application domain and [`KdeTranslator`] the translator of every

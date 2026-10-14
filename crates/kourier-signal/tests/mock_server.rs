@@ -135,7 +135,8 @@ impl World {
 
         assert!(url.starts_with("sgnl://linkdevice?uuid="), "QR URL");
         // The offer of the history transfer is off unless a network switches it on (§14.2
-        // item 14: off in the app until the import exists), so the URL offers nothing.
+        // item 14: the library's default is off, the app turns it on), so the URL offers
+        // nothing.
         assert!(
             url.contains("&pub_key=") && url.ends_with("&capabilities="),
             "QR URL"
@@ -445,7 +446,9 @@ async fn account_survives_a_restart() {
     core.send(Command::Connect).await;
     core.wait_online().await;
     // Every start registers the capabilities and refreshes the remote config (§6.12); the
-    // stored ETag makes the server answer 304, so no new `AccountCaps`.
+    // stored ETag makes the server answer 304, so the refresh adds no `AccountCaps` of its
+    // own. The start states the capabilities itself (`append_account_caps`: S6, so the core
+    // learns what the account can do whatever the config did), which is the second.
     world
         .files
         .wait_for_i64("capabilities registered", PENDING_JOBS, |n| n == Some(0))
@@ -466,7 +469,7 @@ async fn account_survives_a_restart() {
         Some(0),
         "304 Not Modified: the ETag was sent"
     );
-    assert_eq!(world.sink.events("AccountCaps").len(), 1);
+    assert_eq!(world.sink.events("AccountCaps").len(), 2);
 
     // A changed config arrives with a new ETag at the next connect and updates the limits.
     world
@@ -483,9 +486,9 @@ async fn account_survives_a_restart() {
         .expect("remote config");
     core.send(Command::Disconnect).await;
     core.send(Command::Connect).await;
-    let caps = world.sink.wait_events("AccountCaps", 2, WAIT).await;
+    let caps = world.sink.wait_events("AccountCaps", 3, WAIT).await;
     assert_eq!(
-        caps[1].as_deref(),
+        caps[2].as_deref(),
         Some("max_attachment_bytes=Some(1000) long_text_bytes=Some(2048)")
     );
     core.wait_online().await;
@@ -698,6 +701,7 @@ async fn linking_without_a_reachable_server_fails_with_a_connection_error() {
     core.send(Command::StartLogin {
         flow: "qr".to_owned(),
         relink: None,
+        taken: Vec::new(),
     })
     .await;
     let input = core.next_login().await;
@@ -738,7 +742,8 @@ struct ChildSpec {
 }
 
 /// Every kill point of the receive path (§10.4) and the hit counts the three-message stream of a
-/// run reaches.
+/// run reaches. The core's commits count the batch of the start's own `AccountCaps` first
+/// (`append_account_caps`), so the stream's are the second and the third.
 const KILL_POINTS: [(&str, u32); 8] = [
     (kourier_signal::failpoints::AFTER_INBOX_COMMIT, 1),
     (kourier_signal::failpoints::AFTER_INBOX_COMMIT, 2),
@@ -746,8 +751,8 @@ const KILL_POINTS: [(&str, u32); 8] = [
     (kourier_signal::failpoints::BEFORE_ACK, 2),
     (kourier_signal::failpoints::AFTER_BACKEND_EFFECTS_COMMIT, 1),
     (kourier_signal::failpoints::AFTER_BACKEND_EFFECTS_COMMIT, 2),
-    (kourier_signal::failpoints::AFTER_CORE_COMMIT, 1),
     (kourier_signal::failpoints::AFTER_CORE_COMMIT, 2),
+    (kourier_signal::failpoints::AFTER_CORE_COMMIT, 3),
 ];
 
 /// One message of a run's stream, as the uncrashed state compares it (the run number and the
@@ -1333,4 +1338,82 @@ fn child_actor_process() {
         println!("{CHILD_LINE} done");
         let _ = core.shutdown().await;
     });
+}
+
+/// Link feedback L4: what the server's refusal of the logout's own connection means. A server
+/// that no longer knows the device or its credentials (403, as the mock's `failAuth` says it)
+/// has nothing left to remove: `Removed`. One that is busy or limits the caller (429) has not
+/// removed it: `NotReached`. (The 503 class is the test below; the answers to the DELETE
+/// itself are `actor::logout_tests`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_refused_at_the_door_says_whether_the_device_is_gone() {
+    for (status, expected) in [
+        (403, kourier_model::DeviceLogout::Removed),
+        (429, kourier_model::DeviceLogout::NotReached),
+    ] {
+        let Some(world) = World::start().await else {
+            return;
+        };
+        let (mut core, device) = world.link().await;
+        core.send(Command::Disconnect).await;
+        core.wait_conn("Offline", |state| {
+            matches!(state, kourier_model::ConnState::Offline { .. })
+        })
+        .await;
+        world
+            .harness
+            .fail_auth(&device.device_ref, status)
+            .await
+            .expect("failAuth");
+        let (exit, reports) = core.logout().await;
+        assert!(matches!(exit, Exit::LoggedOut { .. }), "{status}: {exit:?}");
+        assert_eq!(reports.len(), 1, "{status}: {reports:?}");
+        assert_eq!(reports[0].outcome, expected, "status {status}");
+        world.harness.shutdown().await.expect("harness shutdown");
+    }
+}
+
+/// Link feedback L4: a logout the server cannot hear (its socket refused, the device stays
+/// on the phone) reports `NotReached` with the name the link gave the device, so the user is
+/// told to remove that device on the phone. The actor still ends `LoggedOut` within the
+/// core's 10 s. (Here, not in `robustness.rs`: that binary asserts no test warns about a
+/// device left on the phone.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_the_server_does_not_hear_reports_the_device_to_remove_on_the_phone() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (mut core, device) = world.link().await;
+    core.send(Command::Disconnect).await;
+    core.wait_conn("Offline", |state| {
+        matches!(state, kourier_model::ConnState::Offline { .. })
+    })
+    .await;
+    world
+        .harness
+        .fail_auth(&device.device_ref, 503)
+        .await
+        .expect("failAuth");
+    let started = std::time::Instant::now();
+    let (exit, reports) = core.logout().await;
+    assert!(matches!(exit, Exit::LoggedOut { .. }), "{exit:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "within the core's 10 s: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        reports,
+        vec![kourier_model::LogoutReport {
+            outcome: kourier_model::DeviceLogout::NotReached,
+            device_name: Some("Kourier test".to_owned()),
+        }]
+    );
+    let devices = world
+        .harness
+        .list_devices(&world.phone.device_ref)
+        .await
+        .expect("listDevices");
+    assert_eq!(devices.len(), 2, "the device is still on the phone");
+    world.harness.shutdown().await.expect("harness shutdown");
 }

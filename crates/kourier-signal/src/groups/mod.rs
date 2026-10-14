@@ -254,6 +254,8 @@ pub(crate) enum Membership {
     Member,
     /// Invited, not joined.
     Pending,
+    /// We asked to join and an administrator has not answered yet.
+    Requesting,
     /// Removed or left.
     Left,
     /// The group no longer exists (404).
@@ -267,6 +269,7 @@ impl Membership {
             Self::Unknown => "unknown",
             Self::Member => "member",
             Self::Pending => "pending",
+            Self::Requesting => "requesting",
             Self::Left => "left",
             Self::Gone => "gone",
         }
@@ -276,6 +279,7 @@ impl Membership {
         match s {
             "member" => Self::Member,
             "pending" => Self::Pending,
+            "requesting" => Self::Requesting,
             "left" => Self::Left,
             "gone" => Self::Gone,
             _ => Self::Unknown,

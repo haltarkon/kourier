@@ -217,6 +217,16 @@ pub(crate) async fn run_fetch<T: SignalTransport>(
                 .zone(|tx| peers::mark_unregistered(tx, &sid, now))?;
             return Ok(Done::Finished);
         }
+        // A rate limit holds every profile fetch until its `Retry-After` (`jobs::settle`).
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => {
+            return Err(Error::RateLimited {
+                retry_after_secs: response
+                    .headers
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse().ok()),
+            });
+        }
         status if !status.is_success() => {
             return Err(Error::Status {
                 what: "profile",

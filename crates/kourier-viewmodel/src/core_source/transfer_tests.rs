@@ -11,7 +11,7 @@ use kourier_model::{
 use super::tests::{Sent, Store, account, result, settle, source, take_queries};
 use super::*;
 use crate::conversations::BannerKind;
-use crate::transfer::TransferPhase;
+use crate::transfer::{TransferPhase, TransferView};
 
 const ME: AccountId = AccountId(1);
 
@@ -68,6 +68,7 @@ fn commands(sent: &Sent) -> Vec<(&'static str, i64)> {
             UiCommand::AddAccount { .. } => Some(("add", 0)),
             UiCommand::CancelLogin { account } => Some(("cancel-login", account.0)),
             UiCommand::Relink { account, .. } => Some(("relink", account.0)),
+            UiCommand::Unlink { account } => Some(("unlink", account.0)),
             _ => None,
         })
         .collect();
@@ -90,7 +91,9 @@ fn linking(src: &mut CoreSource, sent: &Sent, account: AccountId) {
             },
         },
     });
-    sent.borrow_mut().clear();
+    // The queries stay to be answered ([`known`]); commands are forgotten.
+    sent.borrow_mut()
+        .retain(|c| matches!(c, UiCommand::Query { .. }));
 }
 
 /// What the main window shows above the list for all accounts when at most ONE banner is
@@ -113,80 +116,275 @@ fn shown(src: &CoreSource) -> Option<Banner> {
     state.or(transfer)
 }
 
+/// Answers the accounts query with `ids`, Active (the core took them).
+fn known(src: &mut CoreSource, sent: &Sent, ids: &[AccountId]) {
+    let rows: Vec<_> = ids
+        .iter()
+        .map(|id| kourier_core::facade::AccountRow {
+            id: *id,
+            uuid: AccountUuid::new_random(),
+            conn: ConnState::Online { detail: None },
+            ..account()
+        })
+        .collect();
+    src.on_event(&UiEvent::AccountsChanged);
+    // Answered until no accounts query follows up (the other queries are dropped).
+    loop {
+        let accounts: Vec<_> = take_queries(sent)
+            .into_iter()
+            .filter(|(_, q)| matches!(q, Query::Accounts))
+            .collect();
+        if accounts.is_empty() {
+            break;
+        }
+        for (t, _) in accounts {
+            src.on_event(&result(t, QueryData::Accounts(rows.clone())));
+        }
+    }
+}
+
+/// The transfer of `account` as its banner shows it.
+fn banner_view(src: &CoreSource, account: AccountId) -> Option<TransferView> {
+    src.transfer_banner(Some(account)).and_then(|b| b.transfer)
+}
+
+/// Link feedback L3: the link page ends ("Linked") as soon as the backend reports the
+/// transfer of the account it links (it comes only after the link); the transfer goes on in
+/// the banner (the link page has no view of a transfer).
 #[test]
-fn the_link_page_shows_the_transfer_of_its_own_account_only() {
+fn the_link_page_ends_at_its_accounts_transfer_and_the_banner_shows_it() {
     let (mut src, sent) = loaded();
     let new = AccountId(5);
     linking(&mut src, &sent, new);
-    assert!(src.link_transfer().is_none(), "no transfer reported yet");
 
     // Another account's transfer is not this page's business.
     let ch = src.on_event(&transfer(ME, HistoryTransfer::Waiting));
-    assert!(ch.transfer);
-    assert!(src.link_transfer().is_none());
+    assert!(ch.transfer && !ch.login);
+    assert_eq!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Progress)
+    );
 
     let ch = src.on_event(&transfer(new, HistoryTransfer::Waiting));
-    assert!(ch.transfer);
-    let v = src.link_transfer().expect("the linking account's transfer");
+    assert!(ch.transfer && ch.login);
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    known(&mut src, &sent, &[ME, new]);
+    let v = banner_view(&src, new).expect("the banner shows the transfer");
     assert_eq!((v.account, v.phase), (new, TransferPhase::Waiting));
     assert_eq!(v.skip, "Continue Without History");
 
     // The same state again: nothing to redraw, nothing sent.
     let ch = src.on_event(&transfer(new, HistoryTransfer::Waiting));
-    assert!(!ch.transfer);
+    assert!(!ch.transfer && !ch.login);
 
     src.on_event(&transfer(new, downloading(12_300_000, Some(45_600_000))));
-    let v = src.link_transfer().expect("download");
-    assert_eq!(v.title, "Downloading Message History");
+    let v = banner_view(&src, new).expect("download");
+    assert!(
+        v.status.ends_with("Downloading message history…"),
+        "{}",
+        v.status
+    );
     assert_eq!(v.detail, "12.3 MB of 45.6 MB");
     assert!(v.progress > 0.26 && v.progress < 0.28);
 
     // The bytes step back (the backend restarted and counts from the file on disk).
     src.on_event(&transfer(new, downloading(4_000_000, Some(45_600_000))));
-    let v = src.link_transfer().expect("download");
+    let v = banner_view(&src, new).expect("download");
     assert_eq!(v.detail, "4.0 MB of 45.6 MB");
     assert!(v.progress > 0.08 && v.progress < 0.09);
 
     src.on_event(&transfer(new, HistoryTransfer::Reading));
-    let v = src.link_transfer().expect("read");
+    let v = banner_view(&src, new).expect("read");
     assert_eq!(v.phase, TransferPhase::Reading);
     assert!(v.skip.is_empty());
     assert!(!src.skip_transfer(new), "a read cannot be skipped");
     assert!(commands(&sent).is_empty(), "nothing was sent so far");
 
-    // The end: the page goes back to the login's own steps, and the notice waits.
+    // The end: the notice waits, and the backend's own `Done` of the login changes nothing.
     let ch = src.on_event(&transfer(new, HistoryTransfer::Done));
     assert!(ch.transfer);
-    assert!(src.link_transfer().is_none());
+    assert!(banner_view(&src, new).is_none());
     assert_eq!(commands(&sent), [("dismiss", 5)]);
     assert_eq!(
         src.take_transfer_notices(),
-        ["The message history was transferred."]
+        ["Me: The message history was transferred."],
+        "two accounts: the notice names its own"
     );
     assert!(src.take_transfer_notices().is_empty(), "taken once");
+    let ch = src.on_event(&UiEvent::LoginStep {
+        account: new,
+        step: LoginStep {
+            step_id: "syncing".into(),
+            txn: 0,
+            kind: LoginStepKind::Progress {
+                label: "Syncing contacts and groups".into(),
+                fraction: None,
+            },
+        },
+    });
+    assert!(!ch.login, "a later step finds the page ended");
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+}
+
+/// Link feedback L3, a link without a transfer (the phone declined it): the page ends when
+/// the core's list has the account Active (it took `AccountReady`), long before the
+/// backend's `Done`, and leaving it cancels nothing.
+#[test]
+fn without_a_transfer_the_link_page_ends_when_the_core_has_the_account() {
+    let (mut src, sent) = loaded();
+    let new = AccountId(5);
+    linking(&mut src, &sent, new);
+    known(&mut src, &sent, &[ME]);
     assert_eq!(
         src.login_view().map(|v| v.kind),
         Some(LoginViewKind::Progress),
-        "the link finishes as it always did"
+        "not in the core's list yet"
     );
+    known(&mut src, &sent, &[ME, new]);
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    src.cancel_login();
+    assert!(commands(&sent).is_empty(), "nothing to cancel");
+}
+
+fn left(profiles: u32, groups: u32) -> UiEvent {
+    UiEvent::AccountProgress {
+        account: AccountId(5),
+        progress: kourier_model::AccountProgress {
+            profiles_left: profiles,
+            groups_left: groups,
+            ..kourier_model::AccountProgress::default()
+        },
+    }
+}
+
+/// Link feedback L3: after the link page ended, the profiles and groups a fresh link still
+/// fetches show in the banner with their counts, after the transfer's read and in its
+/// place when there is none, until the backend says it finished; an account that is offline
+/// says so instead, and a logged-out one shows none.
+#[test]
+fn the_banner_counts_the_profiles_and_groups_a_fresh_link_still_fetches() {
+    let (mut src, sent) = loaded();
+    let new = AccountId(5);
+    linking(&mut src, &sent, new);
+    // Under the link page nothing shows.
+    let ch = src.on_event(&left(120, 8));
+    assert!(ch.transfer);
+    assert!(banner_view(&src, new).is_none(), "the link page is up");
+    known(&mut src, &sent, &[ME, new]);
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    let b = src.transfer_banner(Some(new)).expect("the update shows");
+    assert_eq!(b.kind, BannerKind::Updating);
+    let v = b.transfer.expect("its view");
+    assert_eq!(v.phase, TransferPhase::Updating);
+    assert_eq!(
+        v.status, "Me: Updating contacts and groups: 120 profiles, 8 groups left",
+        "two accounts: it names its own"
+    );
+    assert!(src.banner(None).is_none(), "not a state of the account");
+
+    // A transfer that runs goes first; after it, the update again.
+    src.on_event(&transfer(new, HistoryTransfer::Reading));
+    assert_eq!(
+        banner_view(&src, new).map(|v| v.phase),
+        Some(TransferPhase::Reading)
+    );
+    src.on_event(&transfer(new, HistoryTransfer::Done));
+    src.on_event(&left(30, 2));
+    let v = banner_view(&src, new).expect("the update again");
+    assert_eq!(v.phase, TransferPhase::Updating);
+    assert!((v.progress - 0.75).abs() < 1e-9, "{}", v.progress);
+
+    // Getting new messages says less than the update; being offline says more.
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: ConnState::Syncing { fraction: None },
+    });
+    assert_eq!(
+        src.transfer_banner(Some(new)).map(|b| b.kind),
+        Some(BannerKind::Updating)
+    );
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: ConnState::Offline { retry_at_ms: None },
+    });
+    assert!(src.transfer_banner(Some(new)).is_none());
+    assert_eq!(
+        src.banner(Some(new)).map(|b| b.kind),
+        Some(BannerKind::Offline)
+    );
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: ConnState::Online { detail: None },
+    });
+
+    // Finished: nothing is left to show.
+    let ch = src.on_event(&UiEvent::AccountProgress {
+        account: new,
+        progress: kourier_model::AccountProgress::finished(),
+    });
+    assert!(ch.transfer);
+    assert!(src.transfer_banner(None).is_none());
+
+    // A logout stops the work; nothing shows of it.
+    src.on_event(&left(5, 0));
+    assert!(src.transfer_banner(Some(new)).is_some());
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: logged_out(),
+    });
+    assert!(src.transfer_banner(Some(new)).is_none());
+}
+
+/// Link feedback L3, F1: the one `finished` report may be lost with a lagged channel (the
+/// reload that follows): the update's banner and the question on quitting must not stay up for
+/// the rest of the session. A report that changed afterwards brings the numbers back.
+#[test]
+fn a_reload_forgets_the_numbers_so_a_lost_finished_leaves_nothing_up() {
+    let (mut src, sent) = loaded();
+    let new = AccountId(5);
+    linking(&mut src, &sent, new);
+    known(&mut src, &sent, &[ME, new]);
+    src.on_event(&left(30, 2));
+    assert_eq!(
+        src.transfer_banner(Some(new)).map(|b| b.kind),
+        Some(BannerKind::Updating)
+    );
+    assert!(src.quit_question().is_some());
+
+    // The channel lagged: the `finished` that came in between is gone.
+    let ch = src.reload();
+    assert!(ch.transfer && ch.accounts, "what was shown must be redrawn");
+    known(&mut src, &sent, &[ME, new]);
+    assert!(src.transfer_banner(Some(new)).is_none(), "no update shown");
+    assert!(src.quit_question().is_none(), "nothing runs");
+    assert!(!src.reload().transfer, "nothing was left to forget");
+
+    // The next report brings the work back.
+    src.on_event(&left(29, 2));
+    assert_eq!(
+        src.transfer_banner(Some(new)).map(|b| b.kind),
+        Some(BannerKind::Updating)
+    );
+    assert!(src.quit_question().is_some());
 }
 
 #[test]
-fn a_skip_from_the_link_page_ends_without_a_notice_and_is_dismissed() {
+fn a_skip_from_the_banner_ends_without_a_notice_and_is_dismissed() {
     let (mut src, sent) = loaded();
     let new = AccountId(5);
     linking(&mut src, &sent, new);
     src.on_event(&transfer(new, HistoryTransfer::Waiting));
+    known(&mut src, &sent, &[ME, new]);
     assert!(src.skip_transfer(new));
     assert_eq!(commands(&sent), [("skip", 5)]);
     assert!(
-        src.link_transfer().is_some(),
+        banner_view(&src, new).is_some(),
         "the state stays until the backend reports the end"
     );
     // The answer to a skip is the next event.
     let ch = src.on_event(&transfer(new, HistoryTransfer::Skipped));
     assert!(ch.transfer);
-    assert!(src.link_transfer().is_none());
+    assert!(banner_view(&src, new).is_none());
     assert!(src.take_transfer_notices().is_empty(), "our own skip");
     assert_eq!(commands(&sent), [("dismiss", 5)]);
     // Skipping what does not run sends nothing.
@@ -223,11 +421,10 @@ fn after_a_restart_the_banner_shows_the_transfer_and_skips_it() {
     assert!(shown(&src).is_none());
     let ch = src.on_event(&transfer(ME, downloading(1_000_000, Some(4_000_000))));
     assert!(ch.transfer);
-    assert!(src.link_transfer().is_none(), "there is no link page");
     let b = shown(&src).expect("banner");
     assert_eq!((b.account, b.kind), (ME, BannerKind::Transfer));
     assert!(b.action.is_empty() && b.url.is_empty());
-    let v = b.transfer.expect("the same view the link page shows");
+    let v = b.transfer.expect("the transfer's view");
     assert_eq!(v.phase, TransferPhase::Downloading);
     assert_eq!(v.status, "Downloading message history…");
     assert_eq!(b.text, v.status);
@@ -354,7 +551,7 @@ fn an_old_version_gets_no_try_again() {
     let v = shown(&src).and_then(|b| b.transfer).expect("view");
     assert!(v.retry.is_empty());
     assert_eq!(v.dismiss, "Dismiss");
-    assert!(v.text.contains("Update Kourier first"));
+    assert!(v.status.contains("Update Kourier first"));
 }
 
 #[test]
@@ -364,12 +561,13 @@ fn an_account_removed_while_its_transfer_is_shown_takes_it_along() {
     linking(&mut src, &sent, new);
     src.on_event(&transfer(new, HistoryTransfer::Waiting));
     src.on_event(&transfer(ME, failed(HistoryTransferFailure::Download)));
-    assert!(src.link_transfer().is_some());
-    assert!(shown(&src).is_some());
+    known(&mut src, &sent, &[ME, new]);
+    assert!(banner_view(&src, new).is_some());
+    assert!(banner_view(&src, ME).is_some());
 
     let ch = src.on_event(&UiEvent::AccountRemoved { account: new });
     assert!(ch.transfer);
-    assert!(src.link_transfer().is_none());
+    assert!(banner_view(&src, new).is_none());
     assert!(!src.skip_transfer(new), "nothing left to skip");
     let ch = src.on_event(&UiEvent::AccountRemoved { account: ME });
     assert!(ch.transfer);
@@ -393,31 +591,31 @@ fn leaving_the_link_page_during_a_transfer_abandons_nothing() {
     let (mut src, sent) = loaded();
     linking(&mut src, &sent, ME);
     src.on_event(&transfer(ME, HistoryTransfer::Waiting));
-    assert!(shown(&src).is_none(), "the page shows it large: not twice");
-    // Back, or Cancel: the account is linked already, so there is no login to cancel.
-    src.cancel_login();
-    assert!(
-        commands(&sent).is_empty(),
-        "no CancelLogin for a linked account"
-    );
-    assert!(src.link_transfer().is_none());
+    // The page ended at the first report (link feedback L3): the banner shows the transfer.
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
     assert_eq!(
         shown(&src).map(|b| b.kind),
         Some(BannerKind::Transfer),
         "the transfer goes on in the banner"
     );
+    // Leaving the "Linked" page: the account is linked, so there is no login to cancel.
+    src.cancel_login();
+    assert!(
+        commands(&sent).is_empty(),
+        "no CancelLogin for a linked account"
+    );
     // Before any transfer state the same press does cancel the login.
     linking(&mut src, &sent, AccountId(6));
     src.cancel_login();
     assert_eq!(commands(&sent), [("cancel-login", 6)]);
-    // And once the transfer is over the rule is the login's own again (the core ignores a
-    // cancel for an account it has linked).
+    // A transfer that ran and ended: the page ended with its first report, and leaving it
+    // sends nothing either.
     linking(&mut src, &sent, AccountId(7));
     src.on_event(&transfer(AccountId(7), HistoryTransfer::Reading));
     src.on_event(&transfer(AccountId(7), HistoryTransfer::Done));
     sent.borrow_mut().clear();
     src.cancel_login();
-    assert_eq!(commands(&sent), [("cancel-login", 7)]);
+    assert!(commands(&sent).is_empty());
 }
 
 #[test]
@@ -530,11 +728,13 @@ fn only_a_confirmed_question_removes_the_account_and_links_it_again() {
     });
     src.on_event(&UiEvent::AccountRemoved { account: ME });
     src.on_event(&transfer(AccountId(2), HistoryTransfer::Waiting));
+    known(&mut src, &sent, &[AccountId(2)]);
     assert_eq!(
-        src.link_transfer().map(|v| v.account),
+        banner_view(&src, AccountId(2)).map(|v| v.account),
         Some(AccountId(2)),
         "the phone is asked for the history"
     );
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
 }
 
 #[test]
@@ -645,25 +845,25 @@ fn review_a_transfer_the_backend_forgot_with_the_login_does_not_come_back_after_
 }
 
 #[test]
-fn review_the_link_page_of_a_relink_does_not_show_a_transfer_the_backend_forgot() {
+fn the_page_of_a_relink_keeps_to_its_steps_whatever_is_heard_of_a_transfer_the_backend_forgot() {
     let (mut src, sent) = loaded();
     src.on_event(&transfer(ME, HistoryTransfer::Waiting));
     src.on_event(&UiEvent::ConnState {
         account: ME,
         state: logged_out(),
     });
-    // "Link Again": the page must show the codes of this login. A relink has no transfer,
-    // and the one the book still holds was deleted by the backend with the login.
+    // "Link Again": the page shows the codes of this login. A relink has no transfer, and
+    // the one the book still holds was deleted by the backend with the login.
     src.relink(ME).expect("relink");
-    assert!(
-        src.link_transfer().is_none(),
-        "the link page shows the old transfer in place of the relink's steps"
-    );
     // Whatever is heard of a transfer of this account while its relink is on the page
     // (nothing should be: a relink has none), the page keeps to the login's steps and its
     // "Cancel" reaches the backend.
     src.on_event(&transfer(ME, HistoryTransfer::Waiting));
-    assert!(src.link_transfer().is_none());
+    assert_ne!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Done),
+        "the relink's page ends at its transfer"
+    );
     sent.borrow_mut().clear();
     src.cancel_login();
     assert_eq!(commands(&sent), [("cancel-login", 1)]);
@@ -1016,16 +1216,734 @@ fn review_a_confirmation_cannot_reach_another_account_than_the_one_asked_about()
 
 #[test]
 fn review_confirming_while_another_link_runs_abandons_that_link() {
-    // What happens today (not asserted as right or wrong: the question does not say it):
-    // the link of a second account is in progress (wide window: its page beside the list),
+    // The link of a second account is in progress (wide window: its page beside the list),
     // and "Try Again…" on the banner of the first account is confirmed.
     let (mut src, sent) = loaded();
     src.on_event(&transfer(ME, failed(HistoryTransferFailure::Corrupt)));
     linking(&mut src, &sent, AccountId(6));
-    src.ask_replace(ME).expect("question");
+    let q = src.ask_replace(ME).expect("question");
+    // F3: the question says that the link in progress is cancelled.
+    assert_eq!(
+        q.paragraphs.last().map(String::as_str),
+        Some(
+            "Linking another Test network account has not finished. Removing this account now cancels that link. You can link that account again later."
+        )
+    );
     src.confirm_replace(ME).expect("link page");
     assert_eq!(
         commands(&sent),
         [("cancel-login", 6), ("remove", 1), ("add", 0)]
     );
+}
+
+#[test]
+fn transfer_history_is_not_offered_while_the_account_still_links() {
+    // `buttons.md` F4: after its transfer a link goes on (contacts, groups, profiles) until
+    // its `Done`; offering the transfer then would delete what just arrived.
+    let offers = |src: &CoreSource, id: AccountId| {
+        src.accounts()
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.offers_history)
+    };
+    let new = AccountId(2);
+    let row = kourier_core::facade::AccountRow {
+        id: new,
+        uuid: AccountUuid::new_random(),
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    let me = kourier_core::facade::AccountRow {
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    // The core has announced the account (rows are asked for at `AccountAdded`).
+    let (mut src, sent) = with_accounts(vec![me.clone(), row.clone()]);
+    let step = |kind| UiEvent::LoginStep {
+        account: new,
+        step: LoginStep {
+            step_id: "linking".into(),
+            txn: 0,
+            kind,
+        },
+    };
+    let progress = || {
+        step(LoginStepKind::Progress {
+            label: "Syncing contacts and groups".into(),
+            fraction: None,
+        })
+    };
+    let answer_accounts = |src: &mut CoreSource| {
+        for (t, q) in take_queries(&sent) {
+            if matches!(q, Query::Accounts) {
+                src.on_event(&result(
+                    t,
+                    QueryData::Accounts(vec![me.clone(), row.clone()]),
+                ));
+            }
+        }
+    };
+    linking(&mut src, &sent, new);
+    assert_eq!(offers(&src, new), Some(false), "at the QR");
+    src.on_event(&transfer(new, HistoryTransfer::Reading));
+    assert_eq!(offers(&src, new), Some(false), "during the transfer");
+    src.on_event(&transfer(new, HistoryTransfer::Done));
+    src.on_event(&progress());
+    assert_eq!(offers(&src, new), Some(false), "in the tail, the page up");
+    // The page is left in the tail (its Cancel): the link goes on in the background.
+    src.cancel_login();
+    src.on_event(&progress());
+    assert_eq!(offers(&src, new), Some(false), "in the tail, the page left");
+    assert_eq!(offers(&src, ME), Some(true), "the other account offers it");
+    src.on_event(&step(LoginStepKind::Done));
+    answer_accounts(&mut src);
+    assert_eq!(offers(&src, new), Some(true), "once the link is done");
+    // A login that started again and was logged out by the phone has nothing to protect.
+    src.on_event(&progress());
+    assert_eq!(offers(&src, new), Some(false));
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: logged_out(),
+    });
+    assert_eq!(offers(&src, new), Some(true), "a logged-out account");
+    // A removed account forgets its unfinished link.
+    src.on_event(&UiEvent::AccountRemoved { account: new });
+    assert!(!src.unfinished_links.contains(&new));
+}
+
+#[test]
+fn an_action_that_would_cancel_a_link_in_progress_asks_first() {
+    // `buttons.md` F3: Settings, "Link Again" or "Remove and Link Again" cancel the login of
+    // the link page; the window asks first when that loses a link.
+    // The first account is logged out: "Link Again" is what the banner offers for it.
+    let (mut src, sent) = with_accounts(vec![logged_out_account()]);
+    assert!(src.abandon_question().is_none(), "no login");
+    assert_eq!(
+        src.ask_replace(ME).expect("question").paragraphs.len(),
+        3,
+        "no link to mention"
+    );
+    src.cancel_replace();
+    linking(&mut src, &sent, AccountId(6));
+    let q = src.abandon_question().expect("at the QR code");
+    assert_eq!(
+        (q.title.as_str(), q.confirm.as_str(), q.cancel.as_str()),
+        ("Stop Linking?", "Stop Linking", "Continue Linking")
+    );
+    // The text names what cancels the link. The dialog's default button says "Continue
+    // Linking", so the text must not say that going on cancels it (user review of L1).
+    assert_eq!(
+        q.text,
+        "Linking a Test network account has not finished. Opening this now cancels the link. You can link the account again later."
+    );
+    assert!(!q.text.contains("Going on"), "{}", q.text);
+    // Linked (its transfer runs or ran): leaving the page cancels nothing.
+    src.on_event(&transfer(AccountId(6), HistoryTransfer::Waiting));
+    assert!(src.abandon_question().is_none(), "transfer waiting");
+    src.on_event(&transfer(AccountId(6), HistoryTransfer::Reading));
+    src.on_event(&transfer(AccountId(6), HistoryTransfer::Done));
+    assert!(src.abandon_question().is_none(), "in the tail");
+    // Asking does not cancel; the answer does.
+    assert!(!commands(&sent).iter().any(|c| c.0 == "cancel-login"));
+    // "Link Again" can be stopped at any step.
+    src.relink(ME).expect("relink");
+    assert!(src.abandon_question().is_some(), "a relink");
+    src.cancel_login();
+    // (The page of 6 ended at its transfer, link feedback L3: no cancel goes out for it.)
+    assert_eq!(commands(&sent), [("relink", 1), ("cancel-login", 1)]);
+    assert!(src.abandon_question().is_none(), "after the cancel");
+}
+
+/// The first account of the tests, logged out by the phone: its banner offers "Link Again".
+fn logged_out_account() -> kourier_core::facade::AccountRow {
+    kourier_core::facade::AccountRow {
+        state: AccountState::LoggedOut {
+            reason: "unlinked".into(),
+        },
+        conn: logged_out(),
+        ..account()
+    }
+}
+
+/// Answers the accounts query the source asked for with `rows` (and the others with nothing).
+fn answer_accounts(src: &mut CoreSource, sent: &Sent, rows: &[kourier_core::facade::AccountRow]) {
+    for (t, q) in take_queries(sent) {
+        if matches!(q, Query::Accounts) {
+            src.on_event(&result(t, QueryData::Accounts(rows.to_vec())));
+        }
+    }
+}
+
+fn progress_step(account: AccountId, label: &str) -> UiEvent {
+    UiEvent::LoginStep {
+        account,
+        step: LoginStep {
+            step_id: "syncing".into(),
+            txn: 0,
+            kind: LoginStepKind::Progress {
+                label: label.into(),
+                fraction: None,
+            },
+        },
+    }
+}
+
+#[test]
+fn a_fresh_link_without_a_transfer_asks_nothing_once_the_core_has_the_account() {
+    // The phone declined the history: no transfer is ever reported. The core takes
+    // `AccountReady` (the account turns Active) and the link page shows the tail ("Syncing
+    // contacts and groups") for minutes. A cancel is dropped for a linked account
+    // (`supervisor.rs` `Control::CancelLogin if !linked`), so a question "Stop Linking?" there
+    // would promise a cancel that never happens (user and correctness reviews of L1).
+    let new = AccountId(2);
+    let me = kourier_core::facade::AccountRow {
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    let row = |state| kourier_core::facade::AccountRow {
+        id: new,
+        uuid: AccountUuid::new_random(),
+        state,
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    let (mut src, sent) = with_accounts(vec![me.clone()]);
+    src.start_login(NetworkKind::Fake).expect("start");
+    // The core announces the account (state Linking) and the source asks for the rows.
+    src.on_event(&UiEvent::AccountAdded { account: new });
+    answer_accounts(&mut src, &sent, &[me.clone(), row(AccountState::Linking)]);
+    src.on_event(&progress_step(new, "Linking"));
+    assert!(src.abandon_question().is_some(), "at the QR code");
+    assert!(
+        src.abandon_question().is_some(),
+        "linking, the core has not the account"
+    );
+    // `AccountReady` is taken: the core's account list says Active.
+    src.on_event(&UiEvent::AccountsChanged);
+    answer_accounts(&mut src, &sent, &[me.clone(), row(AccountState::Active)]);
+    assert!(
+        src.abandon_question().is_none(),
+        "the account is Active: leaving the page cancels nothing"
+    );
+    src.on_event(&progress_step(new, "Syncing contacts and groups"));
+    assert!(src.abandon_question().is_none(), "in the tail");
+    assert!(
+        !commands(&sent).iter().any(|c| c.0 == "cancel-login"),
+        "asking cancels nothing"
+    );
+}
+
+#[test]
+fn a_link_again_asks_nothing_once_the_core_has_the_account_again() {
+    // "Link Again" of a logged-out account: the account is LoggedOut while the phone
+    // scans, Active from `AccountReady` on (the tail follows).
+    let (mut src, sent) = with_accounts(vec![logged_out_account()]);
+    src.relink(ME).expect("relink");
+    assert!(src.abandon_question().is_some(), "at the QR code");
+    src.on_event(&progress_step(ME, "Linking"));
+    assert!(src.abandon_question().is_some(), "linking");
+    src.on_event(&UiEvent::AccountsChanged);
+    let active = kourier_core::facade::AccountRow {
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    answer_accounts(&mut src, &sent, &[active]);
+    // The row says Active, the live state still says logged out: the page stays.
+    assert!(
+        src.abandon_question().is_some(),
+        "the logout is the newer word"
+    );
+    assert_eq!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Progress)
+    );
+    // The relinked account connects: the core has it, and the page ends (link feedback L3).
+    let ch = src.on_event(&UiEvent::ConnState {
+        account: ME,
+        state: ConnState::Connecting,
+    });
+    assert!(ch.login);
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    src.on_event(&progress_step(ME, "Syncing contacts and groups"));
+    assert!(
+        src.abandon_question().is_none(),
+        "the relinked account is Active: nothing to cancel"
+    );
+}
+
+fn failed_step(account: AccountId) -> UiEvent {
+    UiEvent::LoginStep {
+        account,
+        step: LoginStep {
+            step_id: "already-added".into(),
+            txn: 0,
+            kind: LoginStepKind::Failed {
+                error: kourier_model::BackendError::new(
+                    kourier_model::ErrorKind::AlreadyAdded { logged_out: false },
+                    "already".to_owned(),
+                ),
+            },
+        },
+    }
+}
+
+fn done_step(account: AccountId) -> UiEvent {
+    UiEvent::LoginStep {
+        account,
+        step: LoginStep {
+            step_id: "done".into(),
+            txn: 0,
+            kind: LoginStepKind::Done,
+        },
+    }
+}
+
+/// Link feedback L3: the backend's own `Done` of a second link of an account that is here
+/// can come before the core refuses it: the refusal still shows (`link_actions_ui`
+/// `already`). Once the page ended because the core has the account, a later failure of the
+/// backend's tail does not take the page back.
+#[test]
+fn a_refusal_after_the_backends_done_shows_but_not_after_the_core_took_the_account() {
+    let me = kourier_core::facade::AccountRow {
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    let new = AccountId(2);
+    let (mut src, sent) = with_accounts(vec![me.clone()]);
+    src.start_login(NetworkKind::Fake).expect("start");
+    src.on_event(&UiEvent::AccountAdded { account: new });
+    src.on_event(&done_step(new));
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    let ch = src.on_event(&failed_step(new));
+    assert!(ch.login);
+    assert_eq!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Failed)
+    );
+
+    // The core took the account: the page ended, a later failure changes nothing.
+    let other = AccountId(3);
+    src.start_login(NetworkKind::Fake).expect("start again");
+    src.on_event(&UiEvent::AccountAdded { account: other });
+    src.on_event(&transfer(other, HistoryTransfer::Waiting));
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    let ch = src.on_event(&failed_step(other));
+    assert!(!ch.login);
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Done));
+    drop(sent);
+}
+
+/// F8: closing the window while a transfer runs or a new link still fetches its contacts
+/// and groups asks first; after it (or after a failure) it quits at once.
+#[test]
+fn quitting_asks_while_a_transfer_or_the_update_after_a_link_runs() {
+    let (mut src, sent) = loaded();
+    assert!(src.quit_question().is_none(), "nothing runs");
+    let new = AccountId(5);
+    linking(&mut src, &sent, new);
+    src.on_event(&transfer(new, HistoryTransfer::Waiting));
+    known(&mut src, &sent, &[ME, new]);
+    let q = src
+        .quit_question()
+        .expect("a transfer that waits for the phone");
+    assert_eq!(q.title, "Quit While Importing History?");
+    assert_eq!(
+        q.text,
+        "Kourier is still importing your message history. It goes on at the next start."
+    );
+    assert_eq!((q.confirm.as_str(), q.cancel.as_str()), ("Quit", "Cancel"));
+    src.on_event(&transfer(new, HistoryTransfer::Reading));
+    assert_eq!(
+        src.quit_question().map(|q| q.title),
+        Some("Quit While Importing History?".to_owned())
+    );
+    // The update after it: asked with its own words, also while a transfer is reported.
+    src.on_event(&left(30, 2));
+    assert_eq!(
+        src.quit_question().map(|q| q.title),
+        Some("Quit While Importing History?".to_owned()),
+        "the transfer goes first"
+    );
+    src.on_event(&transfer(new, HistoryTransfer::Done));
+    let q = src.quit_question().expect("the update after the transfer");
+    assert_eq!(q.title, "Quit While Updating Contacts and Groups?");
+    assert_eq!(
+        q.text,
+        "Kourier is still fetching your contacts and groups. It goes on at the next start."
+    );
+    src.on_event(&UiEvent::AccountProgress {
+        account: new,
+        progress: kourier_model::AccountProgress::finished(),
+    });
+    assert!(src.quit_question().is_none(), "finished");
+    // A failure that waits to be dismissed is not work that goes on.
+    src.on_event(&transfer(
+        new,
+        HistoryTransfer::Failed(HistoryTransferFailure::Download),
+    ));
+    assert!(src.quit_question().is_none(), "a failure");
+    // A logged-out account does nothing more, whatever was last heard of its work.
+    src.on_event(&transfer(new, HistoryTransfer::Waiting));
+    src.on_event(&left(5, 0));
+    assert!(src.quit_question().is_some());
+    src.on_event(&UiEvent::ConnState {
+        account: new,
+        state: logged_out(),
+    });
+    assert!(src.quit_question().is_none(), "logged out");
+}
+
+// ---------- "Remove Account…" and "Unlink…" (link feedback L4) ----------
+
+#[test]
+fn a_plain_removal_needs_its_own_question_and_cancels_no_other_login() {
+    let (mut src, sent) = loaded();
+    // Without a question nothing is removed, and neither by another action's question.
+    assert!(!src.confirm_account_action(ME, AccountAction::Remove));
+    src.ask_account_action(ME, AccountAction::Unlink)
+        .expect("unlink question");
+    assert!(!src.confirm_account_action(ME, AccountAction::Remove));
+    // The question of "Transfer History from Phone…" is not this one either.
+    src.ask_replace(ME).expect("replace question");
+    assert!(!src.confirm_account_action(ME, AccountAction::Remove));
+    assert_eq!(commands(&sent), []);
+    // A link of another account waits at its QR code: the removal leaves it alone.
+    linking(&mut src, &sent, AccountId(6));
+    let q = src
+        .ask_account_action(ME, AccountAction::Remove)
+        .expect("question");
+    assert_eq!(q.title, "Remove Account?");
+    assert_eq!(q.about, "Me · Test network");
+    // Asking closed the replace question: it cannot be confirmed behind this one's back.
+    assert!(src.confirm_replace(ME).is_err());
+    assert!(src.confirm_account_action(ME, AccountAction::Remove));
+    assert_eq!(commands(&sent), [("remove", 1)]);
+    // Taken once.
+    assert!(!src.confirm_account_action(ME, AccountAction::Remove));
+    assert_eq!(commands(&sent), []);
+}
+
+#[test]
+fn an_unlink_needs_its_own_question_and_cancels_no_other_login() {
+    let (mut src, sent) = loaded();
+    linking(&mut src, &sent, AccountId(6));
+    src.ask_account_action(ME, AccountAction::Remove)
+        .expect("remove question");
+    assert!(!src.confirm_account_action(ME, AccountAction::Unlink));
+    let q = src
+        .ask_account_action(ME, AccountAction::Unlink)
+        .expect("question");
+    assert_eq!(q.confirm, "Unlink");
+    assert!(src.confirm_account_action(ME, AccountAction::Unlink));
+    assert_eq!(commands(&sent), [("unlink", 1)]);
+    assert!(!src.confirm_account_action(ME, AccountAction::Unlink));
+    // Cancelled: nothing.
+    src.ask_account_action(ME, AccountAction::Unlink)
+        .expect("question");
+    src.cancel_account_action();
+    assert!(!src.confirm_account_action(ME, AccountAction::Unlink));
+    assert_eq!(commands(&sent), []);
+}
+
+#[test]
+fn a_logged_out_account_offers_removal_but_no_unlink() {
+    let (mut src, sent) = loaded();
+    assert!(src.accounts().iter().all(|a| a.offers_unlink));
+    src.on_event(&UiEvent::ConnState {
+        account: ME,
+        state: ConnState::LoggedOut {
+            reason: "unlinked".into(),
+        },
+    });
+    assert!(src.accounts().iter().all(|a| !a.offers_unlink));
+    assert!(src.ask_account_action(ME, AccountAction::Unlink).is_none());
+    src.ask_account_action(ME, AccountAction::Remove)
+        .expect("question");
+    assert!(src.confirm_account_action(ME, AccountAction::Remove));
+    assert_eq!(commands(&sent), [("remove", 1)]);
+}
+
+#[test]
+fn an_unlink_asked_before_a_logout_sends_nothing_after_it() {
+    let (mut src, sent) = loaded();
+    src.ask_account_action(ME, AccountAction::Unlink)
+        .expect("question");
+    src.on_event(&UiEvent::ConnState {
+        account: ME,
+        state: ConnState::LoggedOut {
+            reason: "unlinked".into(),
+        },
+    });
+    assert!(!src.confirm_account_action(ME, AccountAction::Unlink));
+    assert_eq!(commands(&sent), []);
+}
+
+#[test]
+fn a_removed_account_closes_its_question() {
+    let (mut src, sent) = loaded();
+    src.ask_account_action(ME, AccountAction::Remove)
+        .expect("question");
+    src.on_event(&UiEvent::AccountRemoved { account: ME });
+    assert!(!src.confirm_account_action(ME, AccountAction::Remove));
+    assert_eq!(commands(&sent), []);
+}
+
+fn label(
+    name: Option<&str>,
+    twin: bool,
+    device: Option<u32>,
+    linked_at: i64,
+) -> kourier_core::facade::AccountLabel {
+    kourier_core::facade::AccountLabel {
+        network: NetworkKind::Fake,
+        display_name: name.map(Into::into),
+        number: None,
+        own_device: device,
+        linked_at,
+        twin,
+    }
+}
+
+fn outcome(
+    seq: u64,
+    removed: bool,
+    report: kourier_model::LogoutReport,
+    who: kourier_core::facade::AccountLabel,
+) -> UiEvent {
+    UiEvent::LogoutOutcome {
+        seq,
+        account: ME,
+        removed,
+        report,
+        who,
+    }
+}
+
+#[test]
+fn the_outcome_of_a_removal_is_told_once() {
+    use kourier_model::{DeviceLogout, LogoutReport};
+    let (mut src, _sent) = loaded();
+    let event = outcome(
+        1,
+        true,
+        LogoutReport::new(DeviceLogout::NotReached),
+        label(Some("Me"), false, Some(2), 0),
+    );
+    let ch = src.on_event(&event);
+    assert!(ch.account_notice);
+    let notices = src.take_logout_notices();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0].text,
+        "The account “Me” was removed from this computer."
+    );
+    assert_eq!(
+        notices[0].on_phone,
+        "Test network could not be reached: remove this computer from the linked devices on your phone."
+    );
+    assert!(src.take_logout_notices().is_empty());
+    // The core tells an outcome it gave before `UiReady` once more at it: not shown twice.
+    let again = src.on_event(&event);
+    assert!(!again.account_notice);
+    assert!(src.take_logout_notices().is_empty());
+    src.on_event(&UiEvent::AccountRemoved { account: ME });
+    assert!(src.take_logout_notices().is_empty());
+}
+
+/// An outcome told live after the front-end subscribed can have a higher number than the ones
+/// only the replay at `UiReady` brings: those are still told, each once.
+#[test]
+fn a_replay_after_a_newer_live_outcome_still_tells_the_older_ones() {
+    use kourier_model::{DeviceLogout, LogoutReport};
+    let (mut src, _sent) = loaded();
+    let ev = |seq| {
+        outcome(
+            seq,
+            true,
+            LogoutReport::new(DeviceLogout::NotReached),
+            label(Some("Me"), false, Some(2), 0),
+        )
+    };
+    src.on_event(&ev(3));
+    for seq in [1, 2, 3] {
+        src.on_event(&ev(seq));
+    }
+    assert_eq!(
+        src.take_logout_notices().len(),
+        3,
+        "1 and 2 once each, 3 once"
+    );
+}
+
+/// F1: a removal the start finished tells its outcome before the account list is loaded and
+/// after the row is gone; the notice still names the account, from the event.
+#[test]
+fn a_notice_names_its_account_from_the_event_not_from_the_list() {
+    use kourier_model::{DeviceLogout, LogoutReport};
+    let (mut src, _sent) = source();
+    // Nothing loaded: no account list at all.
+    assert!(src.accounts().is_empty());
+    src.on_event(&outcome(
+        4,
+        true,
+        LogoutReport::new(DeviceLogout::Removed),
+        label(Some("Ann"), false, Some(2), 0),
+    ));
+    let notices = src.take_logout_notices();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0].text,
+        "The account “Ann” was removed from this computer."
+    );
+    // A profile without a name is told by its network, never by nothing.
+    src.on_event(&outcome(
+        5,
+        false,
+        LogoutReport::new(DeviceLogout::Removed),
+        label(None, false, None, 0),
+    ));
+    assert_eq!(
+        src.take_logout_notices()[0].text,
+        "This computer was unlinked from the account “Test network”. Its chats stay readable here."
+    );
+}
+
+#[test]
+fn two_links_of_one_identity_are_told_apart_by_their_device_and_day() {
+    // D10: a profile from before one identity was one account holds two that look the same.
+    // The day is what the phone lists beside each linked device (the clock of these tests is
+    // 2025-10-09, UTC).
+    let first = kourier_core::facade::AccountRow {
+        own_device: Some(2),
+        linked_at: 1_757_678_400_000, // 2025-09-12
+        conn: ConnState::Online { detail: None },
+        ..account()
+    };
+    let twin = kourier_core::facade::AccountRow {
+        id: AccountId(2),
+        uuid: AccountUuid::new_random(),
+        own_device: Some(3),
+        linked_at: 1_709_640_000_000, // 2024-03-05, another year
+        ..first.clone()
+    };
+    let other = kourier_core::facade::AccountRow {
+        id: AccountId(3),
+        uuid: AccountUuid::new_random(),
+        display_name: Some("Work".into()),
+        own_device: Some(4),
+        ..first.clone()
+    };
+    let (mut src, sent) = with_accounts(vec![first, twin, other]);
+    let devices: Vec<_> = src.accounts().into_iter().map(|a| a.device).collect();
+    assert_eq!(
+        devices,
+        [
+            "device 2 · linked 12 Sep",
+            "device 3 · linked 5 Mar 2024",
+            ""
+        ]
+    );
+    let q = src
+        .ask_account_action(AccountId(2), AccountAction::Remove)
+        .expect("question");
+    assert_eq!(q.about, "Me · Test network · device 3 · linked 5 Mar 2024");
+    assert!(src.confirm_account_action(AccountId(2), AccountAction::Remove));
+    assert_eq!(commands(&sent), [("remove", 2)]);
+    // An account that looks like no other says no device.
+    let q = src
+        .ask_account_action(AccountId(3), AccountAction::Remove)
+        .expect("question");
+    assert_eq!(q.about, "Work · Test network");
+}
+
+/// F2: when the phone cannot be told, the instruction for two links of one account names the
+/// entry by its name and its day, never "this computer".
+#[test]
+fn the_instruction_for_a_twin_names_its_device_and_day() {
+    use kourier_model::{DeviceLogout, LogoutReport};
+    let (mut src, _sent) = source();
+    let report = LogoutReport {
+        outcome: DeviceLogout::NotReached,
+        device_name: Some("workstation".into()),
+    };
+    src.on_event(&outcome(
+        1,
+        true,
+        report,
+        label(Some("Me"), true, Some(3), 1_757_678_400_000),
+    ));
+    let n = &src.take_logout_notices()[0];
+    assert_eq!(
+        n.on_phone,
+        "Test network could not be reached: remove “workstation” linked on 12 Sep from the linked devices on your phone."
+    );
+    assert_eq!(
+        n.text,
+        "The account “Me · device 3 · linked 12 Sep” was removed from this computer."
+    );
+}
+
+/// Wording: a logged-out account has no link to cut, and the question must not say Kourier
+/// unlinks anything.
+#[test]
+fn removing_a_logged_out_account_does_not_claim_to_unlink() {
+    let (mut src, _sent) = loaded();
+    let q = src
+        .ask_account_action(ME, AccountAction::Remove)
+        .expect("question");
+    assert!(q.paragraphs[0].starts_with("Kourier unlinks this computer"));
+    src.on_event(&UiEvent::ConnState {
+        account: ME,
+        state: ConnState::LoggedOut {
+            reason: "unlinked".into(),
+        },
+    });
+    let q = src
+        .ask_account_action(ME, AccountAction::Remove)
+        .expect("question");
+    assert_eq!(
+        q.paragraphs[0],
+        "Kourier deletes this account's chats, messages and files from this computer."
+    );
+}
+
+/// F3: "Remove and Link Again?" is asked only where "Transfer History from Phone…" is offered:
+/// not while the account's history is being imported, and not for a network without it. A menu
+/// item that is hidden but still reachable by the keyboard must not get there.
+#[test]
+fn the_replace_question_is_not_asked_while_a_transfer_runs() {
+    let (mut src, _sent) = loaded();
+    assert!(src.ask_replace(ME).is_some(), "offered at rest");
+    src.cancel_replace();
+    src.on_event(&transfer(ME, downloading(1, Some(10))));
+    assert!(
+        !src.accounts()[0].offers_history,
+        "hidden while the transfer runs"
+    );
+    assert!(src.ask_replace(ME).is_none(), "and not to be asked");
+}
+
+/// L5 (`buttons.md` §3): "Continue Without History" pressed twice (a double click, or a
+/// press and a key) sends ONE skip; the backend's next report (the same state again after a
+/// restart that lost the skip) lets the user press it again, and so does the time (the
+/// window is 2 s: `transfer.rs` `a_second_press_is_dropped_only_within_the_double_click_time`
+/// has the clock).
+#[test]
+fn a_skip_pressed_twice_is_sent_once() {
+    let (mut src, sent) = loaded();
+    src.on_event(&transfer(ME, downloading(1_000, Some(4_000))));
+    assert!(src.skip_transfer(ME));
+    assert!(!src.skip_transfer(ME), "the second press");
+    assert_eq!(commands(&sent), [("skip", 1)]);
+    // The backend restarted before it took the skip: the state is reported again.
+    src.on_event(&transfer(ME, downloading(1_000, Some(4_000))));
+    assert!(
+        src.skip_transfer(ME),
+        "a skip the backend lost can be sent again"
+    );
+    assert!(!src.skip_transfer(ME));
+    assert_eq!(commands(&sent), [("skip", 1)]);
+    src.on_event(&transfer(ME, HistoryTransfer::Skipped));
+    assert!(src.take_transfer_notices().is_empty(), "our own skip");
+    assert_eq!(commands(&sent), [("dismiss", 1)]);
 }

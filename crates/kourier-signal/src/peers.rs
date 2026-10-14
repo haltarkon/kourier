@@ -221,24 +221,32 @@ pub(crate) fn set_expire_timer(
     Ok(())
 }
 
-/// Sets the 1:1 timer and its version as the phone states them at the initial contact sync
-/// (Desktop resets its version there: the phone's counter may have started over).
-pub(crate) fn reset_expire_timer(
+/// Stores a 1:1 timer and its version as a pair, unless the version is BELOW the stored one:
+/// then the stored pair stays and nothing is written (`false`). The timer and the version
+/// travel together, as in the incoming rule (`timer::incoming` refuses an older version).
+/// For a source that states both from the phone's column: the initial contact sync (Android
+/// applies a synced timer only when its version is higher: `MultiDeviceContactSyncJob.kt`)
+/// and the history import's chats zone, which runs again after a redo or a lost stage and
+/// must not write the archive's old timer beside the version of a timer change the user made
+/// meanwhile.
+pub(crate) fn set_expire_timer_unless_older(
     conn: &Connection,
     service_id: &str,
     timer: u32,
     version: u32,
     now: i64,
-) -> Result<()> {
-    conn.prepare_cached(
-        "INSERT INTO peers(service_id, expire_timer, expire_timer_version, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(service_id) DO UPDATE SET expire_timer = excluded.expire_timer,
-           expire_timer_version = excluded.expire_timer_version,
-           updated_at = excluded.updated_at",
-    )?
-    .execute((service_id, timer, version, now))?;
-    Ok(())
+) -> Result<bool> {
+    let changed = conn
+        .prepare_cached(
+            "INSERT INTO peers(service_id, expire_timer, expire_timer_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(service_id) DO UPDATE SET expire_timer = excluded.expire_timer,
+               expire_timer_version = excluded.expire_timer_version,
+               updated_at = excluded.updated_at
+             WHERE excluded.expire_timer_version >= peers.expire_timer_version",
+        )?
+        .execute((service_id, timer, version, now))?;
+    Ok(changed > 0)
 }
 
 /// Raises the stored 1:1 timer version to `version` (the timer itself stays).

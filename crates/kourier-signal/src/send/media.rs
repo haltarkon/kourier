@@ -477,11 +477,15 @@ impl<T: SignalTransport> Uploader<'_, T> {
         let result = self.upload_all(slots, &sent).await;
         ticker.abort();
         if result.is_ok() {
+            // The uploads are over: no step. A 1:1 send reports none after this (the sealed
+            // send, the sync transcript), and the line under the message would go on saying
+            // "Uploading files"; a group send reports its own next step.
             let _ = self
                 .shared
                 .emit(BackendEvent::TransmitProgress {
                     local: self.local,
                     progress: 1.0,
+                    phase: None,
                 })
                 .await;
         }
@@ -727,7 +731,11 @@ async fn report_progress<T: SignalTransport>(
         // Never 1.0 from here: `run` reports that once every upload is done.
         let progress = (now as f32 / total as f32).min(0.99);
         if shared
-            .emit(BackendEvent::TransmitProgress { local, progress })
+            .emit(BackendEvent::TransmitProgress {
+                local,
+                progress,
+                phase: Some(kourier_model::SendPhase::Uploading),
+            })
             .await
             .is_err()
         {
@@ -840,7 +848,9 @@ mod tests {
                         assert!(envelope.ack.is_none(), "progress is ephemeral");
                         for event in envelope.events {
                             match event {
-                                BackendEvent::TransmitProgress { local: l, progress } => {
+                                BackendEvent::TransmitProgress {
+                                    local: l, progress, ..
+                                } => {
                                     assert_eq!(l, local);
                                     seen.push(progress);
                                 }

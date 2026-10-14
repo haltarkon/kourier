@@ -30,6 +30,15 @@ QtObject {
         shell.releaseTimer.stop();
         if (shell.window === null) {
             shell.window = shell.windowComponent.createObject(null) as MainWindow;
+            // What was told while there was no window waits in it until it is shown.
+            if (shell.window !== null && shell.pendingLogoutNotices.length > 0) {
+                shell.window.logoutNotices += shell.pendingLogoutNotices.length;
+                shell.window.pendingLogoutNotices = shell.window.pendingLogoutNotices.concat(shell.pendingLogoutNotices);
+                shell.pendingLogoutNotices = [];
+                // (Shown once the window is up: on the next turn of the event loop, after the
+                // caller has shown it, or when it shows.)
+                Qt.callLater(shell.window.tellLogoutNotices);
+            }
         }
         return shell.window;
     }
@@ -66,6 +75,10 @@ QtObject {
         Qt.quit();
     }
 
+    // Notices about removed or unlinked accounts told while no window existed (link
+    // feedback L5): handed to the next window, which shows them once it is visible.
+    property var pendingLogoutNotices: []
+
     // The window that is being released: set until the event loop has really deleted it.
     property MainWindow releasing: null
     // How many times a hidden window was released (its memory handed back).
@@ -88,6 +101,9 @@ QtObject {
                 if (App.windowReleasing()) {
                     shell.coreReleases += 1;
                 }
+                // Its notices not shown yet outlive it, and so does the one whose dialog is open
+                // (a dialog dies with its window; the user did not answer it): link feedback L5.
+                shell.pendingLogoutNotices = shell.pendingLogoutNotices.concat(shell.window.unshownLogoutNotices());
                 shell.releasing = shell.window;
                 shell.window = null;
                 shell.releasing.destroy();
@@ -125,6 +141,19 @@ QtObject {
         }
         function onQuitRequested(): void {
             shell.quit();
+        }
+        // What became of a removed or unlinked account's device, told while no window exists
+        // (released in the tray, or a `--background` start): kept for the next window. A
+        // window that exists takes it itself (`MainWindow.qml`).
+        function onLogoutNotice(text: string, onPhone: string, title: string): void {
+            if (shell.window !== null) {
+                return;
+            }
+            shell.pendingLogoutNotices.push({
+                "text": text,
+                "onPhone": onPhone,
+                "title": title
+            });
         }
         function onTrayStatusChanged(): void {
             // Never stay invisible without a tray to come back from.

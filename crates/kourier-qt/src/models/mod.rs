@@ -173,6 +173,30 @@ pub fn set_rows<M: ListModel>(mut model: Pin<&mut M>, generation: u64, new: Vec<
     true
 }
 
+/// Replaces row `at` with `new` where the model's roles say it differs (the row's diff
+/// identity must be the same): the Qt row is built again and only the roles that changed are
+/// announced. For the one-row updates the per-second tick makes; `false` when the row is not
+/// there, is another one, or did not change.
+pub fn patch_row<M: ListModel>(mut model: Pin<&mut M>, at: usize, new: M::View) -> bool {
+    let store = model.store();
+    let Some(old) = store.view.get(at) else {
+        return false;
+    };
+    if M::key(old) != M::key(&new) || *old == new {
+        return false;
+    }
+    let roles = M::changed_roles(old, &new);
+    let store = model.as_mut().store_mut();
+    store.qt[at] = M::build(&new);
+    store.view[at] = new;
+    let mut ids = QVector::<i32>::default();
+    for i in roles.iter() {
+        ids.append(role_id(i as usize));
+    }
+    model.emit_changed(as_i32(at), &ids);
+    true
+}
+
 /// Applies `ops` (from [`diff::diff`] against the current rows) taking rows from `new`.
 pub fn apply<M: ListModel>(mut model: Pin<&mut M>, ops: &[ListOp], new: &[M::View]) {
     for op in ops {

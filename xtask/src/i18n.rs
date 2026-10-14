@@ -5,7 +5,7 @@
 //! application:
 //!
 //! - QML: `L10n.i18nc(…)` and QML's own `i18n*()` functions, read by `xgettext -L JavaScript`;
-//! - Rust: the calls of `kourier_viewmodel::i18n` (`trc`, `trnc`, `trfc`, `trc_noop`), read by
+//! - Rust: the calls of `kourier_viewmodel::i18n` (`trc`, `trnc`, `trnfc`, `trfc`, `trc_noop`), read by
 //!   the small reader below, because GNU xgettext has no Rust parser before 0.24;
 //! - the desktop file (`Name`, `GenericName`, `Comment`, `Keywords`) and the AppStream
 //!   metainfo (`xgettext` with gettext's `metainfo.its` rules).
@@ -59,7 +59,13 @@ const QML_KEYWORDS: &[&str] = &[
 
 /// The functions of `kourier_viewmodel::i18n` the Rust reader looks for, with the position of
 /// the context (always 0) and of the message ids that follow it.
-const RUST_KEYWORDS: &[(&str, usize)] = &[("trc", 1), ("trfc", 1), ("trnc", 2), ("trc_noop", 1)];
+const RUST_KEYWORDS: &[(&str, usize)] = &[
+    ("trc", 1),
+    ("trfc", 1),
+    ("trnc", 2),
+    ("trnfc", 2),
+    ("trc_noop", 1),
+];
 
 /// The header of the template: written by this tool, not by `xgettext`, so that it has no date.
 const POT_HEADER: &str = "# Translation template of Kourier (gettext domain \"kourier\").

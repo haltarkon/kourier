@@ -8,32 +8,58 @@ use kourier_blob::{BlobId, FileKey};
 use kourier_db::rusqlite::{Connection, OptionalExtension, params};
 use kourier_model::{
     AccountCaps, AccountId, AccountLocalPrefs, AttachmentId, AttachmentKind, AttachmentMeta,
-    AttachmentState, BackendError, BlobKey, ConversationId, ErrorKind, MessageId,
+    AttachmentState, BackendError, BlobKey, Body, ConversationId, ErrorKind, MessageId,
 };
 
 use super::Apply;
-use crate::attachments::policy::{self, Candidate, Decision};
+use crate::attachments::policy::{self, Candidate, Click, Decision};
 use crate::attachments::{DeriveJob, DownloadJob, MAX_DOWNLOAD_RESENDS};
 use crate::error::{CoreError, Refusal, Result};
 use crate::sql;
 
 /// One attachment row as the download rules see it.
-struct AttRow {
-    id: AttachmentId,
-    message: MessageId,
-    conv: ConversationId,
-    kind: AttachmentKind,
-    size: u64,
-    mime: Option<String>,
-    state: AttachmentState,
-    remote: Option<kourier_model::BackendBlob>,
-    file_id: Option<i64>,
-    sticker: bool,
-    long_text: bool,
+pub(super) struct AttRow {
+    pub(super) id: AttachmentId,
+    pub(super) message: MessageId,
+    pub(super) conv: ConversationId,
+    pub(super) kind: AttachmentKind,
+    pub(super) size: u64,
+    pub(super) mime: Option<String>,
+    pub(super) state: AttachmentState,
+    pub(super) remote: Option<kourier_model::BackendBlob>,
+    pub(super) file_id: Option<i64>,
+    pub(super) sticker: bool,
+    pub(super) long_text: bool,
+    /// Its place in the message's attachments (`attachments.idx`).
+    pub(super) idx: usize,
+    /// Its pointer came from the other device's answer (`attachments.restored`).
+    pub(super) restored: bool,
+}
+
+/// Who started a download (`attachment_downloads.source`): only a click that ends "no longer
+/// available" asks the other device at once (`ingest::restore`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Source {
+    /// The user clicked.
+    User,
+    /// The auto-download policy.
+    Auto,
+    /// The other device's answer to a request the user started.
+    Restore,
+}
+
+impl Source {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Auto => "auto",
+            Self::Restore => "restore",
+        }
+    }
 }
 
 const ATT_SELECT: &str = "SELECT a.id, a.message_id, m.conversation_id, a.kind, a.size, a.mime,
-    a.state, a.remote, a.file_id, m.body_kind, a.long_text
+    a.state, a.remote, a.file_id, m.body_kind, a.long_text, a.idx, a.restored
     FROM attachments a JOIN messages m ON m.id = a.message_id";
 
 fn att_row(r: &kourier_db::rusqlite::Row<'_>) -> kourier_db::rusqlite::Result<RawAtt> {
@@ -49,6 +75,8 @@ fn att_row(r: &kourier_db::rusqlite::Row<'_>) -> kourier_db::rusqlite::Result<Ra
         file_id: r.get(8)?,
         body_kind: r.get(9)?,
         long_text: r.get(10)?,
+        idx: r.get(11)?,
+        restored: r.get(12)?,
     })
 }
 
@@ -64,6 +92,8 @@ struct RawAtt {
     file_id: Option<i64>,
     body_kind: String,
     long_text: bool,
+    idx: i64,
+    restored: bool,
 }
 
 impl RawAtt {
@@ -80,11 +110,17 @@ impl RawAtt {
             file_id: self.file_id,
             sticker: self.body_kind == "Sticker",
             long_text: self.long_text,
+            idx: usize::try_from(self.idx).unwrap_or(usize::MAX),
+            restored: self.restored,
         })
     }
 }
 
-fn load_att(conn: &Connection, account: AccountId, id: AttachmentId) -> Result<Option<AttRow>> {
+pub(super) fn load_att(
+    conn: &Connection,
+    account: AccountId,
+    id: AttachmentId,
+) -> Result<Option<AttRow>> {
     conn.prepare_cached(&format!(
         "{ATT_SELECT} WHERE a.id = ?1 AND m.account_id = ?2"
     ))?
@@ -94,8 +130,20 @@ fn load_att(conn: &Connection, account: AccountId, id: AttachmentId) -> Result<O
     .transpose()
 }
 
+/// Every attachment of `message`, in its order (`attachments.idx`).
+pub(super) fn message_atts(conn: &Connection, message: MessageId) -> Result<Vec<AttRow>> {
+    conn.prepare_cached(&format!(
+        "{ATT_SELECT} WHERE a.message_id = ?1 ORDER BY a.idx"
+    ))?
+    .query_map([message.0], att_row)?
+    .collect::<kourier_db::rusqlite::Result<Vec<_>>>()?
+    .into_iter()
+    .map(RawAtt::parse)
+    .collect()
+}
+
 /// The account's auto-download preferences and the network's receive limit.
-fn download_prefs(
+pub(super) fn download_prefs(
     conn: &Connection,
     account: AccountId,
 ) -> Result<(kourier_model::AutoDownloadPolicy, Option<u64>)> {
@@ -110,12 +158,29 @@ fn download_prefs(
     ))
 }
 
+/// The names (`Attachment::net_ids`) of attachment number `idx` of `body`, empty when the
+/// body has none for it.
+pub(super) fn net_ids_in(body: &Body, idx: usize) -> Vec<String> {
+    match body {
+        Body::Media { attachments, .. } => attachments
+            .get(idx)
+            .map(|a| a.net_ids.clone())
+            .unwrap_or_default(),
+        Body::Sticker(a) if idx == 0 => a.net_ids.clone(),
+        _ => Vec::new(),
+    }
+}
+
 fn key_of(bytes: Vec<u8>) -> Result<BlobKey> {
     let key: [u8; 32] = bytes
         .try_into()
         .map_err(|_| CoreError::Json("stored file key is not 32 bytes".into()))?;
     Ok(BlobKey::new(key))
 }
+
+/// The rows of messages (alias `m`) whose time has not come and that the expiry policy has
+/// not hidden, at `?2` (now): the only ones whose attachments are fetched without a click.
+const NOT_DUE: &str = "m.expiry_hidden = 0 AND (m.expires_at IS NULL OR m.expires_at > ?2)";
 
 impl Apply<'_> {
     /// Applies the auto-download policy to the attachments of a message that was just stored.
@@ -142,6 +207,20 @@ impl Apply<'_> {
                 "SELECT blocked <> 0 OR request_pending <> 0 FROM conversations WHERE id = ?1",
             )?
             .query_row([conv.0], |r| r.get(0))?;
+        // A message that is due or hidden by the expiry policy is gone for the user
+        // ([`Self::user_download`] refuses it), so nothing is fetched for it on its own
+        // either: an imported disappearing message whose timer ran out on the phone arrives
+        // with its expiry while the clock is unconfirmed, and its long text would be asked
+        // from the CDN before the sweeper hides the row.
+        let gone: bool = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT NOT ({NOT_DUE}) FROM messages m WHERE m.id = ?1"
+            ))?
+            .query_row(params![message.0, self.now], |r| r.get(0))?;
+        // Parsed when the first download starts, once for the whole message: an album of 31
+        // pictures would parse its body 31 times.
+        let mut body: Option<Body> = None;
         for raw in rows {
             let row = raw.parse()?;
             let cand = Candidate {
@@ -155,8 +234,24 @@ impl Apply<'_> {
                 untrusted,
             };
             match policy::decide(&cand, &prefs, limit) {
+                Decision::Auto if gone => {}
                 Decision::Auto => {
-                    self.request_download(&row)?;
+                    let body = match &body {
+                        Some(body) => body,
+                        None => body.insert(self.body_of(message)?),
+                    };
+                    let names = net_ids_in(body, row.idx);
+                    self.start_download(&row, Source::Auto, names)?;
+                }
+                Decision::TooLarge if history => {
+                    // The import judged by a limit older than the account's own (the remote
+                    // configuration came later, or differs): nothing here can fetch this, and
+                    // the click path refuses it, so it is "not available on this device" like
+                    // the mapper's own too-large pointers, and keeps no key.
+                    self.conn
+                        .prepare_cached("UPDATE attachments SET remote = NULL WHERE id = ?1")?
+                        .execute([row.id.0])?;
+                    self.set_att_state(&row, &AttachmentState::Unavailable)?;
                 }
                 Decision::TooLarge => {
                     self.set_att_state(&row, &AttachmentState::Failed { retryable: false })?;
@@ -173,16 +268,17 @@ impl Apply<'_> {
     /// then such a message showed only the beginning of its text, and nothing would
     /// complete it afterwards: the policy looks at an attachment once, when its message
     /// is stored. Only what the policy fetches on its own (the size of a text, a pointer
-    /// that is still `Remote`, not imported history); pictures and files of the chat stay
-    /// a click away.
+    /// that is still `Remote`; imported long texts too, which the policy fetches like live
+    /// ones) and only for a message that is not due or hidden by the expiry policy;
+    /// pictures and files of the chat stay a click away.
     pub(crate) fn fetch_long_texts(&mut self, conv: ConversationId) -> Result<()> {
         let rows: Vec<RawAtt> = self
             .conn
             .prepare_cached(&format!(
                 "{ATT_SELECT} WHERE m.conversation_id = ?1 AND a.long_text <> 0
-                   AND m.history = 0 AND m.deleted IS NULL ORDER BY a.id"
+                   AND m.deleted IS NULL AND {NOT_DUE} ORDER BY a.id"
             ))?
-            .query_map([conv.0], att_row)?
+            .query_map(params![conv.0, self.now], att_row)?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         if rows.is_empty() {
             return Ok(());
@@ -201,7 +297,7 @@ impl Apply<'_> {
                 untrusted: false,
             };
             if policy::decide(&cand, &prefs, limit) == Decision::Auto {
-                self.request_download(&row)?;
+                self.request_download(&row, Source::Auto)?;
             }
         }
         Ok(())
@@ -229,13 +325,43 @@ impl Apply<'_> {
             ));
         }
         let (_, limit) = download_prefs(self.conn, self.acc.id)?;
-        policy::may_click(row.state, row.remote.is_some(), row.size, limit)
-            .map_err(CoreError::InvalidInput)?;
-        self.request_download(&row)
+        let can_ask = self.can_ask(&row)?;
+        match policy::may_click(row.state, row.remote.is_some(), row.size, limit, can_ask)
+            .map_err(CoreError::InvalidInput)?
+        {
+            Click::Download => self.request_download(&row, Source::User),
+            Click::Ask => {
+                self.ask_restore(&row)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The names of `row` (`Attachment::net_ids` of the message's stored body), empty when
+    /// the body has none for it.
+    pub(super) fn net_ids_of(&self, row: &AttRow) -> Result<Vec<String>> {
+        Ok(net_ids_in(&self.body_of(row.message)?, row.idx))
     }
 
     /// Starts a download of `row` with a fresh blob target, unless one is in flight already.
-    fn request_download(&mut self, row: &AttRow) -> Result<bool> {
+    /// A caller that starts several downloads of one message parses the body once and uses
+    /// [`Self::start_download`].
+    pub(super) fn request_download(&mut self, row: &AttRow, source: Source) -> Result<bool> {
+        if row.remote.is_none() {
+            return Ok(false);
+        }
+        let net_ids = self.net_ids_of(row)?;
+        self.start_download(row, source, net_ids)
+    }
+
+    /// [`Self::request_download`] with the names of `row` (`net_ids_in` of its message's
+    /// body) given.
+    pub(super) fn start_download(
+        &mut self,
+        row: &AttRow,
+        source: Source,
+        net_ids: Vec<String>,
+    ) -> Result<bool> {
         let Some(remote) = row.remote.clone() else {
             return Ok(false);
         };
@@ -246,14 +372,15 @@ impl Apply<'_> {
             .conn
             .prepare_cached(
                 "INSERT OR IGNORE INTO attachment_downloads(attachment_id, account_id, path, key,
-                   requested_at, attempts) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                   requested_at, attempts, source) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
             )?
             .execute(params![
                 row.id.0,
                 self.acc.id.0,
                 path_col,
                 &key.as_bytes()[..],
-                self.now
+                self.now,
+                source.as_str(),
             ])?;
         if inserted == 0 {
             return Ok(false);
@@ -272,11 +399,12 @@ impl Apply<'_> {
             remote,
             path,
             key: BlobKey::new(*key.as_bytes()),
+            net_ids,
         });
         Ok(true)
     }
 
-    fn set_att_state(&mut self, row: &AttRow, state: &AttachmentState) -> Result<()> {
+    pub(super) fn set_att_state(&mut self, row: &AttRow, state: &AttachmentState) -> Result<()> {
         self.conn
             .prepare_cached("UPDATE attachments SET state = ?2 WHERE id = ?1")?
             .execute((row.id.0, sql::to_json(state)?))?;
@@ -301,15 +429,17 @@ impl Apply<'_> {
             // finished the file only now: it goes at once, not at the next start's sweep.
             return self.late_download(attachment, request);
         };
-        let target: Option<(i64, String, Vec<u8>)> = self
+        let target: Option<(i64, String, Vec<u8>, String)> = self
             .conn
             .prepare_cached(
-                "SELECT id, path, key FROM attachment_downloads WHERE attachment_id = ?1",
+                "SELECT id, path, key, source FROM attachment_downloads WHERE attachment_id = ?1",
             )?
-            .query_row([attachment.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row([attachment.0], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .optional()?;
         if let Some(request) = request
-            && target.as_ref().is_none_or(|(id, _, _)| *id != request.0)
+            && target.as_ref().is_none_or(|(id, ..)| *id != request.0)
         {
             tracing::debug!(
                 attachment = attachment.0,
@@ -319,7 +449,7 @@ impl Apply<'_> {
             // The file of a download whose row went before its answer came.
             return self.late_download(attachment, Some(request));
         }
-        let Some((_, path, key)) = target else {
+        let Some((_, path, key, source)) = target else {
             if let Err(e) = result
                 && row.file_id.is_none()
                 && !matches!(row.state, AttachmentState::Local)
@@ -385,7 +515,20 @@ impl Apply<'_> {
             }
             Err(e) => {
                 self.ch.unlink.push(PathBuf::from(path));
-                self.set_att_state(&row, &failed_state(&e))?;
+                let state = failed_state(&e);
+                // A download the USER started that the network no longer has asks the other
+                // device at once, without a second click; an automatic one asks nothing, and
+                // one whose pointer the other device gave does not ask again by itself (a
+                // click still does).
+                if state == AttachmentState::Expired
+                    && source == Source::User.as_str()
+                    && !row.restored
+                    && self.can_ask(&row)?
+                {
+                    self.ask_restore(&row)?;
+                } else {
+                    self.set_att_state(&row, &state)?;
+                }
             }
         }
         Ok(())
@@ -610,6 +753,9 @@ pub(crate) fn resume_downloads(
         })?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     let mut jobs = Vec::new();
+    // The stored body of each message with downloads in flight, parsed once however many of
+    // its attachments are (a 31-picture album is 31 downloads).
+    let mut bodies: std::collections::HashMap<MessageId, Body> = std::collections::HashMap::new();
     for (request, att, path, key, attempts) in rows {
         let row = load_att(&tx, account, AttachmentId(att))?;
         let remote = row.as_ref().and_then(|r| r.remote.clone());
@@ -620,12 +766,19 @@ pub(crate) fn resume_downloads(
                      WHERE attachment_id = ?1",
                 )?
                 .execute([att])?;
+                let body = match bodies.entry(row.message) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(apply.body_of(row.message)?)
+                    }
+                };
                 jobs.push(DownloadJob {
                     attachment: row.id,
                     request: kourier_model::DownloadId(request),
                     remote,
                     path: PathBuf::from(path),
                     key: key_of(key)?,
+                    net_ids: net_ids_in(body, row.idx),
                 });
             }
             (row, _) => {

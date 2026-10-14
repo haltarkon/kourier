@@ -89,6 +89,10 @@ pub struct LoginView {
     pub error: String,
     /// "Try again" is offered.
     pub retry: bool,
+    /// The label of the button that leaves a failed link for the conversation list (empty:
+    /// none). A link that cannot be tried again, because the account is in Kourier already,
+    /// offers it in place of "Try Again" (user review of L1).
+    pub leave: String,
 }
 
 impl std::fmt::Debug for LoginView {
@@ -185,7 +189,25 @@ pub fn login_view(step: &LoginStep, network: NetworkKind) -> LoginView {
             v.kind = LoginViewKind::Failed;
             v.title = trc("@title:window", "Linking Failed").into_owned();
             v.error = error_text(error);
-            v.retry = true;
+            // A second link of an account that is here already would only fail again: no
+            // "Try Again". An active account is looked at in the list; a logged-out one is
+            // linked again from its banner, which is on the list too.
+            match &error.kind {
+                kourier_model::ErrorKind::AlreadyAdded { logged_out: false } => {
+                    v.retry = false;
+                    v.leave = trc("@action:button close a message and go to the chats", "OK")
+                        .into_owned();
+                }
+                kourier_model::ErrorKind::AlreadyAdded { logged_out: true } => {
+                    v.retry = false;
+                    v.leave = trc(
+                        "@action:button go to the chats, where the banner of the account that must be linked again is",
+                        "Go to Chats",
+                    )
+                    .into_owned();
+                }
+                _ => v.retry = true,
+            }
         }
     }
     v
@@ -215,6 +237,14 @@ pub fn error_text(error: &BackendError) -> String {
         ErrorKind::Expired => trc(
             "@info:status why linking failed",
             "The code expired. Try again for a new one.",
+        ),
+        ErrorKind::AlreadyAdded { logged_out: false } => trc(
+            "@info:status why linking failed",
+            "This account is already in Kourier.",
+        ),
+        ErrorKind::AlreadyAdded { logged_out: true } => trc(
+            "@info:status why linking failed",
+            "This account is already in Kourier. To use it again, choose “Link Again” in its banner.",
         ),
         ErrorKind::Unauthorized | ErrorKind::LoggedOut => trc(
             "@info:status why linking failed",
@@ -320,5 +350,55 @@ mod tests {
         assert!(v.retry);
         assert_eq!(v.error, "The code expired. Try again for a new one.");
         assert_eq!(network_choices().iter().filter(|c| c.available).count(), 1);
+    }
+
+    /// A second link of an account the profile has says so (L1, `buttons.md` F2), and points
+    /// at "Link Again" when that account is logged out.
+    #[test]
+    fn a_link_of_an_account_already_here_says_so() {
+        let failed = |logged_out| LoginStep {
+            step_id: "already-added".into(),
+            txn: 0,
+            kind: LoginStepKind::Failed {
+                error: BackendError::new(ErrorKind::AlreadyAdded { logged_out }, "dup"),
+            },
+        };
+        let v = login_view(&failed(false), NetworkKind::Signal);
+        assert_eq!(v.kind, LoginViewKind::Failed);
+        assert_eq!(v.error, "This account is already in Kourier.");
+        let v = login_view(&failed(true), NetworkKind::Signal);
+        assert!(v.error.contains("“Link Again”"), "{}", v.error);
+    }
+
+    /// A second link of an account that is here would only fail again: no "Try Again". The
+    /// page offers the way on instead: an OK to the list for an active account, "Go to Chats"
+    /// for a logged-out one (its banner with "Link Again" is on the list; L5 renamed the
+    /// button, which said "Show Banner").
+    #[test]
+    fn a_link_of_an_account_already_here_offers_no_retry_but_the_way_back() {
+        let failed = |kind| LoginStep {
+            step_id: "failed".into(),
+            txn: 0,
+            kind: LoginStepKind::Failed {
+                error: BackendError::new(kind, "dup"),
+            },
+        };
+        let active = login_view(
+            &failed(ErrorKind::AlreadyAdded { logged_out: false }),
+            NetworkKind::Signal,
+        );
+        assert!(!active.retry, "no Try Again for an active account");
+        assert_eq!(active.leave, "OK");
+        let out = login_view(
+            &failed(ErrorKind::AlreadyAdded { logged_out: true }),
+            NetworkKind::Signal,
+        );
+        assert!(!out.retry, "no Try Again for a logged-out account");
+        assert_eq!(out.leave, "Go to Chats");
+        // Every other failure still can be tried again and offers no other way.
+        for kind in [ErrorKind::Expired, ErrorKind::Unauthorized] {
+            let v = login_view(&failed(kind), NetworkKind::Signal);
+            assert!(v.retry && v.leave.is_empty(), "{:?}", v.error);
+        }
     }
 }

@@ -223,8 +223,32 @@ impl Apply<'_> {
         Ok(last.map_or(candidate, |l| candidate.max(l.saturating_add(1))))
     }
 
+    /// Whether `conv` exists and is hidden by a delete (not listed).
+    fn in_deleted_chat(&self, conv: &kourier_model::ConvKey) -> Result<bool> {
+        let key = self.canon_conv(conv)?;
+        let hidden: Option<bool> = self
+            .conn
+            .prepare_cached(
+                "SELECT hidden FROM conversations WHERE account_id = ?1 AND conv_key = ?2",
+            )?
+            .query_row((self.acc.id.0, key.encode()), |r| r.get(0))
+            .optional()?;
+        Ok(hidden == Some(true))
+    }
+
     /// Ingests one live (`history = false`) or imported message.
     pub(crate) fn message(&mut self, mut m: IncomingMessage, history: bool) -> Result<()> {
+        // An imported row of a chat that was deleted meanwhile (a history is delivered for a
+        // while, and the phone can delete a chat as well) is dropped: it must neither bring
+        // the chat back with the old messages it still holds nor fail the delivery. A LIVE
+        // message of such a chat does bring it back ([`Self::unhide`]); history is not news.
+        if history && self.in_deleted_chat(&m.conv)? {
+            tracing::debug!(
+                account = self.acc.id.0,
+                "an imported message of a deleted chat was dropped"
+            );
+            return Ok(());
+        }
         // A signal of a call: its line is made or changed, never duplicated ([`super::call`]).
         if let Some(line) = m.body.call_line().cloned() {
             return self.call_signal(m, line, history);

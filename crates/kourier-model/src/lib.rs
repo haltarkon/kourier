@@ -31,7 +31,7 @@ mod serde_util;
 
 pub use account::{
     Account, AccountLocalPrefs, AccountSettings, AccountSettingsPatch, AccountState,
-    AutoDownloadPolicy, OwnDevice, ProfilePatch,
+    AutoDownloadPolicy, DeviceLogout, LogoutReport, OwnDevice, ProfilePatch,
 };
 pub use call::{CallDirection, CallLine, CallMedia, CallState, MAX_RING_MS};
 pub use conn::{ConnState, UserAction};
@@ -40,9 +40,9 @@ pub use contact::{
     TrustLevel,
 };
 pub use content::{
-    Attachment, AttachmentKind, AttachmentMeta, AttachmentState, BlobKey, BlobRef, Body,
-    ContactCard, Deletion, DisappearKind, Expiry, Location, Message, Origin, Placeholder, Poll,
-    QuoteSnapshot, ReplyTo, SystemEvent,
+    AskFailure, Attachment, AttachmentKind, AttachmentMeta, AttachmentState, BlobKey, BlobRef,
+    Body, ContactCard, Deletion, DisappearKind, Expiry, Location, Message, Origin, Placeholder,
+    Poll, QuoteSnapshot, ReplyTo, SystemEvent,
 };
 pub use conversation::{ConvKind, Conversation, ConversationChange, ConversationPatch};
 pub use error::{BackendError, ErrorKind, PersistError};
@@ -59,9 +59,9 @@ pub use ids::{
 pub use log::{Redacted, RedactedShape};
 pub use login::{InputField, InputKind, LoginStep, LoginStepKind};
 pub use patch::Patch;
-pub use state::{FailReason, OutgoingState, ReadState, ReceiptKind, RecipientState};
+pub use state::{FailReason, OutgoingState, ReadState, ReceiptKind, RecipientState, SendPhase};
 pub use text::{RangeError, RangeKind, Text, TextRange, Utf16Map};
-pub use transfer::{HistoryTransfer, HistoryTransferFailure};
+pub use transfer::{AccountProgress, HistoryTransfer, HistoryTransferFailure};
 
 /// FNV-1a 64-bit hash of `bytes`: stable across builds, platforms and runs (unlike
 /// `std::hash`), so it can be persisted (`features_hash`) and used for log tags. Not

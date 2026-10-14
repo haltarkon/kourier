@@ -1611,6 +1611,7 @@ pub struct LoginRust {
     pub(crate) progress: f64,
     pub(crate) error: QString,
     pub(crate) retry: bool,
+    pub(crate) leave: QString,
     pub(crate) fields: QVariant,
     pub(crate) shared: Option<Shared>,
     pub(crate) app: Option<Box<CxxQtThread<App>>>,
@@ -1632,6 +1633,7 @@ impl Default for LoginRust {
             progress: -1.0,
             error: QString::default(),
             retry: false,
+            leave: QString::default(),
             fields: QVariant::default(),
             shared: None,
             app: None,
@@ -1757,6 +1759,7 @@ impl qobject::LoginController {
         self.as_mut().set_progress(v.progress);
         self.as_mut().set_error(QString::from(v.error.as_str()));
         self.as_mut().set_retry(v.retry);
+        self.as_mut().set_leave(QString::from(v.leave.as_str()));
         self.as_mut().set_fields(fields_variant(v));
         // `kind` last: QML switches on it and then reads the fields above.
         self.set_kind(QString::from(v.kind.as_str()));

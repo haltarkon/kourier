@@ -92,6 +92,46 @@ pub enum HistoryTransferFailure {
     Incomplete,
 }
 
+/// How far the work of a newly linked account is that the user waits for while the chats are
+/// already usable (link feedback L3): the delivery of an imported history, then the profiles
+/// and groups the link still fetches. Numbers only. A backend reports it while that work runs
+/// (ephemeral, never stored), and once more with `finished` set when nothing is left; a UI
+/// shows the latest report and forgets it at `finished`. A report is "the numbers now": they
+/// can go up (a group refresh queues profile fetches) and start over after a restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccountProgress {
+    /// Messages of an imported history delivered to the core so far.
+    #[serde(default)]
+    pub messages_done: u64,
+    /// Messages of the imported history in all; 0 when no import is being delivered.
+    #[serde(default)]
+    pub messages_total: u64,
+    /// People whose profile (name, picture) is still to be fetched.
+    #[serde(default)]
+    pub profiles_left: u32,
+    /// Groups whose members and name the server has not given yet (they cannot be sent to).
+    #[serde(default)]
+    pub groups_left: u32,
+    /// The last report: nothing is left to show.
+    #[serde(default)]
+    pub finished: bool,
+}
+
+impl AccountProgress {
+    /// Whether an imported history is being delivered (its messages are counted).
+    pub fn importing(&self) -> bool {
+        self.messages_total > 0 && !self.finished
+    }
+
+    /// The report that ends it all.
+    pub fn finished() -> Self {
+        Self {
+            finished: true,
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +166,19 @@ mod tests {
                 total: None
             }
         );
+    }
+
+    #[test]
+    fn account_progress_reads_back_with_fields_left_out() {
+        let p: AccountProgress = serde_json::from_str(r#"{"profiles_left":3}"#).unwrap();
+        assert_eq!(p.profiles_left, 3);
+        assert!(!p.importing() && !p.finished);
+        let importing = AccountProgress {
+            messages_done: 1,
+            messages_total: 2,
+            ..AccountProgress::default()
+        };
+        assert!(importing.importing());
+        assert!(AccountProgress::finished().finished);
     }
 }

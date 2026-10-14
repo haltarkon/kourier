@@ -32,6 +32,7 @@ path = [
     "crates/**/*.sql",
     "tests/**/*.mjs",
     "scripts/*.sh",
+    "scripts/*.py",
     "**/*.md",
     "crates/kourier-qt/icons/*.svg",
     "packaging/*.svg",
@@ -45,6 +46,7 @@ SPDX-License-Identifier = "AGPL-3.0-only"
 [[annotations]]
 path = [
     ".cargo/config.toml",
+    ".config/nextest.toml",
     ".gitattributes",
     ".gitignore",
     "**/Cargo.toml",

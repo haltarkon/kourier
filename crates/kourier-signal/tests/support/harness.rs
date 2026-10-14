@@ -1026,6 +1026,14 @@ impl Harness {
             .map(drop)
     }
 
+    /// Answers every request a client makes from now on `rtt` later (zero: at once again):
+    /// a round trip as a real network has.
+    pub async fn set_latency(&self, rtt: Duration) -> Result<(), HarnessError> {
+        self.request_value("setLatency", json!({ "ms": millis(rtt) }))
+            .await
+            .map(drop)
+    }
+
     /// Moves the clock the server states on every websocket upgrade by `skew_ms`.
     pub async fn set_server_time(&self, skew_ms: i64) -> Result<(), HarnessError> {
         self.request_value("setServerTime", json!({ "skewMs": skew_ms }))
@@ -1376,6 +1384,29 @@ impl Harness {
         Ok(())
     }
 
+    /// Makes every linked device's Storage Service manifest request fail with 500 (`fail`),
+    /// or work again. Returns how many were refused so far.
+    pub async fn fail_storage_manifest(&self, fail: bool) -> Result<u64, HarnessError> {
+        let v = self
+            .request_value("failStorageManifest", json!({ "fail": fail }))
+            .await?;
+        Ok(v["refused"].as_u64().unwrap_or(0))
+    }
+
+    /// Every profile request answers 429 with `Retry-After: retry_after_secs` (`None`: served
+    /// again). Returns how many were refused so far.
+    pub async fn limit_profile_fetches(
+        &self,
+        retry_after_secs: Option<u32>,
+    ) -> Result<u64, HarnessError> {
+        let args = match retry_after_secs {
+            Some(secs) => json!({ "retryAfter": secs }),
+            None => json!({ "stop": true }),
+        };
+        let v = self.request_value("limitProfileFetches", args).await?;
+        Ok(v["refused"].as_u64().unwrap_or(0))
+    }
+
     /// Replaces the phone's Storage Service state (a new manifest version).
     pub async fn set_storage_state(
         &self,
@@ -1424,6 +1455,58 @@ impl Harness {
     /// (`sendSync`): `deleteForMe`, `viewOnceOpen`, `viewed`, `read` or `callEvent`.
     pub async fn send_sync(&self, args: Value) -> Result<SentData, HarnessError> {
         self.request("sendSync", args).await
+    }
+
+    /// The phone's answer to a request for lost files (`sendSync {attachmentBackfillResponse}`)
+    /// from the primary `from` to its linked device `to`; `pointers` of the result are what
+    /// it put in, in entry order (long text last).
+    pub async fn send_backfill_answer(
+        &self,
+        from: &str,
+        to: &str,
+        answer: &BackfillAnswer,
+        await_delivery: bool,
+    ) -> Result<SentData, HarnessError> {
+        let args = json!({
+            "from": from, "to": to, "attachmentBackfillResponse": answer,
+            "awaitDelivery": await_delivery, "timeout": 60_000,
+        });
+        self.request("sendSync", args).await
+    }
+
+    /// The next request for lost files (`SyncMessage.attachmentBackfillRequest`) the primary
+    /// got, optionally only one `from` a device.
+    pub async fn wait_for_backfill_request(
+        &self,
+        primary: &str,
+        from: Option<&str>,
+        timeout: Duration,
+    ) -> Result<BackfillRequest, HarnessError> {
+        let sync = self
+            .wait_for_sync_message(primary, from, "attachmentBackfillRequest", timeout)
+            .await?;
+        let request = sync
+            .sync_message
+            .pointer("/content/attachmentBackfillRequest")
+            .or_else(|| sync.sync_message.get("attachmentBackfillRequest"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let message = &request["targetMessage"];
+        Ok(BackfillRequest {
+            source: sync.source,
+            author: message
+                .pointer("/author/authorServiceIdBinary")
+                .or_else(|| message.get("authorServiceIdBinary"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            sent_timestamp: message["sentTimestamp"].as_u64().or_else(|| {
+                message["sentTimestamp"]
+                    .as_str()
+                    .and_then(|t| t.parse().ok())
+            }),
+            conversation: request["targetConversation"].clone(),
+            raw: request,
+        })
     }
 
     /// Sends call signalling from a primary to a device (`sendCall`; `args` are the command's
@@ -1688,6 +1771,9 @@ pub struct OpenChallenge {
 pub struct SendStats {
     /// Client 1:1 sends per destination service id (rate-limited ones included).
     pub single: std::collections::BTreeMap<String, u64>,
+    /// The `urgent` flag of every 1:1 send per destination service id, in order.
+    #[serde(default)]
+    pub urgency: std::collections::BTreeMap<String, Vec<SendFlag>>,
     /// Multi-recipient sends served.
     pub multi: u64,
     /// Recipients (service ids) of every multi-recipient send, in order.
@@ -1707,6 +1793,23 @@ pub struct SendStats {
     /// own account) plus every multi-recipient send on either route.
     #[serde(default)]
     pub send_requests: u64,
+    /// `PUT /v1/devices/link` requests served: one for every device a client linked (or
+    /// tried to link). A link refused before this request leaves none.
+    #[serde(default)]
+    pub link_requests: u64,
+    /// The path of every `GET /v1/certificate/delivery`, in order: the sender certificates
+    /// clients fetched (the kind without the number asks `?includeE164=false`).
+    #[serde(default)]
+    pub certificate_requests: Vec<String>,
+}
+
+/// One 1:1 send as the server saw its request (`SendStats::urgency`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SendFlag {
+    /// The request's timestamp.
+    pub timestamp: u64,
+    /// The request said it was urgent.
+    pub urgent: bool,
 }
 
 impl SendStats {
@@ -2094,6 +2197,9 @@ pub struct StorageAccount {
     /// Note to Self archived.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_to_self_archived: Option<bool>,
+    /// Note to Self marked unread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_to_self_marked_unread: Option<bool>,
 }
 
 /// The result of `setStorageState`.
@@ -2553,6 +2659,92 @@ pub struct SentData {
     /// is read from the clock after `timestamp` and can be a millisecond later.
     #[serde(default)]
     pub server_timestamp: Option<u64>,
+    /// The pointers a backfill answer put in (`sendSync {attachmentBackfillResponse}`), as
+    /// JSON, in entry order (long text last).
+    #[serde(default)]
+    pub pointers: Vec<Value>,
+}
+
+/// A request for lost files the phone got (`wait_for_backfill_request`).
+#[derive(Debug, Clone)]
+pub struct BackfillRequest {
+    /// Ref of the sending device.
+    pub source: String,
+    /// The message's author as the binary service id (base64), when named so.
+    pub author: Option<String>,
+    /// The message's sent time.
+    pub sent_timestamp: Option<u64>,
+    /// `targetConversation` as JSON (`identifier.threadServiceIdBinary`, `threadGroupId`, ...).
+    pub conversation: Value,
+    /// The whole request as JSON.
+    pub raw: Value,
+}
+
+/// The phone's answer to a request for lost files (`send_backfill_answer`).
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillAnswer {
+    /// The chat: `{"aci": ..}`, `{"group": ..}` or `{"e164": ..}`.
+    pub conversation: Value,
+    /// The message's author (an ACI).
+    pub author: String,
+    /// The message's sent time.
+    pub timestamp: u64,
+    /// `"messageNotFound"` or a number: the whole answer is an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    /// One entry per file, in the phone's order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<BackfillEntry>>,
+    /// The long text's slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_text: Option<BackfillEntry>,
+    /// Neither a list nor an error.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub empty: bool,
+}
+
+/// One slot of a [`BackfillAnswer`], as the harness takes it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct BackfillEntry(pub Value);
+
+impl BackfillEntry {
+    /// `PENDING`: still uploading.
+    pub fn pending() -> Self {
+        Self(json!({ "status": "pending" }))
+    }
+
+    /// `TERMINAL_ERROR`: the phone does not have this file.
+    pub fn gone() -> Self {
+        Self(json!({ "status": "terminalError" }))
+    }
+
+    /// An `AttachmentData` with neither field.
+    pub fn empty() -> Self {
+        Self(json!({ "empty": true }))
+    }
+
+    /// A pointer sent as it is (JSON, as `SentData::pointers` has it).
+    pub fn pointer(pointer: &Value) -> Self {
+        Self(json!({ "pointer": pointer }))
+    }
+
+    /// `data` uploaded now, its pointer named by `client_uuid` (as Android names a
+    /// backfilled pointer).
+    pub fn upload(data: &[u8], content_type: &str, client_uuid: Option<[u8; 16]>) -> Self {
+        let mut entry = json!({ "data": BASE64.encode(data), "contentType": content_type });
+        if let Some(uuid) = client_uuid {
+            entry["clientUuid"] = json!(BASE64.encode(uuid));
+        }
+        Self(entry)
+    }
+
+    /// [`Self::upload`] with `forge` (`{"digest": "none"}`, `{"size": n}`, ...) merged in.
+    pub fn forged(mut self, forge: Value) -> Self {
+        self.0["forge"] = forge;
+        self
+    }
 }
 
 /// An edit a primary received and decrypted (`waitForEdit`).

@@ -334,8 +334,8 @@ QQC2.ToolBar {
                 smooth: true
                 fillMode: Image.PreserveAspectCrop
                 clip: true
-                sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-                sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+                sourceSize.width: Math.ceil(width)
+                sourceSize.height: Math.ceil(height)
                 Layout.preferredWidth: Math.round(Kirigami.Units.gridUnit * 2.2)
                 Layout.preferredHeight: Math.round(Kirigami.Units.gridUnit * 2.2)
             }
@@ -401,9 +401,8 @@ QQC2.ToolBar {
                     Layout.fillWidth: true
                 }
                 // The core is still looking at the files.
-                QQC2.BusyIndicator {
+                Spinner {
                     visible: !App.composer.planned
-                    running: visible
                     implicitWidth: Kirigami.Units.iconSizes.small
                     implicitHeight: Kirigami.Units.iconSizes.small
                 }
@@ -635,8 +634,8 @@ QQC2.ToolBar {
                                 asynchronous: true
                                 smooth: true
                                 fillMode: Image.PreserveAspectCrop
-                                sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-                                sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+                                sourceSize.width: Math.ceil(width)
+                                sourceSize.height: Math.ceil(height)
                             }
                             Kirigami.Icon {
                                 anchors.centerIn: parent
@@ -721,10 +720,9 @@ QQC2.ToolBar {
                                 to: 1
                                 value: fileRow.progress
                             }
-                            QQC2.BusyIndicator {
+                            Spinner {
                                 anchors.fill: parent
                                 visible: fileRow.working && fileRow.stage !== "packing"
-                                running: visible
                             }
                         }
 
@@ -835,8 +833,7 @@ QQC2.ToolBar {
             Layout.fillWidth: true
             Layout.leftMargin: Kirigami.Units.smallSpacing
 
-            QQC2.BusyIndicator {
-                running: parent.visible
+            Spinner {
                 implicitWidth: Kirigami.Units.iconSizes.small
                 implicitHeight: Kirigami.Units.iconSizes.small
             }

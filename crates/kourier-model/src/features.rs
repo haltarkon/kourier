@@ -293,6 +293,14 @@ pub enum CannotSend {
     Unregistered,
     /// The chat must be started on the phone (Signal M1, §6.7).
     NotAccepted,
+    /// The group is known only from the phone's history so far: its members and our place in
+    /// it come with its first fetch from the server.
+    StillLoading,
+    /// We are invited to the group and have not accepted: Kourier cannot accept an
+    /// invitation, the phone does.
+    InvitationPending,
+    /// We asked to join the group and an administrator has not answered yet.
+    JoinRequestPending,
     /// Another reason, as user-facing text.
     Other(String),
 }
@@ -568,6 +576,21 @@ pub struct AccountCaps {
     pub delete_for_everyone_max_age_secs: Option<u32>,
     /// Named feature flags.
     pub flags: BTreeMap<String, bool>,
+}
+
+impl AccountCaps {
+    /// Flag: the account's other device can be asked to upload again the files of a message
+    /// the network no longer has (`Command::RequestAttachments`; Signal: attachment
+    /// backfill). Without it a file the network lost stays lost.
+    pub const FLAG_ATTACHMENT_RESTORE: &'static str = "attachment_restore";
+
+    /// Whether [`Self::FLAG_ATTACHMENT_RESTORE`] is set.
+    pub fn restores_attachments(&self) -> bool {
+        self.flags
+            .get(Self::FLAG_ATTACHMENT_RESTORE)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

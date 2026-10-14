@@ -26,6 +26,10 @@ const WRAP_MAGIC: &str = "KOURTEST1";
 #[derive(Clone, Debug)]
 pub struct DirVault {
     root: PathBuf,
+    /// `false` while [`DirVault::hold_unwraps`] holds the unwrapping of account keys.
+    unwrap_open: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+    /// `false` while [`DirVault::hold_dir_removals`] holds the removal of account directories.
+    remove_open: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -61,7 +65,34 @@ fn remove_if_exists(p: &Path) -> io::Result<()> {
 impl DirVault {
     /// A vault rooted at `root` (created on first use).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            unwrap_open: std::sync::Arc::new(tokio::sync::watch::channel(true).0),
+            remove_open: std::sync::Arc::new(tokio::sync::watch::channel(true).0),
+        }
+    }
+
+    /// Holds every [`AccountVault::unwrap`] (an account's actor cannot start without its key)
+    /// until [`Self::release_unwraps`]: a test that needs the time between the core's start
+    /// and its supervisors' first backend.
+    pub fn hold_unwraps(&self) {
+        self.unwrap_open.send_replace(false);
+    }
+
+    /// Lets the held unwraps go on.
+    pub fn release_unwraps(&self) {
+        self.unwrap_open.send_replace(true);
+    }
+
+    /// Holds [`AccountVault::remove_dir`] until [`Self::release_dir_removals`]: a test that
+    /// needs the time a removal spends on a big account directory (link feedback L5).
+    pub fn hold_dir_removals(&self) {
+        self.remove_open.send_replace(false);
+    }
+
+    /// Lets the held directory removals go on.
+    pub fn release_dir_removals(&self) {
+        self.remove_open.send_replace(true);
     }
 
     fn dir(&self, uuid: AccountUuid) -> PathBuf {
@@ -197,7 +228,12 @@ impl AccountVault for DirVault {
 
     fn unwrap(&self, uuid: AccountUuid) -> VaultFuture<'_, BackendDbKey> {
         let v = self.clone();
-        blocking(move || v.unwrap_sync(uuid))
+        let mut open = self.unwrap_open.subscribe();
+        Box::pin(async move {
+            // (the sender lives as long as the vault: the wait cannot fail)
+            let _ = open.wait_for(|open| *open).await;
+            blocking(move || v.unwrap_sync(uuid)).await
+        })
     }
 
     fn list(&self) -> VaultFuture<'_, Vec<VaultEntry>> {
@@ -217,7 +253,12 @@ impl AccountVault for DirVault {
 
     fn remove_dir(&self, uuid: AccountUuid) -> VaultFuture<'_, ()> {
         let v = self.clone();
-        blocking(move || v.remove_dir_sync(uuid))
+        let mut open = self.remove_open.subscribe();
+        Box::pin(async move {
+            // (the sender lives as long as the vault: the wait cannot fail)
+            let _ = open.wait_for(|open| *open).await;
+            blocking(move || v.remove_dir_sync(uuid)).await
+        })
     }
 
     fn backend_db(&self, uuid: AccountUuid) -> PathBuf {
@@ -396,6 +437,34 @@ impl Announced {
             notify: ch.notify.iter().map(|n| n.message).collect(),
             catch_up: ch.catch_up.len() + ch.held_calls.len(),
             changed: ch.messages.values().flatten().copied().collect(),
+        }
+    }
+}
+
+/// What a write of the [`IngestHarness`] started for the backend: the durable commands it
+/// stored and the downloads it requested.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// The durable commands, in order.
+    pub commands: Vec<kourier_backend_api::DurableCommand>,
+    /// The downloads: the attachment, the request id `AttachmentDone` names, and the names
+    /// handed to the backend.
+    pub downloads: Vec<(
+        kourier_model::AttachmentId,
+        kourier_model::DownloadId,
+        Vec<String>,
+    )>,
+}
+
+impl Started {
+    fn of(ch: Changes) -> Self {
+        Self {
+            commands: ch.commands.into_iter().map(|(_, c)| c).collect(),
+            downloads: ch
+                .downloads
+                .into_iter()
+                .map(|d| (d.attachment, d.request, d.net_ids))
+                .collect(),
         }
     }
 }
@@ -650,5 +719,92 @@ impl IngestHarness {
     ) -> Result<Vec<kourier_backend_api::DurableCommand>> {
         let done = ingest::delete_attachment(&mut self.conn, self.scope, attachment, self.now)?;
         Ok(done.commands.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// `UiCommand::DownloadAttachment` as the core runs it, in its one transaction, at the
+    /// harness clock: a download, or a request to the account's other device for a file the
+    /// network lost.
+    pub fn download_attachment(
+        &mut self,
+        attachment: kourier_model::AttachmentId,
+    ) -> Result<Started> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(kourier_db::rusqlite::TransactionBehavior::Immediate)?;
+        let mut apply = ingest::Apply::begin(&tx, self.account, self.scope, self.now)?;
+        apply.user_download(attachment)?;
+        apply.finish()?;
+        let ch = std::mem::take(&mut apply.ch);
+        drop(apply);
+        tx.commit()?;
+        Ok(Started::of(ch))
+    }
+
+    /// Applies one batch of live events in one transaction and returns what it started for
+    /// the backend.
+    pub fn apply_starting(&mut self, events: Vec<BackendEvent>) -> Result<Started> {
+        Ok(Started::of(self.apply_one(events)?))
+    }
+
+    /// Runs the deadline sweep of the waits for the other device's answer once at the
+    /// harness clock; returns how many attachments it changed.
+    pub fn settle_restores(&mut self) -> Result<usize> {
+        Ok(crate::restore::sweep(&mut self.conn, self.now)?
+            .iter()
+            .map(|(_, ch)| ch.media.len())
+            .sum())
+    }
+
+    /// [`Self::settle_restores`] while the waits of the account are held (`hold`: its actor
+    /// has only just started, [`crate::restore::START_GRACE_MS`]) or judged; returns how many
+    /// attachments it changed and whether it left a due wait alone.
+    pub fn settle_restores_held(&mut self, hold: bool) -> Result<(usize, bool)> {
+        let (done, held) = crate::restore::sweep_where(&mut self.conn, self.now, &|_| !hold)?;
+        Ok((done.iter().map(|(_, ch)| ch.media.len()).sum(), held))
+    }
+
+    /// The nearest deadline of a wait for the other device's answer.
+    pub fn next_restore_deadline(&self) -> Result<Option<i64>> {
+        crate::restore::next_deadline(&self.conn)
+    }
+
+    /// The account is seen logged out, as the supervisor records it (the unlink bookkeeping);
+    /// returns how many attachments it changed.
+    pub fn log_out(&mut self) -> Result<usize> {
+        let ended = crate::local::logged_out(&mut self.conn, self.account, "test", self.now)?;
+        Ok(ended.media.len())
+    }
+
+    /// How many stored message bodies this thread has read and parsed so far (a probe: a loop
+    /// over a message's attachments reads its body once).
+    pub fn body_reads() -> u64 {
+        ingest::body_reads()
+    }
+
+    /// How many parked receipts this thread has decoded so far to look at them again after
+    /// identity merges (a probe: a transaction of many merges looks at each once).
+    pub fn receipt_retry_decodes() -> u64 {
+        ingest::receipt_retry_decodes()
+    }
+
+    /// What an actor start resends of the downloads an earlier actor left in flight:
+    /// `(attachment, names handed to the backend)`.
+    pub fn resume_downloads(&mut self) -> Result<Vec<(kourier_model::AttachmentId, Vec<String>)>> {
+        let up_to = ingest::newest_download(&self.conn, self.account)?;
+        let (jobs, _) =
+            ingest::resume_downloads(&mut self.conn, self.account, self.scope, self.now, up_to)?;
+        Ok(jobs
+            .into_iter()
+            .map(|j| (j.attachment, j.net_ids))
+            .collect())
+    }
+
+    /// The start-up repair of attachments that say they are being asked for although no
+    /// request is open; returns how many attachments it changed.
+    pub fn end_orphan_asks(&mut self) -> Result<usize> {
+        Ok(crate::restore::end_orphan_asks(&mut self.conn, self.now)?
+            .iter()
+            .map(|(_, ch)| ch.media.len())
+            .sum())
     }
 }

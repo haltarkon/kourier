@@ -287,7 +287,9 @@ impl MediaStore for AppHandle {
 pub enum Request {
     /// `att/<id>`: the full picture.
     Full(AttachmentId),
-    /// `thumb/<id>`: the thumbnail (or the picture when there is none).
+    /// `thumb/<id>`: the picture of the timeline: the file when the 400 px thumbnail cannot
+    /// cover the size asked for, else the thumbnail (or the file when there is none), see
+    /// [`MediaEntry::timeline_blob`].
     Thumb(AttachmentId),
     /// `blurhash/<id>`: the placeholder.
     Blurhash(AttachmentId),
@@ -480,12 +482,30 @@ pub fn resolve(store: &dyn MediaStore, id: &str, width: i32, height: i32) -> Ima
                 Ok(None) => return Image::None,
                 Err(_) => return stand_in(store, None, size),
             };
-            let variant = match req {
-                Request::Full(_) => MediaVariant::Full,
-                Request::Thumb(_) => MediaVariant::Thumb,
+            let blob = match req {
+                Request::Full(_) => entry.blob(MediaVariant::Full),
+                // The size is the item's PHYSICAL size (QML's `sourceSize`); an unset side
+                // arrives as 0 or less.
+                Request::Thumb(_) => entry.timeline_blob((
+                    u32::try_from(width).unwrap_or(0),
+                    u32::try_from(height).unwrap_or(0),
+                )),
                 _ => return stand_in(store, Some(&entry), size),
             };
-            match entry.blob(variant).map(|b| store.read(b)) {
+            let mut read = blob.map(|b| store.read(b));
+            // The timeline does not decode a huge picture of a format that Qt decodes whole
+            // (`MAX_TIMELINE_PIXELS`): the format is the file's bytes', not the sender's MIME
+            // type. A thumbnail exists then (the file was chosen over it), so it is read.
+            if matches!(req, Request::Thumb(_))
+                && let Some(Ok(bytes)) = &read
+                && Codec::sniff(bytes).is_some_and(|codec| codec != Codec::Jpeg)
+                && entry.exceeds_timeline_pixels()
+                && let Some(thumb) = &entry.thumb
+                && blob != Some(thumb)
+            {
+                read = Some(store.read(thumb));
+            }
+            match read {
                 Some(Ok(bytes)) => match Codec::sniff(&bytes) {
                     Some(codec) => Image::Encoded {
                         bytes,
@@ -541,6 +561,10 @@ mod tests {
         key: BlobKey,
         thumb: bool,
         magic: &'static [u8],
+        /// The picture's display size (`MediaEntry::dims`).
+        dims: (u32, u32),
+        /// What the sender called the file (its MIME type).
+        label: &'static str,
         reads: Mutex<Vec<&'static str>>,
     }
 
@@ -568,12 +592,12 @@ mod tests {
                 attachment,
                 account: AccountId(1),
                 kind: AttachmentKind::Image,
-                mime: Some("image/jpeg".into()),
+                mime: Some(self.label.into()),
                 state: AttachmentState::Local,
-                file: Some(blob(self.key.clone(), "image/jpeg")),
+                file: Some(blob(self.key.clone(), self.label)),
                 thumb: self.thumb.then(|| blob(self.key.clone(), "image/webp")),
                 blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".into()),
-                dims: Some((640, 480)),
+                dims: Some(self.dims),
             }))
         }
 
@@ -608,6 +632,8 @@ mod tests {
             key: BlobKey::new(key),
             thumb,
             magic: PNG,
+            dims: (640, 480),
+            label: "image/jpeg",
             reads: Mutex::new(Vec::new()),
         }
     }
@@ -659,6 +685,80 @@ mod tests {
         ] {
             assert_eq!(Request::parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_timeline_gets_the_file_where_its_thumbnail_would_be_stretched() {
+        let tag = |store: &Fake, id: &str, w, h| match encoded(&resolve(store, id, w, h)) {
+            Some((bytes, None)) => String::from_utf8_lossy(bytes).into_owned(),
+            other => panic!("{id} {w}x{h}: {other:?}"),
+        };
+        // A phone photo, 3000 × 4000: the thumbnail is 300 × 400.
+        let mut store = fake([1; 32], true);
+        store.dims = (3000, 4000);
+        // Scale 2: the bubble is 576 × 768 pixels, the thumbnail would be stretched 1.9 times.
+        assert_eq!(tag(&store, "thumb/1?v=1", 576, 768), "full");
+        // Scale 1.25 (the user's display): 360 × 480 against 300 × 400.
+        assert_eq!(tag(&store, "thumb/1?v=1", 360, 480), "full");
+        // What the thumbnail covers is still drawn from it: a 100 × 75 request (a quote's
+        // picture, an album's small tile), and 200 × 267 (the thumbnail halved).
+        assert_eq!(tag(&store, "thumb/1?v=1", 100, 75), "thumb");
+        assert_eq!(tag(&store, "thumb/1?v=1", 200, 267), "thumb");
+        // No size asked (QML's unset `sourceSize` is 0 or -1): the thumbnail, as before.
+        assert_eq!(tag(&store, "thumb/1?v=1", 0, 0), "thumb");
+        assert_eq!(tag(&store, "thumb/1?v=1", -1, -1), "thumb");
+        // The viewer's request is the file whatever the size.
+        assert_eq!(tag(&store, "att/1?v=1", 100, 75), "full");
+        // A landscape 4000 × 3000 at scale 1 (288 × 216) is covered by 400 × 300.
+        store.dims = (4000, 3000);
+        assert_eq!(tag(&store, "thumb/1?v=1", 288, 216), "thumb");
+        assert_eq!(tag(&store, "thumb/1?v=1", 576, 432), "full");
+        // Without a thumbnail every size gets the file.
+        let mut no_thumb = fake([1; 32], false);
+        no_thumb.dims = (3000, 4000);
+        assert_eq!(tag(&no_thumb, "thumb/1", 100, 75), "full");
+    }
+
+    #[test]
+    fn a_huge_picture_is_drawn_from_its_thumbnail_unless_its_bytes_are_a_jpeg() {
+        // What the provider is handed for `thumb/1` asked at 576 × 432: the codec and the tag
+        // of the file it came from.
+        let served = |store: &Fake| match resolve(store, "thumb/1?v=1", 576, 432) {
+            Image::Encoded { bytes, codec, .. } => {
+                let tag = bytes.strip_prefix(store.magic).unwrap_or(&bytes[..]);
+                (codec, String::from_utf8_lossy(tag).into_owned())
+            }
+            _ => panic!("not an encoded picture"),
+        };
+        let huge = (5000, 4000);
+        // A PNG that the sender called a JPEG: the thumbnail (its MIME type decides nothing).
+        let mut png = fake([1; 32], true);
+        png.dims = huge;
+        png.label = "image/jpeg";
+        assert_eq!(served(&png), (Codec::Png, "thumb".into()));
+        png.label = "image/png";
+        assert_eq!(served(&png), (Codec::Png, "thumb".into()));
+        // The same size and a JPEG's bytes: the file, even when called a PNG.
+        let mut jpeg = fake([1; 32], true);
+        jpeg.magic = &[0xff, 0xd8, 0xff, 0xe0, 0, 16];
+        jpeg.dims = huge;
+        jpeg.label = "image/png";
+        assert_eq!(served(&jpeg), (Codec::Jpeg, "full".into()));
+        // At the limit a PNG is still drawn from its file; a row above it is not.
+        png.dims = (4096, 4096);
+        assert_eq!(served(&png), (Codec::Png, "full".into()));
+        png.dims = (4096, 4097);
+        assert_eq!(served(&png), (Codec::Png, "thumb".into()));
+        // Without a thumbnail there is nothing to fall back to: the file.
+        let mut alone = fake([1; 32], false);
+        alone.dims = huge;
+        assert_eq!(served(&alone), (Codec::Png, "full".into()));
+        // The viewer's request is the file, whatever its size.
+        png.dims = huge;
+        assert!(matches!(
+            resolve(&png, "att/1?v=1", 0, 0),
+            Image::Encoded { codec: Codec::Png, ref bytes, .. } if bytes.ends_with(b"full")
+        ));
     }
 
     #[test]

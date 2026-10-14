@@ -14,6 +14,8 @@
 //! through `KOURIER_LOCALE_DIR`, the way a debug run does: a message made in QML and one made
 //! in Rust come back wrapped in `xx`, which proves the chain from the template to the screen.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -278,6 +280,7 @@ fn a_locale() -> Option<String> {
 }
 
 fn main() {
+    support::answer_list("kde");
     // SAFETY (all `set_var` below): single-threaded test binary, before Qt starts.
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

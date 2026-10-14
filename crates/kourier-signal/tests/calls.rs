@@ -25,6 +25,7 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -40,9 +41,20 @@ use support::harness::{
     StorageGroup, StorageSpec,
 };
 
-/// How long the server is watched for a send after a call signal was handled. An owed
-/// delivery receipt goes out 500 ms after it is queued; a reply to a call would go out at once.
-const QUIET: Duration = Duration::from_millis(1500);
+/// How long the server is watched for a send after a call signal was handled. A reply to a
+/// call would go out at once, and an owed delivery receipt 500 ms after it is queued
+/// (`DELIVERY_RECEIPT_WAIT`): the window outlasts that. (It was 1.5 s; a receipt that is owed
+/// is also looked for in `backend.db` the moment the signal is handled, which does not depend
+/// on any time, so the wire only has to see what is sent at once or after the receipt's wait.)
+const QUIET: Duration = Duration::from_millis(700);
+
+/// How long [`World::watch`] waits for the backend to come to rest when nothing has proved it
+/// is at rest already (the first watch after linking): longer than an owed receipt's 500 ms.
+const SETTLE: Duration = Duration::from_millis(700);
+
+/// The same when the step before has just passed [`World::silent_since`] (the inbox empty, no
+/// receipt owed, nothing sent for [`QUIET`]): a short look that nothing started since.
+const SETTLE_AFTER_QUIET: Duration = Duration::from_millis(300);
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -69,6 +81,8 @@ struct World {
     group: GroupInfo,
     sink: Sink,
     files: AccountFiles,
+    /// Set when a step has just proved the backend quiet, taken by the next [`World::watch`].
+    rested: AtomicBool,
 }
 
 impl World {
@@ -119,6 +133,7 @@ impl World {
             group,
             sink,
             files,
+            rested: AtomicBool::new(false),
         })
     }
 
@@ -230,10 +245,17 @@ impl World {
     /// Waits until the backend has stopped sending (what linking and earlier steps left to
     /// do) and has handled everything it received, then notes what the server has seen.
     async fn watch(&self) -> Watch {
+        // Right after a step that passed `silent_since` the backend has shown it is at rest;
+        // otherwise (linking, a restart) wait longer than an owed receipt's 500 ms.
+        let settle = if self.rested.swap(false, Ordering::SeqCst) {
+            SETTLE_AFTER_QUIET
+        } else {
+            SETTLE
+        };
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
             let before = self.send_requests().await;
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::time::sleep(settle).await;
             let idle = self.sql("SELECT count(*) FROM inbox") == 0
                 && self.sql("SELECT count(*) FROM delivery_receipts") == 0;
             if idle && self.send_requests().await == before {
@@ -268,6 +290,13 @@ impl World {
     /// spans a restart, whose own jobs (capabilities, remote config) are no sends.
     async fn sent_nothing_since(&self, watch: &Watch, what: &str) {
         self.handled().await;
+        // A receipt is queued in the transaction that handles the signal, so one that is
+        // owed is in the table now, whatever its 500 ms wait.
+        assert_eq!(
+            self.sql("SELECT count(*) FROM delivery_receipts"),
+            0,
+            "{what}: a delivery receipt is owed"
+        );
         tokio::time::sleep(QUIET).await;
         assert_eq!(
             self.send_requests().await,
@@ -279,6 +308,7 @@ impl World {
             0,
             "{what}: a delivery receipt is owed"
         );
+        self.rested.store(true, Ordering::SeqCst);
     }
 
     /// Waits until stage 2 has handled every envelope the device acknowledged.
@@ -1000,13 +1030,14 @@ async fn a_call_from_while_kourier_was_closed_is_a_catch_up_signal_with_its_age(
     let watch = world.watch().await;
     assert_eq!(core.shutdown().await, Exit::Shutdown);
 
-    // The Offer waits in the server's queue for three seconds.
+    // The Offer waits in the server's queue for a second and a bit (it was three seconds:
+    // the age only has to be measurable and well short of the minute).
     world
         .harness
         .send_call(json!({ "from": ada.aci, "to": device.device_ref, "offer": { "id": 7100 } }))
         .await
         .expect("sendCall");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     let mut core = world.actor(StartMode::Resume);
     core.send(Command::Connect).await;
     core.wait_online().await;
@@ -1014,8 +1045,8 @@ async fn a_call_from_while_kourier_was_closed_is_a_catch_up_signal_with_its_age(
     assert_eq!(ring["catch_up"], true, "{ring}");
     let left = time_left(&ring);
     assert!(
-        (50_000..=57_100).contains(&left),
-        "a minute minus three seconds in the queue: {left}"
+        (50_000..=58_900).contains(&left),
+        "a minute minus 1.2 seconds in the queue: {left}"
     );
     world
         .sent_nothing_since(&watch, "an Offer from the offline queue")

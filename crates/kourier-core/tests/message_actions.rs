@@ -256,12 +256,12 @@ async fn action_flags_are_the_commands_checks_and_end_on_the_clock() {
     let p = page(&env, c).await;
     assert_eq!(p.now, T0, "the page says which instant its flags are for");
     let theirs = p.rows.iter().find(|r| r.author.is_some()).expect("theirs");
-    let a = theirs.actions;
+    let a = theirs.actions.clone();
     assert!(a.reply && a.react && a.copy && a.delete_for_me);
     assert!(!a.edit && !a.delete_for_everyone && !a.take_back);
     assert_eq!(a.until, None, "nothing here depends on time");
     let own = p.rows.iter().find(|r| r.id == mine.id).expect("own");
-    let a = own.actions;
+    let a = own.actions.clone();
     assert!(a.reply && a.react && a.copy && a.edit && a.delete_for_everyone && a.delete_for_me);
     assert!(!a.take_back, "the recipient has it");
     // Signal's windows in the fake: 24 h to edit, one day to delete for everyone; an age of
@@ -286,7 +286,8 @@ async fn action_flags_are_the_commands_checks_and_end_on_the_clock() {
         .iter()
         .find(|r| r.id == mine.id)
         .expect("own")
-        .actions;
+        .actions
+        .clone();
     assert!(!after.edit && !after.delete_for_everyone);
     assert!(after.delete_for_me && after.reply && after.react && after.copy);
     assert_eq!(after.until, None);
@@ -1246,7 +1247,7 @@ async fn a_timer_change_is_confirmed_with_its_timeline_row() {
     assert_ne!(found[0].1, before.id);
     let notice = rows.iter().find(|r| r.id == found[0].1).expect("notice");
     assert_eq!(notice.out_state, None, "a notice is not a sent message");
-    let a = notice.actions;
+    let a = notice.actions.clone();
     assert!(a.delete_for_me && !a.delete_for_everyone && !a.edit && !a.react && !a.reply);
     let version = |env: &Env| -> Option<i64> {
         env.peek(|conn| {

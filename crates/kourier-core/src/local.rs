@@ -42,6 +42,77 @@ pub(crate) fn accounts(conn: &Connection) -> Result<Vec<AccountEntry>> {
         .collect()
 }
 
+/// One account's lifecycle state (`None`: no such row).
+pub(crate) fn state(conn: &Connection, id: AccountId) -> Result<Option<AccountState>> {
+    let row: Option<(String, Option<String>)> = conn
+        .prepare_cached("SELECT state, state_reason FROM accounts WHERE id = ?1")?
+        .query_row([id.0], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(state, reason)| sql::account_state(&state, reason))
+        .transpose()
+}
+
+/// Who `id` is, for the notice about its removal or unlink: read before the row goes. `twin`:
+/// another account of its network, not being removed, has its primary own id or looks the same
+/// (same name and number). `None`: no such row.
+pub(crate) fn account_label(
+    conn: &Connection,
+    id: AccountId,
+) -> Result<Option<crate::facade::AccountLabel>> {
+    type Raw = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        i64,
+        String,
+    );
+    let row: Option<Raw> = conn
+        .prepare_cached(
+            "SELECT network, display_name, number, own_device, created_at, own_ids
+             FROM accounts WHERE id = ?1",
+        )?
+        .query_row([id.0], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((network, display_name, number, own_device, linked_at, own_ids)) = row else {
+        return Ok(None);
+    };
+    let primary = sql::from_json::<Vec<kourier_model::UserId>>(&own_ids)?
+        .into_iter()
+        .next();
+    let same_identity = match &primary {
+        Some(p) => crate::ingest::other_identities(conn, id)?
+            .iter()
+            .any(|(user, _)| user == p),
+        None => false,
+    };
+    let looks_the_same: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM accounts o, accounts me
+               WHERE me.id = ?1 AND o.id <> me.id AND o.state <> 'Removing'
+                 AND o.network = me.network
+                 AND o.display_name IS me.display_name AND o.number IS me.number)",
+        )?
+        .query_row([id.0], |r| r.get(0))?;
+    Ok(Some(crate::facade::AccountLabel {
+        network: sql::network(&network)?,
+        display_name,
+        number,
+        own_device,
+        linked_at,
+        twin: same_identity || looks_the_same,
+    }))
+}
+
 /// Inserts an account row.
 pub(crate) fn insert_account(
     conn: &Connection,
@@ -66,8 +137,74 @@ pub(crate) fn set_state(conn: &Connection, id: AccountId, state: &AccountState) 
     Ok(())
 }
 
+/// Sets a lifecycle state in ONE statement and puts the report a cut-off removal or unlink kept
+/// (link feedback L5, [`removal_report`]) back with it: [`set_state`] writes no reason for
+/// `Removing` and `Unlinking`, so a start that finishes the work and is killed itself between
+/// two statements would lose what the first run told. `kept` is what [`removal_report`]
+/// answered at this start (`None`: nothing was kept, the reason is cleared as `set_state` does).
+pub(crate) fn set_state_keeping_report(
+    conn: &Connection,
+    id: AccountId,
+    state: &AccountState,
+    kept: Option<&Option<kourier_model::LogoutReport>>,
+) -> Result<()> {
+    let (name, _) = sql::account_state_name(state);
+    let json = kept
+        .map(|r| serde_json::to_string(r).map_err(|e| CoreError::Json(e.to_string())))
+        .transpose()?;
+    conn.prepare_cached("UPDATE accounts SET state = ?2, state_reason = ?3 WHERE id = ?1")?
+        .execute((id.0, name, json))?;
+    Ok(())
+}
+
+/// What the logout of a removal or an unlink told (`None`: nothing to tell, a link that never
+/// finished), kept on the `Removing` or `Unlinking` row before the shred (link feedback L5): a
+/// kill after the shred leaves no keys for another logout, and the next start that finishes
+/// the work tells this.
+pub(crate) fn set_removal_report(
+    conn: &Connection,
+    id: AccountId,
+    report: Option<&kourier_model::LogoutReport>,
+) -> Result<()> {
+    let json = serde_json::to_string(&report).map_err(|e| CoreError::Json(e.to_string()))?;
+    conn.prepare_cached(
+        "UPDATE accounts SET state_reason = ?2 WHERE id = ?1 AND state IN ('Removing', 'Unlinking')",
+    )?
+    .execute((id.0, json))?;
+    Ok(())
+}
+
+/// The report [`set_removal_report`] kept: `None` when the logout was not tried yet (or the row
+/// is neither `Removing` nor `Unlinking`), `Some(None)` when it was and there is nothing to
+/// tell.
+pub(crate) fn removal_report(
+    conn: &Connection,
+    id: AccountId,
+) -> Result<Option<Option<kourier_model::LogoutReport>>> {
+    let kept: Option<Option<String>> = conn
+        .prepare_cached(
+            "SELECT state_reason FROM accounts WHERE id = ?1 AND state IN ('Removing', 'Unlinking')",
+        )?
+        .query_row([id.0], |r| r.get(0))
+        .optional()?;
+    match kept.flatten() {
+        None => Ok(None),
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| CoreError::Json(e.to_string())),
+    }
+}
+
 /// The unlink bookkeeping (§4.3 step 5): `LoggedOut`, and durable commands can no longer go out.
-pub(crate) fn logged_out(conn: &mut Connection, id: AccountId, reason: &str) -> Result<()> {
+/// The waits for the other device's answer end too ("did not answer", [`crate::restore`]): the
+/// requests are among the commands that can no longer go out, and no backend will report them
+/// unsent. Returns what ending them changed.
+pub(crate) fn logged_out(
+    conn: &mut Connection,
+    id: AccountId,
+    reason: &str,
+    now: i64,
+) -> Result<crate::ingest::Changes> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     set_state(
         &tx,
@@ -78,8 +215,9 @@ pub(crate) fn logged_out(conn: &mut Connection, id: AccountId, reason: &str) -> 
     )?;
     tx.prepare_cached("DELETE FROM pending_commands WHERE account_id = ?1")?
         .execute([id.0])?;
+    let ended = crate::restore::end_account_waits(&tx, id, now)?;
     tx.commit()?;
-    Ok(())
+    Ok(ended)
 }
 
 /// Deletes an account row (cascading to every core row of the account) and truncates the WAL so

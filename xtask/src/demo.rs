@@ -1051,8 +1051,8 @@ fn is_shot_name(name: &str, prefix: &str) -> bool {
 /// The scripted run: two Kourier runs (light, then dark after a restart) against one mock world.
 fn scripted(mut world: World, bin: &Path, env: &Path, out: &Path, clear_out: bool) -> Result<()> {
     let themes = env.join("themes");
-    let light = theme_home(&themes, "light", "BreezeLight", "breeze")?;
-    let dark = theme_home(&themes, "dark", "BreezeDark", "breeze-dark")?;
+    let light = theme_home(&themes, "light", "BreezeLight", "breeze", false)?;
+    let dark = theme_home(&themes, "dark", "BreezeDark", "breeze-dark", false)?;
     let mut shots = Shots::new(out, clear_out)?;
 
     // -- Run 1 (light): link, receive, reply. --

@@ -48,6 +48,13 @@ pub enum Command {
         flow: String,
         /// Set when relinking an existing account (§4.3 step 6).
         relink: Option<Relink>,
+        /// The primary own ids of the profile's OTHER accounts on this network (not the one
+        /// being relinked, none that is being removed). A backend that learns whose account
+        /// the phone links BEFORE it registers a device refuses a link that brings one of
+        /// them with `ErrorKind::AlreadyAdded`, so the phone never gets a second device of
+        /// one account (L1, `buttons.md` F2). The core checks the same again when
+        /// `AccountReady` arrives; a backend that cannot know early may ignore this.
+        taken: Vec<TakenIdentity>,
     },
     /// Answer an `Input` login step.
     SubmitLoginInput {
@@ -150,6 +157,25 @@ pub enum Command {
         /// way to name one; a backend that cannot name it confirms and tells nobody.
         net_ids: Redacted<Vec<String>>,
     },
+    /// Durable: ask the account's other device to upload the files of one message again,
+    /// because the network lost them (Signal: `SyncMessage.attachmentBackfillRequest` to our
+    /// own devices, which only the primary phone answers). One request names a whole
+    /// message: the other device answers for all its files. The core sends it only for a
+    /// download the user started. The backend confirms the command with `CommandPersisted`,
+    /// then reports `BackendEvent::AttachmentRestore` with [`RestoreUpdate::Sent`] once the
+    /// request went out (the core's wait starts there) or [`RestoreUpdate::NotSent`] when it
+    /// gave up sending it. Answers arrive as `AttachmentRestore` too.
+    ///
+    /// [`RestoreUpdate::Sent`]: crate::RestoreUpdate::Sent
+    /// [`RestoreUpdate::NotSent`]: crate::RestoreUpdate::NotSent
+    RequestAttachments {
+        /// The `pending_commands` row.
+        cmd: CmdId,
+        /// The conversation.
+        conv: ConvKey,
+        /// The message (its original id).
+        target: MsgTarget,
+    },
     /// Ephemeral: we started or stopped typing.
     SetTyping {
         /// The conversation.
@@ -170,6 +196,11 @@ pub enum Command {
         remote: BackendBlob,
         /// Where the plaintext goes.
         dest: BlobTarget,
+        /// The attachment's names (`Attachment::net_ids`). A backend may check the download
+        /// against a name that names content (Signal: `plaintext:`, the plaintext hash an
+        /// import kept), which binds a pointer another device gave later to the file that
+        /// was asked for. Redacted in `Debug`.
+        net_ids: Redacted<Vec<String>>,
     },
     /// Roaming conversation change; confirmed by `ConversationUpsert` after the network
     /// transaction (§4.1 principle 4).
@@ -305,6 +336,7 @@ impl Command {
             Self::SyncReadMarker { .. } => "SyncReadMarker",
             Self::ClearConversation { .. } => "ClearConversation",
             Self::DeleteAttachment { .. } => "DeleteAttachment",
+            Self::RequestAttachments { .. } => "RequestAttachments",
             Self::SetTyping { .. } => "SetTyping",
             Self::DownloadAttachment { .. } => "DownloadAttachment",
             Self::ChangeConversation { .. } => "ChangeConversation",
@@ -328,7 +360,8 @@ impl Command {
             Self::SendReceipts { cmd, .. }
             | Self::SyncReadMarker { cmd, .. }
             | Self::ClearConversation { cmd, .. }
-            | Self::DeleteAttachment { cmd, .. } => Some(*cmd),
+            | Self::DeleteAttachment { cmd, .. }
+            | Self::RequestAttachments { cmd, .. } => Some(*cmd),
             _ => None,
         }
     }
@@ -393,6 +426,13 @@ pub enum DurableCommand {
         #[serde(default)]
         net_ids: Redacted<Vec<String>>,
     },
+    /// See [`Command::RequestAttachments`].
+    RequestAttachments {
+        /// The conversation.
+        conv: ConvKey,
+        /// The message.
+        target: MsgTarget,
+    },
 }
 
 impl DurableCommand {
@@ -439,8 +479,21 @@ impl DurableCommand {
                 index,
                 net_ids,
             },
+            Self::RequestAttachments { conv, target } => {
+                Command::RequestAttachments { cmd, conv, target }
+            }
         }
     }
+}
+
+/// The primary own id of another account of the profile, and whether that account is logged
+/// out (`Command::StartLogin::taken`): the answer of a refused link says which.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakenIdentity {
+    /// The account's primary own id (the first of its `own_ids`).
+    pub user: UserId,
+    /// That account is logged out: the user points it out with "Link Again".
+    pub logged_out: bool,
 }
 
 /// Refuse to link another account than the one being relinked (§4.3 step 6).

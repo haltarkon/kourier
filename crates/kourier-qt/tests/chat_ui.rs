@@ -37,6 +37,8 @@
 //! Nothing here opens a file in another application or plays sound: the file's and the voice
 //! note's actions are checked by what they would do.
 
+mod support;
+
 use std::time::{Duration, Instant};
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -924,6 +926,7 @@ fn own_files(
 }
 
 fn main() {
+    support::answer_list("chat_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

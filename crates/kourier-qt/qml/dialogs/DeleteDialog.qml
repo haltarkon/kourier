@@ -24,6 +24,7 @@ Kirigami.PromptDialog {
     customFooterActions: [
         Kirigami.Action {
             visible: root.forEveryone
+            enabled: visible
             text: L10n.i18nc("@action:button", "Delete for Everyone")
             icon.name: "edit-delete"
             onTriggered: {
@@ -33,6 +34,7 @@ Kirigami.PromptDialog {
         },
         Kirigami.Action {
             visible: root.forMe
+            enabled: visible
             text: root.notice ? L10n.i18nc("@action:button", "Delete") : L10n.i18nc("@action:button", "Delete for Me")
             icon.name: "trash-empty"
             onTriggered: {

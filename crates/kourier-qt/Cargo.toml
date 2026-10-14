@@ -44,6 +44,18 @@ name = "models"
 harness = false
 
 [[test]]
+name = "wait_ui"
+harness = false
+
+[[test]]
+name = "link_actions_ui"
+harness = false
+
+[[test]]
+name = "account_actions_ui"
+harness = false
+
+[[test]]
 name = "qml_smoke"
 harness = false
 
@@ -96,6 +108,10 @@ name = "scroll_ui"
 harness = false
 
 [[test]]
+name = "ask_ui"
+harness = false
+
+[[test]]
 name = "readmore_ui"
 harness = false
 
@@ -110,6 +126,16 @@ harness = false
 # The independent review of the history transfer's screens (target/h3-context/review.md).
 [[test]]
 name = "transfer_review_ui"
+harness = false
+
+# Picture quality in the timeline (P1): the file where the thumbnail cannot cover the size.
+[[test]]
+name = "picture_ui"
+harness = false
+
+# A picture keeps its pixels while its URL changes, and only for the same picture (P1/S1 fix F2, F3).
+[[test]]
+name = "retain_ui"
 harness = false
 
 [[test]]

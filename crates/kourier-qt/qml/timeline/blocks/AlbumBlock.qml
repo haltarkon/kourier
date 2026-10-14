@@ -76,7 +76,8 @@ Item {
                 "kind": item.kind,
                 "state": item.state,
                 "progress": item.progress,
-                "placeholder": item.placeholderUrl
+                "placeholder": item.placeholderUrl,
+                "ask": item.ask === true
             });
         }
         return out;
@@ -91,10 +92,10 @@ Item {
     readonly property string mediaAction: {
         let waiting = false;
         for (const item of root.items) {
-            if (item.state === "remote" || item.state === "failed") {
+            if (item.state === "remote" || item.state === "failed" || item.ask === true) {
                 return "download";
             }
-            waiting = waiting || item.state === "downloading";
+            waiting = waiting || item.state === "downloading" || item.state === "asking";
         }
         return waiting ? "" : "view";
     }
@@ -104,7 +105,7 @@ Item {
     function activate(): void {
         if (root.mediaAction === "download") {
             for (const item of root.items) {
-                if ((item.state === "remote" || item.state === "failed") && (item.attachment ?? 0) > 0) {
+                if ((item.state === "remote" || item.state === "failed" || item.ask === true) && (item.attachment ?? 0) > 0) {
                     App.downloadAttachment(item.attachment);
                 }
             }

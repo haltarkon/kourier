@@ -12,6 +12,7 @@
 
 use kourier_model::{ConversationFeatures, MessageId, Window};
 
+use crate::attachments::policy;
 use crate::error::{CoreError, Refusal, Result};
 use crate::facade::MessageActions;
 
@@ -353,6 +354,39 @@ pub(crate) fn copy(f: &Facts<'_>) -> bool {
     f.deleted.is_none() && f.has_text
 }
 
+/// The attachments of a message whose Download asks the other device
+/// ([`MessageActions::ask_attachments`]): `can` is the message's part of `Apply::can_ask`
+/// (account linked, network can ask, message named, not view-once, a chat and an author with
+/// a stable identity); the rest is [`policy::may_click`] on each file of `body` exactly as the
+/// click checks it. One being asked for already is not offered: its click would only join the
+/// open request.
+pub(crate) fn ask_attachments(
+    can: bool,
+    deleted: Option<&str>,
+    body: &kourier_model::Body,
+    receive_limit: Option<u64>,
+) -> Vec<kourier_model::AttachmentId> {
+    use kourier_model::{AttachmentState, Body};
+    if !can || deleted.is_some() {
+        return Vec::new();
+    }
+    let files: Vec<&kourier_model::Attachment> = match body {
+        Body::Media { attachments, .. } => attachments.iter().collect(),
+        Body::Sticker(a) => vec![a.as_ref()],
+        _ => return Vec::new(),
+    };
+    files
+        .into_iter()
+        .filter(|a| {
+            !a.long_text
+                && a.state != AttachmentState::Asking
+                && policy::may_click(a.state, a.remote.is_some(), a.size, receive_limit, true)
+                    == Ok(policy::Click::Ask)
+        })
+        .filter_map(|a| a.id)
+        .collect()
+}
+
 /// Every flag of one message at `now` (the core clock).
 pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
     let edit = edit(f, now);
@@ -378,6 +412,8 @@ pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
         delete_attachment: delete_attachment(f).is_ok(),
         copy: copy(f),
         take_back: matches!(for_everyone, Ok((Delete::TakeBack, _))),
+        // Needs the attachments' rows: the timeline query sets it ([`ask_attachments`]).
+        ask_attachments: Vec::new(),
         until,
     }
 }
@@ -943,5 +979,62 @@ mod tests {
             ..media(1)
         };
         assert_eq!(why(&tombstone), Some(Refusal::Deleted));
+    }
+
+    /// The Download of a lost file asks the other device only where the click would, file by
+    /// file: a linked account whose network can ask, a named message that is not deleted, and
+    /// a file (not a long text) that the network lost and that is within the receive limit.
+    /// A message with a file that is too large and one that is not offers the second alone;
+    /// a file being asked for, or whose ask ended "no file" or "no message", is not offered.
+    #[test]
+    fn lost_files_ask_where_the_click_would() {
+        use kourier_model::{AskFailure, Attachment, AttachmentId, AttachmentState, Body};
+        let file = |id, state, size, long_text| Attachment {
+            id: Some(AttachmentId(id)),
+            state,
+            size,
+            long_text,
+            ..Attachment::default()
+        };
+        let media = |atts: Vec<Attachment>| Body::Media {
+            attachments: atts,
+            caption: None,
+        };
+        let ids = |v: &[i64]| v.iter().map(|n| AttachmentId(*n)).collect::<Vec<_>>();
+        let gone = media(vec![file(1, AttachmentState::Expired, 10, false)]);
+        assert_eq!(ask_attachments(true, None, &gone, Some(100)), ids(&[1]));
+        assert!(ask_attachments(false, None, &gone, Some(100)).is_empty());
+        assert!(ask_attachments(true, Some("ForMe"), &gone, Some(100)).is_empty());
+        assert!(
+            ask_attachments(true, None, &gone, Some(5)).is_empty(),
+            "above the limit"
+        );
+        let mixed = media(vec![
+            file(1, AttachmentState::Unavailable, 500, false),
+            file(2, AttachmentState::Unavailable, 50, false),
+            file(3, AttachmentState::Local, 50, false),
+            file(4, AttachmentState::Asking, 50, false),
+        ]);
+        assert_eq!(
+            ask_attachments(true, None, &mixed, Some(100)),
+            ids(&[2]),
+            "the too-large file, the one that is here and the one being asked have no Download"
+        );
+        let text = media(vec![file(1, AttachmentState::Unavailable, 10, true)]);
+        assert!(
+            ask_attachments(true, None, &text, None).is_empty(),
+            "a long text alone"
+        );
+        let ended = |why| media(vec![file(1, AttachmentState::AskFailed { why }, 10, false)]);
+        assert!(ask_attachments(true, None, &ended(AskFailure::NoFile), None).is_empty());
+        assert!(ask_attachments(true, None, &ended(AskFailure::NoMessage), None).is_empty());
+        assert_eq!(
+            ask_attachments(true, None, &ended(AskFailure::NoAnswer), None),
+            ids(&[1]),
+            "a request that was not answered can be made again"
+        );
+        let sticker = Body::Sticker(Box::new(file(1, AttachmentState::Unavailable, 10, false)));
+        assert_eq!(ask_attachments(true, None, &sticker, None), ids(&[1]));
+        assert!(ask_attachments(true, None, &Body::Text(Default::default()), None).is_empty());
     }
 }

@@ -8,10 +8,11 @@ import app.kourier
 // state passes by itself (connecting, getting new messages, offline), a message with its
 // action when the user has to act (link again, solve a challenge, set the clock, restart).
 //
-// The history transfer of a newly linked account shows here too (`App.bannerTransfer`), once
-// the link page is gone (after a restart in the middle of one): while it runs, the same view
-// the link page shows, compact, with its "Continue Without History"; after a failure, a
-// message that stays until it is dismissed. Both are made when they are first needed.
+// The history transfer of a newly linked account shows here too (`App.bannerTransfer`): the
+// link page ends as soon as the core has the account, and the chats can be used while the
+// transfer runs. While it runs, a compact line with its bar and "Continue Without History";
+// after a failure, a message that stays until it is dismissed; after it (or without one),
+// the contacts and groups the account still fetches, counted. Made when first needed.
 //
 // One account shows one thing: its state or its transfer, whichever presses more (the order
 // of the viewmodel's `BannerKind`). The transfer is chosen apart from the states of the
@@ -23,12 +24,17 @@ ColumnLayout {
     readonly property string kind: App.bannerKind
     readonly property bool passing: root.kind === "connecting" || root.kind === "syncing" || root.kind === "offline"
     readonly property bool busy: root.kind === "connecting" || root.kind === "syncing"
-    // The history transfer to show: `waiting`, `downloading`, `reading`, `failed`, or empty.
+    // The history transfer to show: `waiting`, `downloading`, `reading`, `failed`, or empty;
+    // `updating` after it, or without one: the contacts and groups a new link still fetches.
     readonly property string transferPhase: App.bannerTransfer.phase ?? ""
     // A history transfer: running, or failed.
     readonly property bool transfer: root.transferPhase !== ""
     // What shows it (`TransferStatus` or `TransferFailure`; null without a transfer).
     readonly property Item transferItem: transferLoader.item as Item
+
+    // The banner's button was pressed: the window acts (`App.bannerActivate`), after asking
+    // when that would cancel a link in progress.
+    signal activated
 
     visible: root.kind !== "" || root.transfer
     spacing: 0
@@ -43,9 +49,8 @@ ColumnLayout {
         Accessible.role: Accessible.StatusBar
         Accessible.name: App.bannerText
 
-        QQC2.BusyIndicator {
+        Spinner {
             visible: root.busy
-            running: root.busy && root.visible
             implicitWidth: Kirigami.Units.iconSizes.small
             implicitHeight: Kirigami.Units.iconSizes.small
         }
@@ -76,6 +81,7 @@ ColumnLayout {
         actions: [
             Kirigami.Action {
                 visible: App.bannerAction !== ""
+                enabled: visible
                 text: App.bannerAction
                 icon.name: {
                     switch (root.kind) {
@@ -87,7 +93,7 @@ ColumnLayout {
                         return "view-refresh";
                     }
                 }
-                onTriggered: App.bannerActivate()
+                onTriggered: root.activated()
             }
         ]
     }
@@ -107,10 +113,6 @@ ColumnLayout {
             transferLoader.loaded = transferLoader.wanted;
             if (transferLoader.wanted === "") {
                 transferLoader.source = "";
-            } else if (transferLoader.wanted === "TransferStatus.qml") {
-                transferLoader.setSource(Qt.resolvedUrl(transferLoader.wanted), {
-                    "compact": true
-                });
             } else {
                 transferLoader.setSource(Qt.resolvedUrl(transferLoader.wanted));
             }

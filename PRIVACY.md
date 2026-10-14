@@ -44,6 +44,7 @@ are mode 0700, files 0600.
 | `~/.local/share/kourier/accounts/<id>/backend.db` | Signal identity and session keys, group secrets, profile keys | SQLCipher 4 database, its own random key per account |
 | `~/.local/share/kourier/accounts/<id>/key.wrap` | that account's database key | encrypted (AES-256-GCM) under a key made from the master key and a per-account secret in the Secret Service |
 | `~/.local/share/kourier/accounts/<id>/blobs/` | received and sent files, thumbnails, avatars | encrypted file by file (AES-256-GCM, a random key per file, kept in `core.db`) |
+| `~/.local/share/kourier/accounts/<id>/transfer/` | only while a message history transfer from the phone runs (a new link offers one, and you can decline on the phone): the archive as the phone uploaded it, and `stage.db`, its messages mapped for the import | the archive is encrypted by the phone with a one-time key that only `backend.db` holds; `stage.db` is a SQLCipher database under a key derived from that one-time key; the directory and the key are removed when the transfer ends (done, skipped or failed), at a logout, and at the next start after a crash |
 | the Secret Service (KWallet or GNOME Keyring) | the master key and one secret per account | the keyring's own protection (your login password) |
 | `~/.config/kourier/kourier.toml` | preferences (tray, autostart, notification content, compact layout) | none; no secrets in it |
 | `~/.local/state/kourier/logs/` | rotating logs (7 files of 10 MiB) and crash reports | redacted, see below |

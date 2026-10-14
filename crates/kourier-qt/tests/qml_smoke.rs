@@ -6,6 +6,8 @@
 //! logo the UI takes (the icon theme's icon of the application when the theme has one, else
 //! the bundled file). Offscreen, `harness = false`.
 
+mod support;
+
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_qt::{APP_ID, UiOptions};
 
@@ -235,6 +237,76 @@ Item {
         return "";
     }
 
+    Component {
+        id: imageBlockComponent
+        ImageBlock {}
+    }
+
+    // A block as the viewmodel hands one to the timeline.
+    function pictureBlock(sticker: bool, state: string): var {
+        return {
+            "attachment": 7,
+            "state": state,
+            "sticker": sticker,
+            "animated": false,
+            "kind": "image",
+            "width": 512,
+            "height": 512,
+            "blurhash": "",
+            "placeholderUrl": "",
+            "url": "",
+            "fullUrl": "",
+            "media": "",
+            "label": "",
+            "progress": 0
+        };
+    }
+
+    // A sticker that cannot be had ("No longer available", "Not available on this device") is
+    // a framed box as high as its note, not a hole of the size of a sticker with a pill in its
+    // corner; one that can be had keeps its size. In a small tile of an album the note is cut
+    // to the tile's width (its whole text is the block's accessible description), and in a
+    // wide one it is not.
+    function checkGoneMedia(): string {
+        for (const state of ["unavailable", "expired"]) {
+            const gone = imageBlockComponent.createObject(this, {
+                "block": pictureBlock(true, state)
+            });
+            const box = findNamed(gone, "standInBox");
+            const is = gone.standIn;
+            const shown = box !== null && box.visible;
+            const height = gone.implicitHeight;
+            gone.destroy();
+            if (!is || !shown) return "no stand-in is shown for a sticker that is " + state;
+            if (height <= 0 || height >= Style.stickerSize * 0.6) return "the stand-in is not as high as its note: " + height + " of " + Style.stickerSize;
+        }
+        const here = imageBlockComponent.createObject(this, {
+            "block": pictureBlock(true, "remote")
+        });
+        const hereBox = findNamed(here, "standInBox");
+        const hereShown = hereBox !== null && hereBox.visible;
+        const size = here.implicitHeight;
+        here.destroy();
+        if (hereShown || size < Style.stickerSize * 0.9) return "a sticker that can be had keeps its size: " + size;
+        for (const [width, cut] of [[80, true], [400, false]]) {
+            const tile = imageBlockComponent.createObject(this, {
+                "block": pictureBlock(false, "unavailable"),
+                "tile": true,
+                "width": width,
+                "height": width
+            });
+            const pill = findNamed(tile, "note");
+            const label = findNamed(tile, "noteLabel");
+            const summary = tile.Accessible.description + " | " + pill.visible + " " + pill.width + " " + label.truncated;
+            const ok = [pill.visible, pill.width <= width, label.truncated === cut];
+            tile.destroy();
+            if (!ok[0]) return "no note on a picture that is not available: " + summary;
+            if (!ok[1]) return "the note is wider than its " + width + " px tile: " + summary;
+            if (!ok[2]) return "the note of a " + width + " px tile is " + (cut ? "not cut" : "cut") + ": " + summary;
+        }
+        return "";
+    }
+
     function findNamed(item: Item, name: string): Item {
         if (item.objectName === name) {
             return item;
@@ -263,6 +335,8 @@ Item {
             if (plain !== "") return fail("plain text: " + plain);
             const logo = checkLogo();
             if (logo !== "") return fail("logo: " + logo);
+            const goneMedia = checkGoneMedia();
+            if (goneMedia !== "") return fail("media that cannot be had: " + goneMedia);
             if (!App.fixture || !App.hasAccounts) return fail("fixture not loaded");
             const listNote = checkListNotice();
             if (listNote !== "") return fail("list notice: " + listNote);
@@ -326,6 +400,7 @@ Item {
 "##;
 
 fn main() {
+    support::answer_list("qml_smoke");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before Qt starts.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

@@ -52,13 +52,17 @@ pub(crate) fn blob_from_sql(bytes: Option<Vec<u8>>) -> Option<BackendBlob> {
     Some(BackendBlob::new(u16::from_le_bytes(*v), rest.to_vec()))
 }
 
-/// The stored name of an account state; the `LoggedOut` reason goes in `state_reason`.
+/// The stored name of an account state; the `LoggedOut` reason goes in `state_reason`. (A
+/// `Removing` or `Unlinking` row has no reason of its own here: `local::set_removal_report` keeps
+/// the JSON of what the device's logout told in the same column until the work is done, and
+/// [`account_state`] ignores it for those two.)
 pub(crate) fn account_state_name(s: &AccountState) -> (&'static str, Option<&str>) {
     match s {
         AccountState::Linking => ("Linking", None),
         AccountState::Active => ("Active", None),
         AccountState::LoggedOut { reason } => ("LoggedOut", Some(reason.as_str())),
         AccountState::Removing => ("Removing", None),
+        AccountState::Unlinking => ("Unlinking", None),
     }
 }
 
@@ -71,6 +75,7 @@ pub(crate) fn account_state(name: &str, reason: Option<String>) -> Result<Accoun
             reason: reason.unwrap_or_default(),
         },
         "Removing" => AccountState::Removing,
+        "Unlinking" => AccountState::Unlinking,
         _ => return Err(CoreError::Json("unknown account state".into())),
     })
 }
@@ -181,6 +186,7 @@ mod tests {
             AccountState::Active,
             AccountState::LoggedOut { reason: "x".into() },
             AccountState::Removing,
+            AccountState::Unlinking,
         ] {
             let (name, reason) = account_state_name(&s);
             assert_eq!(account_state(name, reason.map(str::to_owned)).unwrap(), s);

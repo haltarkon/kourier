@@ -27,7 +27,8 @@ use kourier_backend_api::{
     BackendEnv, Clock as _, Command, Exit, InitialSync, StartMode, SystemClock, TransmitOutcome,
 };
 use kourier_model::{
-    BackendError, ConnState, ErrorKind, LoginStepKind, Redacted, UserAction, UserId,
+    BackendError, ConnState, DeviceLogout, ErrorKind, LoginStepKind, LogoutReport, Redacted,
+    UserAction, UserId,
 };
 use kourier_signal::SignalNetwork;
 use support::fake_core::{AccountFiles, FakeCore, ShiftClock, Sink, WAIT, local_env, text_request};
@@ -1282,12 +1283,21 @@ async fn a_logout_removes_the_device_from_the_account() {
         .expect("listDevices");
     assert_eq!(devices.len(), 2);
     let started = Instant::now();
-    let exit = core.exit_with(Command::Logout).await;
+    let (exit, reports) = core.logout().await;
     assert_eq!(
         exit,
         Exit::LoggedOut {
             reason: "logged out on request".to_owned()
         }
+    );
+    // The core is told once that the phone no longer lists the device, with the name the
+    // link gave it (link feedback L4).
+    assert_eq!(
+        reports,
+        vec![LogoutReport {
+            outcome: DeviceLogout::Removed,
+            device_name: Some("Kourier test".to_owned()),
+        }]
     );
     assert!(
         started.elapsed() < Duration::from_secs(8),
@@ -1360,8 +1370,15 @@ async fn a_logout_at_the_qr_code_has_no_device_to_remove() {
     let (_url, _steps) = core.begin_login(None).await;
     let started = Instant::now();
     core.send(Command::CancelLogin).await;
-    let exit = core.exit_with(Command::Logout).await;
+    let (exit, reports) = core.logout().await;
     assert_eq!(exit, logged_out());
+    assert_eq!(
+        reports,
+        vec![LogoutReport {
+            outcome: DeviceLogout::NoDevice,
+            device_name: None,
+        }]
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "nothing to wait for: {:?}",
@@ -1641,7 +1658,11 @@ async fn a_logout_of_a_device_the_phone_removed_already_warns_about_nothing() {
         .expect("unlink");
     assert_eq!(devices_of_the_phone(&world).await, 1);
     let started = Instant::now();
-    assert_eq!(core.exit_with(Command::Logout).await, logged_out());
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    // Nothing for the user to do on the phone.
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "within the core's 10 s: {:?}",

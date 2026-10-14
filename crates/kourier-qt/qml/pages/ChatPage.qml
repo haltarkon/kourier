@@ -155,14 +155,19 @@ Kirigami.Page {
             text: L10n.i18nc("@action:button", "Disappearing Messages")
             displayHint: Kirigami.DisplayHint.IconOnly
             visible: page.open && page.timerOffered
+            enabled: visible
             onTriggered: page.openTimerMenu()
         },
         // What is done to the chat as a whole lives in the page's menu; both ask first.
+        // While the chat's message history still arrives both wait, and the menu says why
+        // (`App.timeline.stillFilling`; link feedback L3).
         Kirigami.Action {
             icon.name: "edit-clear-history"
             text: L10n.i18nc("@action:inmenu", "Clear Chat History…")
             displayHint: Kirigami.DisplayHint.AlwaysHide
             visible: page.open
+            enabled: App.timeline.stillFilling === ""
+            tooltip: App.timeline.stillFilling
             onTriggered: page.askClear()
         },
         Kirigami.Action {
@@ -170,7 +175,16 @@ Kirigami.Page {
             text: L10n.i18nc("@action:inmenu", "Delete Chat…")
             displayHint: Kirigami.DisplayHint.AlwaysHide
             visible: page.open
+            enabled: App.timeline.stillFilling === ""
+            tooltip: App.timeline.stillFilling
             onTriggered: page.askDelete()
+        },
+        Kirigami.Action {
+            icon.name: "documentinfo"
+            text: App.timeline.stillFilling
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && App.timeline.stillFilling !== ""
+            enabled: false
         }
     ]
 
@@ -216,6 +230,8 @@ Kirigami.Page {
         QQC2.MenuItem {
             objectName: "timerCustom"
             visible: page.timerCustom
+            // Disabled while hidden: the keyboard would reach an invisible item otherwise.
+            enabled: visible
             height: visible ? implicitHeight : 0
             icon.name: "chronometer"
             text: L10n.i18nc("@action:inmenu", "Custom Time…")

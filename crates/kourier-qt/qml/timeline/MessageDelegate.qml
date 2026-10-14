@@ -38,6 +38,12 @@ Item {
     required property string receipt
     required property var actions
     required property string expiry
+    // Why an own message is still on its way and for how long, in two parts ("Setting up
+    // encryption with 12 members" and "· 0:42"; a countdown is the timer alone, "Next try in
+    // 0:30"); both empty for every other message (link feedback L6). The reason gives way in
+    // a narrow window, the timer never does.
+    required property string wait
+    required property string waitTimer
 
     readonly property bool group: App.timeline.isGroup
     // The row is laid out right to left (the window's layout direction, as anchors and
@@ -350,7 +356,12 @@ Item {
 
     Accessible.role: Accessible.ListItem
     Accessible.name: root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", root.author, root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", root.author, root.timeLabel, root.copyText)
-    Accessible.description: (root.edited ? L10n.i18nc("@info accessible", "Edited.") + " " : "") + (root.failed ? L10n.i18nc("@info accessible", "Not sent.") + " " : "") + root.expiry + (root.current && root.keyHint !== "" ? " " + root.keyHint : "")
+    Accessible.description: (root.edited ? L10n.i18nc("@info accessible", "Edited.") + " " : "") + (root.failed ? L10n.i18nc("@info accessible", "Not sent.") + " " : "") + root.waitHint + root.expiry + (root.current && root.keyHint !== "" ? " " + root.keyHint : "")
+    // Why the message has not left, without the seconds (a description that changes every
+    // second would be read again for the focused row); a countdown has no reason, so it says
+    // that the send is tried again. A reason that ends in a stop or an ellipsis ("Sending…") is
+    // not given another stop.
+    readonly property string waitHint: root.wait !== "" ? root.wait + (/[….]$/.test(root.wait) ? " " : ". ") : (root.waitTimer !== "" ? L10n.i18nc("@info accessible", "Not sent yet, trying again.") + " " : "")
     // What the keyboard does on this row, said to a screen reader while the row is current.
     readonly property string keyHint: {
         if (!root.current) {
@@ -423,7 +434,7 @@ Item {
 
         x: Math.round(root.atRight ? root.width - root.sideMargin - root.avatarColumn - width : root.sideMargin + root.avatarColumn)
         y: root.groupStart ? Kirigami.Units.smallSpacing : 0
-        width: Math.max(bubble.width, reactionFlow.visible ? reactionFlow.width : 0)
+        width: Math.max(bubble.width, reactionFlow.visible ? reactionFlow.width : 0, waitLine.visible ? waitLine.width : 0)
         spacing: 0
 
         Kirigami.ShadowedRectangle {
@@ -489,20 +500,31 @@ Item {
                     onImplicitWidthChanged: root.measure()
                 }
 
+                // One delegate per block, KEPT while the blocks' content changes (a new picture
+                // revision when the core derived its thumbnail, download progress): the model is
+                // the number of blocks, and each delegate reads its own block. A model that is
+                // the list of blocks itself would build every block anew at every change, and a
+                // picture could not hold its pixels (`retainWhileLoading`) across its URL's change.
                 Repeater {
                     id: blockRepeater
-                    model: root.blocks
+                    model: root.blocks.length
                     delegate: Loader {
                         id: blockLoader
 
-                        required property var modelData
+                        required property int index
+
+                        // (The last block while the list shrinks and this delegate is still
+                        // there; nothing for a list that is empty.)
+                        readonly property var block: root.blocks[Math.min(blockLoader.index, root.blocks.length - 1)] ?? ({
+                                "type": ""
+                            })
 
                         // Text wraps at the maximum width and reports what it uses; other
                         // blocks take the bubble's width.
-                        width: blockLoader.modelData.type === "text" ? root.maxBubble - root.hpad * 2 : content.width
+                        width: blockLoader.block.type === "text" ? root.maxBubble - root.hpad * 2 : content.width
                         onImplicitWidthChanged: root.measure()
                         sourceComponent: {
-                            switch (blockLoader.modelData.type) {
+                            switch (blockLoader.block.type) {
                             case "text":
                                 return textComponent;
                             case "quote":
@@ -521,7 +543,7 @@ Item {
                         Component {
                             id: textComponent
                             TextBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 ink: root.inkColor
                                 surface: root.surface
                                 message: root.messageId
@@ -530,7 +552,7 @@ Item {
                         Component {
                             id: quoteComponent
                             QuoteBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 ink: root.inkColor
                                 surface: root.surface
                             }
@@ -538,7 +560,7 @@ Item {
                         Component {
                             id: imageComponent
                             ImageBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 available: root.maxBubble - root.hpad * 2
                                 message: root.messageId
                             }
@@ -546,7 +568,7 @@ Item {
                         Component {
                             id: albumComponent
                             AlbumBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 available: root.maxBubble - root.hpad * 2
                                 message: root.messageId
                             }
@@ -554,7 +576,7 @@ Item {
                         Component {
                             id: fileComponent
                             FileBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 ink: root.inkColor
                                 subtleInk: root.subtleInk
                             }
@@ -562,7 +584,7 @@ Item {
                         Component {
                             id: placeholderComponent
                             PlaceholderBlock {
-                                block: blockLoader.modelData
+                                block: blockLoader.block
                                 ink: root.subtleInk
                             }
                         }
@@ -636,6 +658,44 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }
+            }
+        }
+
+        // The line under an own message on its way: why it waits and for how long. The timer is
+        // a label of its own, so a narrow bubble cuts the reason and never the time.
+        Row {
+            id: waitLine
+            objectName: "waitLine"
+            visible: root.wait !== "" || root.waitTimer !== ""
+            anchors.right: parent.right
+            topPadding: Math.round(Kirigami.Units.smallSpacing / 2)
+            rightPadding: Kirigami.Units.largeSpacing
+            spacing: Kirigami.Units.smallSpacing
+
+            QQC2.Label {
+                id: waitReason
+                objectName: "waitReason"
+                visible: root.wait !== ""
+                width: Math.max(0, Math.min(implicitWidth, root.maxBubble - waitLine.rightPadding - (waitTimer.visible ? waitTimer.width + waitLine.spacing : 0)))
+                text: root.wait
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                font: Kirigami.Theme.smallFont
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                Accessible.role: Accessible.StaticText
+                Accessible.name: root.wait
+            }
+
+            QQC2.Label {
+                id: waitTimer
+                objectName: "waitTimer"
+                visible: root.waitTimer !== ""
+                text: root.waitTimer
+                textFormat: Text.PlainText
+                font: Kirigami.Theme.smallFont
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                Accessible.role: Accessible.StaticText
+                Accessible.name: root.waitTimer
             }
         }
 

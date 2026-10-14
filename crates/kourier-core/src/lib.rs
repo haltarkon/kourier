@@ -88,6 +88,7 @@ mod media;
 mod modify;
 mod outbox;
 mod query;
+mod restore;
 mod runtime;
 mod sql;
 mod store;

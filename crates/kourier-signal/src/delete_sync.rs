@@ -85,7 +85,7 @@ use crate::service_id::{SignalUser, parse_user_id};
 
 /// The conversation `conv` as sync messages name it; `None` for a key that is not a Signal
 /// conversation (a chat known only by phone number has no thread other devices could find).
-fn conversation(conv: &ConvKey) -> Option<proto::ConversationIdentifier> {
+pub(crate) fn conversation(conv: &ConvKey) -> Option<proto::ConversationIdentifier> {
     use proto::conversation_identifier::Identifier;
     let identifier = match conv {
         ConvKey::Direct(user) => match parse_user_id(user).ok()? {
@@ -109,7 +109,10 @@ fn conversation(conv: &ConvKey) -> Option<proto::ConversationIdentifier> {
 
 /// The message `target` as sync messages name it: author and sent timestamp. `None` for a
 /// target without a Signal id (a notice) or without a nameable author.
-fn addressable(account: &Account, target: &MsgTarget) -> Option<proto::AddressableMessage> {
+pub(crate) fn addressable(
+    account: &Account,
+    target: &MsgTarget,
+) -> Option<proto::AddressableMessage> {
     use proto::addressable_message::Author;
     let sent_timestamp: u64 = target.local.parse().ok()?;
     let author = match &target.author {
@@ -190,7 +193,10 @@ fn attachment_message(
 ) -> Option<DeleteForMe> {
     let client_uuid = crate::receive::media::uuid_of_net_ids(net_ids);
     let fallback_digest = crate::receive::media::digest_of_net_ids(net_ids);
-    if client_uuid.is_none() && fallback_digest.is_none() {
+    // An imported attachment of a file the phone had downloaded has a plaintext hash and
+    // often no digest; Android sends and reads this name too.
+    let fallback_plaintext_hash = crate::receive::media::plaintext_hash_of_net_ids(net_ids);
+    if client_uuid.is_none() && fallback_digest.is_none() && fallback_plaintext_hash.is_none() {
         return None;
     }
     Some(DeleteForMe {
@@ -199,7 +205,7 @@ fn attachment_message(
             target_message: Some(addressable(account, target)?),
             client_uuid,
             fallback_digest,
-            fallback_plaintext_hash: None,
+            fallback_plaintext_hash,
         }],
         ..Default::default()
     })
@@ -540,6 +546,20 @@ mod tests {
         assert_eq!(attachment.client_uuid.as_deref(), Some(&uuid[..]));
         assert_eq!(attachment.fallback_digest.as_deref(), Some(&digest[..]));
         assert_eq!(attachment.fallback_plaintext_hash, None);
+        // An imported attachment named only by its plaintext hash.
+        let hash = [5u8; 32];
+        let imported = vec![crate::receive::media::net_id_plaintext_hash(&hash).unwrap()];
+        let imported_delete =
+            attachment_message(account, &conv, &from(&user, 78), &imported).expect("a message");
+        let by_hash = &imported_delete.attachment_deletes[0];
+        assert_eq!(by_hash.fallback_plaintext_hash.as_deref(), Some(&hash[..]));
+        assert_eq!(
+            (
+                by_hash.client_uuid.as_ref(),
+                by_hash.fallback_digest.as_ref()
+            ),
+            (None, None)
+        );
         assert_eq!(
             attachment.target_message.as_ref().map(author_and_time),
             Some((ServiceId::from(alice).service_id_binary(), 77))

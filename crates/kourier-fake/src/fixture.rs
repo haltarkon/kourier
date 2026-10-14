@@ -62,6 +62,9 @@ pub enum FixtureState {
     Challenge,
     /// `ConnState::NeedsUserAction(FixClock)`: the clock is two hours ahead.
     ClockSkew,
+    /// `ConnState::NeedsUserAction(Reconnect)`: another session took the connection (the
+    /// state banner of kind "error", whose button restarts the account).
+    Reconnect,
     /// The device is unlinked (`AccountState::LoggedOut`, history kept; "Link again" works).
     LoggedOut,
 }
@@ -525,6 +528,11 @@ pub fn fixture(spec: &FixtureSpec) -> Result<Script, ScriptError> {
                 UserAction::FixClock {
                     skew_ms: 2 * 3_600_000,
                 },
+            )));
+        }
+        FixtureState::Reconnect => {
+            s = s.step(Step::Conn(ConnState::NeedsUserAction(
+                UserAction::Reconnect,
             )));
         }
         FixtureState::LoggedOut => {

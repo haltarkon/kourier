@@ -61,6 +61,6 @@ pub use actor::{
 pub use flavor::Flavor;
 pub use network::{FakeControl, FakeNetwork, TransmitRecord};
 pub use script::{
-    CHALLENGE_TOKEN, Delivery, LoginScript, Script, ScriptError, Step, TransferScript,
-    TransmitRule, challenge_error, challenge_error_after,
+    BackfillScript, CHALLENGE_TOKEN, Delivery, LoginScript, Script, ScriptError, Step,
+    TransferScript, TransmitRule, challenge_error, challenge_error_after,
 };

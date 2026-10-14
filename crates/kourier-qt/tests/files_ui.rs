@@ -18,6 +18,8 @@
 //! - A click on a message's "edited" mark opens its history: the versions, newest first.
 //! - A notice (a system row) has a context menu that removes it from this account.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -592,6 +594,7 @@ fn own_file_messages(app: &kourier_app::AppHandle, conv: ConversationId) -> Vec<
 }
 
 fn main() {
+    support::answer_list("files_ui");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before the app and Qt start.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

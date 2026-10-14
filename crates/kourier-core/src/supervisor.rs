@@ -15,12 +15,13 @@ use std::time::Duration;
 
 use kourier_backend_api::{
     AccountContext, BackendEvent, BackendNotice, Command, ContextParams, DurableCommand, Envelope,
-    Exit, Network, Relink, StartMode, UiPresence,
+    Exit, Network, Relink, StartMode, TakenIdentity, UiPresence,
 };
 use kourier_db::{Priority, failpoint};
 use kourier_model::{
-    AccountId, AccountState, AccountUuid, CmdId, ConnState, ConversationId, LoginStepKind,
-    MsgIdScope, PersistError, Redacted, UserId,
+    AccountId, AccountState, AccountUuid, BackendError, CmdId, ConnState, ConversationId,
+    DeviceLogout, ErrorKind, LoginStep, LoginStepKind, LogoutReport, MsgIdScope, PersistError,
+    Redacted, UserId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -28,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::attachments::{self, DownloadJob, derive};
 use crate::dispatch::{Dispatcher, Signal, Wake};
 use crate::error::{CoreError, Result};
-use crate::facade::{ActionSubject, Progress, UiEvent};
+use crate::facade::{AccountLabel, ActionSubject, Progress, UiEvent};
 use crate::ingest::{self, Changes};
 use crate::runtime::Shared;
 use crate::store::lane;
@@ -43,24 +44,42 @@ pub const FAILPOINT_AFTER_PENDING_COMMAND: &str = "after_pending_command";
 /// handed to the actor (§10.4): the next start resends it with the same target.
 pub const FAILPOINT_BEFORE_DOWNLOAD_SEND: &str = "core_before_download_send";
 
+/// The most `IdentityMerged` events in one writer job. A merge costs what its alias owns
+/// (`ingest::merge`), and a link or a rebuild can tell hundreds of them in one envelope
+/// (`links::all`, a Storage zone of 500 records): cut into jobs of this many, the writer
+/// serves a user's action between them instead of after the whole list.
+pub(crate) const MERGES_PER_JOB: usize = 64;
+
 /// Splits an envelope into writer jobs (§4.9, §4.10): consecutive live events form one
-/// high-priority job; each history batch (≤ 500 messages) is its own low-priority job, so the
-/// writer interleaves other accounts' live traffic between the chunks of a large import. The
-/// ack waits for the last job; a crash in between replays the envelope into idempotent ingest.
+/// high-priority job, cut after every [`MERGES_PER_JOB`] identity merges; each history batch
+/// (≤ 500 messages) is its own low-priority job, so the writer interleaves other accounts'
+/// live traffic between the chunks of a large import. The jobs keep the envelope's order. The
+/// ack waits for the last job; a crash in between replays the envelope into idempotent
+/// ingest (a merge already done finds an alias that owns nothing and returns early).
 pub(crate) fn segments(events: Vec<BackendEvent>) -> Vec<(Priority, Vec<BackendEvent>)> {
     let mut out: Vec<(Priority, Vec<BackendEvent>)> = Vec::new();
+    let mut merges = 0usize;
     for e in events {
         let history = matches!(e, BackendEvent::HistoryBatch { .. });
+        let merge = matches!(e, BackendEvent::IdentityMerged { .. });
         match out.last_mut() {
-            Some((Priority::High, seg)) if !history => seg.push(e),
-            _ => out.push((
-                if history {
-                    Priority::Low
-                } else {
-                    Priority::High
-                },
-                vec![e],
-            )),
+            Some((Priority::High, seg)) if !history && !(merge && merges >= MERGES_PER_JOB) => {
+                seg.push(e)
+            }
+            _ => {
+                merges = 0;
+                out.push((
+                    if history {
+                        Priority::Low
+                    } else {
+                        Priority::High
+                    },
+                    vec![e],
+                ))
+            }
+        }
+        if merge {
+            merges += 1;
         }
     }
     out
@@ -114,6 +133,14 @@ pub struct Timeouts {
     pub shutdown_grace: Duration,
     /// Best-effort `Logout` before removal (§4.3 step 7: 10 s).
     pub logout: Duration,
+    /// How long a request for lost files waits for the other device's first answer after it
+    /// went out (Signal Android: 30 s), and how much longer after each "still uploading"
+    /// answer (2 min). PROCESS-WIDE: [`Core::start`](crate::Core::start) sets them for every
+    /// core of the process (the deadline is stored when it is armed, inside ingest, which
+    /// has no configuration of its own); tests shorten them.
+    pub restore_answer: Duration,
+    /// See [`Self::restore_answer`].
+    pub restore_pending: Duration,
 }
 
 impl Default for Timeouts {
@@ -121,6 +148,12 @@ impl Default for Timeouts {
         Self {
             shutdown_grace: Duration::from_secs(5),
             logout: Duration::from_secs(10),
+            restore_answer: Duration::from_millis(
+                crate::ingest::restore::ANSWER_WAIT_MS.unsigned_abs(),
+            ),
+            restore_pending: Duration::from_millis(
+                crate::ingest::restore::PENDING_WAIT_MS.unsigned_abs(),
+            ),
         }
     }
 }
@@ -172,6 +205,9 @@ pub(crate) enum Control {
         flow: String,
     },
     Remove,
+    /// "Unlink…" (link feedback L4): the device logs out on the network and the account stays
+    /// logged out with its chats, as after an unlink by the phone.
+    Unlink,
     Restart,
     /// Forwarded to a running actor whose account is linked; dropped otherwise (reply senders
     /// then report "gone").
@@ -197,6 +233,54 @@ pub(crate) enum Control {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// The outcome to tell when a cut-off logout was kept and tried again: the device gone beats
+/// "no device" beats "could not tell the network". The name of the device comes from whichever
+/// report has one.
+fn better_report(kept: Option<LogoutReport>, retry: Option<LogoutReport>) -> Option<LogoutReport> {
+    fn rank(o: DeviceLogout) -> u8 {
+        match o {
+            DeviceLogout::Removed => 2,
+            DeviceLogout::NoDevice => 1,
+            DeviceLogout::NotReached => 0,
+        }
+    }
+    match (kept, retry) {
+        (Some(k), Some(r)) => {
+            // On a tie the newer attempt wins.
+            let (mut best, other) = if rank(k.outcome) > rank(r.outcome) {
+                (k, r)
+            } else {
+                (r, k)
+            };
+            if best.device_name.is_none() {
+                best.device_name = other.device_name;
+            }
+            Some(best)
+        }
+        (k, r) => r.or(k),
+    }
+}
+
+/// How an unlink finds its account.
+enum Unlinking {
+    /// With its running, linked actor.
+    Running(Running),
+    /// No actor runs (halted, between restarts): one is started for the logout.
+    NoActor,
+    /// An `Unlinking` row found at start ([`Plan::Unlink`]).
+    AtStart,
+}
+
+/// How a removal finds its account.
+enum Removal {
+    /// With its running actor and whether the core accepted its identity.
+    Running(Running, bool),
+    /// No actor runs (logged out, halted, between restarts).
+    NoActor,
+    /// A `Removing` row found at start ([`Plan::Remove`]).
+    AtStart,
+}
+
 /// What a supervisor does next.
 #[derive(Debug)]
 pub(crate) enum Plan {
@@ -211,6 +295,12 @@ pub(crate) enum Plan {
     Idle,
     /// Gave up after repeated failures: wait for `Restart` or removal.
     Halted,
+    /// A `Removing` row found at start (the removal was cut off, e.g. by a quit during its
+    /// logout): one logout attempt, then the rest of the removal (link feedback L4).
+    Remove,
+    /// An `Unlinking` row found at start: the unlink was cut off; one logout attempt, then the
+    /// account is logged out with its chats kept (link feedback L4).
+    Unlink,
 }
 
 enum Next {
@@ -327,6 +417,16 @@ pub(crate) struct Supervisor {
     outbox_dirty: bool,
     /// When the backend's current `Syncing` began (the `recv.catchup` mark).
     syncing_since: Option<std::time::Instant>,
+    /// The running actor has reported numbers of its work (`AccountProgress`) and not yet that
+    /// it finished: an actor that exits in between never will, and a UI would show the work
+    /// (and ask before quitting) for ever.
+    progress_open: bool,
+    /// The backend's report of its last `Command::Logout` (`BackendEvent::Logout`), taken
+    /// when the user's removal or unlink tells what became of the device.
+    logout_report: Option<LogoutReport>,
+    /// The derive jobs of the publish in progress, until they are handed to their task (0
+    /// outside one): `emit` checks they are counted before any event of it goes out.
+    publishing_jobs: usize,
 }
 
 impl Supervisor {
@@ -356,6 +456,9 @@ impl Supervisor {
             hint: None,
             outbox_dirty: false,
             syncing_since: None,
+            progress_open: false,
+            logout_report: None,
+            publishing_jobs: 0,
         }
     }
 
@@ -387,6 +490,7 @@ impl Supervisor {
     }
 
     fn emit(&self, e: UiEvent) {
+        self.sh.media.check_reserved(self.publishing_jobs);
         // No receiver (headless tests, shutdown) is fine.
         let _ = self.sh.events.send(e);
     }
@@ -399,6 +503,7 @@ impl Supervisor {
         // Connected and caught up: the missed calls that waited for it (`crate::calls`) go
         // into the summary, those that are still missed.
         let online = matches!(state, ConnState::Online { .. });
+        self.sh.restore_online(self.account, online);
         let held = self.sh.calls_online(self.account, online);
         for conv in self.sh.still_missed(held).await {
             self.catch_up.0 = self.catch_up.0.saturating_add(1);
@@ -518,6 +623,14 @@ impl Supervisor {
         loop {
             let next = match plan {
                 Plan::Idle | Plan::Halted => self.wait(plan).await,
+                Plan::Remove => {
+                    self.remove(Removal::AtStart).await;
+                    Next::Stop
+                }
+                Plan::Unlink => {
+                    self.unlink(Unlinking::AtStart).await;
+                    Next::Plan(Plan::Idle)
+                }
                 p @ (Plan::Login { .. } | Plan::Run(_)) => self.incarnation(p).await,
             };
             match next {
@@ -555,8 +668,14 @@ impl Supervisor {
                     return Next::Stop;
                 }
                 Some(Control::Remove) => {
-                    self.remove(None).await;
+                    self.remove(Removal::NoActor).await;
                     return Next::Stop;
+                }
+                // A halted account still has its device: an actor is started just for the
+                // logout. A logged-out one has none left.
+                Some(Control::Unlink) if matches!(plan, Plan::Halted) => {
+                    self.unlink(Unlinking::NoActor).await;
+                    return Next::Plan(Plan::Idle);
                 }
                 Some(Control::Relink { flow }) if matches!(plan, Plan::Idle) => {
                     match self.prepare_relink(flow).await {
@@ -611,7 +730,7 @@ impl Supervisor {
                 (StartMode::Fresh, Some((flow, relink)), relinking)
             }
             Plan::Run(mode) => (mode, None, false),
-            Plan::Idle | Plan::Halted => return Next::Plan(plan),
+            Plan::Idle | Plan::Halted | Plan::Remove | Plan::Unlink => return Next::Plan(plan),
         };
         let mut linked = login.is_none();
         let mut run = match self.spawn(start).await {
@@ -668,7 +787,29 @@ impl Supervisor {
             Some((flow, relink)) => {
                 // A new link starts from scratch: confirmations for the old one do not apply.
                 self.confirm_later.clear();
-                run.send(Command::StartLogin { flow, relink }).await;
+                // The other accounts' ids, so that the backend can refuse a link that brings
+                // one of them before it registers a device (the core refuses again when
+                // `AccountReady` arrives: `ingest::roaming`). Unreadable: none named, the
+                // second line still holds.
+                let account = self.account;
+                let taken = self
+                    .sh
+                    .store
+                    .read(move |c| ingest::other_identities(c, account))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(account = account.0, error = %e, "reading the profile's other identities failed");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .map(|(user, logged_out)| TakenIdentity { user, logged_out })
+                    .collect();
+                run.send(Command::StartLogin {
+                    flow,
+                    relink,
+                    taken,
+                })
+                .await;
             }
             None => {
                 if *ui_ready.borrow_and_update() {
@@ -693,7 +834,8 @@ impl Supervisor {
                         // The backend's own state, not the one shown (a challenge shows over
                         // `Online`, which is a verdict on the clock all the same).
                         self.note_clock(&state);
-                        let resume = self.dispatch.conn(&state);
+                        let now = i64::try_from(self.sh.clock.now_ms()).unwrap_or(i64::MAX);
+                        let resume = self.dispatch.conn(&state, now);
                         let online = state.is_online();
                         let shown = self.dispatch.shown(state);
                         self.set_conn(shown).await;
@@ -756,8 +898,12 @@ impl Supervisor {
                         return Next::Stop;
                     }
                     Some(Control::Remove) => {
-                        self.remove(Some((run, linked))).await;
+                        self.remove(Removal::Running(run, linked)).await;
                         return Next::Stop;
+                    }
+                    Some(Control::Unlink) if linked => {
+                        self.unlink(Unlinking::Running(run)).await;
+                        return Next::Plan(Plan::Idle);
                     }
                     Some(Control::LoginInput { txn, values }) => {
                         run.send(Command::SubmitLoginInput { txn, values }).await;
@@ -1052,6 +1198,8 @@ impl Supervisor {
         });
         let handle = self.network.spawn(ctx)?;
         tracing::info!(account = self.account.0, uuid = %self.uuid.short(), ?start, "account actor started");
+        // Its waits for the other device's answer are judged once its outbox was replayed.
+        self.sh.restore_actor_started(self.account);
         Ok(Running {
             commands: ends.commands,
             events: ends.events,
@@ -1202,6 +1350,35 @@ impl Supervisor {
                     self.attempt = 0;
                 }
             }
+            Err(CoreError::AlreadyAdded { logged_out }) if !*linked => {
+                // The link brought an identity another account of the profile has (L1, F2):
+                // turned away like a relink as another account; the login page says why.
+                let detail = CoreError::AlreadyAdded { logged_out }.to_string();
+                tracing::info!(
+                    account = self.account.0,
+                    logged_out,
+                    "link refused: the identity is already an account here"
+                );
+                ack.complete(Err(PersistError {
+                    retryable: false,
+                    detail: detail.clone(),
+                }));
+                self.publish(ch).await;
+                self.emit(UiEvent::LoginStep {
+                    account: self.account,
+                    step: LoginStep {
+                        step_id: "already-added".into(),
+                        txn: 0,
+                        kind: LoginStepKind::Failed {
+                            error: BackendError::new(
+                                ErrorKind::AlreadyAdded { logged_out },
+                                detail.clone(),
+                            ),
+                        },
+                    },
+                });
+                return Flow::LoginFailed(detail);
+            }
             Err(e) => {
                 tracing::warn!(account = self.account.0, error = %e, "ingest failed; the backend forwards again");
                 ack.complete(Err(PersistError {
@@ -1272,6 +1449,10 @@ impl Supervisor {
     /// Turns committed changes into UI events (§4.9 last row).
     async fn publish(&mut self, ch: Changes) {
         let account = self.account;
+        // Counted before the first UI event: a reader that saw "Local" sees the derive job
+        // until its result is published (`MediaHandles::deriving`).
+        self.publishing_jobs = ch.derive.len();
+        let derive_hold = self.sh.media.reserve(ch.derive.len());
         self.sh.forget_media(&ch);
         self.outbox_dirty |= ch.outbox;
         if ch.expiring {
@@ -1279,6 +1460,9 @@ impl Supervisor {
         }
         if ch.ringing {
             self.sh.calls_wake.notify_one();
+        }
+        if ch.restoring {
+            self.sh.restore_wake.notify_one();
         }
         if ch.accounts {
             self.emit(UiEvent::AccountsChanged);
@@ -1366,9 +1550,18 @@ impl Supervisor {
             let (d, paths) = (dir.clone(), ch.unlink);
             let _ = tokio::task::spawn_blocking(move || attachments::unlink(&d, &paths)).await;
         }
+        // (The jobs may be done and uncounted as soon as they are spawned.)
+        self.publishing_jobs = 0;
         if !ch.derive.is_empty() {
-            derive::spawn(&self.sh, account, self.scope, dir, ch.derive);
+            derive::spawn(&self.sh, account, self.scope, dir, ch.derive, derive_hold);
         }
+        // Requests to the other device stored by what was applied (a user download that
+        // ended "no longer available"): their rows are stored, the next start resends them.
+        self.out.extend(
+            ch.commands
+                .into_iter()
+                .map(|(id, cmd)| cmd.into_command(id)),
+        );
         self.queue_downloads(ch.downloads).await;
     }
 
@@ -1430,18 +1623,39 @@ impl Supervisor {
                 done,
                 total,
             })),
-            BackendEvent::TransmitProgress { local, progress } => {
+            BackendEvent::TransmitProgress {
+                local,
+                progress,
+                phase,
+            } => {
                 self.emit(UiEvent::Progress(Progress::Transmit {
                     message: local,
                     progress,
+                    phase,
                 }));
             }
             BackendEvent::HistoryTransfer(state) => {
                 self.emit(UiEvent::HistoryTransfer { account, state });
             }
+            BackendEvent::AccountProgress(progress) => {
+                self.progress_open = !progress.finished;
+                self.emit(UiEvent::AccountProgress { account, progress });
+            }
+            BackendEvent::Logout(report) => self.logout_report = Some(report),
             _ => {}
         }
         None
+    }
+
+    /// [`Self::ingest_stopping`] during a logout: the backend's report of the logout is taken
+    /// also from an actor whose events are refused (it only says what became of the device).
+    async fn ingest_logging_out(&mut self, env: Envelope, ingest: Ingest) -> Ingest {
+        for event in &env.events {
+            if let BackendEvent::Logout(report) = event {
+                self.logout_report = Some(report.clone());
+            }
+        }
+        self.ingest_stopping(env, ingest).await
     }
 
     /// Applies what the actor still sends after it reported its exit, until its sender closes
@@ -1560,6 +1774,9 @@ impl Supervisor {
         );
         self.set_conn(ConnState::Offline { retry_at_ms: None })
             .await;
+        // The numbers belong to the actor that reported them: it will not finish them now, and
+        // a new one begins again if it has work left (link feedback L3).
+        self.end_progress();
         if !linked {
             let detail = match &exit {
                 Exit::Failed(e) => e.detail.clone(),
@@ -1650,8 +1867,12 @@ impl Supervisor {
                         return Next::Stop;
                     }
                     Some(Control::Remove) => {
-                        self.remove(None).await;
+                        self.remove(Removal::NoActor).await;
                         return Next::Stop;
+                    }
+                    Some(Control::Unlink) => {
+                        self.unlink(Unlinking::NoActor).await;
+                        return Next::Plan(Plan::Idle);
                     }
                     Some(Control::Restart) => return Next::Plan(Plan::Run(mode)),
                     // The sleep did not run while the machine slept: wait for what is left.
@@ -1717,15 +1938,20 @@ impl Supervisor {
             tracing::warn!(account = self.account.0, error = %e, "wiping credentials failed");
         }
         let (account, reason_owned) = (self.account, reason.to_owned());
-        if let Err(e) = self
+        let state = self.sh.clone();
+        match self
             .sh
             .store
             .write(Priority::High, lane(account), move |c| {
-                local::logged_out(c, account, &reason_owned)
+                local::logged_out(c, account, &reason_owned, state.now())
             })
             .await
         {
-            tracing::warn!(account = self.account.0, error = %e, "recording the logout failed");
+            // The waits for the other device's answer ended with the login.
+            Ok(ended) => crate::runtime::emit_changes(&self.sh, &ended),
+            Err(e) => {
+                tracing::warn!(account = self.account.0, error = %e, "recording the logout failed");
+            }
         }
         self.set_conn(ConnState::LoggedOut {
             reason: reason.to_owned(),
@@ -1741,17 +1967,27 @@ impl Supervisor {
     /// away an actor that may have finished its link (a cancelled login, a refused relink):
     /// the core has not accepted that device, and nobody else would ever log it out.
     async fn log_out(&mut self, run: &mut Running, mut ingest: Ingest) {
+        self.logout_report = None;
         run.send(Command::Logout).await;
         let deadline = tokio::time::Instant::now() + self.sh.timeouts.logout;
         let mut events_open = true;
         while !run.exit_done {
+            // The exit first: what the actor sent before it is read after the loop, always.
             tokio::select! {
+                biased;
                 _ = &mut run.exited => run.exit_done = true,
                 ev = run.events.recv(), if events_open => match ev {
-                    Some(env) => ingest = self.ingest_stopping(env, ingest).await,
+                    Some(env) => ingest = self.ingest_logging_out(env, ingest).await,
                     None => events_open = false,
                 },
                 _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        // What the actor sent before its exit and the loop above did not take yet: its report of
+        // the logout is sent right before the exit, and the exit can win the race.
+        if run.exit_done {
+            while let Ok(env) = run.events.try_recv() {
+                ingest = self.ingest_logging_out(env, ingest).await;
             }
         }
         if !run.exit_done {
@@ -1763,30 +1999,238 @@ impl Supervisor {
         }
     }
 
-    /// Remove (§4.3 step 7): best-effort logout, shutdown, shred, row, WAL truncate, directory.
-    /// `run`: the running actor and whether the core accepted its identity. What a linked
-    /// actor still sends during its logout is applied (its forwarder drains); an actor that is
-    /// still linking is not ingested: its `AccountReady` would make the account `Active` (and,
-    /// in a relink, whoever it linked as) while it is being removed, and would stay so if the
-    /// shred then failed.
-    async fn remove(&mut self, run: Option<(Running, bool)>) {
+    /// `Command::Logout` from an actor started just for it (no actor ran: restart backoff,
+    /// halted, a `Removing` row at start). It is not told to connect: the backend opens what
+    /// the logout needs. `quiet`: an actor that cannot start (its keys are gone, which a removal
+    /// cut off after its shred leaves) reports nothing; else that is "not reached".
+    async fn log_out_unstarted(&mut self, quiet: bool) -> Option<LogoutReport> {
+        match self.spawn(StartMode::Resume).await {
+            Ok(mut run) => {
+                self.log_out(&mut run, Ingest::Linked).await;
+                self.end_progress();
+                Some(
+                    self.logout_report
+                        .take()
+                        .unwrap_or_else(|| LogoutReport::new(DeviceLogout::NotReached)),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(account = self.account.0, error = %e, "starting the account for its logout failed");
+                (!quiet).then(|| LogoutReport::new(DeviceLogout::NotReached))
+            }
+        }
+    }
+
+    /// What a `Removing` or `Unlinking` row found at start was told by the run a quit cut off
+    /// (`local::removal_report`): `None` when nothing was kept.
+    async fn kept_report(&self) -> Option<Option<LogoutReport>> {
         let account = self.account;
+        self.sh
+            .store
+            .read(move |c| local::removal_report(c, account))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(account = account.0, error = %e, "reading the kept removal outcome failed");
+                None
+            })
+    }
+
+    /// Keeps what the logout told on the `Removing` or `Unlinking` row (`kept_report` reads it
+    /// at a start that finishes the work).
+    async fn keep_report(&self, report: Option<&LogoutReport>) {
+        let account = self.account;
+        let keep = report.cloned();
+        if let Err(e) = self
+            .sh
+            .store
+            .write(Priority::High, lane(account), move |c| {
+                local::set_removal_report(c, account, keep.as_ref())
+            })
+            .await
+        {
+            tracing::warn!(account = account.0, error = %e, "keeping the logout outcome failed");
+        }
+    }
+
+    /// The logout of a removal or an unlink that a start finishes (link feedback L5). A kept
+    /// report that says the device is gone (`Removed`, `NoDevice`) is told as it is: another
+    /// logout would find nothing. Anything else (a kept `NotReached`, a kept "nothing to tell",
+    /// no report at all) gets ONE more attempt, because the cut-off may have come before the
+    /// shred (the keys are still here) or the network may be reachable now, and the better of
+    /// the two outcomes is told. With the keys gone the attempt cannot start and the kept
+    /// report stands.
+    async fn finish_logout(&mut self, kept: Option<Option<LogoutReport>>) -> Option<LogoutReport> {
+        let kept = kept.flatten();
+        if let Some(r) = &kept
+            && matches!(r.outcome, DeviceLogout::Removed | DeviceLogout::NoDevice)
+        {
+            return kept;
+        }
+        let retry = self.log_out_unstarted(true).await;
+        better_report(kept, retry)
+    }
+
+    /// Who this account is, for the notice about it (read before its row goes or its login
+    /// ends).
+    async fn who(&self) -> AccountLabel {
+        let account = self.account;
+        match self
+            .sh
+            .store
+            .read(move |c| local::account_label(c, account))
+            .await
+        {
+            Ok(Some(who)) => who,
+            _ => AccountLabel {
+                network: self.network.kind(),
+                display_name: None,
+                number: None,
+                own_device: None,
+                linked_at: 0,
+                twin: false,
+            },
+        }
+    }
+
+    /// "Unlink…" (link feedback L4): the account is marked `Unlinking` (durable: a start that
+    /// finds the mark finishes it), the device logs out on the network, the credentials are
+    /// wiped and the account stays logged out with its chats (the way of an unlink by the
+    /// phone, §4.3 step 5), and the user is told once what became of the device.
+    async fn unlink(&mut self, how: Unlinking) {
+        let account = self.account;
+        let who = self.who().await;
+        // What an earlier start's logout of this unlink told, when a kill cut the unlink off
+        // after it (the credentials may be wiped already: no second logout is possible).
+        let kept = if matches!(how, Unlinking::AtStart) {
+            self.kept_report().await
+        } else {
+            None
+        };
+        if !matches!(how, Unlinking::AtStart) {
+            let _ = self
+                .sh
+                .store
+                .write(Priority::High, lane(account), move |c| {
+                    local::set_state(c, account, &AccountState::Unlinking)
+                })
+                .await;
+            self.emit(UiEvent::AccountsChanged);
+        }
+        let report = match how {
+            Unlinking::Running(mut run) => {
+                self.log_out(&mut run, Ingest::Linked).await;
+                self.end_progress();
+                self.logout_report
+                    .take()
+                    .unwrap_or_else(|| LogoutReport::new(DeviceLogout::NotReached))
+            }
+            // An unlink cut off after its credentials were wiped has no actor to start: what
+            // its first logout told was kept on the row before the wipe, and without a kept
+            // report the device is as gone as it will get.
+            Unlinking::AtStart => self
+                .finish_logout(kept)
+                .await
+                .unwrap_or_else(|| LogoutReport::new(DeviceLogout::NoDevice)),
+            Unlinking::NoActor => self
+                .log_out_unstarted(false)
+                .await
+                .unwrap_or_else(|| LogoutReport::new(DeviceLogout::NotReached)),
+        };
+        // Kept before the credentials are wiped (link feedback L5), as a removal's is before its
+        // shred: a kill between the wipe and the end of the unlink must not lose what to tell.
+        self.keep_report(Some(&report)).await;
+        self.logged_out("logged out on request").await;
+        tracing::info!(account = self.account.0, outcome = ?report.outcome, "unlinked on request");
+        self.sh
+            .emit_logout_outcome(self.account, false, report, who);
+    }
+
+    /// The numbers an actor reported belong to it: once it is gone they are finished (link
+    /// feedback L3).
+    fn end_progress(&mut self) {
+        if std::mem::take(&mut self.progress_open) {
+            self.emit(UiEvent::AccountProgress {
+                account: self.account,
+                progress: kourier_model::AccountProgress::finished(),
+            });
+        }
+    }
+
+    /// Remove (§4.3 step 7): logout, shutdown, shred, row, WAL truncate, directory. What a
+    /// linked actor still sends during its logout is applied (its forwarder drains); an actor
+    /// that is still linking is not ingested: its `AccountReady` would make the account `Active`
+    /// (and, in a relink, whoever it linked as) while it is being removed, and would stay so if
+    /// the shred then failed. The network is always asked to forget the device (link feedback
+    /// L4): without a running actor one is started just for the logout, unless the account is
+    /// logged out (no credentials, no device). The user is told once what became of the device
+    /// (`UiEvent::LogoutOutcome`), when the removal is done: after the shred and the deletion of
+    /// the row. A removal that fails there tells nothing; the next start finishes it and tells.
+    async fn remove(&mut self, how: Removal) {
+        let account = self.account;
+        let who = self.who().await;
+        let before = self
+            .sh
+            .store
+            .read(move |c| local::state(c, account))
+            .await
+            .ok()
+            .flatten();
+        // What an earlier start's logout of this removal told, when a kill cut the removal off
+        // after it (the keys may be shredded already: no second logout is possible).
+        let kept = if matches!(how, Removal::AtStart) {
+            self.kept_report().await
+        } else {
+            None
+        };
+        // Its background work stops from here (`Shared::removing`).
+        self.sh
+            .removing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(account);
+        // One statement: the kept report goes back with the state, so a start that finishes
+        // the removal and is killed itself still leaves it on the row.
+        let keep_on_row = kept.clone();
         let _ = self
             .sh
             .store
             .write(Priority::High, lane(account), move |c| {
-                local::set_state(c, account, &AccountState::Removing)
+                local::set_state_keeping_report(
+                    c,
+                    account,
+                    &AccountState::Removing,
+                    keep_on_row.as_ref(),
+                )
             })
             .await;
         self.emit(UiEvent::AccountsChanged);
-        if let Some((mut run, linked)) = run {
-            let ingest = if linked {
-                Ingest::Linked
-            } else {
-                Ingest::Refused
-            };
-            self.log_out(&mut run, ingest).await;
-        }
+        let report = match how {
+            Removal::Running(mut run, linked) => {
+                let ingest = if linked {
+                    Ingest::Linked
+                } else {
+                    Ingest::Refused
+                };
+                self.log_out(&mut run, ingest).await;
+                let report = self.logout_report.take();
+                // A link that never finished has no device the user knows of.
+                if linked {
+                    Some(report.unwrap_or_else(|| LogoutReport::new(DeviceLogout::NotReached)))
+                } else {
+                    report
+                }
+            }
+            Removal::NoActor | Removal::AtStart
+                if matches!(before, Some(AccountState::LoggedOut { .. })) =>
+            {
+                Some(LogoutReport::new(DeviceLogout::NoDevice))
+            }
+            Removal::NoActor => self.log_out_unstarted(false).await,
+            Removal::AtStart => self.finish_logout(kept).await,
+        };
+        // Kept before the shred (link feedback L5): a kill between the shred and the row's
+        // deletion must not lose what to tell (the NotReached instruction for the phone).
+        self.keep_report(report.as_ref()).await;
         if let Err(e) = self.sh.vault.shred(self.uuid).await {
             // Without the shred the removal promise (§5.2) does not hold: the row stays
             // `Removing` (hidden from the lists) and startup tries again.
@@ -1807,11 +2251,39 @@ impl Supervisor {
             })
             .await
         {
-            tracing::warn!(account = self.account.0, error = %e, "deleting the account row failed");
+            // The row says `Removing` still, so the next start tries again (and tells then).
+            tracing::warn!(account = self.account.0, error = %e, "deleting the account row failed; removal retried at the next start");
+            self.emit(UiEvent::AccountError {
+                account,
+                detail: format!("the account could not be removed completely ({e}); it is retried at the next start"),
+                restartable: false,
+            });
+            self.emit(UiEvent::AccountsChanged);
+            return;
         }
+        // The removal is done for the user's purposes (the keys are shredded, the row is gone):
+        // tell what became of the device NOW, before the waits below (L5). A kill in the moment
+        // between the row's deletion and this line still loses the outcome (no row, nothing
+        // kept); that window is the return of one store write, where the wait for the derive
+        // permits and the removal of a big directory used to be in front of it.
+        if let Some(report) = report {
+            tracing::info!(account = account.0, outcome = ?report.outcome, "removed account's device");
+            self.sh.emit_logout_outcome(account, true, report, who);
+        }
+        // A thumbnail being computed for this account when the removal began writes its file
+        // under the account's directory: wait for every compute to end first (each holds a
+        // permit until its file is written; later ones see `removing` and stop), so nothing is
+        // written after the directory is gone (F6).
+        let permits = self
+            .sh
+            .derive_permits
+            .clone()
+            .acquire_many_owned(crate::runtime::DERIVE_PARALLEL_PERMITS)
+            .await;
         if let Err(e) = self.sh.vault.remove_dir(self.uuid).await {
             tracing::warn!(account = self.account.0, error = %e, "removing the account directory failed");
         }
+        drop(permits);
         self.emit(UiEvent::AccountRemoved { account });
         self.emit(UiEvent::AccountsChanged);
     }
@@ -1849,6 +2321,52 @@ mod tests {
             ]
         );
         assert!(segments(Vec::new()).is_empty());
+    }
+
+    fn merge(n: u32) -> BackendEvent {
+        BackendEvent::IdentityMerged {
+            from: UserId::parse(&format!("pni:p{n}")).expect("alias"),
+            into: UserId::parse(&format!("aci:a{n}")).expect("canonical"),
+        }
+    }
+
+    /// Long merges are cut into several write jobs (L2): 200 merges and an upsert become
+    /// 64 + 64 + 64 + (8 merges, the upsert), in the envelope's order; other live events do
+    /// not count toward the cut.
+    #[test]
+    fn long_merge_lists_are_cut_into_several_jobs() {
+        let mut events: Vec<BackendEvent> = (0..200).map(merge).collect();
+        events.push(live(1));
+        let segs = segments(events);
+        let shape: Vec<(Priority, usize)> = segs.iter().map(|(p, e)| (*p, e.len())).collect();
+        assert_eq!(
+            shape,
+            [
+                (Priority::High, 64),
+                (Priority::High, 64),
+                (Priority::High, 64),
+                (Priority::High, 9)
+            ]
+        );
+        let order: Vec<String> = segs
+            .into_iter()
+            .flat_map(|(_, e)| e)
+            .filter_map(|e| match e {
+                BackendEvent::IdentityMerged { from, .. } => Some(from.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<String> = (0..200).map(|n| format!("pni:p{n}")).collect();
+        assert_eq!(order, want);
+        // Many non-merge live events stay one job.
+        let segs = segments((0..500).map(live).collect());
+        assert_eq!(segs.len(), 1);
+        // A history batch resets the count: 60 merges, a batch, 60 merges = 3 jobs.
+        let mut events: Vec<BackendEvent> = (0..60).map(merge).collect();
+        events.push(history());
+        events.extend((60..120).map(merge));
+        let shape: Vec<usize> = segments(events).iter().map(|(_, e)| e.len()).collect();
+        assert_eq!(shape, [60, 1, 60]);
     }
 
     /// The failure window after a clock change (§9.6): failures recorded on a clock that

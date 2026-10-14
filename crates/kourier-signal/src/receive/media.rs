@@ -32,11 +32,13 @@ use crate::proto::{self, content::Content as ContentKind};
 use crate::send::media::{FLAG_GIF, FLAG_VOICE, LONG_TEXT_MIME, MAX_TEXT_BYTES};
 
 /// Longest file name kept from a pointer (bytes).
-const MAX_FILE_NAME: usize = 255;
+pub(crate) const MAX_FILE_NAME: usize = 255;
 /// Longest blurhash kept (Desktop's are ~30 characters).
-const MAX_BLURHASH: usize = 128;
+pub(crate) const MAX_BLURHASH: usize = 128;
+/// Longest content type kept from a pointer or a quote (bytes).
+pub(crate) const MAX_MIME: usize = 255;
 /// Most waveform bars kept.
-const MAX_WAVEFORM: usize = 100;
+pub(crate) const MAX_WAVEFORM: usize = 100;
 /// Downloads tried per long text within the step's time box: a connection that broke off once
 /// must not cost the message its text.
 const LONG_TEXT_ATTEMPTS: u32 = 3;
@@ -64,6 +66,13 @@ pub(crate) fn net_id_digest(digest: &[u8]) -> Option<String> {
     (digest.len() == 32).then(|| format!("digest:{}", hex(digest)))
 }
 
+/// The name of an attachment by the SHA-256 of its plaintext (an archive's pointer of a file
+/// the phone downloaded, `AttachmentDelete.fallbackPlaintextHash`): most imported attachments
+/// have no digest, and older ones no client UUID either.
+pub(crate) fn net_id_plaintext_hash(hash: &[u8]) -> Option<String> {
+    (hash.len() == 32).then(|| format!("plaintext:{}", hex(hash)))
+}
+
 /// The `len` bytes a name of the form `<prefix><hex>` among `net_ids` states.
 fn named_bytes(net_ids: &[String], prefix: &str, len: usize) -> Option<Vec<u8>> {
     net_ids.iter().find_map(|name| {
@@ -87,8 +96,13 @@ pub(crate) fn digest_of_net_ids(net_ids: &[String]) -> Option<Vec<u8>> {
     named_bytes(net_ids, "digest:", 32)
 }
 
+/// The plaintext hash among an attachment's names ([`net_id_plaintext_hash`] read back).
+pub(crate) fn plaintext_hash_of_net_ids(net_ids: &[String]) -> Option<Vec<u8>> {
+    named_bytes(net_ids, "plaintext:", 32)
+}
+
 /// The names of `pointer` ([`net_id_uuid`], [`net_id_digest`]).
-fn net_ids(pointer: &proto::AttachmentPointer) -> Vec<String> {
+pub(crate) fn net_ids(pointer: &proto::AttachmentPointer) -> Vec<String> {
     pointer
         .client_uuid
         .as_deref()
@@ -111,6 +125,29 @@ pub(crate) fn is_long_text(pointer: &proto::AttachmentPointer) -> bool {
 pub(crate) fn is_fetchable_long_text(pointer: &proto::AttachmentPointer) -> bool {
     is_long_text(pointer)
         && Pointer::from_proto(pointer).is_ok_and(|p| p.size <= MAX_TEXT_BYTES as u64)
+}
+
+/// A content type as a pointer or a quote states it, kept when it is not empty and at most
+/// [`MAX_MIME`] bytes: a longer one is as good as none. Every reader of a content type
+/// (the live path and the history import) goes through here.
+pub(crate) fn kept_mime(content_type: Option<&str>) -> Option<String> {
+    content_type
+        .filter(|t| !t.is_empty() && t.len() <= MAX_MIME)
+        .map(str::to_owned)
+}
+
+/// The content type of a sticker's image: `image/webp` when the pointer states none (an
+/// empty one is none), else as [`attachment`] keeps it, so a type that is too long is
+/// `application/octet-stream`.
+pub(crate) fn sticker_mime(content_type: Option<&str>) -> String {
+    match content_type {
+        None | Some("") => "image/webp".to_owned(),
+        Some(_) => kept_mime(content_type).unwrap_or_else(octet_stream),
+    }
+}
+
+fn octet_stream() -> String {
+    "application/octet-stream".to_owned()
 }
 
 /// The kind of an attachment from its flags and content type.
@@ -136,11 +173,7 @@ pub(crate) fn attachment(
     pointer: &proto::AttachmentPointer,
     kind: Option<AttachmentKind>,
 ) -> Attachment {
-    let mime = pointer
-        .content_type
-        .clone()
-        .filter(|t| !t.is_empty() && t.len() <= 255)
-        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let mime = kept_mime(pointer.content_type.as_deref()).unwrap_or_else(octet_stream);
     let kind = kind.unwrap_or_else(|| kind_of(&mime, pointer.flags.unwrap_or(0)));
     let valid = Pointer::from_proto(pointer).is_ok();
     Attachment {
@@ -176,10 +209,12 @@ pub(crate) fn attachment(
             .as_deref()
             .filter(|c| !c.is_empty())
             .map(Text::plain),
+        // A pointer no download can be made of is not available on this device (no dead
+        // "Retry Download" that the core always refuses).
         state: if valid {
             AttachmentState::Remote
         } else {
-            AttachmentState::Failed { retryable: false }
+            AttachmentState::Unavailable
         },
         remote: valid.then(|| BackendBlob::new(POINTER_BLOB_V, pointer.encode_to_vec())),
         local: None,
@@ -192,13 +227,90 @@ pub(crate) fn attachment(
     }
 }
 
+/// The kind of an attachment of a history archive by its flag and type. The archive's
+/// `MessageAttachment.Flag` is an ENUM (`VOICE_MESSAGE` 1, `BORDERLESS` 2, `GIF` 3), not the
+/// wire's bits (`GIF` is 8 there): read as wire flags a GIF would be a voice note. A voice
+/// note is every attachment with the voice flag, as on the live path; `BORDERLESS` is not
+/// modelled, and an unknown value is none (as libsignal and Desktop take it).
+pub(crate) fn archive_kind(mime: &str, flag: i32) -> AttachmentKind {
+    use crate::proto::backup::message_attachment::Flag;
+    match Flag::try_from(flag) {
+        Ok(Flag::VoiceMessage) => AttachmentKind::Voice,
+        Ok(Flag::Gif) => AttachmentKind::Gif,
+        Ok(Flag::None | Flag::Borderless) | Err(_) => kind_of(mime, 0),
+    }
+}
+
+/// An attachment of a history archive's `FilePointer`, its fields bounded as [`attachment`]
+/// bounds a wire pointer's. Its state and `remote` are the importer's to set (the place on
+/// the CDN and its age); it starts `Unavailable` with no pointer. Its names are the digest
+/// and the plaintext hash the pointer carries ([`net_id_digest`], [`net_id_plaintext_hash`]);
+/// a client UUID is the `MessageAttachment`'s, which the caller adds.
+pub(crate) fn file_pointer_attachment(
+    pointer: &crate::proto::backup::FilePointer,
+    kind: AttachmentKind,
+    mime: String,
+) -> Attachment {
+    use crate::proto::backup::file_pointer::locator_info::IntegrityCheck;
+    let locator = pointer.locator_info.as_ref();
+    let net_ids = match locator.and_then(|l| l.integrity_check.as_ref()) {
+        Some(IntegrityCheck::EncryptedDigest(digest)) => net_id_digest(digest),
+        Some(IntegrityCheck::PlaintextHash(hash)) => net_id_plaintext_hash(hash),
+        None => None,
+    };
+    Attachment {
+        id: None,
+        kind,
+        size: locator.map_or(0, |l| u64::from(l.size)),
+        file_name: pointer
+            .file_name
+            .clone()
+            .filter(|n| !n.is_empty() && n.len() <= MAX_FILE_NAME),
+        dims: pointer
+            .width
+            .zip(pointer.height)
+            .filter(|(w, h)| *w > 0 && *h > 0),
+        duration_ms: pointer
+            .audio_duration_seconds
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(|s| (f64::from(s) * 1000.0).min(f64::from(u32::MAX)) as u32),
+        blurhash: pointer
+            .blur_hash
+            .clone()
+            .filter(|b| !b.is_empty() && b.len() <= MAX_BLURHASH),
+        waveform: pointer
+            .audio_waveform
+            .clone()
+            .filter(|w| !w.is_empty())
+            .map(|mut w| {
+                w.truncate(MAX_WAVEFORM);
+                w
+            }),
+        caption: pointer
+            .caption
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(Text::plain),
+        state: AttachmentState::Unavailable,
+        remote: None,
+        local: None,
+        thumb: None,
+        mime,
+        long_text: false,
+        net_ids: net_ids.into_iter().collect(),
+    }
+}
+
+/// The type of an archive's attachment as [`attachment`] keeps a wire pointer's.
+pub(crate) fn archive_mime(content_type: Option<&str>) -> String {
+    kept_mime(content_type).unwrap_or_else(octet_stream)
+}
+
 /// The sticker of a message as an image attachment.
 pub(crate) fn sticker(sticker: &proto::data_message::Sticker) -> Option<Attachment> {
     let data = sticker.data.as_ref()?;
     let mut image = attachment(data, Some(AttachmentKind::Image));
-    if data.content_type.as_deref().is_none_or(str::is_empty) {
-        "image/webp".clone_into(&mut image.mime);
-    }
+    image.mime = sticker_mime(data.content_type.as_deref());
     Some(image)
 }
 
@@ -377,14 +489,37 @@ mod tests {
         assert_eq!(v.duration_ms, Some(2500));
         assert_eq!(v.waveform.map(|w| w.len()), Some(100));
 
-        // Without key or digest the attachment is shown but cannot be downloaded.
+        // Without key or digest the attachment is shown but cannot be downloaded: "not
+        // available on this device", never a "Retry Download" the core always refuses.
         let broken = proto::AttachmentPointer {
             key: None,
             ..pointer("application/pdf", 0)
         };
         let b = attachment(&broken, None);
-        assert_eq!(b.state, AttachmentState::Failed { retryable: false });
+        assert_eq!(b.state, AttachmentState::Unavailable);
         assert!(b.remote.is_none());
+        // The same for a CDN this build has no base URL for (a click could only fail
+        // again), and not for a pointer without a number, which is CDN 0.
+        for cdn_number in [Some(1), Some(4), Some(u32::MAX)] {
+            let unknown = proto::AttachmentPointer {
+                cdn_number,
+                ..pointer("image/png", 0)
+            };
+            let u = attachment(&unknown, None);
+            assert_eq!(u.state, AttachmentState::Unavailable, "CDN {cdn_number:?}");
+            assert!(u.remote.is_none(), "CDN {cdn_number:?}");
+        }
+        for cdn_number in [None, Some(0), Some(2), Some(3)] {
+            let known = proto::AttachmentPointer {
+                cdn_number,
+                ..pointer("image/png", 0)
+            };
+            assert_eq!(
+                attachment(&known, None).state,
+                AttachmentState::Remote,
+                "CDN {cdn_number:?}"
+            );
+        }
         let untyped = proto::AttachmentPointer {
             content_type: None,
             ..pointer("", 0)

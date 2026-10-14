@@ -554,6 +554,67 @@ async fn a_long_text_from_a_message_request_is_completed_when_it_is_accepted() {
     env.stop().await;
 }
 
+/// The same for an IMPORTED long text (step S5, user decision "fetch automatically"): a
+/// history row of a message request fetches nothing while the request is unanswered, and
+/// its rest is fetched by itself once the request is accepted, like a live one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_long_text_of_a_message_request_is_completed_when_it_is_accepted() {
+    let whole = "every word of a long imported message. ".repeat(200);
+    let mut pending = ConversationPatch::new(d_alice());
+    pending.request_pending = Some(true);
+    let mut accepted = ConversationPatch::new(d_alice());
+    accepted.request_pending = Some(false);
+    let BackendEvent::Message(mut imported) = media(
+        T0 + 1,
+        vec![synthetic_long_text(&whole)],
+        Some(&whole[..2048]),
+    ) else {
+        unreachable!("media makes a message")
+    };
+    imported.read = true;
+    let s = script("long-text-request-history")
+        .deliver(vec![
+            BackendEvent::ConversationUpsert(pending),
+            BackendEvent::HistoryBatch {
+                conv: d_alice(),
+                messages: vec![imported],
+                has_more: false,
+                progress: None,
+            },
+        ])
+        .step(Step::WaitAcked)
+        .step(Step::Sleep(Duration::from_secs(5)))
+        .deliver(vec![BackendEvent::ConversationUpsert(accepted)]);
+    let (mut env, account, _uuid) = linked(s).await;
+    let a = conv(&env, &d_alice()).await;
+    sleeping_until(&env, T0U + 5_000).await;
+    settle().await;
+    assert_eq!(
+        count(&env, "SELECT count(*) FROM attachment_downloads"),
+        0,
+        "nothing is fetched from an unanswered request, imported or not"
+    );
+    assert_eq!(
+        count(&env, "SELECT count(*) FROM messages WHERE history <> 0"),
+        1,
+        "the row is a history row"
+    );
+
+    env.clock.advance(Duration::from_secs(5));
+    env.wait_finished(account).await;
+    eventually("the imported message is whole", WAIT, || {
+        let (env, whole) = (&env, whole.clone());
+        async move {
+            env.timeline(a)
+                .await
+                .iter()
+                .any(|r| r.body == Body::text(whole.clone()))
+        }
+    })
+    .await;
+    env.stop().await;
+}
+
 /// The thumbnail blobs `core.db` names: (files row, absolute path, plaintext size).
 fn thumbnails(env: &Env, uuid: AccountUuid) -> Vec<(i64, PathBuf, u64)> {
     let dir = env.vault.blob_dir(uuid);

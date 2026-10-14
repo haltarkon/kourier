@@ -540,6 +540,7 @@ async fn attachments_stream_from_the_cdn_into_blob_targets() {
         request: kourier_model::DownloadId(id),
         remote: kourier_model::BackendBlob::new(2, pointer_bytes(&stored, digest)),
         dest: target(name),
+        net_ids: Vec::new().into(),
     };
     core.send(download(1, &digest, "good")).await;
     let mut wrong = digest.clone();

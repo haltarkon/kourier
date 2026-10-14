@@ -953,6 +953,10 @@ pub(crate) struct TransferShared {
     /// The read that is running on a blocking thread, with its stop flag: parked here so
     /// that a stop of the task can wait for the read's end ([`run`]).
     reading: std::cell::RefCell<Option<Reading>>,
+    /// Whether a transfer of this run ended `done` (its archive was imported): the link then
+    /// does not wait for the first Storage Service sync (memory only; a restart in the link's
+    /// tail has no login waiting). Forgotten when a login starts ([`Self::forget_import`]).
+    imported: std::cell::Cell<bool>,
 }
 
 /// A read of the archive on its blocking thread.
@@ -979,7 +983,26 @@ impl TransferShared {
             hold: watch::Sender::new(held),
             skip: Notify::new(),
             reading: std::cell::RefCell::new(None),
+            imported: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether a transfer of this run ended with its archive imported.
+    pub(crate) fn imported(&self) -> bool {
+        self.imported.get()
+    }
+
+    /// A login starts: it is a new link, and what an earlier transfer of this run imported
+    /// says nothing about it (its `Done` waits for the Storage Service sync again unless its
+    /// own transfer ends `done`).
+    pub(crate) fn forget_import(&self) {
+        self.imported.set(false);
+    }
+
+    /// Test hook: as if a transfer of this run had ended `done` (`release`).
+    #[cfg(test)]
+    pub(crate) fn mark_imported(&self) {
+        self.imported.set(true);
     }
 
     /// The transfer directory.
@@ -1472,6 +1495,19 @@ fn release<T: SignalTransport>(shared: &Shared<T>) {
     });
     if let Err(e) = moved {
         tracing::warn!(error = %e, "moving the contact sync wait failed");
+    }
+    // An imported archive named every chat: the link's `Done` does not wait for the first
+    // Storage Service sync (Desktop: "If backup was imported, we do not need to await the
+    // storage service sync"); the sync still runs and wins where it differs (D10).
+    match shared.db.read(|c| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM history_transfer WHERE id = 1 AND state = 'done')",
+            [],
+            |r| r.get(0),
+        )?)
+    }) {
+        Ok(done) => shared.transfer.imported.set(done),
+        Err(e) => tracing::warn!(error = %e, "reading the history transfer's end failed"),
     }
     shared.transfer.release();
     shared.jobs_wake.notify_one();
@@ -2007,12 +2043,26 @@ async fn read_into_stage<T: SignalTransport>(
     let aci = account.aci;
     let flag = stop.clone();
     let make = shared.tuning.transfer_importer;
+    // What the age rule of attachments needs from `backend.db` (step S5), read here on the
+    // account's thread: the reading thread has no database handle. A remote config that is
+    // not stored yet gives the floors; a database ERROR fails the read (it must not judge
+    // every attachment of the import by floors that may be wrong).
+    let (queue_time, receive_limit) = match shared.db.read(crate::maintenance::import_media_config)
+    {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %e, "reading the remote configuration failed");
+            return Err(Step::Internal);
+        }
+    };
     let context = ImportContext {
         dir,
         key: key.clone(),
         aci,
         pni: account.pni,
         now,
+        queue_time,
+        receive_limit,
     };
     let key = key.clone();
     let task = tokio::task::spawn_blocking(move || {

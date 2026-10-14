@@ -118,8 +118,8 @@ Rectangle {
             smooth: true
             fillMode: Image.PreserveAspectCrop
             clip: true
-            sourceSize.width: Math.ceil(root.thumbSize * Screen.devicePixelRatio)
-            sourceSize.height: Math.ceil(root.thumbSize * Screen.devicePixelRatio)
+            sourceSize.width: Math.ceil(root.thumbSize)
+            sourceSize.height: Math.ceil(root.thumbSize)
             Layout.preferredWidth: root.thumbSize
             Layout.preferredHeight: root.thumbSize
             Layout.alignment: Qt.AlignVCenter

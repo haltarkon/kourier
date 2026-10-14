@@ -53,10 +53,7 @@ fn stage(dir: &std::path::Path, sizes: &[u64], len: usize) -> Recorded {
             nickname: None,
         };
         writer.contact(i, &contact).unwrap();
-        let chat = StagedChat {
-            is_self: false,
-            peer: Some(i),
-        };
+        let chat = StagedChat::direct(i);
         writer
             .chat(i, &ConvKey::Direct(peer(i)), &chat, None)
             .unwrap();
@@ -180,6 +177,7 @@ fn people_come_first_then_the_chats_then_each_chat_most_recent_first_in_frame_or
             messages,
             has_more,
             progress,
+            total,
         } = payload
         else {
             panic!("then messages only");
@@ -190,6 +188,8 @@ fn people_come_first_then_the_chats_then_each_chat_most_recent_first_in_frame_or
         assert!(messages.iter().all(|m| m.conv == *conv));
         let progress = progress.expect("a fraction");
         assert!(progress >= last_progress && progress <= 1.0);
+        // The count the UI shows is against the messages of the shown chats.
+        assert_eq!(*total, 7 + 1200 + 5);
         last_progress = progress;
         seen.push((conv.encode(), messages.len(), *has_more));
     }
@@ -629,5 +629,8 @@ fn the_plain_rows_are_the_feeders_chunks_as_events() {
     }
 }
 
+/// Step S4a: the chat frame's fields and the pins, delivered.
+mod frames;
+mod groups;
 /// Probes of the independent review of step S2.
 mod review;

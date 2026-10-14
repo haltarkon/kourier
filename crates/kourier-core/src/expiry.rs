@@ -337,19 +337,23 @@ pub(crate) fn remembered(
     let since = now.saturating_sub(ms(REMEMBER));
     Ok(match scope {
         MsgIdScope::AccountAuthor => conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM expired_messages WHERE account_id = ?1
-                   AND net_local = ?2 AND net_scope = 0 AND net_author = ?3 AND expired_at >= ?4)",
-            )?
+            .prepare_cached(REMEMBERED_BY_AUTHOR)?
             .query_row((account.0, local, author, since), |r| r.get(0))?,
         MsgIdScope::Conversation => conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM expired_messages WHERE account_id = ?1
-                   AND net_local = ?2 AND net_scope = 1 AND conv_key = ?3 AND expired_at >= ?4)",
-            )?
+            .prepare_cached(REMEMBERED_IN_CONV)?
             .query_row((account.0, local, conv_key, since), |r| r.get(0))?,
     })
 }
+
+// Run for every new message: each must start from the local id (`expired_messages_by_key` or
+// a key of migration 14 that ends in it), never from all of an author's or a conversation's
+// expired keys (`tests::a_new_message_looks_up_its_own_expired_key`).
+const REMEMBERED_BY_AUTHOR: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
+ WHERE account_id = ?1 AND net_local = ?2 AND net_scope = 0 AND net_author = ?3
+   AND expired_at >= ?4)";
+const REMEMBERED_IN_CONV: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
+ WHERE account_id = ?1 AND net_local = ?2 AND net_scope = 1 AND conv_key = ?3
+   AND expired_at >= ?4)";
 
 /// What a sweep changed, per account.
 type Swept = BTreeMap<AccountId, Changes>;
@@ -625,6 +629,46 @@ async fn sweep_once(sh: &Arc<Shared>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lookup of [`remembered`], run for every new message, uses the message's local id:
+    /// an index of the author or the conversation alone walks all of their expired keys (45
+    /// days of a busy chat with disappearing messages: 40 ms a message at 45,000 keys).
+    #[test]
+    fn a_new_message_looks_up_its_own_expired_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([3u8; 32]),
+            kourier_model::NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[kourier_model::UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        for sql in [REMEMBERED_BY_AUTHOR, REMEMBERED_IN_CONV] {
+            let steps: Vec<String> = h
+                .connection()
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    sql.replace("?1", "1")
+                        .replace("?2", "'1700000000000'")
+                        .replace("?3", "'aci:carol'")
+                        .replace("?4", "0")
+                ))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(3))
+                .expect("plan")
+                .collect::<kourier_db::rusqlite::Result<_>>()
+                .expect("rows");
+            let search: Vec<&String> = steps
+                .iter()
+                .filter(|s| s.contains("expired_messages"))
+                .collect();
+            assert!(
+                !search.is_empty() && search.iter().all(|s| s.contains("net_local=?")),
+                "{sql}\n{steps:#?}"
+            );
+        }
+    }
 
     /// A deadline far away is slept towards in steps of at most [`MAX_SLEEP`]: a tokio timer
     /// does not run while the machine is suspended, so one long sleep would end late by the

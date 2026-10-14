@@ -81,15 +81,7 @@ fn writer(dir: &Path, chats: u32, limits: StageLimits) -> StageWriter {
     for i in 0..chats {
         writer.contact(i, &contact(i)).unwrap();
         writer
-            .chat(
-                i,
-                &conv(i),
-                &StagedChat {
-                    is_self: false,
-                    peer: Some(i),
-                },
-                None,
-            )
+            .chat(i, &conv(i), &StagedChat::direct(i), None)
             .unwrap();
     }
     writer
@@ -207,7 +199,7 @@ fn the_stage_gives_a_chat_back_in_frame_order_whatever_the_interleaving() {
     assert!(
         chats
             .iter()
-            .all(|chat| chat.op.peer == Some(chat.counters.idx))
+            .all(|chat| chat.op.peer() == Some(chat.counters.idx))
     );
     let people = reader.contacts(None, 2).unwrap();
     assert_eq!(people.len(), 2);

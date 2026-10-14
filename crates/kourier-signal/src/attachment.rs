@@ -32,6 +32,7 @@ use zeroize::Zeroizing;
 
 use crate::net::{HttpsHost, HttpsRequest, Net, SignalTransport};
 use crate::proto;
+use crate::proto::backup;
 
 /// Length of an attachment key (AES-256 key ‖ HMAC-SHA256 key).
 pub(crate) const KEY_LEN: usize = 64;
@@ -112,9 +113,19 @@ impl fmt::Debug for AttachmentKeys {
 pub(crate) enum Integrity {
     /// SHA-256 of the whole encrypted blob (the pointer's `digest`).
     Digest([u8; 32]),
-    /// SHA-256 of the unpadded plaintext (known locally, e.g. from a backup).
-    #[allow(dead_code, reason = "backup restores and re-downloads (after M1)")]
+    /// SHA-256 of the unpadded plaintext (a pointer of an archive: what the phone computed
+    /// when it downloaded the file).
     PlaintextHash([u8; 32]),
+    /// Both: a pointer the phone gave for a backfill request, of an attachment whose plaintext
+    /// hash Kourier knows (an imported one). The digest says the blob arrived whole; the
+    /// plaintext hash says it is the file the attachment is, so an answer matched to the wrong
+    /// attachment is refused instead of shown under it.
+    Both {
+        /// SHA-256 of the encrypted blob.
+        digest: [u8; 32],
+        /// SHA-256 of the unpadded plaintext.
+        plaintext: [u8; 32],
+    },
 }
 
 /// What a successful decryption verified.
@@ -284,18 +295,20 @@ impl Decryptor {
             return Err(AttachmentError::TooShort);
         }
         let plaintext_hash: [u8; 32] = self.plaintext_hash.finalize().into();
-        match self.integrity {
-            Integrity::Digest(expected) => {
-                let digest: [u8; 32] = self.digest.finalize().into();
-                if digest != expected {
-                    return Err(AttachmentError::BadDigest);
-                }
-            }
-            Integrity::PlaintextHash(expected) => {
-                if plaintext_hash != expected {
-                    return Err(AttachmentError::BadPlaintextHash);
-                }
-            }
+        let digest: [u8; 32] = self.digest.finalize().into();
+        let (digest_ok, plaintext_ok) = match self.integrity {
+            Integrity::Digest(expected) => (digest == expected, true),
+            Integrity::PlaintextHash(expected) => (true, plaintext_hash == expected),
+            Integrity::Both {
+                digest: want_digest,
+                plaintext: want_plain,
+            } => (digest == want_digest, plaintext_hash == want_plain),
+        };
+        if !digest_ok {
+            return Err(AttachmentError::BadDigest);
+        }
+        if !plaintext_ok {
+            return Err(AttachmentError::BadPlaintextHash);
         }
         Ok(Verified {
             size: self.written,
@@ -558,8 +571,9 @@ pub(crate) struct Pointer {
     pub(crate) cdn_key: String,
     /// The 64-byte key.
     pub(crate) key: Zeroizing<Vec<u8>>,
-    /// The blob's SHA-256.
-    pub(crate) digest: [u8; 32],
+    /// What the decrypted attachment is checked against: the blob's SHA-256 (a wire
+    /// pointer's `digest`), or the plaintext's (an archive's pointer, when it has one).
+    pub(crate) integrity: Integrity,
     /// Unpadded plaintext length.
     pub(crate) size: u64,
     /// MIME type, as the sender says.
@@ -578,30 +592,57 @@ impl fmt::Debug for Pointer {
 }
 
 impl Pointer {
-    /// Checks a pointer from the wire.
+    /// Checks a pointer from the wire. A CDN number this client has no base URL for
+    /// ([`KNOWN_CDNS`]; none is a pointer to CDN 0) is refused here, like in an archive's
+    /// pointer: no request can be made for it, so the attachment is "not available on this
+    /// device" at once, not a "Retry Download" that fails every time.
     pub(crate) fn from_proto(pointer: &proto::AttachmentPointer) -> Result<Self, AttachmentError> {
+        Self::from_proto_or_hash(pointer, None)
+    }
+
+    /// [`Self::from_proto`], but a pointer that states no digest at all is checked against
+    /// `plaintext` (the SHA-256 of the file the attachment's names state) instead, and one
+    /// that states a digest is checked against both when `plaintext` is known. Only an
+    /// answer of the phone to a backfill request has such pointers (Signal Android fills
+    /// `digest` from `remoteDigest`, which a file it restored from a backup may lack); the
+    /// core keeps a `plaintext:` name for most imported attachments. A digest of the wrong
+    /// length is refused as before.
+    pub(crate) fn from_proto_or_hash(
+        pointer: &proto::AttachmentPointer,
+        plaintext: Option<[u8; 32]>,
+    ) -> Result<Self, AttachmentError> {
         use proto::attachment_pointer::AttachmentIdentifier;
         let cdn_key = match &pointer.attachment_identifier {
             Some(AttachmentIdentifier::CdnKey(key)) if valid_cdn_key(key) => key.clone(),
             Some(AttachmentIdentifier::CdnId(id)) if *id != 0 => id.to_string(),
             _ => return Err(AttachmentError::Incomplete("CDN key")),
         };
+        let cdn = Some(pointer.cdn_number.unwrap_or(0))
+            .filter(|n| KNOWN_CDNS.contains(n))
+            .ok_or(AttachmentError::Incomplete("CDN number"))?;
         let key = pointer
             .key
             .as_deref()
             .filter(|key| key.len() == KEY_LEN)
             .ok_or(AttachmentError::Incomplete("key"))?;
-        let digest = pointer
-            .digest
-            .as_deref()
-            .and_then(|d| <[u8; 32]>::try_from(d).ok())
-            .ok_or(AttachmentError::Incomplete("digest"))?;
+        let integrity = match (pointer.digest.as_deref(), plaintext) {
+            (None | Some([]), Some(hash)) => Integrity::PlaintextHash(hash),
+            (digest, plaintext) => {
+                let digest = digest
+                    .and_then(|d| <[u8; 32]>::try_from(d).ok())
+                    .ok_or(AttachmentError::Incomplete("digest"))?;
+                match plaintext {
+                    Some(plaintext) => Integrity::Both { digest, plaintext },
+                    None => Integrity::Digest(digest),
+                }
+            }
+        };
         let size = pointer.size.ok_or(AttachmentError::Incomplete("size"))?;
         Ok(Self {
-            cdn: pointer.cdn_number.unwrap_or(0),
+            cdn,
             cdn_key,
             key: Zeroizing::new(key.to_vec()),
-            digest,
+            integrity,
             size: u64::from(size),
             content_type: pointer
                 .content_type
@@ -614,14 +655,88 @@ impl Pointer {
         })
     }
 
-    /// The pointer stored as an attachment's `remote` ([`POINTER_BLOB_V`]).
-    pub(crate) fn from_blob(remote: &kourier_model::BackendBlob) -> Result<Self, AttachmentError> {
-        if remote.v != POINTER_BLOB_V {
-            return Err(AttachmentError::Incomplete("pointer format"));
+    /// Checks a pointer of a history archive (`FilePointer`): a place on the transit tier of
+    /// a CDN this client knows ([`KNOWN_CDNS`]) under a URL-safe key, a key of 64 bytes, a
+    /// plaintext hash or an encrypted digest of 32 bytes (the hash when it has one, as
+    /// Desktop prefers), and a size (0 is legal: an empty file, as on the live path and in
+    /// Desktop; the download bounds the blob by it, which is finite for 0 too). The archive's
+    /// validator checks none of the lengths, so every one is checked here. The media tier
+    /// (`mediaTierCdnNumber`) is not a place this version fetches from.
+    pub(crate) fn from_file_pointer(
+        pointer: &backup::FilePointer,
+    ) -> Result<Self, AttachmentError> {
+        use backup::file_pointer::locator_info::IntegrityCheck;
+        let locator = pointer
+            .locator_info
+            .as_ref()
+            .ok_or(AttachmentError::Incomplete("locator"))?;
+        let cdn_key = locator
+            .transit_cdn_key
+            .as_deref()
+            .filter(|key| valid_cdn_key(key))
+            .ok_or(AttachmentError::Incomplete("CDN key"))?;
+        let cdn = locator
+            .transit_cdn_number
+            .filter(|n| KNOWN_CDNS.contains(n))
+            .ok_or(AttachmentError::Incomplete("CDN number"))?;
+        if locator.key.len() != KEY_LEN {
+            return Err(AttachmentError::BadKey);
         }
-        let pointer = <proto::AttachmentPointer as prost::Message>::decode(&remote.bytes[..])
-            .map_err(|_| AttachmentError::Incomplete("pointer"))?;
-        Self::from_proto(&pointer)
+        let hash = |bytes: &[u8]| <[u8; 32]>::try_from(bytes).ok();
+        let integrity = match &locator.integrity_check {
+            Some(IntegrityCheck::PlaintextHash(h)) => hash(h).map(Integrity::PlaintextHash),
+            Some(IntegrityCheck::EncryptedDigest(d)) => hash(d).map(Integrity::Digest),
+            None => None,
+        }
+        .ok_or(AttachmentError::Incomplete("digest"))?;
+        Ok(Self {
+            cdn,
+            cdn_key: cdn_key.to_owned(),
+            key: Zeroizing::new(locator.key.clone()),
+            integrity,
+            size: u64::from(locator.size),
+            content_type: pointer
+                .content_type
+                .clone()
+                .filter(|t| !t.is_empty() && t.len() <= 255),
+            dims: pointer
+                .width
+                .zip(pointer.height)
+                .filter(|(w, h)| *w > 0 && *h > 0),
+        })
+    }
+
+    /// The pointer stored as an attachment's `remote`: a wire pointer ([`POINTER_BLOB_V`]) or
+    /// an archive's ([`ARCHIVE_POINTER_BLOB_V`]). Any other format, or one that does not pass
+    /// the checks of its kind, is refused before any request.
+    #[cfg(test)]
+    pub(crate) fn from_blob(remote: &kourier_model::BackendBlob) -> Result<Self, AttachmentError> {
+        Self::from_blob_named(remote, &[])
+    }
+
+    /// [`Self::from_blob`] for an attachment with these names: a wire pointer without a
+    /// digest (a backfilled one, [`Self::from_proto_or_hash`]) is checked against the
+    /// `plaintext:` name among them; without one it is refused before any request.
+    pub(crate) fn from_blob_named(
+        remote: &kourier_model::BackendBlob,
+        net_ids: &[String],
+    ) -> Result<Self, AttachmentError> {
+        match remote.v {
+            POINTER_BLOB_V => {
+                let pointer =
+                    <proto::AttachmentPointer as prost::Message>::decode(&remote.bytes[..])
+                        .map_err(|_| AttachmentError::Incomplete("pointer"))?;
+                let plaintext = crate::receive::media::plaintext_hash_of_net_ids(net_ids)
+                    .and_then(|h| <[u8; 32]>::try_from(h).ok());
+                Self::from_proto_or_hash(&pointer, plaintext)
+            }
+            ARCHIVE_POINTER_BLOB_V => {
+                let pointer = <backup::FilePointer as prost::Message>::decode(&remote.bytes[..])
+                    .map_err(|_| AttachmentError::Incomplete("pointer"))?;
+                Self::from_file_pointer(&pointer)
+            }
+            _ => Err(AttachmentError::Incomplete("pointer format")),
+        }
     }
 
     /// `GET {cdn[N]}/attachments/{cdnKey}` (`WebAPI.preload.ts` `getAttachment`).
@@ -638,6 +753,44 @@ impl Pointer {
 /// `BackendBlob.v` of an attachment's `remote`: the encoded `AttachmentPointer` (v 1 is the raw
 /// `DataMessage` of `Body::Unsupported`).
 pub(crate) const POINTER_BLOB_V: u16 = 2;
+
+/// `BackendBlob.v` of the `remote` of an attachment of a history import: a trimmed, encoded
+/// backup `FilePointer` ([`archive_pointer_blob`]). (v 4 is the raw backup `ChatItem` of a
+/// placeholder, `transfer::map::RAW_CHAT_ITEM`.)
+pub(crate) const ARCHIVE_POINTER_BLOB_V: u16 = 3;
+
+/// The CDNs this client has a base URL for (`net::env`: production, staging and the mock all
+/// name 0, 2 and 3, as Android's `Cdn` does). A pointer to another is no place a request can
+/// be made for.
+pub(crate) const KNOWN_CDNS: [u32; 3] = [0, 2, 3];
+
+/// The `remote` of an archive's pointer that passed [`Pointer::from_file_pointer`]: only what a
+/// download needs (the type, the dimensions and the transit locator). Never the `localKey` of
+/// a local backup or the media tier's CDN number, and none of what the attachment row holds
+/// already (file name, caption, blurhash, waveform).
+pub(crate) fn archive_pointer_blob(pointer: &backup::FilePointer) -> kourier_model::BackendBlob {
+    use backup::file_pointer::LocatorInfo;
+    let locator = pointer.locator_info.as_ref().map(|l| LocatorInfo {
+        key: l.key.clone(),
+        integrity_check: l.integrity_check.clone(),
+        size: l.size,
+        transit_cdn_key: l.transit_cdn_key.clone(),
+        transit_cdn_number: l.transit_cdn_number,
+        transit_tier_upload_timestamp: l.transit_tier_upload_timestamp,
+        ..LocatorInfo::default()
+    });
+    let trimmed = backup::FilePointer {
+        content_type: pointer.content_type.clone(),
+        width: pointer.width,
+        height: pointer.height,
+        locator_info: locator,
+        ..backup::FilePointer::default()
+    };
+    kourier_model::BackendBlob {
+        v: ARCHIVE_POINTER_BLOB_V,
+        bytes: prost::Message::encode_to_vec(&trimmed),
+    }
+}
 
 /// CDN keys are URL-safe tokens; anything else could escape the path.
 pub(crate) fn valid_cdn_key(key: &str) -> bool {
@@ -659,6 +812,10 @@ pub(crate) enum DownloadError {
     /// The CDN answered with this status (404: expired or never uploaded).
     #[error("CDN answered {0}")]
     Status(u16),
+    /// The CDN answered that it does not have the object (404 or 410, and 403 from CDN 0,
+    /// which "means the same as 404 from other CDNs": Desktop's `downloadAttachment`).
+    #[error("CDN no longer has it ({0})")]
+    Gone(u16),
     /// The blob failed verification.
     #[error(transparent)]
     Crypto(#[from] AttachmentError),
@@ -668,7 +825,7 @@ impl From<DownloadError> for crate::error::Error {
     fn from(e: DownloadError) -> Self {
         match e {
             DownloadError::Transport(e) => Self::Transport(e),
-            DownloadError::Status(status) => Self::Status {
+            DownloadError::Status(status) | DownloadError::Gone(status) => Self::Status {
                 what: "attachment download",
                 status,
             },
@@ -698,12 +855,12 @@ pub(crate) async fn download_in_memory<T: SignalTransport>(
     let transport = net.clone();
     let response = transport.https(request).await?;
     if !response.status.is_success() {
-        return Err(DownloadError::Status(response.status.as_u16()));
+        return Err(DownloadError::status(pointer.cdn, response.status.as_u16()));
     }
     let keys = AttachmentKeys::from_slice(&pointer.key)?;
     Ok(decrypt_in_memory(
         &keys,
-        Integrity::Digest(pointer.digest),
+        pointer.integrity,
         pointer.size,
         &response.body,
         max_len,
@@ -864,18 +1021,10 @@ pub(crate) async fn download_to_blob<T: SignalTransport>(
         path: dest.to_owned(),
         key: kourier_blob::FileKey::from_bytes(*key.expose()),
     };
-    let (digest, size) = (pointer.digest, pointer.size);
+    let (integrity, size) = (pointer.integrity, pointer.size);
     let counter = written.clone();
     let writer = tokio::task::spawn_blocking(move || {
-        write_verified(
-            rx,
-            &target,
-            &keys,
-            Integrity::Digest(digest),
-            size,
-            max_len,
-            &counter,
-        )
+        write_verified(rx, &target, &keys, integrity, size, max_len, &counter)
     });
     let status = fetch(net, pointer, &sink, max_len, timeout, policy).await;
     // The writer ends its stream when the last sender is gone.
@@ -886,7 +1035,7 @@ pub(crate) async fn download_to_blob<T: SignalTransport>(
         .and_then(|result| result);
     let verified = match (status, written) {
         (Ok(status), _) if !status.is_success() => {
-            return Err(DownloadError::Status(status.as_u16()));
+            return Err(DownloadError::status(pointer.cdn, status.as_u16()));
         }
         (Ok(_), written) => written?,
         // The writer refused the stream (too large, a full disk): that stopped the download.
@@ -1009,6 +1158,7 @@ pub(crate) async fn run_command<T: SignalTransport>(
     request: kourier_model::DownloadId,
     remote: kourier_model::BackendBlob,
     dest: kourier_backend_api::BlobTarget,
+    net_ids: Vec<String>,
 ) {
     use kourier_backend_api::BackendEvent;
 
@@ -1018,7 +1168,7 @@ pub(crate) async fn run_command<T: SignalTransport>(
         .ok()
         .and_then(|config| crate::maintenance::account_caps(&config).max_receive_attachment_bytes)
         .unwrap_or(DEFAULT_MAX_RECEIVE_BYTES);
-    let result = match Pointer::from_blob(&remote) {
+    let result = match Pointer::from_blob_named(&remote, &net_ids) {
         Ok(pointer) => {
             let _ = shared
                 .emit(BackendEvent::DownloadProgress {
@@ -1081,6 +1231,14 @@ pub(crate) async fn run_command<T: SignalTransport>(
 }
 
 impl DownloadError {
+    /// The error of an answer `status` of CDN `cdn` that is not a success.
+    pub(crate) fn status(cdn: u32, status: u16) -> Self {
+        match (cdn, status) {
+            (_, 404 | 410) | (0, 403) => Self::Gone(status),
+            _ => Self::Status(status),
+        }
+    }
+
     /// The contract error of a failed `DownloadAttachment` (`AttachmentDone`).
     pub(crate) fn to_backend_error(&self) -> kourier_model::BackendError {
         use kourier_model::{BackendError, ErrorKind};
@@ -1097,7 +1255,7 @@ impl DownloadError {
                 BackendError::new(ErrorKind::InvalidInput, e.to_string())
             }
             Self::Transport(e) => BackendError::transient(e.to_string()),
-            Self::Status(404 | 410) => {
+            Self::Gone(_) => {
                 BackendError::new(ErrorKind::Expired, "the attachment is no longer on the CDN")
             }
             Self::Status(status) if *status >= 500 || *status == 429 => {
@@ -1302,6 +1460,34 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A restored pointer of an attachment whose plaintext hash is known is checked against the
+    /// digest of its blob AND that hash: a blob that is whole but is another file is refused.
+    #[test]
+    fn a_digest_and_a_plaintext_hash_are_both_checked() {
+        let key = [3u8; 64];
+        let (blob, digest) = encrypt(&key, [1; 16], b"hello world", true);
+        let plaintext: [u8; 32] = Sha256::digest(b"hello world").into();
+        let check = |digest, plaintext| {
+            decrypt_in_memory(
+                &keys(&key),
+                Integrity::Both { digest, plaintext },
+                11,
+                &blob,
+                u64::MAX,
+            )
+        };
+        assert!(check(digest, plaintext).is_ok());
+        assert_eq!(
+            check(digest, [0; 32]).unwrap_err(),
+            AttachmentError::BadPlaintextHash,
+            "whole, but another file"
+        );
+        assert_eq!(
+            check([0; 32], plaintext).unwrap_err(),
+            AttachmentError::BadDigest
+        );
     }
 
     #[test]
@@ -1582,9 +1768,24 @@ pub(crate) mod tests {
                 size: None,
                 ..pointer.clone()
             },
+            // No base URL is known for these CDNs (net::env names 0, 2 and 3).
+            proto::AttachmentPointer {
+                cdn_number: Some(1),
+                ..pointer.clone()
+            },
+            proto::AttachmentPointer {
+                cdn_number: Some(u32::MAX),
+                ..pointer.clone()
+            },
         ] {
             assert!(Pointer::from_proto(&bad).is_err());
         }
+        // An empty file is legal on the wire: size 0 is accepted.
+        let empty = proto::AttachmentPointer {
+            size: Some(0),
+            ..pointer.clone()
+        };
+        assert_eq!(Pointer::from_proto(&empty).unwrap().size, 0);
     }
 
     /// A scripted answer to a whole-body request: a status and a body, or a failure below HTTP.
@@ -1788,7 +1989,7 @@ pub(crate) mod tests {
             cdn: 3,
             cdn_key: "abc".to_owned(),
             key: Zeroizing::new(key.to_vec()),
-            digest,
+            integrity: Integrity::Digest(digest),
             size,
             content_type: Some("video/mp4".to_owned()),
             dims: None,
@@ -1932,7 +2133,7 @@ pub(crate) mod tests {
             cdn,
             cdn_key: "abc".to_owned(),
             key: Zeroizing::new(key.to_vec()),
-            digest,
+            integrity: Integrity::Digest(digest),
             size,
             content_type: Some("image/png".to_owned()),
             dims: None,
@@ -2028,7 +2229,7 @@ pub(crate) mod tests {
         // Gone from the CDN.
         let cdn = ScriptedCdn::new(404, Vec::new(), None);
         let error = run(&cdn, pointer(size, digest, 3)).await.unwrap_err();
-        assert!(matches!(error, DownloadError::Status(404)));
+        assert!(matches!(error, DownloadError::Gone(404)));
         assert_eq!(error.to_backend_error().kind, ErrorKind::Expired);
 
         // The honest transfer of the same blob arrives whole, at its CDN path.
@@ -2043,6 +2244,362 @@ pub(crate) mod tests {
         assert_eq!(
             &kourier_blob::read_all(&dest, &key).unwrap()[..],
             &plaintext[..]
+        );
+    }
+
+    /// An archive's pointer for the tests: key, a plaintext hash or a digest, size, a place.
+    pub(crate) fn file_pointer(
+        integrity: backup::file_pointer::locator_info::IntegrityCheck,
+        size: u32,
+        cdn: Option<u32>,
+        cdn_key: Option<&str>,
+    ) -> backup::FilePointer {
+        backup::FilePointer {
+            content_type: Some("image/png".to_owned()),
+            file_name: Some("name.png".to_owned()),
+            caption: Some("caption".to_owned()),
+            width: Some(4),
+            height: Some(3),
+            locator_info: Some(backup::file_pointer::LocatorInfo {
+                key: vec![6; 64],
+                integrity_check: Some(integrity),
+                size,
+                transit_cdn_key: cdn_key.map(str::to_owned),
+                transit_cdn_number: cdn,
+                transit_tier_upload_timestamp: Some(1_000),
+                media_tier_cdn_number: Some(7),
+                local_key: Some(vec![8; 32]),
+            }),
+            ..backup::FilePointer::default()
+        }
+    }
+
+    /// The test writer's attachments (what the mock tests store on the CDN) decrypt to their
+    /// plaintext under their plaintext hash and under their digest, and to nothing under a
+    /// hash or digest that is one bit off.
+    #[test]
+    fn a_written_attachment_decrypts_to_its_plaintext_under_its_hash_and_its_digest() {
+        let key = [0x5a; 64];
+        let plaintext: Vec<u8> = (0..30_001u32).map(|i| (i % 253) as u8).collect();
+        let written =
+            crate::archive::writer::encrypt_attachment(&plaintext, &key, [7; 16]).unwrap();
+        assert_eq!(written.size as usize, plaintext.len());
+        let keys = AttachmentKeys::from_slice(&key[..]).unwrap();
+        let open = |integrity| {
+            decrypt_in_memory(
+                &keys,
+                integrity,
+                plaintext.len() as u64,
+                &written.blob,
+                1 << 20,
+            )
+        };
+        for integrity in [
+            Integrity::PlaintextHash(written.plaintext_hash),
+            Integrity::Digest(written.digest),
+        ] {
+            assert_eq!(
+                &open(integrity).unwrap()[..],
+                &plaintext[..],
+                "{integrity:?}"
+            );
+        }
+        let (mut hash, mut digest) = (written.plaintext_hash, written.digest);
+        hash[31] ^= 1;
+        digest[31] ^= 1;
+        assert_eq!(
+            open(Integrity::PlaintextHash(hash)).unwrap_err(),
+            AttachmentError::BadPlaintextHash
+        );
+        assert!(open(Integrity::Digest(digest)).is_err());
+    }
+
+    /// An archive's stored pointer asks the CDN it names, at `/attachments/<its key>`, for each
+    /// transit CDN there is (0, 2 and 3).
+    #[test]
+    fn an_imported_pointer_asks_its_cdn_at_its_path() {
+        use backup::file_pointer::locator_info::IntegrityCheck;
+        for n in [0u32, 2, 3] {
+            let key = format!("key-{n}_x");
+            let stored = archive_pointer_blob(&file_pointer(
+                IntegrityCheck::PlaintextHash(vec![4; 32]),
+                99,
+                Some(n),
+                Some(&key),
+            ));
+            let request = Pointer::from_blob(&stored)
+                .unwrap()
+                .request(std::time::Duration::from_secs(5));
+            assert_eq!(request.host, HttpsHost::Cdn(n), "cdn {n}");
+            assert_eq!(request.path, format!("/attachments/{key}"), "cdn {n}");
+        }
+    }
+
+    /// `remote` of both formats reads back as the pointer it was: a wire pointer (`v` 2, by its
+    /// digest) and an archive's (`v` 3, by its plaintext hash when it has one, else its
+    /// digest); the archive's stored form keeps no local key, no media tier and nothing the
+    /// attachment row holds. Another format, a cut `v` 3 and every locator that is no place a
+    /// download can be made for are refused, before any request.
+    #[test]
+    fn a_stored_pointer_of_either_format_reads_back() {
+        use backup::file_pointer::locator_info::IntegrityCheck;
+        let wire = proto::AttachmentPointer {
+            attachment_identifier: Some(proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                "wire-key".to_owned(),
+            )),
+            key: Some(vec![1; 64]),
+            digest: Some(vec![2; 32]),
+            size: Some(10),
+            cdn_number: Some(2),
+            ..Default::default()
+        };
+        let v2 = kourier_model::BackendBlob {
+            v: POINTER_BLOB_V,
+            bytes: prost::Message::encode_to_vec(&wire),
+        };
+        let back = Pointer::from_blob(&v2).unwrap();
+        assert_eq!((back.cdn, back.cdn_key.as_str()), (2, "wire-key"));
+        assert_eq!(back.integrity, Integrity::Digest([2; 32]));
+
+        let hashed = file_pointer(
+            IntegrityCheck::PlaintextHash(vec![4; 32]),
+            99,
+            Some(3),
+            Some("k3"),
+        );
+        let v3 = archive_pointer_blob(&hashed);
+        assert_eq!(v3.v, ARCHIVE_POINTER_BLOB_V);
+        let back = Pointer::from_blob(&v3).unwrap();
+        assert_eq!((back.cdn, back.cdn_key.as_str(), back.size), (3, "k3", 99));
+        assert_eq!(back.integrity, Integrity::PlaintextHash([4; 32]));
+        assert_eq!(&back.key[..], &[6; 64][..]);
+        assert_eq!(
+            (back.content_type.as_deref(), back.dims),
+            (Some("image/png"), Some((4, 3)))
+        );
+        let stored = <backup::FilePointer as prost::Message>::decode(&v3.bytes[..]).unwrap();
+        let locator = stored.locator_info.as_ref().unwrap();
+        assert_eq!(
+            (locator.local_key.as_ref(), locator.media_tier_cdn_number),
+            (None, None)
+        );
+        assert_eq!(
+            (stored.file_name.as_ref(), stored.caption.as_ref()),
+            (None, None),
+            "the row holds those"
+        );
+        let digested = file_pointer(
+            IntegrityCheck::EncryptedDigest(vec![5; 32]),
+            99,
+            Some(0),
+            Some("k0"),
+        );
+        let back = Pointer::from_blob(&archive_pointer_blob(&digested)).unwrap();
+        assert_eq!((back.cdn, back.integrity), (0, Integrity::Digest([5; 32])));
+
+        let mut cut = v3.clone();
+        cut.bytes.truncate(cut.bytes.len() / 2);
+        assert!(Pointer::from_blob(&cut).is_err(), "a cut v 3");
+        for v in [1, 4, 5] {
+            let other = kourier_model::BackendBlob {
+                v,
+                bytes: v3.bytes.clone(),
+            };
+            assert!(Pointer::from_blob(&other).is_err(), "v {v}");
+        }
+        let with = |f: &dyn Fn(&mut backup::FilePointer)| {
+            let mut p = hashed.clone();
+            f(&mut p);
+            p
+        };
+        let locator = |f: &dyn Fn(&mut backup::file_pointer::LocatorInfo)| {
+            with(&|p| f(p.locator_info.as_mut().unwrap()))
+        };
+        for (what, bad) in [
+            ("no locator", with(&|p| p.locator_info = None)),
+            (
+                "no place",
+                locator(&|l| {
+                    l.transit_cdn_key = None;
+                    l.transit_cdn_number = None;
+                }),
+            ),
+            (
+                "a key without its number",
+                locator(&|l| l.transit_cdn_number = None),
+            ),
+            (
+                "a number without its key",
+                locator(&|l| l.transit_cdn_key = None),
+            ),
+            (
+                "an unsafe CDN key",
+                locator(&|l| l.transit_cdn_key = Some("../x".into())),
+            ),
+            (
+                "a CDN key of 257 bytes",
+                locator(&|l| l.transit_cdn_key = Some("a".repeat(257))),
+            ),
+            (
+                "an unknown CDN",
+                locator(&|l| l.transit_cdn_number = Some(1)),
+            ),
+            (
+                "a legacy S3 number",
+                locator(&|l| l.transit_cdn_number = Some(u32::MAX)),
+            ),
+            ("a key of 32 bytes", locator(&|l| l.key = vec![6; 32])),
+            ("no key", locator(&|l| l.key = Vec::new())),
+            (
+                "a hash of 31 bytes",
+                locator(&|l| {
+                    l.integrity_check = Some(IntegrityCheck::PlaintextHash(vec![4; 31]));
+                }),
+            ),
+            (
+                "a digest of 33 bytes",
+                locator(&|l| {
+                    l.integrity_check = Some(IntegrityCheck::EncryptedDigest(vec![4; 33]));
+                }),
+            ),
+            ("no integrity value", locator(&|l| l.integrity_check = None)),
+        ] {
+            assert!(Pointer::from_file_pointer(&bad).is_err(), "{what}");
+            assert!(
+                Pointer::from_blob(&archive_pointer_blob(&bad)).is_err(),
+                "{what}, stored"
+            );
+        }
+    }
+
+    /// A plaintext size of 0 is legal (`backup.proto`: empty content attachments are, "even if
+    /// transitCdnKey is set"; Desktop and the live path take it): an imported pointer of size
+    /// 0 is a place to download from, it reads back from its stored form, and an empty file
+    /// decrypts under it to nothing, under the right hash only.
+    #[test]
+    fn an_imported_pointer_of_size_zero_is_a_place_and_an_empty_file_downloads() {
+        use backup::file_pointer::locator_info::IntegrityCheck;
+        let key = [0x5a; 64];
+        let written = crate::archive::writer::encrypt_attachment(&[], &key, [7; 16]).unwrap();
+        assert_eq!(written.size, 0);
+        let pointer = file_pointer(
+            IntegrityCheck::PlaintextHash(written.plaintext_hash.to_vec()),
+            0,
+            Some(3),
+            Some("empty_1"),
+        );
+        let parsed = Pointer::from_file_pointer(&pointer).expect("size 0 is accepted");
+        assert_eq!((parsed.size, parsed.cdn), (0, 3));
+        let back = Pointer::from_blob(&archive_pointer_blob(&pointer)).expect("reads back");
+        assert_eq!(back.size, 0);
+        assert!(
+            max_blob_len(0) >= written.blob.len() as u64,
+            "the bound holds the blob"
+        );
+        let keys = AttachmentKeys::from_slice(&key[..]).unwrap();
+        let open = |integrity| decrypt_in_memory(&keys, integrity, 0, &written.blob, 1 << 20);
+        assert!(
+            open(Integrity::PlaintextHash(written.plaintext_hash))
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong = written.plaintext_hash;
+        wrong[0] ^= 1;
+        assert_eq!(
+            open(Integrity::PlaintextHash(wrong)).unwrap_err(),
+            AttachmentError::BadPlaintextHash
+        );
+    }
+
+    /// A pointer that carries a plaintext hash is checked by it: the honest blob downloads,
+    /// a hash that lies fails for good and leaves no file.
+    #[tokio::test]
+    async fn a_download_is_checked_against_the_plaintext_hash_when_that_is_what_the_pointer_has() {
+        use kourier_model::ErrorKind;
+        let key = [6u8; 64];
+        let plaintext: Vec<u8> = (0..20_000u32).map(|i| (i % 249) as u8).collect();
+        let (blob, _digest) = encrypt(&key, [3; 16], &plaintext, true);
+        let hash: [u8; 32] = Sha256::digest(&plaintext).into();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("blobs").join("download");
+        let file_key = kourier_model::BlobKey::new([9; 32]);
+        let run = async |hash: [u8; 32]| {
+            let cdn = ScriptedCdn::new(200, blob.chunks(4096).map(<[u8]>::to_vec).collect(), None);
+            let net = Net::new(cdn.clone(), tokio::runtime::Handle::current());
+            let pointer = Pointer {
+                cdn: 3,
+                cdn_key: "abc".to_owned(),
+                key: Zeroizing::new(key.to_vec()),
+                integrity: Integrity::PlaintextHash(hash),
+                size: plaintext.len() as u64,
+                content_type: None,
+                dims: None,
+            };
+            download_to_blob(
+                &net,
+                &pointer,
+                &dest,
+                &file_key,
+                1 << 20,
+                std::time::Duration::from_secs(5),
+                QUICK,
+                &std::sync::Arc::default(),
+            )
+            .await
+        };
+        let meta = run(hash).await.expect("the honest hash");
+        assert_eq!(meta.size, plaintext.len() as u64);
+        let blob_key = kourier_blob::FileKey::from_bytes(*file_key.expose());
+        assert_eq!(
+            &kourier_blob::read_all(&dest, &blob_key).unwrap()[..],
+            &plaintext[..]
+        );
+        std::fs::remove_file(&dest).unwrap();
+
+        let mut wrong = hash;
+        wrong[0] ^= 1;
+        let error = run(wrong).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DownloadError::Crypto(AttachmentError::BadPlaintextHash)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.to_backend_error().kind, ErrorKind::InvalidInput);
+        assert!(!error.to_backend_error().is_retryable());
+        let left: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing is left: {left:?}");
+    }
+
+    /// What a CDN answer that is not a success becomes: 404 and 410 are gone, and so is a
+    /// 403 from CDN 0 (Desktop: "CDN 0 can return 403 which means the same as 404"); a 403
+    /// of another CDN is not.
+    #[test]
+    fn a_cdn_answer_of_410_or_a_403_of_cdn_0_is_expired_as_404_is() {
+        use kourier_model::ErrorKind;
+        for (cdn, status) in [(3, 404), (3, 410), (0, 404), (0, 410), (0, 403), (2, 410)] {
+            let error = DownloadError::status(cdn, status);
+            assert_eq!(
+                error.to_backend_error().kind,
+                ErrorKind::Expired,
+                "{cdn} {status}"
+            );
+        }
+        for (cdn, status) in [(3, 403), (2, 403), (0, 400)] {
+            let error = DownloadError::status(cdn, status);
+            assert_eq!(
+                error.to_backend_error().kind,
+                ErrorKind::InvalidInput,
+                "{cdn} {status}"
+            );
+        }
+        assert!(
+            DownloadError::status(0, 503)
+                .to_backend_error()
+                .is_retryable()
         );
     }
 

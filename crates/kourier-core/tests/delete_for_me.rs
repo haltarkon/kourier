@@ -1271,6 +1271,66 @@ fn a_late_copy_of_a_cleared_message_is_dropped() {
     );
 }
 
+/// Two copies of one file in one message share a plaintext hash and differ in their client
+/// UUID: the phone's delete of the SECOND names its UUID first and the hash after, and the
+/// names are tried in that order over ALL attachments (Desktop's `deleteForMe`), so the first
+/// copy, which has the hash too, stays.
+#[test]
+fn the_names_of_a_deleted_attachment_are_tried_in_order_over_all_attachments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = harness(&dir);
+    let file = |name: &str, seed| synthetic_file(name, "application/octet-stream", 100, seed);
+    let mut message = media(
+        &d_alice(),
+        1,
+        vec![
+            file("first.bin", 1),
+            file("second.bin", 2),
+            file("third.bin", 3),
+        ],
+        None,
+    );
+    let BackendEvent::Message(m) = &mut message else {
+        panic!("a message");
+    };
+    let Body::Media { attachments, .. } = &mut m.body else {
+        panic!("a media body");
+    };
+    attachments[0].net_ids = vec!["uuid:aa".to_owned(), "plaintext:5858".to_owned()];
+    attachments[1].net_ids = vec!["uuid:bb".to_owned(), "plaintext:5858".to_owned()];
+    attachments[2].net_ids = vec!["uuid:cc".to_owned(), "plaintext:7777".to_owned()];
+    h.apply(vec![chat(&d_alice()), message]).expect("apply");
+
+    h.apply(vec![attachment_deleted(
+        &d_alice(),
+        1,
+        &["uuid:bb", "digest:none", "plaintext:5858"],
+    )])
+    .expect("apply");
+    assert_eq!(
+        attachment_rows(&h),
+        [
+            (0, Some("first.bin".to_owned())),
+            (1, Some("third.bin".to_owned()))
+        ],
+        "the second copy goes, not the first one that shares its hash"
+    );
+
+    // A name nobody has falls through to the next one: the UUID is unknown, so the hash
+    // decides.
+    h.apply(vec![attachment_deleted(
+        &d_alice(),
+        1,
+        &["uuid:zz", "plaintext:7777"],
+    )])
+    .expect("apply");
+    assert_eq!(
+        attachment_rows(&h),
+        [(0, Some("first.bin".to_owned()))],
+        "a name the phone's UUID lacks falls through to the hash"
+    );
+}
+
 /// A delete of one attachment waits for a message that is not here yet, like other modifiers.
 #[test]
 fn an_attachment_delete_that_overtakes_its_message_is_applied_on_arrival() {

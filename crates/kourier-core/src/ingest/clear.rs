@@ -90,6 +90,18 @@ pub(crate) struct LocalDelete {
     pub commands: Vec<(CmdId, DurableCommand)>,
 }
 
+thread_local! {
+    /// How many times this thread read and parsed a stored message body
+    /// ([`Apply::body_of`]): a probe for the tests that a loop over the attachments of one
+    /// message parses its body once (`testing::body_reads`).
+    static BODY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The count of [`BODY_READS`] on this thread.
+pub(crate) fn body_reads() -> u64 {
+    BODY_READS.with(std::cell::Cell::get)
+}
+
 impl Apply<'_> {
     /// `ConversationCleared`: every message of the conversation up to the newest of `up_to`
     /// that is here goes, in timeline order; an own message nobody has yet stays (the other
@@ -343,20 +355,25 @@ impl Apply<'_> {
         Ok(())
     }
 
-    /// `AttachmentDeleted` for a message that is here: the first attachment of `row` one of
-    /// whose `net_ids` is in `net_ids` goes, with its files. Unknown names change nothing,
-    /// and nothing is left of a tombstone to delete from.
+    /// `AttachmentDeleted` for a message that is here: `net_ids` are in order of priority
+    /// (Signal: client UUID, digest, plaintext hash, as Desktop's `deleteForMe` tries them),
+    /// and the first NAME that any attachment of `row` has decides: that attachment goes,
+    /// with its files. Priority runs over ALL attachments, not attachment by attachment: two
+    /// copies of one file share a plaintext hash, and the phone's delete of the second must
+    /// not take the first because its hash comes first in the message. Unknown names change
+    /// nothing, and nothing is left of a tombstone to delete from.
     pub(super) fn attachment_deleted(&mut self, row: &MsgRow, net_ids: &[String]) -> Result<()> {
         if row.deleted.is_some() {
             return Ok(());
         }
         let body = self.body_of(row.id)?;
-        let named = |a: &kourier_model::Attachment| a.net_ids.iter().any(|n| net_ids.contains(n));
-        let at = match &body {
-            Body::Media { attachments, .. } => attachments.iter().position(named),
-            Body::Sticker(a) => named(a).then_some(0),
+        let at = net_ids.iter().find_map(|name| match &body {
+            Body::Media { attachments, .. } => {
+                attachments.iter().position(|a| a.net_ids.contains(name))
+            }
+            Body::Sticker(a) => a.net_ids.contains(name).then_some(0),
             _ => None,
-        };
+        });
         match at {
             Some(at) => self.remove_attachment(row, body, at),
             None => Ok(()),
@@ -364,7 +381,8 @@ impl Apply<'_> {
     }
 
     /// The stored body of a message (its latest revision).
-    fn body_of(&self, id: MessageId) -> Result<Body> {
+    pub(super) fn body_of(&self, id: MessageId) -> Result<Body> {
+        BODY_READS.with(|n| n.set(n.get() + 1));
         let body: String = self
             .conn
             .prepare_cached("SELECT body FROM messages WHERE id = ?1")?
@@ -495,7 +513,7 @@ impl Apply<'_> {
     }
 
     /// Stores a durable command of this account (`pending_commands`, §4.8).
-    fn queue_command(&self, cmd: DurableCommand) -> Result<(CmdId, DurableCommand)> {
+    pub(super) fn queue_command(&self, cmd: DurableCommand) -> Result<(CmdId, DurableCommand)> {
         self.conn
             .prepare_cached(
                 "INSERT INTO pending_commands(account_id, command, created_at) VALUES (?1, ?2, ?3)",
@@ -512,7 +530,7 @@ impl Apply<'_> {
 }
 
 /// The conversation's account, key and features.
-fn conversation(
+pub(super) fn conversation(
     conn: &Connection,
     conv: ConversationId,
 ) -> Result<Option<(AccountId, ConvKey, Option<ConversationFeatures>)>> {

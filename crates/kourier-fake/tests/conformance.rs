@@ -382,6 +382,7 @@ fn actor_rotates_qr_codes_and_resumes_after_a_restart() {
             .send(Command::StartLogin {
                 flow: "qr".into(),
                 relink: None,
+                taken: Vec::new(),
             })
             .await
             .expect("send");
@@ -497,6 +498,7 @@ async fn link_until(
         .send(Command::StartLogin {
             flow: "qr".into(),
             relink,
+            taken: Vec::new(),
         })
         .await
         .expect("send");
@@ -750,7 +752,22 @@ fn a_relink_plays_the_rest_of_an_unfinished_script() {
         let mut run = spawn(&fake, dir.path(), uuid, StartMode::Fresh, &clock, &rt);
         let first = link_until(&mut run, None, |e| matches!(e, BackendEvent::Message(_))).await;
         assert_eq!(locals(&first), ["1"]);
-        let exit = kourier_backend_api::Exit::from_channel((&mut run.handle.exited).await);
+        // The core goes on reading and acknowledging while the actor leaves: an actor that
+        // exits after an unlink first hands over what its outbox still holds and waits for
+        // the core's acknowledgement (up to its 30-second drain bound), so a test that only
+        // waits for the exit sits out that whole bound.
+        let exit = loop {
+            tokio::select! {
+                exited = &mut run.handle.exited => {
+                    break kourier_backend_api::Exit::from_channel(exited);
+                }
+                env = run.ends.events.recv() => {
+                    if let Some(ack) = env.and_then(|env| env.ack) {
+                        ack.complete(Ok(()));
+                    }
+                }
+            }
+        };
         assert!(
             matches!(exit, kourier_backend_api::Exit::LoggedOut { .. }),
             "{exit:?}"
@@ -933,6 +950,7 @@ fn a_script_can_fail_relinks() {
                 .send(Command::StartLogin {
                     flow: "qr".into(),
                     relink: relink(),
+                    taken: Vec::new(),
                 })
                 .await
                 .expect("send");

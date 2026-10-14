@@ -177,6 +177,9 @@ fn text_and_feature_enums() {
         RequestPending => CannotSend::RequestPending,
         Unregistered => CannotSend::Unregistered,
         NotAccepted => CannotSend::NotAccepted,
+        StillLoading => CannotSend::StillLoading,
+        InvitationPending => CannotSend::InvitationPending,
+        JoinRequestPending => CannotSend::JoinRequestPending,
         Other => CannotSend::Other("Group is full".into()),
     });
 }
@@ -218,6 +221,14 @@ fn content_enums() {
         Local => AttachmentState::Local,
         Failed => AttachmentState::Failed { retryable: true },
         Expired => AttachmentState::Expired,
+        Unavailable => AttachmentState::Unavailable,
+        Asking => AttachmentState::Asking,
+        AskFailed => AttachmentState::AskFailed { why: AskFailure::NoFile },
+    });
+    roundtrip_all!(AskFailure {
+        NoAnswer => AskFailure::NoAnswer,
+        NoMessage => AskFailure::NoMessage,
+        NoFile => AskFailure::NoFile,
     });
     let by = Some(uid("aci:admin"));
     roundtrip_all!(SystemEvent {
@@ -306,6 +317,7 @@ fn state_and_error_enums() {
         InvalidInput => ErrorKind::InvalidInput,
         Unsupported => ErrorKind::Unsupported,
         Expired => ErrorKind::Expired,
+        AlreadyAdded => ErrorKind::AlreadyAdded { logged_out: true },
         Internal => ErrorKind::Internal,
     });
 }
@@ -353,6 +365,7 @@ fn account_conn_login_enums() {
         Active => AccountState::Active,
         LoggedOut => AccountState::LoggedOut { reason: "unlinked".into() },
         Removing => AccountState::Removing,
+        Unlinking => AccountState::Unlinking,
     });
     roundtrip_all!(TrustLevel {
         Unverified => TrustLevel::Unverified,

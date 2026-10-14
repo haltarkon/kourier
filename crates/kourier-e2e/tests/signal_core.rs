@@ -362,16 +362,18 @@ struct ChildSpec {
 }
 
 /// The kill points of the receive path, backend and core (§10.4), with the hit counts the
-/// three-message stream of a run reaches.
+/// three-message stream of a run reaches. The core's own hits count the batch of the start's
+/// `AccountCaps` first (`append_account_caps`: the backend states the capabilities at every
+/// start), so the stream's are the second and the third.
 const KILL_POINTS: [(&str, u32); 8] = [
     (kourier_signal::failpoints::AFTER_INBOX_COMMIT, 1),
     (kourier_signal::failpoints::BEFORE_ACK, 2),
     (kourier_signal::failpoints::AFTER_BACKEND_EFFECTS_COMMIT, 1),
-    (kourier_core::FAILPOINT_BEFORE_COMMIT, 1),
     (kourier_core::FAILPOINT_BEFORE_COMMIT, 2),
-    (kourier_core::FAILPOINT_BEFORE_ACK, 1),
+    (kourier_core::FAILPOINT_BEFORE_COMMIT, 3),
     (kourier_core::FAILPOINT_BEFORE_ACK, 2),
-    (kourier_signal::failpoints::AFTER_CORE_COMMIT, 1),
+    (kourier_core::FAILPOINT_BEFORE_ACK, 3),
+    (kourier_signal::failpoints::AFTER_CORE_COMMIT, 2),
 ];
 
 /// Sends the stream of run `run` from Alice (unsealed, sealed, unsealed), 300 ms apart so each

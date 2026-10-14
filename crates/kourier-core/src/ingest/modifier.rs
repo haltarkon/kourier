@@ -87,6 +87,18 @@ enum ReceiptRule {
     Wait,
 }
 
+thread_local! {
+    /// How many parked receipts this thread decoded to look at them again
+    /// ([`Apply::retry_parked_receipts`]): a probe for the test that a transaction of 300
+    /// merges looks at each parked receipt once (`testing::receipt_retry_decodes`).
+    static RECEIPT_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The count of [`RECEIPT_DECODES`] on this thread.
+pub(crate) fn receipt_retry_decodes() -> u64 {
+    RECEIPT_DECODES.with(std::cell::Cell::get)
+}
+
 /// One parked modifier (`pending_modifiers`).
 struct Parked {
     id: i64,
@@ -424,7 +436,8 @@ impl Apply<'_> {
     /// Looks again at the receipts that wait: after an identity merge the sender of one may
     /// be a recipient of its message (the receipt came from a contact's ACI while the message
     /// went to the chat under their PNI). One whose message is here and whose sender now
-    /// counts is applied; the others keep waiting.
+    /// counts is applied; the others keep waiting. Runs once per transaction, from
+    /// [`Apply::finish`], however many merges it held (`Changes::receipts_to_retry`).
     pub(crate) fn retry_receipts(&mut self) -> Result<()> {
         let sql = format!(
             "{} WHERE account_id = ?1 AND kind = 'Receipts' ORDER BY id",
@@ -489,6 +502,7 @@ impl Apply<'_> {
     /// left.
     fn retry_parked_receipts(&mut self, parked: Vec<Parked>) -> Result<()> {
         for p in parked {
+            RECEIPT_DECODES.with(|n| n.set(n.get() + 1));
             let e: BackendEvent = sql::from_json(&p.payload)?;
             let BackendEvent::Receipts {
                 targets,

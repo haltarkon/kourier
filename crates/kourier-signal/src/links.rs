@@ -32,7 +32,7 @@ use libsignal_core::{Aci, Pni, ServiceId};
 
 use crate::db::Account;
 use crate::error::Result;
-use crate::service_id::{aci_user_id, pni_user_id, validate_e164};
+use crate::service_id::{aci_user_id, e164_user_id, pni_user_id, validate_e164};
 
 /// `IdentityMerged{pni → aci}`.
 fn merged(pni: Pni, aci: Aci) -> Option<BackendEvent> {
@@ -76,10 +76,54 @@ pub(crate) fn learn(
     Ok(merged(pni, aci))
 }
 
-/// Every pair this device knows, as events: a rebuilt `core.db` has lost its aliases.
+/// Records that `number` belongs to `aci` (a Storage Service contact record states both) and
+/// returns the event that tells the core, `IdentityMerged{number → aci}`, when the pair is new
+/// or the number moved to another ACI. A record that comes back (removed and added, or every
+/// record after `storage::reset`) tells nothing: each merge costs the core a write of what the
+/// number's user owns (link feedback L2). Our own ACI is never a contact's.
+pub(crate) fn learn_number(
+    conn: &Connection,
+    account: &Account,
+    number: &str,
+    aci: Aci,
+    now: i64,
+) -> Result<Option<BackendEvent>> {
+    if aci == account.aci || validate_e164(number).is_err() {
+        return Ok(None);
+    }
+    let aci_sid = ServiceId::from(aci).service_id_string();
+    let known: Option<String> = conn
+        .prepare_cached("SELECT aci FROM number_links WHERE e164 = ?1")?
+        .query_row([number], |r| r.get(0))
+        .optional()?;
+    if known.as_deref() == Some(aci_sid.as_str()) {
+        return Ok(None);
+    }
+    conn.prepare_cached(
+        "INSERT INTO number_links(e164, aci, learned_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(e164) DO UPDATE SET aci = excluded.aci, learned_at = excluded.learned_at",
+    )?
+    .execute((number, &aci_sid, now))?;
+    Ok(number_merged(number, aci))
+}
+
+/// `IdentityMerged{number → aci}`.
+fn number_merged(number: &str, aci: Aci) -> Option<BackendEvent> {
+    match (e164_user_id(number), aci_user_id(aci)) {
+        (Ok(from), Ok(into)) => Some(BackendEvent::IdentityMerged { from, into }),
+        _ => None,
+    }
+}
+
+/// Every pair this device knows (PNI and number), as events: a rebuilt `core.db` has lost its
+/// aliases.
 pub(crate) fn all(conn: &Connection) -> Result<Vec<BackendEvent>> {
     let rows: Vec<(String, String)> = conn
         .prepare("SELECT pni, aci FROM identity_links ORDER BY learned_at, pni")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let numbers: Vec<(String, String)> = conn
+        .prepare("SELECT e164, aci FROM number_links ORDER BY learned_at, e164")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     Ok(rows
@@ -93,6 +137,12 @@ pub(crate) fn all(conn: &Connection) -> Result<Vec<BackendEvent>> {
                 _ => None,
             }
         })
+        .chain(numbers.into_iter().filter_map(|(number, aci)| {
+            match ServiceId::parse_from_service_id_string(&aci)? {
+                ServiceId::Aci(aci) => number_merged(&number, aci),
+                _ => None,
+            }
+        }))
         .collect())
 }
 
@@ -191,6 +241,43 @@ mod tests {
                 let again: Vec<(String, String)> = all(tx)?.iter().map(pair).collect();
                 assert_eq!(again.len(), 2, "{again:?}");
                 assert_eq!(again[0], pair(&moved));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A number's pair is told once, again when the number moved to another ACI, never for our
+    /// own ACI or a malformed number; `all` lists it after the PNI pairs.
+    #[test]
+    fn a_numbers_pair_is_told_once() {
+        let fixture = fixture();
+        let account = &fixture.account;
+        let aci = Aci::from(Uuid::from_u128(0xa11ce));
+        let other = Aci::from(Uuid::from_u128(0xb0b));
+        let pni = Pni::from(Uuid::from_u128(0xa11ce0));
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                let first = learn_number(tx, account, "+14155550101", aci, 1)?.expect("new");
+                assert_eq!(
+                    pair(&first),
+                    (
+                        "e164:+14155550101".to_owned(),
+                        aci_user_id(aci).unwrap().as_str().to_owned()
+                    )
+                );
+                assert_eq!(learn_number(tx, account, "+14155550101", aci, 2)?, None);
+                let moved = learn_number(tx, account, "+14155550101", other, 3)?.expect("moved");
+                assert_eq!(pair(&moved).1, aci_user_id(other).unwrap().as_str());
+                assert_eq!(
+                    learn_number(tx, account, "+14155550102", account.aci, 4)?,
+                    None
+                );
+                assert_eq!(learn_number(tx, account, "not a number", aci, 4)?, None);
+                learn(tx, account, pni, aci, 5)?.expect("a PNI pair");
+                let told: Vec<(String, String)> = all(tx)?.iter().map(pair).collect();
+                assert_eq!(told.len(), 2, "{told:?}");
+                assert_eq!(told[1], pair(&moved));
                 Ok(())
             })
             .unwrap();

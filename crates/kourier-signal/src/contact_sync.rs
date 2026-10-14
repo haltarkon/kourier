@@ -367,22 +367,27 @@ fn apply_zone(
         // and its version (`SD/ts/services/contactSync.preload.ts`). The backend keeps both for
         // what it sends (`crate::timer`); the core hears of it now when it has the chat (an
         // empty chat per contact would flood the list), else with the chat's first event
-        // (`features::features_event`).
-        if initial {
-            peers::reset_expire_timer(
+        // (`features::features_event`). It never LOWERS a stored version, as Android applies a
+        // synced timer only when its version is higher (`MultiDeviceContactSyncJob.kt`): a
+        // contact whose version is below the stored one leaves the stored pair, and the core
+        // is told nothing. The stored version can be higher when a history import gave the
+        // core the phone's newer timer, or a live message did, before this sync was read.
+        // (A relink starts from a wiped `backend.db`, so the case Desktop's reset is for, a
+        // phone whose counter started over, has no stored version to be lower than.)
+        let stated = initial
+            && peers::set_expire_timer_unless_older(
                 tx,
                 &contact.sid,
                 contact.expire_timer.unwrap_or(0),
                 contact.expire_timer_version,
                 now,
             )?;
-            if has_chat && contact.expire_timer.unwrap_or(0) != before.expire_timer {
-                conv.timer = contact.expire_timer.map_or(Patch::Clear, |secs| {
-                    Patch::Set(Duration::from_secs(u64::from(secs)))
-                });
-                conv.timer_version = Some(contact.expire_timer_version);
-                touch = true;
-            }
+        if stated && has_chat && contact.expire_timer.unwrap_or(0) != before.expire_timer {
+            conv.timer = contact.expire_timer.map_or(Patch::Clear, |secs| {
+                Patch::Set(Duration::from_secs(u64::from(secs)))
+            });
+            conv.timer_version = Some(contact.expire_timer_version);
+            touch = true;
         }
         if touch {
             events.push(BackendEvent::ConversationUpsert(conv));

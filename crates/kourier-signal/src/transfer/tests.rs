@@ -982,6 +982,8 @@ fn import_context(dir: &Path) -> ImportContext {
         aci: aci(),
         pni: libsignal_core::Pni::from(Uuid::from_bytes([8; 16])),
         now: NOW,
+        queue_time: None,
+        receive_limit: crate::attachment::DEFAULT_MAX_RECEIVE_BYTES,
     }
 }
 
@@ -1025,10 +1027,7 @@ fn the_history_importer_stages_the_sample_and_counts_by_kind() {
         ),
         (3, 1, 1, 1)
     );
-    assert_eq!(
-        summary.skipped,
-        BTreeMap::from([(map::reason::REACTIONS_NOT_YET, 1)])
-    );
+    assert!(summary.skipped.is_empty(), "{:?}", summary.skipped);
 
     // One file, closed, this user's only; nothing of a text in its bytes.
     assert_eq!(stage_files(dir.path()), [stage::FILE]);
@@ -1056,8 +1055,12 @@ fn the_history_importer_stages_the_sample_and_counts_by_kind() {
     );
     let locals: Vec<&str> = rows.iter().map(|row| &*row.msg.local).collect();
     assert_eq!(locals, ["3000", "3100", "3200"]);
-    // The rows carry the number of the frame they came from.
-    assert_eq!(rows.iter().map(|row| row.n).collect::<Vec<_>>(), [5, 6, 7]);
+    // The rows carry the number of the frame they came from (and their place in it).
+    let per = crate::transfer::map::ROWS_PER_FRAME;
+    assert_eq!(
+        rows.iter().map(|row| row.n).collect::<Vec<_>>(),
+        [5 * per, 6 * per, 7 * per]
+    );
 }
 
 /// Before the commit an import is one file, and every end but the commit removes it.
@@ -1166,6 +1169,56 @@ fn begin_removes_the_stage_an_earlier_import_left() {
     );
     assert_eq!(stage_files(dir.path()), [stage::FILE]);
     assert_eq!(open_stage(dir.path()).unwrap().count().unwrap().messages, 3);
+}
+
+/// The pin list is bounded (`MapLimits::max_pins`): through the importer, the first pins in
+/// the phone's order stay in the stage, the others stay chats without a pin, and the cut is
+/// counted under its reason.
+#[test]
+fn an_import_keeps_the_first_pins_and_counts_the_rest() {
+    use crate::archive::writer::{ChatSpec, ChatWith, ContactSpec, HistorySpec, write_history};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive");
+    let person = |i: u8| ContactSpec {
+        aci: Some(Uuid::from_bytes([i; 16])),
+        profile_name: format!("Person {i}"),
+        profile_sharing: true,
+        ..ContactSpec::default()
+    };
+    let spec = HistorySpec {
+        contacts: (0x21..0x24).map(person).collect(),
+        chats: [30, 10, 20]
+            .iter()
+            .enumerate()
+            .map(|(i, order)| ChatSpec {
+                with: ChatWith::Contact(i),
+                pinned_order: Some(*order),
+                ..ChatSpec::default()
+            })
+            .collect(),
+        ..HistorySpec::default()
+    };
+    write_history(&path, &KEY, aci(), &spec).unwrap();
+    let importer = import::HistoryImporter::new(
+        import_context(dir.path()),
+        map::MapLimits {
+            max_pins: 2,
+            ..map::MapLimits::default()
+        },
+        stage::StageLimits::default(),
+    );
+    let summary = import(&path, Box::new(importer), false).unwrap();
+    assert_eq!(summary.skipped.get(map::reason::PINS_OVER_CAP), Some(&1));
+    let chats = open_stage(dir.path()).unwrap().chats().unwrap();
+    let mut pins: Vec<u32> = chats.iter().filter_map(|chat| chat.pinned).collect();
+    pins.sort_unstable();
+    assert_eq!(pins, [10, 20], "the pin 30 is the one over the bound");
+    assert_eq!(chats.len(), 3, "the chat that lost its pin is still staged");
+    assert_eq!(
+        chats.iter().filter(|chat| chat.shown()).count(),
+        2,
+        "and, with no row, not shown"
+    );
 }
 
 fn reading(db: &kourier_db::ZoneDb) {

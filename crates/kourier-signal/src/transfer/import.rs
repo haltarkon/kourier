@@ -17,7 +17,7 @@ use kourier_model::HistoryTransferFailure;
 use libsignal_core::{Aci, Pni};
 use zeroize::Zeroizing;
 
-use super::map::{MapLimits, Mapper, Staged};
+use super::map::{MapLimits, Mapper, MediaRules, Staged};
 use super::stage::{StageError, StageKey, StageLimits, StageWriter};
 use super::{ImportError, ImportSummary, Importer};
 use crate::archive::{ArchiveInfo, Frame};
@@ -35,6 +35,11 @@ pub(crate) struct ImportContext {
     pub(crate) pni: Pni,
     /// The time of the import (ms, the backend's clock).
     pub(crate) now: i64,
+    /// The server's message queue time from the remote config, when one is stored (step S5:
+    /// how old an attachment's place may be, `map::MediaRules`; none: the 30-day floor).
+    pub(crate) queue_time: Option<std::time::Duration>,
+    /// The largest attachment the server lets this account receive (bytes).
+    pub(crate) receive_limit: u64,
 }
 
 impl std::fmt::Debug for ImportContext {
@@ -97,12 +102,25 @@ impl HistoryImporter {
 }
 
 impl Importer for HistoryImporter {
-    fn begin(&mut self, _info: &ArchiveInfo) -> Result<(), ImportError> {
+    fn begin(&mut self, info: &ArchiveInfo) -> Result<(), ImportError> {
         // The header's media root key is compared with nothing: this version has no use for
         // it, and the archive's own MAC under the ephemeral key authenticates the header.
+        // Its export time is the reference of the attachments' age (`MediaRules`).
         self.summary = ImportSummary::default();
+        let media = MediaRules::new(
+            self.ctx.now,
+            info.backup_time_ms,
+            self.ctx.queue_time,
+            self.ctx.receive_limit,
+        );
+        tracing::info!(
+            queue_time_stored = self.ctx.queue_time.is_some(),
+            window_days = media.window_ms / (24 * 60 * 60 * 1000),
+            "the import judges the age of attachments"
+        );
         let mapper = Mapper::new(self.ctx.aci, self.ctx.pni, self.ctx.now, self.map_limits)
-            .ok_or(ImportError::internal("the account has no user id"))?;
+            .ok_or(ImportError::internal("the account has no user id"))?
+            .with_media(media);
         // `create` removes a stage that is there: what an import left that was killed
         // before its commit was recorded.
         let writer = StageWriter::create(
@@ -124,7 +142,12 @@ impl Importer for HistoryImporter {
         for row in self.rows.drain(..) {
             match row {
                 Staged::Contact { n, contact } => writer.contact(n, &contact)?,
-                Staged::Chat { idx, conv, chat } => writer.chat(idx, &conv, &chat, None)?,
+                Staged::Chat {
+                    idx,
+                    conv,
+                    chat,
+                    pinned,
+                } => writer.chat(idx, &conv, &chat, pinned)?,
                 Staged::Item { chat, n, msg } => writer.item(chat, n, &msg)?,
             }
         }
@@ -138,6 +161,13 @@ impl Importer for HistoryImporter {
         let end = mapper.finish();
         // On an error the writer has removed its files: nothing of a stage that is not
         // whole stays.
+        let mut writer = writer;
+        for idx in &end.unpinned {
+            if let Err(e) = writer.unpin(*idx) {
+                writer.abort();
+                return Err(e.into());
+            }
+        }
         let totals = writer.commit(&end.chats, self.summary.frames)?;
         let mut summary = std::mem::take(&mut self.summary);
         summary.staged = Some(totals);

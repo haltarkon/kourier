@@ -242,6 +242,7 @@ mod tests {
             view_once: false,
             history: false,
             mentions_me: false,
+            outbox: None,
             actions: Default::default(),
         }
     }
@@ -360,6 +361,7 @@ mod tests {
             own_device: None,
             avatar: None,
             number: None,
+            linked_at: 0,
         };
         assert_eq!(account_label(&a), "Work");
         a.display_name = None;

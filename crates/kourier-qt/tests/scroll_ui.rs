@@ -39,6 +39,8 @@
 //! handler's scroll animation and clicks on the track that go to the place of the click
 //! (Plasma's defaults), and without the animation and with clicks that page.
 
+mod support;
+
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
@@ -837,6 +839,7 @@ const RUN: &str = "KOURIER_SCROLL_UI_RUN";
 const RUNS: [(&str, bool, bool); 2] = [("smooth", true, false), ("instant", false, true)];
 
 fn main() -> ExitCode {
+    support::answer_list("scroll_ui");
     match std::env::var(RUN) {
         Ok(name) => session(&name),
         Err(_) => both(),

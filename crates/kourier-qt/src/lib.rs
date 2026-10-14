@@ -84,14 +84,21 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// Calls: `calls` = a chat with a line for every state of a 1:1 call (missed, declined,
 /// answered on another device, made from the phone, unanswered, and one that rings now).
 ///
+/// History import (step S5): `unavailable` = a chat of imported attachments that cannot be
+/// had: a picture, a file, a sticker and an album of four "Not available on this device", a
+/// picture and a file "No longer available", and a picture that downloads on a click.
+///
 /// History transfer (architecture §14.2 item 14): `transferwait`, `transferdownload` and
-/// `transferread` = the link page while the phone is asked, while the history downloads
-/// and while it is read (the page links the fixture account itself and the transfer stays
-/// in that state); `transferbanner` = the main window after a restart in the middle of a
+/// `transferread` = the main window right after a link, its transfer in the account banner
+/// while the phone is asked, while the history downloads and while it is read, with its
+/// counts (the page links the fixture account itself, the link page closes once the core
+/// has the account, and the transfer stays in that state); `transferupdate` = the main
+/// window with the banner of the update after a link (profiles and groups still left);
+/// `transferbanner` = the main window after a restart in the middle of a
 /// download, the transfer in the account banner; `transferfailed` = the main window with
 /// the banner of a failed transfer; `transferask` = the settings page with the question
 /// "Remove and Link Again?" of "Transfer History from Phone…".
-pub const PAGES: [&str; 47] = [
+pub const PAGES: [&str; 49] = [
     "welcome",
     "link",
     "qr",
@@ -133,9 +140,11 @@ pub const PAGES: [&str; 47] = [
     "readmore",
     "about",
     "calls",
+    "unavailable",
     "transferwait",
     "transferdownload",
     "transferread",
+    "transferupdate",
     "transferbanner",
     "transferfailed",
     "transferask",
@@ -187,6 +196,13 @@ pub fn options() -> UiOptions {
 /// Returns `false` when options were already set.
 pub fn set_options(opts: UiOptions) -> bool {
     OPTIONS.set(opts).is_ok()
+}
+
+/// Tests: says that the desktop session is ending (or not), as the session manager's request
+/// would; the question on quitting is then not asked.
+#[doc(hidden)]
+pub fn set_session_ending(ending: bool) {
+    bridge::qobject::set_session_ending(ending);
 }
 
 /// Hands the running app to the `App` singleton the QML engine creates next.
@@ -245,6 +261,8 @@ pub fn run(opts: UiOptions) -> i32 {
     kourier_app::trace::mark_with_cpu("startup.qt_app", &[]);
     // The window may hide in the tray or be released while hidden; QML quits explicitly.
     bridge::qobject::set_quit_on_last_window_closed(false);
+    // A session that ends closes every window: the question on quitting must not hold it.
+    bridge::qobject::watch_session_end();
     if screenshot {
         bridge::qobject::park_cursor();
     }
@@ -277,4 +295,125 @@ pub fn run(opts: UiOptions) -> i32 {
     drop(app);
     qtlog::end();
     code
+}
+
+#[cfg(test)]
+mod qml_rules {
+    use std::path::Path;
+
+    fn qml_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the qml directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                qml_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "qml") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No QML of Kourier uses QtQuick.Shapes: with the threaded render loop Qt's software
+    /// renderer of a `Shape` reads the item's window from the render thread and crashed when
+    /// rows holding one left the list (`ReceiptIcon.qml`, 2026-10-12).
+    #[test]
+    fn no_qml_uses_qtquick_shapes() {
+        let mut files = Vec::new();
+        qml_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("qml"),
+            &mut files,
+        );
+        assert!(files.len() > 20, "the QML files were not found");
+        let users: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                std::fs::read_to_string(f)
+                    .expect("a QML file")
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("import QtQuick.Shapes"))
+            })
+            .collect();
+        assert!(users.is_empty(), "QtQuick.Shapes is imported by {users:?}");
+    }
+
+    /// The 30 s cap of a `--screenshot` run counts from the FIRST start of `shotTimer`
+    /// (`MainWindow.qml`): when the start condition flips (a history page that loads more), the
+    /// timer starts again but the cap does not, so a page that keeps flipping still ends.
+    #[test]
+    fn the_screenshot_cap_counts_from_the_first_start_of_its_timer() {
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("qml/MainWindow.qml"),
+        )
+        .expect("MainWindow.qml");
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let sets: Vec<usize> = (0..lines.len())
+            .filter(|i| lines[*i].starts_with("shotTimer.began = "))
+            .collect();
+        assert_eq!(sets.len(), 1, "began is set in one place: {sets:?}");
+        assert_eq!(
+            lines[sets[0] - 1],
+            "if (shotTimer.began === 0) {",
+            "began is set only at the first start"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("waited >= 30000")),
+            "the cap is still 30 s from began"
+        );
+    }
+
+    /// A menu item that is hidden is disabled too. The menu's keyboard navigation (Down,
+    /// Return) does not skip an item that is only invisible, so a hidden "Transfer History from
+    /// Phone…" could be triggered during an import (link feedback L4, review F3). Every
+    /// `QQC2.MenuItem` that sets `visible:` of its own, and the `Entry` component of the message
+    /// menu (which hides itself by its height), has `enabled: visible`; so has every
+    /// `Kirigami.Action` that hides itself (they end up in the toolbar's overflow menu).
+    #[test]
+    fn a_hidden_menu_item_is_disabled_too() {
+        let mut files = Vec::new();
+        qml_files(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("qml"),
+            &mut files,
+        );
+        let mut items = 0;
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("a QML file");
+            let lines: Vec<&str> = text.lines().collect();
+            for (start, line) in lines.iter().enumerate() {
+                // Also as a property's value or a component: `delegate: QQC2.MenuItem {`,
+                // `helpfulAction: Kirigami.Action {`, `component Entry: QQC2.MenuItem {`.
+                let head = line.trim();
+                let head = head.rsplit_once(": ").map_or(head, |(_, ty)| ty);
+                let action = head == "Kirigami.Action {" || head == "QQC2.Action {";
+                if !(action || head == "QQC2.MenuItem {") {
+                    continue;
+                }
+                // The item's own properties: the lines at the depth of its opening brace.
+                let mut depth = 0i32;
+                let (mut hides, mut disables) = (false, false);
+                for l in &lines[start..] {
+                    let t = l.trim();
+                    if depth == 1 {
+                        hides |= t.starts_with("visible:") || t.starts_with("height: visible ?");
+                        // (An action that has an `enabled:` of its own states when it works.)
+                        disables |=
+                            t == "enabled: visible" || (action && t.starts_with("enabled:"));
+                    }
+                    depth += i32::try_from(t.matches('{').count()).unwrap_or(0)
+                        - i32::try_from(t.matches('}').count()).unwrap_or(0);
+                    if depth <= 0 {
+                        break;
+                    }
+                }
+                items += 1;
+                if hides && !disables {
+                    offenders.push(format!("{}:{}", file.display(), start + 1));
+                }
+            }
+        }
+        assert!(items > 8, "the menu items were not found ({items})");
+        assert!(
+            offenders.is_empty(),
+            "menu items that hide themselves but stay enabled: {offenders:?}"
+        );
+    }
 }

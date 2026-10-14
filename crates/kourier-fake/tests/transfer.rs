@@ -13,7 +13,7 @@ use kourier_backend_api::{
 };
 use kourier_fake::{FakeNetwork, Flavor, Script, Step, TransferScript, scripts};
 use kourier_model::{
-    AccountId, AccountUuid, ConnState, ConvKey, HistorySource, HistoryTransfer,
+    AccountId, AccountProgress, AccountUuid, ConnState, ConvKey, HistorySource, HistoryTransfer,
     HistoryTransferFailure, LoginStepKind, UserId,
 };
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,7 @@ async fn stop(mut run: Running) {
 #[derive(Clone, Debug, PartialEq)]
 enum Seen {
     Transfer(HistoryTransfer),
+    Progress(AccountProgress),
     LoginDone,
     Message(String),
 }
@@ -87,6 +88,7 @@ async fn next(run: &mut Running) -> Vec<Seen> {
         .iter()
         .filter_map(|e| match e {
             BackendEvent::HistoryTransfer(s) => Some(Seen::Transfer(*s)),
+            BackendEvent::AccountProgress(p) => Some(Seen::Progress(*p)),
             BackendEvent::Login(s) if s.kind == LoginStepKind::Done => Some(Seen::LoginDone),
             BackendEvent::Message(m) => Some(Seen::Message(m.local.to_string())),
             _ => None,
@@ -117,6 +119,7 @@ async fn link(run: &Running) {
         Command::StartLogin {
             flow: "qr".into(),
             relink: None,
+            taken: Vec::new(),
         },
     )
     .await;
@@ -196,7 +199,17 @@ fn a_fresh_link_walks_the_transfer_before_done_and_delivers_nothing_meanwhile() 
         link(&run).await;
         let seen = until(&mut run, |s| matches!(s, Seen::Message(_))).await;
         let mut expected: Vec<Seen> = stages.iter().map(|s| Seen::Transfer(*s)).collect();
+        // The read counts the messages as the delivery does, a quarter at a time.
+        let total = TransferScript::MESSAGES;
+        expected.extend((0..4).map(|k| {
+            Seen::Progress(AccountProgress {
+                messages_done: total * k / 4,
+                messages_total: total,
+                ..AccountProgress::default()
+            })
+        }));
         expected.push(Seen::Transfer(HistoryTransfer::Done));
+        expected.push(Seen::Progress(AccountProgress::finished()));
         expected.push(Seen::LoginDone);
         expected.push(Seen::Message("1".into()));
         assert_eq!(
@@ -352,6 +365,7 @@ fn a_skip_during_a_download_is_not_lost_to_the_read() {
             (HistoryTransfer::Reading, None),
         ],
         end: HistoryTransfer::Done,
+        import: None,
     };
     let fake = FakeNetwork::new(Flavor::SignalLike, script(transfer));
     rt.block_on(async {
@@ -449,6 +463,7 @@ fn a_restart_in_the_middle_goes_on_from_its_stage() {
             (HistoryTransfer::Reading, Some(HOLD)),
         ],
         end: HistoryTransfer::Done,
+        import: None,
     };
     let fake = FakeNetwork::new(Flavor::SignalLike, script(transfer));
     let uuid = AccountUuid::new_random();
@@ -556,6 +571,7 @@ fn a_relink_has_no_transfer_and_the_descriptor_can_promise_history() {
                     account: AccountId(1),
                     expect_own: vec![me()],
                 }),
+                taken: Vec::new(),
             },
         )
         .await;

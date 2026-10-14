@@ -39,21 +39,26 @@ How to build is in [README.md](README.md). The commands you will use:
 ```bash
 cargo build                          # whole workspace; binary in target/debug/kourier
 cargo xtask ci                       # what a change must pass
-cargo test -p kourier-core           # one crate while you work
-QT_QPA_PLATFORM=offscreen cargo test -p kourier-qt
+cargo nextest run -p kourier-core    # one crate while you work (or `cargo test -p kourier-core`)
+QT_QPA_PLATFORM=offscreen cargo nextest run -p kourier-qt
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 `cargo xtask ci` runs formatting, clippy with warnings denied, the check of allowed crate
 dependencies (`cargo xtask deps-check`), all tests, `qmllint` and a comparison of the user
-interface's screenshots with stored ones. Without picture changes it takes about nine minutes;
-with them about twenty.
+interface's screenshots with stored ones. On a six-core machine the tests alone take about
+seven minutes with cargo-nextest (fifteen with plain `cargo test`); the build, the checks and, when
+something that draws changed, the screenshots (about five minutes) come on top.
 
 - The tests of the Signal backend (`kourier-signal`, `kourier-e2e`) run against Signal's own mock
-  server through `tests/mock-harness/` and need Node.js 24 (`npm ci` once in that directory). Run
-  them with `-- --test-threads 2`. `KOURIER_REQUIRE_MOCK_HARNESS=1` turns a skipped harness test
-  into a failure; use it before you send a change that touches the backend.
+  server through `tests/mock-harness/` and need Node.js 24 (`npm ci` once in that directory).
+  `KOURIER_REQUIRE_MOCK_HARNESS=1` turns a skipped harness test into a failure; use it before you
+  send a change that touches the backend.
+- `cargo xtask ci` runs the tests with [cargo-nextest](https://nexte.st) (`cargo install
+  cargo-nextest --locked`; `.config/nextest.toml` says how many of the harness-based tests run
+  side by side). Without it `ci` warns and falls back to `cargo test`, which is about three times
+  slower. With plain `cargo test` run the Signal backend's tests with `-- --test-threads 2`.
 - `cargo xtask shots` renders the user interface headless and compares each picture with the one
   you rendered before (`target/shots-baseline`, local: pixels depend on your fonts, Qt and Breeze).
   It names the pictures that changed and writes side-by-side images to `target/shots/diff/`; look

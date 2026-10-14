@@ -17,6 +17,7 @@ mod clear;
 mod merge;
 mod message;
 mod modifier;
+pub(crate) mod restore;
 mod roaming;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,9 +32,12 @@ use kourier_model::{
 
 pub(crate) use attachment::{forget_orphans, newest_download, pending_derives, resume_downloads};
 pub(crate) use call::{DEAD_ORIGIN, is_call_line};
-pub(crate) use clear::{LocalDelete, attachment_account, clear_conversation, delete_attachment};
+pub(crate) use clear::{
+    LocalDelete, attachment_account, body_reads, clear_conversation, delete_attachment,
+};
 pub(crate) use message::{MsgRow, preview};
-pub(crate) use modifier::MAX_EMOJI_BYTES;
+pub(crate) use modifier::{MAX_EMOJI_BYTES, receipt_retry_decodes};
+pub(crate) use roaming::other_identities;
 
 use crate::error::{CoreError, Result};
 use crate::sql::{self, AccountInfo};
@@ -75,6 +79,13 @@ pub(crate) struct Changes {
     /// Durable commands confirmed by the backend.
     pub commands_done: Vec<CmdId>,
     /// Downloads to send to the backend after the commit (§5.8).
+    /// Durable commands stored by this write (`pending_commands`), for the account's
+    /// supervisor to send now (its next start resends what is unconfirmed). Today: requests
+    /// for files the network lost (`ingest::restore`).
+    pub commands: Vec<(CmdId, kourier_backend_api::DurableCommand)>,
+    /// A wait for the other device's answer got a deadline or lost one: the restore task
+    /// looks again (`crate::restore`).
+    pub restoring: bool,
     pub downloads: Vec<crate::attachments::DownloadJob>,
     /// Downloaded files to derive thumbnails and blurhashes from after the commit.
     pub derive: Vec<crate::attachments::DeriveJob>,
@@ -98,6 +109,11 @@ pub(crate) struct Changes {
     pub outbox: bool,
     /// Conversations whose counters must be recomputed before the commit.
     recount: BTreeSet<ConversationId>,
+    /// An identity merge was applied: the receipts that wait because their sender was no
+    /// recipient are looked at again ONCE, in [`Apply::finish`], not after every merge (the
+    /// first Storage Service sync of a link merges ~300 numbers in one transaction, and each
+    /// look decodes every parked receipt of the account).
+    receipts_to_retry: bool,
 }
 
 impl Changes {
@@ -120,6 +136,8 @@ impl Changes {
         self.incoming.extend(other.incoming);
         self.unlink.extend(other.unlink);
         self.commands_done.extend(other.commands_done);
+        self.commands.extend(other.commands);
+        self.restoring |= other.restoring;
         self.downloads.extend(other.downloads);
         self.derive.extend(other.derive);
         self.media.extend(other.media);
@@ -216,7 +234,15 @@ impl Apply<'_> {
             | BackendEvent::AttachmentProgress { .. }
             | BackendEvent::DownloadProgress { .. }
             | BackendEvent::TransmitProgress { .. }
-            | BackendEvent::HistoryTransfer(_) => Ok(()),
+            | BackendEvent::HistoryTransfer(_)
+            | BackendEvent::AccountProgress(_)
+            | BackendEvent::Logout(_) => Ok(()),
+            BackendEvent::AttachmentRestore {
+                target,
+                update,
+                cmd,
+                ..
+            } => self.attachment_restore(&target, update, cmd),
             BackendEvent::AccountReady {
                 own_ids,
                 device,
@@ -300,8 +326,13 @@ impl Apply<'_> {
         }
     }
 
-    /// Recomputes counters of touched conversations (call once before the commit).
+    /// Looks again at the receipts that wait if a merge was applied, then recomputes counters
+    /// of touched conversations (call once before the commit; a receipt that applies touches a
+    /// conversation, so it comes first).
     pub(crate) fn finish(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.ch.receipts_to_retry) {
+            self.retry_receipts()?;
+        }
         let convs = std::mem::take(&mut self.ch.recount);
         for c in convs {
             if self.ch.removed.contains(&c) {

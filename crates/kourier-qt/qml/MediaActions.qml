@@ -26,6 +26,37 @@ QtObject {
         albumRequested(items, index, message);
     }
 
+    // The note of an attachment the user's phone was asked to upload again and did not
+    // ("noanswer", "nomessage", "nofile"); "" for any other state. While asking, the block says
+    // "Asking your phone…" itself.
+    function askNote(state: string): string {
+        switch (state) {
+        case "noanswer":
+            return L10n.i18nc("@info", "Your phone did not answer. Open Signal on your phone and try again.");
+        case "nomessage":
+            return L10n.i18nc("@info", "Your phone no longer has this message.");
+        case "nofile":
+            return L10n.i18nc("@info", "Not on your phone either.");
+        default:
+            return "";
+        }
+    }
+
+    // The same endings in a few words, for a pill on a picture or a small tile that cuts what
+    // does not fit (the whole sentence is its tooltip and its accessible description); ""
+    // for any other state.
+    function askShortNote(state: string): string {
+        switch (state) {
+        case "noanswer":
+            return L10n.i18nc("@info", "No answer from your phone");
+        case "nomessage":
+        case "nofile":
+            return L10n.i18nc("@info", "Not on your phone");
+        default:
+            return "";
+        }
+    }
+
     function open(attachment: real, name: string, media: bool): void {
         openRequested(attachment, name, media);
     }

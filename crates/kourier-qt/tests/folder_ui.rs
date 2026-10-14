@@ -25,6 +25,8 @@
 //! Nothing here opens a file dialog: the picker's two modes are checked by the menu's
 //! entries, and what a picked folder does is what a dropped one does.
 
+mod support;
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -569,6 +571,7 @@ fn archives_left(dir: &Path) -> usize {
 }
 
 fn main() {
+    support::answer_list("folder_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

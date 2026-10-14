@@ -18,7 +18,7 @@ use crate::bridge::qobject::{self, App};
 use crate::shared::Shared;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 20] = [
+pub const ROLES: [&str; 22] = [
     "kind",
     "messageId",
     "own",
@@ -39,6 +39,8 @@ pub const ROLES: [&str; 20] = [
     "actions",
     "expiry",
     "tone",
+    "wait",
+    "waitTimer",
 ];
 
 /// Rust side of `TimelineModel`.
@@ -64,6 +66,9 @@ pub struct TimelineRust {
     pub(crate) timer_custom_step: i32,
     /// Deleting here is told to the account's other devices.
     pub(crate) deletes_sync: bool,
+    /// Why the chat cannot be cleared or deleted now (its history still arrives); empty
+    /// when it can.
+    pub(crate) still_filling: QString,
     /// The timers behind `timer_options` (to tell when they change).
     timer_offered: Vec<kourier_viewmodel::conversations::TimerOption>,
     /// Whether the header of `conversation_id` is loaded. While it is not, the properties
@@ -101,6 +106,8 @@ pub struct MessageQt {
     actions: QVariant,
     expiry: QString,
     tone: QString,
+    wait: QString,
+    wait_timer: QString,
 }
 
 fn s(v: &str) -> QVariant {
@@ -144,6 +151,7 @@ fn image_variant(i: &ImageBlock) -> QVariant {
         ("progress", QVariant::from(&f64::from(i.progress))),
         ("label", s(&i.label)),
         ("sticker", QVariant::from(&i.sticker)),
+        ("ask", QVariant::from(&i.ask)),
     ])
 }
 
@@ -166,6 +174,7 @@ pub fn viewer_items(row: &MessageRow) -> QVariant {
             ("state", s(i.state.as_str())),
             ("progress", QVariant::from(&f64::from(i.progress))),
             ("placeholder", s(&i.placeholder_url)),
+            ("ask", QVariant::from(&i.ask)),
         ])
     }))
 }
@@ -245,6 +254,7 @@ pub fn block_variant(b: &Block) -> QVariant {
             ("state", s(f.state.as_str())),
             ("progress", QVariant::from(&f64::from(f.progress))),
             ("voice", QVariant::from(&f.voice)),
+            ("ask", QVariant::from(&f.ask)),
         ]),
         Block::Placeholder(p) => map(vec![ty, ("text", s(&p.text)), ("icon", s(&p.icon))]),
     }
@@ -275,6 +285,7 @@ fn actions_variant(a: &RowActions) -> QVariant {
         ("deleteAttachment", QVariant::from(&a.delete_attachment)),
         ("takeBack", QVariant::from(&a.take_back)),
         ("retry", QVariant::from(&a.retry)),
+        ("askAttachments", QVariant::from(&a.ask_attachments)),
         ("any", QVariant::from(&a.any())),
     ])
 }
@@ -302,6 +313,8 @@ impl MessageQt {
             actions: actions_variant(&v.actions),
             expiry: QString::from(v.expiry.as_str()),
             tone: QString::from(v.tone.as_str()),
+            wait: QString::from(v.wait.as_str()),
+            wait_timer: QString::from(v.wait_timer.as_str()),
         }
     }
 
@@ -326,6 +339,8 @@ impl MessageQt {
             .with_if(17, a.actions != b.actions)
             .with_if(18, a.expiry != b.expiry)
             .with_if(19, a.tone != b.tone)
+            .with_if(20, a.wait != b.wait)
+            .with_if(21, a.wait_timer != b.wait_timer)
     }
 
     fn key(v: &MessageRow) -> RowKey {
@@ -360,7 +375,9 @@ impl qobject::TimelineModel {
             16 => QVariant::from(&r.icon),
             17 => r.actions.clone(),
             18 => QVariant::from(&r.expiry),
-            _ => QVariant::from(&r.tone),
+            19 => QVariant::from(&r.tone),
+            20 => QVariant::from(&r.wait),
+            _ => QVariant::from(&r.wait_timer),
         }
     }
 
@@ -381,6 +398,12 @@ impl qobject::TimelineModel {
     /// The viewmodel rows currently shown (tests).
     pub fn rows(&self) -> &[MessageRow] {
         &self.store.view
+    }
+
+    /// How many pictures, videos and files of the rows shown are downloading.
+    pub fn downloading_attachments(&self) -> i32 {
+        i32::try_from(kourier_viewmodel::timeline::downloading(&self.store.view))
+            .unwrap_or(i32::MAX)
     }
 
     /// "Read more" on a long text: the message shows one step more of it. Its row is updated in
@@ -434,6 +457,10 @@ impl qobject::TimelineModel {
         let avatar = text(|h| &h.avatar_url);
         if *self.avatar_url() != avatar {
             self.as_mut().set_avatar_url(avatar);
+        }
+        let filling = text(|h| &h.still_filling);
+        if *self.still_filling() != filling {
+            self.as_mut().set_still_filling(filling);
         }
         let cannot = text(|h| &h.cannot_send);
         if *self.cannot_send() != cannot {

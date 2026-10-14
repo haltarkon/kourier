@@ -15,8 +15,8 @@ use crate::actions::{self, Facts, Sending};
 use crate::error::{CoreError, Result};
 use crate::facade::{
     AccountRow, ConversationDetail, ConversationListQuery, ConversationPage, ConversationRow,
-    MessageRevisions, MessageRow, OriginKind, Preview, QuoteState, ReactionGroup, ReplyPreview,
-    Revision, TimelineAnchor, TimelinePage, TimelineQuery,
+    MessageRevisions, MessageRow, OriginKind, OutboxWait, Preview, QuoteState, ReactionGroup,
+    ReplyPreview, Revision, TimelineAnchor, TimelinePage, TimelineQuery,
 };
 use crate::sql;
 
@@ -38,11 +38,12 @@ pub(crate) fn accounts(
         Option<u32>,
         String,
         Option<String>,
+        i64,
     );
     let rows: Vec<Raw> = conn
         .prepare_cached(
             "SELECT id, uuid, network, state, state_reason, display_name, own_device, own_ids,
-               number
+               number, created_at
              FROM accounts ORDER BY coalesce(sort_order, id), id",
         )?
         .query_map([], |r| {
@@ -56,12 +57,13 @@ pub(crate) fn accounts(
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     rows.into_iter()
         .map(
-            |(id, uuid, network, state, reason, name, device, own_ids, number)| {
+            |(id, uuid, network, state, reason, name, device, own_ids, number, linked_at)| {
                 let state = sql::account_state(&state, reason)?;
                 // Without a running actor (after a restart) a logged-out account still says so.
                 let shown =
@@ -92,6 +94,7 @@ pub(crate) fn accounts(
                     own_device: device,
                     avatar,
                     number,
+                    linked_at,
                 })
             },
         )
@@ -393,7 +396,8 @@ pub(crate) fn conversation(
 
 const MSG_SELECT: &str = "SELECT id, sort_key, net_author, origin, device, body, reply_to, sent_at,
       server_at, received_at, revision, edited_at, deleted, deleted_by, out_state, read_state,
-      expiry_kind, expiry_timer_ms, expiry_started_at, view_once, history, mentions_me, account_id
+      expiry_kind, expiry_timer_ms, expiry_started_at, view_once, history, mentions_me, account_id,
+      net_local <> ''
     FROM messages";
 
 struct MsgRaw {
@@ -420,6 +424,8 @@ struct MsgRaw {
     history: bool,
     mentions_me: bool,
     account: i64,
+    /// The message has a network id the other device can be asked about.
+    named: bool,
 }
 
 fn msg_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<MsgRaw> {
@@ -447,6 +453,7 @@ fn msg_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<MsgRaw> {
         history: r.get(20)?,
         mentions_me: r.get(21)?,
         account: r.get(22)?,
+        named: r.get(23)?,
     })
 }
 
@@ -458,6 +465,14 @@ struct PageCtx {
     now: i64,
     /// The account is linked.
     active: bool,
+    /// The account's network can ask its other device for lost files
+    /// (`AccountCaps::restores_attachments`).
+    restores: bool,
+    /// The network's receive limit (`AccountCaps::max_receive_attachment_bytes`).
+    receive_limit: Option<u64>,
+    /// The chat is with a person known by phone number alone: read-only, and the other device
+    /// cannot be asked about its messages (the answer could not be placed).
+    number_only: bool,
     blocked: bool,
     /// The chat with ourselves.
     note_to_self: bool,
@@ -467,19 +482,29 @@ struct PageCtx {
     own_ids: Vec<UserId>,
     /// Reactions per user (`None` = a set).
     per_user: Option<u8>,
-    /// Own messages that still have their send row in the outbox → whether that row waits
-    /// or is in flight (`false`: it failed and is only kept for "Retry").
-    queued: HashMap<i64, bool>,
+    /// Own messages that still have their send row in the outbox → that row's state
+    /// (`waits` false: it failed and is only kept for "Retry").
+    queued: HashMap<i64, QueuedRaw>,
     /// Display name and avatar per author.
     people: HashMap<String, (Option<String>, Option<BlobRef>)>,
 }
 
 impl PageCtx {
     fn load(conn: &Connection, conv: ConversationId, now: i64) -> Result<Self> {
-        type Raw = (bool, Option<String>, String, Option<String>, String, bool);
+        type Raw = (
+            bool,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            bool,
+            Option<String>,
+            String,
+        );
         let row: Option<Raw> = conn
             .prepare_cached(
-                "SELECT c.blocked, c.features, a.state, a.state_reason, a.own_ids, c.is_self
+                "SELECT c.blocked, c.features, a.state, a.state_reason, a.own_ids, c.is_self,
+                   a.caps, c.conv_key
                  FROM conversations c JOIN accounts a ON a.id = c.account_id WHERE c.id = ?1",
             )?
             .query_row([conv.0], |r| {
@@ -490,11 +515,25 @@ impl PageCtx {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
                 ))
             })
             .optional()?;
-        let (blocked, features, state, reason, own_ids, note_to_self) =
-            row.unwrap_or_else(|| (false, None, "Removing".into(), None, "[]".into(), false));
+        let (blocked, features, state, reason, own_ids, note_to_self, caps, conv_key) = row
+            .unwrap_or_else(|| {
+                (
+                    false,
+                    None,
+                    "Removing".into(),
+                    None,
+                    "[]".into(),
+                    false,
+                    None,
+                    String::new(),
+                )
+            });
+        let caps: Option<kourier_model::AccountCaps> = sql::from_json_opt(caps)?;
         let features: Option<ConversationFeatures> = sql::from_json_opt(features)?;
         let own_ids: Vec<UserId> = sql::from_json(&own_ids)?;
         let admin_role = sql::enum_name(&MemberRole::Admin)?;
@@ -509,17 +548,34 @@ impl PageCtx {
             admin |= is;
         }
         // The same condition as `actions::send_waits`, for the whole page at once.
-        let queued: HashMap<i64, bool> = conn
+        let queued: HashMap<i64, QueuedRaw> = conn
             .prepare_cached(
-                "SELECT message_id, state <> 'Failed' FROM outbox
-                 WHERE conversation_id = ?1 AND kind = 'Message'",
+                "SELECT message_id, state <> 'Failed', state = ?2, attempts, next_attempt_at,
+                   last_error
+                 FROM outbox WHERE conversation_id = ?1 AND kind = 'Message'",
             )?
-            .query_map([conv.0], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map((conv.0, crate::outbox::TRANSMITTING), |r| {
+                Ok((
+                    r.get(0)?,
+                    QueuedRaw {
+                        waits: r.get(1)?,
+                        in_flight: r.get(2)?,
+                        attempts: r.get(3)?,
+                        next_attempt_at: r.get(4)?,
+                        last_error: r.get(5)?,
+                    },
+                ))
+            })?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         Ok(Self {
             conv,
             now,
             active: sql::account_state(&state, reason)? == AccountState::Active,
+            restores: caps
+                .as_ref()
+                .is_some_and(kourier_model::AccountCaps::restores_attachments),
+            receive_limit: caps.and_then(|c| c.max_receive_attachment_bytes),
+            number_only: sql::conv_key(&conv_key).is_ok_and(|k| k.is_number_only()),
             blocked,
             note_to_self,
             per_user: match &features {
@@ -654,6 +710,33 @@ pub(crate) fn timeline(conn: &Connection, q: &TimelineQuery, now: i64) -> Result
     })
 }
 
+/// The outbox columns of an own message's send row (§4.5), for [`MessageRow::outbox`].
+#[derive(Clone)]
+struct QueuedRaw {
+    /// Queued, being stored or in flight (not `Failed`).
+    waits: bool,
+    in_flight: bool,
+    attempts: i64,
+    next_attempt_at: Option<i64>,
+    last_error: Option<String>,
+}
+
+impl QueuedRaw {
+    fn wait(&self) -> Option<OutboxWait> {
+        self.waits.then(|| OutboxWait {
+            in_flight: self.in_flight,
+            attempts: u32::try_from(self.attempts.max(0)).unwrap_or(u32::MAX),
+            // Only a row that waits for its next try has a time that means something.
+            next_attempt_at: if self.in_flight {
+                None
+            } else {
+                self.next_attempt_at
+            },
+            last_error: self.last_error.clone(),
+        })
+    }
+}
+
 /// The attachment columns a timeline row overlays on the stored body.
 struct AttRaw {
     id: i64,
@@ -769,9 +852,21 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
             has_text: actions::has_text(&body),
             sending,
             note_to_self: ctx.note_to_self,
-            queued: own && ctx.queued.get(&raw.id).copied().unwrap_or(false),
+            queued: own && ctx.queued.get(&raw.id).is_some_and(|q| q.waits),
         },
         ctx.now,
+    );
+    let mut flags = flags;
+    flags.ask_attachments = actions::ask_attachments(
+        ctx.active
+            && ctx.restores
+            && raw.named
+            && !raw.view_once
+            && !ctx.number_only
+            && !sql::user(&raw.author).is_ok_and(|u| u.is_phone_number()),
+        raw.deleted.as_deref(),
+        &body,
+        ctx.receive_limit,
     );
     let deleted = match raw.deleted.as_deref() {
         None => None,
@@ -823,6 +918,11 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
         view_once: raw.view_once,
         history: raw.history,
         mentions_me: raw.mentions_me,
+        outbox: if own {
+            ctx.queued.get(&raw.id).and_then(QueuedRaw::wait)
+        } else {
+            None
+        },
         actions: flags,
     })
 }

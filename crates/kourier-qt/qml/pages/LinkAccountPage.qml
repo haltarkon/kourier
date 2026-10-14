@@ -11,20 +11,13 @@ import app.kourier
 // Generic login-step renderer (§8.3): input fields, QR code (rotating), pairing code, emoji,
 // progress, error with retry.
 //
-// After the code was scanned the phone may transfer the account's message history. While
-// that runs (`App.linkTransfer`: waiting for the phone, downloading, reading) the page shows
-// it in place of its "linking" step; when it ends the link finishes as it always did. The
-// account is linked by then, so there is nothing left to cancel: the way on without the
-// history is the transfer's own "Continue Without History".
+// After the code was scanned the phone may transfer the account's message history. The page
+// does not wait for it: it says "Linked" as soon as the core has the account, and the
+// transfer goes on in the account banner of the main window.
 Kirigami.ScrollablePage {
     id: page
 
     readonly property string kind: App.login.kind
-    // The history transfer of the account being linked, while it runs.
-    readonly property var transfer: App.linkTransfer
-    readonly property bool transferring: (page.transfer.phase ?? "") !== ""
-    // What shows it (tests read it; null while no transfer runs).
-    readonly property Item transferItem: transferLoader.item as Item
     // Secondary text on the page.
     readonly property color quiet: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
 
@@ -38,7 +31,8 @@ Kirigami.ScrollablePage {
         Kirigami.Action {
             text: L10n.i18nc("@action:button", "Cancel")
             icon.name: "dialog-cancel"
-            visible: page.kind !== "done" && !page.transferring
+            visible: page.kind !== "done"
+            enabled: visible
             onTriggered: {
                 App.login.cancel();
                 page.cancelled();
@@ -172,21 +166,8 @@ Kirigami.ScrollablePage {
             Layout.alignment: Qt.AlignHCenter
         }
 
-        // The history transfer, in place of everything a login step would show below.
-        Loader {
-            id: transferLoader
-            active: page.transferring
-            visible: active
-            Layout.fillWidth: true
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
-            Layout.alignment: Qt.AlignHCenter
-            sourceComponent: TransferStatus {
-                view: page.transfer
-            }
-        }
-
         Kirigami.Heading {
-            visible: page.kind !== "input" && !page.transferring
+            visible: page.kind !== "input"
             text: App.login.title
             textFormat: Text.PlainText
             level: 2
@@ -232,7 +213,7 @@ Kirigami.ScrollablePage {
         }
 
         QQC2.Label {
-            visible: (page.kind !== "qr" || App.login.network !== "Signal") && page.kind !== "input" && App.login.hint !== "" && !page.transferring
+            visible: (page.kind !== "qr" || App.login.network !== "Signal") && page.kind !== "input" && App.login.hint !== ""
             text: App.login.hint
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -256,12 +237,11 @@ Kirigami.ScrollablePage {
         }
 
         RowLayout {
-            visible: (page.kind === "qr" || page.kind === "waiting" || page.kind === "progress") && !page.transferring
+            visible: page.kind === "qr" || page.kind === "waiting" || page.kind === "progress"
             spacing: Kirigami.Units.smallSpacing
             Layout.alignment: Qt.AlignHCenter
             Layout.topMargin: Kirigami.Units.largeSpacing
-            QQC2.BusyIndicator {
-                running: parent.visible
+            Spinner {
                 implicitWidth: Kirigami.Units.iconSizes.medium
                 implicitHeight: Kirigami.Units.iconSizes.medium
             }
@@ -272,7 +252,7 @@ Kirigami.ScrollablePage {
         }
 
         QQC2.ProgressBar {
-            visible: page.kind === "progress" && App.login.progress >= 0 && !page.transferring
+            visible: page.kind === "progress" && App.login.progress >= 0
             from: 0
             to: 1
             value: Math.max(0, App.login.progress)
@@ -294,7 +274,16 @@ Kirigami.ScrollablePage {
                     text: L10n.i18nc("@action:button", "Try Again")
                     icon.name: "view-refresh"
                     visible: App.login.retry
+                    enabled: visible
                     onTriggered: App.login.start(App.login.network)
+                },
+                // A link that would only fail again (the account is here already) offers
+                // the way to the list instead, where the account and its banner are.
+                Kirigami.Action {
+                    text: App.login.leave
+                    visible: App.login.leave !== ""
+                    enabled: visible
+                    onTriggered: page.cancelled()
                 }
             ]
         }

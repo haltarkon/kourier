@@ -137,13 +137,7 @@ pub(crate) async fn seal_for<T: SignalTransport>(
         (None, Some(token)) => SealAccess::GroupSend(token.to_vec()),
         (None, None) => return Ok(None),
     };
-    let settings = ctx.db.read(db::synced_settings)?;
-    let kind = if settings.share_number_with_everybody {
-        CertKind::WithE164
-    } else {
-        CertKind::WithoutE164
-    };
-    match certificate(ctx, kind).await {
+    match certificate(ctx, current_kind(ctx)?).await {
         Ok(certificate) => Ok(Some(Seal {
             access,
             certificate,
@@ -153,6 +147,27 @@ pub(crate) async fn seal_for<T: SignalTransport>(
             tracing::warn!(error = %e, "no sender certificate; sending unsealed");
             Ok(None)
         }
+    }
+}
+
+/// The certificate kind our synced settings ask for: with our number only when it is shared
+/// with everybody.
+fn current_kind<T: SignalTransport>(ctx: &SendContext<'_, T>) -> Result<CertKind> {
+    let settings = ctx.db.read(db::synced_settings)?;
+    Ok(if settings.share_number_with_everybody {
+        CertKind::WithE164
+    } else {
+        CertKind::WithoutE164
+    })
+}
+
+/// Fetches the sender certificate [`seal_for`] would use now, when it is not cached, so
+/// several seals made at once afterwards find it cached instead of each fetching it. A failure
+/// other than the database's is left to `seal_for`, which sends unsealed and says so.
+pub(crate) async fn warm_certificate<T: SignalTransport>(ctx: &SendContext<'_, T>) -> Result<()> {
+    match certificate(ctx, current_kind(ctx)?).await {
+        Err(e @ Error::Db(_)) => Err(e),
+        _ => Ok(()),
     }
 }
 

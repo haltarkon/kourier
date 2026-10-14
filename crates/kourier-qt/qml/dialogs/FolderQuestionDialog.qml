@@ -48,6 +48,7 @@ Kirigami.Dialog {
             text: L10n.i18nc("@action:button", "Back")
             icon.name: "go-previous"
             visible: root.confirming
+            enabled: visible
             onTriggered: root.answer("back")
         },
         Kirigami.Action {

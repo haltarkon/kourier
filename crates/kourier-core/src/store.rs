@@ -29,11 +29,16 @@ pub const MIGRATIONS: Migrations = Migrations::new(
         migration!(10, "0010_call_lines"),
         migration!(11, "0011_call_line_keys"),
         migration!(12, "0012_unread_history"),
+        migration!(13, "0013_attachment_requests"),
+        migration!(14, "0014_merge_indexes"),
     ],
 );
 
 /// Largest number of history messages one writer job applies (§4.10): one `HistoryBatch`.
 pub const HISTORY_CHUNK: usize = kourier_backend_api::MAX_HISTORY_BATCH;
+
+/// Prepared statements the writer connection keeps (rusqlite's default is 16).
+pub(crate) const WRITER_STATEMENT_CACHE: usize = 128;
 
 /// Number of read-only connections for UI queries.
 pub const UI_READERS: usize = 2;
@@ -164,6 +169,11 @@ impl Store {
         let fresh = !path.exists();
         let mut conn = kourier_db::open(path, key)?;
         kourier_db::migrate(&mut conn, &MIGRATIONS)?;
+        // rusqlite keeps 16 prepared statements by default; one job of the writer (an identity
+        // merge, a history batch) runs more distinct ones than that and prepared them again
+        // and again (`target/link-feedback/tail.md`: half the samples of a merge were in
+        // `sqlite3_prepare_v3`). Hiding the window flushes the cache ([`release`]).
+        conn.set_prepared_statement_cache_capacity(WRITER_STATEMENT_CACHE);
         let writer = Writer::spawn("kourier-core-db", conn)?;
         let handle = writer.handle();
         let ui = ReadPool::open(path, key, UI_READERS)?;

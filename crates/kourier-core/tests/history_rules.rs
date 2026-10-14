@@ -1151,3 +1151,72 @@ fn schema_12_counts_the_unread_history_rows_of_an_earlier_build() {
         .expect("the index");
     assert!(!index.contains("history"), "{index}");
 }
+
+/// Link feedback L5 (`buttons.md` 1.5): a chat deleted while the rest of its history is still
+/// to be delivered stays deleted. The imported rows that come afterwards (also a call line of
+/// the chat) are dropped: no row, no listing, no failure. A LIVE message of that chat brings
+/// it back, as before.
+#[test]
+fn an_imported_row_of_a_deleted_chat_is_dropped_and_a_live_message_brings_it_back() {
+    let (_dir, mut h) = harness();
+    let a = d_alice();
+    h.apply(vec![batch(
+        &a,
+        vec![
+            incoming(&a, &alice(), 100, true),
+            incoming(&a, &alice(), 110, true),
+        ],
+    )])
+    .expect("the first rows");
+    let id = conv(&h, &a);
+    h.clear_conversation(id, true).expect("delete the chat");
+    fn listed(h: &IngestHarness) -> usize {
+        h.conversations(&ConversationListQuery::default())
+            .expect("list")
+            .rows
+            .len()
+    }
+    assert_eq!(listed(&h), 0, "the delete took it from the list");
+
+    // The rest of the history: texts, a call line, a row nobody has seen.
+    h.apply(vec![BackendEvent::HistoryBatch {
+        conv: a.clone(),
+        messages: vec![
+            incoming(&a, &alice(), 120, false),
+            incoming(&a, &alice(), 130, true),
+            call(&a, "c1", CallState::Missed, 140, false),
+        ],
+        has_more: true,
+        progress: Some(0.5),
+    }])
+    .expect("the rest is not a failure");
+    assert_eq!(
+        listed(&h),
+        0,
+        "the chat did not come back with old messages"
+    );
+    let timeline = h
+        .timeline(&TimelineQuery {
+            conv: id,
+            anchor: TimelineAnchor::Newest,
+            limit: 500,
+        })
+        .expect("timeline")
+        .rows;
+    assert!(
+        timeline.is_empty(),
+        "nothing was stored: {}",
+        timeline.len()
+    );
+
+    // News is not history: a live message lists the chat again.
+    h.apply(vec![BackendEvent::Message(incoming(
+        &a,
+        &alice(),
+        500,
+        false,
+    ))])
+    .expect("a live message");
+    assert_eq!(listed(&h), 1, "a live message brings the chat back");
+    assert_eq!(rows(&h, &a).len(), 1);
+}

@@ -39,6 +39,7 @@ fn own_actions() -> MessageActions {
         delete_attachment: false,
         copy: true,
         take_back: false,
+        ask_attachments: Vec::new(),
         until: None,
     }
 }
@@ -1986,4 +1987,73 @@ fn the_composer_learns_what_the_chats_network_says_about_files() {
         crate::files::StripRules::default()
     );
     assert_eq!(src.max_text_bytes(ConversationId(2)), None);
+}
+
+/// Link feedback L3: a chat whose imported history still arrives (more batches announced),
+/// or whose account's history transfer still runs, is neither cleared nor deleted: a
+/// cleared chat would fill again. The menu says why; afterwards both work again.
+#[test]
+fn a_chat_still_filling_is_not_cleared_or_deleted_and_says_why() {
+    use kourier_model::{HistoryTransfer, HistoryTransferFailure};
+    let account = AccountId(1);
+    let (mut src, sent) = opened(&store(3));
+    assert_eq!(src.chat(CONV).expect("header").still_filling, "");
+    let progress = |has_more| UiEvent::HistoryProgress {
+        account,
+        conv: CONV,
+        progress: None,
+        has_more,
+    };
+    let ch = src.on_event(&progress(true));
+    assert!(ch.header, "the open chat's menu changes");
+    let why = src.chat(CONV).expect("header").still_filling;
+    assert_eq!(why, "Available once this chat's history has arrived");
+    sent.borrow_mut().clear();
+    assert!(!src.clear_conversation(CONV));
+    assert!(!src.delete_conversation(CONV));
+    assert!(commands(&sent).is_empty(), "nothing sent");
+    // Another chat is not held back.
+    assert!(
+        !src.on_event(&UiEvent::HistoryProgress {
+            account,
+            conv: ConversationId(2),
+            progress: None,
+            has_more: false,
+        })
+        .header
+    );
+    // The last batch: both work again.
+    assert!(src.on_event(&progress(false)).header);
+    assert_eq!(src.chat(CONV).expect("header").still_filling, "");
+    assert!(src.clear_conversation(CONV));
+
+    // While the account's transfer runs, every chat of it waits, and sending stays allowed.
+    let ch = src.on_event(&UiEvent::HistoryTransfer {
+        account,
+        state: HistoryTransfer::Reading,
+    });
+    assert!(ch.header);
+    let header = src.chat(CONV).expect("header");
+    assert!(!header.still_filling.is_empty());
+    assert_eq!(header.cannot_send, "", "a 1:1 chat can be written to");
+    assert!(!src.delete_conversation(CONV));
+    // A failed import leaves its chat as it got it: nothing waits any more.
+    src.on_event(&progress(true));
+    src.on_event(&UiEvent::HistoryTransfer {
+        account,
+        state: HistoryTransfer::Failed(HistoryTransferFailure::Incomplete),
+    });
+    assert_eq!(src.chat(CONV).expect("header").still_filling, "");
+    assert!(src.delete_conversation(CONV));
+
+    // A logout stops the delivery: nothing waits.
+    let (mut src, _) = opened(&store(3));
+    src.on_event(&progress(true));
+    conn(
+        &mut src,
+        ConnState::LoggedOut {
+            reason: "unlinked".into(),
+        },
+    );
+    assert_eq!(src.chat(CONV).expect("header").still_filling, "");
 }

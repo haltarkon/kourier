@@ -27,8 +27,9 @@ use kourier_viewmodel::login::network_choices;
 use kourier_viewmodel::time::{Calendar, FixedOffset};
 use kourier_viewmodel::timeline::{Block, QuoteState};
 use kourier_viewmodel::{
-    Changes, ConversationFilter, CoreSource, CoreSourceConfig, EmptySource, FixtureSource,
-    LoginViewKind, MediaAnswer, NetworkChoice, ReplaceQuestion, RowKind, TransferView, UiSource,
+    AccountAction, Changes, ConversationFilter, CoreSource, CoreSourceConfig, EmptySource,
+    FixtureSource, LoginViewKind, MediaAnswer, NetworkChoice, ReplaceQuestion, RowKind,
+    TransferView, UiSource,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -82,12 +83,10 @@ pub struct AppRust {
     /// there is one (`bannerKind`), as a map; its `phase` is empty when there is none,
     /// `failed` for a failure that waits for the user.
     pub(crate) banner_transfer: QVariant,
-    /// The history transfer the link page shows in place of its "linking" step, as a map;
-    /// its `phase` is empty when there is none.
-    pub(crate) link_transfer: QVariant,
     /// The accounts that offer "Transfer History from Phone…" (`account`, `label`, `about`),
     /// for the settings page.
     pub(crate) history_accounts: QVariant,
+    pub(crate) account_actions: QVariant,
     /// The versions of the message `showRevisions` asked about, newest first.
     pub(crate) revisions: QVariant,
     pub(crate) networks: QVariant,
@@ -116,12 +115,18 @@ pub struct AppRust {
     trace: UiTrace,
     /// What the window last reported: it has the focus, its chat page is on screen.
     presence: (bool, bool),
-    /// What `bannerTransfer` and `linkTransfer` were made from (a property is written only
-    /// when its view changed: a download reports several times a second).
-    shown_transfers: (Option<TransferView>, Option<TransferView>),
+    /// What `bannerTransfer` was made from (a property is written only when its view
+    /// changed: a download reports several times a second).
+    shown_transfer: Option<TransferView>,
     /// What `historyAccounts` was made from: `(account, which account it is)`.
     shown_history: Vec<(i64, String)>,
+    /// What `accountActions` was made from.
+    shown_actions: Vec<ShownActions>,
 }
+
+/// One account of `accountActions`: `(account, which account it is, offers the transfer,
+/// offers "Unlink…")`.
+type ShownActions = (i64, String, bool, bool);
 
 /// Timing marks that end with the frame that shows their rows (`kourier_app::trace`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -327,8 +332,8 @@ impl Default for AppRust {
             banner_action: QString::default(),
             banner_account: 0,
             banner_transfer: transfer_variant(None),
-            link_transfer: transfer_variant(None),
             history_accounts: QVariant::from(&QList::<QVariant>::default()),
+            account_actions: QVariant::from(&QList::<QVariant>::default()),
             revisions: QVariant::from(&QList::<QVariant>::default()),
             networks: QVariant::default(),
             accounts: std::ptr::null_mut(),
@@ -350,8 +355,9 @@ impl Default for AppRust {
             flags_armed: None,
             trace: UiTrace::default(),
             presence: (false, false),
-            shown_transfers: (None, None),
+            shown_transfer: None,
             shown_history: Vec::new(),
+            shown_actions: Vec::new(),
         }
     }
 }
@@ -372,8 +378,6 @@ fn transfer_variant(view: Option<&TransferView>) -> QVariant {
         QString::from("phase"),
         string_variant(view.map_or("", |v| v.phase.as_str())),
     );
-    m.insert(QString::from("title"), text(|v| &v.title));
-    m.insert(QString::from("text"), text(|v| &v.text));
     m.insert(QString::from("status"), text(|v| &v.status));
     m.insert(QString::from("detail"), text(|v| &v.detail));
     m.insert(
@@ -386,8 +390,44 @@ fn transfer_variant(view: Option<&TransferView>) -> QVariant {
     QVariant::from(&m)
 }
 
+/// A question with two answers (`title`, `text`, `confirm`, `cancel`) as QML reads it;
+/// `undefined` without one.
+fn abandon_variant(q: Option<kourier_viewmodel::AbandonQuestion>) -> QVariant {
+    let Some(q) = q else {
+        return QVariant::default();
+    };
+    let mut m = QMap::<QMapPair_QString_QVariant>::default();
+    m.insert(QString::from("title"), string_variant(&q.title));
+    m.insert(QString::from("text"), string_variant(&q.text));
+    m.insert(QString::from("confirm"), string_variant(&q.confirm));
+    m.insert(QString::from("cancel"), string_variant(&q.cancel));
+    QVariant::from(&m)
+}
+
+/// The account action QML names (`"remove"`, `"unlink"`).
+fn account_action(name: &QString) -> Option<AccountAction> {
+    match name.to_string().as_str() {
+        "remove" => Some(AccountAction::Remove),
+        "unlink" => Some(AccountAction::Unlink),
+        _ => None,
+    }
+}
+
+/// The name QML uses for `action`.
+fn account_action_name(action: AccountAction) -> &'static str {
+    match action {
+        AccountAction::Remove => "remove",
+        AccountAction::Unlink => "unlink",
+    }
+}
+
 /// The question before an account is removed and linked again, as QML reads it.
 fn question_variant(q: &ReplaceQuestion) -> QVariant {
+    QVariant::from(&question_variant_map(q))
+}
+
+/// [`question_variant`] as a map, to add to.
+fn question_variant_map(q: &ReplaceQuestion) -> QMap<QMapPair_QString_QVariant> {
     let mut m = QMap::<QMapPair_QString_QVariant>::default();
     m.insert(QString::from("account"), QVariant::from(&q.account.0));
     m.insert(QString::from("title"), string_variant(&q.title));
@@ -399,7 +439,7 @@ fn question_variant(q: &ReplaceQuestion) -> QVariant {
     m.insert(QString::from("paragraphs"), QVariant::from(&paragraphs));
     m.insert(QString::from("confirm"), string_variant(&q.confirm));
     m.insert(QString::from("cancel"), string_variant(&q.cancel));
-    QVariant::from(&m)
+    m
 }
 
 /// The scripted session a measuring build was started with (always empty otherwise).
@@ -562,10 +602,23 @@ fn choices(app: &AppHandle) -> Vec<NetworkChoice> {
     out
 }
 
+/// Whether a debug run asked for the fixture's UI clock to run (`KOURIER_DEV_FIXTURE_CLOCK=run`).
+fn fixture_clock_runs() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("KOURIER_DEV_FIXTURE_CLOCK").is_some_and(|v| v == "run")
+}
+
 fn core_source(ctx: &UiContext) -> CoreSource {
     let handle = ctx.app.clone();
     let fixture = handle.fixture();
     let now: Box<dyn Fn() -> i64> = match fixture {
+        // Debug builds: `KOURIER_DEV_FIXTURE_CLOCK=run` lets the UI's "now" run with the
+        // core's fixture clock, so what counts time (the line under a message on its way,
+        // link feedback L6) can be looked at in fixture mode.
+        Some(_) if fixture_clock_runs() => {
+            let core = handle.clone();
+            Box::new(move || core.core_now_ms())
+        }
         Some(f) => Box::new(move || f.now_ms),
         None => Box::new(system_now_ms),
     };
@@ -631,7 +684,14 @@ fn spawn_pump(app: &AppHandle, queue: Arc<PumpQueue>, thread: CxxQtThread<qobjec
                     Err(RecvError::Closed) => break,
                 },
             };
-            if queue.push(item) && thread.queue(|app| app.drain_events()).is_err() {
+            let post = queue.push(item);
+            // (A test slows the Qt side down: the event is in the queue and the drain comes
+            // late, which `PumpQueue::len` counts.)
+            let delay = crate::pump::test_delay();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if post && thread.queue(|app| app.drain_events()).is_err() {
                 // `App` is gone (the engine was destroyed).
                 break;
             }
@@ -758,7 +818,7 @@ impl cxx_qt::Initialize for qobject::App {
             // windows) a chat, whose composer says when the account cannot send.
             Some(
                 "chat" | "history" | "reactions" | "offline" | "loggedout" | "challenge" | "clock"
-                | "clearchat" | "transferbanner" | "transferfailed",
+                | "clearchat" | "transferbanner" | "transferfailed" | "transferupdate",
             ) => {
                 if let Some(id) = demo {
                     self.as_mut().open_conversation(id.0);
@@ -791,6 +851,11 @@ impl cxx_qt::Initialize for qobject::App {
             }
             Some("calls") => {
                 if let Some(id) = fixture.and_then(|f| f.calls_conversation) {
+                    self.as_mut().open_conversation(id.0);
+                }
+            }
+            Some("unavailable") => {
+                if let Some(id) = fixture.and_then(|f| f.unavailable_conversation) {
                     self.as_mut().open_conversation(id.0);
                 }
             }
@@ -843,6 +908,7 @@ impl qobject::App {
             self.as_mut().set_has_accounts(has);
         }
         self.as_mut().refresh_history_accounts();
+        self.as_mut().refresh_account_actions();
         self.as_mut().refresh_banner();
         // The title of a selected account follows its name.
         if *self.current_account() >= 0 {
@@ -886,10 +952,10 @@ impl qobject::App {
             Some(b) => (b.kind.as_str(), b.text, b.action, b.account.0, b.url),
             None => ("", String::new(), String::new(), 0, String::new()),
         };
-        if self.shown_transfers.0 != transfer {
+        if self.shown_transfer != transfer {
             self.as_mut()
                 .set_banner_transfer(transfer_variant(transfer.as_ref()));
-            self.as_mut().rust_mut().shown_transfers.0 = transfer;
+            self.as_mut().rust_mut().shown_transfer = transfer;
         }
         if *self.banner_text() != QString::from(text.as_str()) {
             self.as_mut().set_banner_text(QString::from(text.as_str()));
@@ -921,8 +987,10 @@ impl qobject::App {
             .filter(|a| a.offers_history)
             // The same line the question shows for the account.
             .map(|a| {
-                let about =
-                    kourier_viewmodel::transfer::account_line(&a.name, &a.number, &a.network_name);
+                let about = kourier_viewmodel::transfer::with_device(
+                    &kourier_viewmodel::transfer::account_line(&a.name, &a.number, &a.network_name),
+                    &a.device,
+                );
                 (a.id.0, about)
             })
             .collect();
@@ -942,19 +1010,57 @@ impl qobject::App {
         self.as_mut().set_history_accounts(QVariant::from(&list));
     }
 
-    /// The history transfer of an account changed: the link page's view of it, the banner,
-    /// which accounts offer a transfer, and what is said once about an end.
+    /// Every account with what Settings → "Accounts" offers for it: a map of `account`,
+    /// `about` (which account it is), `transfer` and `unlink` (whether "Transfer History from
+    /// Phone…" and "Unlink…" are offered; "Remove Account…" always is) and the three labels
+    /// `transferLabel`, `removeLabel`, `unlinkLabel`.
+    fn refresh_account_actions(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let rows: Vec<ShownActions> = shared
+            .borrow()
+            .source
+            .accounts()
+            .into_iter()
+            .map(|a| {
+                let about = kourier_viewmodel::transfer::with_device(
+                    &kourier_viewmodel::transfer::account_line(&a.name, &a.number, &a.network_name),
+                    &a.device,
+                );
+                (a.id.0, about, a.offers_history, a.offers_unlink)
+            })
+            .collect();
+        if self.shown_actions == rows {
+            return;
+        }
+        let transfer = kourier_viewmodel::transfer::transfer_action_label();
+        let remove = kourier_viewmodel::account_actions::remove_action_label();
+        let unlink = kourier_viewmodel::account_actions::unlink_action_label();
+        let mut list = QList::<QVariant>::default();
+        for (account, about, offers_history, offers_unlink) in &rows {
+            let mut m = QMap::<QMapPair_QString_QVariant>::default();
+            m.insert(QString::from("account"), QVariant::from(account));
+            m.insert(QString::from("about"), string_variant(about));
+            m.insert(QString::from("transfer"), QVariant::from(offers_history));
+            m.insert(QString::from("unlink"), QVariant::from(offers_unlink));
+            m.insert(QString::from("transferLabel"), string_variant(&transfer));
+            m.insert(QString::from("removeLabel"), string_variant(&remove));
+            m.insert(QString::from("unlinkLabel"), string_variant(&unlink));
+            list.append(QVariant::from(&m));
+        }
+        self.as_mut().rust_mut().shown_actions = rows;
+        self.as_mut().set_account_actions(QVariant::from(&list));
+    }
+
+    /// The history transfer of an account changed: the banner, which accounts offer a
+    /// transfer, and what is said once about an end.
     fn refresh_transfer(mut self: Pin<&mut Self>) {
         let Some(shared) = self.shared.clone() else {
             return;
         };
-        let link = shared.borrow().source.link_transfer();
-        if self.shown_transfers.1 != link {
-            self.as_mut()
-                .set_link_transfer(transfer_variant(link.as_ref()));
-            self.as_mut().rust_mut().shown_transfers.1 = link;
-        }
         self.as_mut().refresh_history_accounts();
+        self.as_mut().refresh_account_actions();
         self.as_mut().refresh_banner();
         let notices = shared.borrow_mut().source.take_transfer_notices();
         for text in notices {
@@ -1076,6 +1182,33 @@ impl qobject::App {
         self.timeline_rows_changed();
     }
 
+    /// The per-second tick of the lines under the messages on their way: only those rows
+    /// change (their `wait` and `waitTimer` roles), the timeline is not built again.
+    fn refresh_waits(self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let Some(mut timeline) = pinned(self.timeline) else {
+            return;
+        };
+        let id = ConversationId(*timeline.conversation_id());
+        let lines = shared.borrow().source.wait_lines(id);
+        for (message, line) in lines {
+            let Some(at) = timeline
+                .row_of(message)
+                .and_then(|i| usize::try_from(i).ok())
+            else {
+                continue;
+            };
+            let Some(mut row) = timeline.rows().get(at).cloned() else {
+                continue;
+            };
+            row.wait = line.reason;
+            row.wait_timer = line.timer;
+            models::patch_row(timeline.as_mut(), at, row);
+        }
+    }
+
     fn refresh_paging(self: Pin<&mut Self>) {
         let Some(shared) = self.shared.clone() else {
             return;
@@ -1142,6 +1275,9 @@ impl qobject::App {
             self.as_mut().refresh_timeline(false);
         } else {
             self.as_mut().refresh_paging();
+            if ch.waits {
+                self.as_mut().refresh_waits();
+            }
         }
         if ch.login {
             self.as_mut().show_login();
@@ -1149,6 +1285,16 @@ impl qobject::App {
         if ch.transfer || ch.login {
             // (A login step can end what the link page shows of a transfer.)
             self.as_mut().refresh_transfer();
+        }
+        if ch.account_notice {
+            let notices = shared.borrow_mut().source.take_logout_notices();
+            for n in notices {
+                self.as_mut().logout_notice(
+                    QString::from(n.text.as_str()),
+                    QString::from(n.on_phone.as_str()),
+                    QString::from(n.title.as_str()),
+                );
+            }
         }
         if ch.notice {
             let notice = shared.borrow().source.notice();
@@ -1799,18 +1945,21 @@ impl qobject::App {
         if conv == 0 {
             return;
         }
-        // What waited in its composer goes with the chat.
-        if let Some(c) = pinned(self.composer) {
-            c.forget_conversation(conv);
-        }
+        let mut accepted = false;
         self.as_mut().with_source(|s| {
-            s.delete_conversation(ConversationId(conv));
+            accepted = s.delete_conversation(ConversationId(conv));
             Changes {
                 // (The list no longer shows its draft.)
                 conversations: true,
                 ..Self::notice_changed()
             }
         });
+        // What waited in its composer goes with the chat, but only once the delete was
+        // accepted: a refused one (the chat fills, a transfer runs) leaves the chat and
+        // everything the user put into its composer where it was.
+        if accepted && let Some(c) = pinned(self.composer) {
+            c.forget_conversation(conv);
+        }
     }
 
     /// Marks `conversation` read up to its newest message (any chat, focused or not).
@@ -1967,10 +2116,78 @@ impl qobject::App {
         }
     }
 
+    /// The question before an action that would cancel the link in progress, or an invalid
+    /// value (`undefined` in QML) when nothing would be lost.
+    pub fn abandon_question(&self) -> QVariant {
+        abandon_variant(
+            self.shared
+                .clone()
+                .and_then(|shared| shared.borrow().source.abandon_question()),
+        )
+    }
+
+    /// The question before the application quits; `undefined` when nothing runs, and while the
+    /// desktop session ends: the work goes on at the next start, and a question would hold
+    /// the logout.
+    pub fn quit_question(&self) -> QVariant {
+        if crate::bridge::qobject::session_ending() {
+            return abandon_variant(None);
+        }
+        abandon_variant(
+            self.shared
+                .clone()
+                .and_then(|shared| shared.borrow().source.quit_question()),
+        )
+    }
+
     /// The question was closed without confirming.
     pub fn cancel_replace(self: Pin<&mut Self>) {
         if let Some(shared) = self.shared.clone() {
             shared.borrow_mut().source.cancel_replace();
+        }
+    }
+
+    /// Asks for the question before "Remove Account…" or "Unlink…" of `account`.
+    pub fn ask_account_action(self: Pin<&mut Self>, account: i64, action: &QString) {
+        let Some(action) = account_action(action) else {
+            return;
+        };
+        let question = self.shared.clone().and_then(|shared| {
+            shared
+                .borrow_mut()
+                .source
+                .ask_account_action(AccountId(account), action)
+        });
+        if let Some(q) = question {
+            let mut m = question_variant_map(&q);
+            m.insert(
+                QString::from("action"),
+                QVariant::from(&QString::from(account_action_name(action))),
+            );
+            self.account_action_asked(QVariant::from(&m));
+        }
+    }
+
+    /// The user confirmed the question about `account` and `action`.
+    pub fn confirm_account_action(self: Pin<&mut Self>, account: i64, action: &QString) {
+        let (Some(shared), Some(action)) = (self.shared.clone(), account_action(action)) else {
+            return;
+        };
+        let sent = shared
+            .borrow_mut()
+            .source
+            .confirm_account_action(AccountId(account), action);
+        if !sent {
+            // No open question (a second activation), or the account went away or can no
+            // longer do it: nothing was sent.
+            tracing::debug!(?action, "no account action sent");
+        }
+    }
+
+    /// The question about an account action was closed without confirming.
+    pub fn cancel_account_action(self: Pin<&mut Self>) {
+        if let Some(shared) = self.shared.clone() {
+            shared.borrow_mut().source.cancel_account_action();
         }
     }
 
@@ -2361,6 +2578,99 @@ impl qobject::App {
         }
         println!("shot: {path} luma={luma}");
         true
+    }
+
+    /// What still keeps a screenshot of `window` from being final (empty: nothing).
+    ///
+    /// # Safety
+    ///
+    /// `window` must be null or a live `QObject`.
+    pub unsafe fn screenshot_holds(&self, window: *mut QObject) -> QString {
+        // SAFETY: forwarded caller contract.
+        let images = unsafe { qobject::images_loading(window) }.max(0);
+        let requests = qobject::pending_image_requests().max(0);
+        // Thumbnails the core derives change the URLs of the pictures that are on screen: a
+        // window that shows none does not wait for them (the count is the process's, so a
+        // derive of another chat still holds a window with a picture).
+        // SAFETY: forwarded caller contract.
+        let derive = if unsafe { qobject::attachment_pictures(window) } > 0 {
+            self.app.as_ref().map_or(0, |a| a.media().deriving())
+        } else {
+            0
+        };
+        // What the core has said and the models have not shown yet: events sent and not read
+        // by the pump, events in its queue, and the reads of the models that wait for the
+        // core (`MediaHandles::deriving` is 0 as soon as the core has published; the new URLs
+        // are on screen only after these).
+        let events = self.app.as_ref().map_or(0, AppHandle::events_unseen)
+            + self.pump.as_ref().map_or(0, |p| p.len());
+        let queries = self
+            .shared
+            .as_ref()
+            .map_or(0, |s| s.borrow().source.queries_in_flight());
+        let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let reasons: Vec<String> = [
+            ("images", i64::from(images)),
+            ("requests", i64::from(requests)),
+        ]
+        .into_iter()
+        .chain([
+            ("derive", count(derive)),
+            ("events", count(events)),
+            ("queries", count(queries)),
+        ])
+        .filter(|(_, n)| *n > 0)
+        .map(|(what, n)| format!("{what} {n}"))
+        .collect();
+        QString::from(reasons.join(", "))
+    }
+
+    /// Saves a screenshot of `window` to `path` once two frames in a row are equal; prints
+    /// `shot: <path> luma=<0-255> settle_ms=<n>` to stdout for `cargo xtask shots`. -2: the
+    /// frame differs from the previous call's; -1: failed.
+    ///
+    /// # Safety
+    ///
+    /// `window` must be null or a live `QObject`.
+    pub unsafe fn save_screenshot_if_stable(
+        self: Pin<&mut Self>,
+        window: *mut QObject,
+        path: &QString,
+        settle_ms: i32,
+    ) -> i32 {
+        // SAFETY: forwarded caller contract.
+        let luma = unsafe { qobject::grab_if_stable(window, path) };
+        if luma == -1 {
+            tracing::error!("screenshot failed");
+        } else if luma >= 0 {
+            println!("shot: {path} luma={luma} settle_ms={settle_ms}");
+        }
+        luma
+    }
+
+    /// Saves the frame of `window` as it is (the screenshot did not settle) and says so on
+    /// stderr: `shot: unsettled <holds>`.
+    ///
+    /// # Safety
+    ///
+    /// `window` must be null or a live `QObject`.
+    pub unsafe fn save_unsettled_screenshot(
+        self: Pin<&mut Self>,
+        window: *mut QObject,
+        path: &QString,
+        holds: &QString,
+        settle_ms: i32,
+    ) -> i32 {
+        // SAFETY: forwarded caller contract.
+        let luma = unsafe { qobject::grab_window_to_file(window, path) };
+        if luma < 0 {
+            tracing::error!("screenshot failed");
+            return luma;
+        }
+        println!("shot: {path} luma={luma} settle_ms={settle_ms}");
+        // (Not `tracing`/`console.warn`: a line with a QML file counts as a QML problem.)
+        eprintln!("shot: unsettled {holds}");
+        luma
     }
 }
 

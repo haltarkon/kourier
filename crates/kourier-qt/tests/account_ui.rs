@@ -6,6 +6,8 @@
 //! lifts the challenge. Each state runs in a process of its own (one Qt application per
 //! process): the test binary starts itself once per state. Offscreen, `harness = false`.
 
+mod support;
+
 use std::process::Command;
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -244,6 +246,7 @@ fn run(state: &str) -> i32 {
 }
 
 fn main() {
+    support::answer_list("account_ui");
     // Never on the user's desktop, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

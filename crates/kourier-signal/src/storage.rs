@@ -54,9 +54,7 @@ use crate::jobs::{self, Done, JobKind};
 use crate::net::{ChatRequest, HttpsHost, HttpsRequest, SignalTransport, parse_json};
 use crate::outbox::append_events;
 use crate::proto::{self, manifest_record::identifier::Type as ItemType, storage_record::Record};
-use crate::service_id::{
-    aci_user_id, e164_user_id, service_id_from_wire, service_id_user_id, validate_e164,
-};
+use crate::service_id::{aci_user_id, service_id_from_wire, service_id_user_id, validate_e164};
 use crate::{db, features, peers};
 
 /// After a merge zone committed, before the next one (the kill test of §10.4).
@@ -535,8 +533,13 @@ struct Merge<'a> {
     outcome: ZoneOutcome,
 }
 
-/// The stored record of `peer` other than `key` (the previous version of a changed record).
-fn previous_contact(conn: &Connection, peer: &str, key: &[u8]) -> Result<proto::ContactRecord> {
+/// The stored record of `peer` other than `key` (the previous version of a changed record);
+/// `None` when there is none.
+fn previous_contact(
+    conn: &Connection,
+    peer: &str,
+    key: &[u8],
+) -> Result<Option<proto::ContactRecord>> {
     let raw: Option<Vec<u8>> = conn
         .prepare_cached(
             "SELECT record FROM storage_records WHERE peer = ?1 AND key != ?2
@@ -549,8 +552,7 @@ fn previous_contact(conn: &Connection, peer: &str, key: &[u8]) -> Result<proto::
         .and_then(|record| match record.record {
             Some(Record::Contact(contact)) => Some(contact),
             _ => None,
-        })
-        .unwrap_or_default())
+        }))
 }
 
 /// Whether address-book photos win over profile pictures (`AccountRecord.preferContactAvatars`,
@@ -572,8 +574,8 @@ pub(crate) fn prefer_contact_avatars(conn: &Connection) -> Result<bool> {
         }))
 }
 
-/// The stored account record other than `key`.
-fn previous_account(conn: &Connection, key: &[u8]) -> Result<proto::AccountRecord> {
+/// The stored account record other than `key`; `None` when there is none.
+fn previous_account(conn: &Connection, key: &[u8]) -> Result<Option<proto::AccountRecord>> {
     let raw: Option<Vec<u8>> = conn
         .prepare_cached(
             "SELECT record FROM storage_records WHERE kind = ?1 AND key != ?2
@@ -586,8 +588,7 @@ fn previous_account(conn: &Connection, key: &[u8]) -> Result<proto::AccountRecor
         .and_then(|record| match record.record {
             Some(Record::Account(account)) => Some(account),
             _ => None,
-        })
-        .unwrap_or_default())
+        }))
 }
 
 /// A UUID from its binary (16 bytes, preferred) or string form; `PNI:` prefixes are accepted.
@@ -637,8 +638,10 @@ fn diff_patch<T: PartialEq + Clone>(new: Option<T>, old: Option<T>) -> Patch<T> 
     }
 }
 
-/// `mutedUntilTimestamp` as a column value.
-fn muted_until(ts: u64) -> Option<i64> {
+/// `mutedUntilTimestamp` as a column value: 0 is none, `i64::MAX` and more is for ever. The
+/// history import converts a chat frame's `muteUntilMs` through this too (on the `u64`,
+/// before any cast), so that the sync that follows the import sees no change that is none.
+pub(crate) fn muted_until(ts: u64) -> Option<i64> {
     (ts > 0).then(|| i64::try_from(ts).unwrap_or(i64::MAX))
 }
 
@@ -669,6 +672,8 @@ fn merge_contact(
     };
     let e164 = Some(record.e164.as_str()).filter(|n| validate_e164(n).is_ok());
     let prev = previous_contact(tx, &sid, key)?;
+    let first_record = prev.is_none();
+    let prev = prev.unwrap_or_default();
     let prev_e164 = Some(prev.e164.as_str()).filter(|n| !n.is_empty());
 
     // Records that join ACI, PNI and number (Desktop's `maybeMergeContacts`, §3.3).
@@ -680,13 +685,15 @@ fn merge_contact(
         {
             merge.events.push(event);
         }
+        // The number's pair too, told once (`number_links`): a record that comes back (removed
+        // and added, or every record after `reset`) must not make the core merge it again. A
+        // record whose number the previous one already stated was told before the pairs were
+        // remembered (backend.db before schema 21): it is recorded and not told again.
         if let Some(number) = e164
+            && let Some(event) = crate::links::learn_number(tx, merge.account, number, aci, now)?
             && prev_e164 != Some(number)
-            && let (Ok(from), Ok(into)) = (e164_user_id(number), aci_user_id(aci))
         {
-            merge
-                .events
-                .push(BackendEvent::IdentityMerged { from, into });
+            merge.events.push(event);
         }
     }
 
@@ -747,11 +754,18 @@ fn merge_contact(
     merge.events.push(BackendEvent::ContactUpsert(patch));
 
     // The 1:1 chat: only for roaming changes, or a changed accepted state of a chat the core has.
+    // The FIRST record of a contact whose chat the core has (a history import made it, D10)
+    // states the flags whatever they are: the sync wins over the archive, also where the
+    // archive said true and the record says false. For a first record of a contact the core
+    // has NO chat for, the flags are stated only when one differs from the default, as
+    // before: a `ConversationUpsert` makes the conversation, so stating them for every
+    // contact of the Storage Service (most are people with no chat) would make a chat of each.
     let muted = muted_until(record.muted_until_timestamp);
     let roaming_changed = record.archived != prev.archived
         || record.marked_unread != prev.marked_unread
         || muted != muted_until(prev.muted_until_timestamp)
-        || record.blocked != prev.blocked;
+        || record.blocked != prev.blocked
+        || (first_record && after.features_hash.is_some());
     let accepted_changed = before.accepted() != after.accepted() && after.features_hash.is_some();
     if roaming_changed || accepted_changed {
         let mut conv = ConversationPatch::new(ConvKey::Direct(user));
@@ -898,10 +912,11 @@ fn merge_account(
     record: &proto::AccountRecord,
 ) -> Result<()> {
     use proto::account_record::PhoneNumberSharingMode;
-    use proto::account_record::pinned_conversation::Identifier as Pin;
 
     let account = merge.account;
     let prev = previous_account(tx, key)?;
+    let first_record = prev.is_none();
+    let prev = prev.unwrap_or_default();
     if record.profile_key.len() == 32 && record.profile_key[..] != account.profile_key[..] {
         tx.execute(
             "UPDATE account SET profile_key = ?1 WHERE id = 1",
@@ -972,9 +987,14 @@ fn merge_account(
         }
     }
 
-    // Note to Self.
+    // Note to Self. The first account record states its flags when the core has the chat (a
+    // history import made it): the sync wins over the archive (D10), as for a contact. When
+    // the core has no such chat the flags are not sent for nothing: an upsert makes the chat
+    // (the same reason as for a contact, where every Storage contact would become a chat).
+    let own_sid = ServiceId::from(account.aci).service_id_string();
     if record.note_to_self_archived != prev.note_to_self_archived
         || record.note_to_self_marked_unread != prev.note_to_self_marked_unread
+        || (first_record && peers::load(tx, &own_sid)?.features_hash.is_some())
     {
         let mut conv = ConversationPatch::new(ConvKey::Direct(own.clone()));
         conv.archived = Some(record.note_to_self_archived);
@@ -982,35 +1002,118 @@ fn merge_account(
         merge.events.push(BackendEvent::ConversationUpsert(conv));
     }
 
-    // Pins: 1:1 chats by service id. Group pins wait for S10 (the core must not get title-less
-    // groups); number-only pins name no account.
-    let mut pinned: Vec<ConvKey> = Vec::new();
+    // Pins, the record's order across kinds (`pinned_chats`). A 1:1 chat is made first with a
+    // bare upsert, so that it exists with its features (`with_features`).
+    let pinned = pinned_chats(tx, record)?;
+    for pin in pinned.iter().filter(|pin| pin.contact) {
+        merge
+            .events
+            .push(BackendEvent::ConversationUpsert(ConversationPatch::new(
+                pin.conv.clone(),
+            )));
+    }
+    merge.events.push(BackendEvent::PinnedConversations(
+        pinned.into_iter().map(|pin| pin.conv).collect(),
+    ));
+    Ok(())
+}
+
+/// A chat an account record pins.
+struct Pinned {
+    conv: ConvKey,
+    /// A 1:1 chat (a group is named only when the core has it already).
+    contact: bool,
+}
+
+/// The chats an account record pins, in the record's order across kinds, each once: 1:1
+/// chats by service id, groups by master key. The core makes a chat of every key the list
+/// names, so a group is named only when the core has it (its features were sent:
+/// `groups.features_hash`); a group it does not have would be a bare chat without a title or
+/// members. A person known only by a number is left out (no account to name; such a chat is
+/// read-only). The one place that reads a pin list: the sync that merges the record
+/// ([`merge_account`]) and the first fetch of a group the record pins
+/// ([`pins_with_new_group`]).
+fn pinned_chats(conn: &Connection, record: &proto::AccountRecord) -> Result<Vec<Pinned>> {
+    use proto::account_record::pinned_conversation::Identifier as Pin;
+
+    let mut pinned: Vec<Pinned> = Vec::new();
     for pin in &record.pinned_conversations {
-        let Some(Pin::Contact(contact)) = &pin.identifier else {
-            continue;
+        let (conv, contact) = match &pin.identifier {
+            Some(Pin::Contact(contact)) => {
+                let service_id = service_id_from_wire(
+                    Some(contact.service_id_binary.as_slice()),
+                    Some(contact.service_id.as_str()),
+                )
+                .ok()
+                .flatten();
+                let Some(user) = service_id.and_then(|s| service_id_user_id(s).ok()) else {
+                    continue;
+                };
+                (ConvKey::Direct(user), true)
+            }
+            Some(Pin::GroupMasterKey(master)) => {
+                let Some(keys) = crate::groups::GroupKeys::from_slice(master) else {
+                    continue;
+                };
+                let in_core = crate::groups::load_by_master(conn, &keys.master)?
+                    .is_some_and(|row| row.features_hash.is_some());
+                if !in_core {
+                    continue;
+                }
+                (keys.conv_key(), false)
+            }
+            _ => continue,
         };
-        let service_id = service_id_from_wire(
-            Some(contact.service_id_binary.as_slice()),
-            Some(contact.service_id.as_str()),
-        )
-        .ok()
-        .flatten();
-        let Some(user) = service_id.and_then(|s| service_id_user_id(s).ok()) else {
-            continue;
-        };
-        let conv = ConvKey::Direct(user);
-        if !pinned.contains(&conv) {
-            // A bare upsert first, so the chat exists with its features (`with_features`).
-            merge
-                .events
-                .push(BackendEvent::ConversationUpsert(ConversationPatch::new(
-                    conv.clone(),
-                )));
-            pinned.push(conv);
+        if !pinned.iter().any(|pin| pin.conv == conv) {
+            pinned.push(Pinned { conv, contact });
         }
     }
-    merge.events.push(BackendEvent::PinnedConversations(pinned));
-    Ok(())
+    Ok(pinned)
+}
+
+/// The pin list for a group whose first fetch has just given the core its features
+/// (`groups::apply`, in that zone): when the stored account record pins the group, the whole
+/// list again, `None` otherwise. On a fresh link the first sync merges the account record
+/// before any group is fetched, so it had to leave the group out; the phone does not write
+/// its account record again for days, and nothing else would pin the group. The list is the
+/// record's, in its order, and names only chats the core has (a 1:1 chat that the first
+/// sync made, a group fetched before): it is the list the sync would send now, so it agrees
+/// with the sync's and with the history import's (the phone's order). The core's pin list
+/// is a full, idempotent list.
+pub(crate) fn pins_with_new_group(
+    conn: &Connection,
+    group: &crate::groups::GroupKeys,
+) -> Result<Option<BackendEvent>> {
+    let raw: Option<Vec<u8>> = conn
+        .prepare_cached(
+            "SELECT record FROM storage_records WHERE kind = ?1 ORDER BY updated_at DESC, rowid DESC
+             LIMIT 1",
+        )?
+        .query_row([ItemType::Account as i32], |r| r.get(0))
+        .optional()?;
+    let Some(Record::Account(record)) = raw
+        .and_then(|raw| proto::StorageRecord::decode(&raw[..]).ok())
+        .and_then(|record| record.record)
+    else {
+        return Ok(None);
+    };
+    let pinned = pinned_chats(conn, &record)?;
+    let group = group.conv_key();
+    if !pinned.iter().any(|pin| pin.conv == group) {
+        return Ok(None);
+    }
+    let mut list = Vec::with_capacity(pinned.len());
+    for pin in pinned {
+        // A 1:1 chat the core does not have is not named (nothing makes it here).
+        if pin.contact
+            && let ConvKey::Direct(user) = &pin.conv
+            && features::core_has_direct(conn, user)? != Some(true)
+        {
+            continue;
+        }
+        list.push(pin.conv);
+    }
+    Ok(Some(BackendEvent::PinnedConversations(list)))
 }
 
 /// `SyncMessage.Keys` from our phone (`SD/ts/textsecure/MessageReceiver.preload.ts`

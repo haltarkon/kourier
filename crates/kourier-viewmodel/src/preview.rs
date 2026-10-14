@@ -486,6 +486,16 @@ pub fn system_text(event: &SystemEvent, names: &dyn Names) -> String {
             "You added %1",
             &[&list(users, names)],
         ),
+        // Somebody joined of their own accord (a link, an accepted invitation): the notice
+        // names them as the one who added themselves, and "Ada added Ada" is no sentence.
+        SystemEvent::MembersAdded {
+            by: Some(by),
+            users,
+        } if matches!(users.as_slice(), [only] if only == by) => trfc(
+            "@info:status chat notice, %1 who joined",
+            "%1 joined the group",
+            &[&names.display_name(by)],
+        ),
         SystemEvent::MembersAdded {
             by: Some(by),
             users,
@@ -511,6 +521,20 @@ pub fn system_text(event: &SystemEvent, names: &dyn Names) -> String {
             "@info:status chat notice, %1 a name",
             "%1 left the group",
             &[&names.display_name(user)],
+        ),
+        // The name was taken away: "changed the group name to “”" says nothing.
+        SystemEvent::TitleChanged { by: None, title } if title.trim().is_empty() => trc(
+            "@info:status chat notice, the user did it",
+            "You removed the group name",
+        )
+        .into_owned(),
+        SystemEvent::TitleChanged {
+            by: Some(by),
+            title,
+        } if title.trim().is_empty() => trfc(
+            "@info:status chat notice, %1 who",
+            "%1 removed the group name",
+            &[&names.display_name(by)],
         ),
         SystemEvent::TitleChanged { by: None, title } => trfc(
             "@info:status chat notice, the user did it, %1 the new name of the group",
@@ -889,6 +913,60 @@ mod tests {
         assert_eq!(
             body_summary(&media(vec![file], None), &n),
             Summary::new("report.pdf", "mail-attachment")
+        );
+    }
+
+    /// A person who joined by themselves reads as "joined the group", not "Ada added Ada"
+    /// (the live notice and the history import both say `MembersAdded { by: x, users: [x] }`),
+    /// and a name that was taken away reads as that, not as a change to an empty name.
+    #[test]
+    fn a_join_and_a_removed_name_read_as_sentences() {
+        let (n, a, b) = names();
+        let added = |by: Option<&UserId>, users: Vec<UserId>| SystemEvent::MembersAdded {
+            by: by.cloned(),
+            users,
+        };
+        assert_eq!(
+            system_text(&added(Some(&a), vec![a.clone()]), &n),
+            "Olena joined the group"
+        );
+        // Anything else keeps the sentence with two names.
+        assert_eq!(
+            system_text(&added(Some(&a), vec![b.clone()]), &n),
+            "Olena added Taras"
+        );
+        assert_eq!(
+            system_text(&added(Some(&a), vec![a.clone(), b.clone()]), &n),
+            "Olena added Olena and Taras"
+        );
+        assert_eq!(
+            system_text(&added(None, vec![a.clone()]), &n),
+            "You added Olena"
+        );
+        let renamed = |by: Option<&UserId>, title: &str| SystemEvent::TitleChanged {
+            by: by.cloned(),
+            title: title.to_owned(),
+        };
+        assert_eq!(
+            system_text(&renamed(None, ""), &n),
+            "You removed the group name"
+        );
+        assert_eq!(
+            system_text(&renamed(Some(&b), ""), &n),
+            "Taras removed the group name"
+        );
+        assert_eq!(
+            system_text(&renamed(Some(&b), " \n "), &n),
+            "Taras removed the group name"
+        );
+        assert_eq!(
+            system_text(&renamed(Some(&b), "FPV"), &n),
+            "Taras changed the group name to “FPV”"
+        );
+        // The list's preview says the same.
+        assert_eq!(
+            body_summary(&Body::System(renamed(Some(&b), "")), &n).text,
+            "Taras removed the group name"
         );
     }
 

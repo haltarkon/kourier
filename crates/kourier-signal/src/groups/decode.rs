@@ -73,11 +73,28 @@ fn profile_key(keys: &GroupKeys, ciphertext: &[u8], aci: Aci) -> Option<[u8; 32]
         .map(|key| key.get_bytes())
 }
 
-/// The title of an encrypted title blob ("" when it does not decrypt).
+/// The title of an encrypted title blob in a group state ("" when there is none, or when it
+/// does not decrypt: the state then has no name to show). A title CHANGE does not read it this
+/// way: see [`changed_title`].
 pub(crate) fn title(keys: &GroupKeys, ciphertext: &[u8]) -> String {
     match attribute(keys, ciphertext) {
         Some(Blob::Title(title)) => title,
         _ => String::new(),
+    }
+}
+
+/// The new title of a `modifyTitle` action, as Desktop reads it (`decryptGroupChange`): an
+/// action without a blob, or with a blob of an empty title, removed the name (`Some("")`); a
+/// blob that is there and does not decrypt, belongs to another group or is no title says
+/// nothing about the name, and the action is skipped (`None`), like a member whose id does not
+/// decrypt: "removed the group name" for it would be false.
+fn changed_title(keys: &GroupKeys, ciphertext: &[u8]) -> Option<String> {
+    if ciphertext.is_empty() {
+        return Some(String::new());
+    }
+    match attribute(keys, ciphertext)? {
+        Blob::Title(title) => Some(title),
+        _ => None,
     }
 }
 
@@ -231,7 +248,11 @@ pub(crate) fn actions(
             users: added,
         });
     }
-    // Invitations accepted: the invitee added themselves.
+    // Invitations accepted, and people who held an invitation promoted. The history import
+    // makes the same notices for the same changes (`transfer::map`, Android's converter
+    // writes them so): our own acceptance is a join of ours; a member who accepted is
+    // "X joined" (`by` is X); and a member whom somebody ELSE promoted (an admin adding a
+    // person who held an invitation) was added by that editor, not by themselves.
     let accepted = users(
         keys,
         actions
@@ -246,15 +267,19 @@ pub(crate) fn actions(
             ),
     );
     for user in accepted {
-        let by_user = if source_user.as_ref() == Some(&user) {
-            by.clone()
+        if source_user.as_ref() != Some(&user) {
+            events.push(SystemEvent::MembersAdded {
+                by: by.clone(),
+                users: vec![user],
+            });
+        } else if source == ServiceId::from(own) {
+            events.push(SystemEvent::Joined);
         } else {
-            Some(user.clone())
-        };
-        events.push(SystemEvent::MembersAdded {
-            by: by_user,
-            users: vec![user],
-        });
+            events.push(SystemEvent::MembersAdded {
+                by: Some(user.clone()),
+                users: vec![user],
+            });
+        }
     }
     let removed = users(
         keys,
@@ -275,10 +300,12 @@ pub(crate) fn actions(
             users: removed,
         });
     }
-    if let Some(modify) = &actions.modify_title {
+    if let Some(modify) = &actions.modify_title
+        && let Some(title) = changed_title(keys, &modify.title)
+    {
         events.push(SystemEvent::TitleChanged {
             by: by.clone(),
-            title: title(keys, &modify.title),
+            title,
         });
     }
     if actions.modify_avatar.is_some() {

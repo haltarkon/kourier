@@ -132,6 +132,24 @@ fn all_events() -> Vec<BackendEvent> {
             net_ids: Redacted::new(vec!["uuid:1".into(), "digest:2".into()]),
             at: 1_700_000_000_200,
         },
+        AttachmentRestore => BackendEvent::AttachmentRestore {
+            target: target(),
+            update: RestoreUpdate::Answer {
+                attachments: vec![
+                    RestoreSlot::File {
+                        remote: BackendBlob { v: 2, bytes: vec![1, 2] },
+                        net_ids: Redacted::new(vec!["uuid:1".into()]),
+                        size: 9,
+                    },
+                    RestoreSlot::Pending,
+                    RestoreSlot::Gone,
+                    RestoreSlot::Skip,
+                ],
+                long_text: Some(RestoreSlot::Pending),
+            },
+            at: 1_700_000_000_300,
+            cmd: None,
+        },
         Message => BackendEvent::Message(message("2")),
         HistoryBatch => BackendEvent::HistoryBatch {
             conv: group(),
@@ -187,10 +205,15 @@ fn all_events() -> Vec<BackendEvent> {
             request: None,
             result: Err(BackendError::new(ErrorKind::Expired, "gone from CDN")),
         },
-        TransmitProgress => BackendEvent::TransmitProgress { local: MessageId(4), progress: 0.25 },
+        TransmitProgress => BackendEvent::TransmitProgress { local: MessageId(4), progress: 0.25, phase: None },
+        TransmitProgress => BackendEvent::TransmitProgress { local: MessageId(4), progress: 0.0, phase: Some(kourier_model::SendPhase::SettingUpKeys { done: 3, of: 12 }) },
         Notice => BackendEvent::Notice(BackendNotice::IdentityChanged { user: uid("aci:a") }),
         HistoryTransfer => BackendEvent::HistoryTransfer(HistoryTransfer::Downloading { done: 1, total: Some(2) }),
         HistoryTransfer => BackendEvent::HistoryTransfer(HistoryTransfer::Failed(HistoryTransferFailure::UpdateApp)),
+        AccountProgress => BackendEvent::AccountProgress(kourier_model::AccountProgress { messages_done: 1, messages_total: 2, profiles_left: 3, groups_left: 4, finished: false }),
+        AccountProgress => BackendEvent::AccountProgress(kourier_model::AccountProgress::finished()),
+        Logout => BackendEvent::Logout(kourier_model::LogoutReport { outcome: kourier_model::DeviceLogout::Removed, device_name: Some("Kourier".into()) }),
+        Logout => BackendEvent::Logout(kourier_model::LogoutReport::new(kourier_model::DeviceLogout::NotReached)),
     })
 }
 
@@ -238,6 +261,13 @@ fn every_enum_roundtrips_by_name() {
             index: 2,
             net_ids: vec!["uuid:00ff".to_owned()].into(),
         },
+        RequestAttachments => DurableCommand::RequestAttachments { conv: group(), target: target() },
+    });
+    roundtrip_all!(RestoreUpdate {
+        Sent => RestoreUpdate::Sent,
+        NotSent => RestoreUpdate::NotSent,
+        Answer => RestoreUpdate::Answer { attachments: vec![RestoreSlot::Gone], long_text: None },
+        MessageNotFound => RestoreUpdate::MessageNotFound,
     });
     roundtrip_all!(StartMode {
         Fresh => StartMode::Fresh,
@@ -287,7 +317,7 @@ fn outbox_codec_roundtrips_durable_events_only() {
     let events = all_events();
     let (ephemeral, durable): (Vec<_>, Vec<_>) =
         events.into_iter().partition(BackendEvent::is_ephemeral);
-    assert_eq!(ephemeral.len(), 7);
+    assert_eq!(ephemeral.len(), 12);
     // One row per event, and all durable events of a transaction in one row.
     for e in &durable {
         let row = encode_outbox_row(std::slice::from_ref(e)).expect("durable");
@@ -1015,6 +1045,15 @@ fn durable_commands_and_outcomes() {
         ("DeleteAttachment", Some(CmdId(11)))
     );
     assert!(!format!("{cmd:?}").contains(secret));
+    let ask = DurableCommand::RequestAttachments {
+        conv: group(),
+        target: target(),
+    }
+    .into_command(CmdId(12));
+    assert_eq!(
+        (ask.name(), ask.durable_id()),
+        ("RequestAttachments", Some(CmdId(12)))
+    );
     // Rows written before a field existed still decode.
     let old: DurableCommand = serde_json::from_str(&format!(
         r#"{{"ClearConversation":{{"conv":{}}}}}"#,
@@ -1064,6 +1103,22 @@ fn debug_of_events_and_commands_is_log_safe() {
             target: target(),
             net_ids: Redacted::new(vec![secret.into()]),
             at: 1,
+        },
+        BackendEvent::AttachmentRestore {
+            target: target(),
+            update: RestoreUpdate::Answer {
+                attachments: vec![RestoreSlot::File {
+                    remote: BackendBlob {
+                        v: 2,
+                        bytes: secret.as_bytes().to_vec(),
+                    },
+                    net_ids: Redacted::new(vec![secret.into()]),
+                    size: 1,
+                }],
+                long_text: None,
+            },
+            at: 1,
+            cmd: None,
         },
         BackendEvent::ContactUpsert(ContactPatch {
             profile_name: Patch::Set(secret.into()),
@@ -1221,6 +1276,15 @@ fn clear_and_attachment_delete_targets_are_checked() {
                 at: 1,
             },
         ),
+        (
+            "AttachmentRestore",
+            BackendEvent::AttachmentRestore {
+                target: bad.clone(),
+                update: RestoreUpdate::Sent,
+                at: 1,
+                cmd: None,
+            },
+        ),
     ] {
         assert!(!event.is_ephemeral(), "{name} is durable");
         let (env, _w) = Envelope::durable(vec![event]);
@@ -1240,4 +1304,33 @@ fn clear_and_attachment_delete_targets_are_checked() {
         at: 1,
     }]);
     assert_eq!(env.validate(), Ok(()));
+}
+
+/// A report about a request for lost files names the command of the request
+/// (`AttachmentRestore.cmd`): it survives the round trip through the outbox, and an event
+/// stored before the field existed has none, which the core takes for no request.
+#[test]
+fn a_restore_report_names_its_command_and_an_old_event_has_none() {
+    let event = BackendEvent::AttachmentRestore {
+        target: target(),
+        update: RestoreUpdate::NotSent,
+        at: 5,
+        cmd: Some(CmdId(41)),
+    };
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["AttachmentRestore"]["cmd"], 41);
+    let back: BackendEvent = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back, event);
+    // An event of the earlier shape (no `cmd`).
+    let mut old = serde_json::to_value(&event).expect("serialize");
+    old["AttachmentRestore"]
+        .as_object_mut()
+        .expect("object")
+        .remove("cmd");
+    let BackendEvent::AttachmentRestore { cmd, .. } =
+        serde_json::from_value::<BackendEvent>(old).expect("an old event reads")
+    else {
+        panic!("not an AttachmentRestore");
+    };
+    assert_eq!(cmd, None);
 }

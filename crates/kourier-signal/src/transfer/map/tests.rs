@@ -80,7 +80,9 @@ fn chats(staged: &[Staged]) -> Vec<(u32, &ConvKey, &StagedChat)> {
     staged
         .iter()
         .filter_map(|row| match row {
-            Staged::Chat { idx, conv, chat } => Some((*idx, conv, chat)),
+            Staged::Chat {
+                idx, conv, chat, ..
+            } => Some((*idx, conv, chat)),
             _ => None,
         })
         .collect()
@@ -134,6 +136,7 @@ fn one_chat(texts: Vec<TextSpec>) -> HistorySpec {
         chats: vec![ChatSpec {
             with: ChatWith::Contact(0),
             texts,
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     }
@@ -174,6 +177,7 @@ fn rich() -> HistorySpec {
                         ..incoming("from nobody", t0 + 8, true)
                     },
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
@@ -181,22 +185,27 @@ fn rich() -> HistorySpec {
                     incoming("b1", t0 + 2, false),
                     outgoing("b2", t0 + 5, &[SendStatusSpec::Delivered]),
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(2),
                 texts: vec![incoming("c1", t0 + 3, true)],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::NoteToSelf,
                 texts: vec![outgoing("note", t0 + 6, &[SendStatusSpec::Read])],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(4),
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Nobody,
                 texts: vec![incoming("in a chat with nobody", t0 + 9, true)],
+                ..ChatSpec::default()
             },
         ],
         interleaved: true,
@@ -337,6 +346,7 @@ fn an_own_text_item_carries_the_minimum_of_its_send_states() {
         chats: vec![ChatSpec {
             with: ChatWith::NoteToSelf,
             texts: vec![outgoing("note", 1_700_000_000_000, &[S::Pending])],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     });
@@ -348,7 +358,7 @@ fn an_own_text_item_carries_the_minimum_of_its_send_states() {
     );
     let (_, conv, chat) = chats(&staged)[0];
     assert_eq!(conv, &ConvKey::Direct(own_user()));
-    assert!(chat.is_self && chat.peer.is_none());
+    assert!(chat.is_self() && chat.peer().is_none());
     assert!(contacts(&staged).is_empty(), "we are nobody's contact");
 }
 
@@ -385,6 +395,7 @@ fn an_item_of_an_unknown_chat_or_author_is_skipped_and_counted() {
         chats: vec![ChatSpec {
             with: ChatWith::Contact(0),
             texts: vec![incoming("fine", 1_700_000_000_000, true)],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     });
@@ -444,14 +455,17 @@ fn a_chat_without_a_loud_row_is_not_staged_as_shown() {
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(2),
                 texts: vec![incoming("loud", 1_700_000_000_000, true)],
+                ..ChatSpec::default()
             },
         ],
         ..HistorySpec::default()
@@ -545,8 +559,48 @@ fn a_time_far_in_the_future_does_not_become_the_sort_time() {
 fn every_mapped_row_passes_the_contract_check() {
     let mut frames = history_frames(&rich());
     frames.extend(sample_frames());
+    // Every content kind of step S3b, in the chat with the rich archive's first contact
+    // (the frames of its people and chat are the rich archive's again: counted twice).
+    frames.extend(history_frames(&one_chat(content::every_kind())));
     let (staged, end) = map(frames);
     assert!(messages(&staged).len() > 30);
+    let rows = messages(&staged);
+    let has = |what: &dyn Fn(&IncomingMessage) -> bool| rows.iter().any(|m| what(m));
+    assert!(has(&|m| m.mentions_me
+        && m.reply_to.is_some()
+        && !m.edits.is_empty()));
+    assert!(has(&|m| m.reactions.len() == 2));
+    assert!(has(&|m| matches!(m.body, Body::Sticker(_))));
+    for hint in [
+        "sticker",
+        "view-once",
+        "contact",
+        "payment",
+        "gift-badge",
+        "poll",
+        "story-reply",
+        "poll-ended",
+        "pin",
+        "newer-protocol",
+    ] {
+        assert!(
+            has(&|m| matches!(&m.body, Body::Unsupported { kind_hint, .. } if kind_hint == hint)),
+            "{hint}"
+        );
+    }
+    assert!(has(&|m| matches!(
+        m.body,
+        Body::System(SystemEvent::TimerChanged { .. })
+    )));
+    let calls = rows
+        .iter()
+        .filter(|m| matches!(m.body, Body::System(SystemEvent::Call(_))))
+        .count();
+    assert_eq!(
+        calls,
+        1 + 10,
+        "every 1:1 call; the group call is not of this chat"
+    );
     let mut checked = 0;
     for row in &staged {
         let events = match row {
@@ -582,7 +636,7 @@ fn every_mapped_row_passes_the_contract_check() {
             Staged::Contact { n, .. } => assert!(seen_people.insert(*n), "a person twice"),
             Staged::Chat { idx, chat, .. } => {
                 assert!(seen_chats.insert(*idx), "a chat twice");
-                assert!(chat.peer.is_none_or(|peer| seen_people.contains(&peer)));
+                assert!(chat.peer().is_none_or(|peer| seen_people.contains(&peer)));
             }
             Staged::Item { chat, .. } => assert!(seen_chats.contains(chat)),
         }
@@ -671,22 +725,27 @@ fn a_contact_frame_with_one_of_our_ids_is_us_and_one_without_any_id_is_nobody() 
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: vec![outgoing("to myself", t, &[])],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
                 texts: vec![outgoing("to myself again", t + 1, &[])],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(2),
                 texts: vec![incoming("from nobody", t + 2, true)],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(3),
                 texts: vec![incoming("from the person", t + 3, true)],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(4),
                 texts: vec![incoming("from the second frame", t + 4, true)],
+                ..ChatSpec::default()
             },
         ],
         ..HistorySpec::default()
@@ -723,7 +782,7 @@ fn a_contact_frame_with_one_of_our_ids_is_us_and_one_without_any_id_is_nobody() 
 }
 
 #[test]
-fn groups_and_everything_this_step_does_not_import_are_counted_by_their_reason() {
+fn what_this_step_does_not_import_is_counted_by_its_reason() {
     use backup::chat_item::{DirectionalDetails, IncomingMessageDetails, Item};
     use backup::recipient::Destination;
     let t = 1_700_000_000_000u64;
@@ -800,33 +859,12 @@ fn groups_and_everything_this_step_does_not_import_are_counted_by_their_reason()
         ),
         (
             Some(Item::UpdateMessage(Default::default())),
-            reason::UPDATE_NOT_YET,
-        ),
-        (
-            Some(Item::StickerMessage(Default::default())),
-            reason::STICKER_NOT_YET,
-        ),
-        (
-            Some(Item::ContactMessage(Default::default())),
-            reason::CONTACT_CARD_NOT_YET,
-        ),
-        (
-            Some(Item::PaymentNotification(Default::default())),
-            reason::PAYMENT_NOT_YET,
-        ),
-        (
-            Some(Item::GiftBadge(Default::default())),
-            reason::GIFT_BADGE_NOT_YET,
-        ),
-        (
-            Some(Item::ViewOnceMessage(Default::default())),
-            reason::VIEW_ONCE_NOT_YET,
+            reason::UNKNOWN_ITEM,
         ),
         (
             Some(Item::DirectStoryReplyMessage(Default::default())),
-            reason::STORY_REPLY_NOT_YET,
+            reason::EMPTY,
         ),
-        (Some(Item::Poll(Default::default())), reason::POLL_NOT_YET),
         (None, reason::UNKNOWN_ITEM),
         (standard(backup::StandardMessage::default()), reason::EMPTY),
         (
@@ -836,29 +874,25 @@ fn groups_and_everything_this_step_does_not_import_are_counted_by_their_reason()
             }),
             reason::EMPTY,
         ),
+        // Attachments of which nothing is left (no pointer at all) and no text: nothing.
         (
             standard(backup::StandardMessage {
-                text: text("a caption"),
+                text: text(""),
                 attachments: vec![Default::default()],
                 ..Default::default()
             }),
-            reason::ATTACHMENTS_NOT_YET,
-        ),
-        (
-            standard(backup::StandardMessage {
-                text: text("the first two kilobytes"),
-                long_text: Some(Default::default()),
-                ..Default::default()
-            }),
-            reason::LONG_TEXT_NOT_YET,
+            reason::EMPTY,
         ),
     ];
     let mut expected: BTreeMap<&str, u64> = BTreeMap::new();
+    // The attachment without a pointer of the last kind is counted on its own.
+    expected.insert(reason::ATTACHMENT_NOT_AVAILABLE, 1);
     for (i, (content, why)) in kinds.into_iter().enumerate() {
         frames.push(item(1, t + 10 + i as u64, content));
         *expected.entry(why).or_insert(0) += 1;
     }
-    // A text with a quote, reactions and formatting: imported as its text, the rest counted.
+    // A text with a quote, a reaction and a range that name nothing: imported with the
+    // quote of an unknown message, without the reaction and the range (counted).
     frames.push(item(
         1,
         t + 100,
@@ -904,25 +938,28 @@ fn groups_and_everything_this_step_does_not_import_are_counted_by_their_reason()
 
     let (staged, end) = map(frames);
     let texts: Vec<&str> = messages(&staged).into_iter().map(body).collect();
-    assert_eq!(texts, ["kept", "with everything"]);
+    // Since step S4b a group's chat and its items are imported.
+    assert_eq!(texts, ["kept", "in a group", "with everything"]);
     for (why, n) in &expected {
         assert_eq!(count(&end, why), *n, "{why}");
     }
-    assert_eq!(count(&end, reason::GROUP_CHAT_NOT_YET), 1);
-    assert_eq!(count(&end, reason::GROUP_ITEM_NOT_YET), 1);
     assert_eq!(count(&end, reason::UNKNOWN_RECIPIENT), 1);
     assert_eq!(
         count(&end, reason::UNKNOWN_CHAT),
         2 + 1,
         "two chats, one item"
     );
-    assert_eq!(count(&end, reason::QUOTE_NOT_YET), 1);
-    assert_eq!(count(&end, reason::REACTIONS_NOT_YET), 1);
-    assert_eq!(count(&end, reason::RANGES_NOT_YET), 1);
+    assert_eq!(count(&end, reason::REACTION_UNKNOWN_AUTHOR), 1);
+    assert_eq!(count(&end, reason::RANGE_DROPPED), 1);
+    let quoted = messages(&staged)[2].reply_to.as_ref().expect("the quote");
+    assert_eq!(
+        (&quoted.target.author, &*quoted.target.local),
+        (&TargetAuthor::Unknown, "0")
+    );
     assert_eq!(
         chats(&staged).len(),
-        1,
-        "no group and no list became a chat"
+        2,
+        "the group became a chat, no list did"
     );
 }
 
@@ -1200,7 +1237,17 @@ fn the_id_of_an_edited_item_is_the_time_of_its_first_version() {
     );
     assert_eq!(row.sent_at, i64::try_from(t).unwrap());
     assert_eq!(body(row), "the last version");
-    assert_eq!(count(&end, reason::EDITED_MARK_NOT_YET), 1);
+    // The later versions' ids, oldest first: the second version and the item itself.
+    let edits: Vec<(&str, i64)> = row.edits.iter().map(|e| (&*e.local, e.at)).collect();
+    let (second, last) = ((t + 200).to_string(), (t + 500).to_string());
+    assert_eq!(
+        edits,
+        [
+            (second.as_str(), i64::try_from(t + 200).unwrap()),
+            (last.as_str(), i64::try_from(t + 500).unwrap())
+        ]
+    );
+    assert!(end.counts.is_empty(), "{:?}", end.counts);
 }
 
 #[test]
@@ -1212,6 +1259,7 @@ fn ids_that_collide_and_frames_over_the_caps_are_counted() {
         chats: vec![ChatSpec {
             with: ChatWith::Contact(0),
             texts: vec![incoming("to the first", t, true)],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     });
@@ -1257,6 +1305,7 @@ fn ids_that_collide_and_frames_over_the_caps_are_counted() {
             .map(|i| ChatSpec {
                 with: ChatWith::Contact(i),
                 texts: vec![incoming("hello", t + i as u64, true)],
+                ..ChatSpec::default()
             })
             .collect(),
         ..HistorySpec::default()
@@ -1307,6 +1356,7 @@ fn a_text_and_a_name_over_their_bounds_are_cut_on_a_character() {
                 incoming("abcdefgh€€", 1_700_000_000_000, true),
                 incoming("short", 1_700_000_000_001, true),
             ],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     };
@@ -1344,7 +1394,16 @@ fn the_sample_archive_becomes_one_chat_of_three_texts() {
     assert!(rows[1].read && !rows[2].read);
     assert_eq!(end.chats.len(), 1);
     assert_eq!(end.chats[0].n_rows, 3);
-    assert_eq!(count(&end, reason::REACTIONS_NOT_YET), 1);
+    // Our own reaction on the third text.
+    assert_eq!(
+        rows[2].reactions,
+        [HistoryReaction {
+            by: None,
+            emoji: "\u{1f44d}".to_owned(),
+            at: 3300
+        }]
+    );
+    assert!(end.counts.is_empty(), "{:?}", end.counts);
     assert_eq!(contacts(&staged).len(), 1);
     assert_eq!(contacts(&staged)[0].profile_key, Some([2; 32]));
     assert_eq!(
@@ -1364,10 +1423,12 @@ fn a_staged_person_carries_what_the_contact_frame_says() {
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: vec![incoming("one", t, true)],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
                 texts: vec![incoming("two", t + 1, true)],
+                ..ChatSpec::default()
             },
         ],
         ..HistorySpec::default()
@@ -1437,5 +1498,9 @@ fn a_staged_person_carries_what_the_contact_frame_says() {
 }
 
 /// Probes of the independent review of step S1.
+mod content;
 mod fixes;
+mod frames;
+mod groups;
+mod media;
 mod review;

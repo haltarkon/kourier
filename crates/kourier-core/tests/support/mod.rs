@@ -259,6 +259,7 @@ pub async fn start_core_on(
     cfg.timeouts = Timeouts {
         shutdown_grace: Duration::from_secs(5),
         logout: Duration::from_secs(5),
+        ..Timeouts::default()
     };
     Core::start(cfg).await.expect("core starts")
 }

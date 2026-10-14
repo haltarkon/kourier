@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use kourier_backend_api::BackendNotice;
 use kourier_model::{
-    AccountId, AccountState, AccountUuid, AttachmentId, AttachmentKind, BlobRef, Body, ConnState,
-    ConvKind, ConversationChange, ConversationFeatures, ConversationId, Deletion, Expiry,
-    HistoryTransfer, LoginStep, Member, MessageId, NetworkKind, OutgoingState, QuoteSnapshot,
-    ReadState, Redacted, SystemEvent, Text, UserId,
+    AccountId, AccountProgress, AccountState, AccountUuid, AttachmentId, AttachmentKind, BlobRef,
+    Body, ConnState, ConvKind, ConversationChange, ConversationFeatures, ConversationId, Deletion,
+    Expiry, HistoryTransfer, LoginStep, Member, MessageId, NetworkKind, OutgoingState,
+    QuoteSnapshot, ReadState, Redacted, SystemEvent, Text, UserId,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -86,8 +86,20 @@ pub enum UiCommand {
         /// Login flow.
         flow: String,
     },
-    /// Remove the account and shred its keys (§4.3 step 7).
+    /// Remove the account and shred its keys (§4.3 step 7): the network is asked to forget the
+    /// device (an actor is started for it when none runs), then every row and file of the
+    /// account here goes. Answered with `LogoutOutcome` (what became of the device) and
+    /// `AccountRemoved`.
     RemoveAccount {
+        /// The account.
+        account: AccountId,
+    },
+    /// "Unlink…": the device logs out on the network (an actor is started for it when none
+    /// runs) and the account stays logged out with its chats readable, as after an unlink by
+    /// the phone; `Relink` links it again. Answered with `LogoutOutcome`. Ignored for an
+    /// account that is logged out or still linking. Durable like a removal: the account is
+    /// `Unlinking` meanwhile, and a start that finds it makes one more attempt and finishes it.
+    Unlink {
         /// The account.
         account: AccountId,
     },
@@ -487,6 +499,23 @@ pub enum UiEvent {
         /// The account.
         account: AccountId,
     },
+    /// What became of the account's device after the user's "Remove Account…" (`removed`) or
+    /// "Unlink…": sent once, after the removal is done (just before `AccountRemoved`). Also for
+    /// a removal or unlink that a quit cut off and the next start finished: an outcome sent
+    /// before the front-end said `UiReady` is sent again at `UiReady` (same `seq`).
+    LogoutOutcome {
+        /// Counts the outcomes of this run: a front-end that is told of one twice (live, and
+        /// again when it says `UiReady`) shows it once.
+        seq: u64,
+        /// The account.
+        account: AccountId,
+        /// The account was removed (else it stays, logged out).
+        removed: bool,
+        /// The backend's report (no report = not reached).
+        report: kourier_model::LogoutReport,
+        /// Who the account was (its row may be gone by the time the notice is shown).
+        who: AccountLabel,
+    },
     /// The supervisor gave up after repeated failures, or an account action failed; the UI
     /// offers "Restart" when `restartable`.
     AccountError {
@@ -600,6 +629,17 @@ pub enum UiEvent {
         account: AccountId,
         /// The state.
         state: HistoryTransfer,
+    },
+    /// How far the work of a newly linked account is that the user waits for while its chats
+    /// are already usable: the delivery of an imported history (messages delivered and in
+    /// all), then the profiles and groups the link still fetches. Passed on from the backend
+    /// as it comes; not stored. The numbers are "now" (they can go up, and start over after
+    /// a restart); the report with [`AccountProgress::finished`] ends it.
+    AccountProgress {
+        /// The account.
+        account: AccountId,
+        /// The numbers.
+        progress: AccountProgress,
     },
     /// History import progress (§4.10).
     HistoryProgress {
@@ -870,12 +910,16 @@ pub enum Progress {
         /// Total bytes.
         total: u64,
     },
-    /// Transmit of an own message.
+    /// Transmit of an own message, while an attempt runs (ephemeral: lost with a restart,
+    /// the attempt then starts over). The UI keeps the last one per message until the row's
+    /// state changes (`MessagesChanged`).
     Transmit {
         /// The message.
         message: MessageId,
-        /// 0.0 … 1.0.
+        /// The upload share of its attachments, 0.0 … 1.0 (0.0 without attachments).
         progress: f32,
+        /// What the send is doing now; `None` when only the upload share is known.
+        phase: Option<kourier_model::SendPhase>,
     },
     /// The core copies the files of a [`UiCommand::SendFiles`] into the blob store. The
     /// first comes before the first file is copied (`files_done` 0), the last when every
@@ -1002,9 +1046,33 @@ pub struct AccountRow {
     /// E.164 phone number), when the backend reported one (`AccountReady.number`). It follows
     /// a number change made on another device; `AccountsChanged` announces it. Personal data.
     pub number: Option<String>,
+    /// When this device was linked (ms since the epoch): the day the phone lists it under its
+    /// linked devices. Moves to the time of a link that is accepted again (`Relink`).
+    pub linked_at: i64,
 }
 
-kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar } redact { display_name, number });
+kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar, linked_at } redact { display_name, number });
+
+/// Who an account was, read before its row went: what a notice about its removal or unlink
+/// names it by (link feedback L4).
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountLabel {
+    /// Network.
+    pub network: NetworkKind,
+    /// Own profile name (personal data).
+    pub display_name: Option<String>,
+    /// The account's number or address as the network shows it (personal data).
+    pub number: Option<String>,
+    /// Own device id.
+    pub own_device: Option<u32>,
+    /// When this device was linked (ms since the epoch), as [`AccountRow::linked_at`].
+    pub linked_at: i64,
+    /// Another account of the profile (same network) has the same identity or looks the same
+    /// (same name and number): the notice tells them apart by device and link date.
+    pub twin: bool,
+}
+
+kourier_model::redacting_debug!(AccountLabel { network, own_device, linked_at, twin } redact { display_name, number });
 
 /// Conversation list filter and page.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1300,8 +1368,35 @@ pub struct MessageRow {
     pub history: bool,
     /// We are mentioned.
     pub mentions_me: bool,
+    /// Where the own send of this message stands while it is still on its way: `Some` for an
+    /// own message whose send row is in the outbox and not `Failed` (queued, being stored as
+    /// part of a large send, in flight, or waiting for its next try); `None` otherwise. Durable:
+    /// it is read from the outbox row, so it survives a restart. What happens inside an
+    /// attempt (the phase, members done) is not here: it comes as
+    /// [`Progress::Transmit`](crate::facade::Progress::Transmit) and is lost with a restart.
+    pub outbox: Option<OutboxWait>,
     /// What the user may do with the message right now.
     pub actions: MessageActions,
+}
+
+/// The outbox row of an own message that is still on its way ([`MessageRow::outbox`]). The UI
+/// counts the time since Send from [`MessageRow::sent_at`] (the request's own timestamp, set
+/// once when the message was queued) and the countdown to the next try from
+/// `next_attempt_at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxWait {
+    /// An attempt is running now.
+    pub in_flight: bool,
+    /// Attempts started so far (0: not tried yet).
+    pub attempts: u32,
+    /// When the next attempt may start (core clock, ms), for a row that waits for a retry
+    /// after a failed attempt; `None` while in flight and for a row that is due as soon as
+    /// the account can send (not tried yet, or held by a pause, offline, logged out).
+    pub next_attempt_at: Option<i64>,
+    /// The log-safe kind name of the last attempt's error (`"RateLimited"`, `"Transient"`,
+    /// `"Challenge"`, `"UntrustedIdentity"` …: `ErrorKind::name`), `None` before any failed
+    /// attempt.
+    pub last_error: Option<String>,
 }
 
 /// What the user may do with a message at [`TimelinePage::now`]. Each flag is the answer of the
@@ -1319,7 +1414,7 @@ pub struct MessageRow {
 /// of its loaded rows, `until - TimelinePage::now` from when the page arrived, and then
 /// re-queries those rows (or clears the two flags itself). A command sent in the gap is
 /// refused with `ActionFailed`, never applied late.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MessageActions {
     /// A new message may quote it (`SendText`/`SendFiles` with `reply_to`).
     pub reply: bool,
@@ -1345,6 +1440,16 @@ pub struct MessageActions {
     /// retry or whose send gave up on attempts without an answer: it may be with the server,
     /// so a delete for everyone of it is sent.
     pub take_back: bool,
+    /// The attachments of this row whose Download asks the account's other device (Signal: the
+    /// phone) to upload them again: the very ones a click would ask for. The network lost the
+    /// file ("Not available on this device", "No longer available", or an ask that ended
+    /// "did not answer"), the account is linked, its network can ask, the message can be named
+    /// and is not view-once or deleted, the chat and the author are not known by phone number
+    /// alone, and the file (not the rest of a long text) is within the receive limit. An
+    /// attachment being asked for already is not in it: a click would only join the request.
+    /// The note of each attachment says what is going on (`AttachmentState::Asking`,
+    /// `AskFailed`).
+    pub ask_attachments: Vec<AttachmentId>,
     /// When the first time-limited flag turns false (core clock, ms); `None`: no flag here
     /// depends on time.
     pub until: Option<i64>,
@@ -1457,6 +1562,13 @@ impl CoreHandle {
     /// Subscribes to [`UiEvent`]s (from now on).
     pub fn subscribe(&self) -> broadcast::Receiver<UiEvent> {
         self.events.subscribe()
+    }
+
+    /// How many events were sent and not yet read by every subscriber: what is between the
+    /// core's `emit` and the front-end's pump (a screenshot that waits for the final picture
+    /// counts it with the pump's own queue and the queries in flight).
+    pub fn events_unseen(&self) -> usize {
+        self.events.len()
     }
 
     /// The media handle table for the UI's image provider (§8.6).

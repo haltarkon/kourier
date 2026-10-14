@@ -256,6 +256,85 @@ fn zones_name_contacts_mark_system_contacts_and_full_syncs_clear_the_rest() {
     .unwrap();
 }
 
+/// Finding 3 of the reviews (hazard 8): the initial contact sync never LOWERS a stored timer
+/// version, as Android applies a synced timer only when its version is higher. A history
+/// import gave the chat the phone's newer timer; the contact sync that was read earlier on
+/// the phone must leave that pair alone and tell the core nothing. A contact with a higher
+/// version (or the same) is taken, and the core hears of a changed timer.
+#[test]
+fn the_initial_contact_sync_never_lowers_a_stored_timer_version() {
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let dir = tempfile::tempdir().unwrap();
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let bruno = Aci::from(uuid::Uuid::from_u128(0xb0b));
+    let sid = |aci: Aci| ServiceId::from(aci).service_id_string();
+    // Both chats are in the core, with the timers an import gave them: Ada's hour at the
+    // version 5, Bruno's day at the version 2.
+    db.zone(|tx| -> Result<()> {
+        for (aci, timer, version) in [(ada, 3_600, 5), (bruno, 86_400, 2)] {
+            peers::ensure(tx, &sid(aci), 1)?;
+            peers::set_expire_timer(tx, &sid(aci), timer, version, 1)?;
+            peers::set_features_hash(tx, &sid(aci), 7, 1)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let stated = |aci: Aci, secs: u32, version: u32| Parsed {
+        details: proto::ContactDetails {
+            expire_timer: Some(secs),
+            expire_timer_version: Some(version),
+            ..details(aci, Some("A person"), None)
+        },
+        avatar: None,
+    };
+    // Ada: a minute at the version 3 is older than what the core has. Bruno: an hour at the
+    // version 4 is newer. (Not the last zone: the sync stays the initial one.)
+    let parsed = [stated(ada, 60, 3), stated(bruno, 3_600, 4)];
+    let contacts: Vec<_> = parsed.iter().filter_map(|p| checked(account, p)).collect();
+    db.zone(|tx| {
+        apply_zone(
+            tx,
+            account,
+            dir.path(),
+            &contacts,
+            &HashMap::new(),
+            None,
+            10,
+            &wake,
+        )
+    })
+    .unwrap();
+    let pair = |aci: Aci| {
+        let row = db.read(|c| peers::load(c, &sid(aci))).unwrap();
+        (row.expire_timer, row.expire_timer_version)
+    };
+    assert_eq!(
+        pair(ada),
+        (3_600, 5),
+        "the older pair leaves the stored one"
+    );
+    assert_eq!(pair(bruno), (3_600, 4), "the newer pair is taken");
+    let sent = events(db);
+    let timer_of = |aci: Aci| {
+        sent.iter().find_map(|event| match event {
+            BackendEvent::ConversationUpsert(patch)
+                if patch.key == ConvKey::Direct(aci_user_id(aci).unwrap())
+                    && patch.timer != Patch::Unchanged =>
+            {
+                Some((patch.timer, patch.timer_version))
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(timer_of(ada), None, "the core is told nothing of Ada's");
+    assert_eq!(
+        timer_of(bruno),
+        Some((Patch::Set(Duration::from_secs(3_600)), Some(4)))
+    );
+}
+
 /// Which picture a contact shows follows the phone's setting: profile pictures first, or the
 /// address-book photos when `preferContactAvatars` is on.
 #[test]

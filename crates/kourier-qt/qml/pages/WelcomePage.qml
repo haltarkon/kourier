@@ -91,7 +91,7 @@ Kirigami.ScrollablePage {
         }
 
         FormCard.FormSectionText {
-            text: L10n.i18nc("@info", "Kourier links as an additional device: your phone stays the main device and your history stays on it.")
+            text: L10n.i18nc("@info", "Kourier links as an additional device: your phone stays the main device, keeps your message history and can send a copy of it.")
         }
     }
 }

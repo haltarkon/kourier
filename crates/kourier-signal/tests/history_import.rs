@@ -36,7 +36,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kourier_backend_api::{BackendEnv, BackendEvent, Command, Exit, StartMode};
+use kourier_backend_api::{BackendEnv, BackendEvent, Command, Exit, InitialSync, StartMode};
 use kourier_model::{HistoryTransfer, HistoryTransferFailure, LoginStepKind, OutgoingState};
 use kourier_signal::SignalNetwork;
 use kourier_signal::archive_testing::{
@@ -45,7 +45,10 @@ use kourier_signal::archive_testing::{
 };
 use serde::{Deserialize, Serialize};
 use support::fake_core::{AccountFiles, FakeCore, Sink, WAIT, local_env};
-use support::harness::{ArchivePlace, CreatePrimary, DeviceInfo, Harness, Primary, SendText};
+use support::harness::{
+    ArchivePlace, CreatePrimary, DeviceInfo, Harness, Primary, SendText, StorageAccount,
+    StorageContact, StorageSpec,
+};
 use uuid::Uuid;
 
 /// A text that is in every message of the test archives and nowhere else.
@@ -122,6 +125,7 @@ fn history(generated: u32) -> HistorySpec {
                         ..incoming("from nobody", T0 + 8, true)
                     },
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
@@ -129,15 +133,18 @@ fn history(generated: u32) -> HistorySpec {
                     incoming("b1", T0 + 2, false),
                     outgoing("b2", T0 + 5, &[SendStatusSpec::Delivered]),
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::NoteToSelf,
                 texts: vec![outgoing("note", T0 + 3, &[])],
+                ..ChatSpec::default()
             },
             // Dan has a chat and never wrote; Cat has no chat at all.
             ChatSpec {
                 with: ChatWith::Contact(3),
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
         ],
         interleaved: true,
@@ -424,17 +431,23 @@ impl World {
     /// A fresh link whose phone chose to transfer, up to the waiting transfer and past the
     /// link's own work (its sync requests reached the phone).
     async fn link(&self, network: SignalNetwork) -> Linked {
+        self.link_with(network, InitialSync::LinkOnly).await
+    }
+
+    /// [`Self::link`] with the link's initial sync (the app's is `ContactsAndStorage`).
+    async fn link_with(&self, network: SignalNetwork, initial_sync: InitialSync) -> Linked {
         let key = self
             .harness
             .set_ephemeral_backup_key(&self.phone.device_ref)
             .await
             .expect("setEphemeralBackupKey");
-        let mut core = FakeCore::start_with(
+        let mut core = FakeCore::start_full(
             network,
             &self.env,
             &self.files,
             StartMode::Fresh,
             &self.sink,
+            initial_sync,
         )
         .expect("spawn the actor");
         let (url, _) = core.begin_login(None).await;
@@ -1429,6 +1442,7 @@ fn history_with_a_number_only_chat() -> HistorySpec {
     spec.chats.push(ChatSpec {
         with: ChatWith::Contact(4),
         texts: vec![incoming("e1", T0 + 9, true)],
+        ..ChatSpec::default()
     });
     spec.chats[0].texts.push(TextSpec {
         expires_in_ms: Some(1_000),
@@ -1697,14 +1711,372 @@ async fn a_row_that_is_due_is_delivered_with_its_expiry_while_nobody_confirmed_t
 
 /// How many delivery rows the recorded stage makes with rows of `rows` messages: one of
 /// people, one of chats, and each shown chat's batches.
+/// The delivery rows of `dump` at `rows` messages a batch: the people, the chats, the pins
+/// when any chat is pinned, and every shown chat's batches (a chat without a row still
+/// hears that nothing follows).
 fn expected_rows(dump: &StageDump, rows: u64) -> i64 {
     let batches: u64 = dump
         .chats
         .iter()
-        .filter(|chat| chat.loud > 0)
-        .map(|chat| chat.rows.div_ceil(rows))
+        .filter(|chat| chat.shown)
+        .map(|chat| chat.rows.div_ceil(rows).max(1))
         .sum();
-    i64::try_from(2 + batches).expect("rows")
+    let pins = u64::from(dump.chats.iter().any(|chat| chat.pinned.is_some()));
+    i64::try_from(2 + pins + batches).expect("rows")
+}
+
+/// [`history`] with what roams on the chat frames: pins with gaps (Dan's chat has no item
+/// and is pinned), Ann's chat archived, muted for ever, with a timer of a minute; Ben's
+/// marked unread with a timer version and no timer; Note to Self pinned too.
+fn history_with_pins_and_timers(generated: u32) -> HistorySpec {
+    let mut spec = history(generated);
+    spec.chats[0].pinned_order = Some(5);
+    spec.chats[0].archived = true;
+    spec.chats[0].mute_until_ms = Some(i64::MAX as u64);
+    spec.chats[0].expiration_timer_ms = Some(60_000);
+    spec.chats[0].expire_timer_version = 3;
+    spec.chats[1].marked_unread = true;
+    spec.chats[1].expire_timer_version = 4;
+    spec.chats[2].pinned_order = Some(9);
+    spec.chats[3].pinned_order = Some(2);
+    spec
+}
+
+/// The events of the sink named `names`, in commit order, as `(name, value of the name)`.
+fn sink_events(world: &World, names: &[&str]) -> Vec<(String, serde_json::Value)> {
+    let conn = kourier_db::open_read_only(
+        &world.tmp.path().join("sink.db"),
+        &kourier_db::DbKey::from([7; 32]),
+    )
+    .expect("sink");
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT name, detail FROM events WHERE detail IS NOT NULL ORDER BY seq")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        })
+        .expect("events");
+    rows.into_iter()
+        .filter(|(name, _)| names.contains(&name.as_str()))
+        .map(|(name, detail)| {
+            let mut value: serde_json::Value = serde_json::from_str(&detail).expect("json");
+            let inner = value
+                .get_mut(&name)
+                .map(serde_json::Value::take)
+                .unwrap_or(value);
+            (name, inner)
+        })
+        .collect()
+}
+
+/// The `ConversationUpsert` fields of `conv` merged in commit order (the later wins).
+fn merged_upserts(world: &World, conv: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = serde_json::Map::new();
+    for patch in world.sink.event_values("ConversationUpsert") {
+        if patch["key"] == conv
+            && let serde_json::Value::Object(fields) = patch
+        {
+            merged.extend(fields);
+        }
+    }
+    merged
+}
+
+/// Step S4a: the direct chats and Note to Self take what the phone's chat frames say. The
+/// stage holds it; the chats' upserts carry archived, marked unread and the mute ("for
+/// ever"); the 1:1 timer and its version are in `peers` and ride on the chat's features;
+/// ONE `PinnedConversations` comes after every chat's upsert and before the first row, in
+/// the phone's order (with gaps), and names a pinned chat without any item, which is
+/// listed; a blocked contact's chat is blocked with `peers` saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_chats_take_the_archives_pins_archive_mute_marks_and_timer() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut spec = history_with_pins_and_timers(0);
+    spec.contacts[0].blocked = true;
+    let (linked, _, held) = linked_with_an_archive(&world, &spec).await;
+    let Linked { core, key, device } = linked;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    // The stage, as the commit left it.
+    let mut child = spawn_child(
+        &world,
+        0,
+        Some(kourier_signal::failpoints::AFTER_HISTORY_IMPORT_COMMIT),
+    );
+    wait_aborted(&mut child).await;
+    let dump = read_stage(&world.transfer_dir(), &key).expect("the recorded stage");
+    let ann = format!("direct:{}", user(ANN));
+    let ben = format!("direct:pni:{}", BEN_PNI.hyphenated());
+    let dan = format!("direct:{}", user(DAN));
+    let own = format!("direct:aci:{}", device.aci);
+    let staged = |conv: &str| {
+        dump.chats
+            .iter()
+            .find(|chat| chat.conv == conv)
+            .unwrap_or_else(|| panic!("{conv} is staged"))
+    };
+    let a = staged(&ann);
+    assert_eq!(
+        (a.pinned, a.archived, a.marked_unread, a.muted_until),
+        (Some(5), true, false, Some(i64::MAX))
+    );
+    assert_eq!((a.timer_secs, a.timer_version), (Some(60), 3));
+    let b = staged(&ben);
+    assert_eq!(
+        (b.pinned, b.marked_unread, b.timer_secs, b.timer_version),
+        (None, true, None, 4)
+    );
+    let d = staged(&dan);
+    assert_eq!(
+        (d.pinned, d.rows, d.shown),
+        (Some(2), 0, true),
+        "pinned, no item, shown"
+    );
+    assert_eq!(staged(&own).pinned, Some(9));
+    assert_eq!(dump.shown_chats, 4);
+
+    let core = world.restart(network());
+    finish(&world, core, held).await;
+    // The upserts.
+    let a = merged_upserts(&world, &ann);
+    assert_eq!(a["archived"], true);
+    assert_eq!(a["muted_until"]["Set"], i64::MAX, "muted for ever");
+    assert_eq!(a["blocked"], true);
+    assert_eq!(a["timer"]["Set"]["secs"], 60);
+    assert_eq!(a["timer_version"], 3);
+    let b = merged_upserts(&world, &ben);
+    assert_eq!(b["marked_unread"], true);
+    assert!(b.get("archived").is_none() && b.get("timer").is_none());
+    assert!(
+        merged_upserts(&world, &dan).contains_key("features"),
+        "Dan's chat is listed"
+    );
+    // The pins: one list, after every upsert of the import and before its first row.
+    let events = sink_events(
+        &world,
+        &["ConversationUpsert", "PinnedConversations", "HistoryBatch"],
+    );
+    let pins: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| name == "PinnedConversations")
+        .map(|(i, _)| i)
+        .collect();
+    let first_pins = *pins.first().expect("the pins");
+    assert_eq!(
+        events[first_pins].1,
+        serde_json::json!([dan, ann, own]),
+        "ascending pinned order"
+    );
+    let last_upsert = events
+        .iter()
+        .rposition(|(name, v)| {
+            name == "ConversationUpsert"
+                && [&ann, &ben, &dan, &own]
+                    .iter()
+                    .any(|c| v["key"] == c.as_str())
+        })
+        .expect("upserts");
+    let first_batch = events
+        .iter()
+        .position(|(name, _)| name == "HistoryBatch")
+        .expect("batches");
+    assert!(
+        last_upsert < first_pins && first_pins < first_batch,
+        "chats, pins, rows"
+    );
+    // The backend's rows: the timer and its version (also without a timer), blocked.
+    let int = |sql: &str| world.files.peek_i64(sql).expect("backend.db").unwrap_or(-1);
+    let peer = |id: String, column: &str| {
+        int(&format!(
+            "SELECT {column} FROM peers WHERE service_id LIKE '%{id}%'"
+        ))
+    };
+    assert_eq!(peer(ANN.hyphenated().to_string(), "expire_timer"), 60);
+    assert_eq!(
+        peer(ANN.hyphenated().to_string(), "expire_timer_version"),
+        3
+    );
+    assert_eq!(peer(ANN.hyphenated().to_string(), "blocked"), 1);
+    assert_eq!(peer(BEN_PNI.hyphenated().to_string(), "expire_timer"), 0);
+    assert_eq!(
+        peer(BEN_PNI.hyphenated().to_string(), "expire_timer_version"),
+        4
+    );
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The pins are held until every row before them is settled (review of S4a, all three
+/// lenses): the core cannot take the row of the four chats at once and refuses it for good;
+/// it comes back as single chats, and no `PinnedConversations` reaches the core before the
+/// `ConversationUpsert` of a pinned chat, or the core would make a bare chat of the key.
+/// Without the hold the pins row, appended behind the refused row, is taken first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pins_wait_for_a_row_of_chats_the_core_refused_and_for_its_singles() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    // The refusal takes a moment, as a core that is busy: the pins row is appended meanwhile
+    // if nothing holds it.
+    world.sink.set_behavior("refuse_wide_chats", Some("1"));
+    world
+        .sink
+        .set_behavior("refuse_wide_chats_delay_ms", Some("400"));
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let (path, _) = world.archive(&linked, &history_with_pins_and_timers(0));
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_over("done", None);
+    assert!(
+        world
+            .sink
+            .behavior("refused_wide")
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| n >= 1),
+        "the core refused a row of several chats"
+    );
+    let ann = format!("direct:{}", user(ANN));
+    let dan = format!("direct:{}", user(DAN));
+    let own = format!("direct:aci:{}", linked.device.aci);
+    let events = sink_events(&world, &["ConversationUpsert", "PinnedConversations"]);
+    let first_pins = events
+        .iter()
+        .position(|(name, _)| name == "PinnedConversations")
+        .expect("the pins");
+    for chat in [&ann, &dan, &own] {
+        let upserted = events
+            .iter()
+            .position(|(name, v)| name == "ConversationUpsert" && v["key"] == chat.as_str())
+            .unwrap_or_else(|| panic!("{chat} was upserted"));
+        assert!(upserted < first_pins, "the upsert of {chat} comes first");
+    }
+    assert_eq!(
+        events[first_pins].1,
+        serde_json::json!([dan, ann, own]),
+        "and the pins are the phone's, whole"
+    );
+    world.expect_arrival(held).await;
+    linked.core.wait_online().await;
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// D10: where the archive says pinned, archived, marked unread, muted and blocked and the
+/// Storage Service, which has no previous record, says otherwise, the sync wins: for a
+/// contact and for Note to Self.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_storage_sync_wins_over_the_archive_where_they_differ() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    // The phone's Storage Service: Alice's record and the account record say "no" to all.
+    world
+        .harness
+        .set_storage_state(&StorageSpec {
+            primary: world.phone.device_ref.clone(),
+            contacts: vec![StorageContact {
+                archived: Some(false),
+                marked_unread: Some(false),
+                blocked: Some(false),
+                ..StorageContact::of(&world.alice.device_ref)
+            }],
+            account: Some(StorageAccount {
+                note_to_self_archived: Some(false),
+                note_to_self_marked_unread: Some(false),
+                ..StorageAccount::default()
+            }),
+            ..StorageSpec::default()
+        })
+        .await
+        .expect("storage state");
+    let alice_aci: Uuid = world.alice.aci.parse().expect("Alice's ACI");
+    let spec = HistorySpec {
+        contacts: vec![ContactSpec {
+            aci: Some(alice_aci),
+            profile_name: format!("{MARKER} Alice"),
+            profile_sharing: true,
+            blocked: true,
+            ..ContactSpec::default()
+        }],
+        chats: vec![
+            ChatSpec {
+                with: ChatWith::Contact(0),
+                texts: vec![incoming("a1", T0 + 1, true)],
+                archived: true,
+                marked_unread: true,
+                mute_until_ms: Some(i64::MAX as u64),
+                pinned_order: Some(1),
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::NoteToSelf,
+                texts: vec![outgoing("note", T0 + 2, &[])],
+                archived: true,
+                marked_unread: true,
+                pinned_order: Some(2),
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    let (mut linked, _, held) = linked_with_an_archive(&world, &spec).await;
+    let alice = format!("direct:aci:{}", world.alice.aci);
+    let own = format!("direct:aci:{}", linked.device.aci);
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_arrival(held).await;
+    // The sync follows the transfer.
+    world
+        .files
+        .wait_for_i64(
+            "the first Storage Service sync",
+            "SELECT count(*) FROM account WHERE manifest_version IS NOT NULL",
+            |n| n == Some(1),
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let pins = world.sink.event_values("PinnedConversations");
+        if pins.len() >= 2 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the sync's pins");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The import said yes ...
+    let pins = world.sink.event_values("PinnedConversations");
+    assert_eq!(
+        pins[0],
+        serde_json::json!([alice, own]),
+        "the archive's pins"
+    );
+    // ... and the sync, which had no previous record, says no and wins.
+    assert_eq!(pins.last(), Some(&serde_json::json!([])), "the sync's pins");
+    let a = merged_upserts(&world, &alice);
+    assert_eq!(a["archived"], false);
+    assert_eq!(a["marked_unread"], false);
+    assert_eq!(a["muted_until"], "Clear");
+    assert_eq!(a["blocked"], false);
+    let n = merged_upserts(&world, &own);
+    assert_eq!(n["archived"], false);
+    assert_eq!(n["marked_unread"], false);
+    assert_eq!(
+        world
+            .files
+            .peek_i64(&format!(
+                "SELECT blocked FROM peers WHERE service_id = '{}'",
+                world.alice.aci
+            ))
+            .expect("peers"),
+        Some(0),
+        "the backend agrees with the core on blocked"
+    );
+    linked.core.wait_online().await;
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
 }
 
 /// I4: a kill at every zone of the delivery (before and after a chunk's zone, after the
@@ -1719,7 +2091,29 @@ async fn a_kill_at_every_zone_of_the_delivery_goes_on_at_its_cursor_and_appends_
     };
     let generated = 2000;
     let rows = 25;
-    let (linked, frames, held) = linked_with_an_archive(&world, &history(generated)).await;
+    // With pins (a row of their own), timers (written in the chats zone) and a pinned group
+    // (its `groups` row and its refresh job are written in the chats zone too, step S4b).
+    let mut spec = history_with_pins_and_timers(generated);
+    spec.groups
+        .push(kourier_signal::archive_testing::GroupSpec {
+            master_key: vec![0x4b; 32],
+            snapshot: Some(kourier_signal::archive_testing::SnapshotSpec {
+                title: Some(format!("{MARKER} group")),
+                members: vec![(kourier_signal::archive_testing::Party::Contact(0), false)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    spec.chats.push(ChatSpec {
+        with: ChatWith::Group(0),
+        pinned_order: Some(7),
+        texts: vec![TextSpec {
+            author: Some(kourier_signal::archive_testing::Who::Contact(0)),
+            ..incoming(&format!("{MARKER} in the group"), T0 + 50, true)
+        }],
+        ..ChatSpec::default()
+    });
+    let (linked, frames, held) = linked_with_an_archive(&world, &spec).await;
     let Linked { core, key, .. } = linked;
     assert_eq!(core.shutdown().await, Exit::Shutdown);
     let kills = [
@@ -1815,6 +2209,50 @@ async fn a_kill_at_every_zone_of_the_delivery_goes_on_at_its_cursor_and_appends_
     assert!(
         world.sink.history_deliveries() >= world.row("stage_messages").unwrap_or(0),
         "every message reached the core"
+    );
+    // The pins reached the core, every time as the same list, and Ann's timer stands.
+    let pins = world.sink.event_values("PinnedConversations");
+    assert!(!pins.is_empty(), "the pins reached the core");
+    assert!(
+        pins.iter().all(|list| *list == pins[0]),
+        "a pin list appended again is the same list"
+    );
+    assert_eq!(
+        pins[0].as_array().map(Vec::len),
+        Some(4),
+        "three chats and the group"
+    );
+    // The group: one row, its features recorded, and its refresh queued at most once.
+    assert_eq!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM groups WHERE features_hash IS NOT NULL")
+            .expect("groups"),
+        Some(1)
+    );
+    assert!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM jobs WHERE kind = 'group_refresh'")
+            .expect("jobs")
+            .unwrap_or(0)
+            <= 1
+    );
+    assert_eq!(
+        world
+            .files
+            .peek_i64(&format!(
+                "SELECT expire_timer * 100 + expire_timer_version FROM peers
+                  WHERE service_id LIKE '%{}%'",
+                ANN.hyphenated()
+            ))
+            .expect("peers"),
+        Some(6_003)
+    );
+    assert_eq!(
+        merged_upserts(&world, &format!("direct:{}", user(ANN)))["timer"]["Set"]["secs"],
+        60,
+        "the timer reached the core with the chat"
     );
     println!(
         "{} kills, {want} delivery rows, {} deliveries of {} messages",
@@ -2466,5 +2904,1574 @@ async fn messages_the_core_cannot_store_one_after_another_end_the_transfer_at_th
     world.expect_arrival(held).await;
     linked.core.wait_online().await;
     assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The user's report (2026-10-10): after an import "too many profile_fetch jobs which takes
+/// ages". The delivery queues one fetch per person whose profile key is new, and the jobs
+/// ran one after another. They run in batches now: every person of the archive with a key
+/// is fetched (the name the server holds reaches the core), more than one at a time, and
+/// the queue is empty at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_profiles_of_an_import_are_fetched_several_at_a_time() {
+    use base64::Engine as _;
+    const PEOPLE: usize = 30;
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut contacts = Vec::new();
+    let mut fetched_names = Vec::new();
+    for i in 0..PEOPLE {
+        let name = format!("Fetched {i}");
+        let person = world
+            .harness
+            .create_primary(&CreatePrimary::named(&name))
+            .await
+            .expect("a person");
+        let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(&person.profile_key)
+            .expect("base64")
+            .try_into()
+            .expect("32 bytes");
+        contacts.push(ContactSpec {
+            aci: Some(person.aci.parse().expect("ACI")),
+            profile_name: format!("{MARKER} Archived {i}"),
+            profile_sharing: true,
+            profile_key: Some(key),
+            ..ContactSpec::default()
+        });
+        fetched_names.push(name);
+    }
+    let spec = HistorySpec {
+        chats: (0..PEOPLE)
+            .map(|i| ChatSpec {
+                with: ChatWith::Contact(i),
+                texts: vec![incoming(&format!("{MARKER} {i}"), T0 + i as u64, true)],
+                ..ChatSpec::default()
+            })
+            .collect(),
+        contacts,
+        ..HistorySpec::default()
+    };
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let (path, _) = world.archive(&linked, &spec);
+    let started = tokio::time::Instant::now();
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world
+        .files
+        .wait_for_i64(
+            "every person's profile fetched",
+            "SELECT count(*) FROM peers WHERE profile_fetched_at IS NOT NULL",
+            |n| n.is_some_and(|n| n >= i64::try_from(PEOPLE).expect("people")),
+        )
+        .await
+        .expect("profiles fetched");
+    world
+        .files
+        .wait_for_i64(
+            "no profile fetch left",
+            "SELECT count(*) FROM jobs WHERE kind = 'profile_fetch'",
+            |n| n == Some(0),
+        )
+        .await;
+    println!(
+        "{PEOPLE} profiles fetched {} ms after the upload",
+        started.elapsed().as_millis()
+    );
+    // A fetched name is written to backend.db and to the core's outbox in one zone; the
+    // forwarder brings it to the core a moment later: look until it is there.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for name in &fetched_names {
+        let needle = format!("\"{name}\"");
+        loop {
+            let there = events_of_the_core(&world)
+                .iter()
+                .any(|(event, v)| event == "ContactUpsert" && v.to_string().contains(&needle));
+            if there {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the server's name of {name} reached the core"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let log = log_buffer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let log = String::from_utf8_lossy(&log);
+    assert!(
+        log.lines().any(|line| line.contains("jobs done")
+            && line.contains("kind=\"profile_fetch\"")
+            && !line.contains("ran=1 ")),
+        "profile fetches ran in batches"
+    );
+    world.expect_arrival(held).await;
+    linked.core.wait_online().await;
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Link feedback L3: while the import is delivered the core hears how many messages of how
+/// many are in, the count only climbs and reaches the total, and once nothing is left a
+/// last report says `finished` (after the login's `Done`); nothing follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_delivery_reports_its_message_counts_and_then_that_it_finished() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let generated = 300;
+    let mut linked = world.link(rows_of(network(), 40)).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let (path, _) = world.archive(&linked, &history(generated));
+    world.upload(&linked.device, &path).await;
+    let deadline = tokio::time::Instant::now() + 3 * WAIT;
+    let mut counts: Vec<(u64, u64)> = Vec::new();
+    let (mut login_done, mut finished) = (false, false);
+    while !finished {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match linked.core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) if p.finished => {
+                assert!(login_done, "finished before the login's Done");
+                finished = true;
+            }
+            Some(BackendEvent::AccountProgress(p)) => {
+                if p.messages_total > 0 {
+                    counts.push((p.messages_done, p.messages_total));
+                }
+            }
+            Some(BackendEvent::Login(step)) => match step.kind {
+                LoginStepKind::Done => login_done = true,
+                LoginStepKind::Failed { error } => panic!("login failed: {error:?}"),
+                _ => {}
+            },
+            Some(_) => {}
+            None => panic!("no finished report"),
+        }
+    }
+    assert!(
+        counts.len() > 3,
+        "the delivery reported per chunk: {counts:?}"
+    );
+    let total = counts[0].1;
+    assert!(
+        counts.iter().all(|&(_, t)| t == total),
+        "one total: {counts:?}"
+    );
+    assert!(
+        counts.windows(2).all(|w| w[0].0 < w[1].0),
+        "the count climbs and is not repeated: {counts:?}"
+    );
+    assert_eq!(
+        counts.last().map(|c| c.0),
+        Some(total),
+        "it reaches the total"
+    );
+    world.expect_arrival(held).await;
+    // Nothing more is reported once it finished.
+    while let Some(event) = linked.core.next_ephemeral(Duration::from_millis(500)).await {
+        assert!(
+            !matches!(event, BackendEvent::AccountProgress(_)),
+            "a report after the finish: {event:?}"
+        );
+    }
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Link feedback L3 (F3): a start that finds a transfer unfinished reports the account's work
+/// again, whatever the age of the link: the UI of the new run knows nothing of the old one.
+/// (A stranded group alone is the link's tail only within a day of the link: the `groups`
+/// test `a_start_reports_a_stranded_group_only_within_a_day_of_the_link`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_in_the_middle_of_a_transfer_reports_the_work_again() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let Linked { core, device, key } = linked;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    // Long after the link: only the transfer is the reason to report.
+    world
+        .files
+        .execute("UPDATE account SET linked_at = linked_at - 2592000000")
+        .expect("an old link");
+
+    let mut core = world.restart(network());
+    core.send(Command::Connect).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) => {
+                assert!(!p.finished, "finished while the transfer waits");
+                break;
+            }
+            Some(_) => {}
+            None => panic!("the start did not report the work of the unfinished transfer"),
+        }
+    }
+    // The phone answers at last: the transfer ends and the report says so.
+    let linked = Linked { core, device, key };
+    let (path, _) = world.archive(&linked, &history(40));
+    world.upload(&linked.device, &path).await;
+    let Linked { mut core, .. } = linked;
+    let deadline = tokio::time::Instant::now() + 3 * WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) if p.finished => break,
+            Some(_) => {}
+            None => panic!("no finished report after the transfer ended"),
+        }
+    }
+    world.expect_arrival(held).await;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+// Step S4b: groups.
+
+/// The core's key of a harness group (`group:gv2:<base64url group id>`).
+fn group_conv(group: &support::harness::GroupInfo) -> String {
+    use base64::Engine as _;
+    let id = base64::engine::general_purpose::STANDARD
+        .decode(&group.id)
+        .expect("group id");
+    format!(
+        "group:gv2:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id)
+    )
+}
+
+fn master_key_of(group: &support::harness::GroupInfo) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(&group.master_key)
+        .expect("master key")
+}
+
+/// The upserts of `conv` in commit order.
+fn upserts_of(world: &World, conv: &str) -> Vec<serde_json::Value> {
+    world
+        .sink
+        .event_values("ConversationUpsert")
+        .into_iter()
+        .filter(|patch| patch["key"] == conv)
+        .collect()
+}
+
+/// Waits until the merged upserts of `conv` satisfy `pred`.
+async fn until_upserts(
+    world: &World,
+    conv: &str,
+    what: &str,
+    pred: impl Fn(&serde_json::Map<String, serde_json::Value>) -> bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let merged = merged_upserts(world, conv);
+        if pred(&merged) {
+            return merged;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn contact_of(primary: &Primary, name: &str) -> ContactSpec {
+    ContactSpec {
+        aci: Some(primary.aci.parse().expect("ACI")),
+        profile_name: format!("{MARKER} {name}"),
+        profile_sharing: true,
+        ..ContactSpec::default()
+    }
+}
+
+/// Step S4b, mock tests 2, 3, 6 and 10: an imported group is upserted with the ARCHIVE's
+/// title, members (admin, member, invited by PNI, requesting) and timer (the snapshot's
+/// seconds), its features say "still loading" (not "no longer a member"), and its `groups`
+/// row has no snapshot and one refresh. The refresh then fetches the SERVER's group: its
+/// title, members and timer replace the archive's, no notice is made for the difference,
+/// sending becomes possible, the archive's archived flag stays; and a member's live message
+/// lands in the same conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_imported_group_comes_from_the_archive_and_its_first_fetch_replaces_title_members_and_timer()
+ {
+    use kourier_signal::archive_testing::{GroupSpec, Party, SnapshotSpec, Who};
+    use support::harness::{CreateGroup, SendGroupText};
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let bo = world
+        .harness
+        .create_primary(&CreatePrimary::named("Bo"))
+        .await
+        .expect("Bo");
+    let group = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.phone.device_ref.clone(),
+            title: "Server title".to_owned(),
+            members: vec![world.alice.device_ref.clone(), bo.device_ref.clone()],
+            timer: Some(600),
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("createGroup");
+    let conv = group_conv(&group);
+    let invitee = Uuid::from_bytes([0x6b; 16]);
+    let asking = Uuid::from_bytes([0x6c; 16]);
+    let spec = HistorySpec {
+        contacts: vec![contact_of(&world.alice, "Alice"), contact_of(&bo, "Bo")],
+        groups: vec![GroupSpec {
+            master_key: master_key_of(&group),
+            whitelisted: true,
+            blocked: false,
+            snapshot: Some(SnapshotSpec {
+                title: Some(format!("{MARKER} Archive title")),
+                timer_secs: Some(3_600),
+                members: vec![(Party::Own, true), (Party::Contact(0), false)],
+                pending: vec![Party::Pni(invitee)],
+                requesting: vec![Party::Aci(asking)],
+                invite_link_password: MARKER.as_bytes().to_vec(),
+            }),
+        }],
+        chats: vec![ChatSpec {
+            with: ChatWith::Group(0),
+            archived: true,
+            texts: vec![
+                TextSpec {
+                    author: Some(Who::Contact(0)),
+                    ..incoming(&format!("{MARKER} from Alice"), T0 + 1, true)
+                },
+                TextSpec {
+                    author: Some(Who::Contact(1)),
+                    ..incoming(&format!("{MARKER} from Bo"), T0 + 2, false)
+                },
+            ],
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    let fetches_before = world
+        .harness
+        .send_stats()
+        .await
+        .expect("sendStats")
+        .group_fetches
+        .get(&group.id)
+        .copied()
+        .unwrap_or(0);
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let (path, _) = world.archive(&linked, &spec);
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+
+    // The import's own upsert: the archive's group.
+    let first = upserts_of(&world, &conv)
+        .into_iter()
+        .find(|patch| !patch["features"].is_null())
+        .expect("the import's upsert");
+    assert_eq!(first["title"]["Set"], format!("{MARKER} Archive title"));
+    assert_eq!(
+        first["timer"]["Set"]["secs"], 3_600,
+        "the snapshot's SECONDS"
+    );
+    assert_eq!(first["archived"], true);
+    assert_eq!(first["features"]["cannot_send"], "StillLoading");
+    let roles: Vec<(String, String)> = first["members"]["upsert"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| {
+            (
+                m["user"].as_str().unwrap_or_default().to_owned(),
+                m["role"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let own = format!("aci:{}", linked.device.aci);
+    assert_eq!(
+        roles,
+        [
+            (own, "Admin".to_owned()),
+            (format!("aci:{}", world.alice.aci), "Member".to_owned()),
+            (
+                format!("pni:{}", invitee.hyphenated()),
+                "Pending".to_owned()
+            ),
+            (
+                format!("aci:{}", asking.hyphenated()),
+                "Requesting".to_owned()
+            ),
+        ]
+    );
+    // Both items are in the group.
+    let in_group = world.sink.messages_in(&conv);
+    assert!(
+        in_group.iter().filter(|m| m.body.contains(MARKER)).count() == 2,
+        "the group's two items"
+    );
+
+    // The refresh: the server's group replaces the archive's.
+    let merged = until_upserts(&world, &conv, "the server's title", |m| {
+        m.get("title").is_some_and(|t| t["Set"] == "Server title")
+    })
+    .await;
+    assert_eq!(merged["timer"]["Set"]["secs"], 600);
+    assert!(
+        merged["features"]["cannot_send"].is_null(),
+        "a member can send"
+    );
+    assert_eq!(merged["archived"], true, "the archive's flag stays");
+    assert_eq!(
+        merged["members"]["upsert"].as_array().map(Vec::len),
+        Some(3)
+    );
+    assert!(
+        !world
+            .sink
+            .messages_in(&conv)
+            .iter()
+            .any(|m| m.body.starts_with("<System>")),
+        "a first fetch makes no notices for what changed since the export"
+    );
+    let fetches = world
+        .harness
+        .send_stats()
+        .await
+        .expect("sendStats")
+        .group_fetches
+        .get(&group.id)
+        .copied()
+        .unwrap_or(0);
+    assert!(fetches > fetches_before, "the group was fetched");
+    assert_eq!(
+        world
+            .files
+            .peek_i64(
+                "SELECT count(*) FROM groups WHERE state IS NOT NULL AND features_hash IS NOT NULL"
+            )
+            .expect("groups"),
+        Some(1)
+    );
+    // The password of the invite link is nowhere in backend.db.
+    assert_eq!(
+        world
+            .files
+            .peek_i64(&format!(
+                "SELECT count(*) FROM groups WHERE instr(state, CAST('{MARKER}' AS BLOB)) > 0"
+            ))
+            .expect("groups"),
+        Some(0)
+    );
+    world.expect_arrival(held).await;
+    linked.core.wait_online().await;
+
+    // A member writes into the imported group: the same conversation.
+    let sent = world
+        .harness
+        .send_group_text(&SendGroupText {
+            from: world.alice.aci.clone(),
+            group: group.id.clone(),
+            to: vec![linked.device.device_ref.clone()],
+            text: "live in the group".to_owned(),
+            ..SendGroupText::default()
+        })
+        .await
+        .expect("sendGroupText");
+    let message = world
+        .sink
+        .wait_message(
+            &format!("aci:{}", world.alice.aci),
+            &sent.timestamp.to_string(),
+            WAIT,
+        )
+        .await
+        .expect("the live group message");
+    assert_eq!(message.conv, conv);
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    // Nothing of the group was logged: not the marker, not its title (the archive's or the
+    // server's), not its members' names.
+    let log = log_buffer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let log = String::from_utf8_lossy(&log);
+    assert!(
+        log.contains("group state applied"),
+        "the log was captured and holds the first fetch"
+    );
+    for secret in [
+        MARKER,
+        "Archive title",
+        "Server title",
+        "Alice",
+        "\"Bo\"",
+        "live in the group",
+    ] {
+        assert!(!log.contains(secret), "content of a group in the log");
+    }
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Step S4b, mock tests 4, 5, 11, 12 and 13: a group the archive says we LEFT is read-only
+/// and is refreshed once (D10); a group with an EMPTY snapshot comes without title and
+/// members, then takes them from its first fetch; the group changes become the live path's
+/// notices (the actor-less entry skipped); member items, a quote, a reaction; a missed
+/// group call is a line of its group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_left_group_is_refreshed_once_and_group_items_notices_and_calls_are_imported() {
+    use kourier_signal::archive_testing::{
+        CallSpec, GroupCallSpec, GroupChangeSpec, GroupSpec, ItemSpec, NoticeSpec, Party,
+        QuoteSpec, ReactionSpec, SnapshotSpec, Who,
+    };
+    use support::harness::CreateGroup;
+    let Some(world) = World::start().await else {
+        return;
+    };
+    // A group without us on the server (Alice made it), and one with us whose state the
+    // phone did not have.
+    let left = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.alice.device_ref.clone(),
+            title: "Alice's group".to_owned(),
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("createGroup");
+    let empty = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.phone.device_ref.clone(),
+            title: "Fetched title".to_owned(),
+            members: vec![world.alice.device_ref.clone()],
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("createGroup");
+    let (left_conv, empty_conv) = (group_conv(&left), group_conv(&empty));
+    let notice = |entries| TextSpec {
+        outgoing: true,
+        kind: ItemSpec::Notice(NoticeSpec::GroupChange(entries)),
+        sent_at: T0 + 10,
+        ..TextSpec::default()
+    };
+    let spec = HistorySpec {
+        contacts: vec![contact_of(&world.alice, "Alice")],
+        groups: vec![
+            GroupSpec {
+                master_key: master_key_of(&left),
+                snapshot: Some(SnapshotSpec {
+                    title: Some(format!("{MARKER} Left")),
+                    members: vec![(Party::Contact(0), true)],
+                    ..SnapshotSpec::default()
+                }),
+                ..GroupSpec::default()
+            },
+            GroupSpec {
+                master_key: master_key_of(&empty),
+                snapshot: None,
+                ..GroupSpec::default()
+            },
+        ],
+        chats: vec![
+            ChatSpec {
+                with: ChatWith::Group(0),
+                texts: vec![
+                    TextSpec {
+                        author: Some(Who::Contact(0)),
+                        ..incoming(&format!("{MARKER} before we left"), T0 + 1, true)
+                    },
+                    TextSpec {
+                        quote: Some(QuoteSpec {
+                            target: Some(T0 + 1),
+                            author: Some(Who::Contact(0)),
+                            text: "before we left".to_owned(),
+                            ..QuoteSpec::default()
+                        }),
+                        reactions: vec![ReactionSpec {
+                            by: Who::Contact(0),
+                            emoji: "\u{1f44d}".to_owned(),
+                            sent_at: T0 + 3,
+                            sort_order: 1,
+                        }],
+                        statuses_by: vec![(Who::Contact(0), SendStatusSpec::Read)],
+                        ..outgoing(&format!("{MARKER} our reply"), T0 + 2, &[])
+                    },
+                    notice(vec![
+                        GroupChangeSpec::Name {
+                            by: Party::Contact(0),
+                            name: Some("\u{2068}Новий\u{2069}".to_owned()),
+                        },
+                        GroupChangeSpec::Avatar { by: Party::Absent },
+                        GroupChangeSpec::MemberRemoved {
+                            by: Party::Contact(0),
+                            removed: Party::Own,
+                        },
+                    ]),
+                    TextSpec {
+                        kind: ItemSpec::Call(CallSpec::Group {
+                            call_id: Some(4_242),
+                            state: GroupCallSpec::Missed,
+                            ringer: Some(Who::Contact(0)),
+                            started_by: None,
+                            read: false,
+                            started_at: T0 + 20,
+                        }),
+                        sent_at: T0 + 20,
+                        ..TextSpec::default()
+                    },
+                ],
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::Group(1),
+                texts: vec![TextSpec {
+                    author: Some(Who::Contact(0)),
+                    ..incoming(
+                        &format!("{MARKER} in a group the phone had no state of"),
+                        T0 + 30,
+                        true,
+                    )
+                }],
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let (path, _) = world.archive(&linked, &spec);
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+
+    // Left: read-only from the start, membership 'left', and its one refresh ran: the server
+    // was asked for the group and the job is gone. (Not `fetched_at`: the mock answers 200
+    // to a non-member where the real server answers 403, which stores nothing for a row the
+    // import wrote 'left'; so the fetch is counted on the server's side.)
+    let first = upserts_of(&world, &left_conv)
+        .into_iter()
+        .find(|patch| !patch["features"].is_null())
+        .expect("the import's upsert");
+    assert_eq!(first["features"]["cannot_send"], "NotMember");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let fetches = world
+            .harness
+            .send_stats()
+            .await
+            .expect("sendStats")
+            .group_fetches
+            .get(&left.id)
+            .copied()
+            .unwrap_or(0);
+        if fetches > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the left group was never fetched"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    world
+        .files
+        .wait_for_i64(
+            "the left group's refresh job is gone",
+            "SELECT count(*) FROM groups g WHERE g.membership = 'left'
+               AND g.features_hash IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM jobs j
+                               WHERE j.kind = 'group_refresh' AND j.key = lower(hex(g.group_id)))",
+            |n| n >= Some(1),
+        )
+        .await
+        .expect("refresh of the left group");
+    // Empty snapshot: no title and no members from the import, then the server's.
+    let first = upserts_of(&world, &empty_conv)
+        .into_iter()
+        .find(|patch| !patch["features"].is_null())
+        .expect("the import's upsert");
+    assert!(
+        first["title"].is_null() && first["members"].is_null(),
+        "{first}"
+    );
+    assert_eq!(first["features"]["cannot_send"], "StillLoading");
+    until_upserts(&world, &empty_conv, "the fetched title", |m| {
+        m.get("title").is_some_and(|t| t["Set"] == "Fetched title")
+    })
+    .await;
+    assert_eq!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM jobs WHERE kind = 'group_refresh'")
+            .expect("jobs"),
+        Some(0),
+        "every refresh done, none left"
+    );
+
+    // The rows of the left group.
+    let rows = world.sink.messages_in(&left_conv);
+    let alice = format!("aci:{}", world.alice.aci);
+    assert!(
+        rows.iter()
+            .any(|m| m.author == alice && m.body.contains("before we left"))
+    );
+    let notices: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|m| m.body.strip_prefix("<System>"))
+        .map(|json| serde_json::from_str(json).expect("event"))
+        .filter(|event: &serde_json::Value| event.get("Call").is_none())
+        .collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(
+        notices[0]["TitleChanged"]["title"], "Новий",
+        "one isolate pair off"
+    );
+    assert_eq!(notices[0]["TitleChanged"]["by"], alice.as_str());
+    assert_eq!(notices[1]["MembersRemoved"]["by"], alice.as_str());
+    let reply = rows
+        .iter()
+        .find(|m| m.body.contains("our reply"))
+        .expect("our reply");
+    let json = world.sink.message_values(&reply.author, &reply.local);
+    let json = json.first().expect("its json");
+    assert_eq!(json["reply_to"]["target"]["author"]["User"], alice.as_str());
+    assert_eq!(json["reactions"][0]["by"], alice.as_str());
+    assert_eq!(json["initial_out_state"], "Read");
+    assert!(
+        rows.iter()
+            .any(|m| m.local == "gcall:4242" && m.body.contains("Missed")),
+        "the missed group call is a line of its group"
+    );
+    world.expect_arrival(held).await;
+    linked.core.wait_online().await;
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Step S4b, mock test 1: with GROUPS in the archive, nothing of them reaches `backend.db`
+/// or the core before the commit: while the archive is read and at the commit zone there is
+/// no `groups` row, no refresh job, no row for the core and no event, while the stage holds
+/// the group, its members and its notices; the delivery then makes the row and its refresh.
+/// The process is killed right after the commit zone, so the files are looked at exactly as
+/// the commit left them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_of_the_archives_groups_reaches_backend_db_before_the_commit() {
+    use kourier_signal::archive_testing::{GroupSpec, Party, SnapshotSpec, Who};
+    let Some(world) = World::start().await else {
+        return;
+    };
+    // The 1:1 history, and a group on top of it: members by ACI and by PNI, an invitation,
+    // a request, a title and a password that must not be kept, items by two members and
+    // a change of the name.
+    let mut spec = history(900);
+    let group_key = vec![0x5a; 32];
+    spec.groups = vec![GroupSpec {
+        master_key: group_key.clone(),
+        whitelisted: true,
+        blocked: false,
+        snapshot: Some(SnapshotSpec {
+            title: Some(format!("{MARKER} Hikers")),
+            timer_secs: Some(3_600),
+            members: vec![
+                (Party::Own, false),
+                (Party::Contact(0), true),
+                (Party::Contact(2), false),
+            ],
+            pending: vec![Party::Pni(Uuid::from_bytes([0x6b; 16]))],
+            requesting: vec![Party::Aci(Uuid::from_bytes([0x6c; 16]))],
+            invite_link_password: b"group-password-5d1c".to_vec(),
+        }),
+    }];
+    spec.chats.push(ChatSpec {
+        with: ChatWith::Group(0),
+        pinned_order: Some(1),
+        texts: vec![
+            TextSpec {
+                author: Some(Who::Contact(0)),
+                ..incoming(&format!("{MARKER} from Ann in the group"), T0 + 40, true)
+            },
+            TextSpec {
+                author: Some(Who::Contact(2)),
+                ..incoming(&format!("{MARKER} from Cat in the group"), T0 + 41, false)
+            },
+            TextSpec {
+                outgoing: true,
+                kind: kourier_signal::archive_testing::ItemSpec::Notice(
+                    kourier_signal::archive_testing::NoticeSpec::GroupChange(vec![
+                        kourier_signal::archive_testing::GroupChangeSpec::Name {
+                            by: Party::Contact(0),
+                            name: Some(format!("{MARKER} Renamed")),
+                        },
+                    ]),
+                ),
+                sent_at: T0 + 42,
+                ..TextSpec::default()
+            },
+        ],
+        ..ChatSpec::default()
+    });
+    let (linked, frames, held) = linked_with_an_archive(&world, &spec).await;
+    let Linked { core, device, key } = linked;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+
+    let mut child = spawn_child(
+        &world,
+        8,
+        Some(kourier_signal::failpoints::AFTER_HISTORY_IMPORT_COMMIT),
+    );
+    world.wait_reading_into_the_stage().await;
+    let before = world.settled().await;
+    assert_eq!(
+        world.row("state = 'reading' AND import_staged = 0"),
+        Some(1)
+    );
+    let int = |sql: &str| world.files.peek_i64(sql).expect("backend.db").unwrap_or(0);
+    let nothing_of_the_groups = |when: &str| {
+        assert_eq!(int("SELECT count(*) FROM groups"), 0, "{when}: a group row");
+        assert_eq!(
+            int("SELECT count(*) FROM jobs WHERE kind = 'group_refresh'"),
+            0,
+            "{when}: a refresh of a group"
+        );
+        for needle in [MARKER, "group-password-5d1c"] {
+            assert_eq!(
+                int(&format!(
+                    "SELECT count(*) FROM core_outbox
+                      WHERE instr(envelope, CAST('{needle}' AS BLOB)) > 0"
+                )),
+                0,
+                "{when}: a row for the core holds a text of the group"
+            );
+        }
+        assert!(
+            world
+                .sink
+                .event_values("ConversationUpsert")
+                .iter()
+                .all(|patch| !patch["key"].as_str().unwrap_or("").starts_with("group:")),
+            "{when}: an upsert of a group reached the core"
+        );
+    };
+    nothing_of_the_groups("while the archive is read");
+
+    wait_aborted(&mut child).await;
+    // The commit recorded the stage; the stage holds the group, and still nothing else
+    // changed, strictly.
+    assert_eq!(
+        world.row("state = 'reading' AND import_staged = 1 AND read_open = 0"),
+        Some(1),
+        "the commit zone recorded the stage"
+    );
+    let dump = read_stage(&world.transfer_dir(), &key).expect("the committed stage");
+    assert_eq!(dump.frames, frames);
+    let staged = dump
+        .chats
+        .iter()
+        .find_map(|chat| chat.group.as_ref().map(|group| (chat, group)))
+        .expect("the group is in the stage");
+    assert_eq!(staged.1.membership, "member");
+    assert_eq!(
+        staged.1.title.as_deref(),
+        Some(&*format!("{MARKER} Hikers"))
+    );
+    assert_eq!(staged.1.members.as_ref().map(Vec::len), Some(5));
+    assert_eq!(staged.0.messages.len(), 3, "two texts and the notice");
+    assert_eq!(world.untouched(), before, "the import touched something");
+    nothing_of_the_groups("at the commit");
+    let _ = device;
+
+    // The delivery then makes the group's row, its features and one refresh; the server
+    // does not know this made-up group, so the refresh is a 404 and the row is 'gone'.
+    let mut core = world.restart(network());
+    core.send(Command::Connect).await;
+    until(&mut core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_over("done", None);
+    assert_eq!(int("SELECT count(*) FROM groups"), 1);
+    assert_eq!(
+        int("SELECT count(*) FROM groups WHERE features_hash IS NOT NULL AND state IS NULL"),
+        1
+    );
+    world.expect_arrival(held).await;
+    core.wait_online().await;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Step S4b, mock test 9 for groups: the Storage Service sync that follows the transfer
+/// wins over the archive's flags of a group where they differ (archived, marked unread,
+/// muted, blocked), and makes no event for a group where they agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_storage_sync_wins_over_the_archives_group_flags_and_is_silent_where_they_agree() {
+    use kourier_signal::archive_testing::{GroupSpec, Party, SnapshotSpec, Who};
+    use support::harness::{CreateGroup, StorageGroup};
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut groups = Vec::new();
+    for title in ["Differs", "Agrees"] {
+        groups.push(
+            world
+                .harness
+                .create_group(&CreateGroup {
+                    from: world.phone.device_ref.clone(),
+                    title: title.to_owned(),
+                    members: vec![world.alice.device_ref.clone()],
+                    ..CreateGroup::default()
+                })
+                .await
+                .expect("createGroup"),
+        );
+    }
+    // The phone's Storage Service: the first group is not archived, not unread, not muted;
+    // the second is archived, as the archive says.
+    world
+        .harness
+        .set_storage_state(&StorageSpec {
+            primary: world.phone.device_ref.clone(),
+            contacts: vec![StorageContact::of(&world.alice.device_ref)],
+            groups: vec![
+                StorageGroup {
+                    id: groups[0].id.clone(),
+                    archived: Some(false),
+                    marked_unread: Some(false),
+                    blocked: Some(false),
+                    ..StorageGroup::default()
+                },
+                StorageGroup {
+                    id: groups[1].id.clone(),
+                    archived: Some(true),
+                    marked_unread: Some(false),
+                    blocked: Some(false),
+                    ..StorageGroup::default()
+                },
+            ],
+            ..StorageSpec::default()
+        })
+        .await
+        .expect("storage state");
+    let snapshot = || {
+        Some(SnapshotSpec {
+            title: Some(format!("{MARKER} archive")),
+            members: vec![(Party::Own, false), (Party::Contact(0), false)],
+            ..SnapshotSpec::default()
+        })
+    };
+    let group_chat = |index: usize, archived: bool, differs: bool| ChatSpec {
+        with: ChatWith::Group(index),
+        archived,
+        marked_unread: differs,
+        mute_until_ms: differs.then_some(i64::MAX as u64),
+        texts: vec![TextSpec {
+            author: Some(Who::Contact(0)),
+            ..incoming(
+                &format!("{MARKER} in group {index}"),
+                T0 + 1 + index as u64,
+                true,
+            )
+        }],
+        ..ChatSpec::default()
+    };
+    let spec = HistorySpec {
+        contacts: vec![contact_of(&world.alice, "Alice")],
+        groups: groups
+            .iter()
+            .map(|group| GroupSpec {
+                master_key: master_key_of(group),
+                whitelisted: true,
+                blocked: false,
+                snapshot: snapshot(),
+            })
+            .collect(),
+        chats: vec![group_chat(0, true, true), group_chat(1, true, false)],
+        ..HistorySpec::default()
+    };
+    let (mut linked, _, held) = linked_with_an_archive(&world, &spec).await;
+    let (differs, agrees) = (group_conv(&groups[0]), group_conv(&groups[1]));
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_arrival(held).await;
+    // The import said yes ...
+    let first = upserts_of(&world, &differs)
+        .into_iter()
+        .find(|patch| !patch["features"].is_null())
+        .expect("the import's upsert");
+    assert_eq!(first["archived"], true);
+    assert_eq!(first["marked_unread"], true);
+    assert_eq!(first["muted_until"]["Set"], i64::MAX);
+    // ... and the first sync, which had no previous record, says no and wins.
+    let merged = until_upserts(&world, &differs, "the sync's flags", |m| {
+        m.get("archived") == Some(&serde_json::json!(false))
+    })
+    .await;
+    assert_eq!(merged["marked_unread"], false);
+    assert_eq!(merged["muted_until"], "Clear");
+    assert_eq!(merged["blocked"], false);
+    world
+        .files
+        .wait_for_i64(
+            "the first Storage Service sync",
+            "SELECT count(*) FROM account WHERE manifest_version IS NOT NULL",
+            |n| n == Some(1),
+        )
+        .await;
+    // Where the record agrees with the row the import wrote, the sync says nothing: an
+    // upsert that carries flags and neither a title nor features is the sync's.
+    let by_the_sync: Vec<serde_json::Value> = upserts_of(&world, &agrees)
+        .into_iter()
+        .filter(|patch| {
+            !patch["archived"].is_null() && patch["title"].is_null() && patch["features"].is_null()
+        })
+        .collect();
+    assert!(by_the_sync.is_empty(), "{by_the_sync:?}");
+    let sync_of_the_first = upserts_of(&world, &differs)
+        .into_iter()
+        .filter(|patch| patch["title"].is_null() && patch["features"].is_null())
+        .count();
+    assert_eq!(sync_of_the_first, 1, "one upsert of the flags that differ");
+    // The backend's rows say what the sync said.
+    assert_eq!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM groups WHERE archived = 1 AND marked_unread = 0")
+            .expect("groups"),
+        Some(1),
+        "only the agreeing group stays archived"
+    );
+    linked.core.wait_online().await;
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+// ---- Step S5: attachment pointers -------------------------------------------------------
+
+/// This computer's clock (ms).
+fn wall_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("ms")
+}
+
+fn attachments_of(msg: &kourier_backend_api::IncomingMessage) -> Vec<kourier_model::Attachment> {
+    match &msg.body {
+        kourier_model::Body::Media { attachments, .. } => attachments.clone(),
+        kourier_model::Body::Sticker(image) => vec![(**image).clone()],
+        other => panic!("attachments: {other:?}"),
+    }
+}
+
+/// D8 with the user's decisions (step S5): an imported picture whose place on the CDN is
+/// young is delivered `Remote` with its pointer, and the import asks the CDN for NOTHING of
+/// it (nor of any other attachment): only the archive itself is downloaded. A click (the
+/// core's `DownloadAttachment`) makes exactly one request and the blob decrypts under the
+/// plaintext hash. One the CDN no longer has becomes "no longer available" on the click
+/// (404 → `Expired`); one older than the age rule is "not available on this device" at
+/// once, without a pointer, and is never asked for. Nothing of a pointer is logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_imported_picture_downloads_on_a_click_and_the_import_asks_the_cdn_nothing() {
+    use kourier_signal::archive_testing::{
+        AttachmentSpec, LocatorSpec, PointerSpec, encrypt_attachment,
+    };
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    let now = wall_ms();
+    let hour = 3_600_000;
+    let key = [0x5a; 64];
+    let plain: Vec<u8> = (0..30_000u32).map(|i| (i % 253) as u8).collect();
+    let young = encrypt_attachment(&plain, &key, [1; 16]).expect("encrypt");
+    // CDN keys as the server makes them (not route words: the request log replaces them).
+    let cdn3 = world
+        .harness
+        .handshake()
+        .state_dir
+        .join("cdn3")
+        .join("attachments");
+    std::fs::create_dir_all(&cdn3).expect("cdn3");
+    std::fs::write(cdn3.join("S5YoungKey"), &young.blob).expect("store");
+    std::fs::write(cdn3.join("S5OldKey"), &young.blob).expect("store");
+    let picture = |cdn_key: &str, upload: Option<u64>| AttachmentSpec {
+        pointer: Some(PointerSpec {
+            content_type: Some("image/png".to_owned()),
+            locator: Some(LocatorSpec::of(&young, &key, 3, cdn_key, upload, true)),
+            ..PointerSpec::default()
+        }),
+        flag: 0,
+        client_uuid: Some([0x77; 16]),
+    };
+    let with = |sent_at: u64, attachment: AttachmentSpec| TextSpec {
+        attachments: vec![attachment],
+        ..incoming("", sent_at, true)
+    };
+    let spec = HistorySpec {
+        contacts: history(0).contacts,
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts: vec![
+                with(now - 2 * hour, picture("S5YoungKey", Some(now - 2 * hour))),
+                with(now - 2 * hour + 1, picture("S5GoneKey", None)),
+                // Two hundred days old: older than twice the 30-day floor (the mock's config
+                // has no queue time).
+                with(now - 200 * 24 * hour, picture("S5OldKey", None)),
+            ],
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    let (path, _) = world.archive(&linked, &spec);
+    let place = world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_arrival(held).await;
+
+    let by_time = |at: u64| -> kourier_backend_api::IncomingMessage {
+        let json = world.sink.message_values(&user(ANN), &at.to_string());
+        serde_json::from_value(
+            json.last()
+                .cloned()
+                .unwrap_or_else(|| panic!("the message of {at}")),
+        )
+        .expect("an IncomingMessage")
+    };
+    let [young_att] = &attachments_of(&by_time(now - 2 * hour))[..] else {
+        panic!("one attachment");
+    };
+    assert_eq!(young_att.state, kourier_model::AttachmentState::Remote);
+    let remote = young_att.remote.clone().expect("a pointer");
+    assert_eq!(remote.v, 3, "the archive's pointer");
+    assert!(
+        young_att
+            .net_ids
+            .contains(&format!("uuid:{}", "77".repeat(16))),
+        "named by its client UUID"
+    );
+    let [gone_att] = &attachments_of(&by_time(now - 2 * hour + 1))[..] else {
+        panic!("one attachment");
+    };
+    assert_eq!(gone_att.state, kourier_model::AttachmentState::Remote);
+    let [old_att] = &attachments_of(&by_time(now - 200 * 24 * hour))[..] else {
+        panic!("one attachment");
+    };
+    assert_eq!(old_att.state, kourier_model::AttachmentState::Unavailable);
+    assert_eq!(
+        old_att.remote, None,
+        "no key is kept for an object that is not there"
+    );
+    assert!(
+        !old_att.net_ids.is_empty(),
+        "its names stay for a later ask of the phone"
+    );
+
+    // The import asked the CDN for the archive and for nothing else.
+    let asked = |stats: &[support::harness::DownloadStat]| -> Vec<String> {
+        stats
+            .iter()
+            .filter(|s| s.key != place.key)
+            .map(|s| s.key.clone())
+            .collect()
+    };
+    let downloads = world.harness.downloads().await.expect("downloadStats");
+    assert!(asked(&downloads).is_empty(), "{:?}", asked(&downloads));
+
+    // A click: one request, the blob decrypts under the plaintext hash.
+    let blobs = world.files.dir.join("blobs");
+    let target = |name: &str| kourier_backend_api::BlobTarget {
+        path: blobs.join("core").join("s5").join(name),
+        key: kourier_model::BlobKey::new([0x42; 32]),
+    };
+    linked
+        .core
+        .send(Command::DownloadAttachment {
+            attachment: kourier_model::AttachmentId(1),
+            request: kourier_model::DownloadId(1),
+            remote,
+            dest: target("young"),
+            net_ids: Vec::new().into(),
+        })
+        .await;
+    linked
+        .core
+        .send(Command::DownloadAttachment {
+            attachment: kourier_model::AttachmentId(2),
+            request: kourier_model::DownloadId(2),
+            remote: gone_att.remote.clone().expect("a pointer"),
+            dest: target("gone"),
+            net_ids: Vec::new().into(),
+        })
+        .await;
+    world.sink.wait_events("AttachmentDone", 2, WAIT).await;
+    let results = world.sink.event_values("AttachmentDone");
+    let result = |id: i64| {
+        results
+            .iter()
+            .find(|r| r["attachment"] == id)
+            .unwrap_or_else(|| panic!("AttachmentDone {id}: {results:?}"))["result"]
+            .clone()
+    };
+    assert_eq!(result(1)["Ok"]["size"], 30_000, "{}", result(1));
+    let got = kourier_blob::read_all(
+        &target("young").path,
+        &kourier_blob::FileKey::from_bytes([0x42; 32]),
+    )
+    .expect("the downloaded blob");
+    assert_eq!(&got[..], &plain[..]);
+    assert_eq!(
+        result(2)["Err"]["kind"],
+        "Expired",
+        "gone from the CDN: no longer available ({})",
+        result(2)
+    );
+    assert!(
+        !target("gone").path.exists(),
+        "nothing is left of a failed download"
+    );
+    let downloads = world.harness.downloads().await.expect("downloadStats");
+    let mut asked = asked(&downloads);
+    asked.sort();
+    assert_eq!(
+        asked,
+        ["S5GoneKey", "S5YoungKey"],
+        "one request per click, the old one never"
+    );
+
+    // Nothing of a pointer reaches the log.
+    let log = String::from_utf8_lossy(&log_buffer().lock().expect("log")).into_owned();
+    for secret in ["S5YoungKey", "S5GoneKey", "S5OldKey", &"5a".repeat(8)] {
+        let line = log.lines().find(|l| l.contains(secret));
+        assert!(line.is_none(), "the log names {secret}: {line:?}");
+    }
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+}
+
+/// The age window and the receive limit come from the remote config `backend.db` holds when
+/// the read begins: a message queue time of 60 days (a window of twice that) makes a picture
+/// of 100 days a download (the 30-day floor would not), one of 250 days is still not
+/// available, and a picture above the server's receive limit is not available either (no dead
+/// "Retry Download"). The age counts back from the PHONE's export time, bounded to a day before
+/// the import: the test writer's export time is in 2023, so the reference is the import's
+/// time minus a day, and a picture half a day inside the window by that reference is a
+/// download although it is half a day outside it by this computer's clock (and one half a
+/// day outside it is not).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_servers_queue_time_and_receive_limit_decide_at_the_import() {
+    use kourier_signal::archive_testing::{
+        AttachmentSpec, LocatorSpec, PointerSpec, encrypt_attachment,
+    };
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let day: u64 = 24 * 3_600_000;
+    world
+        .harness
+        .set_remote_config(
+            "global.messageQueueTimeInSeconds",
+            true,
+            Some(&(60 * 86_400).to_string()),
+        )
+        .await
+        .expect("queue time");
+    world
+        .harness
+        .set_remote_config("global.attachments.maxReceiveBytes", true, Some("25000"))
+        .await
+        .expect("receive limit");
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    world
+        .files
+        .wait_for_i64(
+            "the remote config is stored",
+            "SELECT count(*) FROM remote_config
+              WHERE name IN ('global.messageQueueTimeInSeconds',
+                             'global.attachments.maxReceiveBytes')",
+            |v| v == Some(2),
+        )
+        .await;
+    let now = wall_ms();
+    let key = [0x2b; 64];
+    let small = encrypt_attachment(&[7; 20_000], &key, [1; 16]).expect("encrypt");
+    let large = encrypt_attachment(&[7; 30_000], &key, [1; 16]).expect("encrypt");
+    let picture = |encrypted, cdn_key: &str| AttachmentSpec {
+        pointer: Some(PointerSpec {
+            content_type: Some("image/png".to_owned()),
+            locator: Some(LocatorSpec::of(encrypted, &key, 3, cdn_key, None, true)),
+            ..PointerSpec::default()
+        }),
+        flag: 0,
+        client_uuid: None,
+    };
+    let with = |sent_at: u64, attachment: AttachmentSpec| TextSpec {
+        attachments: vec![attachment],
+        ..incoming("", sent_at, true)
+    };
+    let (days100, days250, large_at) = (now - 100 * day, now - 250 * day, now - day);
+    // The window's edge by the reference (the import's time minus a day): 121 days back.
+    let (inside, outside) = (now - 121 * day + day / 2, now - 121 * day - day / 2);
+    let spec = HistorySpec {
+        contacts: history(0).contacts,
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts: vec![
+                with(days100, picture(&small, "S5Days100")),
+                with(days250, picture(&small, "S5Days250")),
+                with(large_at, picture(&large, "S5Large")),
+                with(inside, picture(&small, "S5Inside")),
+                with(outside, picture(&small, "S5Outside")),
+            ],
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    let (path, _) = world.archive(&linked, &spec);
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_arrival(held).await;
+    let state = |at: u64| {
+        let json = world.sink.message_values(&user(ANN), &at.to_string());
+        let msg: kourier_backend_api::IncomingMessage =
+            serde_json::from_value(json.last().cloned().expect("the message")).expect("message");
+        attachments_of(&msg)[0].state
+    };
+    use kourier_model::AttachmentState::{Remote, Unavailable};
+    assert_eq!(
+        [state(days100), state(days250), state(large_at)],
+        [Remote, Unavailable, Unavailable]
+    );
+    assert_eq!(
+        [state(inside), state(outside)],
+        [Remote, Unavailable],
+        "the age counts from the phone's export time, a day before the import at most"
+    );
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+}
+
+/// The reference of the age rule IS the phone's export time when it is within a day of the
+/// import (not the day-before bound the writer's default time falls to): with the export
+/// twelve hours before the import, a picture an hour inside the window by it is a download,
+/// and one an hour outside it is "not available" although it is half a day INSIDE the window
+/// by the day-before bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_age_window_counts_from_the_export_time_when_it_is_within_a_day_of_the_import() {
+    use kourier_signal::archive_testing::{
+        AttachmentSpec, LocatorSpec, PointerSpec, encrypt_attachment,
+    };
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (hour, day): (u64, u64) = (3_600_000, 24 * 3_600_000);
+    world
+        .harness
+        .set_remote_config(
+            "global.messageQueueTimeInSeconds",
+            true,
+            Some(&(60 * 86_400).to_string()),
+        )
+        .await
+        .expect("queue time");
+    let mut linked = world.link(network()).await;
+    let held = world
+        .alice_says(&linked.device, "waits for the import")
+        .await;
+    world
+        .files
+        .wait_for_i64(
+            "the remote config is stored",
+            "SELECT count(*) FROM remote_config
+              WHERE name = 'global.messageQueueTimeInSeconds'",
+            |v| v == Some(1),
+        )
+        .await;
+    let now = wall_ms();
+    let export = now - 12 * hour;
+    let key = [0x2b; 64];
+    let small = encrypt_attachment(&[7; 20_000], &key, [1; 16]).expect("encrypt");
+    let picture = |cdn_key: &str| AttachmentSpec {
+        pointer: Some(PointerSpec {
+            content_type: Some("image/png".to_owned()),
+            locator: Some(LocatorSpec::of(&small, &key, 3, cdn_key, None, true)),
+            ..PointerSpec::default()
+        }),
+        flag: 0,
+        client_uuid: None,
+    };
+    let with = |sent_at: u64, attachment: AttachmentSpec| TextSpec {
+        attachments: vec![attachment],
+        ..incoming("", sent_at, true)
+    };
+    // The window is 120 days. Its edge by the export time is 120 days before it; by the
+    // day-before bound it would be 12 hours earlier still.
+    let edge = export - 120 * day;
+    let (inside, outside) = (edge + hour, edge - hour);
+    let spec = HistorySpec {
+        contacts: history(0).contacts,
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts: vec![
+                with(inside, picture("S5ExportInside")),
+                with(outside, picture("S5ExportOutside")),
+            ],
+            ..ChatSpec::default()
+        }],
+        export_time_ms: Some(export),
+        ..HistorySpec::default()
+    };
+    let (path, _) = world.archive(&linked, &spec);
+    world.upload(&linked.device, &path).await;
+    until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
+    world.expect_arrival(held).await;
+    let state = |at: u64| {
+        let json = world.sink.message_values(&user(ANN), &at.to_string());
+        let msg: kourier_backend_api::IncomingMessage =
+            serde_json::from_value(json.last().cloned().expect("the message")).expect("message");
+        attachments_of(&msg)[0].state
+    };
+    use kourier_model::AttachmentState::{Remote, Unavailable};
+    assert_eq!(
+        [state(inside), state(outside)],
+        [Remote, Unavailable],
+        "the reference is the export time, twelve hours before the import"
+    );
+    assert_eq!(linked.core.shutdown().await, Exit::Shutdown);
+}
+
+/// Link feedback L2 (`target/link-feedback/tail.md` §4.1, §4.3): after an imported archive the
+/// login's `Done` waits neither for the first Storage Service sync (the archive named every
+/// chat; Desktop does the same) nor for the profile fetches the link queued. With every
+/// manifest request failing and every profile fetch rate limited for ten minutes, `Done`
+/// (`InitialSync::ContactsAndStorage`, the app's) comes once the transfer and the contact
+/// sync are done, before the storage sync gave up (3 failed attempts would also let it
+/// pass), with the profile fetches still queued; the sync runs after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_an_import_the_link_is_done_without_the_storage_sync_and_the_profile_fetches() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    world
+        .harness
+        .set_storage_state(&StorageSpec {
+            primary: world.phone.device_ref.clone(),
+            contacts: vec![StorageContact::of(&world.alice.device_ref)],
+            ..StorageSpec::default()
+        })
+        .await
+        .expect("storage state");
+    world
+        .harness
+        .fail_storage_manifest(true)
+        .await
+        .expect("failStorageManifest");
+    world
+        .harness
+        .limit_profile_fetches(Some(600))
+        .await
+        .expect("limitProfileFetches");
+    let linked = world
+        .link_with(network(), InitialSync::ContactsAndStorage)
+        .await;
+    // Ann's profile key in the archive queues a fetch of her profile.
+    let mut spec = history(0);
+    spec.contacts[0].profile_key = Some([7; 32]);
+    let (path, _) = world.archive(&linked, &spec);
+    world.upload(&linked.device, &path).await;
+    let mut core = linked.core;
+    until(&mut core, "Done", |s| *s == HistoryTransfer::Done).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::Login(step)) => match step.kind {
+                LoginStepKind::Done => break,
+                LoginStepKind::Failed { error } => panic!("login failed: {error:?}"),
+                _ => {}
+            },
+            Some(_) => {}
+            None => panic!("no login Done after the transfer"),
+        }
+    }
+    let refused = world
+        .harness
+        .fail_storage_manifest(true)
+        .await
+        .expect("failStorageManifest");
+    let int = |sql: &str| world.files.peek_i64(sql).expect("backend.db").unwrap_or(0);
+    let storage_attempts = int("SELECT max(attempts) FROM jobs WHERE kind = 'storage_sync'");
+    let profiles = int("SELECT count(*) FROM jobs WHERE kind = 'profile_fetch'");
+    println!(
+        "at Done: {refused} manifest requests refused, storage sync attempts \
+         {storage_attempts}, {profiles} profile fetches queued"
+    );
+    assert!(
+        refused < 3 && storage_attempts < 3,
+        "Done did not wait for the storage sync to give up ({refused} refused, \
+         {storage_attempts} attempts)"
+    );
+    assert_eq!(
+        int("SELECT count(*) FROM jobs WHERE kind = 'storage_sync'"),
+        1,
+        "the storage sync is still to run"
+    );
+    assert_eq!(
+        int("SELECT contact_sync_done FROM account WHERE id = 1"),
+        1,
+        "the contact sync was applied before Done"
+    );
+    assert!(profiles >= 1, "the profile fetches are still queued");
+    assert!(
+        world
+            .harness
+            .limit_profile_fetches(Some(600))
+            .await
+            .expect("limitProfileFetches")
+            >= 1,
+        "a profile fetch met the rate limit"
+    );
+
+    // Served again: the storage sync runs after Done.
+    world
+        .harness
+        .fail_storage_manifest(false)
+        .await
+        .expect("failStorageManifest");
+    world
+        .harness
+        .limit_profile_fetches(None)
+        .await
+        .expect("limitProfileFetches");
+    world
+        .files
+        .wait_for_i64(
+            "the first Storage Service sync after Done",
+            "SELECT count(*) FROM account WHERE manifest_version IS NOT NULL",
+            |n| n == Some(1),
+        )
+        .await;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
     world.harness.shutdown().await.expect("harness shutdown");
 }

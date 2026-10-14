@@ -19,6 +19,8 @@
 //! - every button and every text field that is on screen has an accessible name (its text, or
 //!   `Accessible.name`).
 
+mod support;
+
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_app::{App, FixtureOptions, Launch, StartOptions};
 use kourier_qt::{UiContext, UiOptions};
@@ -437,6 +439,7 @@ MainWindow {
 "##;
 
 fn main() {
+    support::answer_list("shortcuts_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

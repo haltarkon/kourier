@@ -66,9 +66,8 @@ FormCard.FormCardPage {
     // What the core says holds now ("" until it has answered).
     readonly property string expiryPolicy: App.settings.expiryPolicy
 
-    // The accounts that offer "Transfer History from Phone…": those of a network that hands
-    // a newly linked device the account's history.
-    readonly property var historyAccounts: App.historyAccounts
+    // Every account with what it offers here (`App.accountActions`).
+    readonly property var accountActions: App.accountActions
 
     // Brings "Accounts" on screen (a fixture page shows it).
     function showAccounts(): void {
@@ -202,34 +201,66 @@ FormCard.FormCardPage {
         }
     }
 
-    // What can be done with an account. Today one action, for accounts whose network can
-    // send a newly linked device their history; the group is not there without one.
+    // What can be done with each account (link feedback L4): a group per account with its
+    // line (name and number), "Transfer History from Phone…" for an account whose network
+    // hands a newly linked device its history (hidden while that account still links),
+    // "Remove Account…" and, for a linked account, "Unlink…". Every action only asks: the
+    // question says what would happen, and "Cancel" is its default.
     FormCard.FormHeader {
         id: accountsHeader
-        visible: page.historyAccounts.length > 0
+        visible: page.accountActions.length > 0
         title: L10n.i18nc("@title:group", "Accounts")
     }
-    Card {
-        visible: page.historyAccounts.length > 0
+    Repeater {
+        model: page.accountActions
+        delegate: Card {
+            id: accountCard
 
-        Repeater {
-            model: page.historyAccounts
-            delegate: FormCard.FormButtonDelegate {
+            required property var modelData
+            readonly property real account: accountCard.modelData.account
+
+            objectName: "account-" + accountCard.account
+
+            // Which account: its name and number (the account's own text).
+            FormCard.FormTextDelegate {
+                text: Style.plain(accountCard.modelData.about)
+                textItem.textFormat: Text.PlainText
+                icon.name: "im-user"
+            }
+            FormCard.FormDelegateSeparator {
+                visible: accountCard.modelData.transfer
+            }
+            FormCard.FormButtonDelegate {
                 id: transferRow
-
-                required property var modelData
-
-                objectName: "transfer-history-" + transferRow.modelData.account
+                visible: accountCard.modelData.transfer
+                objectName: "transfer-history-" + accountCard.account
                 icon.name: "document-import"
-                text: transferRow.modelData.label
-                // Which account (`about`: its name and number, the account's own text). With
-                // several accounts the rows have the same name: a screen reader is told
-                // which one this is.
-                description: Style.plain(transferRow.modelData.about)
-                Accessible.description: transferRow.modelData.about
-                // It only asks: the question says what would happen, and "Cancel" is its
-                // default.
-                onClicked: App.askReplace(transferRow.modelData.account)
+                text: accountCard.modelData.transferLabel
+                // With several accounts the rows have the same name: a screen reader is
+                // told which account this is.
+                Accessible.description: accountCard.modelData.about
+                onClicked: App.askReplace(accountCard.account)
+            }
+            FormCard.FormDelegateSeparator {
+                visible: accountCard.modelData.unlink
+            }
+            FormCard.FormButtonDelegate {
+                id: unlinkRow
+                visible: accountCard.modelData.unlink
+                objectName: "unlink-" + accountCard.account
+                icon.name: "network-disconnect"
+                text: accountCard.modelData.unlinkLabel
+                Accessible.description: accountCard.modelData.about
+                onClicked: App.askAccountAction(accountCard.account, "unlink")
+            }
+            FormCard.FormDelegateSeparator {}
+            FormCard.FormButtonDelegate {
+                id: removeRow
+                objectName: "remove-account-" + accountCard.account
+                icon.name: "list-remove-user"
+                text: accountCard.modelData.removeLabel
+                Accessible.description: accountCard.modelData.about
+                onClicked: App.askAccountAction(accountCard.account, "remove")
             }
         }
     }

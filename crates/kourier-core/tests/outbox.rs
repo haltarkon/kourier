@@ -354,6 +354,20 @@ async fn untrusted_identity_pauses_the_conversation_until_confirmed() {
         "the paused queue holds the next message"
     );
     assert_eq!(t.iter().filter(|r| r.message == one.id).count(), 1);
+    // What the UI names the reason from (link feedback L6, "Waiting for you to confirm the new
+    // safety number"): the paused head shows as failed and is still in the outbox, the message
+    // behind it is queued and in the outbox.
+    let head = timeline_row(&env, ca, one.id).await;
+    assert!(
+        head.outbox.as_ref().is_some_and(|o| !o.in_flight),
+        "{head:?}"
+    );
+    let behind = timeline_row(&env, ca, two.id).await;
+    assert_eq!(behind.out_state, Some(OutgoingState::Queued));
+    assert!(
+        behind.outbox.as_ref().is_some_and(|o| !o.in_flight),
+        "{behind:?}"
+    );
 
     env.handle
         .send(UiCommand::ConfirmIdentity {
@@ -415,8 +429,8 @@ async fn a_challenge_pauses_the_account_until_the_user_retries() {
     assert!(shown.is_online(), "{shown:?}");
 }
 
-/// Nothing is transmitted while the account is not `Online`; a queued message that never left
-/// can be cancelled; the rest goes out once the account is online again.
+/// Nothing is transmitted while the account's connection is down; a queued message that never
+/// left can be cancelled; the rest goes out once the account is online again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_waits_for_online_and_a_queued_message_can_be_cancelled() {
     let s = script("offline")
@@ -467,6 +481,89 @@ async fn the_queue_waits_for_online_and_a_queued_message_can_be_cancelled() {
     .await;
     assert_eq!(t.len(), 1);
     assert_eq!(t[0].message, second.id);
+}
+
+/// Send at once (link feedback L6, the user's decision): the outbox drains as soon as the
+/// connection is up, while the account still catches up (`Syncing`), not only in `Online`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_goes_out_while_the_account_still_catches_up() {
+    let s = script("syncing")
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(3600)))
+        .step(Step::Conn(ConnState::Online { detail: None }));
+    let (env, _account, uuid) = linked(s).await;
+    let c = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account syncing", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| matches!(r.conn, ConnState::Syncing { .. })))
+        }
+    })
+    .await;
+    send(&env, c, "now");
+    let m = queued(&env, c, 1).await;
+    // The fake clock stands still: `Online` is an hour away, the send must not wait for it.
+    let t = transmits(&env, uuid, 1).await;
+    assert_eq!(t[0].message, m.id);
+    out_state(&env, c, m.id, sent()).await;
+    settle().await;
+    assert_eq!(env.control.transmits(uuid).len(), 1, "sent once");
+}
+
+/// Send at once, the commonest case (link feedback L6 follow-up): a message typed while the
+/// account reconnects (`Connecting`) waits, and leaves as soon as the connection is up and
+/// catches up (`Syncing`), before `Online`. The drain is kicked by the `Syncing` itself: the
+/// send's own kick found the connection down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_queued_while_connecting_leaves_when_syncing_starts() {
+    let s = script("connecting-then-syncing")
+        .step(Step::Conn(ConnState::Connecting))
+        .step(Step::Sleep(Duration::from_secs(60)))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(3600)))
+        .step(Step::Conn(ConnState::Online { detail: None }));
+    let (env, account, uuid) = linked(s).await;
+    let c = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account connecting", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| r.conn == ConnState::Connecting))
+        }
+    })
+    .await;
+    send(&env, c, "typed while reconnecting");
+    let m = queued(&env, c, 1).await;
+    settle().await;
+    assert!(
+        env.control.transmits(uuid).is_empty(),
+        "connecting: nothing sent"
+    );
+
+    // The connection comes up and starts to catch up. `Online` is an hour away on the fake
+    // clock, which stands still from here: the message must not wait for it.
+    env.clock.advance(Duration::from_secs(60));
+    let t = transmits(&env, uuid, 1).await;
+    assert_eq!(t[0].message, m.id);
+    let shown = env.account(account).await.expect("account").conn;
+    assert!(
+        matches!(shown, ConnState::Syncing { .. }),
+        "left before Online: {shown:?}"
+    );
+    out_state(
+        &env,
+        c,
+        m.id,
+        OutgoingState::Sent {
+            server_at: Some(T0 + 60_000),
+        },
+    )
+    .await;
+    settle().await;
+    assert_eq!(env.control.transmits(uuid).len(), 1, "sent once");
 }
 
 /// An own copy from another device with the outbox row's id merges into it (§4.8 step 6): the
@@ -1014,5 +1111,323 @@ async fn a_repeated_online_keeps_the_challenge_shown() {
             .expect("account")
             .conn
             .is_online()
+    );
+}
+
+/// A challenge met while the account still catches up (L6: the outbox sends in `Syncing`) is
+/// not lifted by the `Online` that ends that catch-up: that is the same connection, not a
+/// return after an interruption. The challenge stays on show over the catch-up's own updates,
+/// nothing is sent until the user answers, and a NEW connection's `Online` lifts it as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenge_met_while_catching_up_outlives_the_end_of_that_catch_up() {
+    let s = script("challenge-syncing")
+        .fail_transmit(TransmitRule::attempts(challenge(), 1).in_conv(d_alice()))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Syncing {
+            fraction: Some(0.5),
+        }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Online { detail: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Offline { retry_at_ms: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Online { detail: None }));
+    let (mut env, account, uuid) = linked(s).await;
+    let ca = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account syncing", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| matches!(r.conn, ConnState::Syncing { .. })))
+        }
+    })
+    .await;
+    send(&env, ca, "one");
+    let one = queued(&env, ca, 1).await;
+    env.event("SolveChallenge", |e| match e {
+        UiEvent::ConnState {
+            state: ConnState::NeedsUserAction(UserAction::SolveChallenge { .. }),
+            ..
+        } => Some(()),
+        _ => None,
+    })
+    .await;
+    let challenge_shown = |c: ConnState| {
+        matches!(
+            c,
+            ConnState::NeedsUserAction(UserAction::SolveChallenge { .. })
+        )
+    };
+
+    // The catch-up reports its progress: the challenge stays over it.
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    let shown = env.account(account).await.expect("account").conn;
+    assert!(
+        challenge_shown(shown.clone()),
+        "over the progress: {shown:?}"
+    );
+
+    // The catch-up ends (`Online`, the same connection): still paused, still shown.
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    let shown = env.account(account).await.expect("account").conn;
+    assert!(
+        challenge_shown(shown.clone()),
+        "after the catch-up: {shown:?}"
+    );
+    assert_eq!(env.control.transmits(uuid).len(), 1, "still paused");
+
+    // The connection drops and comes back: that `Online` lifts the pause and the send goes.
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    assert_eq!(
+        env.control.transmits(uuid).len(),
+        1,
+        "offline: paused still"
+    );
+    env.clock.advance(Duration::from_secs(10));
+    let after = OutgoingState::Sent {
+        server_at: Some(T0 + 40_000),
+    };
+    out_state(&env, ca, one.id, after).await;
+    assert_eq!(env.control.transmits(uuid).len(), 2, "retried once");
+    assert!(
+        env.account(account)
+            .await
+            .expect("account")
+            .conn
+            .is_online()
+    );
+}
+
+/// The connection a challenge was met on while it caught up drops before the catch-up ends:
+/// the `Online` of the NEXT connection is the return after an interruption and lifts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenge_met_while_catching_up_ends_with_the_next_connection() {
+    let s = script("challenge-syncing-drop")
+        .fail_transmit(TransmitRule::attempts(challenge(), 1).in_conv(d_alice()))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Offline { retry_at_ms: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Online { detail: None }));
+    let (mut env, account, uuid) = linked(s).await;
+    let ca = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account syncing", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| matches!(r.conn, ConnState::Syncing { .. })))
+        }
+    })
+    .await;
+    send(&env, ca, "one");
+    let one = queued(&env, ca, 1).await;
+    env.event("SolveChallenge", |e| match e {
+        UiEvent::ConnState {
+            state: ConnState::NeedsUserAction(UserAction::SolveChallenge { .. }),
+            ..
+        } => Some(()),
+        _ => None,
+    })
+    .await;
+    // Offline, then the next connection catches up: the pause holds until its `Online`.
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    assert_eq!(env.control.transmits(uuid).len(), 1, "paused while syncing");
+    env.clock.advance(Duration::from_secs(10));
+    let after = OutgoingState::Sent {
+        server_at: Some(T0 + 30_000),
+    };
+    out_state(&env, ca, one.id, after).await;
+    assert_eq!(env.control.transmits(uuid).len(), 2, "retried once");
+    assert!(
+        env.account(account)
+            .await
+            .expect("account")
+            .conn
+            .is_online()
+    );
+}
+
+/// A 428 whose answer reaches the core while the connection is DOWN does not belong to a
+/// catch-up: the account's `Online` of the NEXT connection is the return after an interruption
+/// and lifts the pause (`paused_in_catch_up` is set only for a connection that is up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_challenge_answered_while_offline_ends_with_the_next_connection() {
+    let s = script("challenge-offline")
+        .fail_transmit(TransmitRule::attempts(challenge(), 1).in_conv(d_alice()))
+        // The server has the request at once; the core hears its answer 15 seconds later.
+        .delay_reply(d_alice(), Duration::from_secs(15))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Offline { retry_at_ms: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Syncing { fraction: None }))
+        .step(Step::Sleep(Duration::from_secs(10)))
+        .step(Step::Conn(ConnState::Online { detail: None }));
+    let (env, account, uuid) = linked(s).await;
+    let ca = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account syncing", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| matches!(r.conn, ConnState::Syncing { .. })))
+        }
+    })
+    .await;
+    send(&env, ca, "one");
+    let one = queued(&env, ca, 1).await;
+    transmits(&env, uuid, 1).await;
+
+    // The connection drops with the send unanswered; then the 428 arrives (t = 15 s).
+    env.clock.advance(Duration::from_secs(10));
+    settle().await;
+    let shown = env.account(account).await.expect("account").conn;
+    assert!(matches!(shown, ConnState::Offline { .. }), "{shown:?}");
+    env.clock.advance(Duration::from_secs(5));
+    settle().await;
+    assert_eq!(env.control.transmits(uuid).len(), 1, "paused by the 428");
+
+    // The next connection catches up (t = 20 s): paused still, nothing is sent.
+    env.clock.advance(Duration::from_secs(5));
+    settle().await;
+    assert_eq!(env.control.transmits(uuid).len(), 1, "paused while syncing");
+
+    // Its `Online` (t = 30 s) lifts the pause: the send goes again (answered at t = 45 s, stamped by the server at 30 s).
+    env.clock.advance(Duration::from_secs(10));
+    transmits(&env, uuid, 2).await;
+    env.clock.advance(Duration::from_secs(15));
+    let after = OutgoingState::Sent {
+        server_at: Some(T0 + 30_000),
+    };
+    out_state(&env, ca, one.id, after).await;
+    assert_eq!(env.control.transmits(uuid).len(), 2, "retried once");
+    assert!(
+        env.account(account)
+            .await
+            .expect("account")
+            .conn
+            .is_online()
+    );
+}
+
+/// The own row of `message` in the newest timeline page of `conv`.
+async fn timeline_row(
+    env: &Env,
+    conv: ConversationId,
+    message: MessageId,
+) -> kourier_core::facade::MessageRow {
+    let q = kourier_core::facade::TimelineQuery {
+        conv,
+        anchor: kourier_core::facade::TimelineAnchor::Newest,
+        limit: 50,
+    };
+    match env
+        .handle
+        .query(Query::Timeline(q))
+        .await
+        .expect("timeline")
+    {
+        QueryData::Timeline(p) => p.rows.into_iter().find(|r| r.id == message).expect("row"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// The timeline row of an own message carries its outbox row (link feedback L6): before any
+/// attempt (offline) nothing tried and no next try; after a rate-limited attempt the attempts,
+/// the stored time of the next try (Retry-After, from the outbox) and the error's kind name;
+/// once sent, nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_row_of_a_waiting_send_says_when_it_is_tried_next() {
+    use kourier_core::facade::OutboxWait;
+    let s = script("wait")
+        .step(Step::Conn(ConnState::Connecting))
+        .step(Step::Sleep(Duration::from_secs(60)))
+        .step(Step::Conn(ConnState::Online { detail: None }))
+        .fail_transmit(TransmitRule::attempts(
+            rate_limited(Some(Duration::from_secs(30))),
+            1,
+        ));
+    let (env, _account, uuid) = linked(s).await;
+    let c = conv(&env, &d_alice()).await;
+    let h = env.handle.clone();
+    eventually("the account connecting", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(Query::Accounts).await, Ok(QueryData::Accounts(a))
+                if a.iter().any(|r| r.conn == ConnState::Connecting))
+        }
+    })
+    .await;
+    send(&env, c, "later");
+    let m = queued(&env, c, 1).await;
+    let row = timeline_row(&env, c, m.id).await;
+    assert_eq!(row.sent_at, T0, "the timer counts from the stored sent_at");
+    assert_eq!(
+        row.outbox,
+        Some(OutboxWait {
+            in_flight: false,
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+        }),
+        "queued, not tried yet"
+    );
+
+    env.clock.advance(Duration::from_secs(60));
+    transmits(&env, uuid, 1).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let row = loop {
+        let row = timeline_row(&env, c, m.id).await;
+        if row
+            .outbox
+            .as_ref()
+            .is_some_and(|w| w.attempts == 1 && !w.in_flight)
+        {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the attempt recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        row.outbox,
+        Some(OutboxWait {
+            in_flight: false,
+            attempts: 1,
+            next_attempt_at: Some(T0 + 60_000 + 30_000),
+            last_error: Some("RateLimited".into()),
+        }),
+        "waits for the retry the server asked for"
+    );
+    assert_eq!(row.sent_at, T0, "sent_at stays the moment of Send");
+
+    env.clock.advance(Duration::from_secs(30));
+    transmits(&env, uuid, 2).await;
+    out_state(
+        &env,
+        c,
+        m.id,
+        OutgoingState::Sent {
+            server_at: Some(T0 + 90_000),
+        },
+    )
+    .await;
+    assert_eq!(
+        timeline_row(&env, c, m.id).await.outbox,
+        None,
+        "sent: no wait"
     );
 }

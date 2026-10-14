@@ -8,6 +8,99 @@ use super::message::MsgRow;
 use crate::error::Result;
 use crate::sql;
 
+// The statements of [`Apply::identity_merged`] that look for the rows of the alias. Each
+// starts from the alias's own rows through an index (core.db schema 14), never from all of
+// the account's messages: the first Storage Service sync after a link merges every contact
+// with a phone number, and a walk of the messages per merge took minutes on a big account
+// (`tests::a_merge_looks_only_at_the_rows_of_the_alias` holds the plans). The joins are
+// `CROSS JOIN`s because core.db has no planner statistics and the planner would start from
+// the account's messages; for the same reason an `a = ? OR b = ?` is two `EXISTS`, one per
+// index (given the OR the planner took the index of `account_id` alone and walked them all).
+
+/// Whether `?2` (with direct conversation key `?3`) owns anything of account `?1` that a
+/// merge would move: without, a merge only records the alias.
+pub(crate) const ALIAS_OWNS: &str = "SELECT
+    EXISTS(SELECT 1 FROM contacts WHERE account_id = ?1 AND user_id = ?2)
+ OR EXISTS(SELECT 1 FROM members mb CROSS JOIN conversations c ON c.id = mb.conversation_id
+           WHERE mb.user_id = ?2 AND c.account_id = ?1)
+ OR EXISTS(SELECT 1 FROM messages WHERE account_id = ?1 AND net_author = ?2)
+ OR EXISTS(SELECT 1 FROM messages WHERE account_id = ?1 AND deleted_by = ?2)
+ OR EXISTS(SELECT 1 FROM message_revisions WHERE account_id = ?1 AND net_author = ?2)
+ OR EXISTS(SELECT 1 FROM reactions r CROSS JOIN messages m ON m.id = r.message_id
+           WHERE r.user_id = ?2 AND m.account_id = ?1)
+ OR EXISTS(SELECT 1 FROM receipts r CROSS JOIN messages m ON m.id = r.message_id
+           WHERE r.user_id = ?2 AND m.account_id = ?1)
+ OR EXISTS(SELECT 1 FROM send_state s CROSS JOIN messages m ON m.id = s.message_id
+           WHERE s.user_id = ?2 AND m.account_id = ?1)
+ OR EXISTS(SELECT 1 FROM pending_modifiers WHERE account_id = ?1 AND target_author = ?2)
+ OR EXISTS(SELECT 1 FROM pending_modifiers WHERE account_id = ?1 AND conv_key = ?3)
+ OR EXISTS(SELECT 1 FROM expired_messages WHERE account_id = ?1 AND net_author = ?2)
+ OR EXISTS(SELECT 1 FROM expired_messages WHERE account_id = ?1 AND conv_key = ?3)
+ OR EXISTS(SELECT 1 FROM conversations WHERE account_id = ?1 AND conv_key = ?3)";
+
+/// Aliases that pointed at `?2` point at the canonical id `?3` (no chains).
+const ALIAS_REPOINT: &str =
+    "UPDATE identity_alias SET user_id = ?3 WHERE account_id = ?1 AND user_id = ?2";
+const MEMBER_CONVS: &str = "SELECT mb.conversation_id FROM members mb
+   CROSS JOIN conversations c ON c.id = mb.conversation_id
+ WHERE mb.user_id = ?2 AND c.account_id = ?1";
+const AUTHORED_CONVS: &str =
+    "SELECT DISTINCT conversation_id FROM messages WHERE account_id = ?1 AND net_author = ?2";
+const AUTHORED_ROWS: &str =
+    "SELECT id, net_local FROM messages WHERE account_id = ?1 AND net_author = ?2 ORDER BY id";
+const REAUTHOR: &str =
+    "UPDATE messages SET net_author = ?3 WHERE account_id = ?1 AND net_author = ?2";
+const REAUTHOR_REVISIONS: &str = "UPDATE OR IGNORE message_revisions SET net_author = ?3
+ WHERE account_id = ?1 AND net_author = ?2";
+const REDELETER: &str =
+    "UPDATE messages SET deleted_by = ?3 WHERE account_id = ?1 AND deleted_by = ?2";
+const PENDING_RETARGET: &str = "UPDATE OR IGNORE pending_modifiers SET target_author = ?3
+ WHERE account_id = ?1 AND target_author = ?2";
+const PENDING_REKEY: &str =
+    "UPDATE OR IGNORE pending_modifiers SET conv_key = ?3 WHERE account_id = ?1 AND conv_key = ?2";
+const EXPIRED_REAUTHOR: &str =
+    "UPDATE expired_messages SET net_author = ?3 WHERE account_id = ?1 AND net_author = ?2";
+const EXPIRED_REKEY: &str =
+    "UPDATE expired_messages SET conv_key = ?3 WHERE account_id = ?1 AND conv_key = ?2";
+const REACTIONS_OF: &str = "SELECT r.message_id, r.emoji, r.at, r.removed FROM reactions r
+   CROSS JOIN messages m ON m.id = r.message_id
+ WHERE r.user_id = ?2 AND m.account_id = ?1";
+const DELETE_REACTIONS_OF: &str = "DELETE FROM reactions WHERE user_id = ?2
+   AND EXISTS(SELECT 1 FROM messages m WHERE m.id = reactions.message_id AND m.account_id = ?1)";
+const RECEIPTS_OF: &str = "SELECT r.message_id, r.kind, r.at FROM receipts r
+   CROSS JOIN messages m ON m.id = r.message_id
+ WHERE r.user_id = ?2 AND m.account_id = ?1";
+const DELETE_RECEIPTS_OF: &str = "DELETE FROM receipts WHERE user_id = ?2
+   AND EXISTS(SELECT 1 FROM messages m WHERE m.id = receipts.message_id AND m.account_id = ?1)";
+const SENDS_OF: &str = "SELECT s.message_id, s.state, s.error FROM send_state s
+   CROSS JOIN messages m ON m.id = s.message_id
+ WHERE s.user_id = ?2 AND m.account_id = ?1";
+const DELETE_SENDS_OF: &str = "DELETE FROM send_state WHERE user_id = ?2
+   AND EXISTS(SELECT 1 FROM messages m WHERE m.id = send_state.message_id AND m.account_id = ?1)";
+
+/// Every statement above, for the plan test.
+#[cfg(test)]
+pub(crate) const LOOKUPS: &[&str] = &[
+    ALIAS_OWNS,
+    ALIAS_REPOINT,
+    MEMBER_CONVS,
+    AUTHORED_CONVS,
+    AUTHORED_ROWS,
+    REAUTHOR,
+    REAUTHOR_REVISIONS,
+    REDELETER,
+    PENDING_RETARGET,
+    PENDING_REKEY,
+    EXPIRED_REAUTHOR,
+    EXPIRED_REKEY,
+    REACTIONS_OF,
+    DELETE_REACTIONS_OF,
+    RECEIPTS_OF,
+    DELETE_RECEIPTS_OF,
+    SENDS_OF,
+    DELETE_SENDS_OF,
+];
+
 /// Precedence of tombstones: delete-for-me hides the message for good.
 fn deleted_rank(d: Option<&str>) -> u8 {
     match d {
@@ -43,22 +136,33 @@ impl Apply<'_> {
                  ON CONFLICT(account_id, alias) DO UPDATE SET user_id = excluded.user_id",
             )?
             .execute((acc, f, t))?;
-        // Aliases that pointed at `from` now point at the canonical id (no chains).
         self.conn
-            .prepare_cached(
-                "UPDATE identity_alias SET user_id = ?3 WHERE account_id = ?1 AND user_id = ?2",
-            )?
+            .prepare_cached(ALIAS_REPOINT)?
             .execute((acc, f, t))?;
+
+        let (from_key, into_key) = (
+            ConvKey::Direct(from.clone()).encode(),
+            ConvKey::Direct(target.clone()).encode(),
+        );
+        let owns: bool = self
+            .conn
+            .prepare_cached(ALIAS_OWNS)?
+            .query_row((acc, f, &from_key), |r| r.get(0))?;
+        if !owns {
+            // Nothing to move (on a first Storage Service sync: every contact with a number
+            // whose number-user never wrote here). A receipt the alias sent may have waited
+            // for its sender to be a recipient: it is one now (looked at in `finish`).
+            self.ch.receipts_to_retry = true;
+            self.ch.contacts = true;
+            return Ok(());
+        }
 
         self.merge_contact(from, &target)?;
 
         // Members: union, the canonical row wins.
         let convs: Vec<i64> = self
             .conn
-            .prepare_cached(
-                "SELECT m.conversation_id FROM members m JOIN conversations c ON c.id = m.conversation_id
-                 WHERE c.account_id = ?1 AND m.user_id = ?2",
-            )?
+            .prepare_cached(MEMBER_CONVS)?
             .query_map((acc, f), |r| r.get(0))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         for c in convs {
@@ -76,17 +180,13 @@ impl Apply<'_> {
         // Messages by `from`: re-author; under AccountAuthor a key conflict merges the rows.
         let touched: Vec<i64> = self
             .conn
-            .prepare_cached(
-                "SELECT DISTINCT conversation_id FROM messages WHERE account_id = ?1 AND net_author = ?2",
-            )?
+            .prepare_cached(AUTHORED_CONVS)?
             .query_map((acc, f), |r| r.get(0))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         if self.scope == MsgIdScope::AccountAuthor {
             let rows: Vec<(i64, String)> = self
                 .conn
-                .prepare_cached(
-                    "SELECT id, net_local FROM messages WHERE account_id = ?1 AND net_author = ?2 ORDER BY id",
-                )?
+                .prepare_cached(AUTHORED_ROWS)?
                 .query_map((acc, f), |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<kourier_db::rusqlite::Result<_>>()?;
             for (id, local) in rows {
@@ -115,21 +215,11 @@ impl Apply<'_> {
                 }
             }
         }
+        self.conn.prepare_cached(REAUTHOR)?.execute((acc, f, t))?;
         self.conn
-            .prepare_cached(
-                "UPDATE messages SET net_author = ?3 WHERE account_id = ?1 AND net_author = ?2",
-            )?
+            .prepare_cached(REAUTHOR_REVISIONS)?
             .execute((acc, f, t))?;
-        self.conn
-            .prepare_cached(
-                "UPDATE OR IGNORE message_revisions SET net_author = ?3 WHERE account_id = ?1 AND net_author = ?2",
-            )?
-            .execute((acc, f, t))?;
-        self.conn
-            .prepare_cached(
-                "UPDATE messages SET deleted_by = ?3 WHERE account_id = ?1 AND deleted_by = ?2",
-            )?
-            .execute((acc, f, t))?;
+        self.conn.prepare_cached(REDELETER)?.execute((acc, f, t))?;
         for c in touched {
             self.ch.timelines.insert(ConversationId(c));
             self.ch.recount_conv(ConversationId(c));
@@ -139,30 +229,17 @@ impl Apply<'_> {
 
         // Parked modifiers follow the canonical id.
         self.conn
-            .prepare_cached(
-                "UPDATE OR IGNORE pending_modifiers SET target_author = ?3
-                 WHERE account_id = ?1 AND target_author = ?2",
-            )?
+            .prepare_cached(PENDING_RETARGET)?
             .execute((acc, f, t))?;
-        let (from_key, into_key) = (
-            ConvKey::Direct(from.clone()).encode(),
-            ConvKey::Direct(target.clone()).encode(),
-        );
         self.conn
-            .prepare_cached(
-                "UPDATE OR IGNORE pending_modifiers SET conv_key = ?3 WHERE account_id = ?1 AND conv_key = ?2",
-            )?
+            .prepare_cached(PENDING_REKEY)?
             .execute((acc, &from_key, &into_key))?;
         // So do the keys of expired messages: a late copy under either identity stays dropped.
         self.conn
-            .prepare_cached(
-                "UPDATE expired_messages SET net_author = ?3 WHERE account_id = ?1 AND net_author = ?2",
-            )?
+            .prepare_cached(EXPIRED_REAUTHOR)?
             .execute((acc, f, t))?;
         self.conn
-            .prepare_cached(
-                "UPDATE expired_messages SET conv_key = ?3 WHERE account_id = ?1 AND conv_key = ?2",
-            )?
+            .prepare_cached(EXPIRED_REKEY)?
             .execute((acc, &from_key, &into_key))?;
 
         // The direct conversation: re-key, or merge when `into` has one already.
@@ -184,8 +261,8 @@ impl Apply<'_> {
         // in the chat under the other until now: both are one conversation from here on.
         self.retry_pending(&into_key)?;
         // And a receipt that waited because its sender was no recipient of its message may
-        // come from one now.
-        self.retry_receipts()?;
+        // come from one now (looked at once for all merges of the transaction, in `finish`).
+        self.ch.receipts_to_retry = true;
         self.ch.contacts = true;
         Ok(())
     }
@@ -239,11 +316,7 @@ impl Apply<'_> {
         let acc = self.acc.id.0;
         let reactions: Vec<(i64, String, i64, bool)> = self
             .conn
-            .prepare_cached(
-                "SELECT r.message_id, r.emoji, r.at, r.removed FROM reactions r
-                   JOIN messages m ON m.id = r.message_id
-                 WHERE m.account_id = ?1 AND r.user_id = ?2",
-            )?
+            .prepare_cached(REACTIONS_OF)?
             .query_map((acc, from), |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
@@ -252,18 +325,12 @@ impl Apply<'_> {
             self.merge_reaction(MessageId(mid), into, &emoji, at, removed)?;
         }
         self.conn
-            .prepare_cached(
-                "DELETE FROM reactions WHERE user_id = ?2
-                   AND message_id IN (SELECT id FROM messages WHERE account_id = ?1)",
-            )?
+            .prepare_cached(DELETE_REACTIONS_OF)?
             .execute((acc, from))?;
 
         let receipts: Vec<(i64, String, i64)> = self
             .conn
-            .prepare_cached(
-                "SELECT r.message_id, r.kind, r.at FROM receipts r JOIN messages m ON m.id = r.message_id
-                 WHERE m.account_id = ?1 AND r.user_id = ?2",
-            )?
+            .prepare_cached(RECEIPTS_OF)?
             .query_map((acc, from), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         let mut own_messages: Vec<i64> = Vec::new();
@@ -272,18 +339,12 @@ impl Apply<'_> {
             own_messages.push(mid);
         }
         self.conn
-            .prepare_cached(
-                "DELETE FROM receipts WHERE user_id = ?2
-                   AND message_id IN (SELECT id FROM messages WHERE account_id = ?1)",
-            )?
+            .prepare_cached(DELETE_RECEIPTS_OF)?
             .execute((acc, from))?;
 
         let sends: Vec<(i64, String, Option<String>)> = self
             .conn
-            .prepare_cached(
-                "SELECT s.message_id, s.state, s.error FROM send_state s JOIN messages m ON m.id = s.message_id
-                 WHERE m.account_id = ?1 AND s.user_id = ?2",
-            )?
+            .prepare_cached(SENDS_OF)?
             .query_map((acc, from), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         for (mid, state, error) in sends {
@@ -292,10 +353,7 @@ impl Apply<'_> {
             own_messages.push(mid);
         }
         self.conn
-            .prepare_cached(
-                "DELETE FROM send_state WHERE user_id = ?2
-                   AND message_id IN (SELECT id FROM messages WHERE account_id = ?1)",
-            )?
+            .prepare_cached(DELETE_SENDS_OF)?
             .execute((acc, from))?;
         own_messages.sort_unstable();
         own_messages.dedup();
@@ -629,5 +687,88 @@ impl Apply<'_> {
         self.ch.timelines.insert(drop.conv);
         self.ch.recount_conv(drop.conv);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kourier_model::{MsgIdScope, NetworkKind, UserId};
+
+    /// Every lookup of a merge starts from the alias's own rows (core.db schema 14): no walk
+    /// of the account's messages (`messages_local`, `messages_key_account` on `account_id`
+    /// alone, a list of every message id) and no scan of a table.
+    #[test]
+    fn a_merge_looks_only_at_the_rows_of_the_alias() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([3u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let mut seen: Vec<String> = Vec::new();
+        for sql in super::LOOKUPS {
+            let steps: Vec<String> = h
+                .connection()
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    sql.replace("?1", "1")
+                        .replace("?2", "'e164:+15550100'")
+                        .replace("?3", "'d:e164:+15550100'")
+                ))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(3))
+                .expect("plan")
+                .collect::<kourier_db::rusqlite::Result<_>>()
+                .expect("rows");
+            seen.extend(steps.iter().cloned());
+            for step in &steps {
+                assert!(
+                    !step.starts_with("SCAN") || step == "SCAN CONSTANT ROW",
+                    "{sql}\n{steps:#?}"
+                );
+                assert!(!step.contains("LIST SUBQUERY"), "{sql}\n{steps:#?}");
+                let on_messages = step.starts_with("SEARCH messages ")
+                    || step.starts_with("SEARCH m ")
+                    || step.starts_with("SEARCH message_revisions ");
+                if on_messages {
+                    assert!(
+                        step.contains("INTEGER PRIMARY KEY")
+                            || step.contains("messages_by_author (account_id=? AND net_author=?)")
+                            || step.contains("messages_deleted_by (account_id=? AND deleted_by=?)")
+                            || step.contains("revisions_by_author (account_id=? AND net_author=?)"),
+                        "a walk of the account's messages: {sql}\n{steps:#?}"
+                    );
+                }
+                for table in ["reactions", "receipts", "send_state", "r ", "s "] {
+                    if step.starts_with(&format!("SEARCH {table}")) {
+                        assert!(step.contains("(user_id=?)"), "{sql}\n{steps:#?}");
+                    }
+                }
+                // Whatever the table: an index that is used for `account_id` alone walks all
+                // of the account's rows of it (the keys of expired messages, parked modifiers).
+                assert!(
+                    !(step.starts_with("SEARCH ") && step.ends_with("(account_id=?)")),
+                    "a walk of the account's rows: {sql}\n{steps:#?}"
+                );
+            }
+        }
+        // The test must SEE the lookups it guards: the ones on the keys of expired messages
+        // and parked modifiers, each through its own index (a mutant without the four indexes
+        // of migration 14 searches the old ones by `account_id` alone, which is refused above).
+        for index in [
+            "expired_messages_by_author (account_id=? AND net_author=?)",
+            "expired_messages_by_conv (account_id=? AND conv_key=?)",
+            "pending_by_author (account_id=? AND target_author=?)",
+            "pending_by_conv (account_id=? AND conv_key=?)",
+            "identity_alias_by_user (account_id=? AND user_id=?)",
+        ] {
+            assert!(
+                seen.iter().any(|step| step.contains(index)),
+                "no lookup uses {index}: {seen:#?}"
+            );
+        }
     }
 }

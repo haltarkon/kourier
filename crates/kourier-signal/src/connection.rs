@@ -878,11 +878,23 @@ async fn connect_steps<T: SignalTransport>(
 /// `InitialSync::LinkOnly` stops there by definition. `ContactsAndStorage` (the app's default)
 /// also waits until the phone's contact sync was applied (or `contact_sync::LINK_WAIT` passed
 /// without one) and the first Storage Service sync finished (or was given up), so the UI opens
-/// on named contacts.
+/// on named contacts; after an imported history archive it does not wait for the Storage
+/// Service sync (the archive named every chat; Desktop does the same).
+///
+/// The job runner looks here after every batch too (`jobs::run`): nothing else in the queue
+/// (profile fetches, group refreshes, receipts) holds `Done`.
 async fn finish_link<T: SignalTransport>(shared: &Shared<T>) -> Result<()> {
     let Some(account) = shared.account() else {
         return Ok(());
     };
+    let result = finish_link_steps(shared, account).await;
+    // How far the link's work is (`progress.rs`): after the gate, so a `Done` sent here is
+    // already counted out.
+    crate::progress::report(shared).await?;
+    result
+}
+
+async fn finish_link_steps<T: SignalTransport>(shared: &Shared<T>, account: Account) -> Result<()> {
     // A history transfer comes before the link is done (Desktop shows its import inside the
     // install screen): the contact sync's answer and the Storage Service sync wait for it,
     // and so does `Done`. Its end wakes the job runner, which comes back here.
@@ -896,7 +908,8 @@ async fn finish_link<T: SignalTransport>(shared: &Shared<T>) -> Result<()> {
         match shared.config.initial_sync {
             InitialSync::LinkOnly => {}
             InitialSync::ContactsAndStorage => {
-                if !shared.db.read(initial_sync_done)? {
+                let imported = shared.transfer.imported();
+                if !shared.db.read(|c| initial_sync_done(c, imported))? {
                     return Ok(());
                 }
             }
@@ -936,9 +949,10 @@ async fn finish_link<T: SignalTransport>(shared: &Shared<T>) -> Result<()> {
 /// expiry and a contact-sync download retries for a day, far too long for a login screen).
 const LINK_SYNC_ATTEMPTS: i64 = 3;
 
-/// Contact sync applied (or waited for long enough) and no Storage Service sync or contact
-/// sync left to run, except ones that already failed [`LINK_SYNC_ATTEMPTS`] times.
-fn initial_sync_done(conn: &kourier_db::rusqlite::Connection) -> Result<bool> {
+/// Contact sync applied (or waited for long enough) and no Storage Service sync (unless
+/// `imported`: a history archive was imported) or contact sync left to run, except ones that
+/// already failed [`LINK_SYNC_ATTEMPTS`] times.
+fn initial_sync_done(conn: &kourier_db::rusqlite::Connection, imported: bool) -> Result<bool> {
     let contacts: bool = conn.query_row(
         "SELECT contact_sync_done = 1 FROM account WHERE id = 1",
         [],
@@ -948,7 +962,11 @@ fn initial_sync_done(conn: &kourier_db::rusqlite::Connection) -> Result<bool> {
         "SELECT count(*) FROM jobs WHERE kind IN (?1, ?2) AND attempts < ?3",
         (
             JobKind::ContactSync.as_str(),
-            JobKind::StorageSync.as_str(),
+            if imported {
+                JobKind::ContactSync.as_str()
+            } else {
+                JobKind::StorageSync.as_str()
+            },
             LINK_SYNC_ATTEMPTS,
         ),
         |r| r.get(0),
@@ -1227,7 +1245,7 @@ mod tests {
     #[test]
     fn the_link_gate_waits_for_both_syncs_but_not_for_failing_ones() {
         let fixture = fixture();
-        let done = || fixture.db.read(initial_sync_done).unwrap();
+        let done = || fixture.db.read(|c| initial_sync_done(c, false)).unwrap();
         fixture
             .db
             .zone(|tx| -> Result<()> {
@@ -1245,6 +1263,10 @@ mod tests {
             })
             .unwrap();
         assert!(!done(), "the storage sync is still queued");
+        assert!(
+            fixture.db.read(|c| initial_sync_done(c, true)).unwrap(),
+            "after an imported archive the storage sync does not hold the link"
+        );
         for attempt in 1..=LINK_SYNC_ATTEMPTS {
             fixture
                 .db

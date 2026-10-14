@@ -10,6 +10,9 @@
 #include <QtGui/QPainter>
 #include <QtGui/QPainterPath>
 #include <QtGui/QPixmap>
+#include <QtGui/QSessionManager>
+
+#include <atomic>
 
 #include <dlfcn.h>
 #include <malloc.h>
@@ -210,6 +213,41 @@ rust::Vec<uint8_t> renderAvatarRgba(const QString& name, bool anonymous, int32_t
 void trimMemory()
 {
     malloc_trim(0);
+}
+
+namespace {
+std::atomic<bool> g_sessionEnding{false};
+}
+
+void watchSessionEnd()
+{
+    if (qGuiApp == nullptr) {
+        return;
+    }
+#ifndef QT_NO_SESSIONMANAGER
+    // Direct: the signal comes from the session manager's own turn of the event loop and the
+    // flag must be set before the windows are asked to close.
+    QObject::connect(
+        qGuiApp, &QGuiApplication::commitDataRequest, qGuiApp,
+        [](QSessionManager&) { g_sessionEnding.store(true); }, Qt::DirectConnection);
+#endif
+}
+
+bool sessionEnding()
+{
+    if (g_sessionEnding.load()) {
+        return true;
+    }
+#ifndef QT_NO_SESSIONMANAGER
+    return qGuiApp != nullptr && qGuiApp->isSavingSession();
+#else
+    return false;
+#endif
+}
+
+void setSessionEnding(bool ending)
+{
+    g_sessionEnding.store(ending);
 }
 
 } // namespace kourier

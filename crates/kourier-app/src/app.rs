@@ -100,6 +100,11 @@ pub struct FixtureOptions {
     pub qr_codes: u32,
     /// Messages per fixture conversation.
     pub messages_per_conversation: usize,
+    /// Generated contacts, each with a direct chat (the fixture's own 12 by default; a test
+    /// that needs a list of about 200 chats asks for more).
+    pub contacts: usize,
+    /// Generated groups (4 by default).
+    pub groups: usize,
     /// Adds the showcase chats on top of the generated ones: quotes of a known, a missing and
     /// a deleted message with an edited photo caption, a chat with a disappearing-message
     /// timer, and a chat with stand-ins for content Kourier does not show yet.
@@ -133,6 +138,53 @@ pub struct FixtureOptions {
     pub history_on_link: bool,
     /// How long each stage of a [`FixtureTransfer::Walk`] lasts (tests shorten it).
     pub transfer_stage: Duration,
+    /// Without [`FixtureOptions::link`]: what the NEXT account added after the start does
+    /// (the fixture account is the first). `None`: it links at once, as the first did. Tests
+    /// of a second link (a link page beside a list with chats).
+    pub second_link: Option<FixtureSecondLink>,
+    /// Without [`FixtureOptions::link`]: the fixture account still updates its contacts and
+    /// groups after its link and never finishes (`BackendEvent::AccountProgress`: 160
+    /// profiles and 12 groups left, then 120 and 8), so the banner says so
+    /// (`--page=transferupdate`). `false`: no such report, as before.
+    pub updating: bool,
+    /// The fixture account's logout does not reach the network (`NotReached`, the device
+    /// stays on the phone) and names the device "Kourier fixture" (link feedback L4: the
+    /// notice of a removal or an unlink the network did not confirm). `false`: the logout
+    /// removes the device, as before.
+    pub logout_unreachable: bool,
+    /// Sends that take their time (link feedback L6: the line under a message on its way;
+    /// `--fixture-send=<name>`, pictures looked at by hand). `None`: every send is answered
+    /// at once, as before.
+    pub sends: Option<FixtureSends>,
+}
+
+/// How the fixture account's sends behave ([`FixtureOptions::sends`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureSends {
+    /// Every send is answered after [`FixtureSends::SLOW`] and reports this phase meanwhile
+    /// (`None`: no phase, "Sending… 0:42").
+    Slow(Option<kourier_model::SendPhase>),
+    /// The first attempt of every send is refused as rate limited, with this wait.
+    RateLimited(Duration),
+}
+
+impl FixtureSends {
+    /// How long a slow send takes: long enough for its line to show (after 3 s) in a picture.
+    pub const SLOW: Duration = Duration::from_secs(120);
+}
+
+/// The second link of a fixture profile ([`FixtureOptions::second_link`]). Both ask for no
+/// device name and show one QR code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureSecondLink {
+    /// The code stays on screen (a minute) and nobody scans it: the link waits at its QR code.
+    AtQr,
+    /// The phone scans at once and is the fixture account's own: the core refuses it
+    /// (one identity is one account, `buttons.md` F2).
+    SameAccount,
+    /// The phone scans at once and is another account (its own identity, no chats): the
+    /// profile then has two accounts (link feedback L4: removing one keeps the other).
+    OtherAccount,
 }
 
 /// The history transfer of fixture mode ([`FixtureOptions::transfer`]).
@@ -188,6 +240,8 @@ impl Default for FixtureOptions {
             qr_valid_for: Duration::from_secs(5),
             qr_codes: 3,
             messages_per_conversation: 120,
+            contacts: 12,
+            groups: 4,
             showcase: true,
             state: FixtureState::Online,
             expiring: None,
@@ -197,6 +251,10 @@ impl Default for FixtureOptions {
             transfer: None,
             history_on_link: false,
             transfer_stage: FixtureTransfer::STAGE,
+            second_link: None,
+            updating: false,
+            logout_unreachable: false,
+            sends: None,
         }
     }
 }
@@ -215,6 +273,8 @@ pub enum FixtureState {
     Challenge,
     /// The system clock is two hours ahead.
     ClockSkew,
+    /// Another session took the connection: the "error" banner with "Reconnect".
+    Reconnect,
     /// The device was unlinked; its history stays and "Link Again" works.
     LoggedOut,
 }
@@ -230,18 +290,31 @@ pub struct StartOptions {
     pub desktop: DesktopOptions,
 }
 
-/// The environment variable that switches the history transfer of a new link ON for one run
-/// (`KOURIER_HISTORY_TRANSFER=1`), in every build. Without it Signal's backend offers no
-/// transfer and no "Transfer History from Phone…": the import is not whole yet (architecture
-/// §14.2 item 14), and a phone that is asked exports and uploads its whole history. The
-/// switch is for the runs that try the import; it becomes the default, and this variable
-/// goes away, when the import is whole.
+/// The environment variable that switches the history transfer of a new link OFF for one run
+/// (`KOURIER_HISTORY_TRANSFER=0`, exactly `0`), in every build. By default a new link
+/// offers the transfer, as Signal Desktop's does: the linking URL carries `backup5`, the
+/// phone asks its user whether to transfer the history and he can decline there, and
+/// the descriptor says `HistorySource::PushedOnLink`, which makes the screens offer
+/// "Transfer History from Phone…" (architecture §14.2 item 14). Any other value, or none,
+/// leaves the offer on. The switch is for the runs that do not want a phone to be asked
+/// (a link that is not about the history); there is no persistent setting.
 pub const HISTORY_TRANSFER_ENV: &str = "KOURIER_HISTORY_TRANSFER";
 
-/// Whether the value of [`HISTORY_TRANSFER_ENV`] asks for the transfer: exactly `1`.
+/// Whether a new link offers the history transfer given the value of
+/// [`HISTORY_TRANSFER_ENV`]: always, except when it is exactly `0`.
 #[cfg_attr(not(feature = "signal"), allow(dead_code))]
-fn history_transfer_asked(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|v| v == "1")
+fn history_transfer_offered(value: Option<&std::ffi::OsStr>) -> bool {
+    !value.is_some_and(|v| v == "0")
+}
+
+/// The Signal network of the user's profile: a new link offers the history transfer unless
+/// the value of [`HISTORY_TRANSFER_ENV`] says `0`. The offer also sets the descriptor's
+/// `HistorySource::PushedOnLink`, which is what makes the screens offer "Transfer History
+/// from Phone…".
+#[cfg(feature = "signal")]
+fn signal_network(history_transfer: Option<&std::ffi::OsStr>) -> kourier_signal::SignalNetwork {
+    kourier_signal::SignalNetwork::new()
+        .with_history_transfer_offer(history_transfer_offered(history_transfer))
 }
 
 /// A network the user can add an account of.
@@ -286,6 +359,10 @@ pub struct FixtureInfo {
     /// The direct chat with a call line of every state of a 1:1 call, the last one ringing
     /// (`--page=calls`).
     pub calls_conversation: Option<ConversationId>,
+    /// The showcase chat of imported attachments that cannot be had: "Not available on this
+    /// device", "No longer available", and a picture that downloads on a click
+    /// (`--page=unavailable`).
+    pub unavailable_conversation: Option<ConversationId>,
 }
 
 /// Facts about the running app, the same for every [`AppHandle`] clone.
@@ -301,6 +378,17 @@ struct AppInfo {
     /// What seeding the reference profile took, when this start seeded it.
     #[cfg(feature = "perf")]
     seeded: Option<crate::perf::SeedReport>,
+    /// The core's clock (in fixture mode the fixture's running clock).
+    clock: CoreClock,
+}
+
+/// The core's clock, for [`AppHandle::core_now_ms`].
+struct CoreClock(Arc<dyn Clock>);
+
+impl std::fmt::Debug for CoreClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CoreClock")
+    }
 }
 
 /// The UI's handle to the running app: commands, events, queries and a few facts. Cloneable
@@ -333,6 +421,12 @@ impl AppHandle {
         self.core.subscribe()
     }
 
+    /// How many core events were sent and not yet read by every subscriber
+    /// ([`CoreHandle::events_unseen`](kourier_core::facade::CoreHandle::events_unseen)).
+    pub fn events_unseen(&self) -> usize {
+        self.core.events_unseen()
+    }
+
     /// Runs a query and awaits the rows (tests and app-side tasks; the UI uses
     /// `UiCommand::Query`).
     pub async fn query(&self, query: Query) -> Result<QueryData, CoreError> {
@@ -357,6 +451,13 @@ impl AppHandle {
     /// This computer's host name (the default device name when linking).
     pub fn hostname(&self) -> &str {
         &self.info.hostname
+    }
+
+    /// What the core's clock reads now (ms since the Unix epoch). In fixture mode this is the
+    /// fixture's clock, which RUNS from [`FixtureInfo::now_ms`]; the UI's own "now" stays at
+    /// that instant so pictures do not move, except where a debug run asks for it to run.
+    pub fn core_now_ms(&self) -> i64 {
+        i64::try_from(self.info.clock.0.now_ms()).unwrap_or(i64::MAX)
     }
 
     /// Fixture facts, once the fixture data is in `core.db`.
@@ -559,6 +660,12 @@ struct Setup {
     /// The peer of the fixture's chat with calls.
     #[cfg(feature = "fake")]
     fixture_calls: Option<kourier_model::UserId>,
+    /// The peer of the fixture's chat of attachments that cannot be had.
+    #[cfg(feature = "fake")]
+    fixture_unavailable: Option<kourier_model::UserId>,
+    /// The script of the next account added after the fixture was seeded.
+    #[cfg(feature = "fake")]
+    fixture_second_link: Option<kourier_fake::Script>,
     /// An empty reference profile to seed: what to remember of its script, and its root.
     #[cfg(feature = "perf")]
     perf_seed: Option<(crate::perf::Reference, std::path::PathBuf)>,
@@ -651,10 +758,19 @@ impl App {
                 &setup.avatars,
                 setup.fixture_now,
                 setup.fixture_seed,
-                setup.fixture_calls.clone(),
+                PagePeers {
+                    calls: setup.fixture_calls.clone(),
+                    unavailable: setup.fixture_unavailable.clone(),
+                },
             ))?),
             _ => None,
         };
+        // The next account added gets the second link's script (the seeding took the default
+        // one).
+        #[cfg(feature = "fake")]
+        if let (Some(fake), Some(second)) = (&setup.fake, setup.fixture_second_link.take()) {
+            fake.control().push_script(second);
+        }
         // ("Link Again" of the fixture's unlinked account needs nothing here: the fake does
         // not replay a script the account already ran, so the relinked account comes online
         // with its history in `core.db`.)
@@ -714,6 +830,7 @@ impl App {
                 fake: setup.fake.as_ref().map(kourier_fake::FakeNetwork::control),
                 #[cfg(feature = "perf")]
                 seeded,
+                clock: CoreClock(setup.clock.clone()),
             }),
         };
         Ok(Self {
@@ -783,9 +900,22 @@ async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
     let paths = Paths::resolve(profile.clone())?;
     paths.create_dirs().map_err(AppError::Dirs)?;
     crate::logging::init(Some(&paths.log_dir()));
-    let backend = config::backend_config(|k| std::env::var(k).ok(), &paths.state)?;
+    normal_setup_in(paths, |k| std::env::var_os(k)).await
+}
+
+/// What [`normal_setup`] does once the paths are known and logging runs, reading the
+/// environment through `env` so that a test can start from a private one: the keyring, the
+/// compiled-in networks and their registry. This is the one place the registry of a normal
+/// start is built, and the test `a_normal_start_offers_the_history_transfer_by_default` runs
+/// it.
+async fn normal_setup_in(
+    paths: Paths,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Setup, AppError> {
+    let backend =
+        config::backend_config(|k| env(k).and_then(|v| v.into_string().ok()), &paths.state)?;
     #[cfg(debug_assertions)]
-    let dev_keyring = if crate::dev::wants_dev_keyring(|k| std::env::var_os(k)) {
+    let dev_keyring = if crate::dev::wants_dev_keyring(&env) {
         tracing::info!("development keyring (KOURIER_DEV_KEYRING); the Secret Service is not used");
         Some(crate::dev::open_keyring(&paths)?)
     } else {
@@ -801,16 +931,13 @@ async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
     let mut registry = NetworkRegistry::new();
     #[cfg(feature = "signal")]
     {
-        let transfer = history_transfer_asked(std::env::var_os(HISTORY_TRANSFER_ENV).as_deref());
-        if transfer {
+        let value = env(HISTORY_TRANSFER_ENV);
+        if !history_transfer_offered(value.as_deref()) {
             tracing::warn!(
-                "history transfer at link time is switched on for this run (experimental: the import is not whole)"
+                "history transfer at link time is switched OFF for this run (KOURIER_HISTORY_TRANSFER=0): a new link does not offer it to the phone"
             );
         }
-        register(
-            &mut registry,
-            Arc::new(kourier_signal::SignalNetwork::new().with_history_transfer_offer(transfer)),
-        );
+        register(&mut registry, Arc::new(signal_network(value.as_deref())));
     }
     #[cfg(feature = "fake")]
     let fake = {
@@ -819,7 +946,7 @@ async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
             // Debug builds: the state the demo account ends in (tests of the account states
             // on a real profile, e.g. a challenge answered from a second launch).
             #[cfg(debug_assertions)]
-            state: crate::dev::demo_state(|k| std::env::var_os(k)),
+            state: crate::dev::demo_state(&env),
             ..FixtureOptions::default()
         })?;
         register(&mut registry, Arc::new(demo.network.clone()));
@@ -843,6 +970,10 @@ async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
         fixture_seed: None,
         #[cfg(feature = "fake")]
         fixture_calls: None,
+        #[cfg(feature = "fake")]
+        fixture_unavailable: None,
+        #[cfg(feature = "fake")]
+        fixture_second_link: None,
         #[cfg(feature = "perf")]
         perf_seed: None,
     })
@@ -915,6 +1046,8 @@ fn fixture_setup(f: &FixtureOptions) -> Result<Setup, AppError> {
         fixture_now: demo.now_ms,
         fixture_seed: demo.seed_steps,
         fixture_calls: demo.calls_peer,
+        fixture_unavailable: demo.unavailable_peer,
+        fixture_second_link: demo.second_link,
         #[cfg(feature = "perf")]
         perf_seed: None,
     })
@@ -945,6 +1078,8 @@ fn perf_setup(p: &crate::perf::PerfOptions) -> Result<Setup, AppError> {
         fixture_now: None,
         fixture_seed: None,
         fixture_calls: None,
+        fixture_unavailable: None,
+        fixture_second_link: None,
         perf_seed: net.seeding.map(|reference| (reference, p.home.clone())),
     })
 }
@@ -952,6 +1087,16 @@ fn perf_setup(p: &crate::perf::PerfOptions) -> Result<Setup, AppError> {
 /// How long after its newest message fixture mode's "now" is.
 #[cfg(feature = "fake")]
 const FIXTURE_NOW_AFTER_NEWEST_MS: i64 = 7 * 60_000;
+
+/// The peers of the generated chats that a fixture page opens (the showcase chats have fixed
+/// peers of their own).
+#[cfg(feature = "fake")]
+struct PagePeers {
+    /// The chat with calls (`--page=calls`).
+    calls: Option<kourier_model::UserId>,
+    /// The chat of attachments that cannot be had (`--page=unavailable`).
+    unavailable: Option<kourier_model::UserId>,
+}
 
 /// The fake network of fixture mode and what belongs to its data.
 #[cfg(feature = "fake")]
@@ -966,6 +1111,11 @@ struct Demo {
     seed_steps: Option<usize>,
     /// The peer of the chat with calls (`--page=calls`).
     calls_peer: Option<kourier_model::UserId>,
+    /// The peer of the chat of attachments that cannot be had (`--page=unavailable`).
+    unavailable_peer: Option<kourier_model::UserId>,
+    /// The script the next account added after the seeding gets
+    /// ([`FixtureOptions::second_link`]).
+    second_link: Option<kourier_fake::Script>,
 }
 
 /// The fake network with the fixture data set: an automatic login for seeded fixture mode
@@ -977,6 +1127,8 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
     use kourier_fake::{FakeNetwork, Flavor, LoginScript};
     let spec = FixtureSpec {
         messages_per_conversation: f.messages_per_conversation,
+        contacts: f.contacts,
+        groups: f.groups,
         showcase: f.showcase,
         state: match f.state {
             FixtureState::Online => FakeState::Online,
@@ -984,6 +1136,7 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
             FixtureState::Connecting => FakeState::Connecting,
             FixtureState::Challenge => FakeState::Challenge,
             FixtureState::ClockSkew => FakeState::ClockSkew,
+            FixtureState::Reconnect => FakeState::Reconnect,
             FixtureState::LoggedOut => FakeState::LoggedOut,
         },
         ..FixtureSpec::default()
@@ -1000,6 +1153,7 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
     }
     let mut seed_steps = None;
     let mut calls_peer = None;
+    let mut unavailable_peer = None;
     if f.showcase
         && let Some(now) = now_ms
     {
@@ -1011,6 +1165,12 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
                 ring_for: f.calls_ring_for,
             },
         );
+        (script, unavailable_peer) =
+            crate::fixture_media::with_unavailable(script, calls_peer.as_ref());
+        // The fixture account is a Signal account: its phone can be asked for the files the
+        // server lost (the gone ones of the `unavailable` page offer Download), and says
+        // nothing, as a phone that is not at hand.
+        script = script.with_backfill(kourier_fake::BackfillScript::Silent);
     }
     if !f.link {
         (script, avatars) = crate::fixture_media::with_fixture_media(script);
@@ -1059,6 +1219,69 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
             _ => {}
         }
     }
+    // The update after a link that is still going on: profiles and groups left.
+    // (Reports are not stored: they come after the seeding, once a second, so that the UI,
+    // which subscribes after it, sees the most left and then what is left now.)
+    if f.updating && !f.link {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::Step;
+        use kourier_model::AccountProgress;
+        seed_steps.get_or_insert(script.steps.len());
+        for _ in 0..30 {
+            script = script.step(Step::Sleep(Duration::from_secs(1)));
+            for (profiles_left, groups_left) in [(160, 12), (120, 8)] {
+                script = script.step(Step::Ephemeral(Box::new(BackendEvent::AccountProgress(
+                    AccountProgress {
+                        profiles_left,
+                        groups_left,
+                        ..AccountProgress::default()
+                    },
+                ))));
+            }
+        }
+    }
+    match f.sends {
+        Some(FixtureSends::Slow(phase)) => script = script.slow_sends(phase, FixtureSends::SLOW),
+        Some(FixtureSends::RateLimited(wait)) => {
+            script = script.fail_transmit(kourier_fake::TransmitRule::attempts(
+                kourier_model::BackendError::new(
+                    kourier_model::ErrorKind::RateLimited {
+                        retry_after: Some(wait),
+                    },
+                    "fixture: rate limited",
+                ),
+                1,
+            ));
+        }
+        None => {}
+    }
+    if f.logout_unreachable {
+        script.logout_unreachable = true;
+        script.device_name = Some("Kourier fixture".to_owned());
+    }
+    // The second link: the same identity (never scanned, or scanned and refused by the core),
+    // or another account linked at once.
+    let other = kourier_model::UserId::parse("aci:00000000-0000-4000-8000-0000000f2000")
+        .map_err(|e| AppError::Fixture(e.to_string()))?;
+    let second_link = f.second_link.filter(|_| !f.link).map(|kind| {
+        let own_ids = if kind == FixtureSecondLink::OtherAccount {
+            vec![other]
+        } else {
+            script.own_ids.clone()
+        };
+        let mut second = kourier_fake::Script::new("second link", own_ids);
+        second.login = LoginScript::Qr {
+            ask_device_name: false,
+            codes: 1,
+            valid_for: Duration::from_secs(60),
+            scanned_at: match kind {
+                FixtureSecondLink::AtQr => None,
+                FixtureSecondLink::SameAccount | FixtureSecondLink::OtherAccount => Some(0),
+            },
+            linked_as: None,
+        };
+        second
+    });
     let mut network = FakeNetwork::new(Flavor::SignalLike, script);
     if f.history_on_link || f.transfer.is_some() {
         network = network.with_history(kourier_model::HistorySource::PushedOnLink);
@@ -1069,6 +1292,8 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
         now_ms,
         seed_steps,
         calls_peer,
+        unavailable_peer,
+        second_link,
     })
 }
 
@@ -1083,7 +1308,7 @@ async fn seed_fixture(
     avatars: &crate::fixture_media::FixtureAvatars,
     now_ms: Option<i64>,
     seed_steps: Option<usize>,
-    calls_peer: Option<kourier_model::UserId>,
+    peers: PagePeers,
 ) -> Result<FixtureInfo, AppError> {
     use kourier_core::facade::ConversationListQuery;
     use kourier_model::ConvKind;
@@ -1172,7 +1397,8 @@ async fn seed_fixture(
         kinds_conversation: direct(crate::fixture_media::kinds_peer()),
         albums_conversation: direct(crate::fixture_media::albums_peer()),
         readmore_conversation: direct(crate::fixture_media::readmore_peer()),
-        calls_conversation: direct(calls_peer),
+        calls_conversation: direct(peers.calls),
+        unavailable_conversation: direct(peers.unavailable),
     })
 }
 
@@ -1180,20 +1406,88 @@ async fn seed_fixture(
 mod transfer_switch_tests {
     use std::ffi::OsStr;
 
-    use super::{HISTORY_TRANSFER_ENV, history_transfer_asked};
+    use super::{HISTORY_TRANSFER_ENV, history_transfer_offered};
 
-    /// The history transfer of a new link is off unless the run's environment says exactly
-    /// `1`: no other value switches it on, and nothing switches it on by default.
+    /// The history transfer of a new link is offered by default and is off only when the
+    /// run's environment says exactly `0`: no other value switches it off.
     #[test]
-    fn the_history_transfer_is_asked_for_only_by_the_value_one() {
+    fn the_history_transfer_is_offered_unless_the_value_is_exactly_zero() {
         assert_eq!(HISTORY_TRANSFER_ENV, "KOURIER_HISTORY_TRANSFER");
-        assert!(!history_transfer_asked(None));
-        for other in ["", "0", "true", "yes", "on", "1 ", " 1", "11"] {
+        assert!(history_transfer_offered(None));
+        for other in [
+            "", "1", "true", "false", "no", "off", "00", "0 ", " 0", "01", "10",
+        ] {
             assert!(
-                !history_transfer_asked(Some(OsStr::new(other))),
+                history_transfer_offered(Some(OsStr::new(other))),
                 "{other:?}"
             );
         }
-        assert!(history_transfer_asked(Some(OsStr::new("1"))));
+        assert!(!history_transfer_offered(Some(OsStr::new("0"))));
+    }
+
+    /// The Signal network the app builds offers the transfer by default (and says so in its
+    /// descriptor, which is what shows "Transfer History from Phone…"), and with the switch
+    /// at `0` it offers nothing.
+    #[cfg(feature = "signal")]
+    #[test]
+    fn the_signal_network_of_the_app_offers_the_transfer_by_default() {
+        use kourier_backend_api::Network as _;
+        use kourier_model::HistorySource;
+
+        use super::signal_network;
+
+        for on in [None, Some(OsStr::new("1")), Some(OsStr::new("yes"))] {
+            assert_eq!(
+                signal_network(on).descriptor().history,
+                HistorySource::PushedOnLink,
+                "{on:?}"
+            );
+        }
+        assert_eq!(
+            signal_network(Some(OsStr::new("0"))).descriptor().history,
+            HistorySource::None
+        );
+    }
+
+    /// THE WIRING: the registry a normal start builds (`normal_setup_in`, which
+    /// `normal_setup` calls with the process environment) holds a Signal network that
+    /// offers the transfer by default, and none that offers it when the run's environment
+    /// says `0`. A `normal_setup` that registered `SignalNetwork::new()` (the library's
+    /// default, offer off) passes every test of `signal_network` and fails this one. Debug
+    /// builds only: the test starts from the development keyring, which release builds lack.
+    #[cfg(all(debug_assertions, feature = "signal"))]
+    #[tokio::test]
+    async fn a_normal_start_offers_the_history_transfer_by_default() {
+        use std::ffi::OsString;
+
+        use kourier_model::{HistorySource, NetworkKind};
+
+        use super::normal_setup_in;
+        use crate::dev::DEV_KEYRING_ENV;
+        use crate::paths::{HOME_ENV, Paths, Profile};
+
+        for (switch, expected) in [
+            (None, HistorySource::PushedOnLink),
+            (Some("1"), HistorySource::PushedOnLink),
+            (Some("0"), HistorySource::None),
+        ] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let env = |k: &str| -> Option<OsString> {
+                match k {
+                    HOME_ENV => Some(tmp.path().into()),
+                    DEV_KEYRING_ENV => Some("passphrase".into()),
+                    HISTORY_TRANSFER_ENV => switch.map(OsString::from),
+                    _ => None,
+                }
+            };
+            let paths = Paths::from_env(Profile::default(), env).expect("paths");
+            paths.create_dirs().expect("dirs");
+            let setup = normal_setup_in(paths, env).await.expect("a normal setup");
+            let signal = setup
+                .registry
+                .get(NetworkKind::Signal)
+                .expect("the Signal network is registered");
+            assert_eq!(signal.descriptor().history, expected, "{switch:?}");
+        }
     }
 }

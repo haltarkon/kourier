@@ -2,6 +2,8 @@
 //! rich-text positions as Qt's document sees them. Runs offscreen on the main thread
 //! (`harness = false`): `QT_QPA_PLATFORM=offscreen cargo test -p kourier-qt`.
 
+mod support;
+
 use std::pin::Pin;
 
 use cxx_qt_lib::{QGuiApplication, QModelIndex, QString, QVariant};
@@ -14,13 +16,14 @@ use kourier_viewmodel::{ConversationFilter, FixtureSource, NameMap, UiSource, re
 type Check = (&'static str, fn());
 
 fn main() {
+    support::answer_list("models");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before Qt starts.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };
     }
     cxx_qt::init_crate!(kourier_qt);
     let _app = QGuiApplication::new();
-    let checks: [Check; 6] = [
+    let checks: [Check; 7] = [
         (
             "timeline rows, roles and an appended message",
             timeline_rows_and_roles,
@@ -38,6 +41,10 @@ fn main() {
             random_list_ops,
         ),
         ("accounts", accounts_model),
+        (
+            "a wait line is patched into its row only",
+            a_wait_line_is_patched_into_its_row,
+        ),
         (
             "rich text positions match Qt's document",
             rich_text_positions,
@@ -319,4 +326,40 @@ fn rich_text_positions() {
             assert!(s.start + s.len <= len16);
         }
     }
+}
+
+/// The per-second tick (link feedback L6) changes the lines under the messages on their way
+/// one row at a time: `patch_row` takes over a row with the same identity, rebuilds its Qt
+/// form, and the roles it announces are the two of the line, nothing else.
+fn a_wait_line_is_patched_into_its_row() {
+    let src = FixtureSource::new().expect("fixture");
+    let conv = src.fixture().long_chat;
+    let rows = src.timeline(conv);
+    let mut model = qobject::new_timeline_model();
+    let mut m: Pin<&mut TimelineModel> = model.pin_mut();
+    assert!(models::set_rows(m.as_mut(), 1, rows.clone()));
+    assert_eq!(string(timeline_data(&m, 0, "wait")), "");
+
+    let mut line = rows[0].clone();
+    line.wait = "Sending…".into();
+    line.wait_timer = "0:42".into();
+    // Only the two roles of the line differ, and those are what a change announces.
+    let roles = <TimelineModel as ListModel>::changed_roles(&rows[0], &line);
+    assert_eq!(roles.0, (1 << 20) | (1 << 21), "wait and waitTimer only");
+    assert!(models::patch_row(m.as_mut(), 0, line.clone()));
+    assert_eq!(string(timeline_data(&m, 0, "wait")), "Sending…");
+    assert_eq!(string(timeline_data(&m, 0, "waitTimer")), "0:42");
+    assert_eq!(string(timeline_data(&m, 1, "wait")), "", "no other row");
+    assert_eq!(m.rows()[0], line, "the viewmodel row follows");
+    assert_eq!(m.rows().len(), rows.len());
+
+    // The next second.
+    line.wait_timer = "0:43".into();
+    assert!(models::patch_row(m.as_mut(), 0, line.clone()));
+    assert_eq!(string(timeline_data(&m, 0, "waitTimer")), "0:43");
+    // Nothing new, another row's identity, a row that is not there: nothing happens.
+    assert!(!models::patch_row(m.as_mut(), 0, line.clone()));
+    assert!(!models::patch_row(m.as_mut(), 0, rows[1].clone()));
+    assert!(!models::patch_row(m.as_mut(), rows.len(), line));
+    assert_eq!(string(timeline_data(&m, 0, "waitTimer")), "0:43");
 }

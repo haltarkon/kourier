@@ -55,7 +55,8 @@ impl AccountStatus {
         match state {
             AccountState::LoggedOut { .. } | AccountState::Removing => return Self::LoggedOut,
             AccountState::Linking => return Self::Connecting,
-            AccountState::Active => {}
+            // Still linked until the logout is through.
+            AccountState::Active | AccountState::Unlinking => {}
         }
         match conn {
             ConnState::Online { .. } => Self::Online,
@@ -117,6 +118,12 @@ pub struct AccountRow {
     /// The account offers "Transfer History from Phone…": its network hands a newly linked
     /// device the history, and no transfer of it runs.
     pub offers_history: bool,
+    /// The account offers "Unlink…": it is linked and its link is not still going on.
+    pub offers_unlink: bool,
+    /// Which device of its identity this account is ("device 3"), only when another account
+    /// of the profile has the same name and number (a profile from before one identity was
+    /// one account, link feedback D10); empty otherwise.
+    pub device: String,
 }
 
 crate::safe_debug!(AccountRow {
@@ -148,6 +155,8 @@ pub fn account_row(account: &Account, conn: &ConnState, unread: u32) -> AccountR
         avatar_url: String::new(),
         number: String::new(),
         offers_history: false,
+        offers_unlink: false,
+        device: String::new(),
     }
 }
 
@@ -533,6 +542,9 @@ pub struct ChatHeader {
     /// account's other devices; `false`: it stays on this device (the network has no such
     /// message, or the account is logged out).
     pub deletes_sync: bool,
+    /// Why "Clear Chat History" and "Delete Chat" are not offered now (its message history
+    /// is still arriving); empty when they are.
+    pub still_filling: String,
 }
 
 /// The custom timers a conversation takes: every `min + k × step` seconds up to `max`.
@@ -667,6 +679,11 @@ pub enum BannerKind {
     Connecting,
     /// Connected, catching up on what arrived meanwhile.
     Syncing,
+    /// A freshly linked account still fetches the profiles of its contacts and the groups
+    /// the server has not given yet (after its history transfer, or without one): chats
+    /// work, some names and groups are still coming. It says more than "connecting" or
+    /// "getting new messages", and less than a running transfer.
+    Updating,
     /// The history transfer of a new link runs (waiting for the phone, downloading,
     /// reading): nothing new arrives until it ends. It says more than "connecting" or
     /// "getting new messages", and less than any state that cuts the account off.
@@ -691,13 +708,15 @@ pub enum BannerKind {
 
 impl BannerKind {
     /// Stable name for QML (`connecting`, `syncing`, `offline`, `error`, `restricted`,
-    /// `clock`, `challenge`, `loggedOut`). `transfer` and `transferFailed` never reach it:
+    /// `clock`, `challenge`, `loggedOut`). `updating`, `transfer` and `transferFailed` never
+    /// reach it:
     /// a history transfer is not the state banner's kind (`UiSource::transfer_banner`), the
     /// two only say where a transfer stands in the order of ONE account's banners.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Connecting => "connecting",
             Self::Syncing => "syncing",
+            Self::Updating => "updating",
             Self::Transfer => "transfer",
             Self::Offline => "offline",
             Self::TransferFailed => "transferFailed",
@@ -772,7 +791,7 @@ pub fn account_banner(
     match state {
         AccountState::LoggedOut { .. } => return logged_out(),
         AccountState::Linking | AccountState::Removing => return None,
-        AccountState::Active => {}
+        AccountState::Active | AccountState::Unlinking => {}
     }
     match conn {
         ConnState::LoggedOut { .. } | ConnState::NeedsUserAction(UserAction::Relink) => {
@@ -976,6 +995,7 @@ pub fn chat_header(
             timer_span(&c.features)
         },
         deletes_sync: c.features.delete_for_me,
+        still_filling: String::new(),
     }
 }
 

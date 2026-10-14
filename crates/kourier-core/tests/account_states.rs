@@ -417,7 +417,7 @@ async fn connection_clock_and_logged_out_states_reach_the_ui() {
     assert_eq!(row.conn, logged_out);
     let before = env.timeline(c).await.len();
     assert_eq!(before, 2, "alice's message and ours");
-    let flags = env.timeline(c).await[0].actions;
+    let flags = env.timeline(c).await[0].actions.clone();
     assert!(!flags.reply && !flags.react && flags.delete_for_me && flags.copy);
 
     // After a restart no actor runs, and the row still says why.
@@ -628,6 +628,7 @@ async fn the_fixture_ends_in_the_asked_account_state() {
         (FixtureState::Syncing, "Syncing"),
         (FixtureState::ClockSkew, "NeedsUserAction"),
         (FixtureState::Challenge, "NeedsUserAction"),
+        (FixtureState::Reconnect, "NeedsUserAction"),
         (FixtureState::LoggedOut, "LoggedOut"),
     ];
     for (state, name) in cases {
@@ -667,6 +668,10 @@ async fn the_fixture_ends_in_the_asked_account_state() {
                 conn_of(&env, account).await,
                 Some(ConnState::NeedsUserAction(UserAction::FixClock { skew_ms })) if skew_ms > 0
             )),
+            FixtureState::Reconnect => assert_eq!(
+                conn_of(&env, account).await,
+                Some(ConnState::NeedsUserAction(UserAction::Reconnect))
+            ),
             FixtureState::LoggedOut => {
                 // The backend publishes "logged out" before it exits, and the core records
                 // the logout once it has exited: the row follows the connection state by a

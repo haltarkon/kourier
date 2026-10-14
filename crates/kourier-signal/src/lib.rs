@@ -54,6 +54,7 @@ mod actor;
 mod archive;
 mod attachment;
 mod avatar;
+mod backfill;
 mod challenge;
 mod commands;
 mod connection;
@@ -76,6 +77,7 @@ mod outbox;
 mod padding;
 mod peers;
 mod profile;
+mod progress;
 mod proto;
 mod provisioning;
 mod receive;
@@ -164,8 +166,14 @@ pub mod archive_testing {
     }
 
     pub use crate::archive::writer::{
-        ChatSpec, ChatWith, ContactSpec, GeneratedSpec, HistorySpec, SendStatusSpec, TextSpec,
-        generated_aci,
+        AttachmentSpec, EncryptedAttachment, IntegritySpec, LocatorSpec, PointerSpec,
+        encrypt_attachment,
+    };
+    pub use crate::archive::writer::{
+        CallSpec, ChatSpec, ChatWith, ContactSpec, GeneratedSpec, GroupCallSpec, GroupChangeSpec,
+        GroupSpec, HistorySpec, IndividualCallSpec, ItemSpec, NoticeSpec, Party, QuoteSpec,
+        RangeKindSpec, RangeSpec, ReactionSpec, SendStatusSpec, SimpleSpec, SnapshotSpec, TextSpec,
+        Who, generated_aci,
     };
 
     /// Writes the history `spec` describes (people, chats, text messages) to `path`,
@@ -197,7 +205,8 @@ pub mod archive_testing {
         pub frames: u64,
         /// Its messages, over all chats.
         pub messages: u64,
-        /// Its chats with at least one row that makes a chat show.
+        /// Its chats that delivery shows: with at least one row that makes a chat show, or
+        /// pinned.
         pub shown_chats: u64,
         /// The user ids of the people it holds, in the order they were staged.
         pub contacts: Vec<String>,
@@ -216,14 +225,61 @@ pub mod archive_testing {
         pub rows: u64,
         /// Of those, rows that make a chat show.
         pub loud: u64,
-        /// Its rows that say "unread" (`read: false` on a message somebody else wrote):
-        /// what the core will count for the chat. Counted here from the rows; the stage
-        /// keeps no such counter.
+        /// Its rows that say "unread" (`read: false` on a message somebody else wrote, or
+        /// on a call line of a missed or a ringing call): what the core will count for the
+        /// chat. Counted here from the rows; the stage keeps no such counter.
         pub unread: u64,
         /// The newest sort time of its rows (ms).
         pub last_at: i64,
+        /// The phone's pinned order (`Chat.pinnedOrder`, not 0).
+        pub pinned: Option<u32>,
+        /// Archived on the phone.
+        pub archived: bool,
+        /// Marked unread on the phone.
+        pub marked_unread: bool,
+        /// Muted until (ms; `i64::MAX`: for ever).
+        pub muted_until: Option<i64>,
+        /// The 1:1 disappearing timer in seconds.
+        pub timer_secs: Option<u32>,
+        /// The version of that timer (at least 1).
+        pub timer_version: u32,
+        /// Delivery shows the chat (a loud row, pinned, or a group we are invited to).
+        pub shown: bool,
+        /// For a group's chat, what the stage holds of the group.
+        pub group: Option<StagedGroupDump>,
         /// Its rows, in the order of their frames.
         pub messages: Vec<kourier_backend_api::IncomingMessage>,
+    }
+
+    /// The group of a [`StagedChatDump`] (no master key).
+    #[derive(Clone, Debug)]
+    pub struct StagedGroupDump {
+        /// The title.
+        pub title: Option<String>,
+        /// The members with their roles (`None`: an empty snapshot).
+        pub members: Option<Vec<kourier_model::Member>>,
+        /// Our place: "member", "invited", "requesting", "left" or "unknown".
+        pub membership: &'static str,
+        /// Blocked on the phone.
+        pub blocked: bool,
+        /// Accepted on the phone.
+        pub whitelisted: bool,
+    }
+
+    /// Whether the row says "unread", the way the core will count it: a message somebody
+    /// else wrote, or a call line of a missed call (or of a group call somebody started)
+    /// that the phone had not seen. A line that still RINGS in the archive counts too: it
+    /// has no read state, and the core settles it at once as an unread missed call.
+    fn says_unread(m: &kourier_backend_api::IncomingMessage) -> bool {
+        use kourier_model::{Body, CallState, SystemEvent};
+        !m.read
+            && match &m.body {
+                Body::System(SystemEvent::Call(line)) => {
+                    line.counts_unread() || matches!(line.state, CallState::Ringing { .. })
+                }
+                Body::System(_) => false,
+                _ => !m.origin.is_own(),
+            }
     }
 
     /// Reads the committed stage in `transfer_dir` with the key derived from
@@ -267,18 +323,34 @@ pub mod archive_testing {
             }
             chats.push(StagedChatDump {
                 conv: chat.conv.encode(),
-                is_self: chat.op.is_self,
+                is_self: chat.op.is_self(),
                 rows: chat.counters.n_rows,
                 loud: chat.counters.n_loud,
-                unread: messages
-                    .iter()
-                    .filter(|m: &&kourier_backend_api::IncomingMessage| {
-                        !m.read
-                            && !m.origin.is_own()
-                            && !matches!(m.body, kourier_model::Body::System(_))
-                    })
-                    .count() as u64,
+                unread: messages.iter().filter(|m| says_unread(m)).count() as u64,
                 last_at: chat.counters.last_at,
+                pinned: chat.pinned,
+                archived: chat.op.frame.archived,
+                marked_unread: chat.op.frame.marked_unread,
+                muted_until: chat.op.frame.muted_until,
+                timer_secs: chat.op.frame.timer_secs,
+                timer_version: chat.op.frame.timer_version,
+                shown: chat.shown(),
+                group: chat.op.group().map(|group| {
+                    use crate::transfer::stage::GroupMembership;
+                    StagedGroupDump {
+                        title: group.title.clone(),
+                        members: group.members.clone(),
+                        membership: match group.membership {
+                            GroupMembership::Member => "member",
+                            GroupMembership::Invited => "invited",
+                            GroupMembership::Requesting => "requesting",
+                            GroupMembership::Left => "left",
+                            GroupMembership::Unknown => "unknown",
+                        },
+                        blocked: group.blocked,
+                        whitelisted: group.whitelisted,
+                    }
+                }),
                 messages,
             });
         }
@@ -312,6 +384,8 @@ pub mod archive_testing {
             aci: own_aci.into(),
             pni: own_pni.into(),
             now: now_ms,
+            queue_time: None,
+            receive_limit: crate::attachment::DEFAULT_MAX_RECEIVE_BYTES,
         };
         let archive_key = crate::archive::ArchiveKey::for_transfer(&key, own_aci.into());
         crate::transfer::import_archive(
@@ -329,6 +403,111 @@ pub mod archive_testing {
             crate::transfer::deliver::DeliveryBounds::DEFAULT,
         )
         .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use kourier_backend_api::IncomingMessage;
+        use kourier_model::{Body, CallDirection, CallLine, CallState, ConvKey, Origin, UserId};
+
+        use super::says_unread;
+
+        const AT: i64 = 1_700_000_000_000;
+
+        fn row(body: Body, origin: Origin, read: bool) -> IncomingMessage {
+            let conv =
+                ConvKey::Direct(UserId::parse("aci:21212121-2121-2121-2121-212121212121").unwrap());
+            let mut msg = IncomingMessage::new(conv, "1", origin, body, AT, AT);
+            msg.read = read;
+            msg
+        }
+
+        fn call(
+            group: bool,
+            direction: CallDirection,
+            state: CallState,
+            read: bool,
+        ) -> IncomingMessage {
+            let conv = if group {
+                ConvKey::Group("gv2:AAAA".into())
+            } else {
+                ConvKey::Direct(UserId::parse("aci:21212121-2121-2121-2121-212121212121").unwrap())
+            };
+            let line = CallLine::signal(direction, group, state, AT);
+            let mut msg = IncomingMessage::call(
+                conv,
+                "5",
+                Origin::OwnOtherDevice { device: None },
+                line,
+                AT,
+                AT,
+            );
+            msg.read = read;
+            msg
+        }
+
+        /// What the dump counts as unread is what the core will count: a ring that is
+        /// still on in the archive is settled at once as an unread missed call (S3a), so
+        /// it is counted, if the archive says it was not read.
+        #[test]
+        fn the_dump_counts_the_rows_the_core_counts_unread() {
+            use CallDirection::Incoming;
+            let peer = Origin::Remote {
+                author: UserId::parse("aci:21212121-2121-2121-2121-212121212121").unwrap(),
+                device: None,
+            };
+            let ringing = CallState::Ringing { deadline: AT };
+            let cases = [
+                (
+                    "ringing, unread",
+                    call(true, Incoming, ringing, false),
+                    true,
+                ),
+                ("ringing, read", call(true, Incoming, ringing, true), false),
+                (
+                    "missed, unread",
+                    call(false, Incoming, CallState::Missed, false),
+                    true,
+                ),
+                (
+                    "missed, read",
+                    call(false, Incoming, CallState::Missed, true),
+                    false,
+                ),
+                (
+                    "started, unread",
+                    call(true, Incoming, CallState::Started, false),
+                    true,
+                ),
+                (
+                    "answered",
+                    call(false, Incoming, CallState::Answered, false),
+                    false,
+                ),
+                (
+                    "a text of the peer, unread",
+                    row(Body::text("hi"), peer.clone(), false),
+                    true,
+                ),
+                (
+                    "a text of the peer, read",
+                    row(Body::text("hi"), peer, true),
+                    false,
+                ),
+                (
+                    "a text of ours",
+                    row(
+                        Body::text("hi"),
+                        Origin::OwnOtherDevice { device: None },
+                        false,
+                    ),
+                    false,
+                ),
+            ];
+            for (what, msg, unread) in cases {
+                assert_eq!(says_unread(&msg), unread, "{what}");
+            }
+        }
     }
 }
 
@@ -448,11 +627,11 @@ pub(crate) struct Tuning {
     /// to last).
     pub(crate) transfer_commit_pause: Duration,
     /// Whether a fresh link offers the history transfer (`backup5` in the linking URL).
-    /// OFF until the import is whole (architecture §14.2 item 14): it delivers people,
-    /// direct chats and plain text today; with the offer on, the user's phone would export
-    /// and upload its whole history for Kourier to import a part of it (no groups, no
-    /// media, no quotes or reactions yet). With it off the URL carries no capability and a
-    /// key the phone sends all the same is ignored.
+    /// OFF in the library (`SignalNetwork::new()`), because tests build networks directly;
+    /// the application turns it ON where it builds its network
+    /// (`with_history_transfer_offer(true)`, `kourier_app::signal_network`), as Signal
+    /// Desktop offers it (architecture §14.2 item 14). With it off the URL carries no
+    /// capability and a key the phone sends all the same is ignored.
     pub(crate) transfer_offer: bool,
     /// The bounds of the archive's download as a whole (its deadline, its slowest rate).
     pub(crate) transfer_download: transfer::DownloadBounds,
@@ -596,11 +775,13 @@ impl SignalNetwork {
     }
 
     /// Whether a fresh link offers the phone the history transfer (`backup5` in the linking
-    /// URL). Off by default, and the app keeps it off until the import is whole
-    /// (architecture §14.2 item 14): offered today, the user's phone would export and
-    /// upload its whole history for Kourier to import people, direct chats and plain text
-    /// only. With it off the linking URL carries no capability, and a key a phone sends all
-    /// the same is ignored. Every test of the transfer switches it on.
+    /// URL). Off in the library, which has no way to know who builds it: the APP switches it
+    /// on (`kourier_app` does, for every new link, unless the run's environment says
+    /// `KOURIER_HISTORY_TRANSFER=0`; architecture §14.2 item 14), and the tests that build a
+    /// network directly (the mock harness of `kourier-e2e`, this crate's unit tests) keep
+    /// their links free of a transfer unless they are about it. With it off the linking URL
+    /// carries no capability, and a key a phone sends all the same is ignored. Every test of
+    /// the transfer switches it on.
     ///
     /// The descriptor follows the switch: with the offer on it says that linking brings the
     /// account's history (`HistorySource::PushedOnLink`), which is what makes a UI offer

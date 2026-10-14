@@ -16,7 +16,13 @@
 //!   presence (focus, chat on screen) stands: the end of the old window's release does not
 //!   reset it.
 //!
+//! - (L5) notices about removed accounts told while no window exists are kept by the shell
+//!   and shown by the next window; a window released with a notice's dialog open and another
+//!   notice waiting hands both over (the open one first).
+//!
 //! Debug builds only: the release delay of a release build is a minute.
+
+mod support;
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_app::{App, FixtureOptions, Launch, StartOptions};
@@ -48,7 +54,7 @@ Window {
 
     // The window comes back while the released one is still being deleted.
     function comeBack(): void {
-        test.raced = shell.releases === 1;
+        test.raced = shell.releases === 2;
         shell.activate("", CHAT);
     }
 
@@ -137,6 +143,11 @@ Window {
                 if (!test.coreAskedFirst) return test.fail("the heap was trimmed before the core was asked to free its caches");
                 // The models stay: the conversation is still open in the core's view.
                 if (App.conversations.count < 15) return test.fail("the list's rows went with the window");
+                // L5: what became of a removed account's device is told while no window
+                // exists (a notice that stays and a passing one): kept for the next window.
+                App.logoutNotice("Gone.", "Remove “gone” on your phone.", "Remove This Computer on Your Phone");
+                App.logoutNotice("Removed.", "", "");
+                if (shell.pendingLogoutNotices.length !== 2) return test.fail("the shell kept " + shell.pendingLogoutNotices.length + " notices, not two");
                 // A notification click, the tray, a second launch: the window comes back.
                 shell.activate("", 0);
                 test.next("back");
@@ -147,9 +158,66 @@ Window {
                 const list = w.pageStack.get(0);
                 if (!list || !list.rowsShown || list.flickable.count < 15) return test.later("its list");
                 if (w.welcomePage !== null || w.settingsPage !== null || w.linkPage !== null) return test.fail("pages nobody asked for");
+                if (w.logoutNotices !== 2) return test.fail("the new window was told " + w.logoutNotices + " notices, not two");
+                if (w.logoutDialog === null || !w.logoutDialog.opened) return test.later("the notice that stays, in the new window");
+                if (w.logoutDialog.onPhone.indexOf("“gone”") < 0) return test.fail("the notice: " + w.logoutDialog.onPhone);
+                w.logoutDialog.close();
+                test.next("noticed");
+                return;
+            }
+            case "noticed": {
+                const w = shell.window;
+                if (w.logoutDialog !== null) return test.later("the notice closes");
+                const list = w.pageStack.get(0);
                 if (w.pageStack.depth !== 2 || list.width > w.width / 2) return test.fail("the new window's columns: " + w.pageStack.depth + " pages, list " + list.width);
                 // It does not release itself while it is shown.
                 if (shell.releases !== 1) return test.fail("released while shown");
+                // L5 hand-over: two notices that stay are told in the shown window, the first
+                // one's dialog opens and the second waits; the window then hides and is
+                // released with the dialog still open. Neither notice may be lost.
+                App.logoutNotice("One.", "Remove “one” on your phone.", "Remove This Computer on Your Phone");
+                App.logoutNotice("Two.", "Remove “two” on your phone.", "Remove This Computer on Your Phone");
+                test.next("open");
+                return;
+            }
+            case "open": {
+                const w = shell.window;
+                if (w.logoutDialog === null || !w.logoutDialog.opened) return test.later("the first notice opens");
+                if (w.logoutDialog.onPhone.indexOf("“one”") < 0) return test.fail("the first notice: " + w.logoutDialog.onPhone);
+                if (w.pendingLogoutNotices.length !== 1) return test.fail("the second notice waits: " + w.pendingLogoutNotices.length);
+                w.hideToTray();
+                test.next("released2");
+                return;
+            }
+            case "released2": {
+                if (shell.releases < 2) return test.later("the second release");
+                if (shell.window !== null || shell.releasing !== null) return test.later("the window is gone");
+                // The shell holds the open dialog's notice first and the waiting one after it.
+                if (shell.pendingLogoutNotices.length !== 2) return test.fail("the shell kept " + shell.pendingLogoutNotices.length + " notices of the released window, not two");
+                if (shell.pendingLogoutNotices[0].onPhone.indexOf("“one”") < 0 || shell.pendingLogoutNotices[1].onPhone.indexOf("“two”") < 0) return test.fail("their order");
+                shell.activate("", 0);
+                test.next("handed");
+                return;
+            }
+            case "handed": {
+                const w = shell.window;
+                if (w === null) return test.later("the window");
+                if (w.logoutDialog === null || !w.logoutDialog.opened || w.logoutDialog.onPhone.indexOf("“one”") < 0) return test.later("the first notice, in the new window");
+                w.logoutDialog.close();
+                test.next("handed2");
+                return;
+            }
+            case "handed2": {
+                const w = shell.window;
+                if (w.logoutDialog === null || !w.logoutDialog.opened || w.logoutDialog.onPhone.indexOf("“two”") < 0) return test.later("the second notice, after the first");
+                w.logoutDialog.close();
+                test.next("handed3");
+                return;
+            }
+            case "handed3": {
+                const w = shell.window;
+                if (w.logoutDialog !== null || w.pendingLogoutNotices.length !== 0) return test.later("both notices are told");
+                if (shell.pendingLogoutNotices.length !== 0) return test.fail("the shell still holds " + shell.pendingLogoutNotices.length);
                 w.openConversation(CHAT);
                 test.next("again");
                 return;
@@ -166,8 +234,8 @@ Window {
                 return;
             }
             case "raced": {
-                if (shell.releases < 2) return test.later("the second release");
-                if (shell.coreReleases !== 2) return test.fail("each release asks the core once: " + shell.coreReleases);
+                if (shell.releases < 3) return test.later("the third release");
+                if (shell.coreReleases !== 3) return test.fail("each release asks the core once: " + shell.coreReleases);
                 if (!test.raced) return test.fail("the activation did not fall between the release and the trim");
                 const w = shell.window;
                 if (w === null || !w.visible) return test.fail("the window that came back is not there");
@@ -193,6 +261,7 @@ Window {
 "##;
 
 fn main() {
+    support::answer_list("release_ui");
     // This test shows windows: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

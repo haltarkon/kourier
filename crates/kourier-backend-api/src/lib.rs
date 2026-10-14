@@ -28,7 +28,7 @@ pub use kourier_model as model;
 pub use clock::{Clock, FakeClock, Sleep, SystemClock};
 pub use command::{
     BlobTarget, CLEAR_ANCHORS, Command, DurableCommand, OutgoingKind, OutgoingRequest, Relink,
-    Reply, TransmitOutcome,
+    Reply, TakenIdentity, TransmitOutcome,
 };
 pub use context::{
     AccountContext, AccountHandle, BackendConfig, BackendEnv, COMMAND_QUEUE, ContextParams,
@@ -38,6 +38,6 @@ pub use context::{
 pub use event::{
     Ack, AckWaiter, BackendEvent, BackendNotice, CodecError, ContractViolation, Envelope,
     HistoryEdit, HistoryReaction, IncomingMessage, MAX_HISTORY_BATCH, MAX_HISTORY_EDITS,
-    OUTBOX_FORMAT, decode_outbox_row, encode_outbox_row,
+    OUTBOX_FORMAT, RestoreSlot, RestoreUpdate, decode_outbox_row, encode_outbox_row,
 };
 pub use network::{AllocatedId, Network, NetworkRegistry, RegistryError};

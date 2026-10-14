@@ -14,14 +14,16 @@ use kourier_core::facade::{
     UiEvent,
 };
 use kourier_core::testing::IngestHarness;
-use kourier_fake::attachments::{Pointer, expired_attachment, synthetic_file, synthetic_image};
+use kourier_fake::attachments::{
+    Pointer, expired_attachment, synthetic_file, synthetic_image, synthetic_long_text,
+};
 use kourier_fake::scripts::{T0, remote, signal_features};
 use kourier_fake::{Flavor, Script, TransmitRule};
 use kourier_media::{SampleFormat, sample_image};
 use kourier_model::{
     AccountCaps, Attachment, AttachmentId, AttachmentKind, AttachmentState, BackendError, Body,
-    ConvKey, ConversationId, ConversationPatch, ErrorKind, FileLimits, MsgIdScope, NetworkKind,
-    OutgoingState, Text,
+    ConvKey, ConversationId, ConversationPatch, DisappearKind, ErrorKind, Expiry, FileLimits,
+    MsgIdScope, NetworkKind, OutgoingState, Text,
 };
 use support::send::{ME, ME_PNI, alice, d_alice, setup, uid};
 use support::{Env, WAIT, add_linked, eventually};
@@ -876,6 +878,192 @@ async fn a_plaintext_scan_of_the_profile_finds_no_attachment_bytes() {
     }
 }
 
+/// An imported message (`sent_at` = `T0 + n`, read) with the rest of a long text as its
+/// attachment and, when `expiry` is given, a disappearing timer.
+fn imported_long_text(n: i64, expiry: Option<Expiry>) -> kourier_backend_api::IncomingMessage {
+    let whole = format!("message {n}: every word of a long imported text. ").repeat(100);
+    let BackendEvent::Message(mut m) = media(
+        T0 + n,
+        vec![synthetic_long_text(&whole)],
+        text(&whole[..2048]),
+    ) else {
+        unreachable!("media makes a message")
+    };
+    m.read = true;
+    m.expiry = expiry;
+    m
+}
+
+/// The `sent_at - T0` of every message whose attachment has a download in flight.
+fn fetched(h: &IngestHarness) -> Vec<i64> {
+    let mut stmt = h
+        .connection()
+        .prepare(
+            "SELECT m.sent_at - ?1 FROM attachment_downloads d
+               JOIN attachments a ON a.id = d.attachment_id
+               JOIN messages m ON m.id = a.message_id ORDER BY m.sent_at",
+        )
+        .expect("prepare");
+    stmt.query_map([T0], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("fetched")
+}
+
+fn history_harness(dir: &tempfile::TempDir) -> IngestHarness {
+    let mut h = IngestHarness::open(
+        &dir.path().join("core.db"),
+        &kourier_db::DbKey::from([3; 32]),
+        NetworkKind::Fake,
+        MsgIdScope::AccountAuthor,
+        &[uid(ME)],
+    )
+    .expect("harness");
+    h.set_now(T0 + 600_000);
+    h
+}
+
+fn history_batch(messages: Vec<kourier_backend_api::IncomingMessage>) -> BackendEvent {
+    BackendEvent::HistoryBatch {
+        conv: d_alice(),
+        messages,
+        has_more: false,
+        progress: None,
+    }
+}
+
+/// An imported message that is already DUE (its timer ran out on the phone before the
+/// import, and the delivery ran under an unconfirmed clock, so the row arrives with its
+/// expiry and is hidden only afterwards) fetches no long text by itself: the click path
+/// refuses such a message, and so does the policy. A message whose time has not come, and
+/// one without a timer, are fetched as before.
+#[test]
+fn an_imported_message_that_is_due_fetches_no_long_text_by_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = history_harness(&dir);
+    let now = h.now();
+    let timer = |secs: u64, started_at: i64| {
+        Some(Expiry {
+            kind: DisappearKind::AfterRead,
+            timer: std::time::Duration::from_secs(secs),
+            started_at: Some(started_at),
+        })
+    };
+    h.apply(vec![
+        BackendEvent::ConversationUpsert(ConversationPatch::new(d_alice())),
+        history_batch(vec![
+            // Not due: started a second ago, an hour long.
+            imported_long_text(1, timer(3600, now - 1_000)),
+            // Due: a minute long, started two minutes ago.
+            imported_long_text(2, timer(60, now - 120_000)),
+            // Due exactly now (the bound is inclusive, as the sweeper's).
+            imported_long_text(3, timer(60, now - 60_000)),
+            // No timer at all.
+            imported_long_text(4, None),
+        ]),
+    ])
+    .expect("apply");
+    assert_eq!(
+        fetched(&h),
+        [1, 4],
+        "only the message whose time has not come and the one without a timer are fetched"
+    );
+}
+
+/// The same for the long texts a chat gets when it stops being a message request: a message
+/// that is due, or hidden by the expiry policy, is not fetched then either.
+#[test]
+fn accepting_a_request_fetches_no_long_text_of_a_due_or_hidden_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = history_harness(&dir);
+    let now = h.now();
+    let mut pending = ConversationPatch::new(d_alice());
+    pending.request_pending = Some(true);
+    let mut accepted = ConversationPatch::new(d_alice());
+    accepted.request_pending = Some(false);
+    let timer = |secs: u64, started_at: i64| {
+        Some(Expiry {
+            kind: DisappearKind::AfterRead,
+            timer: std::time::Duration::from_secs(secs),
+            started_at: Some(started_at),
+        })
+    };
+    h.apply(vec![
+        BackendEvent::ConversationUpsert(pending),
+        history_batch(vec![
+            imported_long_text(1, timer(3600, now - 1_000)),
+            imported_long_text(2, timer(60, now - 120_000)),
+            imported_long_text(3, timer(3600, now - 1_000)),
+            imported_long_text(4, None),
+        ]),
+    ])
+    .expect("apply");
+    assert!(fetched(&h).is_empty(), "nothing from an unanswered request");
+    // The sweeper hid message 3 (its clock was not confirmed).
+    h.connection()
+        .execute(
+            "UPDATE messages SET expiry_hidden = 1 WHERE sent_at = ?1",
+            [T0 + 3],
+        )
+        .expect("hide");
+    h.apply(vec![BackendEvent::ConversationUpsert(accepted)])
+        .expect("apply");
+    assert_eq!(fetched(&h), [1, 4]);
+}
+
+/// An imported attachment above the receive limit that the ACCOUNT states (the import judged
+/// by an older or default limit) is "not available on this device" and keeps no key, not a
+/// dead "Retry Download"; a live one above the limit is as before.
+#[test]
+fn an_imported_attachment_above_the_receive_limit_is_not_available_and_keeps_no_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = history_harness(&dir);
+    let big = |name: &str, seed| {
+        synthetic_file(name, "application/octet-stream", RECEIVE_LIMIT + 1, seed)
+    };
+    let mut live = media(T0 + 3, vec![big("live.bin", 3)], None);
+    let BackendEvent::Message(live_message) = &mut live else {
+        unreachable!("media makes a message")
+    };
+    live_message.read = true;
+    let BackendEvent::Message(history_message) = media(T0 + 2, vec![big("history.bin", 2)], None)
+    else {
+        unreachable!("media makes a message")
+    };
+    h.apply(vec![
+        BackendEvent::AccountCaps(AccountCaps {
+            max_receive_attachment_bytes: Some(RECEIVE_LIMIT),
+            ..Default::default()
+        }),
+        BackendEvent::ConversationUpsert(ConversationPatch::new(d_alice())),
+        history_batch(vec![history_message]),
+        live,
+    ])
+    .expect("apply");
+    let state_of = |name: &str| -> (AttachmentState, bool) {
+        let (state, no_key): (String, bool) = h
+            .connection()
+            .query_row(
+                "SELECT state, remote IS NULL FROM attachments WHERE file_name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("attachment");
+        (serde_json::from_str(&state).expect("state"), no_key)
+    };
+    assert_eq!(
+        state_of("history.bin"),
+        (AttachmentState::Unavailable, true),
+        "an imported file above the limit: not available, no pointer left"
+    );
+    assert_eq!(
+        state_of("live.bin"),
+        (AttachmentState::Failed { retryable: false }, false),
+        "a live one is unchanged"
+    );
+    assert!(fetched(&h).is_empty());
+}
+
 #[test]
 fn pending_command_and_attachment_ids_never_repeat_after_the_table_empties() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1045,4 +1233,66 @@ async fn fixture_photos_are_downloaded_and_thumbnailed() {
     })
     .await;
     env.stop().await;
+}
+
+/// A picture with a pointer and a name of its own.
+fn named_picture(i: u64) -> Attachment {
+    Attachment {
+        kind: AttachmentKind::Image,
+        mime: "image/jpeg".into(),
+        size: 1000,
+        remote: Some(Pointer::Bytes { len: 1000, seed: i }.to_blob()),
+        net_ids: vec![format!("uuid:{i}")],
+        ..Attachment::default()
+    }
+}
+
+/// An album is stored and resumed with ONE parse of its message's body however many pictures
+/// it holds (a 31-picture album parsed it 31 times): the number of body reads of a message of
+/// six pictures is the number of a message of one, at the store and at the resend of the
+/// downloads an earlier actor left in flight; every download still gets its own names.
+#[test]
+fn a_message_of_many_attachments_parses_its_body_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = history_harness(&dir);
+    let reads = |h: &mut IngestHarness, event: BackendEvent| {
+        let before = IngestHarness::body_reads();
+        let started = h.apply_starting(vec![event]).expect("message");
+        (IngestHarness::body_reads() - before, started)
+    };
+    let (one, started_one) = reads(&mut h, media(1000, vec![named_picture(0)], None));
+    let album: Vec<Attachment> = (1..=6).map(named_picture).collect();
+    let (six, started) = reads(&mut h, media(2000, album, None));
+    assert_eq!(
+        started_one.downloads.len(),
+        1,
+        "the picture downloads by itself"
+    );
+    assert_eq!(
+        started.downloads.len(),
+        6,
+        "every picture of the album does"
+    );
+    let names: Vec<Vec<String>> = started.downloads.iter().map(|d| d.2.clone()).collect();
+    let want: Vec<Vec<String>> = (1..=6).map(|i| vec![format!("uuid:{i}")]).collect();
+    assert_eq!(
+        names, want,
+        "each download has the names of its own picture"
+    );
+    assert!(one >= 1, "the probe counts: {one}");
+    assert_eq!(six, one, "six pictures parse the body as often as one");
+    // The resend at an actor start: one parse per message, two messages.
+    let before = IngestHarness::body_reads();
+    let jobs = h.resume_downloads().expect("resume");
+    assert_eq!(jobs.len(), 7);
+    assert_eq!(
+        IngestHarness::body_reads() - before,
+        2,
+        "one parse per message of the downloads in flight"
+    );
+    let mut resumed: Vec<Vec<String>> = jobs.into_iter().map(|j| j.1).collect();
+    resumed.sort();
+    let mut want: Vec<Vec<String>> = (0..=6).map(|i| vec![format!("uuid:{i}")]).collect();
+    want.sort();
+    assert_eq!(resumed, want, "and each resent download keeps its names");
 }

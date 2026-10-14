@@ -17,11 +17,17 @@
 //! banner tells several accounts apart; neither type prints it in `Debug`.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use kourier_model::{AccountId, HistoryTransfer, HistoryTransferFailure};
+use kourier_model::{AccountId, AccountProgress, HistoryTransfer, HistoryTransferFailure};
 
-use crate::i18n::{trc, trfc};
+use crate::i18n::{trc, trfc, trnfc};
 use crate::time::file_size;
+
+/// A second press of "Continue Without History" within this time of the first (a double
+/// click) sends nothing more; a later one sends again, because Signal's backend may have
+/// dropped the first skip without a word (the core had not taken the account yet).
+pub const DOUBLE_PRESS: Duration = Duration::from_secs(2);
 
 /// What the transfer view shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,22 +40,26 @@ pub enum TransferPhase {
     Reading,
     /// The transfer failed; the banner stays until the user acts.
     Failed,
+    /// No transfer runs (any more), but the account still fetches the profiles of its
+    /// contacts and the groups the server has not given yet (the tail of every fresh link).
+    Updating,
 }
 
 impl TransferPhase {
-    /// Stable name for QML (`waiting`, `downloading`, `reading`, `failed`).
+    /// Stable name for QML (`waiting`, `downloading`, `reading`, `failed`, `updating`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Waiting => "waiting",
             Self::Downloading => "downloading",
             Self::Reading => "reading",
             Self::Failed => "failed",
+            Self::Updating => "updating",
         }
     }
 }
 
-/// One history transfer as it is shown: large on the link page (title, sentence, bar, bytes,
-/// button) and compact in the account banner (one line, bytes, bar, button).
+/// One history transfer as it is shown in the account banner: one line, bytes, bar, button.
+/// (The link page shows none: the chats are usable as soon as the account is linked.)
 ///
 /// Its `status` can carry the name of an account once the banner tells several accounts
 /// apart, so `Debug` prints the account's id and the phase only.
@@ -59,11 +69,7 @@ pub struct TransferView {
     pub account: AccountId,
     /// What it shows.
     pub phase: TransferPhase,
-    /// The heading of the large presentation.
-    pub title: String,
-    /// The sentence under the heading; for a failure, what happened and what can be done.
-    pub text: String,
-    /// The one line of the compact presentation.
+    /// The one line of the banner; for a failure, what happened and what can be done.
     pub status: String,
     /// The bytes of a download ("12.3 MB of 45.6 MB", or "12.3 MB" while the size is
     /// unknown); empty otherwise.
@@ -128,6 +134,13 @@ struct Entry {
     state: HistoryTransfer,
     /// This UI sent the skip of the transfer that runs or ran.
     skipped_here: bool,
+    /// When the skip was sent, while the backend has reported nothing since: a second press
+    /// within [`DOUBLE_PRESS`] of it (a double click on "Continue Without History") sends
+    /// nothing more. The next report clears it, and so does the time: Signal's backend
+    /// may have dropped the skip (the core had not taken the account yet, so it reports
+    /// nothing), and a button that stayed dead until the phone's next report would be a
+    /// stuck control for minutes.
+    skip_sent: Option<Instant>,
     /// The end in `state` was shown and dismissed: its notice went out (done, skipped), or
     /// the user closed its banner (failed). A repeated report of it shows nothing again.
     settled: bool,
@@ -137,6 +150,11 @@ struct Entry {
 #[derive(Clone, Debug, Default)]
 pub struct TransferBook {
     entries: HashMap<AccountId, Entry>,
+    /// The latest `UiEvent::AccountProgress` of each account whose work is not finished.
+    progress: HashMap<AccountId, AccountProgress>,
+    /// The most profiles and groups left seen in one account's reports since its work began:
+    /// the whole the "Updating" bar measures against (the reports say only what is left).
+    peak: HashMap<AccountId, u64>,
 }
 
 impl TransferBook {
@@ -160,6 +178,7 @@ impl TransferBook {
             // A state that is not over after an end (or after nothing) is a new transfer:
             // nobody has skipped it yet.
             skipped_here: prev.is_some_and(|e| e.skipped_here && !e.state.is_over()),
+            skip_sent: None,
             settled: false,
         };
         let mut out = Outcome::default();
@@ -195,11 +214,25 @@ impl TransferBook {
 
     /// The user pressed "Continue Without History": `true` when the transfer of `account`
     /// can be skipped now (the caller sends `SkipHistoryTransfer`). The state stays what it
-    /// is until the backend reports the end.
+    /// is until the backend reports the end. A press within [`DOUBLE_PRESS`] of the last
+    /// skip that no report has answered is `false`: one skip per press of the button, not
+    /// per click of a double click (`buttons.md` §3, scratch `doubleskip` sent two). Any
+    /// later press sends again.
     pub fn skip(&mut self, account: AccountId) -> bool {
+        self.skip_at(account, Instant::now())
+    }
+
+    /// [`Self::skip`] at a given time (tests bring their own clock).
+    pub fn skip_at(&mut self, account: AccountId, now: Instant) -> bool {
         match self.entries.get_mut(&account) {
-            Some(e) if e.state.can_skip() => {
+            Some(e)
+                if e.state.can_skip()
+                    && !e
+                        .skip_sent
+                        .is_some_and(|at| now.saturating_duration_since(at) < DOUBLE_PRESS) =>
+            {
                 e.skipped_here = true;
+                e.skip_sent = Some(now);
                 true
             }
             _ => false,
@@ -235,7 +268,59 @@ impl TransferBook {
 
     /// The account is gone: nothing of its transfer is shown any more.
     pub fn remove(&mut self, account: AccountId) -> bool {
-        self.entries.remove(&account).is_some_and(|e| e.shows())
+        let progress = self.forget_progress(account);
+        self.entries.remove(&account).is_some_and(|e| e.shows()) || progress
+    }
+
+    /// `UiEvent::AccountProgress`: the numbers of `account` now; `true` when what is shown
+    /// changed. A finished report forgets the account's numbers.
+    pub fn on_progress(&mut self, account: AccountId, progress: AccountProgress) -> bool {
+        if progress.finished {
+            return self.forget_progress(account);
+        }
+        let left = updates_left(progress);
+        let peak = self.peak.entry(account).or_default();
+        *peak = (*peak).max(left);
+        self.progress.insert(account, progress) != Some(progress)
+    }
+
+    /// The numbers of `account` while its work is not finished.
+    pub fn progress(&self, account: AccountId) -> Option<AccountProgress> {
+        self.progress.get(&account).copied()
+    }
+
+    /// The account was logged out or removed: its backend's work stopped with it, and no
+    /// finished report follows.
+    pub fn forget_progress(&mut self, account: AccountId) -> bool {
+        self.peak.remove(&account);
+        self.progress.remove(&account).is_some()
+    }
+
+    /// Every account's numbers are forgotten: a channel that lagged may have dropped the one
+    /// `finished` report, which is never sent again, and an update that nobody ends would show
+    /// (and ask before quitting) for ever. A changed report brings the numbers back. `true`
+    /// when something that was shown is gone.
+    pub fn forget_all_progress(&mut self) -> bool {
+        self.peak.clear();
+        let shown = !self.progress.is_empty();
+        self.progress.clear();
+        shown
+    }
+
+    /// What to show for `account` once no transfer of it shows: the profiles and groups it
+    /// still fetches ("Updating contacts and groups: 120 profiles, 8 groups left", a bar
+    /// against the most seen left); `None` when its work is finished or it reports none.
+    pub fn updating(&self, account: AccountId) -> Option<TransferView> {
+        let p = self.progress(account)?;
+        let left = updates_left(p);
+        let mut v = view(account, HistoryTransfer::Reading);
+        v.phase = TransferPhase::Updating;
+        v.status = updating_text(p);
+        v.progress = match self.peak.get(&account).copied() {
+            Some(peak) if peak > 0 => fraction(peak - left.min(peak), Some(peak)),
+            _ => -1.0,
+        };
+        Some(v)
     }
 
     /// Whether a transfer of `account` runs (waiting, downloading, reading).
@@ -249,7 +334,13 @@ impl TransferBook {
     /// dismissed; `None` otherwise.
     pub fn view(&self, account: AccountId) -> Option<TransferView> {
         let e = self.entries.get(&account).filter(|e| e.shows())?;
-        Some(view(account, e.state))
+        let mut v = view(account, e.state);
+        if e.state == HistoryTransfer::Reading
+            && let Some(p) = self.progress(account).filter(AccountProgress::importing)
+        {
+            counted_import(&mut v, p);
+        }
+        Some(v)
     }
 }
 
@@ -305,8 +396,6 @@ fn view(account: AccountId, state: HistoryTransfer) -> TransferView {
     let mut v = TransferView {
         account,
         phase: TransferPhase::Waiting,
-        title: String::new(),
-        text: String::new(),
         status: String::new(),
         detail: String::new(),
         progress: -1.0,
@@ -317,19 +406,9 @@ fn view(account: AccountId, state: HistoryTransfer) -> TransferView {
     match state {
         HistoryTransfer::Waiting | HistoryTransfer::Done | HistoryTransfer::Skipped => {
             v.phase = TransferPhase::Waiting;
-            v.title = trc(
-                "@title heading while the phone prepares the message history",
-                "Waiting for Your Phone",
-            )
-            .into_owned();
             // (A transfer exists only when the phone's user already agreed to it: on Signal
             // the phone asks at the scan, before it links. While this waits the phone
             // prepares and uploads the history.)
-            v.text = trc(
-                "@info while the phone prepares the message history",
-                "Your phone is preparing your message history. This can take a few minutes. New messages arrive once it is here.",
-            )
-            .into_owned();
             v.status = trc(
                 "@info:status banner of an account",
                 "Waiting for your phone to prepare the message history…",
@@ -339,16 +418,6 @@ fn view(account: AccountId, state: HistoryTransfer) -> TransferView {
         }
         HistoryTransfer::Downloading { done, total } => {
             v.phase = TransferPhase::Downloading;
-            v.title = trc(
-                "@title heading while the message history downloads",
-                "Downloading Message History",
-            )
-            .into_owned();
-            v.text = trc(
-                "@info while the message history downloads",
-                "New messages arrive once the history is here.",
-            )
-            .into_owned();
             v.status = trc(
                 "@info:status banner of an account",
                 "Downloading message history…",
@@ -360,27 +429,18 @@ fn view(account: AccountId, state: HistoryTransfer) -> TransferView {
         }
         HistoryTransfer::Reading => {
             v.phase = TransferPhase::Reading;
-            v.title = trc(
-                "@title heading while the downloaded message history is read",
-                "Importing Messages",
-            )
-            .into_owned();
-            v.text = trc(
-                "@info while the downloaded message history is read",
-                "Keep Kourier open until this is finished. New messages arrive afterwards.",
-            )
-            .into_owned();
+            // (No "keep Kourier open": a quit goes on at the next start, and the question
+            // before quitting says so.)
             v.status = trc(
                 "@info:status banner of an account",
-                "Importing messages… Keep Kourier open until this is finished.",
+                "Importing messages… New messages arrive afterwards.",
             )
             .into_owned();
         }
         HistoryTransfer::Failed(kind) => {
             v.phase = TransferPhase::Failed;
-            // (No heading: a failure is one message in the banner.)
-            v.text = failure_text(kind);
-            v.status = v.text.clone();
+            // (A failure is one message in the banner.)
+            v.status = failure_text(kind);
             if kind != HistoryTransferFailure::UpdateApp {
                 v.retry = trc(
                     "@action:button transfer the message history again; it opens a question",
@@ -392,6 +452,93 @@ fn view(account: AccountId, state: HistoryTransfer) -> TransferView {
         }
     }
     v
+}
+
+/// The messages of an import as they are delivered: "Importing history: 12,400 of 50,000
+/// messages. New messages arrive afterwards." with a bar that knows how far it is. The reason
+/// stays in the line: the chats are usable meanwhile and a message sent now goes out at once
+/// (link feedback L6), but nothing new arrives until the import is delivered.
+fn counted_import(v: &mut TransferView, p: AccountProgress) {
+    let done = p.messages_done.min(p.messages_total);
+    v.status = trnfc(
+        "@info:status banner of an account while an imported message history fills the chats, %1 all the messages, %2 the ones there so far",
+        "Importing history: %2 of %1 message. New messages arrive afterwards.",
+        "Importing history: %2 of %1 messages. New messages arrive afterwards.",
+        p.messages_total,
+        &[&group_digits(p.messages_total), &group_digits(done)],
+    );
+    v.progress = fraction(done, Some(p.messages_total));
+}
+
+/// The profiles and groups still to come in one report.
+fn updates_left(p: AccountProgress) -> u64 {
+    u64::from(p.profiles_left) + u64::from(p.groups_left)
+}
+
+/// "Updating contacts and groups: 120 profiles, 8 groups left", with only the counts that
+/// are not zero; without either (a sync of the link still pending) the bare line.
+fn updating_text(p: AccountProgress) -> String {
+    let profiles = (p.profiles_left > 0).then(|| {
+        trnfc(
+            "@info:status a count in the line of an account that fetches its contacts and groups, %1 the number",
+            "%1 profile",
+            "%1 profiles",
+            u64::from(p.profiles_left),
+            &[&group_digits(u64::from(p.profiles_left))],
+        )
+    });
+    let groups = (p.groups_left > 0).then(|| {
+        trnfc(
+            "@info:status a count in the line of an account that fetches its contacts and groups, %1 the number",
+            "%1 group",
+            "%1 groups",
+            u64::from(p.groups_left),
+            &[&group_digits(u64::from(p.groups_left))],
+        )
+    });
+    match (profiles, groups) {
+        (Some(a), Some(b)) => trfc(
+            "@info:status banner of an account that fetches its contacts and groups, %1 the profiles left as in 120 profiles, %2 the groups left as in 8 groups",
+            "Updating contacts and groups: %1, %2 left",
+            &[&a, &b],
+        ),
+        (Some(a), None) | (None, Some(a)) => trfc(
+            "@info:status banner of an account that fetches its contacts and groups, %1 what is left, as in 120 profiles or 8 groups",
+            "Updating contacts and groups: %1 left",
+            &[&a],
+        ),
+        (None, None) => trc(
+            "@info:status banner of an account that fetches its contacts and groups",
+            "Updating contacts and groups…",
+        )
+        .into_owned(),
+    }
+}
+
+/// A count with its thousands grouped ("12,400"; the separator is the translator's).
+pub fn group_digits(n: u64) -> String {
+    // A front-end that fills a plural's count in itself writes every count: the same digit
+    // groups for both numbers of "12,400 of 50,000".
+    if let Some(written) = crate::i18n::number(n) {
+        return written;
+    }
+    let digits = n.to_string();
+    if digits.len() <= 4 {
+        // "1200" reads as well as "1,200", and a year-like number stays whole.
+        return digits;
+    }
+    let sep = trc(
+        "@info the character between the groups of three digits of a large number, as in 12,400; many languages use a no-break space",
+        ",",
+    );
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 * sep.len());
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push_str(&sep);
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// What happened and what the user can do, one text per kind of failure.
@@ -472,6 +619,44 @@ pub fn account_line(name: &str, number: &str, network_name: &str) -> String {
     }
 }
 
+/// Which link of its identity an account is, for two accounts that look the same: the device
+/// number the network gave this computer, and the day it was linked (what the phone lists
+/// beside each linked device). Empty when neither is known.
+pub fn device_label(device: Option<u32>, linked: &str) -> String {
+    match (device, linked.is_empty()) {
+        (Some(n), false) => trfc(
+            "@info which of two links of one account this is, %1 the device number the network gave this computer, %2 the date it was linked",
+            "device %1 · linked %2",
+            &[&n.to_string(), linked],
+        ),
+        (Some(n), true) => trfc(
+            "@info which of two links of one account this is, %1 the device number the network gave this computer",
+            "device %1",
+            &[&n.to_string()],
+        ),
+        (None, false) => trfc(
+            "@info which of two links of one account this is, %1 the date it was linked",
+            "linked %1",
+            &[linked],
+        ),
+        (None, true) => String::new(),
+    }
+}
+
+/// An account's line ([`account_line`]) with its device ([`device_label`]); the line alone
+/// when `device` is empty.
+pub fn with_device(about: &str, device: &str) -> String {
+    if device.is_empty() {
+        about.to_owned()
+    } else {
+        trfc(
+            "@info an account told apart from another that looks the same, %1 its name and number, %2 which device it is",
+            "%1 · %2",
+            &[about, device],
+        )
+    }
+}
+
 /// A passing notice about one of several accounts: the account's name in front of it.
 pub fn named_notice(account_name: &str, notice: &str) -> String {
     trfc(
@@ -526,6 +711,112 @@ pub fn replace_question(account: AccountId, about: String) -> ReplaceQuestion {
     }
 }
 
+/// The question before an action that would cancel a link in progress (`buttons.md` F3:
+/// opening Settings, "Link Again" of another account, or "Remove and Link Again" while the
+/// link page waits for its QR code to be scanned). The default answer keeps the link.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AbandonQuestion {
+    /// The dialog's title.
+    pub title: String,
+    /// What happens, in plain words.
+    pub text: String,
+    /// The button that cancels the link and goes on.
+    pub confirm: String,
+    /// The button that keeps the link (the default).
+    pub cancel: String,
+}
+
+/// The question before a link to `network` (the messenger's name) in progress is cancelled.
+pub fn abandon_question(network: &str) -> AbandonQuestion {
+    AbandonQuestion {
+        title: trc(
+            "@title:dialog question before a link in progress is cancelled",
+            "Stop Linking?",
+        )
+        .into_owned(),
+        text: abandon_paragraph(network),
+        confirm: trc("@action:button cancel a link in progress", "Stop Linking").into_owned(),
+        cancel: trc("@action:button keep a link in progress", "Continue Linking").into_owned(),
+    }
+}
+
+/// What the action the user pressed does to a link in progress, one paragraph. It names what
+/// cancels the link, not "going on": the dialog's default button says "Continue Linking",
+/// and a text that says that continuing cancels it contradicts the button (user review of
+/// L1).
+fn abandon_paragraph(network: &str) -> String {
+    trfc(
+        "@info question before a link in progress is cancelled, %1 the name of a messenger",
+        "Linking a %1 account has not finished. Opening this now cancels the link. You can link the account again later.",
+        &[network],
+    )
+}
+
+/// The same for the question of "Remove and Link Again": there the account is removed, which
+/// cancels the other link.
+fn replace_abandon_paragraph(network: &str) -> String {
+    trfc(
+        "@info question before an account is replaced while another link is in progress, %1 the name of a messenger",
+        "Linking another %1 account has not finished. Removing this account now cancels that link. You can link that account again later.",
+        &[network],
+    )
+}
+
+/// What still runs when the window is closed (`buttons.md` F8): the question before the
+/// application quits names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuitWork {
+    /// A history transfer: waiting for the phone, downloading or importing.
+    Import,
+    /// The contacts and groups a fresh link still fetches.
+    Update,
+}
+
+/// The question before the application quits while `work` runs. Nothing is lost (the work
+/// goes on at the next start); the question is there because the window said "Keep Kourier
+/// open". The default answer keeps the application open.
+pub fn quit_question(work: QuitWork) -> AbandonQuestion {
+    let (title, text) = match work {
+        QuitWork::Import => (
+            trc(
+                "@title:dialog question before the application quits while a message history is transferred",
+                "Quit While Importing History?",
+            ),
+            trc(
+                "@info question before the application quits while a message history is transferred",
+                "Kourier is still importing your message history. It goes on at the next start.",
+            ),
+        ),
+        QuitWork::Update => (
+            trc(
+                "@title:dialog question before the application quits while a new link fetches its contacts and groups",
+                "Quit While Updating Contacts and Groups?",
+            ),
+            trc(
+                "@info question before the application quits while a new link fetches its contacts and groups",
+                "Kourier is still fetching your contacts and groups. It goes on at the next start.",
+            ),
+        ),
+    };
+    AbandonQuestion {
+        title: title.into_owned(),
+        text: text.into_owned(),
+        confirm: trc("@action:button quit the application", "Quit").into_owned(),
+        cancel: trc("@action:button", "Cancel").into_owned(),
+    }
+}
+
+/// [`replace_question`] when it would also cancel a link in progress to `network`.
+pub fn replace_question_cancelling(
+    account: AccountId,
+    about: String,
+    network: &str,
+) -> ReplaceQuestion {
+    let mut q = replace_question(account, about);
+    q.paragraphs.push(replace_abandon_paragraph(network));
+    q
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,11 +848,181 @@ mod tests {
         }
         let v = book.view(A).expect("shown");
         assert_eq!(v.phase, TransferPhase::Waiting);
-        assert_eq!(v.title, "Waiting for Your Phone");
+        assert_eq!(
+            v.status,
+            "Waiting for your phone to prepare the message history…"
+        );
         assert_eq!(v.skip, "Continue Without History");
         assert_eq!(v.progress, -1.0);
         assert!(v.detail.is_empty() && v.retry.is_empty() && v.dismiss.is_empty());
         assert!(book.running(A));
+    }
+
+    fn counts(done: u64, total: u64) -> AccountProgress {
+        AccountProgress {
+            messages_done: done,
+            messages_total: total,
+            ..AccountProgress::default()
+        }
+    }
+
+    #[test]
+    fn the_read_counts_the_messages_as_they_arrive_and_forgets_them_when_finished() {
+        let mut book = TransferBook::default();
+        book.on_state(A, HistoryTransfer::Reading);
+        // Before the first count the read has no measure.
+        let v = book.view(A).expect("shown");
+        assert_eq!(
+            v.status,
+            "Importing messages… New messages arrive afterwards."
+        );
+        assert_eq!(v.progress, -1.0);
+        assert!(book.on_progress(A, counts(12_400, 50_000)));
+        assert!(
+            !book.on_progress(A, counts(12_400, 50_000)),
+            "the same numbers"
+        );
+        let v = book.view(A).expect("shown");
+        assert_eq!(
+            v.status,
+            "Importing history: 12,400 of 50,000 messages. New messages arrive afterwards."
+        );
+        assert!((v.progress - 0.248).abs() < 1e-9);
+        // Another account's numbers are its own; one message is one.
+        book.on_state(B, HistoryTransfer::Reading);
+        book.on_progress(B, counts(1, 1));
+        assert_eq!(
+            book.view(B).expect("shown").status,
+            "Importing history: 1 of 1 message. New messages arrive afterwards."
+        );
+        // More than in all is all.
+        book.on_progress(A, counts(60_000, 50_000));
+        assert_eq!(
+            book.view(A).expect("shown").status,
+            "Importing history: 50,000 of 50,000 messages. New messages arrive afterwards."
+        );
+        // The profiles and groups that follow count no messages: the read has no measure.
+        book.on_progress(
+            A,
+            AccountProgress {
+                profiles_left: 3,
+                ..AccountProgress::default()
+            },
+        );
+        assert_eq!(book.view(A).expect("shown").progress, -1.0);
+        assert_eq!(book.progress(A).map(|p| p.profiles_left), Some(3));
+        // Finished: nothing is left of the numbers; a second finish changes nothing.
+        assert!(book.on_progress(A, AccountProgress::finished()));
+        assert!(!book.on_progress(A, AccountProgress::finished()));
+        assert_eq!(book.progress(A), None);
+        // A logout or a removal takes the numbers too.
+        assert!(book.forget_progress(B));
+        book.on_progress(B, counts(1, 2));
+        assert!(book.remove(B));
+        assert_eq!(book.progress(B), None);
+    }
+
+    fn left(profiles: u32, groups: u32) -> AccountProgress {
+        AccountProgress {
+            profiles_left: profiles,
+            groups_left: groups,
+            ..AccountProgress::default()
+        }
+    }
+
+    #[test]
+    fn the_update_after_a_link_counts_what_is_left_against_the_most_seen() {
+        let mut book = TransferBook::default();
+        assert!(book.updating(A).is_none(), "nothing reported");
+        book.on_progress(A, left(120, 8));
+        let v = book.updating(A).expect("shown");
+        assert_eq!(v.phase, TransferPhase::Updating);
+        assert_eq!(
+            v.status,
+            "Updating contacts and groups: 120 profiles, 8 groups left"
+        );
+        assert_eq!(v.progress, 0.0, "nothing done yet");
+        assert!(v.skip.is_empty() && v.retry.is_empty() && v.dismiss.is_empty());
+        // Half of the most seen is done.
+        book.on_progress(A, left(60, 4));
+        assert!((book.updating(A).expect("shown").progress - 0.5).abs() < 1e-9);
+        // More work queued than ever: the whole grows, the bar never goes past full.
+        book.on_progress(A, left(200, 0));
+        let v = book.updating(A).expect("shown");
+        assert_eq!(v.status, "Updating contacts and groups: 200 profiles left");
+        assert_eq!(v.progress, 0.0);
+        book.on_progress(A, left(0, 1));
+        let v = book.updating(A).expect("shown");
+        assert_eq!(v.status, "Updating contacts and groups: 1 group left");
+        assert!((v.progress - 0.995).abs() < 1e-9);
+        book.on_progress(A, left(1, 0));
+        assert_eq!(
+            book.updating(A).expect("shown").status,
+            "Updating contacts and groups: 1 profile left"
+        );
+        // Nothing counted, but not finished (a sync of the link is still pending).
+        book.on_progress(A, left(0, 0));
+        let v = book.updating(A).expect("shown");
+        assert_eq!(v.status, "Updating contacts and groups…");
+        assert_eq!(v.progress, 1.0);
+        // Finished: gone, and the next work measures from its own start.
+        book.on_progress(A, AccountProgress::finished());
+        assert!(book.updating(A).is_none());
+        book.on_progress(A, left(10, 0));
+        assert_eq!(book.updating(A).expect("shown").progress, 0.0);
+        // Thousands are grouped here too.
+        book.on_progress(B, left(12_400, 2));
+        assert_eq!(
+            book.updating(B).expect("shown").status,
+            "Updating contacts and groups: 12,400 profiles, 2 groups left"
+        );
+    }
+
+    #[test]
+    fn large_counts_group_their_thousands() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_200, "1200"),
+            (12_400, "12,400"),
+            (123_456, "123,456"),
+            (1_234_567, "1,234,567"),
+        ];
+        for (n, text) in cases {
+            assert_eq!(group_digits(n), text, "{n}");
+        }
+    }
+
+    /// A front-end whose plural fills its count in itself (KI18n writes `%L1`, by the
+    /// locale's numbers) writes the other count of the line the same way.
+    #[test]
+    fn both_counts_of_the_import_are_written_alike_when_the_front_end_writes_numbers() {
+        struct Spaced;
+        impl crate::i18n::Translator for Spaced {
+            fn translate(&self, _context: &str, msgid: &str) -> String {
+                msgid.to_owned()
+            }
+            fn translate_plural(&self, _c: &str, one: &str, many: &str, n: u64) -> String {
+                let form = if n == 1 { one } else { many };
+                form.replace("%1", &self.number(n).expect("written"))
+            }
+            fn number(&self, n: u64) -> Option<String> {
+                Some(match n {
+                    50_000 => "50\u{a0}000".to_owned(),
+                    12_400 => "12\u{a0}400".to_owned(),
+                    other => other.to_string(),
+                })
+            }
+        }
+        crate::i18n::with_translator(Spaced, || {
+            let mut book = TransferBook::default();
+            book.on_state(A, HistoryTransfer::Reading);
+            book.on_progress(A, counts(12_400, 50_000));
+            assert_eq!(
+                book.view(A).expect("shown").status,
+                "Importing history: 12\u{a0}400 of 50\u{a0}000 messages. New messages arrive afterwards."
+            );
+        });
     }
 
     #[test]
@@ -571,7 +1032,7 @@ mod tests {
         book.on_state(A, downloading(30 * mb, Some(40 * mb)));
         let v = book.view(A).expect("shown");
         assert_eq!(v.phase, TransferPhase::Downloading);
-        assert_eq!(v.title, "Downloading Message History");
+        assert_eq!(v.status, "Downloading message history…");
         assert_eq!(v.detail, "30.0 MB of 40.0 MB");
         assert_eq!(v.progress, 0.75);
         assert_eq!(v.skip, "Continue Without History");
@@ -601,11 +1062,41 @@ mod tests {
         book.on_state(A, HistoryTransfer::Reading);
         let v = book.view(A).expect("shown");
         assert_eq!(v.phase, TransferPhase::Reading);
-        assert_eq!(v.title, "Importing Messages");
-        assert!(v.text.contains("Keep Kourier open"));
+        assert!(
+            !v.status.contains("Keep Kourier open"),
+            "a read goes on at the next start: no request to keep the application open"
+        );
+        assert!(v.status.contains("New messages arrive afterwards"));
         assert!(v.skip.is_empty(), "no button to skip a read");
         assert_eq!(v.progress, -1.0);
         assert!(!book.skip(A), "and the skip is refused");
+    }
+
+    /// L5 fix 1: a double click sends one skip, but a skip Signal's backend dropped without
+    /// a report (the core had not taken the account yet) must never leave a dead button: a
+    /// press later than `DOUBLE_PRESS` sends again, and so does a press after any report.
+    #[test]
+    fn a_second_press_is_dropped_only_within_the_double_click_time() {
+        let t0 = Instant::now();
+        let mut book = TransferBook::default();
+        book.on_state(A, HistoryTransfer::Waiting);
+        assert!(book.skip_at(A, t0));
+        assert!(!book.skip_at(A, t0), "the same instant");
+        assert!(
+            !book.skip_at(A, t0 + Duration::from_millis(1_999)),
+            "a double click"
+        );
+        assert!(
+            book.skip_at(A, t0 + DOUBLE_PRESS),
+            "after the window a press sends again: the backend may have dropped the first"
+        );
+        // The window runs from the last SENT skip.
+        assert!(!book.skip_at(A, t0 + DOUBLE_PRESS + Duration::from_millis(500)));
+        // A report of the backend (a restart reports the state again) clears the guard.
+        book.on_state(A, HistoryTransfer::Waiting);
+        assert!(book.skip_at(A, t0 + DOUBLE_PRESS + Duration::from_millis(600)));
+        // A clock that steps back never panics and counts as "just now".
+        assert!(!book.skip_at(A, t0));
     }
 
     #[test]
@@ -742,7 +1233,7 @@ mod tests {
         assert_eq!(v.dismiss, "Dismiss");
         assert!(v.skip.is_empty());
         assert!(
-            v.text
+            v.status
                 .starts_with("The message history could not be downloaded.")
         );
         assert!(!book.running(A));
@@ -775,7 +1266,10 @@ mod tests {
             let mut book = TransferBook::default();
             book.on_state(A, HistoryTransfer::Failed(kind));
             let v = book.view(A).expect("shown");
-            assert!(texts.insert(v.text.clone()), "{kind:?} repeats a sentence");
+            assert!(
+                texts.insert(v.status.clone()),
+                "{kind:?} repeats a sentence"
+            );
             assert_eq!(v.retry.is_empty(), kind == UpdateApp, "{kind:?}");
             assert_eq!(v.dismiss, "Dismiss");
         }

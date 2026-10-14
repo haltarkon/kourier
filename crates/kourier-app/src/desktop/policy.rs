@@ -724,6 +724,7 @@ mod tests {
             view_once: false,
             history: false,
             mentions_me: false,
+            outbox: None,
             actions: Default::default(),
         }
     }

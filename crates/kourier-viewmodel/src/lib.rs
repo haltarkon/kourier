@@ -26,6 +26,7 @@ macro_rules! safe_debug {
 }
 pub(crate) use safe_debug;
 
+pub mod account_actions;
 pub mod composer;
 pub mod conversations;
 pub mod core_source;
@@ -46,6 +47,7 @@ pub mod time;
 pub mod timeline;
 pub mod transfer;
 
+pub use account_actions::{AccountAction, LogoutNotice};
 pub use conversations::{
     AccountRow, AccountStatus, ChatHeader, ConversationFilter, ConversationRow, PreviewSource,
 };
@@ -67,4 +69,4 @@ pub use source::{
 };
 pub use time::{Calendar, FixedOffset, TimeContext};
 pub use timeline::{Block, MessageRow, Receipt, RowKey, RowKind};
-pub use transfer::{ReplaceQuestion, TransferPhase, TransferView};
+pub use transfer::{AbandonQuestion, ReplaceQuestion, TransferPhase, TransferView};

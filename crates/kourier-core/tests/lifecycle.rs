@@ -451,6 +451,14 @@ async fn a_failed_shred_keeps_the_removal_pending_until_the_next_start() {
     env.stop().await;
     std::fs::remove_dir(&secret).expect("unblock");
     env.restart().await;
+    // The start finishes it in the account's supervisor (after one logout attempt, which
+    // cannot start an actor without the secret: link feedback L4).
+    let db = env.core_db();
+    eventually("the row deleted", WAIT, || {
+        let db = db.clone();
+        async move { account_rows(&db) == 0 }
+    })
+    .await;
     assert!(env.accounts().await.is_empty());
     assert!(!env.account_dir(uuid).exists());
     env.stop().await;
@@ -1060,6 +1068,87 @@ async fn catch_up_messages_are_summarized_once_when_syncing_ends() {
     env.stop().await;
 }
 
+/// The numbers of a new link's work (link feedback L3) pass from the backend to the UI as they
+/// come, ephemeral: the core stores nothing of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_progress_passes_to_the_ui_as_it_comes() {
+    let counts = kourier_model::AccountProgress {
+        profiles_left: 120,
+        groups_left: 8,
+        ..kourier_model::AccountProgress::default()
+    };
+    let script = small_script("progress")
+        .step(Step::Ephemeral(Box::new(BackendEvent::AccountProgress(
+            counts,
+        ))))
+        .step(Step::Ephemeral(Box::new(BackendEvent::AccountProgress(
+            kourier_model::AccountProgress::finished(),
+        ))));
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    let mut seen = Vec::new();
+    env.event("the finished AccountProgress", |e| match e {
+        UiEvent::AccountProgress {
+            account: a,
+            progress,
+        } if *a == account => {
+            seen.push(*progress);
+            progress.finished.then_some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(seen, [counts, kourier_model::AccountProgress::finished()]);
+    env.stop().await;
+}
+
+/// An actor that exits in the middle of its report never says "finished": the core says it
+/// for it (link feedback L3, F1), or a UI would show the work, and ask before quitting, for
+/// ever. A report that was finished already is not followed by a second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_actor_that_exits_in_the_middle_of_its_report_is_followed_by_a_finished_one() {
+    let counts = kourier_model::AccountProgress {
+        profiles_left: 120,
+        groups_left: 8,
+        ..kourier_model::AccountProgress::default()
+    };
+    let script = small_script("progress-exit")
+        .step(Step::WaitAcked)
+        .step(Step::Ephemeral(Box::new(BackendEvent::AccountProgress(
+            counts,
+        ))))
+        .step(Step::Panic { times: 1 });
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    let mut seen = Vec::new();
+    env.event(
+        "the finished AccountProgress after the crash",
+        |e| match e {
+            UiEvent::AccountProgress {
+                account: a,
+                progress,
+            } if *a == account => {
+                seen.push(*progress);
+                progress.finished.then_some(())
+            }
+            _ => None,
+        },
+    )
+    .await;
+    assert_eq!(
+        seen.first(),
+        Some(&counts),
+        "the numbers came first: {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&kourier_model::AccountProgress::finished())
+    );
+    env.stop().await;
+}
+
 /// Every per-network script through the whole stack (backend.db, core_outbox, forwarder,
 /// supervisor, writer) ends in the state the ingest harness computes, with no contract
 /// violation.
@@ -1298,4 +1387,107 @@ async fn slow_forwarding_and_disconnects() {
     }
     env.wait_finished(account).await;
     env.stop().await;
+}
+
+/// What a refused second link of one identity must look like (L1, `buttons.md` F2): the login
+/// fails with `AlreadyAdded`, the half-made account is gone with its secret and directory, its
+/// device is logged out of the network again, and the first account is untouched.
+async fn second_link_is_refused(env: &mut Env, first: kourier_model::AccountId, logged_out: bool) {
+    let me = uid("aci:00000000-0000-4000-8000-0000000000aa");
+    env.control
+        .push_script(Script::new("same-identity", vec![me]));
+    let second = support::add_account(env).await;
+    assert_ne!(second, first);
+    let uuid = env.account(second).await.expect("row").uuid;
+    let kind = env
+        .event("the login failed", |e| match e {
+            UiEvent::LoginStep { account, step } if *account == second => match &step.kind {
+                kourier_model::LoginStepKind::Failed { error } => Some(error.kind.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .await;
+    assert_eq!(kind, kourier_model::ErrorKind::AlreadyAdded { logged_out });
+    env.event("AccountRemoved", |e| match e {
+        UiEvent::AccountRemoved { account } if *account == second => Some(()),
+        _ => None,
+    })
+    .await;
+    let control = env.control.clone();
+    tokio::time::timeout(WAIT, control.wait_for(|c| !c.has_device(uuid)))
+        .await
+        .expect("the second device is logged out of the network");
+    assert!(env.control.commands(uuid).contains(&"Logout"));
+    let accounts = env.accounts().await;
+    assert_eq!(accounts.len(), 1, "one identity, one account");
+    assert_eq!(accounts[0].id, first);
+    assert!(!env.secret_exists(uuid), "secret deleted");
+    assert!(!env.account_dir(uuid).exists(), "directory deleted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_link_of_an_account_already_in_the_profile_is_refused() {
+    let mut env = Env::new(Flavor::SignalLike, small_script("first")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let first = add_linked(&mut env).await;
+    second_link_is_refused(&mut env, first, false).await;
+    assert_eq!(
+        env.account(first).await.expect("row").state,
+        AccountState::Active
+    );
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_link_of_a_logged_out_account_is_refused_and_points_at_link_again() {
+    let script = small_script("unlink").step(Step::Unlink {
+        reason: "device unlinked".into(),
+    });
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let first = support::add_account(&mut env).await;
+    let h = env.handle.clone();
+    eventually("logged out", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(kourier_core::facade::Query::Accounts).await,
+                Ok(kourier_core::facade::QueryData::Accounts(a))
+                if a.iter().any(|r| matches!(r.state, AccountState::LoggedOut { .. })))
+        }
+    })
+    .await;
+    second_link_is_refused(&mut env, first, true).await;
+    assert!(matches!(
+        env.account(first).await.expect("row").state,
+        AccountState::LoggedOut { .. }
+    ));
+    // "Link Again" on it still works: the rule leaves a link of the account itself alone.
+    let me = uid("aci:00000000-0000-4000-8000-0000000000aa");
+    env.control.push_script(Script::new("again", vec![me]));
+    env.handle
+        .send(UiCommand::Relink {
+            account: first,
+            flow: "qr".into(),
+        })
+        .expect("send");
+    let h = env.handle.clone();
+    eventually("linked again", WAIT, || {
+        let h = h.clone();
+        async move {
+            matches!(h.query(kourier_core::facade::Query::Accounts).await,
+                Ok(kourier_core::facade::QueryData::Accounts(a))
+                if a.len() == 1 && a[0].id == first && a[0].state == AccountState::Active)
+        }
+    })
+    .await;
+    env.stop().await;
+}
+
+/// Every row of `accounts`, `Removing` ones too (the facade hides those).
+fn account_rows(db: &std::path::Path) -> i64 {
+    let conn = kourier_db::open_read_only(db, &kourier_db::DbKey::from(support::CORE_KEY))
+        .expect("open core.db");
+    conn.query_row("SELECT count(*) FROM accounts", [], |r| r.get(0))
+        .expect("count")
 }

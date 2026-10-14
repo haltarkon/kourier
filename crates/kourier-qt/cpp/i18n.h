@@ -28,6 +28,10 @@ QString translatePlural(rust::Str domain,
                         rust::Str plural,
                         uint64_t count);
 
+// A count written as KI18n writes the `%1` of a plural (`%L1`: the default QLocale, which
+// follows LC_NUMERIC), so that a second number of the same message looks the same.
+QString formatNumber(uint64_t n);
+
 // Tests: catalogs of `domain` are also looked for under `dir`
 // (`<dir>/<language>/LC_MESSAGES/<domain>.mo`), and the languages to translate into.
 void addLocaleDir(rust::Str domain, const QString& dir);

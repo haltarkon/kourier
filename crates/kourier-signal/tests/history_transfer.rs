@@ -3,9 +3,10 @@
 //! backup key into its provisioning message when the linking URL offers `backup5`, stores an
 //! archive on the CDN and answers the new device's long-poll), the test plays the core.
 //!
-//! The offer of the transfer is switched off in the app until the import exists
-//! (`SignalNetwork::with_history_transfer_offer`); every test here switches it on, and one
-//! proves what a link does while it is off.
+//! The offer of the transfer is off in the library (`SignalNetwork::new()`) and on in the
+//! app, which turns it on with `SignalNetwork::with_history_transfer_offer`; every test here
+//! switches it on, and one proves what a link does while it is off (the run with
+//! `KOURIER_HISTORY_TRANSFER=0`).
 //!
 //! What is proven here: the URL of a fresh link offers `backup5` and a relink's does not; the
 //! key is kept with the linked account; the long-poll asks again on 204 and after a failed
@@ -1569,16 +1570,17 @@ async fn a_skip_during_the_sync_of_the_downloaded_file_is_honoured() {
     world.harness.shutdown().await.expect("harness shutdown");
 }
 
-/// Finding 10. The offer is OFF unless a network switches it on (the app does not, until
-/// the import exists): a fresh link's URL carries no capability, so a phone exports and
-/// uploads nothing; and a key that a phone sends all the same is ignored: no transfer is
-/// stored, no long-poll goes out, and receiving starts at once.
+/// Finding 10. The offer is OFF unless a network switches it on (the app does, except in a
+/// run with `KOURIER_HISTORY_TRANSFER=0`): a fresh link's URL carries no capability, so a
+/// phone exports and uploads nothing; and a key that a phone sends all the same is ignored:
+/// no transfer is stored, no long-poll goes out, and receiving starts at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_transfer_is_not_offered_unless_it_is_switched_on() {
     let Some(world) = World::start().await else {
         return;
     };
-    // What the app runs: `SignalNetwork::new()` as it is.
+    // What a run with the offer off gets: `SignalNetwork::new()` as it is (the app builds
+    // its network with the offer on).
     // (1) A phone whose user would transfer: it is not asked, so it sends no key.
     world
         .harness

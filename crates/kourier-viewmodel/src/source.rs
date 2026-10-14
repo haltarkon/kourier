@@ -14,6 +14,7 @@ use kourier_model::{AccountId, AttachmentId, ConversationId, MessageId, NetworkK
 
 use kourier_core::facade::FileRefusal;
 
+use crate::account_actions::{AccountAction, LogoutNotice};
 use crate::conversations::{AccountRow, Banner, ChatHeader, ConversationFilter, ConversationRow};
 use crate::core_source::{Changes, Paging};
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules};
@@ -21,8 +22,8 @@ use crate::fixture::Fixture;
 use crate::login::{LoginView, NetworkChoice, network_choices};
 use crate::richtext::RichText;
 use crate::time::{Calendar, TimeContext};
-use crate::timeline::{self, MessageRow, QuoteBlock, RowKind};
-use crate::transfer::{ReplaceQuestion, TransferView};
+use crate::timeline::{self, MessageRow, QuoteBlock, RowKind, WaitLine};
+use crate::transfer::{AbandonQuestion, ReplaceQuestion};
 
 /// Why a source refused a command.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -196,6 +197,12 @@ pub trait UiSource {
     fn chat(&self, id: ConversationId) -> Option<ChatHeader>;
     /// Timeline rows of a conversation, newest first.
     fn timeline(&self, id: ConversationId) -> Vec<MessageRow>;
+    /// The lines under the own messages of the open conversation that are on its way, as the
+    /// rows of [`timeline`](Self::timeline) would show them now: what [`Changes::waits`]
+    /// asks the UI to bring up to date, row by row, without rebuilding the timeline.
+    fn wait_lines(&self, _id: ConversationId) -> Vec<(MessageId, WaitLine)> {
+        Vec::new()
+    }
     /// Networks offered on the welcome page.
     fn networks(&self) -> Vec<NetworkChoice> {
         network_choices()
@@ -420,6 +427,12 @@ pub trait UiSource {
     fn flags_deadline(&self) -> Option<Instant> {
         None
     }
+    /// How many of the models' reads are asked of the core and not applied yet (a query in
+    /// flight, or an invalidation that waits for the one in flight to be followed up): the
+    /// rows on screen are going to change. A screenshot waits for 0.
+    fn queries_in_flight(&self) -> usize {
+        0
+    }
     /// The [`UiSource::flags_deadline`] may have passed: re-reads the open timeline if so.
     fn refresh_flags(&mut self) -> Changes {
         Changes::default()
@@ -462,12 +475,6 @@ pub trait UiSource {
         None
     }
 
-    /// The history transfer the link page shows in place of its "linking" step: the one of
-    /// the account being linked, while it runs (waiting for the phone, downloading,
-    /// reading). Never another account's, and never an end.
-    fn link_transfer(&self) -> Option<TransferView> {
-        None
-    }
     /// "Continue Without History": ends the wait for the history of `account`, or its
     /// download. `false` when its transfer cannot be skipped now (none runs, or it is being
     /// read). The view stays until the backend reports the end, and that end is not
@@ -505,6 +512,32 @@ pub trait UiSource {
     }
     /// The user closed the question without confirming: nothing happens.
     fn cancel_replace(&mut self) {}
+
+    /// "Remove Account…" (`AccountAction::Remove`) or "Unlink…" (`AccountAction::Unlink`) of an
+    /// account: the question to put first. `None`: the account does not exist (any more), is
+    /// being removed, or does not offer the action (an account that is logged out or still
+    /// linking cannot be unlinked). Nothing is sent; the source remembers which question is
+    /// open, and opening it closes any other question about an account.
+    fn ask_account_action(
+        &mut self,
+        _account: AccountId,
+        _action: AccountAction,
+    ) -> Option<ReplaceQuestion> {
+        None
+    }
+    /// The user confirmed the open question about `account` and `action`: the command goes
+    /// out, alone (no other login is cancelled, nothing is linked). Only that very question,
+    /// and only once: anything else sends nothing and answers `false`.
+    fn confirm_account_action(&mut self, _account: AccountId, _action: AccountAction) -> bool {
+        false
+    }
+    /// The question about an account action was closed without confirming.
+    fn cancel_account_action(&mut self) {}
+    /// What the user is told once about the device of an account that was removed or
+    /// unlinked ([`crate::Changes::account_notice`]). Taken once.
+    fn take_logout_notices(&mut self) -> Vec<LogoutNotice> {
+        Vec::new()
+    }
 
     /// Downloads an attachment the policy left for a click, or retries a failed download.
     fn download_attachment(&mut self, _id: AttachmentId) -> bool {
@@ -579,6 +612,17 @@ pub trait UiSource {
     }
     /// Abandons the login.
     fn cancel_login(&mut self) {}
+    /// The question to put before an action that would abandon the login in progress
+    /// ([`Self::cancel_login`] would stop it: a link not taken by the core yet, e.g. one
+    /// waiting at its QR code). `None`: nothing would be lost, go on without asking.
+    fn abandon_question(&self) -> Option<AbandonQuestion> {
+        None
+    }
+    /// The question to put before the application quits (`buttons.md` F8): while a history
+    /// transfer runs or a new link still fetches its contacts and groups. `None`: quit at once.
+    fn quit_question(&self) -> Option<AbandonQuestion> {
+        None
+    }
     /// Window focus and whether the chat page is on screen (notifications, read markers).
     fn set_presence(&mut self, _focused: bool, _chat_visible: bool) -> Changes {
         Changes::default()

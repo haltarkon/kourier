@@ -18,6 +18,7 @@ pub(super) fn base() -> Vec<Frame> {
         chats: vec![ChatSpec {
             with: ChatWith::Contact(0),
             texts: Vec::new(),
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     })
@@ -249,10 +250,12 @@ fn review_an_incoming_item_by_us_is_never_a_row() {
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::NoteToSelf,
                 texts: Vec::new(),
+                ..ChatSpec::default()
             },
         ],
         ..HistorySpec::default()
@@ -294,6 +297,7 @@ fn review_large_and_odd_texts_stay_within_their_bounds() {
         chats: vec![ChatSpec {
             with: ChatWith::Contact(0),
             texts: Vec::new(),
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     });

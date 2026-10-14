@@ -48,6 +48,19 @@ pub trait Translator: Send + Sync {
     /// The translation of the plural message `singular`/`plural` in `context` for `count`:
     /// the catalog's plural rule of the language picks the form, not this crate.
     fn translate_plural(&self, context: &str, singular: &str, plural: &str, count: u64) -> String;
+
+    /// A count written the way [`Translator::translate_plural`] writes the `%1` it fills in
+    /// (the locale's digit groups), so that a second number of the same message looks the
+    /// same (link feedback L3: "12,400 of 50 000" under an English UI with Ukrainian
+    /// numbers). `None`: this crate groups it itself ([`crate::transfer::group_digits`]).
+    fn number(&self, _n: u64) -> Option<String> {
+        None
+    }
+}
+
+/// `n` as the translator writes counts, when it has a way (see [`Translator::number`]).
+pub fn number(n: u64) -> Option<String> {
+    dispatch(|t| t.and_then(|t| t.number(n)))
 }
 
 /// A second [`install`]: the first translator stays.
@@ -149,6 +162,23 @@ pub fn trnc(context: &str, singular: &'static str, plural: &'static str, n: u64)
         None => Cow::Borrowed(if n == 1 { singular } else { plural }),
     });
     substitute(&template, &[&n.to_string()])
+}
+
+/// Translates a plural message chosen by `n` and fills in `%1`…`%9` from `args` (not from
+/// `n`): for a count written another way than plain digits (grouped thousands) as `%1`, or
+/// a plural with more numbers than its count. The extractor reads it like [`trnc`].
+pub fn trnfc(
+    context: &str,
+    singular: &'static str,
+    plural: &'static str,
+    n: u64,
+    args: &[&str],
+) -> String {
+    let template = dispatch(|t| match t {
+        Some(t) => Cow::Owned(t.translate_plural(context, singular, plural, n)),
+        None => Cow::Borrowed(if n == 1 { singular } else { plural }),
+    });
+    substitute(&template, args)
 }
 
 /// Translates a message in a KDE context and fills in `%1`…`%9` from `args`.
@@ -260,6 +290,20 @@ mod tests {
         assert_eq!(trnc("@info", "%1 member", "%1 members", 3), "3 members");
         assert_eq!(trnc("@info", "%1 member", "%1 members", 0), "0 members");
         assert_eq!(trfc("@info", "%1 and %2", &["A", "B"]), "A and B");
+        assert_eq!(
+            trnfc(
+                "@info",
+                "%2 of %1 item",
+                "%2 of %1 items",
+                1_200,
+                &["1,200", "7"]
+            ),
+            "7 of 1,200 items"
+        );
+        assert_eq!(
+            trnfc("@info", "%1 item", "%1 items", 1, &["one"]),
+            "one item"
+        );
         assert_eq!(trfc("@info", "%1 left", &["A"]), "A left");
         // Arguments are not re-scanned for placeholders.
         assert_eq!(trfc("@info", "%1: %2", &["%2", "x"]), "%2: x");

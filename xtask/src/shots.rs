@@ -17,25 +17,50 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::{
-    SHOT_PAGES, SHOT_SIZES, SHOT_THEMES, cargo, color_scheme_file, qml_problems, root, run,
-    shot_luma, shot_mode, target_dir, theme_home, theme_problem,
+    SHOT_PAGES, SHOT_SIZES, SHOT_THEMES, cargo, color_scheme_file, qml_problems, render_kdeglobals,
+    root, run, shot_luma, shot_mode, shot_settle_ms, shot_unsettled, target_dir, theme_home,
+    theme_problem,
 };
 
-/// App starts at a time when `--jobs` is not given.
-const DEFAULT_JOBS: usize = 4;
+/// The most app starts at a time when `--jobs` is not given. T1, 2026-10-13, 6-core machine with
+/// one core taken by another process: 196 pictures took 315 s at 4, 276 s and 266 s at 6, with
+/// no flap the 4-job run did not have (the glyph-edge flap of one `transfer*` picture and the
+/// hand-compared album pages show at both).
+const MAX_DEFAULT_JOBS: usize = 6;
+
+/// App starts at a time when `--jobs` is not given: one per core, at least 2 and at most
+/// [`MAX_DEFAULT_JOBS`] (4 when the number of cores cannot be read).
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, MAX_DEFAULT_JOBS))
+}
 
 /// Pages whose picture is random by design, so there is nothing to compare: the rotating QR code
 /// carries a fresh random payload in every render (thousands of pixels differ). Both sizes and
 /// both color schemes are skipped; the checks of a render (clean exit, no QML warning, theme)
 /// still apply.
 const SHOT_PAGES_NOT_COMPARED: [&str; 1] = ["qr"];
+
+/// Pages compared only in a run by hand, not in ci's screenshot step (rendered and checked in ci
+/// all the same). EMPTY: the eight pages that flapped before S1 (2026-10-13) are all compared in
+/// ci again, with ci's limits. A picture is now grabbed when it is final (`MainWindow.qml`
+/// `shotTimer`) and `shots --repeat` is the tool that finds a page that is not (see CLAUDE.md,
+/// "Stable screenshots"). The list and its handling stay for the next page that cannot be made
+/// stable.
+const SHOT_PAGES_COMPARED_BY_HAND: [&str; 0] = [];
+
+/// Whether a render of `page` is compared with its baseline: not the random ones, and in ci not
+/// [`SHOT_PAGES_COMPARED_BY_HAND`].
+fn is_compared(ci: bool, page: &str) -> bool {
+    !SHOT_PAGES_NOT_COMPARED.contains(&page) && !(ci && SHOT_PAGES_COMPARED_BY_HAND.contains(&page))
+}
 
 /// A pixel differs when any of its channels differs by more than this.
 const PIXEL_TOLERANCE: u8 = 24;
@@ -48,12 +73,13 @@ const PIXEL_TOLERANCE: u8 = 24;
 /// timing are settled by the re-renders.
 const MAX_DIFFERING_PIXELS: usize = 24;
 
-/// Pages that show pictures. A picture is grabbed a fixed time after the page opened, and a
-/// thumbnail in it may or may not have been replaced by its full-size picture yet (more so
-/// with several renders at a time): the edges of the shapes in it then differ by a few
-/// hundred pixels from render to render, in every one of three renders. Until a screenshot
-/// waits for the page's pictures to be final, these pages are compared with the looser
-/// [`PICTURE_PAGE_ONE_IN`]; a change of their text or layout smaller than that is not seen.
+/// Pages that show pictures. They are grabbed when their pictures are final (nothing loading,
+/// the core's thumbnails derived), but the same picture drawn from its file and from its
+/// thumbnail differs by a level or two in a fifth of its pixels and a few pixels more at the
+/// edges of shapes, and which of the two a picture shows depends on when it was asked for. So
+/// these pages are compared with the looser [`PICTURE_PAGE_ONE_IN`]; a change of their text or
+/// layout smaller than that is not seen. (The lead decides, after three full runs without a
+/// re-render of a picture page, whether they get the strict limit: stable-screenshots.md step 8.)
 const SHOT_PAGES_WITH_PICTURES: [&str; 19] = [
     "media",
     "viewer",
@@ -66,7 +92,7 @@ const SHOT_PAGES_WITH_PICTURES: [&str; 19] = [
     "deleteattachment",
     "folderfiles",
     "folderzip",
-    // The chats of these pages show a picture too (`mediaShot` in `MainWindow.qml`): a full
+    // The chats of these pages show a picture too (they open a chat with a photo): a full
     // run of 2026-10-08 flagged `edit` and `compose` for 48 and 68 pixels inside a photo.
     "compose",
     "folder",
@@ -81,9 +107,15 @@ const SHOT_PAGES_WITH_PICTURES: [&str; 19] = [
 /// A page with pictures differs when more than one pixel in this many differs (0.15 %).
 const PICTURE_PAGE_ONE_IN: usize = 667;
 
-/// Renders of a picture after the first one when it differs from the baseline, and when its only
-/// problem is a QML warning.
+/// Renders of a picture after the first one when it differs from the baseline, and when the app
+/// said `shot: unsettled` (the picture did not become final within its 30 s).
 const RETRIES: usize = 2;
+
+/// The longest a single render may take. The app saves an unsettled frame itself after 30 s
+/// (`MainWindow.qml` `shotTimer`), so a render still running after twice that is stuck (a page
+/// that never became ready, a hang): it is killed and counts as a failed render, never as a
+/// picture.
+const RENDER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The directory `cargo xtask shots` writes to unless it is given another one.
 fn default_dir() -> PathBuf {
@@ -118,6 +150,11 @@ struct Args {
     matrix: bool,
     /// Only these variants of the matrix run (`--variant a,b`).
     variants: Option<Vec<String>>,
+    /// ci's step ([`ci_step`]): [`SHOT_PAGES_COMPARED_BY_HAND`] are rendered, not compared.
+    ci: bool,
+    /// `--repeat N`: render each picture N times and require every render to be the very same
+    /// picture ([`run_repeat`]); no baseline is involved.
+    repeat: Option<usize>,
 }
 
 impl Default for Args {
@@ -127,12 +164,14 @@ impl Default for Args {
             pages: None,
             theme: None,
             size: None,
-            jobs: DEFAULT_JOBS,
+            jobs: default_jobs(),
             build: true,
             accept: false,
             compare: true,
             matrix: false,
             variants: None,
+            ci: false,
+            repeat: None,
         }
     }
 }
@@ -145,7 +184,8 @@ impl Args {
 }
 
 /// Parses `[dir] [--page a,b,...] [--theme light|dark] [--size wide|narrow] [--jobs N]
-/// [--no-build] [--accept] [--no-compare]`; a value follows its flag as `--page=a` or `--page a`.
+/// [--repeat N] [--no-build] [--accept] [--no-compare]`; a value follows its flag as
+/// `--page=a` or `--page a`.
 fn parse_args(args: &[String]) -> Result<Args> {
     let mut out = Args::default();
     let mut it = args.iter();
@@ -200,6 +240,13 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     _ => bail!("--jobs: {jobs:?} is not a number of at least 1"),
                 };
             }
+            "--repeat" => {
+                let times = value()?;
+                out.repeat = match times.parse() {
+                    Ok(n) if n >= 2 => Some(n),
+                    _ => bail!("--repeat: {times:?} is not a number of at least 2"),
+                };
+            }
             "--variant" => {
                 let list = value()?;
                 let variants = out.variants.get_or_insert_with(Vec::new);
@@ -249,6 +296,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
     }
     if out.variants.is_some() && !out.matrix {
         bail!("--variant belongs to --matrix");
+    }
+    if out.repeat.is_some() && (out.accept || out.matrix) {
+        bail!(
+            "--repeat renders each picture again and again to see that they are the same picture; \
+             it compares nothing with the baseline: drop --accept and --matrix"
+        );
     }
     Ok(out)
 }
@@ -496,6 +549,10 @@ enum Verdict {
 struct Outcome {
     failures: Vec<String>,
     luma: Option<u32>,
+    /// The `settle_ms` of every render of this picture that reported one.
+    settle_ms: Vec<u32>,
+    /// Renders that ended `shot: unsettled` and were rendered again.
+    unsettled_retries: usize,
     /// The render printed QML problems (they are in `failures`).
     qml_warnings: bool,
     verdict: Verdict,
@@ -507,6 +564,12 @@ impl Outcome {
         let mut out = String::new();
         if self.qml_warnings {
             out.push_str(" (QML warnings)");
+        }
+        if self.unsettled_retries > 0 {
+            out.push_str(&format!(
+                " ({} unsettled render(s) repeated)",
+                self.unsettled_retries
+            ));
         }
         match &self.verdict {
             Verdict::NotCompared | Verdict::Same { renders: 1 } => {}
@@ -539,6 +602,8 @@ struct Ctx<'a> {
     mode: Mode,
     /// The matrix run's variant: what it changes in the render's environment.
     variant: Option<&'a Variant>,
+    /// ci's screenshot step: [`SHOT_PAGES_COMPARED_BY_HAND`] are not compared.
+    ci: bool,
 }
 
 impl Ctx<'_> {
@@ -555,14 +620,74 @@ struct Render {
     /// QML problems from the app's stderr.
     qml: Vec<String>,
     luma: Option<u32>,
+    /// Milliseconds from the page's ready moment to the grab.
+    settle_ms: Option<u32>,
+    /// What held the picture back when the app gave up waiting for it to be final
+    /// (`shot: unsettled`); the render is also a failure then.
+    unsettled: Option<String>,
 }
 
-/// Renders `job` once into its file (`label` names it in failures).
-fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
-    let png = ctx.png(job);
-    let _ = std::fs::remove_file(&png);
+/// The numeric locale of the pictures. KI18n writes the count of a plural ("12,400 messages")
+/// by `LC_NUMERIC`, which `LANG` does not set, so a machine whose numbers are Ukrainian would
+/// draw other pictures than one whose numbers are American: the step pins it to a locale
+/// that every machine can have, and the application itself keeps following the user's.
+const PINNED_NUMERIC: &str = "en_US.UTF-8";
+
+/// What `locale -a` lists, as the locale names compare: lower case, `utf8` for `UTF-8`.
+fn locale_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace("utf-8", "utf8")
+}
+
+/// The numeric locale for a machine with the locales `installed` (the output of `locale -a`):
+/// [`PINNED_NUMERIC`] when it is there, else `C.UTF-8` and `true`, to say so.
+fn pick_numeric(installed: &str) -> (&'static str, bool) {
+    let wanted = locale_key(PINNED_NUMERIC);
+    if installed.lines().any(|l| locale_key(l) == wanted) {
+        (PINNED_NUMERIC, false)
+    } else {
+        ("C.UTF-8", true)
+    }
+}
+
+/// The pinned numeric locale of this machine, found (and, when it falls back, warned about)
+/// once.
+fn pinned_numeric() -> &'static str {
+    static PICKED: OnceLock<&'static str> = OnceLock::new();
+    PICKED.get_or_init(|| {
+        let listed = Command::new("locale")
+            .arg("-a")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let (locale, fell_back) = pick_numeric(&listed);
+        if fell_back {
+            eprintln!(
+                "shots: warning: the locale {PINNED_NUMERIC} is not installed; the numbers of \
+                 the pictures use {locale}, so a baseline made elsewhere may differ in the \
+                 counts"
+            );
+        }
+        locale
+    })
+}
+
+/// The `LC_NUMERIC` of a render of `variant` given the pinned one: a variant that sets its own
+/// `LANG` (a locale to look at) takes its numbers from it, any other keeps the pin.
+fn numeric_for(variant: Option<&Variant>, pinned: &'static str) -> &'static str {
+    variant
+        .and_then(|v| v.env.iter().find(|(name, _)| *name == "LANG"))
+        .and_then(|(_, value)| *value)
+        .unwrap_or(pinned)
+}
+
+fn numeric_locale(variant: Option<&Variant>) -> &'static str {
+    numeric_for(variant, pinned_numeric())
+}
+
+/// The start of the application that draws `job` into `png`, with the environment every
+/// render has (what the machine or the session set must not change the picture).
+fn shot_command(ctx: &Ctx, job: &Job, png: &Path) -> Command {
     let (_, w, h) = job.size;
-    let mut render = Render::default();
     let mut command = Command::new(ctx.bin);
     command
         .arg(shot_mode(job.page))
@@ -577,7 +702,10 @@ fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
         .env("QT_FORCE_STDERR_LOGGING", "1")
         .env("XDG_CONFIG_HOME", &ctx.homes[job.theme.0])
         .env("LANG", "en_US.UTF-8")
-        .env("LANGUAGE", "en");
+        .env("LANGUAGE", "en")
+        .env("LC_NUMERIC", numeric_locale(ctx.variant))
+        // (LC_ALL would beat both LANG and LC_NUMERIC.)
+        .env_remove("LC_ALL");
     if let Some(variant) = ctx.variant {
         for (name, value) in variant.env {
             match value {
@@ -593,8 +721,63 @@ fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
                 .env("KOURIER_LOCALE_DIR", locale_dir());
         }
     }
-    let out = command.output();
-    let out = match out {
+    command
+}
+
+/// Renders `job` once into its file (`label` names it in failures).
+fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
+    render_to(ctx, job, &ctx.png(job), label)
+}
+
+/// Runs `command` to its end and returns its output, or kills it after `limit`; the flag says
+/// it was killed.
+fn output_within(command: &mut Command, limit: Duration) -> std::io::Result<(Output, bool)> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
+    Ok((output, timed_out))
+}
+
+/// Renders `job` once into `png`.
+fn render_to(ctx: &Ctx, job: &Job, png: &Path, label: &str) -> Render {
+    render_within(ctx, job, png, label, RENDER_TIMEOUT)
+}
+
+/// [`render_to`] with the longest the app may run.
+fn render_within(ctx: &Ctx, job: &Job, png: &Path, label: &str, limit: Duration) -> Render {
+    let _ = std::fs::remove_file(png);
+    let mut render = Render::default();
+    let mut command = shot_command(ctx, job, png);
+    let (out, timed_out) = match output_within(&mut command, limit) {
         Ok(out) => out,
         Err(e) => {
             render
@@ -603,6 +786,15 @@ fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
             return render;
         }
     };
+    if timed_out {
+        // Whatever it wrote is not a picture of a finished page.
+        let _ = std::fs::remove_file(png);
+        render.failures.push(format!(
+            "{label}: timed out after {} s (the app was killed)",
+            limit.as_secs()
+        ));
+        return render;
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let problems = qml_problems(&stderr);
@@ -623,21 +815,43 @@ fn render(ctx: &Ctx, job: &Job, label: &str) -> Render {
             .failures
             .push(format!("{label}: no luminance reported"));
     }
+    render.settle_ms = shot_settle_ms(&stdout);
+    // The app saved the frame it had after 30 s: a picture that was still changing. Never a
+    // picture to compare or to accept as the baseline.
+    render.unsettled = shot_unsettled(&stderr);
+    if let Some(what) = &render.unsettled {
+        render
+            .failures
+            .push(format!("{label}: the picture did not settle ({what})"));
+    }
     render
 }
 
 /// Renders a picture, compares it with the baseline as `ctx.mode` says and returns what was found.
 fn process(ctx: &Ctx, job: &Job) -> Outcome {
     let name = job.name();
-    let last = render(ctx, job, &name);
+    let mut last = render(ctx, job, &name);
+    let mut settle_ms: Vec<u32> = last.settle_ms.into_iter().collect();
+    // A picture that did not settle is rendered again; only the last render's failures count.
+    let mut unsettled_retries = 0;
+    while last.unsettled.is_some() && unsettled_retries < RETRIES {
+        unsettled_retries += 1;
+        last = render(
+            ctx,
+            job,
+            &format!("{name} (render {})", unsettled_retries + 1),
+        );
+        settle_ms.extend(last.settle_ms);
+    }
     let mut out = Outcome {
         qml_warnings: !last.qml.is_empty(),
         failures: last.failures.into_iter().chain(last.qml).collect(),
         luma: last.luma,
+        settle_ms,
+        unsettled_retries,
         verdict: Verdict::NotCompared,
     };
-    let compared = !SHOT_PAGES_NOT_COMPARED.contains(&job.page);
-    if ctx.mode == Mode::Plain || !compared || !ctx.png(job).is_file() {
+    if ctx.mode == Mode::Plain || !is_compared(ctx.ci, job.page) || !ctx.png(job).is_file() {
         return out;
     }
     match store_or_compare(ctx, job, &mut out) {
@@ -677,6 +891,7 @@ fn store_or_compare(ctx: &Ctx, job: &Job, out: &mut Outcome) -> Result<Verdict> 
     while diff.is_change(job.page) && renders <= RETRIES {
         renders += 1;
         let again = render(ctx, job, &format!("{name} (render {renders})"));
+        out.settle_ms.extend(again.settle_ms);
         out.failures.extend(again.failures);
         if !png.is_file() {
             break;
@@ -771,7 +986,7 @@ struct Variant {
 
 /// The variants of `cargo xtask shots --matrix`, each a place where the default pictures cannot
 /// show a fault. Breeze Light is the base of those that do not change the color scheme.
-const VARIANTS: [Variant; 9] = [
+const VARIANTS: [Variant; 11] = [
     Variant {
         name: "classic",
         about: "Breeze Classic color scheme",
@@ -851,6 +1066,35 @@ const VARIANTS: [Variant; 9] = [
         catalogs: false,
     },
     Variant {
+        name: "scale-2",
+        // The picture-quality fix (P1) is about the pictures of a display with a scale above
+        // 1: the timeline draws them from the file when the 400 px thumbnail cannot cover
+        // them. Look at it with `--matrix --variant scale-2 --page chat,album`; the pixel
+        // test is `kourier-qt/tests/picture_ui.rs`. The window is 1200x800 LOGICAL pixels, so
+        // the pictures are 2400x1600.
+        about: "a display of scale 2, QT_SCALE_FACTOR=2 (Breeze Light)",
+        theme: "light",
+        scheme: Scheme::Installed("BreezeLight"),
+        icons: "breeze",
+        kdeglobals: "",
+        env: &[("QT_SCALE_FACTOR", Some("2"))],
+        catalogs: false,
+    },
+    Variant {
+        name: "scale-1.25",
+        // The user's own display (125 %, 2026-10-13), where a tall picture, a phone screenshot
+        // and (since the sizes the provider is asked for are the physical ones) some landscape
+        // ones are drawn from the file, and the avatars' corners are cut for a size that is not
+        // a whole number of pixels. The window is 1200x800 logical pixels, the pictures 1500x1000.
+        about: "the user's display of scale 1.25, QT_SCALE_FACTOR=1.25 (Breeze Light)",
+        theme: "light",
+        scheme: Scheme::Installed("BreezeLight"),
+        icons: "breeze",
+        kdeglobals: "",
+        env: &[("QT_SCALE_FACTOR", Some("1.25"))],
+        catalogs: false,
+    },
+    Variant {
         name: "x-test",
         about: "the pseudo-language: every translatable text is wrapped in xx…xx (Breeze Light)",
         theme: "light",
@@ -872,12 +1116,19 @@ const VARIANTS: [Variant; 9] = [
     },
 ];
 
+/// The config home of a compared run's color scheme: [`theme_home`] with the style's animations
+/// stopped (`STILL_STYLE`).
+fn shot_home(base: &Path, theme: &str, scheme: &str, icons: &str) -> Result<PathBuf> {
+    theme_home(base, theme, scheme, icons, true)
+}
+
 /// A config home for `variant`: its color scheme, icon theme and extra lines in `kdeglobals`,
-/// with a text cursor that does not blink, like [`theme_home`].
+/// with a text cursor that does not blink and the style's animations stopped, like
+/// [`theme_home`] with `still` ([`render_kdeglobals`]).
 fn variant_home(base: &Path, variant: &Variant) -> Result<PathBuf> {
     let home = base.join(variant.name);
     std::fs::create_dir_all(&home)?;
-    let mut globals = match variant.scheme {
+    let colors = match variant.scheme {
         Scheme::Installed(name) => {
             let colors = color_scheme_file(name);
             std::fs::read_to_string(&colors)
@@ -885,10 +1136,7 @@ fn variant_home(base: &Path, variant: &Variant) -> Result<PathBuf> {
         }
         Scheme::Bundled(text) => text.to_owned(),
     };
-    globals.push_str(&format!(
-        "\n[Icons]\nTheme={}\n\n[KDE]\nCursorBlinkRate=0\n\n{}",
-        variant.icons, variant.kdeglobals
-    ));
+    let globals = render_kdeglobals(&colors, variant.icons, true, variant.kdeglobals);
     std::fs::write(home.join("kdeglobals"), globals)?;
     Ok(home)
 }
@@ -927,6 +1175,7 @@ fn run_matrix(args: &Args) -> Result<()> {
             homes: BTreeMap::from([(variant.theme, variant_home(&homes, variant)?)]),
             mode: Mode::Plain,
             variant: Some(variant),
+            ci: false,
         };
         let theme = (variant.theme, "", "");
         let mut jobs = Vec::new();
@@ -1001,7 +1250,10 @@ pub fn ci_step() -> Result<()> {
         Ok(_) => {}
         Err(e) => eprintln!("shots: cannot tell whether anything changed ({e:#}); rendering"),
     }
-    run_shots(&Args::default())
+    run_shots(&Args {
+        ci: true,
+        ..Args::default()
+    })
 }
 
 /// The debug binary the renders run, built first unless `build` is false.
@@ -1032,6 +1284,7 @@ fn run_shots(args: &Args) -> Result<()> {
     let default = args.dir.is_none();
     let dir = args.dir.clone().unwrap_or_else(default_dir);
     let mode = match (default, args.accept, args.compare) {
+        _ if args.repeat.is_some() => Mode::Plain,
         (true, true, _) => Mode::Accept,
         (true, false, true) => Mode::Compare,
         _ => Mode::Plain,
@@ -1061,7 +1314,7 @@ fn run_shots(args: &Args) -> Result<()> {
     let mut config_homes = BTreeMap::new();
     for (theme, scheme, icons) in SHOT_THEMES {
         if jobs.iter().any(|j| j.theme.0 == theme) {
-            config_homes.insert(theme, theme_home(&homes, theme, scheme, icons)?);
+            config_homes.insert(theme, shot_home(&homes, theme, scheme, icons)?);
         }
     }
     let ctx = Ctx {
@@ -1070,8 +1323,12 @@ fn run_shots(args: &Args) -> Result<()> {
         homes: config_homes,
         mode,
         variant: None,
+        ci: args.ci,
     };
     let workers = args.jobs.min(jobs.len().max(1));
+    if let Some(times) = args.repeat {
+        return run_repeat(&ctx, &jobs, workers, times, started);
+    }
     eprintln!(
         "shots: {} pictures, {workers} at a time{}",
         jobs.len(),
@@ -1114,6 +1371,10 @@ fn run_shots(args: &Args) -> Result<()> {
         eprintln!("shots: {f}");
     }
     let secs = started.elapsed().as_secs();
+    eprintln!(
+        "shots: {}",
+        settle_summary(outcomes.iter().flat_map(|o| o.settle_ms.iter().copied()))
+    );
     match mode {
         Mode::Plain => eprintln!("shots: {} PNGs in {} ({secs} s)", jobs.len(), dir.display()),
         Mode::Compare => {
@@ -1150,6 +1411,159 @@ fn run_shots(args: &Args) -> Result<()> {
     }
     if let Some(digest) = digest {
         write_stamp(&dir, digest)?;
+    }
+    Ok(())
+}
+
+/// "settle_ms: sum 123456 over 200 renders, max 5400": how long the pictures waited for their
+/// page to be final, from the app's `shot:` lines.
+fn settle_summary(times: impl Iterator<Item = u32>) -> String {
+    let (mut sum, mut max, mut count) = (0u64, 0u32, 0usize);
+    for t in times {
+        sum += u64::from(t);
+        max = max.max(t);
+        count += 1;
+    }
+    format!("settle_ms: sum {sum} over {count} renders, max {max}")
+}
+
+/// Whether two renders are the very same picture: the same size and every pixel equal (no
+/// tolerance, unlike [`compare`]). Else how many pixels differ (all of them for another size).
+fn identical(a: &Image, b: &Image) -> std::result::Result<(), usize> {
+    if a.size() != b.size() {
+        return Err(a.pixels.len().max(b.pixels.len()));
+    }
+    let differing = a
+        .pixels
+        .iter()
+        .zip(&b.pixels)
+        .filter(|(x, y)| x != y)
+        .count();
+    if differing == 0 {
+        Ok(())
+    } else {
+        Err(differing)
+    }
+}
+
+/// `--repeat N`: renders every picture of `jobs` `times` times, into `<dir>/repeat/<name>-<k>.png`
+/// (k from 1), `workers` at a time, and fails naming each picture whose renders are not all the
+/// same picture, pixel for pixel. A picture that is final when it is grabbed has one result;
+/// this is the test of that ("Stable screenshots"). Also fails on whatever fails a render.
+fn run_repeat(
+    ctx: &Ctx,
+    jobs: &[Job],
+    workers: usize,
+    times: usize,
+    started: Instant,
+) -> Result<()> {
+    let dir = ctx.dir.join("repeat");
+    std::fs::create_dir_all(&dir)?;
+    let path = |job: &Job, k: usize| dir.join(format!("{}-{k}.png", job.name()));
+    for job in jobs {
+        for k in 1..=times {
+            let _ = std::fs::remove_file(path(job, k));
+        }
+    }
+    eprintln!(
+        "shots: {} pictures x {times} renders = {}, {workers} at a time, into {}",
+        jobs.len(),
+        jobs.len() * times,
+        dir.display()
+    );
+    let work: Vec<(usize, usize)> = (0..jobs.len())
+        .flat_map(|i| (1..=times).map(move |k| (i, k)))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let finished = Mutex::new(Vec::with_capacity(work.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers.clamp(1, work.len().max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(i, k)) = work.get(n) else { break };
+                    let job = &jobs[i];
+                    let label = format!("{} (repeat {k})", job.name());
+                    let render = render_to(ctx, job, &path(job, k), &label);
+                    let mut done = finished.lock().unwrap();
+                    done.push((i, k, render));
+                    eprintln!("shots: [{}/{}] {label}", done.len(), work.len());
+                }
+            });
+        }
+    });
+    let mut finished = finished.into_inner().unwrap();
+    finished.sort_by_key(|(i, k, _)| (*i, *k));
+    let mut failures = Vec::new();
+    let mut settle = Vec::new();
+    let mut unstable = Vec::new();
+    for (i, job) in jobs.iter().enumerate() {
+        let mut renders: Vec<(usize, Image)> = Vec::new();
+        for (_, k, render) in finished.iter().filter(|(j, ..)| *j == i) {
+            failures.extend(render.failures.iter().cloned());
+            failures.extend(render.qml.iter().cloned());
+            settle.extend(render.settle_ms);
+            if render.failures.is_empty()
+                && let Ok(image) = read_png(&path(job, *k))
+            {
+                renders.push((*k, image));
+            }
+        }
+        // The distinct pictures among the renders, each with the renders that made it.
+        let mut distinct: Vec<(Vec<usize>, usize)> = Vec::new();
+        'renders: for (j, (k, image)) in renders.iter().enumerate() {
+            for (members, first) in &mut distinct {
+                if identical(&renders[*first].1, image).is_ok() {
+                    members.push(*k);
+                    continue 'renders;
+                }
+            }
+            distinct.push((vec![*k], j));
+        }
+        if distinct.len() > 1 {
+            let worst = distinct
+                .iter()
+                .skip(1)
+                .map(|(_, first)| {
+                    identical(&renders[distinct[0].1].1, &renders[*first].1).unwrap_err()
+                })
+                .max()
+                .unwrap_or(0);
+            let groups: Vec<String> = distinct
+                .iter()
+                .map(|(members, _)| format!("{} x{}", members[0], members.len()))
+                .collect();
+            unstable.push(format!(
+                "{}: {} different pictures in {} renders (first render of each: {}; up to {worst} px \
+                 differ from the most common one's first)",
+                job.name(),
+                distinct.len(),
+                renders.len(),
+                groups.join(", ")
+            ));
+        }
+    }
+    for f in failures.iter().chain(&unstable) {
+        eprintln!("shots: {f}");
+    }
+    eprintln!(
+        "shots: {} pictures x {times} renders, {} not the same picture in every render ({} s); {}",
+        jobs.len(),
+        unstable.len(),
+        started.elapsed().as_secs(),
+        settle_summary(settle.into_iter())
+    );
+    if !failures.is_empty() || !unstable.is_empty() {
+        bail!(
+            "{} render problem(s), {} picture(s) that differ between renders: {}",
+            failures.len(),
+            unstable.len(),
+            unstable
+                .iter()
+                .filter_map(|u| u.split(':').next())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }
@@ -1389,7 +1803,8 @@ mod tests {
     fn the_command_line_without_arguments_renders_everything_compared() {
         let a = args(&[]).unwrap();
         assert_eq!(a, Args::default());
-        assert_eq!(a.jobs, 4);
+        assert_eq!(a.jobs, default_jobs());
+        assert!((2..=MAX_DEFAULT_JOBS).contains(&a.jobs), "{}", a.jobs);
         assert!(a.build && a.compare && !a.accept && a.is_full());
         assert_eq!(select_jobs(&a).len(), SHOT_PAGES.len() * 4);
     }
@@ -1479,6 +1894,9 @@ mod tests {
             assert!(SHOT_PAGES.contains(&page), "{page}");
         }
         assert!(SHOT_PAGES_NOT_COMPARED.contains(&"qr"));
+        for page in SHOT_PAGES_COMPARED_BY_HAND {
+            assert!(SHOT_PAGES.contains(&page), "{page}");
+        }
     }
 
     #[test]
@@ -1525,10 +1943,374 @@ mod tests {
                 assert!(color_scheme_file(name).is_file(), "{name} is not installed");
             }
         }
-        // The five looks the task asks for.
-        for name in ["classic", "hc-light", "hc-dark", "font-14", "rtl", "no-kde"] {
+        // The five looks the task asks for, and the display of scale 2 (P1).
+        for name in [
+            "classic",
+            "hc-light",
+            "hc-dark",
+            "font-14",
+            "rtl",
+            "no-kde",
+            "scale-2",
+            "scale-1.25",
+        ] {
             assert!(VARIANTS.iter().any(|v| v.name == name), "{name}");
         }
+        let scale = VARIANTS.iter().find(|v| v.name == "scale-2").unwrap();
+        assert_eq!(scale.env, [("QT_SCALE_FACTOR", Some("2"))]);
+        let scale = VARIANTS.iter().find(|v| v.name == "scale-1.25").unwrap();
+        assert_eq!(scale.env, [("QT_SCALE_FACTOR", Some("1.25"))]);
+    }
+
+    #[test]
+    fn the_numbers_of_the_pictures_do_not_depend_on_the_machine() {
+        // The machine's numeric locale (Ukrainian here) is replaced, never inherited.
+        let listed = "C\nC.utf8\nen_US.utf8\nuk_UA.utf8\nPOSIX\n";
+        assert_eq!(pick_numeric(listed), ("en_US.UTF-8", false));
+        assert_eq!(pick_numeric("en_US.UTF-8\n"), ("en_US.UTF-8", false));
+        // Not installed (or `locale` not run): C.UTF-8 and the warning.
+        assert_eq!(pick_numeric("C\nC.utf8\nuk_UA.utf8\n"), ("C.UTF-8", true));
+        assert_eq!(pick_numeric(""), ("C.UTF-8", true));
+        // The normal run and the looks that keep LANG take the pin; a language variant its own.
+        let by_name = |n: &str| VARIANTS.iter().find(|v| v.name == n).expect("variant");
+        assert_eq!(numeric_for(None, "en_US.UTF-8"), "en_US.UTF-8");
+        assert_eq!(
+            numeric_for(Some(by_name("font-14")), "en_US.UTF-8"),
+            "en_US.UTF-8"
+        );
+        assert_eq!(
+            numeric_for(Some(by_name("x-test")), "en_US.UTF-8"),
+            "en_US.UTF-8"
+        );
+        assert_eq!(
+            numeric_for(Some(by_name("uk")), "en_US.UTF-8"),
+            "uk_UA.UTF-8"
+        );
+    }
+
+    #[test]
+    fn every_render_takes_its_numbers_from_the_pin_and_not_from_the_session() {
+        let job = Job {
+            page: "transferread",
+            size: SHOT_SIZES[0],
+            theme: SHOT_THEMES[0],
+        };
+        let homes: BTreeMap<&'static str, PathBuf> = SHOT_THEMES
+            .iter()
+            .map(|t| (t.0, PathBuf::from("/nonexistent/home")))
+            .collect();
+        let env_of = |variant: Option<&Variant>, name: &str| -> Option<Option<String>> {
+            let ctx = Ctx {
+                bin: Path::new("/nonexistent/kourier"),
+                dir: Path::new("/nonexistent/shots"),
+                homes: homes.clone(),
+                mode: Mode::Plain,
+                variant,
+                ci: false,
+            };
+            let command = shot_command(&ctx, &job, Path::new("/nonexistent/a.png"));
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let numeric = env_of(None, "LC_NUMERIC")
+            .expect("LC_NUMERIC is set")
+            .expect("to a value");
+        assert!(
+            ["en_US.UTF-8", "C.UTF-8"].contains(&numeric.as_str()),
+            "{numeric}"
+        );
+        assert_eq!(env_of(None, "LC_ALL"), Some(None), "LC_ALL is removed");
+        let by_name = |n: &str| VARIANTS.iter().find(|v| v.name == n).expect("variant");
+        assert_eq!(
+            env_of(Some(by_name("font-14")), "LC_NUMERIC"),
+            Some(Some(numeric.clone()))
+        );
+        assert_eq!(
+            env_of(Some(by_name("uk")), "LC_NUMERIC"),
+            Some(Some("uk_UA.UTF-8".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_command_line_takes_repeat_and_refuses_it_with_what_it_cannot_do() {
+        assert_eq!(args(&["--repeat", "10"]).unwrap().repeat, Some(10));
+        assert_eq!(args(&["--repeat=3", "--no-build"]).unwrap().repeat, Some(3));
+        assert_eq!(args(&[]).unwrap().repeat, None);
+        for bad in [
+            &["--repeat", "1"][..],
+            &["--repeat", "0"],
+            &["--repeat", "often"],
+            &["--repeat"],
+            &["--repeat", "5", "--accept"],
+            &["--repeat", "5", "--matrix"],
+        ] {
+            assert!(args(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn two_renders_are_the_same_picture_only_when_every_pixel_is() {
+        let a = solid(4, 3, [9, 9, 9, 255]);
+        assert_eq!(identical(&a, &solid(4, 3, [9, 9, 9, 255])), Ok(()));
+        // One level in one channel of one pixel is another picture (the tolerance of
+        // `compare` does not apply to the repeat test).
+        let b = with_first(solid(4, 3, [9, 9, 9, 255]), 1, [9, 9, 10, 255]);
+        assert_eq!(identical(&a, &b), Err(1));
+        assert_eq!(identical(&a, &solid(3, 3, [9, 9, 9, 255])), Err(12));
+        assert_eq!(
+            settle_summary([300, 2500, 450].into_iter()),
+            "settle_ms: sum 3250 over 3 renders, max 2500"
+        );
+        assert_eq!(
+            settle_summary(std::iter::empty()),
+            "settle_ms: sum 0 over 0 renders, max 0"
+        );
+    }
+
+    /// A stand-in for the app in `tree`: writes `sample-<n>.png` as the screenshot, where n
+    /// is `pick` (a shell expression of `$runs`, the number of earlier runs), and prints
+    /// the `shot:` line and, when `stderr_line` is not empty, that line on stderr.
+    fn fake_app(tree: &TempTree, pick: &str, stderr_line: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        for (n, shade) in [(0, 40u8), (1, 41)] {
+            write_png(
+                &tree.0.join(format!("sample-{n}.png")),
+                &solid(8, 8, [shade, 50, 60, 255]),
+            )
+            .unwrap();
+        }
+        tree.write(
+            "app.sh",
+            &format!(
+                "#!/bin/sh\nd=$(dirname \"$0\")\nfor a in \"$@\"; do case \"$a\" in --screenshot=*) png=\"${{a#--screenshot=}}\";; esac; done\n\
+                 runs=$(cat \"$d/runs\" 2>/dev/null | wc -l)\necho x >> \"$d/runs\"\n\
+                 cp \"$d/sample-$(({pick})).png\" \"$png\"\necho \"shot: $png luma=120 settle_ms=777\"\n\
+                 [ -n '{stderr_line}' ] && echo '{stderr_line}' >&2\nexit 0\n"
+            ),
+        );
+        let bin = tree.0.join("app.sh");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn fake_ctx<'a>(bin: &'a Path, dir: &'a Path, mode: Mode) -> Ctx<'a> {
+        Ctx {
+            bin,
+            dir,
+            homes: SHOT_THEMES
+                .iter()
+                .map(|t| (t.0, PathBuf::from("/nonexistent/home")))
+                .collect(),
+            mode,
+            variant: None,
+            ci: false,
+        }
+    }
+
+    fn runs_of(tree: &TempTree) -> usize {
+        std::fs::read_to_string(tree.0.join("runs")).map_or(0, |t| t.lines().count())
+    }
+
+    #[test]
+    fn ci_compares_every_page_but_the_random_one() {
+        // The pages S1 kept out of ci while their pictures flapped (F10, 2026-10-14): ci compares
+        // them again, with its own limits.
+        for page in [
+            "album",
+            "albumviewer",
+            "mediamenu",
+            "transferdownload",
+            "revisions",
+            "deleteattachment",
+            "transferwait",
+            "transferread",
+        ] {
+            assert!(SHOT_PAGES.contains(&page), "{page}");
+            assert!(is_compared(true, page), "{page} is compared in ci");
+            assert!(is_compared(false, page), "{page} is compared by hand");
+        }
+        for page in SHOT_PAGES {
+            assert_eq!(is_compared(true, page), page != "qr", "{page}");
+        }
+    }
+
+    /// The lines of every `[KDE]` group of a `kdeglobals` text (a color scheme file has one
+    /// of its own: `contrast`; the render adds more below it).
+    fn kde_lines(globals: &str) -> Vec<&str> {
+        let mut in_kde = false;
+        let mut lines = Vec::new();
+        for line in globals.lines() {
+            if line.starts_with('[') {
+                in_kde = line.trim() == "[KDE]";
+            } else if in_kde && !line.trim().is_empty() {
+                lines.push(line.trim());
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn every_render_has_the_animations_of_the_style_stopped_at_the_source() {
+        // (F12, 2026-10-14.) The style's transitions (the fade of a menu, a dialog, a tip, of the
+        // scroll bar; the slide of a page) take their time from `Kirigami.Units`, which the
+        // desktop style reads from `[KDE] AnimationDurationFactor` of `kdeglobals`: 0 makes them
+        // 0 to 2 ms. One of them that starts late fits between the two frames that must be
+        // equal for the grab, so none may be left in a picture for comparison, whichever way
+        // the render's config home is made.
+        let globals =
+            render_kdeglobals("[KDE]\ncontrast=4\n", "breeze", true, "[General]\nfont=x\n");
+        let kde = kde_lines(&globals);
+        assert!(kde.contains(&"AnimationDurationFactor=0"), "{globals}");
+        assert!(kde.contains(&"CursorBlinkRate=0"), "{globals}");
+        assert!(
+            kde.contains(&"contrast=4"),
+            "the scheme's own line is kept: {globals}"
+        );
+        assert!(globals.contains("[General]\nfont=x\n"), "{globals}");
+        // The demo and the measurements show and time the animations: no such line there.
+        let moving = render_kdeglobals("", "breeze", false, "");
+        assert!(!moving.contains("AnimationDurationFactor"), "{moving}");
+
+        // The homes the run writes: the compared run's two schemes and every look of `--matrix`.
+        let tree = TempTree::new("still-style");
+        let mut homes = Vec::new();
+        for (theme, scheme, icons) in SHOT_THEMES {
+            homes.push((
+                theme.to_owned(),
+                shot_home(&tree.0, theme, scheme, icons).unwrap(),
+            ));
+        }
+        for variant in &VARIANTS {
+            homes.push((
+                variant.name.to_owned(),
+                variant_home(&tree.0, variant).unwrap(),
+            ));
+        }
+        for (name, home) in homes {
+            let written = std::fs::read_to_string(home.join("kdeglobals")).unwrap();
+            assert!(
+                kde_lines(&written).contains(&"AnimationDurationFactor=0"),
+                "{name}: the animations of the style run in this render"
+            );
+        }
+    }
+
+    #[test]
+    fn a_render_that_hangs_is_killed_and_is_a_failure_never_a_picture() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("hang");
+        // (`exec`: the shell is replaced, so the kill reaches the process that holds the pipes.)
+        tree.write("app.sh", "#!/bin/sh\nexec sleep 30\n");
+        let bin = tree.0.join("app.sh");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tree.0.join("shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = Job {
+            page: "hang-test-page",
+            size: SHOT_SIZES[0],
+            theme: SHOT_THEMES[0],
+        };
+        let ctx = fake_ctx(&bin, &dir, Mode::Compare);
+        let png = ctx.png(&job);
+        let started = Instant::now();
+        let render = render_within(&ctx, &job, &png, "hang", Duration::from_millis(400));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed after the limit, not after the app's own end: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            render
+                .failures
+                .iter()
+                .any(|f| f.contains("timed out after 0 s")),
+            "{:?}",
+            render.failures
+        );
+        assert!(!png.is_file());
+        // The real limit is twice the app's own 30 s.
+        assert_eq!(RENDER_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn an_unsettled_render_is_a_failure_that_is_retried_and_never_a_baseline() {
+        let tree = TempTree::new("unsettled");
+        let bin = fake_app(&tree, "0", "shot: unsettled images 2, moving");
+        let dir = tree.0.join("shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        // (A page the matrix does not have: its baseline must never come to exist.)
+        let job = Job {
+            page: "unsettled-test-page",
+            size: SHOT_SIZES[0],
+            theme: SHOT_THEMES[0],
+        };
+        let stored = baseline_dir().join(format!("{}.png", job.name()));
+        let _ = std::fs::remove_file(&stored);
+        let ctx = fake_ctx(&bin, &dir, Mode::Compare);
+        let out = process(&ctx, &job);
+        let accepted = stored.is_file();
+        let _ = std::fs::remove_file(&stored);
+        assert!(!accepted, "an unsettled render became the baseline");
+        assert_eq!(out.verdict, Verdict::NotCompared);
+        assert_eq!(
+            runs_of(&tree),
+            1 + RETRIES,
+            "rendered again, up to RETRIES times"
+        );
+        assert_eq!(out.unsettled_retries, RETRIES);
+        assert_eq!(out.settle_ms, [777; 1 + RETRIES]);
+        assert_eq!(out.failures.len(), 1, "{:?}", out.failures);
+        assert!(
+            out.failures[0].contains("did not settle (images 2, moving)"),
+            "{:?}",
+            out.failures
+        );
+        assert!(out.describe().contains("unsettled"), "{}", out.describe());
+
+        // The same app without the line: no failure, no repeat, and it is the baseline.
+        let fine = TempTree::new("settled");
+        let bin = fake_app(&fine, "0", "");
+        let dir = fine.0.join("shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = fake_ctx(&bin, &dir, Mode::Plain);
+        let out = process(&ctx, &job);
+        assert_eq!(runs_of(&fine), 1);
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        assert_eq!((out.unsettled_retries, out.luma), (0, Some(120)));
+    }
+
+    #[test]
+    fn repeat_fails_naming_the_pictures_whose_renders_differ_and_only_those() {
+        let job = |page| Job {
+            page,
+            size: SHOT_SIZES[0],
+            theme: SHOT_THEMES[0],
+        };
+        // The app alternates between two pictures one level apart: not the same picture.
+        let tree = TempTree::new("repeat-flap");
+        let bin = fake_app(&tree, "runs % 2", "");
+        let dir = tree.0.join("shots");
+        let ctx = fake_ctx(&bin, &dir, Mode::Plain);
+        let err = run_repeat(&ctx, &[job("chat")], 1, 4, Instant::now()).unwrap_err();
+        assert!(err.to_string().contains("chat-wide-light"), "{err}");
+        assert!(dir.join("repeat/chat-wide-light-1.png").is_file());
+        assert!(dir.join("repeat/chat-wide-light-4.png").is_file());
+        // The app that always draws the same picture passes.
+        let tree = TempTree::new("repeat-same");
+        let bin = fake_app(&tree, "0", "");
+        let dir = tree.0.join("shots");
+        let ctx = fake_ctx(&bin, &dir, Mode::Plain);
+        run_repeat(&ctx, &[job("chat"), job("edit")], 2, 3, Instant::now()).unwrap();
+        assert_eq!(runs_of(&tree), 6);
+        // An unsettled render fails the repeat run even when the pictures are the same.
+        let tree = TempTree::new("repeat-unsettled");
+        let bin = fake_app(&tree, "0", "shot: unsettled derive 1");
+        let dir = tree.0.join("shots");
+        let ctx = fake_ctx(&bin, &dir, Mode::Plain);
+        let err = run_repeat(&ctx, &[job("chat")], 1, 2, Instant::now()).unwrap_err();
+        assert!(err.to_string().contains("render problem"), "{err}");
     }
 
     /// The color of `role` in `group` of a `.colors` file as `[r, g, b]`.

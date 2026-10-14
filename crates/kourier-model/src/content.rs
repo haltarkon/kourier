@@ -217,8 +217,43 @@ pub enum AttachmentState {
         /// Whether trying again may help.
         retryable: bool,
     },
-    /// The network no longer has it.
+    /// The network no longer has it: the server said so when it was asked (Signal: a 404 or
+    /// 410, a 403 from CDN 0). Shown as "No longer available". It keeps its dead pointer. A
+    /// click asks the account's other device to upload it again where the network can
+    /// (Signal's attachment backfill: [`AttachmentState::Asking`]).
     Expired,
+    /// Not available on this device: the backend knew without asking that it cannot fetch it
+    /// (an imported attachment too old for the server to keep, one with no place on the
+    /// server or an invalid pointer, one above the receive limit). Shown as "Not available
+    /// on this device". It has no network pointer; the message's id and the attachment's
+    /// `net_ids` stay, so that a click can ask the user's other device for the file
+    /// (Signal's attachment backfill: [`AttachmentState::Asking`]), unless it is above the
+    /// receive limit.
+    Unavailable,
+    /// The user asked for it and the core asked the account's other device (Signal: the
+    /// primary phone) to upload it again; the answer is awaited. Shown as "Asking your
+    /// phone…". Ends with a new pointer (`Remote`, then a download), or
+    /// [`AttachmentState::AskFailed`]. It keeps whatever pointer it had.
+    Asking,
+    /// The other device was asked and could not help. Shown as the attachment's note, by
+    /// reason. Only [`AskFailure::NoAnswer`] can be asked again by a click.
+    AskFailed {
+        /// Why.
+        why: AskFailure,
+    },
+}
+
+/// Why asking the account's other device for an attachment ended without the file
+/// ([`AttachmentState::AskFailed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AskFailure {
+    /// The other device did not answer in time ("Your phone did not answer. Open Signal on
+    /// your phone and try again."). A click asks again.
+    NoAnswer,
+    /// The other device no longer has the message. Final.
+    NoMessage,
+    /// The other device has the message but not this file. Final.
+    NoFile,
 }
 
 /// An attachment of a message. `Debug` hides the file name, blurhash and waveform.

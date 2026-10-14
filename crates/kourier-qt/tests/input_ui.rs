@@ -16,6 +16,8 @@
 //! package `qml6-module-qttest`), delivered to the window like the platform's. Offscreen,
 //! `harness = false`.
 
+mod support;
+
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_app::{App, FixtureOptions, Launch, StartOptions};
 use kourier_qt::{UiContext, UiOptions};
@@ -575,6 +577,7 @@ Window {
 "#;
 
 fn main() {
+    support::answer_list("input_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

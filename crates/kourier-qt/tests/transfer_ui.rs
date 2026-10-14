@@ -3,24 +3,42 @@
 //! case runs in a process of its own (one Qt application per process): the test binary
 //! starts itself once per case.
 //!
-//! - `skip`: a link with a transfer shows "Waiting for Your Phone" on the link page with
-//!   "Continue Without History"; the button skips, the link finishes, and nothing is said
-//!   about the end. The fake received one skip.
-//! - `leave`: the link page is left while the transfer waits (back): nothing is cancelled
-//!   (the account is linked), the banner takes the transfer over at once, and its button
-//!   skips it.
-//! - `done`: a transfer that walks to its end shows waiting, downloading and reading on the
-//!   link page (no button while it reads), says once that the history was transferred, and
-//!   the fake received one dismissal.
+//! - `skip`: the link page closes as soon as the core has the account (link feedback L3):
+//!   the transfer waits for the phone in the account banner, with "Continue Without
+//!   History", and the empty list says the history is on its way. Nothing was cancelled;
+//!   the button skips, the banner goes, and nothing is said about the end. The fake received
+//!   one skip.
+//! - `reading`: a read held in the middle: the banner counts the messages ("Importing
+//!   history: 12,400 of 50,000 messages. New messages arrive afterwards.") with a bar at that share and no button, and the
+//!   empty list says the history is being imported. Closing the window asks "Quit While
+//!   Importing History?" (F8) with the keyboard on Cancel: Enter and Cancel keep the
+//!   application open, Ctrl+Q asks the same, the confirming button quits once it can be
+//!   read, and a close after that asks nothing more.
+//! - `done`: a transfer that walks to its end shows waiting, downloading and reading in the
+//!   banner (no button while it reads, the messages counted), says once that the history was
+//!   transferred, and the fake received one dismissal.
+//! - `tray`: the tray menu's Quit asks nothing, also with the window hidden in the tray
+//!   during a held read (the shell says `quitting`; the question would open unseen and the
+//!   quit would be refused).
+//! - `session`: while the desktop session ends (the case says so) a close during a held read
+//!   asks nothing and quits.
 //! - `banner`: after a restart in the middle of a download there is no link page: the
-//!   account banner shows the same view, compact, with its bytes and the same button; the
+//!   account banner shows it with its bytes and the skip button; the
 //!   button skips, the banner goes and nothing is said.
+//! - `delete`: "Delete Chat" asked while a transfer runs is refused, and the chat keeps what
+//!   waits in its composer (the dialog does not watch the transfer); once the transfer is
+//!   skipped the same call deletes the chat and the composer's copy goes with it.
+//! - `search`: with chats in the list and a transfer running, a search that matches nothing
+//!   says so ("No chats match ...") and not that the chats are on their way; clearing the
+//!   search brings the list back.
 //! - `failed`: a failure found at the start shows a banner that stays; "Dismiss" removes it
 //!   and the fake received the dismissal. The account is untouched.
 //! - `again`: "Try Again…" on the banner opens the question with the keyboard on "Cancel";
 //!   Cancel and Escape change nothing, Enter does not confirm; the confirming button removes
 //!   the account, a second activation does nothing more, and the link page opens with a QR
 //!   code.
+
+mod support;
 
 use std::process::Command;
 use std::time::Duration;
@@ -52,10 +70,24 @@ MainWindow {
     property int waits: 0
     property int quiet: 0
     property var ev: null
-    // The states the link page showed of the transfer, in order.
+    // The states the banner showed of the transfer, in order.
     property var phases: []
     // The account before it was replaced.
     property real firstAccount: 0
+    // The chat the `delete` case works on.
+    property real chatId: 0
+    // How often the window asked the application to quit (`closedForGood`).
+    property int quits: 0
+    // (Only the last step may quit: a close that went through ends the application with the
+    // window, with 0 whatever `fail` said; that case ends with a code of its own.)
+    onClosedForGood: {
+        win.quits += 1;
+        if (win.step !== "quit-again" && win.step !== "tray-hidden" && win.step !== "session") {
+            win.fail("quit without asking");
+        }
+    }
+    // How often the banner showed the read with its counts.
+    property int counted: 0
     // How often the question was asked for.
     property int asked: 0
     // How often an account was replaced (removed, and its new link started).
@@ -74,7 +106,7 @@ MainWindow {
     function later(what: string): void {
         win.waits += 1;
         if (win.waits > 1500) {
-            fail("never happened: " + what + " (login " + App.login.kind + ", transfer '" + App.linkTransfer.phase + "', banner '" + win.transferBanner + "', accounts " + accounts.count + ")");
+            fail("never happened: " + what + " (login " + App.login.kind + ", transfer '" + App.bannerTransfer.phase + "', banner '" + win.transferBanner + "', accounts " + accounts.count + ")");
         }
     }
 
@@ -96,6 +128,17 @@ MainWindow {
             }
         }
         return null;
+    }
+
+    // The transfer's view in the account banner.
+    function bannerView(): Item {
+        return win.find(win.contentItem, i => i.skipButton !== undefined);
+    }
+
+    // What the empty list says (its heading, then its explanation).
+    function emptyList(): var {
+        const p = win.find(win.contentItem, i => i.explanation !== undefined && i.phase !== undefined && i.visible);
+        return p ? [p.text, p.explanation] : null;
     }
 
     // The banner of a failed transfer.
@@ -128,9 +171,9 @@ MainWindow {
 
     Connections {
         target: App
-        function onLinkTransferChanged(): void {
-            const phase = App.linkTransfer.phase;
-            if (phase !== "" && (win.phases.length === 0 || win.phases[win.phases.length - 1] !== phase)) {
+        function onBannerTransferChanged(): void {
+            const phase = App.bannerTransfer.phase;
+            if (phase !== "" && phase !== "failed" && (win.phases.length === 0 || win.phases[win.phases.length - 1] !== phase)) {
                 win.phases = win.phases.concat([phase]);
             }
         }
@@ -166,9 +209,9 @@ MainWindow {
         case "start":
             if (!win.started) return win.later("the start page");
             win.ev = Qt.createQmlObject("import QtTest\nTestEvent {}", win.contentItem, "transfer_ui_events.qml");
-            if (win.mode === "failed" || win.mode === "banner") {
+            if (win.mode === "failed" || win.mode === "banner" || win.mode === "delete" || win.mode === "search") {
                 if (!App.hasAccounts) return win.later("the fixture account");
-                win.next(win.mode === "failed" ? "failure" : "restart");
+                win.next(win.mode === "failed" ? "failure" : (win.mode === "banner" ? "restart" : win.mode));
                 return;
             }
             if (App.hasAccounts) return win.fail("a link case starts without an account");
@@ -183,20 +226,19 @@ MainWindow {
 
         // ---- skip ----
         case "skip": {
-            if (App.linkTransfer.phase !== "waiting") return win.later("the transfer waits for the phone");
-            const view = win.linkPage ? win.linkPage.transferItem : null;
-            if (!view || !view.skipButton.visible) return win.later("the transfer view with its button");
-            if (!win.linking()) return win.fail("the link page stays up during the transfer");
-            if (App.login.kind === "done") return win.fail("the login is done before the transfer is");
-            if (App.linkTransfer.title !== "Waiting for Your Phone") return win.fail("the title: " + App.linkTransfer.title);
-            if (App.linkTransfer.text.indexOf("Your phone is preparing your message history.") !== 0) return win.fail("the sentence: " + App.linkTransfer.text);
+            if (win.transferBanner !== "transfer" || App.bannerTransfer.phase !== "waiting") return win.later("the banner's transfer waits for the phone");
+            if (win.linking()) return win.later("the link page closes once the core has the account");
+            const view = win.bannerView();
+            if (!view || !view.visible || !view.skipButton.visible) return win.later("the banner's view with its button");
+            if (App.bannerTransfer.status !== "Waiting for your phone to prepare the message history…") return win.fail("the banner: " + App.bannerTransfer.status);
             if (view.skipButton.text !== "Continue Without History") return win.fail("the button: " + view.skipButton.text);
             if (view.skipButton.Accessible.name !== "Continue Without History") return win.fail("the button's accessible name");
-            if (view.compact) return win.fail("the link page shows the large presentation");
-            // The account is linked: there is nothing left to cancel.
-            if (win.linkPage.actions[0].visible) return win.fail("Cancel is offered during a transfer");
-            // Shown once: not in the banner too while the page is up.
-            if (win.transferBanner === "transfer") return win.fail("the banner repeats what the page shows");
+            // (A transfer is not the state of an account: that banner has nothing to say.)
+            if (App.bannerKind !== "" || App.bannerText !== "") return win.fail("the state's banner shows too: " + App.bannerKind);
+            const said = win.emptyList();
+            if (!said) return win.later("the empty list's text");
+            if (said[0] !== "Your history is on its way" || said[1] !== "Chats appear here when your phone sends them.") return win.fail("the empty list says: " + said.join(" / "));
+            if (accounts.count !== 1) return win.fail("the account is not in the list: " + accounts.count);
             // It stays there until somebody acts.
             win.quiet += 1;
             if (win.quiet < 12) return;
@@ -205,61 +247,132 @@ MainWindow {
             return;
         }
         case "skipped":
-            if (App.linkTransfer.phase !== "" || win.linking() || !App.hasAccounts) return win.later("the link finishes after the skip");
+            if (win.transferBanner !== "" || win.linking() || !App.hasAccounts) return win.later("the banner goes after the skip");
             // The end of our own skip is not announced, and nothing is left of the transfer.
             win.quiet += 1;
             if (win.quiet < 25) return;
             if (win.transferNotices !== 0) return win.fail("our own skip was announced");
             if (win.transferBanner === "transfer" || win.transferBanner === "transferFailed") return win.fail("a banner is left: " + win.transferBanner);
             if (win.phases.join(",") !== "waiting") return win.fail("the states shown: " + win.phases.join(","));
-            Qt.exit(0);
-            return;
-
-        // ---- leave ----
-        case "leave": {
-            if (App.linkTransfer.phase !== "waiting" || !win.linkPage || !win.linkPage.transferItem) return win.later("the transfer waits for the phone");
-            if (win.transferBanner === "transfer") return win.fail("the banner repeats what the page shows");
-            // Back: what the page's own back button does.
-            App.login.cancel();
-            win.leaveLink();
-            win.next("left");
-            return;
-        }
-        case "left": {
-            if (win.linking() || win.transferBanner !== "transfer") return win.later("the banner takes the transfer over");
-            const view = win.find(win.contentItem, i => i.skipButton !== undefined && i.compact === true);
-            if (!view || !view.visible || !view.skipButton.visible) return win.later("the banner's view with its button");
-            if (App.linkTransfer.phase !== "") return win.fail("the link page's transfer outlives the page");
-            if (view.phase !== "waiting" || App.bannerTransfer.status !== "Waiting for your phone to prepare the message history…") return win.fail("the banner: " + App.bannerTransfer.status);
-            // (A transfer is not the state of an account: that banner has nothing to say.)
-            if (App.bannerKind !== "" || App.bannerText !== "") return win.fail("the state's banner shows too: " + App.bannerKind);
-            if (accounts.count !== 1) return win.fail("leaving the page removed the account");
-            win.quiet += 1;
-            if (win.quiet < 12) return;
-            view.skipButton.click();
-            win.next("left-skipped");
-            return;
-        }
-        case "left-skipped":
-            if (win.transferBanner === "transfer") return win.later("the banner goes after the skip");
-            win.quiet += 1;
-            if (win.quiet < 25) return;
-            if (win.transferNotices !== 0) return win.fail("our own skip was announced");
             if (accounts.count !== 1) return win.fail("the account stays");
             Qt.exit(0);
             return;
 
+        // ---- reading ----
+        case "reading": {
+            if (win.transferBanner !== "transfer" || App.bannerTransfer.phase !== "reading") return win.later("the banner's transfer reads");
+            if (win.linking()) return win.later("the link page closes once the core has the account");
+            const view = win.bannerView();
+            if (!view || !view.visible) return win.later("the banner's view");
+            // The counts come with the delivery's first report.
+            if (App.bannerTransfer.status !== "Importing history: 12,400 of 50,000 messages. New messages arrive afterwards.") return win.later("the counted messages (" + App.bannerTransfer.status + ")");
+            if (!(view.progress > 0.247 && view.progress < 0.249)) return win.fail("the bar: " + view.progress);
+            if (view.skipButton.visible) return win.fail("a read offers a skip");
+            const said = win.emptyList();
+            if (!said) return win.later("the empty list's text");
+            if (said[0] !== "Importing your message history" || said[1] !== "Chats appear here as they are imported.") return win.fail("the empty list says: " + said.join(" / "));
+            win.quiet += 1;
+            if (win.quiet < 12) return;
+            if (win.transferNotices !== 0) return win.fail("a read in the middle was announced");
+            // F8: closing the window asks first; the window stays meanwhile.
+            win.close();
+            win.next("quit-asked");
+            return;
+        }
+        case "quit-asked": {
+            const dialog = win.quitDialog;
+            if (dialog === null || !dialog.opened) return win.later("the question before quitting");
+            if (win.quits !== 0) return win.fail("closing quit without asking");
+            if (!win.visible) return win.fail("the window closed while it asks");
+            if (dialog.title !== "Quit While Importing History?") return win.fail("the title: " + dialog.title);
+            if (dialog.confirmButton.text !== "Quit" || dialog.cancelButton.text !== "Cancel") return win.fail("the buttons: " + dialog.confirmButton.text + ", " + dialog.cancelButton.text);
+            if (!dialog.cancelButton.activeFocus) return win.later("the keyboard on Cancel");
+            // Enter confirms nothing; Cancel keeps the application open.
+            if (!win.ev.keyClick(Qt.Key_Return, Qt.NoModifier, -1)) return win.fail("no key event");
+            if (win.quits !== 0 || dialog.answered) return win.fail("Enter quit");
+            dialog.cancelButton.click();
+            win.next("quit-kept");
+            return;
+        }
+        case "quit-kept":
+            if (win.quitDialog !== null) return win.later("the question closes");
+            win.quiet += 1;
+            if (win.quiet < 10) return;
+            if (win.quits !== 0 || !win.visible) return win.fail("Cancel quit");
+            // Ctrl+Q asks the same; the confirming button acts once it can be read.
+            if (!win.ev.keyClick(Qt.Key_Q, Qt.ControlModifier, -1)) return win.fail("no key event");
+            win.next("quit-again");
+            return;
+        case "quit-again": {
+            const dialog = win.quitDialog;
+            if (dialog === null || !dialog.opened) return win.later("the question after Ctrl+Q");
+            if (!dialog.armed) {
+                dialog.confirmButton.click();
+                if (win.quits !== 0) return win.fail("quit before the question could be read");
+                return;
+            }
+            dialog.confirmButton.click();
+            if (win.quits !== 1) return win.fail("the confirming button quit " + win.quits + " times");
+            // Agreed once: the close that follows asks nothing more.
+            win.close();
+            if (win.quits !== 2) return win.fail("asked again after the answer: " + win.quits);
+            // (Its own code: a window that closed ends the application with 0.)
+            Qt.exit(REACHED_THE_END);
+            return;
+        }
+
+        // ---- tray: the tray menu's Quit never asks (F4) ----
+        case "tray": {
+            if (win.transferBanner !== "transfer" || App.bannerTransfer.phase !== "reading") return win.later("the banner's transfer reads");
+            if (win.linking()) return win.later("the link page closes once the core has the account");
+            if (App.bannerTransfer.status !== "Importing history: 12,400 of 50,000 messages. New messages arrive afterwards.") return win.later("the counted messages (" + App.bannerTransfer.status + ")");
+            if (!App.quitQuestion()) return win.fail("a read is no reason to ask");
+            // The close button hides the window in the tray (where a question could not be read).
+            win.trayAvailable = true;
+            win.close();
+            win.next("tray-hidden");
+            return;
+        }
+        case "tray-hidden":
+            if (win.visible) return win.later("the window hides in the tray");
+            if (win.quitDialog !== null || win.quits !== 0) return win.fail("the close button asked or quit");
+            // The tray menu's Quit: the shell says `quitting` and quits the application, which
+            // closes the hidden window too. Nothing may veto that.
+            win.quitting = true;
+            win.close();
+            if (win.quitDialog !== null) return win.fail("the tray's Quit asked");
+            if (win.quits !== 1) return win.fail("the tray's Quit did not quit: " + win.quits);
+            Qt.exit(REACHED_THE_END);
+            return;
+
+        // ---- session: no question while the desktop session ends (the run said so) ----
+        case "session": {
+            if (win.transferBanner !== "transfer" || App.bannerTransfer.phase !== "reading") return win.later("the banner's transfer reads");
+            if (win.linking()) return win.later("the link page closes once the core has the account");
+            if (App.bannerTransfer.status !== "Importing history: 12,400 of 50,000 messages. New messages arrive afterwards.") return win.later("the counted messages (" + App.bannerTransfer.status + ")");
+            if (App.quitQuestion() !== undefined && App.quitQuestion() !== null) return win.fail("a question while the session ends");
+            win.close();
+            if (win.quitDialog !== null) return win.fail("the close asked while the session ends");
+            if (win.quits !== 1) return win.fail("the close did not quit while the session ends: " + win.quits);
+            Qt.exit(REACHED_THE_END);
+            return;
+        }
+
         // ---- done ----
         case "done": {
-            const view = win.linkPage ? win.linkPage.transferItem : null;
-            if (view && view.phase === "downloading" && view.phase === App.linkTransfer.phase) {
+            // (The page may say "Linked" a moment longer; the transfer shows in the banner only.)
+            const view = win.bannerView();
+            if (view && view.visible && view.phase === "downloading" && view.phase === App.bannerTransfer.phase) {
                 if (!view.skipButton.visible) return win.fail("a download can be skipped");
                 // "0 B" before the size is known, then "4.1 MB of 45.6 MB".
-                if (view.detail === App.linkTransfer.detail && !/^[0-9.]+ [KM]?B( of 45\.6 MB)?$/.test(view.detail)) return win.fail("the bytes: " + view.detail);
+                if (view.detail === App.bannerTransfer.detail && !/^[0-9.]+ [KM]?B( of 45\.6 MB)?$/.test(view.detail)) return win.fail("the bytes: " + view.detail);
             }
-            if (view && view.phase === "reading" && view.phase === App.linkTransfer.phase) {
+            if (view && view.visible && view.phase === "reading" && view.phase === App.bannerTransfer.phase) {
                 if (view.skipButton.visible) return win.fail("a read offers a skip");
-                if (App.linkTransfer.text.indexOf("Keep Kourier open") !== 0) return win.fail("the sentence: " + App.linkTransfer.text);
+                const status = App.bannerTransfer.status;
+                // Before the first count the plain line, then the counted one.
+                if (status !== "Importing messages… New messages arrive afterwards." && !/^Importing history: [0-9,]+ of 50,000 messages\. New messages arrive afterwards\.$/.test(status)) return win.fail("the line: " + status);
+                if (status.indexOf("Importing") === 0) win.counted += 1;
             }
             if (win.transferNotices === 0 || win.linking() || !App.hasAccounts) return win.later("the transfer ends and the link finishes");
             win.next("said");
@@ -270,7 +383,12 @@ MainWindow {
             win.quiet += 1;
             if (win.quiet < 25) return;
             if (win.transferNotices !== 1) return win.fail("the end was announced " + win.transferNotices + " times");
-            if (win.phases.join(",") !== "waiting,downloading,reading") return win.fail("the states shown: " + win.phases.join(","));
+            // "updating" (the link's tail after the import, L3) may show for a moment when the
+            // machine is loaded: the fake's login ends right after the transfer, but the
+            // banner can catch the step between (failed once that way in the L6 sweep).
+            const shown = win.phases.join(",");
+            if (shown !== "waiting,downloading,reading" && shown !== "waiting,downloading,reading,updating") return win.fail("the states shown: " + shown);
+            if (win.counted === 0) return win.fail("the read was never counted");
             if (win.transferBanner === "transfer" || win.transferBanner === "transferFailed") return win.fail("a banner is left: " + win.transferBanner);
             Qt.exit(0);
             return;
@@ -278,7 +396,7 @@ MainWindow {
         // ---- banner ----
         case "restart": {
             if (win.transferBanner !== "transfer") return win.later("the banner of the running transfer");
-            const view = win.find(win.contentItem, i => i.skipButton !== undefined && i.compact === true);
+            const view = win.find(win.contentItem, i => i.skipButton !== undefined);
             if (!view || !view.visible || !view.skipButton.visible) return win.later("the banner's view with its button");
             if (win.linkPage !== null) return win.fail("a link page after a restart");
             if (App.bannerTransfer.status !== "Downloading message history…") return win.fail("the line: " + App.bannerTransfer.status);
@@ -299,6 +417,75 @@ MainWindow {
             if (win.transferBanner === "transfer" || win.transferBanner === "transferFailed") return win.fail("a banner is left: " + win.transferBanner);
             if (win.transferNotices !== 0) return win.fail("our own skip was announced");
             if (accounts.count !== 1) return win.fail("the account is untouched");
+            Qt.exit(0);
+            return;
+
+        // ---- delete: a refused Delete Chat keeps the composer's files (F2) ----
+        case "delete": {
+            if (win.transferBanner !== "transfer") return win.later("the banner of the running transfer");
+            win.chatId = App.conversationAt(0);
+            if (win.chatId === 0) return win.later("the chat list");
+            App.openConversation(win.chatId);
+            win.next("delete-open");
+            return;
+        }
+        case "delete-open": {
+            if (App.timeline.conversationId !== win.chatId) return win.later("the chat opens");
+            if (App.timeline.stillFilling === "") return win.later("the chat says it still fills");
+            if (!App.composer.addFile(FILE)) return win.fail("the file was not added: " + App.composer.notice);
+            if (App.composer.attachmentCount !== 1) return win.fail("strip count " + App.composer.attachmentCount);
+            // The question was opened before the transfer began; this is its confirming button.
+            App.deleteConversation();
+            win.next("delete-refused");
+            return;
+        }
+        case "delete-refused": {
+            win.quiet += 1;
+            if (win.quiet < 12) return;
+            if (App.composer.attachmentCount !== 1) return win.fail("a refused Delete Chat took the files from the composer: " + App.composer.attachmentCount);
+            if (App.timeline.conversationId !== win.chatId || App.conversationAt(0) !== win.chatId) return win.fail("a refused Delete Chat removed the chat");
+            const view = win.bannerView();
+            if (!view || !view.visible || !view.skipButton.visible) return win.later("the banner's button");
+            view.skipButton.click();
+            win.next("delete-skipped");
+            return;
+        }
+        case "delete-skipped": {
+            if (win.transferBanner !== "" || App.timeline.stillFilling !== "") return win.later("the transfer is over");
+            App.deleteConversation();
+            win.next("delete-gone");
+            return;
+        }
+        case "delete-gone":
+            if (App.conversationAt(0) === win.chatId) return win.later("the chat is deleted");
+            if (App.composer.attachmentCount !== 0) return win.fail("the composer kept the files of a deleted chat: " + App.composer.attachmentCount);
+            Qt.exit(0);
+            return;
+
+        // ---- search: a search without a match says so, not that the chats are coming (M1) ----
+        case "search": {
+            if (win.transferBanner !== "transfer") return win.later("the banner of the running transfer");
+            const list = win.pageStack.get(0);
+            if (!list || list.searchField === undefined) return win.later("the list page");
+            if (App.conversationAt(0) === 0) return win.later("the chat list");
+            if (win.emptyList() !== null) return win.fail("an empty list over a full one: " + win.emptyList().join(" / "));
+            list.searchField.text = "  zzqx <b>no</b>  ";
+            win.next("search-none");
+            return;
+        }
+        case "search-none": {
+            const said = win.emptyList();
+            if (!said) return win.later("the empty list's text");
+            // The words around the search are not part of it, and no markup is made of it.
+            if (said[0] !== "No chats match “zzqx ‹b›no‹/b›”") return win.fail("the heading: " + said[0]);
+            if (said[1] !== "") return win.fail("the explanation: " + said[1]);
+            win.pageStack.get(0).searchField.text = "";
+            win.next("search-cleared");
+            return;
+        }
+        case "search-cleared":
+            if (App.conversationAt(0) === 0) return win.later("the list comes back");
+            if (win.emptyList() !== null) return win.later("the placeholder goes");
             Qt.exit(0);
             return;
 
@@ -441,6 +628,9 @@ MainWindow {
 }
 "##;
 
+/// What the `reading` case exits with when it reached its end.
+const REACHED_THE_END: i32 = 5;
+
 fn options(case: &str) -> FixtureOptions {
     let base = FixtureOptions {
         messages_per_conversation: 6,
@@ -455,9 +645,9 @@ fn options(case: &str) -> FixtureOptions {
             transfer: Some(FixtureTransfer::Hold(HistoryTransfer::Waiting)),
             ..base
         },
-        "leave" => FixtureOptions {
+        "reading" | "tray" | "session" => FixtureOptions {
             link: true,
-            transfer: Some(FixtureTransfer::Hold(HistoryTransfer::Waiting)),
+            transfer: Some(FixtureTransfer::Hold(HistoryTransfer::Reading)),
             ..base
         },
         "done" => FixtureOptions {
@@ -465,7 +655,7 @@ fn options(case: &str) -> FixtureOptions {
             transfer: Some(FixtureTransfer::Walk(HistoryTransfer::Done)),
             ..base
         },
-        "banner" => FixtureOptions {
+        "banner" | "delete" | "search" => FixtureOptions {
             transfer: Some(FixtureTransfer::Left(HistoryTransfer::Downloading {
                 done: 12_300_000,
                 total: Some(45_600_000),
@@ -516,7 +706,15 @@ fn run(case: &str) -> i32 {
     });
     kourier_qt::set_options(UiOptions::default());
     let mut qt = QGuiApplication::new();
-    let script = SCRIPT.replace("CASE", case);
+    // No session manager is there to say it: the case says the session ends.
+    kourier_qt::set_session_ending(case == "session");
+    // A small file for the composer (the `delete` case).
+    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("transfer_ui_sample.txt");
+    std::fs::write(&file, b"waiting in the composer").expect("a sample file");
+    let script = SCRIPT
+        .replace("CASE", case)
+        .replace("FILE", &format!("{:?}", kourier_qt::app::file_url(&file)))
+        .replace("REACHED_THE_END", &REACHED_THE_END.to_string());
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
         kourier_qt::install_image_provider(engine.as_mut());
@@ -526,6 +724,13 @@ fn run(case: &str) -> i32 {
         );
     }
     let code = qt.as_mut().map_or(3, |qt| qt.exec());
+    // `reading`, `tray` and `session` close the window: only their own code says they
+    // reached their end.
+    let code = match (case, code) {
+        ("reading" | "tray" | "session", REACHED_THE_END) => 0,
+        ("reading" | "tray" | "session", 0) => 1,
+        (_, code) => code,
+    };
     drop(engine);
     kourier_qt::media::set_store(None);
     if code != 0 {
@@ -553,11 +758,14 @@ fn run(case: &str) -> i32 {
         "skip" => {
             expect("one skip reached the backend", skips == 1);
             expect("the end of the skip was dismissed", dismissals >= 1);
+            expect(
+                "no login was cancelled",
+                count("CancelLogin") == 0 && count("Logout") == 0,
+            );
             expect("the account is linked", accounts(&handle) == 1);
         }
-        "leave" => {
-            expect("one skip reached the backend", skips == 1);
-            expect("the end of the skip was dismissed", dismissals >= 1);
+        "reading" | "tray" | "session" => {
+            expect("nothing was skipped", skips == 0);
             expect(
                 "no login was cancelled",
                 count("CancelLogin") == 0 && count("Logout") == 0,
@@ -569,7 +777,11 @@ fn run(case: &str) -> i32 {
             expect("one dismissal reached the backend", dismissals == 1);
             expect("the account is linked", accounts(&handle) == 1);
         }
-        "banner" => {
+        "search" => {
+            expect("nothing was skipped", skips == 0);
+            expect("the account is untouched", accounts(&handle) == 1);
+        }
+        "banner" | "delete" => {
             expect("one skip reached the backend", skips == 1);
             expect("the end of the skip was dismissed", dismissals >= 1);
             expect("the account is untouched", accounts(&handle) == 1);
@@ -595,6 +807,7 @@ fn run(case: &str) -> i32 {
 }
 
 fn main() {
+    support::answer_list("transfer_ui");
     // Never on the user's desktop, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };
@@ -606,7 +819,10 @@ fn main() {
         std::process::exit(run(&case));
     }
     let exe = std::env::current_exe().expect("the test binary");
-    let cases = ["skip", "leave", "done", "banner", "failed", "again"];
+    let cases = [
+        "skip", "reading", "tray", "session", "done", "banner", "delete", "search", "failed",
+        "again",
+    ];
     let mut failed = 0;
     for case in cases {
         let status = Command::new(&exe)

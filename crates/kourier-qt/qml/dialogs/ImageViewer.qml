@@ -66,6 +66,10 @@ QQC2.Popup {
     readonly property bool media: root.current ? root.current.media === true : false
     readonly property bool video: root.current ? root.current.kind === "video" : false
     readonly property string mediaState: root.current ? root.current.state : ""
+    // Gone here, and Download asks the user's phone to upload it again (the core decides it).
+    readonly property bool ask: root.current ? root.current.ask === true : false
+    // What the button fetches: a download, a retry, or the question to the phone.
+    readonly property bool downloadable: root.mediaState === "remote" || root.mediaState === "failed" || root.ask
     // How far its download is (0 … 1).
     readonly property real progress: root.current && root.current.progress ? root.current.progress : 0
     // Nothing to show full size yet: not downloaded, or a clip another application plays.
@@ -76,7 +80,16 @@ QQC2.Popup {
     // timeline; a viewer that follows its message is told `animated` by the row, which
     // cannot know.
     readonly property bool movie: root.animated && !copy.notMovie
-    readonly property bool shown: root.movie ? moving.status === AnimatedImage.Ready : (!root.absent && still.status === Image.Ready)
+    readonly property bool shown: root.movie ? moving.status === AnimatedImage.Ready : (!root.absent && root.stillHeld)
+    // The attachment whose pixels `still` holds (set when decoded, kept while the next URL
+    // loads, cleared when there is none or it failed: `paintedWidth` keeps its old value after
+    // an error, though nothing is drawn).
+    property real heldFor: 0
+    // The still is decoded, or still the previous pixels of THIS picture while a new URL of
+    // it loads (`retainWhileLoading`: the URL changes once more after its download, when the
+    // core has derived the thumbnail): the spinner does not flash over it. Stepping to another
+    // picture of an album shows the spinner, never the previous picture under the new counter.
+    readonly property bool stillHeld: still.status === Image.Ready || (still.status === Image.Loading && root.heldFor === root.attachment && still.paintedWidth > 0)
 
     // What the button in the middle does: fetch a picture that is not here (the viewer stays
     // and shows it when it arrives), or hand a video to another application.
@@ -88,7 +101,7 @@ QQC2.Popup {
             if (root.video) {
                 MediaActions.open(root.attachment, L10n.i18nc("@info", "Video"), root.media);
             }
-        } else if (root.mediaState === "remote" || root.mediaState === "failed") {
+        } else if (root.downloadable) {
             App.downloadAttachment(root.attachment);
         }
     }
@@ -172,6 +185,7 @@ QQC2.Popup {
 
         Image {
             id: still
+            objectName: "still"
             anchors.fill: parent
             anchors.margins: Kirigami.Units.gridUnit * 2
             anchors.topMargin: Kirigami.Units.gridUnit * 3
@@ -180,11 +194,19 @@ QQC2.Popup {
             visible: !root.movie && !root.absent
             source: root.movie ? "" : root.url
             asynchronous: true
+            retainWhileLoading: true
             smooth: true
             mipmap: true
             fillMode: Image.PreserveAspectFit
-            sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-            sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+            sourceSize.width: Math.ceil(width)
+            sourceSize.height: Math.ceil(height)
+            onStatusChanged: {
+                if (still.status === Image.Ready) {
+                    root.heldFor = root.attachment;
+                } else if (still.status !== Image.Loading) {
+                    root.heldFor = 0;
+                }
+            }
         }
 
         MediaCopy {
@@ -203,9 +225,9 @@ QQC2.Popup {
             playing: root.opened
         }
 
-        QQC2.BusyIndicator {
+        Spinner {
             anchors.centerIn: parent
-            running: !root.absent && (still.status === Image.Loading || (root.movie && copy.url === "" && !copy.failed))
+            running: !root.absent && ((still.status === Image.Loading && !root.stillHeld) || (root.movie && copy.url === "" && !copy.failed))
         }
 
         Kirigami.PlaceholderMessage {
@@ -232,8 +254,18 @@ QQC2.Popup {
                 if (root.mediaState === "expired") {
                     return L10n.i18nc("@info:placeholder", "No longer available");
                 }
+                if (root.mediaState === "unavailable") {
+                    return L10n.i18nc("@info:placeholder", "Not available on this device");
+                }
                 if (root.mediaState === "failed") {
                     return L10n.i18nc("@info:placeholder", "The download failed");
+                }
+                if (root.mediaState === "asking") {
+                    return L10n.i18nc("@info", "Asking your phone…");
+                }
+                const note = MediaActions.askNote(root.mediaState);
+                if (note !== "") {
+                    return note;
                 }
                 if (root.mediaState !== "local") {
                     return L10n.i18nc("@info:placeholder", "Not downloaded yet");
@@ -242,7 +274,7 @@ QQC2.Popup {
             }
             helpfulAction: Kirigami.Action {
                 objectName: "viewerAction"
-                enabled: root.current !== null && (root.mediaState === "local" ? root.video : root.mediaState !== "downloading" && root.mediaState !== "expired")
+                enabled: root.current !== null && (root.mediaState === "local" ? root.video : root.downloadable)
                 icon.name: root.mediaState === "local" ? "media-playback-start" : (root.mediaState === "failed" ? "view-refresh" : "download")
                 text: root.mediaState === "local" ? L10n.i18nc("@action:button", "Play") : (root.mediaState === "failed" ? L10n.i18nc("@action:button", "Try Again") : L10n.i18nc("@action:button", "Download"))
                 onTriggered: root.act()

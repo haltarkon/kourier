@@ -7,6 +7,7 @@
 #include <QtGui/QTextBlock>
 #include <QtGui/QTextCursor>
 #include <QtGui/QTextDocument>
+#include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickTextDocument>
 #include <QtQuick/QQuickWindow>
 
@@ -39,13 +40,13 @@ void installMessageHandler(rust::Fn<void(int32_t, rust::Str, rust::Str)> sink)
     qInstallMessageHandler(routeMessage);
 }
 
-int grabWindowToFile(QObject* window, const QString& path)
+namespace {
+// The previous grab of grabIfStable.
+QImage g_previousGrab;
+
+// Saves `image` as a PNG at `path` and returns its mean luminance, or -1.
+int saveWithLuma(const QImage& image, const QString& path)
 {
-    auto* quickWindow = qobject_cast<QQuickWindow*>(window);
-    if (quickWindow == nullptr) {
-        return -1;
-    }
-    const QImage image = quickWindow->grabWindow();
     if (image.isNull() || !image.save(path, "PNG")) {
         return -1;
     }
@@ -62,6 +63,82 @@ int grabWindowToFile(QObject* window, const QString& path)
         }
     }
     return count > 0 ? static_cast<int>(sum / count) : -1;
+}
+
+int loadingBelow(const QQuickItem* item)
+{
+    int loading = 0;
+    // QQuickImageBase::Status: Null 0, Ready 1, Loading 2, Error 3.
+    if (item->inherits("QQuickImageBase") && item->property("status").toInt() == 2) {
+        ++loading;
+    }
+    for (const QQuickItem* child : item->childItems()) {
+        loading += loadingBelow(child);
+    }
+    return loading;
+}
+
+// The visible images below `item` that draw an attachment (`image://kourier/thumb/…` or
+// `…/att/…`): the pictures whose URL changes when the core derives a thumbnail.
+int attachmentPicturesBelow(const QQuickItem* item)
+{
+    int pictures = 0;
+    if (item->isVisible() && item->inherits("QQuickImageBase")) {
+        const QString source = item->property("source").toUrl().toString();
+        if (source.startsWith(QLatin1String("image://kourier/thumb/"))
+            || source.startsWith(QLatin1String("image://kourier/att/"))) {
+            ++pictures;
+        }
+    }
+    for (const QQuickItem* child : item->childItems()) {
+        pictures += attachmentPicturesBelow(child);
+    }
+    return pictures;
+}
+} // namespace
+
+int grabWindowToFile(QObject* window, const QString& path)
+{
+    auto* quickWindow = qobject_cast<QQuickWindow*>(window);
+    if (quickWindow == nullptr) {
+        return -1;
+    }
+    return saveWithLuma(quickWindow->grabWindow(), path);
+}
+
+int imagesLoading(QObject* window)
+{
+    auto* quickWindow = qobject_cast<QQuickWindow*>(window);
+    if (quickWindow == nullptr) {
+        return -1;
+    }
+    return loadingBelow(quickWindow->contentItem());
+}
+
+int attachmentPictures(QObject* window)
+{
+    auto* quickWindow = qobject_cast<QQuickWindow*>(window);
+    if (quickWindow == nullptr) {
+        return -1;
+    }
+    return attachmentPicturesBelow(quickWindow->contentItem());
+}
+
+int grabIfStable(QObject* window, const QString& path)
+{
+    auto* quickWindow = qobject_cast<QQuickWindow*>(window);
+    if (quickWindow == nullptr) {
+        return -1;
+    }
+    const QImage image = quickWindow->grabWindow();
+    if (image.isNull()) {
+        return -1;
+    }
+    if (g_previousGrab.isNull() || g_previousGrab != image) {
+        g_previousGrab = image;
+        return -2;
+    }
+    return saveWithLuma(image, path);
 }
 
 QString richTextPlain(const QString& html)

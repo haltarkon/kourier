@@ -9,11 +9,13 @@
 //! nothing plaintext lands in the profile outside its runtime directory. Offscreen,
 //! `harness = false`.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
-use kourier_app::facade::{Query, QueryData};
+use kourier_app::facade::{Query, QueryData, TimelineAnchor, TimelineQuery};
 use kourier_app::{App, AppHandle, FixtureOptions, Launch, StartOptions};
 use kourier_model::{AttachmentId, AttachmentKind, AttachmentState};
 use kourier_qt::media::{Codec, Image, resolve};
@@ -345,6 +347,23 @@ fn wait_for<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
 /// that moment and failed with "blurhash size 8x8").
 #[allow(clippy::disallowed_methods)] // The test's main thread before Qt starts, not the Qt thread.
 fn downloaded_media(app: &AppHandle) -> (Vec<AttachmentId>, AttachmentId) {
+    // The fixture's chat of imported attachments (`--page=unavailable`) keeps a picture that
+    // waits for a click: history never downloads by itself, so it is not "on its way".
+    let imported: std::collections::HashSet<_> = app
+        .fixture()
+        .and_then(|f| f.unavailable_conversation)
+        .map(|conv| {
+            let query = Query::Timeline(TimelineQuery {
+                conv,
+                anchor: TimelineAnchor::Newest,
+                limit: 50,
+            });
+            match app.runtime().block_on(app.query(query)) {
+                Ok(QueryData::Timeline(page)) => page.rows.iter().map(|r| r.id).collect(),
+                _ => Default::default(),
+            }
+        })
+        .unwrap_or_default();
     wait_for(30, || {
         let mut images = Vec::new();
         let mut voice = None;
@@ -365,7 +384,11 @@ fn downloaded_media(app: &AppHandle) -> (Vec<AttachmentId>, AttachmentId) {
                         images.push(id);
                     }
                     AttachmentState::Local if audio => voice = Some(id),
-                    AttachmentState::Remote | AttachmentState::Downloading { .. } => pending = true,
+                    AttachmentState::Remote | AttachmentState::Downloading { .. }
+                        if !imported.contains(&a.message) =>
+                    {
+                        pending = true;
+                    }
                     _ => {}
                 }
             }
@@ -421,6 +444,79 @@ const SVG: &[u8] =
 const EPS: &[u8] =
     b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n0 0 10 10 rectfill\nshowpage\n%%EOF\n";
 
+/// The provider decodes a picture at the size it is drawn at, not whole (P1 fixes F6 and the
+/// avatar's decode size): the reader is told the size to scale to in the FILE's orientation
+/// (the transposed one for a picture stored sideways, EXIF 90/270: Qt turns it after decoding),
+/// so libjpeg's scaling applies; an avatar is decoded at the size that covers its square.
+fn assert_decoder_scales_at_decode() {
+    let decode = kourier_qt::bridge::qobject::decode_probe;
+    let jpeg = Codec::Jpeg as u8;
+    let red = 0xdc1e1e;
+    let blue = 0x1e1edc;
+    // Stored 1600 x 800, rotated by 90 degrees to display 800 x 1600: the stored left (red)
+    // becomes the top. Asked for 200 x 400.
+    let rotated = kourier_qt::bridge::qobject::oriented_image(1600, 800, 6);
+    assert!(rotated.starts_with(&[0xff, 0xd8]), "a JPEG");
+    let got = decode(rotated.clone(), jpeg, 200, 400, false);
+    assert_eq!(got.len(), 6, "decoded");
+    assert_eq!(
+        (got[0], got[1]),
+        (200, 400),
+        "the displayed size, covering the request"
+    );
+    assert_eq!(got[2], 0, "scaled by the decoder, not after a whole decode");
+    assert!(
+        got[5] <= 200 * 400 * 2,
+        "a rotated picture is decoded at its scaled size, not whole: {} pixels of 1,280,000",
+        got[5]
+    );
+    let near = |a: i32, b: i32| {
+        let c = |x: i32, s: u32| (x >> s) & 0xff;
+        [16, 8, 0].iter().all(|s| (c(a, *s) - c(b, *s)).abs() <= 24)
+    };
+    assert!(
+        near(got[3], red) && near(got[4], blue),
+        "rotated by 90: {got:x?}"
+    );
+    // Rotated by 270: the stored left (red) becomes the bottom.
+    let got = decode(
+        kourier_qt::bridge::qobject::oriented_image(1600, 800, 8),
+        jpeg,
+        200,
+        400,
+        false,
+    );
+    assert_eq!((got[0], got[1], got[2]), (200, 400, 0), "rotated by 270");
+    assert!(
+        near(got[3], blue) && near(got[4], red),
+        "rotated by 270: {got:x?}"
+    );
+    // Not rotated: scaled to the request by the decoder all the same.
+    let flat = decode(
+        kourier_qt::bridge::qobject::oriented_image(1600, 800, 1),
+        jpeg,
+        400,
+        200,
+        false,
+    );
+    assert_eq!((flat[0], flat[1], flat[2]), (400, 200, 0), "not rotated");
+    // An avatar (cut to a square later) is decoded at the size whose shorter side covers the
+    // side asked for: 2000 x 1000 for 100 x 100 is 200 x 100, not 2,000,000 pixels.
+    let avatar = decode(
+        kourier_qt::bridge::qobject::oriented_image(2000, 1000, 1),
+        jpeg,
+        100,
+        100,
+        true,
+    );
+    assert_eq!((avatar[0], avatar[1]), (100, 100), "the avatar's square");
+    assert!(
+        avatar[5] <= 200 * 100 * 2,
+        "an avatar is decoded at the size that covers its square: {} pixels of 2,000,000",
+        avatar[5]
+    );
+}
+
 /// The provider's decoder (§9.4): Qt decodes a payload with the one decoder its codec byte
 /// names and never detects a format by content, so bytes from other people cannot reach the
 /// SVG, PDF, PostScript, camera raw and other plugins installed on the system.
@@ -466,6 +562,7 @@ fn assert_decoders_are_pinned(png: &[u8]) {
 }
 
 fn main() {
+    support::answer_list("media_ui");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before the app and Qt start.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };
@@ -584,6 +681,7 @@ fn main() {
     }
     assert_eq!(corner(sample.clone(), Codec::Jpeg as u8, 40, 8), -1);
     assert_decoders_are_pinned(&sample);
+    assert_decoder_scales_at_decode();
     assert_eq!(
         kourier_viewmodel::media::kind_for_file_name("Field sample.png"),
         AttachmentKind::Image

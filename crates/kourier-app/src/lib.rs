@@ -45,13 +45,14 @@ pub mod trace;
 pub mod vault;
 
 pub use app::{
-    App, AppError, AppHandle, Arrivals, EXPIRING_TEXT, FixtureInfo, FixtureOptions, FixtureState,
-    FixtureTransfer, Launch, NetworkInfo, StartOptions, hostname, set_private_umask,
+    App, AppError, AppHandle, Arrivals, EXPIRING_TEXT, FixtureInfo, FixtureOptions,
+    FixtureSecondLink, FixtureSends, FixtureState, FixtureTransfer, Launch, NetworkInfo,
+    StartOptions, hostname, set_private_umask,
 };
 pub use keys::{KeyError, KeyMode, Keyring, PassphraseConfig};
 pub use kourier_core::facade;
 /// The states of a history transfer, for [`FixtureTransfer`] (the binary names them and
 /// depends on no model crate).
-pub use kourier_model::{HistoryTransfer, HistoryTransferFailure};
+pub use kourier_model::{HistoryTransfer, HistoryTransferFailure, SendPhase};
 pub use paths::{Paths, Profile};
 pub use prefs::{NotificationContent, Prefs};

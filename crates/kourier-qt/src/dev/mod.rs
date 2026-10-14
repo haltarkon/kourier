@@ -345,6 +345,7 @@ fn account_state(s: &AccountState) -> &'static str {
         AccountState::Active => "active",
         AccountState::LoggedOut { .. } => "logged_out",
         AccountState::Removing => "removing",
+        AccountState::Unlinking => "unlinking",
     }
 }
 

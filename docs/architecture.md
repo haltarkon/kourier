@@ -72,7 +72,7 @@ Paths: `SD/` = a checkout of `signalapp/Signal-Desktop` (v8.32.0-alpha.1, `83227
 | Text ranges | UTF-8 byte offsets in the core; conversion only at the Signal edge (UTF-16) and the Qt edge (QString UTF-16) | Rust-native, and WhatsApp/Threema produce ranges by parsing markup in Rust (§3.6) |
 | Storage Service in M1 | Read-only. Roaming chat state (archive, pin, mute, block) is shown, not changed. A Kourier-local "mute on this computer" exists. A 1:1 chat the phone has not accepted (`whitelisted = false`) cannot be started from Kourier | Writing without unknown-field preservation can clobber the phone's state (R:signal-desktop-send §5.5); sending without profile sharing would show us as an unnamed request (§6.7) |
 | Group send in M1 | Sender key + Group Send Endorsements via `send_multi_recipient_message`, with per-member 1:1 fan-out as the fallback | Access-key group sends are being retired (`SD/ts/util/sendToGroup.preload.ts:301`) |
-| Capabilities advertised | Link URL `capabilities=` (empty: no `nopni`; `backup5` only once the history import exists, §14.2 item 14); device capabilities `spqr: true`, `attachmentBackfill: true`, `usernameChangeSyncMessage: true`, `optionalPhoneNumber: false` | Desktop's values: the server derives the account's capabilities from its devices, so a device that claims less could lower them for the whole account (§6.5 step 5, §13 phase K). `attachmentBackfill` puts no duty on a device that sends no backfill request |
+| Capabilities advertised | Link URL `capabilities=` (`backup5` on a fresh link, as Desktop's, so the phone asks whether to transfer the history, §14.2 item 14; nothing on a relink; never `nopni`); device capabilities `spqr: true`, `attachmentBackfill: true`, `usernameChangeSyncMessage: true`, `optionalPhoneNumber: false` | Desktop's values: the server derives the account's capabilities from its devices, so a device that claims less could lower them for the whole account (§6.5 step 5, §13 phase K). `attachmentBackfill`: Kourier sends backfill requests (§6.11 "Asking the phone") and takes the answers only from the primary |
 | Linker | rustc's self-contained rust-lld via `-fuse-ld=lld` in `.cargo/config.toml`; no extra package | Any `-fuse-ld` flag stops cxx-qt from forcing gold; the Qt spike and S0 link and run this way [V] (§2.4) |
 
 ---
@@ -440,7 +440,7 @@ Rules:
 ```rust
 pub struct Account {
     pub id: AccountId, pub uuid: AccountUuid, pub network: NetworkKind,
-    pub state: AccountState,            // Linking | Active | LoggedOut{reason} | Removing
+    pub state: AccountState,            // Linking | Active | LoggedOut{reason} | Removing | Unlinking
     pub own_ids: Vec<UserId>,           // Signal: [aci, pni?]; WA: [lid, pn]; Threema: [id]
     pub own_device: Option<u32>,
     pub display_name: Option<String>,   // own profile name, for the account switcher
@@ -465,6 +465,35 @@ pub struct Account {
   `PniSignatureMessage`) and E164→ACI (Storage Service `ContactRecord`s carry ACI, PNI and E164;
   Desktop's `maybeMergeContacts` in `SD/ts/ConversationController.preload.ts`); WhatsApp for
   PN→LID (R:whatsapp §8 req 1: "must collapse without losing messages").
+  A merge costs what `from` owns, never the account's size (link feedback L2, 2026-10-12): the
+  first Storage Service sync after a link tells one merge per contact with a phone number, and
+  each merge used to walk all of the account's messages about nine times (~2 µs per contact and
+  message, minutes in one write job for a big account, and the link page waited for it). Now
+  (`ingest/merge.rs`, core.db schema 14): every lookup of the alias's rows starts from an index
+  of its own rows (`messages(account_id, net_author)`, `messages(account_id, deleted_by)`
+  partial, `message_revisions(account_id, net_author)`, `reactions(user_id)`,
+  `receipts(user_id)`, `send_state(user_id)`, and for the keys that live 45 days or until
+  their message comes, `expired_messages(account_id, net_author, net_local)` and
+  `(account_id, conv_key, net_local)`, `pending_modifiers(account_id, target_author)` and
+  `(account_id, conv_key)`, and `identity_alias(account_id, user_id)` for the repointing of
+  older aliases), joins are
+  `CROSS JOIN`s from the user's rows (core.db has no planner statistics, so an `a = ? OR
+  b = ?` is two `EXISTS`: given the OR the planner took the index of `account_id` alone),
+  deletes are `EXISTS`-scoped; one `ALIAS_OWNS` query first, and an alias that owns nothing
+  only gets its alias row and the contacts change flag; the parked receipts whose sender may
+  have become a recipient are looked at once per transaction, after all its merges
+  (`Changes::receipts_to_retry`, consumed in `Apply::finish`), not once per merge; the
+  writer's statement cache holds 128 statements. The two keys of `expired_messages` end in
+  `net_local` because `expiry::remembered`, run for every new message, names the author (or
+  the conversation) and the local id: with two columns they tied with the older
+  `expired_messages_by_key` and the planner, taking the newer index on a tie, walked all of
+  that author's expired keys per message (40 ms a message at 45,000 keys).
+  The supervisor cuts a live segment after 64 merges (`supervisor::MERGES_PER_JOB`), so a
+  user's action waits for one job of merges, not for all of them. The plan test is
+  `ingest::merge::tests::a_merge_looks_only_at_the_rows_of_the_alias`, the budget test
+  `kourier-core/tests/merge_cost.rs` (20,000 messages, 45 days of expired keys, 5,000 parked
+  modifiers, 303 merges: 25 ms in debug, 7.7 s without the indexes; and 300 merges look at
+  each of 40 parked receipts once).
 - `merge_conversation(from, into)` (core, one `core.db` transaction):
   1. Move messages. On a key conflict (§3.1) keep the older row (smaller `sort_key`), merge state
      into it monotonically (out/read state, revisions, reactions, receipts, `send_state`), delete
@@ -683,7 +712,9 @@ pub struct ConversationFeatures {
     pub history: HistorySource,                  // from the descriptor unless the conversation differs
     pub group_actions: GroupActions,             // add/remove/rename/avatar/leave/disband (all false in M1)
     pub cannot_send: Option<CannotSend>,         // NotMember | AdminsOnly | Blocked | RequestPending
-                                                 // | Unregistered | NotAccepted | Other(String)
+                                                 // | Unregistered | NotAccepted | StillLoading
+                                                 // | InvitationPending | JoinRequestPending
+                                                 // | Other(String)
 }
 ```
 
@@ -895,7 +926,11 @@ pub enum BackendEvent {
     AttachmentProgress { local: LocalMsgId, index: u16, done: u64, total: u64 },
     AttachmentDone { attachment: AttachmentId, request: Option<DownloadId> /* echoed; an answer to
                      another request is ignored */, result: Result<AttachmentMeta, BackendError> },
-    TransmitProgress { local: LocalMsgId, progress: f32 },
+    TransmitProgress { local: LocalMsgId, progress: f32 /* upload share */,
+                       phase: Option<SendPhase> /* Uploading | RefreshingGroup |
+                       SettingUpKeys{done,of} | RepairingDevices | Sending{done,of} |
+                       SyncingOwnDevices; ephemeral, a group send reports it at most
+                       every 250 ms per phase (link feedback L6) */ },
     Notice(BackendNotice),                           // safety-number change pending, …; ChallengeRequired{url,
                                                      // retry_after}: a job met a challenge (§4.8 step 3)
 }
@@ -1054,6 +1089,24 @@ Notes:
    released; a fresh link has an empty identity store) and no `SubmitChallenge` (the command
    fails with "the account is not running"). What waited in the outbox goes out only as the
    account that wrote it.
+   One identity is one account of a profile, checked twice. FIRST LINE, in the backend, before a
+   device exists: `Command::StartLogin` carries `taken`, the primary own ids (with whether that
+   account is logged out) of the profile's other accounts of the network that are not
+   `Removing`; the Signal backend compares the ACI of the phone's provisioning message with
+   them and, on a match, ends the login with `ErrorKind::AlreadyAdded { logged_out }` BEFORE
+   `PUT /v1/devices/link` (the phone never gets a second device; the mock harness counts the
+   link requests, `sendStats.linkRequests`). SECOND LINE, in the core, for a backend that
+   cannot know early (or ignores `taken`, as the fake does): an `AccountReady` of an account
+   that is not yet `Active` (a fresh link or a relink) whose primary own id is the primary own
+   id of another such account is refused in the ingest transaction that would take it
+   (`CoreError::AlreadyAdded`, so two links ending together cannot both pass): the login fails
+   with the same kind, the device is logged out of the network and the half-made account goes
+   the failed-login way. The login page then says "This account is already in Kourier." (with
+   `logged_out` pointing at that account's "Link Again"), offers no "Try Again" (it would only
+   fail again) and a button back to the list ("OK", or "Go to Chats" for a logged-out
+   account). No unique index enforces it (`own_ids` is a JSON column, and a profile made before
+   the rule may hold two `Active` accounts of one identity, which keep running: L4's "Remove
+   Account" is how the user gets rid of one).
 7. **Remove account**: `Logout` (best effort, 10 s; the Signal backend deletes its device on the
    server and exits `LoggedOut`; when it has an account and no socket, because it has just
    linked, is offline or is held, it opens a socket of its own for the request, so a removal
@@ -1061,6 +1114,69 @@ Notes:
    account secret from the
    Secret Service (this is the shred, §5.2), delete the `accounts` row (cascades core rows),
    `PRAGMA wal_checkpoint(TRUNCATE)` on `core.db`, then delete the directory.
+   The server is always asked (link feedback L4): with no actor running (restart backoff,
+   `Halted`) one is started (`StartMode::Resume`, no `Connect`) only for the `Logout`; a
+   `Removing` row found at start (a quit cut the removal off) gets one such logout attempt
+   before its shred (`Plan::Remove`), unless the first run kept a report that says the device
+   is gone: what the logout told is kept as JSON in `accounts.state_reason` of the `Removing`
+   (and `Unlinking`) row, written BEFORE the shred (link feedback L5), because a kill after the
+   shred leaves no keys for another logout. The start that finds a kept `Removed` or `NoDevice`
+   tells it without a new logout; a kept `NotReached`, a kept "nothing to tell" or no report
+   gets ONE attempt (the keys may still be here: a shred that failed, a kill before it; the
+   network may answer now) and the better of the two outcomes is told (Removed, then NoDevice,
+   then NotReached); with the keys gone the attempt cannot start and the kept report stands.
+   The start writes the kept report back with the state in one statement (`set_state` clears
+   it). An account whose keys are gone and that kept nothing gets no notice.
+   The `Logout` reports what became of the device
+   (`BackendEvent::Logout(LogoutReport { outcome: Removed | NoDevice | NotReached,
+   device_name })`, ephemeral, sent just before the `LoggedOut` exit; Signal stores the name it
+   linked with in `backend.db`, migration 0022, NULL for older links). The Signal backend counts
+   a 2xx answer to `DELETE /v1/devices/<id>` and a 401, 403 or 404 to it on an open socket (the
+   server no longer knows the device or its credentials), and a 401 or 403 (or "device
+   deregistered") at the door of a socket opened for the request, as `Removed`; a 5xx, 429,
+   413, any other refusal (a 404 at the door too), a timeout or a transport error is
+   `NotReached`. The core tells the front-end once, AFTER the removal is done (after the shred
+   and the deletion of the row, BEFORE the wait for the derive permits and the removal of the
+   account directory, which a big account takes a while for; the window in which a kill loses
+   the notice is then the return of one store write):
+   `UiEvent::LogoutOutcome { seq, account, removed, report, who }`; no report = `NotReached`, a
+   logged-out account's removal = `NoDevice`. A shred or a row deletion that fails keeps the
+   `Removing` row and tells nothing; the next start finishes the removal and tells then, so the
+   user never reads "removed from this computer" about files that are still there, and never
+   twice. `who` (`AccountLabel`) is the account as the UI names it, read from `core.db` before
+   the row goes: name, number, device, the day the device was linked (`accounts.created_at`,
+   which moves to the time a link is accepted) and `twin` (another account of the network has
+   its identity or looks the same). An outcome told before the front-end said `UiReady` (a
+   removal or unlink that the start finished runs before any front-end listens) is kept
+   (`Shared::logout_outcomes`, at most 32) and told again at `UiReady` with the same `seq`; a
+   front-end shows one notice per `seq`. The UI shows Removed/NoDevice as a passing notice
+   ("The account “%1” was removed from this computer.") and NotReached as a dialog that stays,
+   naming the device to remove on the phone. The notices are shown one dialog at a time (the
+   next opens when the open one closes), none while the window is hidden in the tray (shown
+   when it is back), and the shell (`Main.qml`) keeps them while no window exists (released,
+   or a `--background` start) and hands them, with the open dialog's notice, to the next
+   window; a window released with a dialog open hands that notice over too. KNOWN LIMIT: the
+   notices held in memory (hidden window, no window) are lost when Kourier quits before a window
+   shows them; the core replays only what was told before `UiReady`, so a NotReached instruction
+   that never reached a visible window is not told again.
+   The account id goes into `Shared::removing` before the row says `Removing`: attachment
+   derivation (`attachments/derive.rs`) checks it before each compute and each commit, and the
+   removal takes every derive permit around the directory delete, so a compute already
+   running cannot write a thumbnail after it. Of two `Active` accounts of one identity (step
+   6) only the removed one's device is logged out and only its rows and files go. The UI tells
+   such twins apart by what the phone shows of each: the device number and the day it was
+   linked ("device 3 · linked 12 Sep") in Settings → "Accounts", the drawer's tooltip and the
+   questions, and the notice for a twin whose server could not be reached names the device's
+   name and the day ("remove “desk” linked on 12 Sep from the linked devices on your phone"),
+   never "this computer", which would be both entries.
+   **Unlink** (`UiCommand::Unlink`, "Unlink…" for an `Active`, not logged-out account whose
+   link has finished) is durable like a removal: the account is marked `Unlinking` in `core.db`
+   before anything, the `Logout` goes to the running actor (or to one started for it), then the
+   account goes the `LoggedOut` way (chats kept and readable, "Link Again"), with the same
+   once-told outcome. A start that finds `Unlinking` (the logout was cut off by a kill) makes
+   one logout attempt (`Plan::Unlink`) and logs the account out the same way; the outcome is
+   kept on the row before the credentials are wiped, as a removal's is before its shred, so a
+   kill between the wipe and the new state still tells what the first logout told.
 8. **Rebuild `core.db`** (lost, corrupt, or a failed migration the user chose to reset): create an
    empty `core.db`; for each `accounts/<uuid>/key.wrap`, unwrap it (network kind and uuid are in its
    header), recreate the `accounts` row as `Active` and spawn with `start = Rebuild`. The backend
@@ -1110,11 +1226,28 @@ Signal Desktop does the same: `#onEmpty` waits until
 the incoming, decrypted and app queues are all drained
 (`SD/ts/textsecure/MessageReceiver.preload.ts:771-835`).
 
-Core rules: the outbox drains only in `Online`; `catch_up` messages never notify one by one, and
-one summary ("12 new messages in 4 chats") is shown when the account leaves `Syncing` (Signal
-Desktop pauses notifications while catching up, `SD/ts/background.preload.ts:2135-2154`).
-Backend side-effect queues (delivery receipts, retry requests, profile-key responses) also wait for
-`Online` (R:signal-desktop-receive §9 item 27).
+Core rules: the outbox drains as soon as the connection is up (`Syncing` or `Online`, also during
+a history transfer's delivery; as Signal Desktop, whose conversation job queues wait only for the
+socket, `SD/ts/jobs/helpers/commonShouldJobContinue.preload.ts` `waitForOnline`; link feedback
+L6, the user's decision 2026-10-12; until then it drained only in `Online`). `catch_up` messages
+never notify one by one, and one summary ("12 new messages in 4 chats") is shown when the account
+leaves `Syncing` (Signal Desktop pauses notifications while catching up,
+`SD/ts/background.preload.ts:2135-2154`). Backend side-effect queues (delivery receipts, retry
+requests, profile-key responses) also wait for `Online` (R:signal-desktop-receive §9 item 27).
+
+*The exception for a challenge.* A pause that waits for the user (a 428 challenge, rejected
+credentials) is lifted by what lifted it before sends could start in `Syncing`: the challenge's
+own end (its Retry-After, an answer, the user's retry) or the `Online` of a NEW connection after
+the one the 428 came on dropped. The `Online` that ends the catch-up the 428 was met in is the
+same connection, not a return after an interruption: it neither lifts the pause nor hides the
+challenge, which also stays on show over the catch-up's own progress updates
+(`kourier-core/src/dispatch.rs`, `paused_in_catch_up`).
+
+*A known limit.* A send made while a history import still fills its chat sorts behind every
+imported row that is already there and behind those that come later, because an imported row
+sorts by its `sent_at` (§3.9) and the send is newer than all of them. An imported row dated
+LATER than the send (a phone whose clock runs ahead, by less than a day: the mapper clamps only
+what is further ahead) sorts after the send; that stays so.
 
 ### 4.6 Error model
 
@@ -1334,8 +1467,10 @@ final DB state; the conformance rules are in §10.2.
 
 - History is local-first: the UI pages `core.db` with a keyset cursor `(sort_key, id)`.
 - The source is per conversation (`ConversationFeatures.history`, default from the descriptor).
-- `HistorySource::None` (Signal M1, Threema): nothing else.
-- `PushedOnLink` (WhatsApp): `HistoryBatch` events during and after linking, with progress; the
+- `HistorySource::None` (Threema; Signal on a run with the offer switched off, §14.2 item 14):
+  nothing else.
+- `PushedOnLink` (WhatsApp; Signal by default, whose archive import, §14.2 item 14, is
+  delivered the same way): `HistoryBatch` events during and after linking, with progress; the
   backend splits them into ≤ 500 messages per `core_outbox` row, so each is one bounded core
   transaction that the writer interleaves with live traffic.
 - `OnDemand` (WhatsApp PDO, newsletters): when the user scrolls past the oldest local message, the
@@ -1551,7 +1686,7 @@ The Qt thread never touches the DB (§8.5).
 
 | Table | Content |
 |---|---|
-| `account` | ACI, PNI, E164, device id, password, registration ids (ACI, PNI), profile key, master key / AEP, storage key, manifest version, `post_link_sync` state, arrival counter, catch-up boundary |
+| `account` | ACI, PNI, E164, device id, password, registration ids (ACI, PNI), profile key, master key / AEP, storage key, manifest version, `post_link_sync` state, arrival counter, catch-up boundary, `device_name` (the name the device was linked with, what the phone lists; NULL for a link made before schema 22, migration 0022) |
 | `own_identity` | our ACI and PNI identity key pairs (never generated by us; from provisioning) |
 | `identities` | remote identity keys + verified state + first use |
 | `sessions` | `(our_service_id, their_service_id, device_id) → SessionRecord` |
@@ -1569,6 +1704,7 @@ The Qt thread never touches the DB (§8.5).
 | `storage_records` | raw decrypted Storage Service records (kept for the M2 write path) |
 | `jobs` | backend job queue (sync requests, read receipts and syncs with the core's `cmd` id (unique), delivery receipts, profile refresh, group refresh, key maintenance, resend requests, deletes for me made here); `challenged` and `held_from` mark the jobs a send challenge holds (§6.12) |
 | `identity_links` | which ACI a PNI belongs to, as far as this device learned it (§6.13); one funnel writes it and emits `IdentityMerged` once per pair |
+| `number_links` | which ACI a phone number belongs to, as the Storage Service told this device (§6.13, schema 21); `links::learn_number` emits `IdentityMerged{number → aci}` only when the pair is new or the number moved |
 | `remote_config`, `sender_certs` | `/v2/config` (ETag) and the two sender certificates |
 | `retry_state` | decryption-error dedup and session-reset rate limits |
 
@@ -1638,6 +1774,10 @@ message, which the catch-up budget (§1.3) needs.
   `kourier_blob::sealed_len`, and derives a broken one again); files imported for a send are
   fsynced in batches of 1024 and at the end, always before the transaction that enqueues the
   send.
+- The thumbnail (long edge 400 px, JPEG q80 or PNG with alpha, derived after a download and at
+  the import of a picture) is a smaller copy for the sizes it covers, not the picture the user
+  sees: the timeline draws the file where the thumbnail would be stretched (§8.6, "Which file a
+  timeline picture is drawn from").
 - Incoming: core decides auto-download (images, stickers, voice notes and files ≤ 25 MiB by
   default; videos and bigger files on click; never above the network's receive limit), issues
   `DownloadAttachment` with a fresh `BlobTarget`; the backend verifies the network's MAC/digest and
@@ -1872,7 +2012,10 @@ crates/kourier-signal/
    with a number (`SD/ts/types/Capabilities.d.ts`, `SD/ts/textsecure/WebAPI.preload.ts:2962-2967`
    at link, `SD/ts/background.preload.ts:2091-2098` at every start). The server derives the
    account's capabilities from its devices, so Kourier claims no less than Desktop;
-   `attachmentBackfill` puts no duty on a device that sends no backfill request (§13 phase K).
+   `attachmentBackfill` is claimed because Kourier now does what it stands for: it sends
+   backfill requests for files the server lost and applies the answers of the primary (§6.11
+   "Asking the phone"). It never answers a request of another device (only the primary
+   does), and it states the capability to its own core at every start (§13 phase K).
    409 → `Failed("Kourier is too old for this account")`, 411 → `Failed("too many linked devices")`.
 6. Persist account, identities (own marked verified), keys, profile key, master key/AEP, storage key
    (`HMAC-SHA256(masterKey, "Storage Service Encryption")`) in one `backend.db` transaction,
@@ -1886,6 +2029,16 @@ crates/kourier-signal/
    devices (prekey fetch, session, `send_sync_message`); start the receive loop; run the Storage
    Service sync; emit `Progress` until contact sync and Storage Service sync are complete (Desktop
    waits for both, `SD/ts/background.preload.ts:1825-1982`), then `AccountReady` + `Done`.
+   After an imported history archive the Storage Service sync does not hold `Done` (the archive
+   named every chat; Desktop does the same): only the contact sync does
+   (`connection::initial_sync_done`, `TransferShared::imported`, memory only, forgotten when a
+   login starts: a later link waits for the sync unless its own transfer ends `done`). The
+   gate (`finish_link`) is
+   looked at by the job runner whenever no job is due AND after every batch (`jobs::run`), so
+   profile fetches, group refreshes and receipts queued behind it never hold the login; the
+   contact sync runs at priority 2, ahead of the group refreshes (3) an import queues (link
+   feedback L2, 2026-10-12: on the mock at 150 ms round trip the gate waited ~19 s behind 50
+   group refreshes and 300 profile fetches).
    `BackendConfig.initial_sync = LinkOnly` emits `Done` right after the sync requests are sent;
    tests use it until contact and Storage Service sync exist (S9), production uses
    `ContactsAndStorage`. The mock's `waitForSync` resolves when the phone has received all three
@@ -2049,6 +2202,16 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
      A 428 on the multi-recipient send is such an answer too: libsignal-net v0.104.0 hands no
      challenge over for unauthenticated requests, so its token is lost; the 1:1 sends that
      follow report their own 428 as `Challenge` with token and Retry-After.
+   - Bounded concurrency (link feedback L6, `send/group.rs`): the key setup and the fan-out do
+     not go member by member (100 members took 30 s on the mock at 125 ms round trip, 6 s now).
+     Prekey fetches run up to `PREKEY_FETCHES_AT_ONCE` = 32 at once (Desktop 30), the
+     distribution messages to new devices and the 1:1 fan-out up to `MEMBER_SENDS_AT_ONCE` = 16,
+     all on the send's own task (no cross-task state); the per-recipient send locks stay, the
+     409/410 repair loop stays one entry at a time (rare), a distribution is recorded per member
+     as soon as the server took it. The sender certificate is fetched once before each of the
+     parallel steps (one cache read when it is cached), never by every one of their sends. The
+     send reports its step (`SendPhase` in `TransmitProgress`, §4.2, at most every 250 ms per
+     step) for the line under the message (§8.4).
    - Results merged per recipient into `send_progress`; MSL covers both paths. Some recipients
      accepted and some failed → `TransmitOutcome::Partial`; the core retries only the failed ones
      with `is_recipient_update = true`, and the follow-up sync transcript sets `isRecipientUpdate`
@@ -2078,10 +2241,13 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
   presentations as HTTP Basic auth to storage.signal.org.
 - State: `GET /v2/groups/logs/{rev}` (with `joined_at_version` when unknown, pagination via 206),
   else `GET /v2/groups/`; decrypt title, description, timer, avatar, members, member profile keys
-  (`SD/ts/groups.preload.ts:3585-3792, 6428, 7195, 7379`); 403 = not a member, 404 = gone.
+  (`SD/ts/groups.preload.ts:3585-3792, 6428, 7195, 7379`); 403 = not a member (on an invited row
+  the invitation is over; a row that asked to join keeps its request), 404 = gone, 401 = the
+  day's credential was refused (the credentials are forgotten and the job tries again).
 - Endorsements from `GroupResponse` / last log page, stored with expiry.
 - Mapping: `ConversationUpsert{title, avatar, members(full), timer, features{cannot_send: NotMember |
-  AdminsOnly}}` + `System` messages for changes since the last known revision (not on first sync).
+  InvitationPending | JoinRequestPending | AdminsOnly}}` + `System` messages for changes since the
+  last known revision (not on first sync).
 - Apply rule (§5.6): fetch logs/state first (network step), then one zone that stores the new
   revision and snapshot *and* inserts the `ConversationUpsert` and `System` messages computed from
   the diff into `core_outbox`. A crash can no longer leave the backend at the new revision with the
@@ -2136,7 +2302,11 @@ digest are); limits from remote config (`global.attachments.maxReceiveBytes`, el
 - Results (`AttachmentDone`): network failures, 5xx and 429 are transient (retryable); a blob
   longer than its pointer allows, a pointer size over the receive limit and 413 are `TooLarge`; a
   wrong MAC, digest, padding or size and an unknown CDN number are `InvalidInput` (no request is
-  made for an unknown CDN; Desktop falls back to CDN 0); 404 and 410 are `Expired`. When the
+  made for an unknown CDN; Desktop falls back to CDN 0); 404 and 410, and a 403 of CDN 0
+  (Desktop: "means the same as 404 from other CDNs"), are `Expired` ("No longer available").
+  A pointer that does not pass `Pointer::from_proto` arrives `Unavailable` ("Not available on
+  this device", no `remote`), not as a failed download whose "Retry Download" the core
+  always refuses. When the
   transfer broke off, the transport error is reported whatever the decryptor made of the cut
   stream.
 - A request that carries a blob (download or upload) has a whole-request timeout of max(10 min,
@@ -2155,6 +2325,111 @@ digest are); limits from remote config (`global.attachments.maxReceiveBytes`, el
   the core downloads it later and joins the text (§5.8).
 - View-once media is not mapped: the message is `Unsupported` ("view-once"), no attachment is
   mapped and the raw DataMessage (pointer and key) is not kept, until the view-once flow exists.
+- A pointer is checked by what it carries (`Pointer.integrity`): a wire pointer by its digest,
+  an archive's (history import, `BackendBlob` v 3: a trimmed backup `FilePointer`) by its
+  plaintext hash when it has one, else its digest; `Pointer::from_blob` reads v 2 and v 3 and
+  refuses anything else before a request. The names of an attachment (`net_ids`) are
+  `uuid:<hex>` (client UUID), `digest:<hex>` and `plaintext:<hex>` (an archive's plaintext
+  hash): a delete-for-me sync is sent with `fallbackPlaintextHash` too and one that names
+  only the plaintext hash is applied (most imported attachments have no digest). The names
+  of a received delete are tried in the order the event lists them (client UUID, digest,
+  plaintext hash, as Desktop's `deleteForMe`) over ALL the attachments of the message: two
+  copies of one file share a plaintext hash, and the delete of the second must not take the
+  first (`AttachmentDeleted` in `kourier-backend-api`, `attachment_deleted` in the core).
+- Asking the phone (step S6, Signal's attachment backfill; user decisions of 2026-10-11: the
+  button says "Download", the wait and its end are the attachment's own note, a long text is
+  asked only with the files of its message). A click on an attachment that is "No longer
+  available" (`Expired`), "Not available on this device" (`Unavailable`) or whose ask was not
+  answered goes through the same `DownloadAttachment`; the core's `may_click` decides
+  `Click::Download` or `Click::Ask` (size first; `can_ask`: account Active, the backend's
+  `AccountCaps` flag `attachment_restore`, a message with a network id, not view-once or
+  deleted, not a long text, and a chat and an author that are not known by phone number
+  alone: the answer could not be placed, a number-only chat is read-only). The row's
+  `MessageActions.ask_attachments` lists the attachments this decision is `Ask` for, one by
+  one (a message with a file above the receive limit and a fine lost one lists the second
+  only; one being asked for is not listed); the viewmodel copies the list to the blocks and
+  decides nothing. The flag is the backend's own statement: the Signal backend sends its
+  `AccountCaps` at every start (`maintenance::append_account_caps`), with the limits of the
+  stored remote config when there is one, so it does not wait for a config. An ask stores
+  one `attachment_requests` row PER MESSAGE (core.db schema 13; a second click joins it) and
+  queues the durable `Command::RequestAttachments`; the attachment is `Asking` ("Asking your
+  phone…"). The Signal backend sends an URGENT `SyncMessage.attachmentBackfillRequest` to our
+  own devices (job kind `backfill_request`, the usual retry) naming the message by its author
+  and ORIGINAL sent time (an edited message too: Android finds it by that time; the core
+  then ignores the long-text slot of an edited message) and reports
+  `BackendEvent::AttachmentRestore { Sent }`, or `NotSent` when it gave up or no session with
+  device 1 exists. The job is dropped, with `NotSent`, when it is older than
+  `backfill::REQUEST_MAX_AGE` (1 h) before it ran (no socket came up) as well as when a
+  failed attempt would start after that (`jobs::expired_before_run`).
+  "Asking your phone…" always ends. The request row has a deadline from the click
+  (`UNSENT_BOUND_MS`, the backend's hour and five minutes), replaced at `Sent` by one 30 s
+  later and by 2 min after each answer that still has a PENDING slot (`Timeouts::
+  restore_answer` / `restore_pending`; a PENDING long text counts while this device asked
+  and its text is still lost); the deadline is durable (`attachment_requests.deadline`,
+  `kourier-core/src/restore.rs`), a wait whose deadline passed while Kourier was closed ends
+  at the first look after its account's backend replayed its outbox (`restore::Gate`: 10 s
+  after the actor started, or the first `Online`), so an answer that came in time and was
+  waiting there is applied to its request first; a logout or unlink ends the account's open
+  waits; a start ends an
+  attachment that says it is being asked for with no request open; a due row whose message is
+  gone is deleted. The gate also covers the start itself: `Core::start` marks the accounts
+  that will get an actor as starting before the task is spawned, so its first look cannot
+  end a due wait before the actor registered and replayed (the supervisor's own mark, at the
+  spawn, replaces it). Ending a wait by any of these ways deletes the request's command from
+  `pending_commands` too: a command no backend confirmed yet would otherwise go out at a later
+  start, for a wait that is over. The backend's `Sent` and `NotSent` name that command
+  (`AttachmentRestore.cmd`, kept in `attachment_requests.cmd`) and apply only to the request
+  it made, never to a newer wait of the same message (a second click after the first wait
+  ended); an answer names no command on any network and applies to the message's open
+  request. All end as "Your phone did not answer…" (`AskFailed { NoAnswer }`,
+  clickable again). Answers (`attachmentBackfillResponse`) are taken ONLY from device 1 of
+  our account (Desktop and Android take any of our devices; a linked device cannot give a
+  file a pointer here) and only for a message named with its conversation: the core finds
+  the message only in that conversation. Matching in the core is two passes: every file
+  slot by name (a slot carries `uuid:` and `digest:` names only, the client UUID and the
+  digest of the file the phone re-uploaded; the plaintext hash is the STORED attachment's
+  name, which checks the new pointer's download, never the slot's matching), then by
+  position, only where the phone's order is proven to be Kourier's: the answer has exactly
+  as many slots as the message has non-long-text attachments, every slot a name placed sits
+  on its own index, and every file slot placed by position has the size of the file there
+  (an unknown size 0 proves nothing; the import drops entries without a pointer). A "gone"
+  slot states nothing about a file but its place, so it is believed only where a NAME placed
+  a slot too: an answer of status slots alone ([gone, still uploading] with no name), or of
+  file slots placed by their sizes alone, proves nothing about the phone's order and its
+  "gone" slots place nothing. (A message of ONE file has no order to prove: its single
+  "gone" slot is believed, or "not on your phone" would be out of reach for it.) A slot no pass placed is skipped; a size above the receive limit
+  is ignored. A
+  pointer is taken only when it can be checked (it states a digest, or the attachment has a
+  plaintext hash among its names) and never replaces the working pointer of a file that is
+  there; a pointer without a digest is checked against the plaintext hash, and one with a
+  digest against it too when there is a hash (`Integrity::Both`: an answer matched to the
+  wrong attachment is refused, not shown under it). The new pointer (v2) replaces the old one
+  and its names are added; `attachments.restored` marks it. Only the attachments this device
+  asked for (`Asking`) download, with source `restore`; answers to another device's request
+  (the phone sends every snapshot to all our devices) give lost attachments a pointer and
+  download nothing. A final answer ends the request: the attachment a "gone" slot was placed
+  on becomes "Not on your phone either." (`NoFile`, final), one still asked for that no slot
+  placed or whose pointer could not be used becomes "did not answer" (clickable again: a
+  matching gap of ours is no statement about the phone); `MESSAGE_NOT_FOUND` ends them as
+  "Your phone no longer has this message." (`NoMessage`, final). A download the USER started
+  that ends `Expired` asks at once (`attachment_downloads.source` 'user'); an automatic one
+  asks nothing, and one whose pointer came from an answer does not ask again by itself.
+  Tests: `kourier-core/tests/restore.rs`, `restore_fake.rs` (the fake's `BackfillScript`
+  knob; the row's per-attachment list, a number-only chat), `restore_start.rs` (a real core
+  started on the files of an earlier run: the orphan ask ended at the start, the first look
+  before the actor is there, the hold from the spawn, the end of the hold when online; each
+  fails when its line of wiring is taken out), `kourier-signal/tests/backfill.rs`
+  (mock: the request as the phone sees it and its urgency, answers in steps, not found, a
+  pointer without a digest and one with a digest and another file's hash, a request that
+  outlived its hour before a socket came up, an answer across a restart), unit tests in
+  `backfill.rs`, `maintenance.rs`, `receive/tests.rs` (a request's answer finds its message
+  again for every shape of chat and author), `policy.rs`, `actions.rs`, the viewmodel's
+  `timeline.rs`, and `kourier-qt/tests/ask_ui.rs` (the Download on a file, a picture, a
+  sticker's stand-in and the viewer, and the block turning to "Asking your phone…"). Known
+  limits: an edited message takes no long text from an answer; an iPhone primary was never
+  tried (it may not answer: the note covers it); an answer that arrives after the wait ended
+  gives the file a pointer but starts no download (its note says the phone did not answer,
+  and a click downloads); the waits' lengths are process-wide (`tune_waits`).
 
 ### 6.12 Maintenance jobs
 
@@ -2165,7 +2440,17 @@ that meets a 428 challenge keeps the token, is marked `challenged` and announces
 `BackendNotice::ChallengeRequired` once while that challenge stands. Every other queued job
 that sends to another account (receipts, delivery receipts, retry requests, resends, timer
 updates) is held meanwhile without a request of its own, its previous due time kept in
-`held_from`; a job queued later is held when it comes up. An accepted `SubmitChallenge` makes
+`held_from`; a job queued later is held when it comes up.
+
+Jobs run one at a time, by priority, except profile fetches: up to 10 due `profile_fetch`
+jobs run together (`jobs::PROFILE_FETCH_BATCH`; Desktop's `ProfileService` runs 30), and
+the next job starts when the whole batch has ended. A history import or a first Storage
+Service sync queues one fetch per contact. One after another they took many minutes on
+the user's account (2026-10-10). A 413 or 429 on a profile fetch holds every queued
+profile fetch until its Retry-After, or one minute without one, as Desktop pauses its
+queue. A batch logs one `jobs done` line, not one line per profile. After every batch, and
+whenever no job is due, the runner looks at the post-link gate (§6.5 step 8), so the jobs a
+link queues never hold its `Done`. An accepted `SubmitChallenge` makes
 the job that met the challenge due at once and gives each held job its own time back (now, if
 that has passed), so a rate limit or backoff of a held job is never cut short. A challenge
 met by a message send does not hold jobs.
@@ -2228,7 +2513,7 @@ backend-side handling (§5.6).
 | `Command::ClearConversation` / `DeleteAttachment` (deletes made in Kourier) | `conversationDeletes` with `isFullDelete = remove`, `mostRecentMessages` newest first (at most 5) and `mostRecentNonExpiringMessages` only when it differs; no anchor and `remove` → `localOnlyConversationDeletes`; no anchor and no `remove` → confirmed, nothing sent. `attachmentDeletes` with `clientUuid` and `fallbackDigest` from `net_ids`; without either, confirmed and nothing sent. A group is named by `threadGroupId`, a 1:1 chat by `threadServiceIdBinary` (the ACI, or the PNI for a chat known by number), a message by `authorServiceIdBinary` + `sentTimestamp`. Signal Desktop always sends `isFullDelete = true`; Kourier sends false for "clear" and true for "delete". On Desktop, Android and iOS false empties the chat up to the anchor and keeps it, and only true goes on to remove the chat (sources in §13 phase J; Android sends false itself when it trims a chat). The field is always present on the wire: iOS drops an entry whose flag is unset. An entry without `mostRecentMessages` is dropped by Desktop and finds no anchor on the phones | `CommandPersisted` |
 | `SyncMessage.keys` / `.fetchLatest` | update keys / trigger sync | — |
 | `SyncMessage.request` / `.verified` / call events | ignore (calls out of M1) | — |
-| Storage Service records | merge | `ContactUpsert`, `ConversationUpsert{…, marked_unread}`, `PinnedConversations`, `AccountSettings`, `IdentityMerged` |
+| Storage Service records | merge | `ContactUpsert`, `ConversationUpsert{…, marked_unread}`, `PinnedConversations`, `AccountSettings`, `IdentityMerged` (number → ACI only when `number_links` did not hold that pair yet, so a record that comes back, `storage::reset`, tells nothing; a record whose previous version stated the number was told before schema 21 and is recorded silently) |
 | Group state change | fetch/apply | `ConversationUpsert` + `Message(System …)` |
 | Identity key changed (decrypt or profile fetch) | archive sibling sessions, downgrade verified | `ContactUpsert{fingerprint, trust}` + `Message(System IdentityKeyChanged)` |
 | A PNI and an ACI learned to be one contact: a Storage Service contact record with both ids, a verified PNI signature, or a sealed sender's certificate that states for an ACI the number a contact record gives to a PNI without an ACI (nothing joins when two PNIs hold the number) | recorded in `identity_links` by one funnel (`links::learn`); a rebuilt core gets every pair again. Not a source: the group change that promotes an invited PNI to its ACI (only the server vouches for it, and a merge moves a 1:1 chat) | `IdentityMerged`, once per pair |
@@ -2514,6 +2799,26 @@ conversion for the composer, and the diff engine producing
 `ListOp::{Reset, Insert{at,n}, Remove{at,n}, Move{from,to}, Change{at, roles}}`. It is tested with
 plain `cargo test`.
 
+**The line under a message on its way** (link feedback L6). An own message that has not left
+three seconds after its `sent_at` (`timeline::WAIT_SHOWN_AFTER_MS`; normal sends stay clean) gets
+a line under its bubble, built in `kourier-viewmodel` (`timeline::wait_line`) in two labels: the
+REASON (it may be cut short in a narrow window) and the TIMER (never cut, a label of its own,
+`wait` and `waitTimer` roles). The timer counts up from the message's stored `sent_at`, so it
+survives a restart. The reason is the real hold, in the words of the banner above the chat that
+says the same: waiting for the connection (offline, connecting), for the check ("Verify…"), for
+the new safety number to be confirmed (the queue behind a paused head), for the clock, for the
+device to be linked again, the network's restriction, an update, a reconnect; or, while the
+connection is up, the step of the running attempt (`SendPhase`: uploading files, checking the
+group, setting up encryption with N members, sending to N members, "Sent to M of N members",
+updating the members' devices, sending to your other devices) or plain "Sending…". While the
+outbox waits for a retry the line is the countdown from the stored `next_attempt_at` ("Next try
+in 0:24", rounded up; a hold beats it). The per-second tick brings up to date only the rows that
+show a line (`Changes.waits`, `UiSource::wait_lines`, `models::patch_row`: the `wait` and
+`waitTimer` roles of those rows), never the whole timeline; so does a step report
+(`Progress::Transmit` with a phase, up to four a second in a group send; `None` ends the step
+shown, so the line falls back to "Sending…"). The row's accessible description carries the
+reason without the seconds, ending in one stop (none after a reason that ends in "…" or ".").
+
 **Message text (decision).** Selectable formatted text needs `TextEdit` (Kirigami's
 `SelectableLabel` is one: `org/kde/kirigami/controls/SelectableLabel.qml:22` in the system QML
 dir), and `TextEdit` has no `StyledText` (only Plain, Rich, Auto, Markdown). So the text block is a
@@ -2565,6 +2870,28 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   these formats by content gets an icon, whatever its name says. The files of a folder the
   user adds are sniffed the same way while the folder is listed, on a worker thread; a folder
   itself and its archive get an icon.
+- Which file a timeline picture is drawn from (P1, 2026-10-13; Android's rule, its
+  `Attachment.displayUri` is the file when it is here): `thumb/<id>` is the item's picture and
+  the provider receives the item's PHYSICAL size (QML sets `sourceSize` in logical pixels,
+  `Math.ceil(width)`, and Qt multiplies it by the `devicePixelRatio` itself: a `picture_ui` test
+  logs the requests and compares them with the item). The core's `MediaEntry::timeline_blob(want)` serves the 400 px thumbnail
+  (`kourier_media::THUMBNAIL_EDGE`) only when it covers `want` (the picture drawn to cover it,
+  as `PreserveAspectCrop` does: `max(want.w / w, want.h / h) <= min(1, 400 / longest edge)`,
+  compared in integers), or while there is no file, or when nothing is known or asked (no
+  dimensions, no size), or when the file is no larger than the thumbnail. Otherwise it serves
+  the FILE (but the provider, which has the bytes, takes the thumbnail instead when the file
+  is not a JPEG BY ITS CONTENT, `Codec::sniff`, never the sender's MIME type, and has more than
+  4096 × 4096 pixels, `MediaEntry::exceeds_timeline_pixels`: Qt decodes those whole), which the provider decodes down to the asked size and never up (a JPEG by libjpeg's
+  scaling). So a thumbnail is never stretched: tall pictures and phone screenshots needed the
+  file at scale 1 already, landscape pictures from scale 1.5, album tiles mostly keep the
+  thumbnail. `att/<id>` (the viewer) is the file as before. The rule sits in the core type
+  because `kourier-qt` does not depend on `kourier-media`; the viewmodel's URL revision says
+  whether a thumbnail exists, so a picture drawn from the file before its thumbnail was
+  derived is asked for again when it appears (`Image.retainWhileLoading` keeps the old pixels
+  on screen meanwhile: the block delegates of a row live on while its content changes).
+  Cost: a worker decrypts and decodes a file of up to a few MiB for each picture the thumbnail
+  cannot cover, and Qt's pixmap cache holds the asked size (a 576 × 768 picture is 1.8 MB
+  instead of 0.5 MB); there is no decode cache of our own.
 - Media handle table (core facade, `MediaHandles`): when the core answers a row query it
   registers, per attachment in the rows, `attachment id → (path, key, mime)` in an in-memory LRU
   (4,096 entries, keys `Zeroizing`). The provider resolves handles without touching `core.db`, so
@@ -3065,9 +3392,17 @@ QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QPA_PLATFORMTHEME=kde \
 ```
 
 As built, `ci` runs the fmt, clippy, deps-check, the two test runs, qmllint and the screenshots.
-The mock suites are part of `cargo test --workspace` (they skip without the harness unless
-`KOURIER_REQUIRE_MOCK_HARNESS=1`); the harness's `npm ci`, the release build and
-`cargo xtask symbols-check` are run by hand. Not part of `ci` either:
+The two test runs go through cargo-nextest when it is installed (T1, 2026-10-13: every test in a
+process of its own, several at a time across all test binaries, the suites that start the mock
+harness, use the real Secret Service or open a Qt window held back by the test groups of
+`.config/nextest.toml`; a `cargo test --workspace --doc` step follows because nextest does not run
+doc tests), and through `cargo test` with a warning when it is not. The mock suites are part of
+the workspace run (they skip without the harness unless `KOURIER_REQUIRE_MOCK_HARNESS=1`); the
+harness's `npm ci`, the release build and `cargo xtask symbols-check` are run by hand. Measured on
+the 6-core machine (2026-10-13, same tree, one core taken by another process): the test steps took
+15.0 minutes through `cargo test` (non-Qt 669 s, Qt 233 s) and 6.4 minutes through nextest
+(non-Qt 271 s, Qt 87 s, doc tests 12 s; with the harness-based suites 2, 4 and 6 at a time the
+non-Qt run took 654, 360 and 271-283 s, the Qt run 103 s at 3 UI tests at a time). Not part of `ci` either:
 
 - `cargo xtask perf [--out <file>] [--quick] [--report-only] [--idle <s>] [--runs <n>] [--no-mock]
   [--no-build] [--keep-profile]`: the §1.3 table (§13 phase I). A full run takes 13 to 15 min.
@@ -3447,7 +3782,7 @@ Phase B (S2 walking skeleton, S3 core + fake, S4 UI groundwork; 2026-10-06):
   first, each `HistoryBatch` separately, ack after the last; idempotent on replay).
 - §4.3 lifecycle: relink keeps the account `LoggedOut` until `AccountReady`, whose own ids must match
   the stored primary id; an exit before `AccountReady` is a failed login; startup discards `Linking`
-  rows, finishes `Removing`, re-wipes `LoggedOut` credentials, rebuilds accounts from `key.wrap`
+  rows, finishes `Removing` (after one more logout attempt, unless the kept report says the device is gone) and `Unlinking` (the same rule, then `LoggedOut` with the chats kept), re-wipes `LoggedOut` credentials, rebuilds accounts from `key.wrap`
   files whose secret still opens; an unrequested `Exit::Shutdown` restarts; backoff = min·2^(n−1) +
   ≤ 25 % jitter from the account uuid, streak reset after a quiet window; missing keys → `LoggedOut`;
   a failed shred keeps the account `Removing` until next start. Key access is the
@@ -3782,8 +4117,10 @@ compact list, S13 core side, id fixes; 2026-10-06):
   where Desktop sends `start-*` and resumes at N. Pointer cache: keyed by SHA-256 of the transform
   plus the core blob's path and key (or the long text itself), so the same file attached to two
   messages uploads twice (Desktop keys by plaintext hash). `TransmitProgress`: every 250 ms while
-  it changes, capped at 0.99, then 1.0 once all uploads are done (before the message itself is
-  sent); a body without uploads reports nothing.
+  it changes (step `Uploading`), capped at 0.99, then 1.0 once all uploads are done (before the
+  message itself is sent) with no step (`phase: None`: the line under the message falls back
+  to "Sending…" until a group send reports its next step); a body without uploads reports
+  nothing.
 - §3.8 (S12): Signal conversations list all six attachment kinds with `max_size` from
   `global.attachments.maxBytes` (100 MiB without a config), no caption on voice notes and
   `max_text_bytes` 64 KiB; re-emitted when the config changes (phase H: `max_size` is the largest
@@ -4606,11 +4943,21 @@ revision history, the desktop side of S15; 2026-10-07):
   | History import: people and chats kept while the archive is read (200,000 recipients and 128 MiB by estimate, 100,000 chats) | `kourier-signal` `transfer::map::MapLimits` | Kourier's own: memory, against a broken or hostile archive | Added: the frame is not kept and counted; what names it is unknown |
   | History import: the stage at most 8 GiB of payload, written in transactions of 16 MiB | `transfer::stage::MAX_BYTES`, `COMMIT_EVERY` | Kourier's own: disk, and the stage's own WAL | Added: fails as "too large", nothing kept |
   | History import: a text 128 KiB, a person's names 256 bytes each | `MapLimits::max_text_bytes`, `max_name_bytes` | the text: the format's own cap (libsignal's validator, which the reader does not run); the names: Kourier's own | Added: cut on a character, counted |
+  | History import, per message: a quote's text 4 KiB, 2,048 formatting and mention ranges, 1,000 reactions, 100 ids of later versions, a placeholder's raw item 64 KiB | `MapLimits::max_quote_bytes`, `max_ranges`, `max_reactions`, `max_edits` (`MAX_HISTORY_EDITS`), `max_raw_bytes` | the edit ids: the contract's (the core reads 100); the rest Kourier's own: memory and stage size against a broken or hostile archive | Added: cut (the newest reactions and versions stay) or left out, the row stays; a range that crosses a cut text is shortened to the cut; counted (`quote_text_cut`, `ranges_cut`, `range_dropped`, `reactions_cut`, `edits_cut`, `raw_too_large`) |
   | History import: a time more than 24 h ahead of the import is not used: the sort time becomes the received time (else the import's), the row has no server time, a timer's start is the import's time. A disappearing timer is at most `i32::MAX` seconds | `MapLimits::max_ahead_ms`, `Mapper::timer_start`, `map::MAX_TIMER` | Kourier's own: a future sort time pins a chat to the top, and the core measures the edit and delete windows from the server's time. Up to the bound the phone's time stands, also for a timer's start: this computer's clock may be the one that is behind, and a start moved back to it would make a row due early. The timer bound is the live path's | Added: the id keeps the true time; counted (`future_time`, `future_server_time`, `future_timer_start`) |
   | History import, a delivery row: at most 500 messages (`MAX_HISTORY_BATCH`) and 1 MiB of staged bytes; a larger message travels alone. People 200 and chats 50 per row | `kourier-signal` `transfer::deliver::MAX_ROW_BYTES`, `DeliveryBounds` | the contract (500: the core refuses more); the megabyte and the row sizes are Kourier's own: one core transaction, and small first rows so the list stands at once | Added |
   | History import: at most 2 delivery rows unacknowledged | `deliver::WINDOW` | Kourier's own: `backend.db` stays small however large the history | Added |
+  | History import: a chat frame's 1:1 timer at most `i32::MAX` seconds (less than a second is none), its version at least 1; a mute of `i64::MAX` ms or more is for ever | `transfer::map::chat_frame`, `storage::muted_until` | the timer bound and the mute's meaning are the live path's and the Storage Service's (one conversion for both) | Kept |
+  | History import, per group: 4,096 entries of each member list (members, invited, requesting), a title of 1,024 bytes, 64 notices per group change (after folding) | `transfer::map::MapLimits::max_members`, `max_title_bytes`, `max_group_notices` | Kourier's own: memory and stage size against a broken or hostile archive (the server's group size is far below) | Added: the rest dropped or cut, counted (`members_cut`, `title_cut`, `group_notices_cut`) |
+  | History import: at most 1,000 chats stay pinned: the first 1,000 in the phone's order (`pinnedOrder` ascending), the rest stay chats without the pin | `MapLimits::max_pins`, `map::reason::PINS_OVER_CAP` | Kourier's own: the pin list goes to the core as ONE event and is applied in one transaction, and Signal's clients pin only a few chats | Added: the chats beyond it are counted (`pins_over_cap`) and imported unpinned |
+  | History import: at most 1,000 attachments per message | `MapLimits::max_attachments`, `map::reason::ATTACHMENTS_CUT` | Kourier's own: memory and stage size against a broken or hostile archive (Signal's clients send far fewer per message) | Added (S5): the first 1,000 kept, the cut counted once per message (`attachments_cut`) |
+  | History import: an attachment is fetchable only while its upload (else original sent) time is within 2 × max(queue time, 30 days) of the phone's export time, and not above the receive limit | `transfer::map::MediaRules`, `Mapper::place` | Interop: what Signal Desktop says "could still exist on the transit tier"; the receive limit is the server's | Added (S5): the rest is "Not available on this device" with no pointer, counted (`attachment_too_old`, `attachment_too_large`) |
   | History import: a row found unacknowledged at more than 3 delivery starts, and the oldest waiting row after 10 minutes of RUNNING time without any acknowledgement, is taken back (a row of several becomes singles, a single is dropped and counted) | `deliver::MAX_STARTS`, `IDLE`, `strike` | Kourier's own: a delivery must not hold receiving back for good; the core stops at the first failing job, so only the oldest row can be at fault | Added |
+  | A job that met a refused group credential (401 of the group server) is dropped after 30 attempts (about four hours of backoff) | `jobs::GROUP_AUTH_ATTEMPTS`, `jobs::gives_up` | Kourier's own: the group refresh jobs have no expiry, and a credential that is never accepted must not be asked for every fifteen minutes for good (Desktop fails and tries again at its next update, without a bound) | Added: the next start queues the refresh of an imported group that was never fetched again |
   | History import ends as "incomplete" after 3 takings back in a row without an answer, after 20 single units refused in a row, after 60 minutes of stuck running time in all, or after 3 chunks in a row out of step | `deliver::MAX_STRIKES`, `MAX_REFUSED_RUN`, `STUCK`, `MAX_OUT_OF_STEP` | Kourier's own: receiving is held back for a bounded time whatever the core cannot store; a fault must not loop | Added: what was delivered stays and receiving starts. A dropped unit alone leaves the transfer done |
+  | Asking the phone for a lost file: the answer is awaited 30 s after the request went out, and 2 min more after each answer that still has a PENDING slot | core `Timeouts::restore_answer` / `restore_pending` (`ingest::restore::tune_waits`) | Kourier's own (Desktop has no wait: it shows nothing until an answer); a phone that never answers must end as a note the user can act on | Kept, own |
+  | A backfill request that cannot go out is given up 1 h after the click, also before its first attempt; the core ends the wait itself 5 minutes later when nothing was reported | `kourier-signal` `backfill::REQUEST_MAX_AGE`, `jobs::expired_before_run`; core `ingest::restore::UNSENT_BOUND_MS` | Kourier's own: a request the phone gets hours later finds a user who gave up; the core's wait ends as "did not answer" (`NotSent`, or its own deadline when the backend never says) | Kept, own |
+  | Backfill answers only from device 1 | `receive/dispatch.rs` `backfill_response`, `PRIMARY_DEVICE` | Kourier's own (security): Desktop and Android take one from any of our devices; only the phone has the files | Kept, own |
 
   Not limits: the sticker send refusal (a missing feature), sender key needing two recipients
   (a path choice; there is no group size limit), unknown `DataMessage` flags and newer protocol
@@ -6515,7 +6862,8 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   is cut expands it first. It applies to every text block (own and others' messages, with a
   quote above, as a caption); a long-text attachment whose rest has not arrived shows what is
   there. Fixture: the showcase chat of `--page=readmore` (one received message of 1,645
-  characters); the fixture now has 20 chats. Tests: unit tests in `readmore.rs` and
+  characters); the fixture now has 20 chats (the page `unavailable` of step S5 adds none: its
+  rows are a history batch in a generated chat of the list's lower body). Tests: unit tests in `readmore.rs` and
   `kourier-qt/tests/readmore_ui.rs`. Not solved: in a chat shorter than the window the hold
   cannot keep the cut line (nothing to scroll), the text grows upward and the view follows
   the newest message again; chats with a history are not affected. The row's menu has no
@@ -6524,7 +6872,8 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   previous ones and only in case of some difference we should check it"). Before, the 152
   pictures were rendered one after another (10.2 minutes of a 22-minute CI run) and nothing
   compared them with earlier ones. Now 4 app starts run at a time (`--jobs N`; 247 s
-  measured on an idle machine). Renders share nothing: each fixture start has its own
+  measured on an idle machine; since T1, 2026-10-13, one per core up to 6: 266-276 s against
+  315 s at 4 on a 6-core machine with one core busy). Renders share nothing: each fixture start has its own
   temporary profile, takes no D-Bus name, opens no port and uses a passphrase keyring; the
   Breeze `kdeglobals` of each colour scheme is written once before the first render; only
   KDE's icon cache in the real `~/.cache` is shared (made for several processes). Every old
@@ -6536,10 +6885,11 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   than 24 of its pixels differ or its size does (an absolute number: a share of the picture
   let a changed label pass on the wide pages). The eleven pages that show pictures
   (`SHOT_PAGES_WITH_PICTURES`) are compared more loosely, at 0.15 % of their pixels: a page
-  is grabbed a fixed time after it opened, and a thumbnail may or may not have been replaced
-  by its full-size picture by then, which moves the edges of the shapes in it by a few
-  hundred pixels in every one of three renders. Open: grab a page when its pictures are
-  final, then compare these pages as strictly as the others; a picture that differs is rendered up to
+  is grabbed when it is final (S1, below), but a picture asked for before its thumbnail
+  existed is drawn from the file and one asked for after from the thumbnail, which differ by a
+  level or two in a fifth of the pixels and by a few pixels at the edges of shapes. Open:
+  compare these pages as strictly as the others once three full runs show no re-render of a
+  picture page; a picture that differs is rendered up to
   twice more and counts as changed only when every render differs (a page that is still
   loading when it is grabbed differs by a row now and then). `qr` (random content) is not
   compared. The run prints "N pictures, M changed: names", writes
@@ -6557,12 +6907,32 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   two xtask files, the Qt version and the two Breeze colour scheme files. Not covered: a
   changed font or Breeze package (`cargo xtask shots` never skips). Known unstable spots,
   measured under load: a late chat-list row in wide `edit`/`reply`, and the album pictures of
-  `deleteattachment` (two states).
+  `deleteattachment` (two states; fixed by S1 below).
+- Stable screenshots, S1 (2026-10-13; the design is the working note
+  `target/next/stable-screenshots.md`). A `--screenshot` run no longer grabs a fixed time after
+  its page is ready (1,200 or 2,500 ms): `MainWindow.qml`'s `shotTimer` checks every 50 ms,
+  after a floor of 300 ms, that nothing holds the picture back and then saves the second of
+  two equal frames. Holds: images loading in the window, requests of the image provider
+  (`pendingImageRequests`), thumbnails the core still derives (`MediaHandles::deriving()`:
+  reserved in the same function that publishes a change with derive jobs, BEFORE its first UI
+  event, and released per derive task after the group it recorded was published, by a guard
+  that also releases on every early return), downloads running, the page row moving, the link
+  page still in the stack on the link pages of a transfer. At 30 s the frame is saved and the
+  app prints `shot: unsettled <what>` (a failed render for `cargo xtask shots`). Cost: every
+  page waits for the fixture's thumbnails (a full render 430 s, was 270 s). Measured with
+  `cargo xtask shots --repeat 10` under a second render (load average 42): 480 renders of 12
+  pages, 25 hit the old 15 s cap (now 30 s), 15 of 48 pictures had a second picture among the
+  settled renders (one or two levels inside photos: a picture requested before its derive is
+  drawn from the file, one requested after from the thumbnail, and its URL does not change when
+  only the thumbnail appears, so it is not requested again). The one-run check of the design's
+  cause for the transfer pages (the ColumnView still sliding) printed `moving=false
+  contentX=0` at the grab of all 16 renders, one of which differed from the rest by one grey
+  level: the slide was not the cause there; the equal-frames check is what settles those.
 - Waiting times, measured for this phase (a full CI was about 22 minutes: 10.2 screenshots,
   about 6 the 86 non-Qt test binaries one after another, about 5 building, 1.5 Qt tests). A
   read-only audit (`target/wait-audit/*.md`) found little real duplication between the test
   layers; what it lists, not done yet: test binaries in parallel (about 200 s), the fixture
-  profile seeded once per screenshot run, a shorter fixed wait before a screenshot,
+  profile seeded once per screenshot run, a shorter fixed wait before a screenshot (done by S1: none),
   `kourier-core`'s test files as one binary, the two kill-at-every-failpoint loops on 7
   threads, and a 20 s fixed wait in the rehearsal's `step send`.
 
@@ -6676,11 +7046,17 @@ go in that session. Research with sources (working notes outside this repository
     reader now refuses the header format of remote backups and counts a frame's fields
     before decoding it. The link-time protocol is built too (2026-10-09,
     `kourier-signal/src/transfer.rs`, backend.db schema 16 and 17) and its review's
-    findings are fixed. IT IS NOT IN USE: the offer of `backup5` is switched off
-    (`Tuning::transfer_offer`, default off; the app's `SignalNetwork` does not switch it
-    on) until the import and its screens exist, so no phone is made to export a history
-    that would be read and dropped. With the offer off the linking URL carries no
-    capability and a key that arrives anyway is ignored. As built:
+    findings are fixed. IT IS IN USE BY DEFAULT since 2026-10-11 (the user, asked with
+    options: "On by default (Recommended)"): every fresh link offers `backup5`, like Signal
+    Desktop, and the phone asks its user whether to transfer, who can decline there. It was
+    held back until the import and its screens existed, so that no phone was made to export
+    a history that would be read and dropped. The app switches the offer on where it builds
+    the Signal network (`Tuning::transfer_offer` through
+    `SignalNetwork::with_history_transfer_offer(true)`, which also sets the descriptor's
+    `HistorySource::PushedOnLink`); the library's own default stays off, because the tests
+    that build a network directly (the mock harness) are not about the transfer. With the
+    offer off the linking URL carries no capability and a key that arrives anyway is
+    ignored. As built:
     - One row per account holds the state: waiting, downloading, reading, done, skipped,
       failed, with a reason. Receiving and the Storage Service sync wait until the
       transfer is over; every end lets them start.
@@ -6745,43 +7121,42 @@ go in that session. Research with sources (working notes outside this repository
       nothing: no row is skipped for being due and no timer's start is moved back to the
       import's time; only a time more than a day ahead of the import is replaced. Two
       contact frames of one person are one person and one conversation. An own message's
-      state is what the phone says for the chat's contact, and a row names only people the
-      stage holds. Everything else is skipped and counted under a reason; one item never
-      fails an import.
+      state is what the phone says for the chat's contact. Everything else is skipped and
+      counted under a reason; one item never fails an import.
     - Proven on the mock for everything before the commit: the core gets no
       event of the import and `core_outbox`, `peers`, `groups` and `jobs` are unchanged at
       the commit while the stage holds the archive's rows; and page by page that an aborted
       import leaves no text in `backend.db`, its WAL or the transfer directory.
     - Measured (debug build, one run): 50,000 text messages over 200 chats are verified,
       read, mapped and staged in 4.3 s; the stage is 31 MiB (517 bytes a message).
-    **Delivery (S2, backend.db schema 19).** After the commit zone the stage is delivered to
-    the core (`transfer/deliver.rs`): the people, then the chats that are shown (upserted the
-    least recent first so that the list stands in the phone's order before it fills, each with
-    its features), then each chat, the most recent first, as `HistoryBatch` rows of at most 500
-    messages and 1 MiB with `has_more` and `progress`, (a chat whose last row is not delivered still hears that
-    nothing follows). No unread count is sent: the rows say whether the phone had read them,
-    and the core counts the unread ones. One zone per row writes the backend's own rows, the `core_outbox` row, its entry
-    and the cursor, so a quit or a kill goes on at the cursor and every row is appended exactly
-    once; at most two rows wait for the core. `done` is written after the last acknowledgement,
-    the login's `Done` after that. A committed import is never withdrawn: a lost stage is read
-    again from the archive (ids are deterministic, ingest is idempotent), also for a rebuilt
-    `core.db`. A row the core refuses or does not acknowledge within the bounds is appended
-    again as single messages; only the oldest waiting row is ever dropped (the core stops at the
-    first failing job), and a single that still fails is dropped and counted. A delivery that
-    cannot finish ends as the failure kind `Incomplete` with what was delivered left in place
-    and receiving started: when the core answers nothing three times in a row, when it refuses
-    20 single units in a row, and when the time spent waiting for rows that were then taken
-    back reaches an hour in all. A dropped unit alone leaves the transfer `done`. A logout or
-    an unlink during a delivery keeps what was delivered. The chat of a contact known only by a
-    number is read-only. A row that is due is dropped only under a clock the server confirmed on
-    the connection that stands. Measured in a release build (the builder's run, before the
-    fixes): 50,000 texts over 200 chats are read in 0.6 s and delivered in 1.9 s; stage 30 MiB,
-    core.db 23 MiB, backend.db at most 1.6 MiB. Not yet: pins and the other things that roam
-    (a chat the archive blocks and the Storage record does not stays blocked until S4), groups,
-    content beyond plain text, attachments,  a chat all of
-    whose rows were due stays in the list, empty; the offer stays
-    off. A rebuild of `core.db` after the transfer ended cannot bring the history back (the
-    archive and its key are gone).
+    **Delivery (S2, backend.db schema 19; 20 since S4b).** After the commit zone the stage is
+    delivered to the core (`transfer/deliver.rs`): the people, then the chats that are shown
+    (upserted the least recent first so that the list stands in the phone's order before it
+    fills, each with its features), then each chat, the most recent first, as `HistoryBatch`
+    rows of at most 500 messages and 1 MiB with `has_more` and `progress`, (a chat whose last
+    row is not delivered still hears that nothing follows). No unread count is sent: the rows
+    say whether the phone had read them, and the core counts the unread ones. One zone per row
+    writes the backend's own rows, the `core_outbox` row, its entry and the cursor, so a quit
+    or a kill goes on at the cursor and every row is appended exactly once; at most two rows
+    wait for the core. `done` is written after the last acknowledgement, the login's `Done`
+    after that. A committed import is never withdrawn: a lost stage is read again from the
+    archive (ids are deterministic, ingest is idempotent), also for a rebuilt `core.db`. A row
+    the core refuses or does not acknowledge within the bounds is appended again as single
+    messages; only the oldest waiting row is ever dropped (the core stops at the first failing
+    job), and a single that still fails is dropped and counted. A delivery that cannot finish
+    ends as the failure kind `Incomplete` with what was delivered left in place and receiving
+    started: when the core answers nothing three times in a row, when it refuses 20 single
+    units in a row, and when the time spent waiting for rows that were then taken back reaches
+    an hour in all. A dropped unit alone leaves the transfer `done`. A logout or an unlink
+    during a delivery keeps what was delivered. The chat of a contact known only by a number
+    is read-only. A row that is due is dropped only under a clock the server confirmed on the
+    connection that stands. Measured in a release build (the builder's run, before the fixes):
+    50,000 texts over 200 chats are read in 0.6 s and delivered in 1.9 s; stage 30 MiB,
+    core.db 23 MiB, backend.db at most 1.6 MiB. Not yet: attachments (S5; content beyond plain
+    text came with S3b, what roams with S4a and groups with S4b, below); a chat all of whose
+    rows were due stays in the list, empty; at this step the offer stayed off by default (it
+    has been on by default since 2026-10-11, below). A rebuild of `core.db` after the transfer
+    ended cannot bring the history back (the archive and its key are gone).
     **The rules of the contract and the core (S3a, core.db schema 12, `stage::FORMAT` 2).**
     The lead's rule replaces the design's C2: the rows are the truth about what is unread. A
     history row that says "not read" counts for the chat like a live row and is announced to
@@ -6808,26 +7183,270 @@ go in that session. Research with sources (working notes outside this repository
     alone does not start the timer of a message that was pending on the phone; a call line that
     still rings when imported does not keep `read: true`; a version id equal to another
     message's id of the author takes what waited for that id.
-    A run can switch the transfer on before it is the default: the environment variable
-    `KOURIER_HISTORY_TRANSFER=1` (read where `kourier-app` makes the Signal network, in every
-    build; `cargo xtask smoke start --history-transfer`). It sets the offer and, with it, the
-    descriptor's `HistorySource::PushedOnLink`. It exists for the runs that try the import
-    while it is not whole and goes away when the transfer becomes the default.
-    Not built: message content beyond plain text, groups, what roams, attachment pointers,
-    the switch-on by default.
-    The screens (2026-10-09; built and tested on the fake network, not reachable with
-    Signal while the offer is off and Signal's descriptor says `HistorySource::None`):
-    - One view of a running transfer (`kourier_viewmodel::transfer`), shown large on the
-      link page in place of its "linking" step and compact in the account banner:
-      "Waiting for Your Phone" (the phone prepares and uploads the history: on Signal its
-      user agreed at the scan, before the link, so nothing is asked any more) with
-      "Continue Without History"; "Downloading Message History" with a bar and
-      "12.3 MB of 45.6 MB" (only the bytes while the size is unknown; a count that steps
-      back is a shorter bar) and the same button; "Importing Messages" with an
-      indeterminate bar, a sentence to keep Kourier open, and no button. The login's
-      `Done` comes after the transfer's end, so the link page stays up through it; after
-      a restart there is no link page and the banner shows the same view. While the link
-      page shows a transfer it offers no "Cancel": the account is linked.
+    **The content of 1:1 chats (S3b, `stage::FORMAT` 3).** The mapper now maps, in direct chats
+    and Note to Self: formatting and mentions (the archive's UTF-16 ranges through the live
+    mapper's `receive::dispatch::ranged_text`; a range that does not fit is dropped and counted,
+    one that crosses the cut of a long text is shortened to the cut and dropped only when
+    nothing of it is left; a mention of us sets `mentions_me`); quotes (the target by its sent
+    time, `local` "0" when the phone did not find it, the author as far as the chat knows them,
+    the quote's own text and its first attachment's kind, name and type, no thumbnail);
+    reactions (one per author, the highest `sortOrder` wins, in that order, ours as `by: None`,
+    the live emoji rule); an edited message's later versions as `IncomingMessage.edits` (its id
+    stays the first version's; earlier texts are not imported; sorted by time, one entry per
+    time, the newest last, whatever order the archive lists them in); a sticker as
+    `Body::Sticker` whose image follows the attachment rules of S5, its content
+    type kept as the live path keeps it (`receive::media::sticker_mime`: none is `image/webp`,
+    one over 255 bytes `application/octet-stream`); view-once (`Unsupported "view-once"`,
+    `view_once`, no attachment and no raw), contact cards, payments, gift badges, polls and
+    story replies as the live path's placeholders with the encoded backup `ChatItem` as raw
+    (`BackendBlob` v 4, at most 64 KiB); the 1:1 notices the contract has (timer change, safety
+    number, number change, session reset, accepted request) under ids `h:<frame>:0`;
+    newer-protocol, payments activated, poll ended and pin as placeholders under the message's
+    real id; and 1:1 call lines in every state, said by our own device (`call_id` the archive's
+    `callId`, else `h<frame>`, and a `callId` of 0 is none, as in Desktop's importer, or every
+    such call of a chat would be one line; the time the call started). A quote, a reaction and a
+    1:1 notice name only us and the chat's contact (a quote by anybody else has an unknown
+    author, such a reaction is dropped and such a notice skipped); a mention keeps the ACI it
+    names, as live, with no name. Timer rules: a timer-change notice gets NO timer (Android
+    never starts it; the core's notice rule would erase it at once); another notice keeps a
+    timer only when the phone started it; an outgoing call line without a start is started at
+    the import's time (the core would count it from the call's time); an incoming one keeps its
+    after-read timer unstarted. The group call's line (`Mapper::group_call`) is built and
+    unit-tested and waits for S4's groups. A ring of the moment of the export is reported unread
+    and with no time left on its ring (a deadline at or before the import's time): the core
+    keeps a ring by the time it has left, counted from the time the line was received, so a ring
+    with a minute left would ring here when the call began shortly before the import or the
+    phone's clock is ahead; with none left the core settles it at once as an unread missed call.
+    Tests: `transfer/map/tests/content.rs` (one per mapping row and the caps) and
+    `kourier-e2e/tests/signal_history_import.rs` `the_rich_archive_becomes_these_chats`,
+    `a_reaction_from_the_phone_lands_on_an_imported_edited_message`.
+    The offer is on by default (2026-10-11). A run can switch it off: the environment variable
+    `KOURIER_HISTORY_TRANSFER=0` (exactly `0`, read where `kourier-app` makes the Signal
+    network, in every build; the log then carries a warning; `cargo xtask smoke start
+    --no-history-transfer`). It turns the offer and, with it, the descriptor's
+    `HistorySource::PushedOnLink` off for that run. It is no setting and not meant for
+    users: it serves the runs that are not about the history (a link that must not ask the
+    phone) and, as a last resort, a transfer that goes wrong. The wiring is held by a test:
+    `kourier-app` `app::transfer_switch_tests::a_normal_start_offers_the_history_transfer_by_default`
+    runs `normal_setup_in` (what `normal_setup` does after the paths and the logging, over an
+    environment it is given) on a private profile and asks the registry's Signal network for
+    its descriptor; a `normal_setup` that registered `SignalNetwork::new()` fails it. (Debug
+    builds only: it starts from the development keyring.)
+    What roams, for direct chats and Note to Self (S4a): the first chat frame of a
+    conversation gives archived, marked unread, the mute (converted by the Storage Service's own
+    `storage::muted_until`; `i64::MAX` is for ever, a past mute stays past), the 1:1 timer in
+    seconds with its version (at least 1, kept also without a timer) and the pinned order. Note
+    to Self takes the same fields from its chat frame: the import keeps its mute and its timer
+    when the frame has them. Only the Storage Service record of Note to Self lacks them (it has
+    archived and marked unread only). A pinned chat is staged and shown even with no loud row
+    or no row (Android and Desktop list it).
+    Delivery puts the flags into the chat's upsert. It writes the timer into `peers` inside the
+    chats zone before the features are computed, and only when its version is not below the
+    stored one: the zone runs again after a redo or a lost stage, and the archive's old timer
+    beside the version of a change the user made meanwhile would undo that change. The first
+    features event of a chat carries the timer and its version when the timer is on. A version
+    alone stays in `peers`, which every send reads. The pins are ONE `PinnedConversations` in a
+    row of its own after every chat's upsert, sorted by `pinnedOrder`. The delivery holds that
+    row until every row before it is settled. A chats row that the core refuses is appended
+    again after whatever stands behind it, and a pin list that came first would make a bare
+    chat of each key it names. The list leaves out a chat whose upsert was dropped for good: a
+    row of chats that is taken back forgets the features of the chats it named
+    (`peers.features_hash`, those chats only), and the list names only chats the backend's
+    records say the core took. A chat known only by a number has no such record and stays named.
+    At most 1,000 chats keep the pin (§13). The Storage Service sync that follows wins where it
+    differs: a first record of a contact or Note to Self whose chat the core has states its
+    flags even when they are false (D10). A first record of a contact the core has no chat for
+    states nothing, or the sync would make a chat of every contact. Its pin list keeps the
+    record's order across kinds and names a group only when the core has it (design §3 S4). On
+    a fresh link the first sync runs before any group is fetched. So the first fetch of a group
+    that the stored account record pins sends the list again, built by the same function
+    (`storage::pins_with_new_group`, in the group's zone). That list is the record's, so it
+    agrees with the sync's and with the archive's order (both are the phone's). The initial
+    contact sync never lowers a stored timer version (Android's rule: a synced timer applies
+    only when its version is higher), so it cannot undo what the import gave the core.
+    Known limit: a pin of a person known only by a number is unpinned by the first Storage
+    Service sync, which names only people with an account (such a chat is read-only).
+    Known limit: a delivery row of chats that runs again (the core took it back, or a lost
+    stage is read again) states the archive's archived, marked-unread and mute flags again. A
+    flag the user changed on this device in the meantime comes back, for example a
+    marked-unread dot that reading the chat cleared. This is rare. Known limit: a chats row
+    that the core refuses while the delivery waits for the feeder is not yet settled when a
+    lost stage is forgotten. Its chats can keep a features flag that says the core has them.
+    Tests:
+    `transfer/map/tests/frames.rs`, `transfer/deliver/tests/frames.rs`, `storage/tests.rs`,
+    `contact_sync/tests.rs`, `kourier-signal/tests/history_import.rs`
+    `direct_chats_take_the_archives_pins_archive_mute_marks_and_timer`,
+    `the_pins_wait_for_a_row_of_chats_the_core_refused_and_for_its_singles`,
+    `the_storage_sync_wins_over_the_archive_where_they_differ`, `tests/groups.rs`
+    `a_pinned_group_stays_pinned_after_a_storage_sync`, and in `kourier-e2e`
+    `the_list_after_an_import_has_the_phones_pins_archive_mute_and_marks` (also: a live message
+    into a chat muted for ever is silent, one into a chat whose mute is over is announced),
+    `a_message_sent_into_an_imported_chat_carries_the_archives_timer`.
+    Groups (S4b): the group recipient keeps its master key and, from the phone's snapshot, the
+    title, the members, invited and requesting people with their roles, the timer in seconds
+    and our membership: member, invited (our ACI or our PNI among the pending, read from the
+    service-id binary: 16 bytes an ACI, 17 with 0x01 a PNI), requesting (only among those who
+    asked to join), left (a non-empty snapshot without us) or unknown (an empty snapshot,
+    which Android writes when it had no state). The chat frame's timer (ms) wins over the
+    snapshot's. A group we are invited to is shown, as a pinned chat is, with the request to
+    accept it and the reason "Accept the invitation on your phone to join this group."
+    (Kourier cannot accept an invitation); a request to join says that it "is waiting for an
+    admin" (two new translatable `CannotSend` reasons, neither is "not a member"). The
+    invitation, `selfInvitedToGroupUpdate`, is no notice (the live decoder makes none for our
+    own invitation, and the contract has none), so such a chat has no row and lists after
+    every chat that has one. The people of a staged group's lists are staged with it, so
+    members have names, and in a group any person of the archive may write, react, be quoted
+    or be named in a send state. Group changes follow the live decoder: an entry whose actor
+    is absent is skipped (the contract's `by: None` means "you"), the item's author is never
+    the actor, `Joined` for our own join, join by a link and accepted invitation (the live
+    decoder says the same), a member whom an admin promoted from an invitation is added by
+    that admin in both paths, our own leave is a notice of our own device, additions and
+    removals by one actor are folded into one notice before the cap of 64, a title loses one
+    outer pair of bidi isolates (known difference: a title with unbalanced bidi controls keeps
+    the closers Android adds, which the live notice does not show). The viewmodel says "X
+    joined the group" for `MembersAdded { by: X, users: [X] }` and "X removed the group name"
+    for an empty title (the live decoder makes an empty one only for an action without a blob
+    or a blob that decrypts to nothing, as Desktop reads it; a blob that does not decrypt makes
+    no title notice). Group calls are lines of their group. Delivery writes the `groups` row
+    in the chats zone WITHOUT the snapshot, with the flags the Storage Service merge compares,
+    the membership the archive says ('pending' for an invitation, 'requesting' for a request
+    to join, 'left'; what the server said before stands over it) and the hash of the features
+    sent ("still loading", a new translatable `CannotSend::StillLoading`, until the first
+    fetch for a member or an empty snapshot; the invitation and the request to join as above;
+    "not a member" when left or gone). It queues a refresh for every imported group, a left
+    one too (D10), and wakes the job runner. A row whose server state is there already (a
+    refresh ran during the delivery, or after a rebuild) gets that state's title, members and
+    timer and never the archive's, so that a rebuilt core gets a whole group. The first fetch
+    is a "first" one: the server's title, members and timer replace the archive's and no
+    notice is made for what changed since the export (Desktop shows those changes: a known
+    difference), and it states `request_pending` from the server's state. A first answer that
+    is no state ends an invitation: a 403 or a 404 states `request_pending` false (Desktop:
+    its 403 on the state falls back to a pre-join fetch that fails the same way, and the group
+    is left; the same on the live path when an invited row's state is refused), while a 403 on
+    a request to join changes nothing (the server gives a requester no state and the request
+    may still stand; Desktop keeps it pending too). A 401 of the group server is a refused
+    credential: the job backs off and asks again with fresh credentials, for at most 30
+    attempts (about four hours), after which the next start queues the refresh again. Every
+    start queues a refresh for an imported group that was never fetched and is not left or
+    gone. `groups.membership` knows 'requesting' (backend.db schema 20, migration 0020, which
+    also drops the dead `deliver_hinted`). `stage::FORMAT` is 5. Tests:
+    `transfer/map/tests/groups.rs`, `transfer/deliver/tests/groups.rs`, `groups/tests.rs`,
+    `kourier-signal/tests/history_import.rs`
+    `an_imported_group_comes_from_the_archive_and_its_first_fetch_replaces_title_members_and_timer`,
+    `a_left_group_is_refreshed_once_and_group_items_notices_and_calls_are_imported`,
+    `nothing_of_the_archives_groups_reaches_backend_db_before_the_commit`,
+    `the_storage_sync_wins_over_the_archives_group_flags_and_is_silent_where_they_agree`, the
+    kill at every zone with a pinned group, `tests/history_transfer_attack.rs` (a group title
+    with the marker; the master key and the invite link's password, a needle of its own, in no
+    file and no page of `backend.db` or of the stage), and in `kourier-e2e`
+    `an_imported_group_is_listed_from_the_archive_and_a_send_reaches_the_servers_members` and
+    `an_imported_invitation_is_offered_with_its_reason_until_the_first_fetch_finds_it_over`.
+    Known limits: (a) a notice title keeps the closers Android adds for unbalanced bidi
+    controls (safer; a cosmetic difference from the live notice); (b) a take-back after the
+    group's refresh, followed by a single dropped for good, leaves the group's features flag
+    cleared although the core has the group from the refresh (its pin and the Storage sync's
+    first flags wait for the next fetch); (c) a request to join never learns that it was
+    declined (the server gives a requester nothing).
+    **Attachment pointers (S5, `stage::FORMAT` 6; user decisions of 2026-10-10: old media
+    "Ask the phone" (step S6), long texts "Fetch automatically", wording "Two texts").** A
+    message's attachments (at most 1,000 per message, the cut counted), the rest of a long
+    text and a sticker's image become `Attachment`s with the live path's bounds (file name
+    255 bytes, blurhash 128, content type 255, waveform 100 bars, duration, dimensions,
+    caption) and their kind from the archive's flag ENUM (`VOICE_MESSAGE` 1, `GIF` 3; the
+    wire's GIF bit is 8: `receive::media::archive_kind`); every voice-flagged attachment is a
+    voice note, as live. Names: the client UUID, the digest or the plaintext hash
+    (`plaintext:<hex>`, which delete-for-me syncs now carry both ways). One whose transit
+    place is valid (a CDN key `valid_cdn_key` takes, a CDN number 0, 2 or 3, a key of 64
+    bytes, a plaintext hash or digest of 32 bytes, any size: 0 is an empty file, legal as live
+    and in Desktop), within the receive limit and young is `Remote` with `remote` =
+    `BackendBlob` v 3, the prost-encoded backup `FilePointer` trimmed to content type,
+    dimensions and the transit locator (with the size; no `localKey`, no media tier); `Pointer::from_blob` reads it back and the download checks the plaintext hash
+    (else the digest). Every other one is `AttachmentState::Unavailable`, shown as "Not
+    available on this device", with NO pointer and no key but with its names and its
+    message's id (author and original sent time), what step S6 uses to ask the phone for it
+    (§6.11 "Asking the phone", built 2026-10-11);
+    "No longer available" (`Expired`) stays the state after the server said so on a click
+    (404, 410, a 403 of CDN 0). Each kind is counted (`attachment_not_available`,
+    `attachment_too_old`, `attachment_too_large`, `attachments_cut`). The age rule is Signal
+    Desktop's (`AttachmentDownloadManager`, which uses it only to pick what it fetches by
+    itself): the upload time, else the message's original sent time, is old when it is at
+    or before the reference minus twice max(the remote config's message queue time, 30
+    days); the reference is the phone's export time (`ArchiveInfo.backup_time_ms`) clamped
+    to within a day of the import's time, so this computer's clock decides nothing alone and
+    a re-read gives the same rows; the queue time and the receive limit are read from
+    `backend.db` when the read begins (none stored: the 30-day floor, a 60-day window, and the
+    default limit; the log line "the import judges the age of attachments" says which; a
+    database error there fails the read as an internal error and never gives the floors). The
+    import starts no download: a history attachment waits for a click (invariant I13), except
+    the rest of a young long text, which the core fetches by itself and joins into the body
+    (into the NEWEST revision of an imported edited message, whose revision 0 has no body),
+    and not for a message that is due or hidden by the expiry policy (the refusal a click
+    meets too); an old long text keeps its first 2 KiB. A history attachment the core finds
+    above the receive limit the account states (the import judged by an older one) becomes
+    "not available on this device" with its pointer dropped, and a LIVE pointer to a CDN
+    this build has no base URL for is "not available" at once, not a "Retry Download". A quote's thumbnail, a view-once pointer and a
+    contact card's avatar never become a pointer. Tests: `transfer/map/tests/media.rs` (every
+    locator shape, the age bound and its reference, the kinds, long texts, stickers, the cap),
+    `attachment.rs` (both blob formats, a download checked by the plaintext hash, 410 and the
+    403 of CDN 0), `kourier-core` `attachments/derive.rs` and `policy.rs`,
+    `kourier-signal/tests/history_import.rs`
+    `an_imported_picture_downloads_on_a_click_and_the_import_asks_the_cdn_nothing`,
+    `the_servers_queue_time_and_receive_limit_decide_at_the_import` and
+    `the_age_window_counts_from_the_export_time_when_it_is_within_a_day_of_the_import`,
+    `kourier-core/tests/attachments.rs` (a due or hidden message fetches no long text by
+    itself, an imported file above the limit is not available), `delete_for_me.rs` (the names
+    of a delete tried in order over all attachments), and in `kourier-e2e`
+    `an_import_fetches_its_young_long_texts_and_nothing_else_by_itself` (the mock CDN's
+    request log holds only the archive and the young long texts until a click). The fixture
+    page `unavailable` shows every state (pictures: `cargo xtask shots --page unavailable`;
+    the fixture account can ask its phone, so the gone ones offer Download and the ones
+    being asked for or finally refused do not); a gone sticker is a small framed box with the
+    note and its own Download inside, and on a picture the note is a few words (the whole
+    sentence is its tooltip) that a small tile may still cut to its width. Known
+    limits: (a) an edit or a forward of an imported own message whose attachment was never
+    downloaded needs the file (only wire pointers are re-sent) and fails; (b) an own message
+    the phone was still sending at the export has empty locators and stays "not available"
+    although the phone's later transcript has the pointers; (c) the queue time and the
+    receive limit are those stored at the read, and the reference is the export time only
+    within a day of the import's time: a re-read of a lost stage after a change of the remote
+    config, or more than a day after the export, can judge differently for the rows not yet
+    delivered (delivered rows stay: ingest is idempotent); (d) an old sticker is "not
+    available" although its pack could give it (a later step); (e) accepting a message
+    request, or unblocking a chat, long after the import fetches the long texts of that
+    chat's imported messages (the core's `fetch_long_texts` does not look at the age rule), and
+    those the server no longer has end as "No longer available". Asking the phone for what is
+    not available is built (S6, §6.11 "Asking the phone"), and the offer is on by default
+    (2026-10-11).
+    The screens (2026-10-09; built and tested on the fake network, and reachable with
+    Signal since the offer is on by default and its descriptor then says
+    `HistorySource::PushedOnLink`; a run with `KOURIER_HISTORY_TRANSFER=0` has neither):
+    - One view of a running transfer (`kourier_viewmodel::transfer`), shown in the
+      account banner (since link feedback L3 no longer on the link page: the page
+      closes as soon as the core has the account, at the transfer's first report or
+      the account's first state, and the chats are usable meanwhile):
+      "Waiting for your phone to prepare the message history…" (the phone prepares and
+      uploads the history: on Signal its user agreed at the scan, before the link, so
+      nothing is asked any more) with "Continue Without History"; "Downloading message
+      history…" with a bar and "12.3 MB of 45.6 MB" (only the bytes while the size is
+      unknown; a count that steps back is a shorter bar) and the same button; "Importing
+      history: 12,400 of 50,000 messages. New messages arrive afterwards." with a
+      determinate bar from the backend's ephemeral `BackendEvent::AccountProgress`
+      (`UiEvent::AccountProgress`, not stored), and no button; the line keeps its reason
+      because nothing new arrives until the import is delivered (a message sent meanwhile goes
+      out at once since L6, §4.5). After it (or without a transfer) the same reports drive "Updating contacts
+      and groups: 120 profiles, 8 groups left" until the backend says `finished`. The
+      login's `Done` still comes after the transfer's end, but no page waits for it; after
+      a restart the banner shows the same view. An empty list says why it is empty (and
+      a search that matches nothing says so before any of that); "Clear Chat History…"
+      and "Delete Chat…" wait (disabled, with the reason: "Available once this chat's
+      history has arrived") while a chat still fills or its account's transfer runs (the
+      core itself does not refuse a delete in that time, a phone's delete of a chat can come
+      then too: the rows of a chat deleted while its history is delivered are dropped, they
+      neither bring the chat back nor fail the delivery, `ingest/message.rs`
+      `in_deleted_chat`; a LIVE message still lists a deleted chat again);
+      closing the window while the transfer or the update runs asks "Quit While …?" (the
+      work goes on at the next start; the tray's Quit and the end of the desktop session
+      never ask).
     - A logout in the middle ends the transfer without an event (the backend deletes it
       with the login): the UI drops a running state when it sees the account logged out,
       and "Link Again" shows the steps of that login, never a transfer.
@@ -6856,13 +7475,12 @@ go in that session. Research with sources (working notes outside this repository
       narrow for both.
     - The fake network walks a transfer (`TransferScript`), obeys skip and dismissal and
       reports the stored state at every start and connect; fixture pages
-      `transferwait`, `transferdownload`, `transferread`, `transferbanner`,
-      `transferfailed`, `transferask`; `--fixture-link --fixture-transfer=<…>`.
+      `transferwait`, `transferdownload`, `transferread`, `transferupdate`,
+      `transferbanner`, `transferfailed`, `transferask`;
+      `--fixture-link --fixture-transfer=<…>`.
     Left: the passing notice is lost when no window exists at the end (hidden in the
     tray and released); a skip sent before the core has the account is dropped (the
-    button stays); between the transfer's end and the login's `Done` (Signal: the
-    contact and storage syncs) the link page shows "Linking…" with a "Cancel" that
-    cancels nothing; the end of our own skip is announced as "not transferred" when
+    button stays); the end of our own skip is announced as "not transferred" when
     Kourier was restarted before the backend reported it; an account picked in the
     drawer hides the other accounts' banners, the transfer's too; the action shows for
     Signal only once its descriptor says `PushedOnLink`.
@@ -7165,8 +7783,12 @@ keep is §8.10):
   on them (from `git status`, the package graph of `cargo metadata`); qmllint only when a
   `.qml` file changed; no screenshots. A changed root `Cargo.toml`, `Cargo.lock`,
   `rust-toolchain.toml` or `.cargo/` makes it the full run. First real run: 4 min 16 s for
-  a batch that touched five packages (901 tests), against 9 to 14 minutes. Still open from
-  the audit of waiting times: test binaries in parallel, and the rest of its list.
+  a batch that touched five packages (901 tests), against 9 to 14 minutes. Since T1
+  (2026-10-13) both tiers run their tests through cargo-nextest (§10.5): for a change in
+  `kourier-viewmodel` (reached: itself, `kourier-qt`, `kourier`) the test steps took 5.0 minutes
+  through `cargo test` (unit tests 44 s, `kourier` 26 s, `kourier-qt` 233 s) and 2.1 through
+  nextest (23 s, 17 s, 87 s), same tree and machine. Still open from the
+  audit of waiting times: the rest of its list.
 
 ### 14.3 Soon after R1
 
@@ -7177,6 +7799,14 @@ color scheme picker (KColorSchemeManager); `ConfigurationView` settings modules 
 shortcuts, about); conversation details as a context drawer or third column; `Accessible.announce()` for
 incoming messages; notifyrc + "Configure Notifications…" + "Mark as Read" action; `DBusActivatable` with
 a D-Bus service file; opt-in KRunner runner; a documentation site (user guide, FAQ, threat model).
+
+Asked for by the user, not scheduled yet (2026-10-10, his words: "add screenshot mode for
+selected messages for export"): a mode in which the user selects messages in a chat and
+exports them as a picture. His answers: the bubbles exactly as Kourier draws them, in the
+current theme, as one tall PNG; whether other people's names and avatars are shown is the
+exporting user's choice, among the options of the export ("Also export can have options
+for user"). Kourier has no selection of several messages today; this mode brings it, and
+"Save as Markdown" of several messages could use the same selection.
 
 ### 14.4 Later
 

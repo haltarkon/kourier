@@ -41,9 +41,8 @@ Kirigami.Dialog {
     ColumnLayout {
         spacing: Kirigami.Units.largeSpacing
 
-        QQC2.BusyIndicator {
+        Spinner {
             visible: !root.loaded
-            running: visible
             Layout.alignment: Qt.AlignHCenter
         }
 

@@ -45,6 +45,10 @@ QString translatePlural(rust::Str domain,
     return message.relaxSubs().subs(qulonglong(count)).toString();
 }
 
+QString formatNumber(uint64_t n) {
+    return QStringLiteral("%L1").arg(qulonglong(n));
+}
+
 void addLocaleDir(rust::Str domain, const QString& dir) {
     KLocalizedString::addDomainLocaleDir(bytes(domain), dir);
 }

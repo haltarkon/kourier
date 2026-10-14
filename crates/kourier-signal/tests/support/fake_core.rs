@@ -158,6 +158,7 @@ impl Sink {
                PRIMARY KEY (author, local));
              CREATE TABLE IF NOT EXISTS deliveries(
                seq INTEGER PRIMARY KEY, author TEXT NOT NULL, local TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS caps_flags(seq INTEGER PRIMARY KEY, flags TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, name TEXT NOT NULL,
                detail TEXT);
              CREATE TABLE IF NOT EXISTS message_json(seq INTEGER PRIMARY KEY,
@@ -180,7 +181,10 @@ impl Sink {
     /// never refused for good, its ingest fails and the backend ships it again; like the
     /// real core it first commits what stands before the failing batch in the envelope and
     /// skips what stands behind it), `stall` (`1`: no envelope with a history
-    /// batch is answered until it is set back).
+    /// batch is answered until it is set back), `refuse_wide_chats` (`1`: every envelope that
+    /// upserts two or more different chats is refused for good, after
+    /// `refuse_wide_chats_delay_ms` if that is set: a core that cannot take a row of several
+    /// chats at once but takes each chat alone; `refused_wide` counts the refusals).
     pub fn set_behavior(&self, key: &str, value: Option<&str>) {
         let conn = self.conn();
         match value {
@@ -194,7 +198,7 @@ impl Sink {
         .expect("behavior");
     }
 
-    fn behavior(&self, key: &str) -> Option<String> {
+    pub fn behavior(&self, key: &str) -> Option<String> {
         self.conn()
             .query_row("SELECT v FROM behavior WHERE k = ?1", [key], |r| r.get(0))
             .optional()
@@ -231,6 +235,12 @@ impl Sink {
                         let author = m.origin.author().map_or("", UserId::as_str).to_owned();
                         let body = match &m.body {
                             Body::Text(text) => text.body.clone(),
+                            // A notice keeps its detail, as a live one does (the group tests
+                            // read imported group notices; test data only).
+                            Body::System(event) => format!(
+                                "<System>{}",
+                                serde_json::to_string(event).unwrap_or_default()
+                            ),
                             other => format!("<{}>", other.kind_name()),
                         };
                         tx.execute(
@@ -357,6 +367,12 @@ impl Sink {
                         "INSERT INTO events(name, detail) VALUES ('AccountCaps', ?1)",
                         [detail],
                     )?;
+                    // The flags beside it, as JSON, in a table of their own (the event list is
+                    // compared as it is by other tests).
+                    tx.execute(
+                        "INSERT INTO caps_flags(flags) VALUES (?1)",
+                        [serde_json::to_string(&caps.flags).unwrap_or_default()],
+                    )?;
                 }
                 // Contacts, chats and settings keep their JSON for the S9 tests (test data only;
                 // the real core never logs these).
@@ -372,6 +388,8 @@ impl Sink {
                 | BackendEvent::ConversationCleared { .. }
                 | BackendEvent::AttachmentDeleted { .. }
                 | BackendEvent::Notice(_)
+                | BackendEvent::AttachmentRestore { .. }
+                | BackendEvent::CommandPersisted { .. }
                 | BackendEvent::Receipts { .. }) => {
                     let detail = serde_json::to_string(other).unwrap_or_default();
                     tx.execute(
@@ -577,6 +595,34 @@ impl Sink {
             .unwrap_or_default()
     }
 
+    /// The flags of every committed `AccountCaps` event, as JSON, oldest first.
+    pub fn caps_flags(&self) -> Vec<String> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare("SELECT flags FROM caps_flags ORDER BY seq") else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| r.get(0))
+            .and_then(|rows| rows.collect())
+            .unwrap_or_default()
+    }
+
+    /// Waits until `n` `AccountCaps` events are committed; returns their flags.
+    pub async fn wait_caps_flags(&self, n: usize, timeout: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let flags = self.caps_flags();
+            if flags.len() >= n {
+                return flags;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {n} AccountCaps events (have {})",
+                flags.len()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Waits until the message `(author, local)` is committed.
     pub async fn wait_message(
         &self,
@@ -636,6 +682,8 @@ pub struct FakeCore {
     // Kept so the actor's watch receivers stay connected.
     _ui: watch::Sender<kourier_backend_api::UiPresence>,
     _prefs: watch::Sender<kourier_backend_api::LocalPrefsView>,
+    /// The `AccountProgress` reports that waits for a login step passed over.
+    pub progress_seen: Vec<kourier_model::AccountProgress>,
 }
 
 /// How long a single wait in these helpers may take.
@@ -730,6 +778,7 @@ impl FakeCore {
             pump: Some(pump),
             _ui: ends.ui,
             _prefs: ends.local_prefs,
+            progress_seen: Vec::new(),
         })
     }
 
@@ -746,6 +795,7 @@ impl FakeCore {
         loop {
             match tokio::time::timeout(WAIT, self.ephemeral.recv()).await {
                 Ok(Some(BackendEvent::Login(step))) => return step,
+                Ok(Some(BackendEvent::AccountProgress(p))) => self.progress_seen.push(p),
                 Ok(Some(_)) => {}
                 Ok(None) => panic!("the actor stopped before the next login step"),
                 Err(_) => panic!("no login step within {WAIT:?}"),
@@ -814,6 +864,7 @@ impl FakeCore {
         self.send(Command::StartLogin {
             flow: "qr".to_owned(),
             relink,
+            taken: Vec::new(),
         })
         .await;
         let mut steps = Vec::new();
@@ -902,6 +953,20 @@ impl FakeCore {
         self.join().await
     }
 
+    /// Sends `Logout`, waits for the exit, and returns it with the `Logout` reports the actor
+    /// sent before it (exactly one is expected; the other ephemeral events are dropped).
+    pub async fn logout(mut self) -> (Exit, Vec<kourier_model::LogoutReport>) {
+        let _ = self.commands.send(Command::Logout).await;
+        let exit = self.join().await;
+        let mut reports = Vec::new();
+        while let Ok(event) = self.ephemeral.try_recv() {
+            if let BackendEvent::Logout(report) = event {
+                reports.push(report);
+            }
+        }
+        (exit, reports)
+    }
+
     async fn join(&mut self) -> Exit {
         let exited = self.exited.take().expect("joined once");
         let exit = tokio::time::timeout(WAIT, exited)
@@ -985,6 +1050,34 @@ async fn pump(
                         ack.complete(Err(PersistError {
                             retryable: true,
                             detail: "a test cannot store this history row".to_owned(),
+                        }));
+                        continue;
+                    }
+                }
+                if sink.behavior("refuse_wide_chats").as_deref() == Some("1") {
+                    let mut chats: Vec<&ConvKey> = Vec::new();
+                    for event in &envelope.events {
+                        if let BackendEvent::ConversationUpsert(patch) = event
+                            && !chats.contains(&&patch.key)
+                        {
+                            chats.push(&patch.key);
+                        }
+                    }
+                    if chats.len() >= 2 {
+                        if let Some(ms) = sink
+                            .behavior("refuse_wide_chats_delay_ms")
+                            .and_then(|v| v.parse().ok())
+                        {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                        }
+                        let refused = sink
+                            .behavior("refused_wide")
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        sink.set_behavior("refused_wide", Some(&(refused + 1).to_string()));
+                        ack.complete(Err(PersistError {
+                            retryable: false,
+                            detail: "a test refuses a row of several chats".to_owned(),
                         }));
                         continue;
                     }

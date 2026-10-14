@@ -30,6 +30,7 @@ use super::DeriveJob;
 use super::policy::MAX_LONG_TEXT_BYTES;
 use crate::error::Result;
 use crate::ingest::{Apply, Changes};
+use crate::media::DeriveHold;
 use crate::runtime::Shared;
 use crate::sql;
 use crate::store::lane;
@@ -390,8 +391,10 @@ pub(crate) fn repair_thumbs(
             .await;
         match forgotten {
             Ok((ch, jobs)) => {
+                // Counted before the events that tell the UI the thumbnails are gone.
+                let hold = sh.media.reserve(jobs.len());
                 sh.publish_local(account, &blob_dir, ch).await;
-                spawn(&sh, account, scope, blob_dir, jobs);
+                spawn(&sh, account, scope, blob_dir, jobs, hold);
             }
             Err(e) => {
                 tracing::warn!(account = account.0, error = %e, "forgetting broken thumbnails failed")
@@ -448,7 +451,8 @@ fn without_long_text(body: Body, idx: usize, whole: Option<&str>) -> Body {
 /// Joins the downloaded long text of `job` into its message: the attachment row and its file go
 /// (the rows behind it move up, as in the body's list), and the whole text replaces the text of
 /// the original body: the message row's, or revision 0 once the message was edited (the edits
-/// keep their own texts and lose only the attachment entry).
+/// keep their own texts and lose only the attachment entry). An imported edited message has no
+/// body of its revision 0: there the text is the newest revision's.
 fn join_long_text(apply: &mut Apply<'_>, job: &DeriveJob, whole: &str) -> Result<()> {
     let conn = apply.conn;
     let message = MessageId(job.message.0);
@@ -481,10 +485,20 @@ fn join_long_text(apply: &mut Apply<'_>, job: &DeriveJob, whole: &str) -> Result
 
     let revisions: Vec<(i64, Option<String>, bool)> = conn
         .prepare_cached(
-            "SELECT rowid, body, edited_at IS NULL FROM message_revisions WHERE message_id = ?1",
+            "SELECT rowid, body, edited_at IS NULL FROM message_revisions WHERE message_id = ?1
+             ORDER BY revision",
         )?
         .query_map([message.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
+    // The revision the text belongs to: the original's (revision 0) when it has a body, as for
+    // a live message edited before its rest arrived. An imported edited message has no body
+    // of its original (only the newest version's content is in the archive): its text is that
+    // of the NEWEST revision with a body, the one the row shows.
+    let whole_into = revisions
+        .iter()
+        .find(|(_, body, original)| *original && body.is_some())
+        .or_else(|| revisions.iter().rev().find(|(_, body, _)| body.is_some()))
+        .map(|(rowid, _, _)| *rowid);
     if revisions.is_empty() {
         let joined = without_long_text(sql::from_json(&body)?, at, Some(whole));
         conn.prepare_cached(
@@ -497,9 +511,10 @@ fn join_long_text(apply: &mut Apply<'_>, job: &DeriveJob, whole: &str) -> Result
             crate::ingest::preview(&joined)
         ])?;
     } else {
-        for (rowid, body, original) in revisions {
+        for (rowid, body, _) in revisions {
             let Some(body) = body else { continue };
-            let joined = without_long_text(sql::from_json(&body)?, at, original.then_some(whole));
+            let text = (Some(rowid) == whole_into).then_some(whole);
+            let joined = without_long_text(sql::from_json(&body)?, at, text);
             conn.prepare_cached("UPDATE message_revisions SET body = ?2 WHERE rowid = ?1")?
                 .execute((rowid, sql::to_json(&joined)?))?;
         }
@@ -514,12 +529,18 @@ fn join_long_text(apply: &mut Apply<'_>, job: &DeriveJob, whole: &str) -> Result
 /// the same time), and records and publishes the results in groups: a result waits for the
 /// rest of its group only while those are being computed, never for a result that is not
 /// on its way.
+///
+/// `hold` counts these jobs in [`MediaHandles::deriving`](crate::media::MediaHandles::deriving)
+/// (reserved by the caller before the UI events of the `Changes` they came with, one job each);
+/// the task releases a job when the group that recorded it has been published, and the rest
+/// when it ends, however it ends.
 pub(crate) fn spawn(
     sh: &Arc<Shared>,
     account: AccountId,
     scope: MsgIdScope,
     blob_dir: PathBuf,
     jobs: Vec<DeriveJob>,
+    mut hold: DeriveHold,
 ) {
     if jobs.is_empty() {
         return;
@@ -528,10 +549,27 @@ pub(crate) fn spawn(
     tokio::spawn(async move {
         let mut jobs = jobs.into_iter().peekable();
         let mut group: Vec<(DeriveJob, Outcome)> = Vec::new();
+        // Jobs taken from the list whose group has not been published yet.
+        let mut unpublished = 0;
+        let mut open = sh.media.derives_open();
         while let Some(job) = jobs.next() {
+            // (Held only by a test: `MediaHandles::hold_derives`.)
+            if open.wait_for(|open| *open).await.is_err() {
+                return;
+            }
+            unpublished += 1;
             let Ok(permit) = sh.derive_permits.clone().acquire_owned().await else {
                 return;
             };
+            // A removed account's files are going and its rows with them: nothing to derive,
+            // nothing to record (link feedback L4, F6).
+            if sh.is_removing(account) {
+                tracing::debug!(
+                    account = account.0,
+                    "the account is being removed: its thumbnails stop"
+                );
+                return;
+            }
             let (dir, j) = (blob_dir.clone(), job.clone());
             let outcome = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -555,6 +593,10 @@ pub(crate) fn spawn(
                     _ => None,
                 })
                 .collect();
+            if sh.is_removing(account) {
+                // Written but never recorded: the account's directory goes with them.
+                return;
+            }
             let now = sh.now();
             let res = sh
                 .store
@@ -573,7 +615,11 @@ pub(crate) fn spawn(
                     }
                 }
             }
+            // The URLs of this group's pictures have changed (or nothing more will for them).
+            hold.release(std::mem::take(&mut unpublished));
         }
+        // `hold` goes with the task: what is left (jobs that failed to compute, a task that
+        // stopped early) is released here, on every `return` above, and when the task is dropped.
     });
 }
 
@@ -817,5 +863,121 @@ mod tests {
             )
             .expect("counts");
         assert_eq!(left, (0, 0));
+    }
+
+    /// An imported edited message (`IncomingMessage.edits`) has no body of its original
+    /// revision: the archive holds only the newest version. Its long text, fetched by itself
+    /// (user decision, 2026-10-10), completes the NEWEST version, which is what the row shows;
+    /// joined into revision 0 as for a live edit, the whole text went nowhere and the row
+    /// kept its first 2 KiB.
+    #[test]
+    fn a_long_text_of_an_imported_edited_message_completes_its_newest_version() {
+        use kourier_backend_api::HistoryEdit;
+        use kourier_fake::attachments::synthetic_long_text;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        let alice = UserId::parse(ALICE).expect("id");
+        let conv = ConvKey::Direct(alice.clone());
+        let mut h = IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([5; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse(ME).expect("id")],
+        )
+        .expect("harness");
+        let whole = "the whole text of the newest version. ".repeat(100);
+        let long = synthetic_long_text(&whole);
+        let pointer = Pointer::from_blob(long.remote.as_ref().expect("remote")).expect("ours");
+        let mut m = remote(&conv, &alice, "1000", 1_000, "");
+        m.body = Body::Media {
+            attachments: vec![long],
+            caption: Some(Text::plain(&whole[..2048])),
+        };
+        m.read = true;
+        m.edits = vec![HistoryEdit {
+            local: "2000".into(),
+            at: 2_000,
+        }];
+        h.apply(vec![BackendEvent::HistoryBatch {
+            conv: conv.clone(),
+            messages: vec![m],
+            has_more: false,
+            progress: None,
+        }])
+        .expect("history");
+        let (att, path, key): (i64, String, Vec<u8>) = h
+            .connection()
+            .query_row(
+                "SELECT attachment_id, path, key FROM attachment_downloads",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("an imported long text is fetched without a click");
+        let plain = pointer.plaintext().expect("bytes").expect("ok");
+        let target = blobs.join(&path);
+        std::fs::create_dir_all(target.parent().expect("shard")).expect("shard dir");
+        let key: [u8; 32] = key.try_into().expect("key");
+        kourier_blob::write_all(&target, &FileKey::from_bytes(key), &plain).expect("blob");
+        h.apply(vec![BackendEvent::AttachmentDone {
+            attachment: AttachmentId(att),
+            request: None,
+            result: Ok(AttachmentMeta {
+                size: plain.len() as u64,
+                ..AttachmentMeta::default()
+            }),
+        }])
+        .expect("done");
+        let account = h.account();
+        let jobs = crate::ingest::pending_derives(h.connection(), account).expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        let outcome = compute(&blobs, &jobs[0]);
+        commit(
+            h.connection_mut(),
+            account,
+            MsgIdScope::AccountAuthor,
+            3_000,
+            &jobs[0],
+            outcome,
+        )
+        .expect("commit");
+
+        let (body, kind): (String, String) = h
+            .connection()
+            .query_row("SELECT body, body_kind FROM messages", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("row");
+        assert_eq!(kind, "Text");
+        assert_eq!(
+            serde_json::from_str::<Body>(&body).expect("body"),
+            Body::text(&whole),
+            "the row shows the whole text"
+        );
+        let revisions: Vec<Option<String>> = {
+            let mut stmt = h
+                .connection()
+                .prepare("SELECT body FROM message_revisions ORDER BY revision")
+                .expect("prepare");
+            stmt.query_map([], |r| r.get::<_, Option<String>>(0))
+                .expect("query")
+                .map(|b| b.expect("row"))
+                .collect()
+        };
+        let newest = revisions
+            .last()
+            .cloned()
+            .flatten()
+            .expect("the newest has a body");
+        assert_eq!(
+            serde_json::from_str::<Body>(&newest).expect("body"),
+            Body::text(&whole),
+            "the newest revision holds the whole text"
+        );
+        let left: i64 = h
+            .connection()
+            .query_row("SELECT count(*) FROM attachments", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(left, 0);
     }
 }

@@ -58,6 +58,33 @@ pub mod qobject {
         #[cxx_name = "grabWindowToFile"]
         unsafe fn grab_window_to_file(window: *mut QObject, path: &QString) -> i32;
 
+        /// The images of `window` (a `QQuickWindow`) that are loading (-1: not a window).
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[cxx_name = "imagesLoading"]
+        unsafe fn images_loading(window: *mut QObject) -> i32;
+
+        /// The visible images of `window` that draw an attachment (`image://kourier/thumb/…`
+        /// or `…/att/…`), whatever their status (-1: not a window).
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[cxx_name = "attachmentPictures"]
+        unsafe fn attachment_pictures(window: *mut QObject) -> i32;
+
+        /// Grabs `window` and saves it at `path` when it equals the previous grab: returns the
+        /// luminance then, -2 when the frame differs from the previous one (it is kept), -1 on
+        /// failure.
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[cxx_name = "grabIfStable"]
+        unsafe fn grab_if_stable(window: *mut QObject, path: &QString) -> i32;
+
         /// Moves the pointer outside every window (headless screenshots).
         #[cxx_name = "parkCursor"]
         fn park_cursor();
@@ -104,6 +131,19 @@ pub mod qobject {
         /// Returns free heap memory to the system.
         #[cxx_name = "trimMemory"]
         fn trim_memory();
+
+        /// Notes the end of the desktop session when the session manager announces it (after
+        /// the application exists).
+        #[cxx_name = "watchSessionEnd"]
+        fn watch_session_end();
+
+        /// Whether the desktop session is ending.
+        #[cxx_name = "sessionEnding"]
+        fn session_ending() -> bool;
+
+        /// Sets what [`session_ending`] says (tests: no session manager is there to ask).
+        #[cxx_name = "setSessionEnding"]
+        fn set_session_ending(ending: bool);
     }
 
     unsafe extern "C++" {
@@ -122,6 +162,41 @@ pub mod qobject {
             engine: Pin<&mut QQmlApplicationEngine>,
             reader: fn(&str, i32, i32) -> Vec<u8>,
         );
+
+        /// Requests of the provider that are queued or being decoded.
+        #[cxx_name = "pendingImageRequests"]
+        fn pending_image_requests() -> i32;
+
+        /// Logs, while on, every request the provider gets as `id WxH` (the size Qt asked for:
+        /// `sourceSize` times the device pixel ratio); turning it on or off clears the log
+        /// (tests of picture quality).
+        #[cxx_name = "logImageRequests"]
+        fn log_image_requests(on: bool);
+
+        /// The requests logged since, in order; empties the log.
+        #[cxx_name = "takeImageRequestLog"]
+        fn take_image_request_log() -> Vec<String>;
+
+        /// A JPEG as stored (`width` x `height`, left half red, right half blue) with the EXIF
+        /// orientation tag `orientation` (1 to 8: 6 = shown rotated by 90 degrees, 8 = by 270)
+        /// and the pixels as stored, as a phone writes it; empty when it cannot be written
+        /// (tests of the decoder).
+        #[cxx_name = "orientedImage"]
+        fn oriented_image(width: i32, height: i32, orientation: i32) -> Vec<u8>;
+
+        /// `[width, height, pictures scaled after the decoder had decoded them whole (0: the
+        /// decoder scaled), colour in the middle of the top tenth, of the bottom tenth, the pixels the
+        /// decoder made]` of
+        /// `file` decoded as the provider does for a request of `width` x `height` (cut to a
+        /// square when `cornered`); empty when nothing was decoded (tests of the decoder).
+        #[cxx_name = "decodeProbe"]
+        fn decode_probe(
+            file: Vec<u8>,
+            codec: u8,
+            width: i32,
+            height: i32,
+            cornered: bool,
+        ) -> Vec<i32>;
 
         /// Whether the clipboard holds an image; if so it is encoded as PNG on a worker thread
         /// and handed to `done` there (Qt thread only).
@@ -163,6 +238,12 @@ pub mod qobject {
         #[cxx_name = "avatarCornerProbe"]
         fn avatar_corner_probe(bytes: Vec<u8>, codec: u8, side: i32, radius: i32) -> i32;
 
+        /// `[width, height, transparent area of the top left quarter in pixels]` of the PNG `grab`
+        /// of a cornered avatar (the area is the sum of 1 - alpha/255; a quarter circle of radius
+        /// r has r² (1 - pi/4)); empty when it does not decode (tests of picture quality).
+        #[cxx_name = "cornerProbe"]
+        fn corner_probe(grab: Vec<u8>) -> Vec<f64>;
+
         /// A gradient PNG (fixture screenshots of the composer).
         #[cxx_name = "samplePng"]
         fn sample_png(width: i32, height: i32, hue: i32) -> Vec<u8>;
@@ -171,6 +252,19 @@ pub mod qobject {
         /// cannot (tests of the decoders).
         #[cxx_name = "sampleImage"]
         fn sample_image(width: i32, height: i32, hue: i32, format: &str) -> Vec<u8>;
+
+        /// A picture of fine detail (stripes, two lines of text, thin diagonals) in a
+        /// Qt format; empty when it cannot be written (tests of picture quality).
+        #[cxx_name = "detailImage"]
+        fn detail_image(width: i32, height: i32, format: &str) -> Vec<u8>;
+
+        /// `[coarse psnr in dB against the provider's answer, variance of the Laplacian of the grab,
+        /// the same of the file scaled smoothly, grab width, grab height, coarse psnr in dB
+        /// against that scaled file, the same variance of the provider's answer]` for the PNG `grab`
+        /// of an item and the `file` (decoded by `codec`) it shows; empty when either does
+        /// not decode (tests of picture quality).
+        #[cxx_name = "pictureProbe"]
+        fn picture_probe(file: Vec<u8>, codec: u8, grab: Vec<u8>) -> Vec<f64>;
     }
 
     // ---- App -------------------------------------------------------------------------------
@@ -203,8 +297,8 @@ pub mod qobject {
         #[qproperty(QString, banner_action)]
         #[qproperty(i64, banner_account)]
         #[qproperty(QVariant, banner_transfer)]
-        #[qproperty(QVariant, link_transfer)]
         #[qproperty(QVariant, history_accounts)]
+        #[qproperty(QVariant, account_actions)]
         #[qproperty(QVariant, revisions)]
         #[qproperty(QVariant, networks, READ, CONSTANT)]
         #[qproperty(*mut AccountListModel, accounts, READ, CONSTANT)]
@@ -455,7 +549,7 @@ pub mod qobject {
         fn relink_started(self: Pin<&mut App>);
 
         /// "Continue Without History": ends the wait for the history transfer of `account`,
-        /// or its download (`linkTransfer.skip`, `bannerTransfer.skip`). The view stays
+        /// or its download (`bannerTransfer.skip`). The view stays
         /// until the backend reports the end.
         #[qinvokable]
         fn skip_transfer(self: Pin<&mut App>, account: i64);
@@ -486,6 +580,48 @@ pub mod qobject {
         /// The question was closed without confirming.
         #[qinvokable]
         fn cancel_replace(self: Pin<&mut App>);
+
+        /// "Remove Account…" (`action` "remove") or "Unlink…" ("unlink") of `account`
+        /// (`accountActions`, the drawer's menu): asks for the question to be put
+        /// (`accountActionAsked`) before anything happens. Nothing is sent; nothing happens
+        /// when the account is gone or does not offer the action.
+        #[qinvokable]
+        fn ask_account_action(self: Pin<&mut App>, account: i64, action: &QString);
+
+        /// Put this question to the user: the map of `replaceAsked` and its `action`. The
+        /// answer is `confirmAccountAction` or `cancelAccountAction`.
+        #[qsignal]
+        fn account_action_asked(self: Pin<&mut App>, question: QVariant);
+
+        /// The user confirmed the question that `askAccountAction` opened about `account`
+        /// and `action`: the command goes out, alone. Without that question open nothing
+        /// happens.
+        #[qinvokable]
+        fn confirm_account_action(self: Pin<&mut App>, account: i64, action: &QString);
+
+        /// The question about an account action was closed without confirming.
+        #[qinvokable]
+        fn cancel_account_action(self: Pin<&mut App>);
+
+        /// What became of the device of a removed or unlinked account, told once: `text`
+        /// (what happened here); when the network could not be told, `onPhone` (what to do
+        /// on the phone) and `title`, and the notice stays until the user closes it.
+        #[qsignal]
+        fn logout_notice(self: Pin<&mut App>, text: QString, on_phone: QString, title: QString);
+
+        /// The question to put before an action that would cancel the link in progress
+        /// (opening Settings, "Link Again" of an account while a link waits at its QR
+        /// code): a map of `title`, `text`, `confirm` (cancels the link and goes on) and
+        /// `cancel` (keeps it, the default); `undefined` when nothing would be lost.
+        #[qinvokable]
+        fn abandon_question(self: &App) -> QVariant;
+
+        /// The question before the application quits (`buttons.md` F8: closing the window,
+        /// Ctrl+Q): while a history transfer runs or a new link still fetches its contacts
+        /// and groups. The same map as `abandon_question` (`confirm` quits, `cancel` keeps
+        /// the application open, the default); `undefined` when nothing runs.
+        #[qinvokable]
+        fn quit_question(self: &App) -> QVariant;
 
         /// A history transfer ended: say `text` once, in passing.
         #[qsignal]
@@ -538,6 +674,48 @@ pub mod qobject {
             window: *mut QObject,
             path: &QString,
         ) -> bool;
+
+        /// What still keeps a `--screenshot` from being final, as the reasons ("images 2,
+        /// requests 1, derive 3"); empty when nothing does: the images of `window` that are
+        /// loading, the provider's unfinished requests and the thumbnails the core still derives.
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[qinvokable]
+        unsafe fn screenshot_holds(self: &App, window: *mut QObject) -> QString;
+
+        /// Saves a screenshot of `window` to `path` when the frame equals the previous call's
+        /// (two equal frames in a row: nothing moves); prints `shot: <path> luma=<n>
+        /// settle_ms=<settle_ms>` then and returns the luminance. -2: the frame differs from the
+        /// previous one, call again; -1: failed.
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[qinvokable]
+        unsafe fn save_screenshot_if_stable(
+            self: Pin<&mut App>,
+            window: *mut QObject,
+            path: &QString,
+            settle_ms: i32,
+        ) -> i32;
+
+        /// The last resort of a `--screenshot` that did not settle: saves the frame as it is,
+        /// prints the `shot:` line and `shot: unsettled <holds>` on stderr (`cargo xtask shots`
+        /// makes that a failure of the render). Returns the luminance, or -1.
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[qinvokable]
+        unsafe fn save_unsettled_screenshot(
+            self: Pin<&mut App>,
+            window: *mut QObject,
+            path: &QString,
+            holds: &QString,
+            settle_ms: i32,
+        ) -> i32;
     }
 
     impl cxx_qt::Threading for App {}
@@ -788,6 +966,7 @@ pub mod qobject {
         #[qproperty(i32, timer_custom_max)]
         #[qproperty(i32, timer_custom_step)]
         #[qproperty(bool, deletes_sync)]
+        #[qproperty(QString, still_filling)]
         #[qproperty(bool, has_older)]
         #[qproperty(bool, has_newer)]
         #[qproperty(bool, loading)]
@@ -808,6 +987,11 @@ pub mod qobject {
         /// in place.
         #[qinvokable]
         fn read_more(self: Pin<&mut TimelineModel>, message: i64);
+
+        /// How many pictures, videos and files of the rows shown are downloading (a
+        /// `--screenshot` waits for 0).
+        #[qinvokable]
+        fn downloading_attachments(self: &TimelineModel) -> i32;
     }
 
     #[auto_cxx_name]
@@ -1015,6 +1199,7 @@ pub mod qobject {
         #[qproperty(f64, progress)]
         #[qproperty(QString, error)]
         #[qproperty(bool, retry)]
+        #[qproperty(QString, leave)]
         #[qproperty(QVariant, fields)]
         type LoginController = super::LoginRust;
 

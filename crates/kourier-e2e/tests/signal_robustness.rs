@@ -17,6 +17,17 @@
 //! - [`a_link_cancelled_at_its_last_step_leaves_no_device_on_the_phone`]: the user cancels
 //!   while the link request is on its way and the server has linked the device already; the
 //!   account is gone from the app and the device from the phone's list.
+//! - [`a_second_link_of_the_same_phone_is_refused_and_leaves_one_device`]: the phone links
+//!   again into a profile that has its account; the second account is refused BEFORE the
+//!   link request (no `PUT /v1/devices/link`, the phone's list never shows a third device)
+//!   and is gone.
+//! - [`a_fresh_link_of_a_logged_out_account_is_refused_before_a_device_exists`]: the same
+//!   for an account the phone unlinked: the refusal points at "Link Again".
+//! - [`removing_an_account_and_linking_the_same_phone_at_once_is_not_refused`]: "Remove and Link
+//!   Again": the account being removed does not count as one the phone's link must not bring.
+//! - [`an_account_made_between_a_logins_start_and_its_scan_is_still_refused`]: two links of one
+//!   phone at once; the one scanned last is refused by the core after its device exists, and
+//!   that device is logged out again.
 //!
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
@@ -28,7 +39,8 @@ use std::time::Duration;
 
 use kourier_core::facade::{OriginKind, UiCommand, UiEvent};
 use kourier_model::{
-    AccountId, AccountState, ConnState, LoginStepKind, OutgoingState, Redacted, Text, UserAction,
+    AccountId, AccountState, ConnState, DeviceLogout, ErrorKind, LoginStepKind, OutgoingState,
+    Redacted, Text, UserAction,
 };
 use support::harness::{DeviceInfo, SendText};
 use support::{App, WAIT, World, user};
@@ -597,6 +609,419 @@ async fn a_link_cancelled_at_its_last_step_leaves_no_device_on_the_phone() {
     assert_ne!(again, account);
     assert_eq!(devices().await, 2);
     assert_eq!(device.aci, world.phone.aci);
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// L1 (`buttons.md` F2): the same phone links a second time into a profile that has its
+/// account. The Signal backend knows the other accounts' ids (`Command::StartLogin::taken`)
+/// and refuses the link when the phone's message names one of them (`AlreadyAdded`), BEFORE
+/// `PUT /v1/devices/link`: the server saw no link request, the phone's list never showed a
+/// third device, the second account is gone and the first stays as it was. (The core's own
+/// check at `AccountReady` is the second line: `kourier-core/tests/lifecycle.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_link_of_the_same_phone_is_refused_and_leaves_one_device() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let devices = async || {
+        harness
+            .list_devices(&world.phone.device_ref)
+            .await
+            .expect("listDevices")
+            .len()
+    };
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    let (first, device) = app.link(&world).await;
+    assert_eq!(devices().await, 2, "the phone and our first device");
+
+    let links_before = harness.send_stats().await.expect("sendStats").link_requests;
+    assert_eq!(
+        links_before, 1,
+        "the first device was linked by one request"
+    );
+    let (second, url) = app.begin_link().await;
+    assert_ne!(second, first);
+    let refused = {
+        // The harness waits for the device's one-time keys, which a refused device may never
+        // upload: its end is not awaited, only the app's answer.
+        let provision = harness.complete_provision(&url, &world.phone.device_ref, WAIT);
+        tokio::pin!(provision);
+        let failed = app.event("the second link fails", |e| match e {
+            UiEvent::LoginStep { account, step } if *account == second => match &step.kind {
+                LoginStepKind::Failed { error } => Some(error.kind.clone()),
+                LoginStepKind::Done => panic!("the second link of one phone was taken"),
+                _ => None,
+            },
+            _ => None,
+        });
+        tokio::pin!(failed);
+        let mut provisioned = false;
+        loop {
+            tokio::select! {
+                _ = &mut provision, if !provisioned => provisioned = true,
+                kind = &mut failed => break kind,
+            }
+        }
+    };
+    assert_eq!(refused, ErrorKind::AlreadyAdded { logged_out: false });
+    // No device was ever made for the second link: the server saw no link request, and the
+    // phone's list stays at two for as long as one would take to appear and be removed again.
+    for _ in 0..30 {
+        assert_eq!(
+            devices().await,
+            2,
+            "a device of the refused link showed up on the phone's account"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        harness.send_stats().await.expect("sendStats").link_requests,
+        links_before,
+        "the refused link reached PUT /v1/devices/link: a device was made, however briefly"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while app.account(second).await.is_some() || devices().await != 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second account still listed: {}, devices on the phone's account: {}",
+            app.account(second).await.is_some(),
+            devices().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = app.account(first).await.expect("the first account is kept");
+    assert_eq!(row.state, AccountState::Active);
+    assert_eq!(row.own_device, Some(device.device_id));
+    // The device left on the phone's list is the first one.
+    let listed = harness
+        .list_devices(&world.phone.device_ref)
+        .await
+        .expect("listDevices");
+    assert!(
+        listed.iter().any(|d| d.device_id == device.device_id),
+        "the first device is the one listed"
+    );
+    app.wait_online(first).await;
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// L1 (`buttons.md` F2): the phone unlinked this computer ("logged out"), and a FRESH link of
+/// the same phone is started instead of "Link Again". It is refused before a device exists,
+/// saying that the account is logged out (the page points at "Link Again"), and the logged-out
+/// account stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_link_of_a_logged_out_account_is_refused_before_a_device_exists() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    let (first, device) = app.link(&world).await;
+    // The phone unlinks this computer.
+    harness
+        .unlink(&world.phone.device_ref, &device.device_ref)
+        .await
+        .expect("unlink");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !matches!(
+        app.account(first).await.map(|a| a.state),
+        Some(AccountState::LoggedOut { .. })
+    ) {
+        assert!(tokio::time::Instant::now() < deadline, "never logged out");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let links_before = harness.send_stats().await.expect("sendStats").link_requests;
+
+    let (second, url) = app.begin_link().await;
+    let refused = {
+        let provision = harness.complete_provision(&url, &world.phone.device_ref, WAIT);
+        tokio::pin!(provision);
+        let failed = app.event("the fresh link fails", |e| match e {
+            UiEvent::LoginStep { account, step } if *account == second => match &step.kind {
+                LoginStepKind::Failed { error } => Some(error.kind.clone()),
+                LoginStepKind::Done => panic!("a logged-out account was linked a second time"),
+                _ => None,
+            },
+            _ => None,
+        });
+        tokio::pin!(failed);
+        let mut provisioned = false;
+        loop {
+            tokio::select! {
+                _ = &mut provision, if !provisioned => provisioned = true,
+                kind = &mut failed => break kind,
+            }
+        }
+    };
+    assert_eq!(refused, ErrorKind::AlreadyAdded { logged_out: true });
+    assert_eq!(
+        harness.send_stats().await.expect("sendStats").link_requests,
+        links_before,
+        "the refused link reached PUT /v1/devices/link"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while app.account(second).await.is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second account still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = app.account(first).await.expect("the account is kept");
+    assert!(
+        matches!(row.state, AccountState::LoggedOut { .. }),
+        "still logged out, to be linked again from its banner"
+    );
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// "Remove and Link Again" (`ReplaceAccountDialog`): the window sends `RemoveAccount` and
+/// `AddAccount` back to back and the phone scans the new code at once. The account that is
+/// being removed is not one of the `taken` identities (the new login is not turned away as
+/// "already in Kourier"), the new device is linked, and the removed account's device is gone
+/// from the phone's list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_an_account_and_linking_the_same_phone_at_once_is_not_refused() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    let (first, old_device) = app.link(&world).await;
+    // The window's two commands, one right behind the other.
+    app.send(UiCommand::RemoveAccount { account: first });
+    let (second, new_device) = app.link(&world).await;
+    assert_ne!(second, first);
+    // (The mock hands out the lowest free device id, so the new device may carry the id of
+    // the one that was removed: the phone's list is counted, not compared by id.)
+    let _ = old_device;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let listed = harness
+            .list_devices(&world.phone.device_ref)
+            .await
+            .expect("listDevices");
+        if app.account(first).await.is_none()
+            && listed.len() == 2
+            && listed.iter().any(|d| d.device_id == new_device.device_id)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the removed account is still listed or its device is still on the phone: {listed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = app.account(second).await.expect("the new account");
+    assert_eq!(row.state, AccountState::Active);
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// L5 (`L1-recheck.md` new 2): two links of ONE phone started at once. The first login's
+/// `taken` was read before the second account existed, so the backend's early check lets
+/// its scan through; the core's check at `AccountReady` is what refuses it, after the server
+/// made its device. The refused device is logged out again: the phone's list ends with the
+/// phone and the second login's device, never three, and the account that linked first stays
+/// Active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_made_between_a_logins_start_and_its_scan_is_still_refused() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let devices = async || {
+        harness
+            .list_devices(&world.phone.device_ref)
+            .await
+            .expect("listDevices")
+    };
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    // The early login waits at its QR code, its `taken` empty.
+    let (early, early_url) = app.begin_link().await;
+    // A second login of the same phone runs to the end meanwhile.
+    let (late, device) = app.link(&world).await;
+    assert_ne!(early, late);
+    assert_eq!(devices().await.len(), 2, "the phone and the late device");
+
+    // Now the phone scans the early code.
+    let refused = {
+        let provision = harness.complete_provision(&early_url, &world.phone.device_ref, WAIT);
+        tokio::pin!(provision);
+        let failed = app.event("the early link fails", |e| match e {
+            UiEvent::LoginStep { account, step } if *account == early => match &step.kind {
+                LoginStepKind::Failed { error } => Some(error.kind.clone()),
+                LoginStepKind::Done => panic!("one phone was linked twice into one profile"),
+                _ => None,
+            },
+            _ => None,
+        });
+        tokio::pin!(failed);
+        let mut provisioned = false;
+        loop {
+            tokio::select! {
+                _ = &mut provision, if !provisioned => provisioned = true,
+                kind = &mut failed => break kind,
+            }
+        }
+    };
+    assert_eq!(refused, ErrorKind::AlreadyAdded { logged_out: false });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let listed = devices().await;
+        assert!(
+            listed.len() <= 3,
+            "more devices than the phone and two links: {listed:?}"
+        );
+        if app.account(early).await.is_none()
+            && listed.len() == 2
+            && listed.iter().any(|d| d.device_id == device.device_id)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refused account is still listed ({}) or its device is still on the phone: \
+             {listed:?}",
+            app.account(early).await.is_some()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = app.account(late).await.expect("the late account is kept");
+    assert_eq!(row.state, AccountState::Active);
+    assert_eq!(row.own_device, Some(device.device_id));
+    // Only one account directory is left.
+    let accounts = world.tmp.path().join("data").join("accounts");
+    let left = std::fs::read_dir(&accounts).map_or(0, Iterator::count);
+    assert_eq!(left, 1, "the refused account's directory is gone");
+    app.wait_online(late).await;
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// Link feedback L5 (`L4-lead.md`): the removal and the unlink a quit cut off are finished at
+/// the next start through the REAL Signal actor (`log_out_unstarted`: an actor started in
+/// `Resume` that is told only `Logout`, never `Connect`), and while the account is online the
+/// logout goes over the socket that stands. Each ends with the device gone from the phone's
+/// list and the user told `Removed`.
+fn mark_state(dir: &Path, account: AccountId, state: &str) {
+    let conn = kourier_db::open(
+        &dir.join("data").join("core.db"),
+        &kourier_db::DbKey::from(support::CORE_KEY),
+    )
+    .expect("open core.db");
+    conn.execute(
+        "UPDATE accounts SET state = ?2 WHERE id = ?1",
+        (account.0, state),
+    )
+    .expect("mark");
+}
+
+async fn logout_outcome(app: &mut App, account: AccountId) -> (bool, DeviceLogout) {
+    app.event("LogoutOutcome", |e| match e {
+        UiEvent::LogoutOutcome {
+            account: a,
+            removed,
+            report,
+            ..
+        } if *a == account => Some((*removed, report.outcome)),
+        _ => None,
+    })
+    .await
+}
+
+async fn phone_devices(world: &World) -> usize {
+    world
+        .harness
+        .list_devices(&world.phone.device_ref)
+        .await
+        .expect("listDevices")
+        .len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_and_an_unlink_cut_off_by_a_quit_log_the_device_out_at_the_next_start() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    for (state, removed) in [("Removing", true), ("Unlinking", false)] {
+        let dir = world.tmp.path().join(state);
+        let mut app = App::start(&dir, &world.env).await;
+        let (account, _) = app.link(&world).await;
+        app.wait_online(account).await;
+        assert_eq!(
+            phone_devices(&world).await,
+            2,
+            "{state}: the phone and ours"
+        );
+        app.stop().await;
+        // What a quit in the middle of the removal (or the unlink) leaves: the mark.
+        mark_state(&dir, account, state);
+        let mut app = App::start(&dir, &world.env).await;
+        let (was_removed, outcome) = logout_outcome(&mut app, account).await;
+        assert_eq!(was_removed, removed, "{state}");
+        assert_eq!(outcome, DeviceLogout::Removed, "{state}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while phone_devices(&world).await != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{state}: our device is still on the phone"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let row = app.account(account).await;
+        if removed {
+            assert!(row.is_none(), "the removed account is still listed");
+        } else {
+            let row = row.expect("an unlinked account stays with its chats");
+            assert!(
+                matches!(row.state, AccountState::LoggedOut { .. }),
+                "unlinked: {:?}",
+                row.state
+            );
+        }
+        app.stop().await;
+    }
+    world.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_while_online_logs_the_device_out_over_the_open_socket() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    let (account, device) = app.link(&world).await;
+    app.wait_online(account).await;
+    assert_eq!(phone_devices(&world).await, 2);
+    let stats = world
+        .harness
+        .connection_stats(&device.device_ref)
+        .await
+        .expect("connectionStats");
+    assert!(stats.open, "online means a socket stands");
+    app.send(UiCommand::RemoveAccount { account });
+    let (was_removed, outcome) = logout_outcome(&mut app, account).await;
+    assert!(was_removed);
+    assert_eq!(outcome, DeviceLogout::Removed);
+    assert_eq!(phone_devices(&world).await, 1, "our device is gone at once");
+    let after = world
+        .harness
+        .connection_stats(&device.device_ref)
+        .await
+        .expect("connectionStats");
+    assert_eq!(
+        after.connects, stats.connects,
+        "the logout opened a socket of its own beside the one that stood"
+    );
+    assert!(app.account(account).await.is_none());
     app.stop().await;
     world.shutdown().await;
 }

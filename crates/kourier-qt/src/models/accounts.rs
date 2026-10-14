@@ -8,7 +8,7 @@ use kourier_viewmodel::diff::RoleSet;
 use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
-const ROLES: [&str; 10] = [
+const ROLES: [&str; 11] = [
     "accountId",
     "name",
     "network",
@@ -19,6 +19,7 @@ const ROLES: [&str; 10] = [
     "unread",
     "avatarUrl",
     "number",
+    "device",
 ];
 
 /// Rust side of `AccountListModel`.
@@ -40,6 +41,7 @@ pub struct AccountQt {
     unread: i32,
     avatar_url: QString,
     number: QString,
+    device: QString,
 }
 
 impl AccountQt {
@@ -55,6 +57,7 @@ impl AccountQt {
             unread: i32::try_from(v.unread).unwrap_or(i32::MAX),
             avatar_url: QString::from(v.avatar_url.as_str()),
             number: QString::from(v.number.as_str()),
+            device: QString::from(v.device.as_str()),
         }
     }
 
@@ -69,6 +72,7 @@ impl AccountQt {
             .with_if(7, a.unread != b.unread)
             .with_if(8, a.avatar_url != b.avatar_url)
             .with_if(9, a.number != b.number)
+            .with_if(10, a.device != b.device)
     }
 
     fn key(v: &AccountRow) -> AccountId {
@@ -93,7 +97,8 @@ impl qobject::AccountListModel {
             6 => QVariant::from(&row.status_label),
             7 => QVariant::from(&row.unread),
             8 => QVariant::from(&row.avatar_url),
-            _ => QVariant::from(&row.number),
+            9 => QVariant::from(&row.number),
+            _ => QVariant::from(&row.device),
         }
     }
 

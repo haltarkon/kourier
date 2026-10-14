@@ -30,6 +30,7 @@ Kirigami.InlineMessage {
         Kirigami.Action {
             id: retry
             visible: root.retryLabel !== ""
+            enabled: visible
             text: root.retryLabel
             icon.name: "view-refresh"
             onTriggered: App.askReplace(root.account)
@@ -37,6 +38,7 @@ Kirigami.InlineMessage {
         Kirigami.Action {
             id: dismiss
             visible: root.dismissLabel !== ""
+            enabled: visible
             text: root.dismissLabel
             icon.name: "dialog-close"
             onTriggered: App.dismissTransfer(root.account)

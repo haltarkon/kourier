@@ -12,13 +12,16 @@
 //!    member list, the group is refreshed first (once per send).
 //! 3. Our chain (`send::sender_key`): started on first use, reset when older than
 //!    `desktop.senderKeyMaxAge`.
-//! 4. Sessions: a prekey fetch for recipients without a usable session.
+//! 4. Sessions: a prekey fetch for recipients without a usable session, up to
+//!    [`PREKEY_FETCHES_AT_ONCE`] at once after the sender certificate is cached (steps 6 and 9
+//!    make sure of the certificate before their sends too: one fetch, never one per member).
 //! 5. Partition: members with an endorsement and a session trusted for sending go the
 //!    sender-key way; the rest (and everyone when fewer than two qualify, or without
 //!    endorsements) get 1:1 sends, where an unconfirmed safety-number change fails that member
 //!    with `UntrustedIdentity` as in a 1:1 chat.
 //! 6. Member devices: a device that has our chain but is not in a full send means a member left:
-//!    the chain is reset; a device without our chain gets our distribution message first (1:1);
+//!    the chain is reset; a device without our chain gets our distribution message first (1:1,
+//!    up to [`MEMBER_SENDS_AT_ONCE`] members at once);
 //!    others that are gone are forgotten.
 //! 7. One zone: `group_encrypt`, the sealed content with the certificate without our number and
 //!    the group id, `sealed_sender_multi_recipient_encrypt`; then the multi-recipient send
@@ -27,8 +30,9 @@
 //!    zone, unregistered recipients marked; 409/410 → repair the device lists and restart;
 //!    401 or an answer the typed API does not know (404) → every member gets a 1:1 send;
 //!    connectivity, rate limits and server errors fail the sender-key recipients.
-//! 9. 1:1 sends to the rest (sealed with the access key, or the member's endorsement token when
-//!    sealed sender is off for them, else unsealed), each logged with the group id.
+//! 9. 1:1 sends to the rest (up to [`MEMBER_SENDS_AT_ONCE`] at once), sealed with the access
+//!    key, or the member's endorsement token when sealed sender is off for them, else
+//!    unsealed; each logged with the group id.
 //!
 //! [`transmit`] is `Command::Transmit` in a group: a message, an edit, a delete for everyone or
 //! a reaction ([`super::outgoing`]) with the group context, then the
@@ -36,12 +40,16 @@
 //! members an earlier attempt missed); per-recipient results merge into `TransmitOutcome::Partial`
 //! when some failed. [`send_typing`] sends typing indicators the same way (online only).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use kourier_backend_api::{OutgoingKind, OutgoingRequest, TransmitOutcome};
-use kourier_model::{BackendError, ConvKey, ErrorKind, RecipientState, UserId};
+use kourier_backend_api::{BackendEvent, Envelope, OutgoingKind, OutgoingRequest, TransmitOutcome};
+use kourier_model::{
+    BackendError, ConvKey, ErrorKind, LocalMsgId, RecipientState, SendPhase, UserId,
+};
 use libsignal_core::{Aci, DeviceId, ServiceId};
 use libsignal_protocol::{
     CiphertextMessageType, ProtocolAddress, SessionRecord, SessionStore as _, SignalProtocolError,
@@ -49,6 +57,7 @@ use libsignal_protocol::{
 };
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use super::content::{self, GroupContext, RecipientStatus, Thread, Transcript};
@@ -76,6 +85,86 @@ use crate::store::{
 /// Most restarts of one group send (Desktop's `MAX_RECURSION`).
 pub(crate) const MAX_RESTARTS: usize = 10;
 
+/// Prekey fetches of one group send at once (Desktop's `fetchKeysForServiceIds` runs up to 50).
+pub(crate) const PREKEY_FETCHES_AT_ONCE: usize = 32;
+
+/// 1:1 sends of one group send at once: distribution messages and the 1:1 fan-out (Desktop
+/// sends them with `Promise.all`; bounded here so a 1,000-member group does not open a
+/// thousand requests). Sends to one member still wait for each other (`SendLocks`).
+pub(crate) const MEMBER_SENDS_AT_ONCE: usize = 16;
+
+/// Runs `f` for every item with at most `limit` of them in flight, on this task, and returns
+/// the results in completion order.
+async fn bounded<I, F, Fut>(items: I, limit: usize, f: F) -> Vec<Fut::Output>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: std::future::Future,
+{
+    use futures::StreamExt as _;
+    futures::stream::iter(items)
+        .map(f)
+        .buffer_unordered(limit.max(1))
+        .collect()
+        .await
+}
+
+/// How often one phase of a group send is reported again with new counts: a few times a
+/// second at most (a new phase, and the last count of one, always go out at once).
+pub(crate) const PHASE_EVERY: Duration = Duration::from_millis(250);
+
+/// Reports what a group send of a message is doing to the core
+/// (`BackendEvent::TransmitProgress` with a phase, ephemeral; link feedback L6), throttled to
+/// [`PHASE_EVERY`] per phase.
+#[derive(Debug)]
+pub(crate) struct Phases {
+    events: mpsc::Sender<Envelope>,
+    local: LocalMsgId,
+    last: Cell<Option<(std::mem::Discriminant<SendPhase>, Instant)>>,
+}
+
+impl Phases {
+    pub(crate) fn new(events: mpsc::Sender<Envelope>, local: LocalMsgId) -> Self {
+        Self {
+            events,
+            local,
+            last: Cell::new(None),
+        }
+    }
+
+    /// Reports `phase` unless the same phase went out less than [`PHASE_EVERY`] ago. A lost
+    /// report changes nothing (the core is gone, or the next one comes).
+    pub(crate) async fn report(&self, phase: SendPhase) {
+        let now = Instant::now();
+        let kind = std::mem::discriminant(&phase);
+        let complete = matches!(
+            phase,
+            SendPhase::SettingUpKeys { done, of } | SendPhase::Sending { done, of } if done >= of
+        );
+        if let Some((last, at)) = self.last.get()
+            && last == kind
+            && !complete
+            && now.duration_since(at) < PHASE_EVERY
+        {
+            return;
+        }
+        self.last.set(Some((kind, now)));
+        let _ = self
+            .events
+            .send(Envelope::ephemeral(BackendEvent::TransmitProgress {
+                local: self.local,
+                progress: 0.0,
+                phase: Some(phase),
+            }))
+            .await;
+    }
+}
+
+/// A member count for a phase.
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// The sender-key path needs at least this many recipients (Desktop step 5).
 const MIN_SENDER_KEY_RECIPIENTS: usize = 2;
 
@@ -94,6 +183,16 @@ pub(crate) struct GroupSend<'a> {
     pub(crate) local: Option<&'a str>,
     /// Only these members (a resend); `None` = every member.
     pub(crate) only: Option<&'a [Aci]>,
+    /// Where its phases go (a message's send; `None`: typing and other sends nobody watches).
+    pub(crate) phases: Option<&'a Phases>,
+}
+
+impl GroupSend<'_> {
+    async fn report(&self, phase: SendPhase) {
+        if let Some(phases) = self.phases {
+            phases.report(phase).await;
+        }
+    }
 }
 
 /// What a group send achieved, per recipient.
@@ -105,6 +204,38 @@ pub(crate) struct GroupOutcome {
     pub(crate) failed: Vec<(Aci, BackendError)>,
     /// How many recipients went the sender-key way (log and tests).
     pub(crate) sender_key_recipients: usize,
+    /// Where the send's time went (the summary log line).
+    pub(crate) parts: SendParts,
+}
+
+/// Counts and times of one group send's parts, for its summary log line (diagnosis §2 item 3):
+/// tells a slow key setup from a refresh, device repairs or 1:1 sends.
+#[derive(Debug, Default)]
+pub(crate) struct SendParts {
+    /// Passes of the restart loop after the first.
+    pub(crate) restarts: usize,
+    /// The group was refreshed for its endorsements, and how long that took.
+    pub(crate) refreshed: bool,
+    pub(crate) refresh: Duration,
+    /// Members whose prekeys were fetched, and the time of those fetches.
+    pub(crate) prekey_fetches: usize,
+    pub(crate) fetch: Duration,
+    /// Members that got our distribution message, and the time of those sends.
+    pub(crate) skdm: usize,
+    pub(crate) skdm_time: Duration,
+    /// 409/410 entries repaired, and the time of the repairs.
+    pub(crate) repairs: usize,
+    pub(crate) repair: Duration,
+    /// The multi-recipient send (encryption and request).
+    pub(crate) multi: Duration,
+    /// Members that got 1:1 sends, and the time of those.
+    pub(crate) fanout: usize,
+    pub(crate) fanout_time: Duration,
+}
+
+/// Whole milliseconds of `d` for a log field.
+pub(crate) fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl GroupOutcome {
@@ -241,7 +372,8 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
     let mut endorsed: Option<Endorsements> = None;
     let mut endorsed_stamp: Option<(Option<u32>, Option<i64>, bool)> = None;
     let mut fan_out: Option<Vec<Aci>> = None;
-    for _ in 0..MAX_RESTARTS {
+    for pass in 0..MAX_RESTARTS {
+        outcome.parts.restarts = pass;
         let now = ctx.now();
         let Some(row) = ctx.db.read(|c| groups::load_by_id(c, group_id))? else {
             return Err(Error::Internal("the group vanished during a send"));
@@ -270,6 +402,8 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
             fan_out = Some(Vec::new());
             break;
         }
+        // Members of this send: the ones it is done for and the ones left.
+        let of = count(outcome.delivered.len() + outcome.failed.len() + members.len());
 
         // Step 2: endorsements, refreshing the group once when they are unusable. Verifying
         // them costs a zk check per member, so a restart reuses them until the group changed.
@@ -283,7 +417,12 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
         }
         if endorsed.is_none() && !refreshed && shared.zk_params.is_some() {
             refreshed = true;
-            match groups::refresh(shared, socket, account, &row).await {
+            outcome.parts.refreshed = true;
+            send.report(SendPhase::RefreshingGroup).await;
+            let started = Instant::now();
+            let refresh = groups::refresh(shared, socket, account, &row).await;
+            outcome.parts.refresh += started.elapsed();
+            match refresh {
                 Ok(()) => {
                     tracing::debug!(
                         group = %groups::log_id(group_id),
@@ -349,15 +488,39 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
             }
         }
         if !to_fetch.is_empty() {
-            for member in to_fetch {
-                fetched.insert(member);
+            fetched.extend(to_fetch.iter().copied());
+            outcome.parts.prekey_fetches += to_fetch.len();
+            let started = Instant::now();
+            let keys_of = count(to_fetch.len());
+            send.report(SendPhase::SettingUpKeys {
+                done: 0,
+                of: keys_of,
+            })
+            .await;
+            // Once, so the parallel fetches below find it cached instead of each asking.
+            sealed::warm_certificate(&ctx).await?;
+            let ctx = &ctx;
+            let done = Cell::new(0_u32);
+            let done = &done;
+            let failed = bounded(to_fetch, PREKEY_FETCHES_AT_ONCE, |member| {
                 let token = tokens.token(&[member]);
-                if let Err(e) = fetch_for(&ctx, member, token.as_deref()).await {
+                async move {
+                    let fetched = fetch_for(ctx, member, token.as_deref()).await;
+                    done.set(done.get() + 1);
+                    send.report(SendPhase::SettingUpKeys {
+                        done: done.get(),
+                        of: keys_of,
+                    })
+                    .await;
+                    let e = fetched.err()?;
                     // The 1:1 send repeats the fetch and reports the error for this member.
                     tracing::debug!(member = ?log_safe(member), error = %e, "prekey fetch failed");
-                    one_to_one.insert(member);
+                    Some(member)
                 }
-            }
+            })
+            .await;
+            outcome.parts.fetch += started.elapsed();
+            one_to_one.extend(failed.into_iter().flatten());
             continue;
         }
 
@@ -401,12 +564,22 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
             continue;
         }
         if !diff.new.is_empty() {
-            distribute(shared, &ctx, account, send, &chain, &diff.new, tokens)
-                .await?
-                .into_iter()
-                .for_each(|failed| {
-                    one_to_one.insert(failed);
-                });
+            // The distribution messages are sealed: the certificate is fetched once here when
+            // no earlier step did (every member may have a session already), not by every one
+            // of the sends below at the same time.
+            sealed::warm_certificate(&ctx).await?;
+            outcome.parts.skdm += diff
+                .new
+                .iter()
+                .map(|d| d.recipient.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let started = Instant::now();
+            let failed = distribute(shared, &ctx, account, send, &chain, &diff.new, tokens).await;
+            outcome.parts.skdm_time += started.elapsed();
+            failed?.into_iter().for_each(|failed| {
+                one_to_one.insert(failed);
+            });
             continue;
         }
         if !diff.removed.is_empty() {
@@ -415,6 +588,11 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
         }
 
         // Step 7: encrypt and send.
+        send.report(SendPhase::Sending {
+            done: count(outcome.delivered.len()),
+            of,
+        })
+        .await;
         let acis: Vec<Aci> = key_recipients.iter().map(|r| r.aci).collect();
         let Some(token) = tokens.token(&acis) else {
             fan_out = Some(members);
@@ -429,6 +607,7 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
                 break;
             }
         };
+        let multi_started = Instant::now();
         let padded = pad(&bytes);
         let encrypted = ctx.db.zone(|tx| {
             encrypt_multi(
@@ -489,6 +668,7 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
             }
             Err(e) => Err(e),
         };
+        outcome.parts.multi += multi_started.elapsed();
         match answer {
             Ok(MultiRecipientOutcome::Sent { unregistered }) => {
                 let now = ctx.now();
@@ -538,6 +718,11 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
                     }
                 }
                 outcome.sender_key_recipients = key_recipients.len();
+                send.report(SendPhase::Sending {
+                    done: count(outcome.delivered.len()),
+                    of,
+                })
+                .await;
                 tracing::debug!(
                     group = %groups::log_id(group_id),
                     recipients = key_recipients.len(),
@@ -555,9 +740,13 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
                 break;
             }
             Ok(MultiRecipientOutcome::MismatchedDevices(entries)) => {
+                send.report(SendPhase::RepairingDevices).await;
+                let started = Instant::now();
+                outcome.parts.repairs += entries.len();
                 for entry in entries {
                     repair(&ctx, &entry, tokens).await?;
                 }
+                outcome.parts.repair += started.elapsed();
                 tracing::debug!(group = %groups::log_id(group_id), "device lists repaired");
                 continue;
             }
@@ -611,9 +800,28 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
             }
         }
     };
-    // Step 9: 1:1 sends.
-    for member in fan_out {
-        let token = endorsed.as_ref().and_then(|e| e.token(&[member]));
+    // Step 9: 1:1 sends, several members at once (Desktop's `sendToGroup` legacy path sends
+    // to every member with `Promise.all`).
+    let ctx_ref = &ctx;
+    let endorsed = endorsed.as_ref();
+    outcome.parts.fanout = fan_out.len();
+    let fanout_started = Instant::now();
+    let of = count(outcome.delivered.len() + outcome.failed.len() + fan_out.len());
+    let done = Cell::new(count(outcome.delivered.len()));
+    let done = &done;
+    if !fan_out.is_empty() {
+        send.report(SendPhase::Sending {
+            done: done.get(),
+            of,
+        })
+        .await;
+    }
+    if !fan_out.is_empty() {
+        // The same for the 1:1 sends: one fetch of the certificate, not one per member.
+        sealed::warm_certificate(ctx_ref).await?;
+    }
+    let sent = bounded(fan_out, MEMBER_SENDS_AT_ONCE, |member| async move {
+        let token = endorsed.and_then(|e| e.token(&[member]));
         let out = Outgoing {
             content: send.content,
             timestamp: send.timestamp,
@@ -625,7 +833,21 @@ pub(crate) async fn send_to_group<T: SignalTransport>(
                 named: true,
             }),
         };
-        match send_to(&ctx, ServiceId::from(member), &out).await {
+        let result = send_to(ctx_ref, ServiceId::from(member), &out).await;
+        if result.is_ok() {
+            done.set(done.get() + 1);
+            send.report(SendPhase::Sending {
+                done: done.get(),
+                of,
+            })
+            .await;
+        }
+        (member, result)
+    })
+    .await;
+    outcome.parts.fanout_time = fanout_started.elapsed();
+    for (member, result) in sent {
+        match result {
             Ok(accepted) => outcome.delivered.push((member, accepted.sealed)),
             Err(e) => {
                 let user = aci_user_id(member)
@@ -679,36 +901,65 @@ async fn distribute<T: SignalTransport>(
     for device in new {
         by_member.entry(&device.recipient).or_default().push(device);
     }
-    let mut failed = Vec::new();
-    for (recipient, devices) in by_member {
-        let Some(ServiceId::Aci(aci)) = ServiceId::parse_from_service_id_string(recipient) else {
-            continue;
-        };
+    let to_send: Vec<(Aci, Vec<&MemberDevice>)> = by_member
+        .into_iter()
+        .filter_map(|(recipient, devices)| {
+            match ServiceId::parse_from_service_id_string(recipient) {
+                Some(ServiceId::Aci(aci)) => Some((aci, devices)),
+                _ => None,
+            }
+        })
+        .collect();
+    let distribution = &distribution;
+    let keys_of = count(to_send.len());
+    send.report(SendPhase::SettingUpKeys {
+        done: 0,
+        of: keys_of,
+    })
+    .await;
+    let done = Cell::new(0_u32);
+    let done = &done;
+    let sent = bounded(to_send, MEMBER_SENDS_AT_ONCE, |(aci, devices)| {
         let token = tokens.token(&[aci]);
-        let out = Outgoing {
-            content: &distribution,
-            timestamp: shared.unique_timestamp(),
-            delivery,
-            local: None,
-            group: Some(InGroup {
-                id: group_id,
-                token: token.as_deref(),
-                named: true,
-            }),
-        };
-        match send_to(ctx, ServiceId::from(aci), &out).await {
-            Ok(_) => {
+        let timestamp = shared.unique_timestamp();
+        async move {
+            let out = Outgoing {
+                content: distribution,
+                timestamp,
+                delivery,
+                local: None,
+                group: Some(InGroup {
+                    id: group_id,
+                    token: token.as_deref(),
+                    named: true,
+                }),
+            };
+            let result = send_to(ctx, ServiceId::from(aci), &out).await;
+            if result.is_ok() {
+                // Recorded as soon as the server took it, so a failure elsewhere keeps it.
                 ctx.db
                     .zone(|tx| sender_key::add_devices(tx, group_id, devices.iter().copied()))?;
             }
-            Err(e) => {
-                tracing::info!(
-                    member = ?log_safe(aci),
-                    error = %e,
-                    "sender key distribution failed; the member gets 1:1 sends"
-                );
-                failed.push(aci);
-            }
+            done.set(done.get() + 1);
+            send.report(SendPhase::SettingUpKeys {
+                done: done.get(),
+                of: keys_of,
+            })
+            .await;
+            Ok::<_, Error>((aci, result))
+        }
+    })
+    .await;
+    let mut failed = Vec::new();
+    for sent in sent {
+        let (aci, result) = sent?;
+        if let Err(e) = result {
+            tracing::info!(
+                member = ?log_safe(aci),
+                error = %e,
+                "sender key distribution failed; the member gets 1:1 sends"
+            );
+            failed.push(aci);
         }
     }
     tracing::debug!(
@@ -871,6 +1122,7 @@ async fn transmit_message<T: SignalTransport>(
     req: &OutgoingRequest,
     uploader: &super::media::Uploader<'_, T>,
 ) -> std::result::Result<TransmitOutcome, BackendError> {
+    let started = Instant::now();
     let timestamp = u64::try_from(req.sent_at)
         .map_err(|_| BackendError::new(ErrorKind::InvalidInput, "negative sent_at"))?;
     if let OutgoingKind::Delete {
@@ -912,6 +1164,8 @@ async fn transmit_message<T: SignalTransport>(
             .collect()
     });
     let local = &*req.local;
+    let built_in = started.elapsed();
+    let phases = Phases::new(shared.events.clone(), uploader.local);
     let outcome = send_to_group(
         shared,
         socket,
@@ -923,18 +1177,12 @@ async fn transmit_message<T: SignalTransport>(
             delivery: built.delivery,
             local: Some(local),
             only: only.as_deref(),
+            phases: Some(&phases),
         },
     )
     .await
     .map_err(|e| e.to_backend_error())?;
-    tracing::info!(
-        group = %groups::log_id(&row.keys.id),
-        request = req.kind.name(),
-        delivered = outcome.delivered.len(),
-        failed = outcome.failed.len(),
-        sender_key = outcome.sender_key_recipients,
-        "group message sent"
-    );
+    let mut transcript_time = Duration::ZERO;
     // A lonely group (nobody else to send to) still syncs the message, like Note to Self; a
     // follow-up whose members all left has nothing to tell.
     let lonely = req.only.is_none() && outcome.delivered.is_empty() && outcome.failed.is_empty();
@@ -962,11 +1210,53 @@ async fn transmit_message<T: SignalTransport>(
             local.to_owned()
         };
         let ctx = shared.send_context(account, socket);
-        super::sync_transcript(&ctx, &transcript, timestamp, &key, lonely)
-            .await
-            .map_err(|e| e.to_backend_error())?;
+        phases.report(SendPhase::SyncingOwnDevices).await;
+        let transcript_started = Instant::now();
+        let synced = super::sync_transcript(&ctx, &transcript, timestamp, &key, lonely).await;
+        transcript_time = transcript_started.elapsed();
+        if let Err(e) = synced {
+            log_group_send(&row, req, &outcome, built_in, transcript_time, started);
+            return Err(e.to_backend_error());
+        }
     }
+    log_group_send(&row, req, &outcome, built_in, transcript_time, started);
     Ok(merge(outcome))
+}
+
+/// The one summary line of a group send (diagnosis §2 item 3): counts and milliseconds only.
+fn log_group_send(
+    row: &GroupRow,
+    req: &OutgoingRequest,
+    outcome: &GroupOutcome,
+    built: Duration,
+    transcript: Duration,
+    started: Instant,
+) {
+    let parts = &outcome.parts;
+    tracing::info!(
+        group = %groups::log_id(&row.keys.id),
+        request = req.kind.name(),
+        members = outcome.delivered.len() + outcome.failed.len(),
+        delivered = outcome.delivered.len(),
+        failed = outcome.failed.len(),
+        sender_key = outcome.sender_key_recipients,
+        restarts = parts.restarts,
+        refreshed = parts.refreshed,
+        refresh_ms = millis(parts.refresh),
+        prekey_fetches = parts.prekey_fetches,
+        fetch_ms = millis(parts.fetch),
+        skdm = parts.skdm,
+        skdm_ms = millis(parts.skdm_time),
+        repairs = parts.repairs,
+        repair_ms = millis(parts.repair),
+        multi_ms = millis(parts.multi),
+        fanout = parts.fanout,
+        fanout_ms = millis(parts.fanout_time),
+        build_ms = millis(built),
+        transcript_ms = millis(transcript),
+        total_ms = millis(started.elapsed()),
+        "group message sent"
+    );
 }
 
 /// The progress key of a recipient-update transcript (`<local>:update:<digest of members>`).
@@ -1071,6 +1361,7 @@ pub(crate) async fn send_typing<T: SignalTransport>(
             delivery: Delivery::TYPING,
             local: None,
             only: None,
+            phases: None,
         },
     )
     .await;
@@ -1134,6 +1425,49 @@ mod tests {
         assert!(
             matches!(&none, TransmitOutcome::Failed(e) if matches!(e.kind, ErrorKind::RateLimited { .. })),
             "the retryable failure wins: {none:?}"
+        );
+    }
+
+    /// The key setup and the 1:1 sends of a group run several members at once, never more
+    /// than the bound: 40 sends of 20 ms each at 16 at once take three rounds, not forty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn member_steps_run_at_once_up_to_the_bound() {
+        use std::cell::Cell;
+        let in_flight = Cell::new(0_usize);
+        let most = Cell::new(0_usize);
+        let started = tokio::time::Instant::now();
+        let done = bounded(0..40_u32, MEMBER_SENDS_AT_ONCE, |n| {
+            let (in_flight, most) = (&in_flight, &most);
+            async move {
+                in_flight.set(in_flight.get() + 1);
+                most.set(most.get().max(in_flight.get()));
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                in_flight.set(in_flight.get() - 1);
+                n
+            }
+        })
+        .await;
+        let mut done = done;
+        done.sort_unstable();
+        assert_eq!(done, (0..40).collect::<Vec<_>>(), "every member, once");
+        assert_eq!(
+            most.get(),
+            MEMBER_SENDS_AT_ONCE,
+            "bounded, and actually parallel"
+        );
+        // 60 ms in three rounds; one at a time would be 800 ms.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            (20..=50).contains(&PREKEY_FETCHES_AT_ONCE),
+            "Desktop's range"
+        );
+        assert!(
+            (10..=20).contains(&MEMBER_SENDS_AT_ONCE),
+            "the lead's range"
         );
     }
 

@@ -23,8 +23,125 @@ Kirigami.GlobalDrawer {
     // Collapsed sidebar: avatars only, names in tooltips.
     readonly property bool rail: drawer.collapsed
 
+    // Whether the drawer acts as one that has accounts: `App.hasAccounts`, but a moment
+    // LATE when it turns false. The last account leaving deletes its entry from the
+    // Repeater below; flipping the rail into a modal drawer in that same moment made
+    // Kirigami's GlobalDrawer read the size of a layout that still held the freed entry, a
+    // use-after-free in Qt Quick Layouts that crashed the application (wide window, threaded
+    // render loop, many chats: `transfer_review_ui` case `wide-many`). MainWindow's
+    // `enabled` follows this too. An account arriving is followed at once.
+    // It is set once when the drawer is made and then only by the handler below: a binding
+    // to `App.hasAccounts` would stay alive and could re-evaluate at the false edge in the
+    // very moment the entry is deleted, whatever the start order (a drawer made while the
+    // accounts are already there never saw the true edge that broke it).
+    property bool accountsShown: false
+    Component.onCompleted: drawer.accountsShown = App.hasAccounts
+    Connections {
+        target: App
+        function onHasAccountsChanged(): void {
+            if (App.hasAccounts) {
+                accountsFollow.stop();
+                drawer.accountsShown = true;
+            } else {
+                accountsFollow.restart();
+            }
+        }
+    }
+    Timer {
+        id: accountsFollow
+        interval: 300
+        onTriggered: drawer.accountsShown = App.hasAccounts
+    }
+
+    // The context menu of an account's entry (link feedback L4): what Settings → "Accounts"
+    // offers for it. Made once an account entry is hovered, focused or pressed.
+    property bool menuWanted: false
+    property QQC2.Menu accountMenu: null
+    onMenuWantedChanged: {
+        if (drawer.menuWanted && drawer.accountMenu === null) {
+            drawer.accountMenu = accountMenuComponent.createObject(drawer) as QQC2.Menu;
+        }
+    }
+    // (A Component, not a Loader: an Item here would go into the drawer's layout.)
+    Component {
+        id: accountMenuComponent
+
+        QQC2.Menu {
+            id: accountMenu
+
+            // The account the menu was opened for, and what it offers
+            // (`App.accountActions`).
+            property real account: 0
+            property var actions: ({})
+
+            popupType: QQC2.Popup.Item
+
+            // (A hidden item is disabled too: the menu's keyboard navigation does not skip an
+            // item that is only invisible, and "Transfer History from Phone…" must not be
+            // reachable with Down and Return while an import runs.)
+            QQC2.MenuItem {
+                visible: accountMenu.actions.transfer === true
+                enabled: visible
+                height: visible ? implicitHeight : 0
+                icon.name: "document-import"
+                text: accountMenu.actions.transferLabel ?? ""
+                onTriggered: App.askReplace(accountMenu.account)
+            }
+            QQC2.MenuItem {
+                visible: accountMenu.actions.unlink === true
+                enabled: visible
+                height: visible ? implicitHeight : 0
+                icon.name: "network-disconnect"
+                text: accountMenu.actions.unlinkLabel ?? ""
+                onTriggered: App.askAccountAction(accountMenu.account, "unlink")
+            }
+            QQC2.MenuItem {
+                objectName: "drawer-remove-account"
+                icon.name: "list-remove-user"
+                text: accountMenu.actions.removeLabel ?? ""
+                onTriggered: App.askAccountAction(accountMenu.account, "remove")
+            }
+        }
+    }
+
+    // Opens the menu of `account` at (`x`, `y`) of `entry`, or under the entry (keyboard). A
+    // menu that does not exist yet (the pointer never hovered an entry, nothing was focused or
+    // pressed) is made now and shown in the next turn of the event loop: a menu popped up in
+    // the moment it was made can come out the size of its padding and never open.
+    function openAccountMenu(entry: Item, account: real, x: real, y: real): void {
+        const actions = App.accountActions.find(a => a.account === account);
+        if (actions === undefined) {
+            return;
+        }
+        const existed = drawer.accountMenu !== null;
+        drawer.menuWanted = true;
+        if (drawer.accountMenu === null) {
+            return;
+        }
+        if (existed) {
+            drawer.popupAccountMenu(entry, account, x, y);
+        } else {
+            Qt.callLater(drawer.popupAccountMenu, entry, account, x, y);
+        }
+    }
+
+    function popupAccountMenu(entry: Item, account: real, x: real, y: real): void {
+        const actions = App.accountActions.find(a => a.account === account);
+        const menu = drawer.accountMenu;
+        if (actions === undefined || menu === null || entry === null) {
+            return;
+        }
+        menu.account = account;
+        menu.actions = actions;
+        if (x < 0) {
+            menu.popup(entry, 0, entry.height);
+        } else {
+            menu.popup(entry, x, y);
+        }
+    }
+
     // Without accounts there is nothing to switch between: no rail, no handle.
-    modal: !drawer.window.wideScreen || !App.hasAccounts
+    modal: !drawer.window.wideScreen || !drawer.accountsShown
     collapsible: !drawer.modal
     collapsed: !drawer.modal
     collapseButtonVisible: !drawer.modal
@@ -78,6 +195,47 @@ Kirigami.GlobalDrawer {
         property int unreadCount: 0
         // The key of the action, as the platform writes it (shown in the tooltip).
         property string keys: ""
+        // The entry of an account: it has a context menu (`accountMenu`).
+        property real menuAccount: 0
+
+        // Right click, a long press on a touch screen, the Menu key and Shift+F10.
+        signal menuRequested(real x, real y)
+
+        TapHandler {
+            enabled: entry.menuAccount > 0
+            acceptedButtons: Qt.RightButton
+            onTapped: point => entry.menuRequested(point.position.x, point.position.y)
+        }
+        TapHandler {
+            id: entryLongPress
+            enabled: entry.menuAccount > 0
+            acceptedDevices: PointerDevice.TouchScreen | PointerDevice.Stylus
+            onPressedChanged: {
+                if (entryLongPress.pressed) {
+                    drawer.menuWanted = true;
+                }
+            }
+            onLongPressed: entry.menuRequested(entryLongPress.point.position.x, entryLongPress.point.position.y)
+        }
+        Keys.onMenuPressed: entry.menuRequested(-1, -1)
+        Keys.onPressed: event => {
+            if (entry.menuAccount > 0 && event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
+                entry.menuRequested(-1, -1);
+                event.accepted = true;
+            }
+        }
+        // The menu is made before it is first asked for (a menu opened in the moment it
+        // was made can come out the size of its padding), but not at the start.
+        onHoveredChanged: {
+            if (entry.hovered && entry.menuAccount > 0) {
+                drawer.menuWanted = true;
+            }
+        }
+        onActiveFocusChanged: {
+            if (entry.activeFocus && entry.menuAccount > 0) {
+                drawer.menuWanted = true;
+            }
+        }
 
         Layout.fillWidth: true
         // At least the usual height, more when the two lines of text need it.
@@ -198,16 +356,21 @@ Kirigami.GlobalDrawer {
                 required property int unread
                 // The account's own number or address on its network (empty when unknown).
                 required property string number
+                // Which device of its identity it is, when another account looks the same
+                // (two links of one identity from an older profile); empty otherwise.
+                required property string device
 
                 label: name
                 // Which account it is: its number where the network has one (the badge on
                 // the picture says which network), then its state.
-                detail: (number !== "" ? number : networkName) + " · " + statusLabel
+                detail: (number !== "" ? number : networkName) + (device !== "" ? " · " + device : "") + " · " + statusLabel
                 avatarName: name
                 badgeIcon: networkIcon
                 stateName: status
                 unreadCount: unread
                 highlighted: App.currentAccount === accountId
+                menuAccount: accountId
+                onMenuRequested: (x, y) => drawer.openAccountMenu(this, accountId, x, y)
                 onClicked: {
                     App.selectAccount(accountId);
                     if (drawer.modal) {

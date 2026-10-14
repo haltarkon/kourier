@@ -55,6 +55,49 @@ pub enum AccountState {
     },
     /// Being removed.
     Removing,
+    /// "Unlink…" is in progress: the device logs out on the network. A start that finds it
+    /// (the logout was cut off) makes one more attempt and then finishes it as `LoggedOut`
+    /// with the chats kept (link feedback L4).
+    Unlinking,
+}
+
+/// What became of this device on the network when it logged out on the user's request ("Remove
+/// Account…", "Unlink…"; architecture §4.3 step 7, link feedback L4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceLogout {
+    /// The network confirmed that the device is gone from the account, or no longer knew it
+    /// (the phone had removed it already).
+    Removed,
+    /// There was no device to remove: the link never finished, or the account was logged out
+    /// already (its credentials are gone).
+    NoDevice,
+    /// The network could not be told (offline, no answer in time, refused): the device may still
+    /// be listed among the phone's linked devices.
+    NotReached,
+}
+
+/// A backend's report of its logout ([`DeviceLogout`] and the name the device was linked with,
+/// which the phone lists). `Debug` hides the name.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutReport {
+    /// What became of the device.
+    pub outcome: DeviceLogout,
+    /// The device's name as the phone shows it, when the backend knows it (personal data: it is
+    /// often the computer's host name).
+    #[serde(default)]
+    pub device_name: Option<String>,
+}
+
+crate::redacting_debug!(LogoutReport { outcome } redact { device_name });
+
+impl LogoutReport {
+    /// A report without a name.
+    pub fn new(outcome: DeviceLogout) -> Self {
+        Self {
+            outcome,
+            device_name: None,
+        }
+    }
 }
 
 /// Settings the network syncs (owned by the backend, reported with `AccountSettings` events).

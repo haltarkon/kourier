@@ -140,6 +140,46 @@ fn seeded_fixture_serves_core_db_and_stops() {
         hints.iter().any(|h| h == "view-once") && hints.len() >= 5,
         "{hints:?}"
     );
+    // The chat of imported attachments that cannot be had (`--page=unavailable`): one of the
+    // generated chats (none is added, so no list changes), with every state the page shows and
+    // nothing downloaded by itself.
+    let imported = info
+        .unavailable_conversation
+        .expect("the chat of attachments that cannot be had");
+    assert!(![quotes, timer, kinds, long].contains(&imported));
+    let mut states = std::collections::BTreeMap::<String, usize>::new();
+    // (The chat's own photo, from the generated data, is on its way or here: not counted.)
+    for row in timeline(imported).rows {
+        let attachments = match &row.body {
+            kourier_model::Body::Media { attachments, .. } => attachments.clone(),
+            kourier_model::Body::Sticker(a) => vec![a.as_ref().clone()],
+            _ => Vec::new(),
+        };
+        for a in attachments {
+            if !matches!(
+                a.state,
+                kourier_model::AttachmentState::Local
+                    | kourier_model::AttachmentState::Downloading { .. }
+            ) {
+                *states.entry(format!("{:?}", a.state)).or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(
+        states,
+        std::collections::BTreeMap::from([
+            ("AskFailed { why: NoAnswer }".to_owned(), 2),
+            ("AskFailed { why: NoFile }".to_owned(), 1),
+            ("AskFailed { why: NoMessage }".to_owned(), 1),
+            ("Asking".to_owned(), 1),
+            ("Expired".to_owned(), 2),
+            ("Remote".to_owned(), 1),
+            ("Unavailable".to_owned(), 7),
+        ]),
+        "a picture, a file, a sticker and four of an album are not available on this device, a \
+         picture and a file are gone, one picture is asked of the phone and four asks ended \
+         (two without an answer, no message, no file), one picture waits for a click"
+    );
     // Several members reacted to one message of the group `--page=chat` opens.
     let reacted = timeline(demo)
         .rows

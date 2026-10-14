@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use kourier_app::desktop::{DesktopMode, DesktopOptions, SystemBus, handled_uris};
 use kourier_app::{
-    App, AppError, FixtureOptions, FixtureState, FixtureTransfer, HistoryTransfer,
+    App, AppError, FixtureOptions, FixtureSends, FixtureState, FixtureTransfer, HistoryTransfer,
     HistoryTransferFailure, Launch, Profile, StartOptions,
 };
 use kourier_qt::{PAGES, UiContext, UiOptions};
@@ -26,10 +26,10 @@ const USAGE: &str =
 [--page=<welcome|link|qr|list|chat|history|settings|drawer|media|viewer|compose|files|album|\
 albumviewer|revisions|compact|quotes|menu|react|reactions|edit|reply|delete|timer|placeholders|\
 offline|loggedout|challenge|clock|originals|timercustom|clearchat|mediamenu|deleteattachment|\
-folder|folderfiles|folderzip|expiry|readmore|about|calls|transferwait|transferdownload|\
-transferread|transferbanner|transferfailed|transferask>] \
+folder|folderfiles|folderzip|expiry|readmore|about|calls|unavailable|transferwait|\
+transferdownload|transferread|transferupdate|transferbanner|transferfailed|transferask>] \
 [--fixture-transfer=<walk|declined|wait|download|read|link-again|update-app|corrupt|too-large|\
-download-failed|internal>] [--screenshot=<png>] \
+download-failed|internal>] [--fixture-send=<slow|keys|members|retry>] [--screenshot=<png>] \
 [--size=<width>x<height>] [sgnl://… | signalcaptcha://…]
 
   --version       print the name and the version, then exit
@@ -39,7 +39,10 @@ download-failed|internal>] [--screenshot=<png>] \
                   rotating QR codes
   --fixture-transfer  with --fixture-link: after the link the phone transfers the message
                   history. walk: the whole of it; declined: the phone's user says no;
-                  wait, download, read: it stays in that state; the others: it fails that way";
+                  wait, download, read: it stays in that state; the others: it fails that way
+  --fixture-send  with --fixture: every send takes two minutes (slow: no step known; keys:
+                  setting up encryption with 12 members; members: sent to 8 of 20) or its
+                  first attempt is rate limited for 30 seconds (retry)";
 
 /// Debug builds: the development control channel on stdin/stdout (`kourier_qt::dev`).
 #[cfg(debug_assertions)]
@@ -62,6 +65,8 @@ struct Args {
     fixture_link: bool,
     /// `--fixture-transfer=<name>`: the history transfer the fixture link walks.
     fixture_transfer: Option<FixtureTransfer>,
+    /// `--fixture-send=<name>`: how the fixture account's sends behave.
+    fixture_send: Option<FixtureSends>,
     background: bool,
     uris: Vec<String>,
     /// Builds with the cargo feature `perf` (`cargo xtask perf`): the reference profile.
@@ -147,6 +152,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             out.fixture_transfer = Some(
                 link_transfer(name).ok_or_else(|| format!("unknown fixture transfer {name:?}"))?,
             );
+        } else if let Some(name) = arg.strip_prefix("--fixture-send=") {
+            out.fixture_send =
+                Some(fixture_send(name).ok_or_else(|| format!("unknown fixture send {name:?}"))?);
         } else if let Some(name) = arg.strip_prefix("--profile=") {
             out.profile = Some(name.to_owned());
         } else if let Some(page) = arg.strip_prefix("--page=") {
@@ -184,6 +192,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     if out.fixture && out.fixture_link {
         return Err("--fixture and --fixture-link exclude each other".into());
     }
+    if out.fixture_send.is_some() && !out.fixture {
+        return Err("--fixture-send needs --fixture".into());
+    }
     if out.fixture_transfer.is_some() && !out.fixture_link {
         return Err("--fixture-transfer needs --fixture-link".into());
     }
@@ -195,6 +206,18 @@ const TRANSFER_DOWNLOAD: HistoryTransfer = HistoryTransfer::Downloading {
     done: 12_300_000,
     total: Some(45_600_000),
 };
+
+/// How `--fixture-send=<name>` makes the fixture account's sends behave.
+fn fixture_send(name: &str) -> Option<FixtureSends> {
+    use kourier_app::SendPhase;
+    Some(match name {
+        "slow" => FixtureSends::Slow(None),
+        "keys" => FixtureSends::Slow(Some(SendPhase::SettingUpKeys { done: 3, of: 12 })),
+        "members" => FixtureSends::Slow(Some(SendPhase::Sending { done: 8, of: 20 })),
+        "retry" => FixtureSends::RateLimited(std::time::Duration::from_secs(30)),
+        _ => return None,
+    })
+}
 
 /// The history transfer `--fixture-transfer=<name>` asks a fixture link to walk.
 fn link_transfer(name: &str) -> Option<FixtureTransfer> {
@@ -216,8 +239,9 @@ fn link_transfer(name: &str) -> Option<FixtureTransfer> {
     })
 }
 
-/// The history transfer a page shows: the link page in one of its three states (the page
-/// links the fixture account itself, and the transfer stays in that state), or the main
+/// The history transfer a page shows: a link that reaches one of three states (the page
+/// links the fixture account itself, and the transfer stays in that state, in the banner
+/// once the link page closed), or the main
 /// window after a restart in the middle of a download or after a failure.
 fn page_transfer(page: Option<&str>) -> Option<FixtureTransfer> {
     Some(match page? {
@@ -262,6 +286,8 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
                 FixtureOptions::default().qr_codes
             },
             transfer,
+            // The banner of the update after a link.
+            updating: page == Some("transferupdate"),
             // The page of the question needs an account that offers the transfer.
             history_on_link: page == Some("transferask"),
             state: fixture_state(args.ui.page.as_deref()),
@@ -270,6 +296,7 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
             // And there its last call rings, from the start, for as long as a call may ring.
             calls_ring_for: (args.ui.page.as_deref() == Some("calls"))
                 .then_some(FixtureOptions::RING),
+            sends: args.fixture_send,
             ..FixtureOptions::default()
         })
     } else {
@@ -543,6 +570,7 @@ mod tests {
                 false,
             ),
             ("transferask", false, None, true),
+            ("transferupdate", false, None, false),
             ("settings", false, None, false),
         ] {
             let a = p(&["--fixture", &format!("--page={page}")]).expect("page");
@@ -555,6 +583,7 @@ mod tests {
                 "{page}"
             );
             assert_eq!(f.qr_codes, if link { 1 } else { 3 }, "{page}");
+            assert_eq!(f.updating, page == "transferupdate", "{page}");
         }
         // A fixture link walks the transfer it is asked for.
         let a = p(&["--fixture-link", "--fixture-transfer=too-large"]).expect("transfer");
@@ -589,6 +618,17 @@ mod tests {
         assert!(p(&["--fixture-link", "--fixture-transfer=nope"]).is_err());
         assert!(p(&["--fixture", "--fixture-transfer=walk"]).is_err());
         assert!(p(&["--fixture-transfer=walk"]).is_err());
+        // Slow sends (link feedback L6) need the fixture.
+        let a = p(&["--fixture", "--fixture-send=keys"]).expect("send");
+        assert!(matches!(
+            start_options(&a).expect("options").launch,
+            Launch::Fixture(FixtureOptions {
+                sends: Some(FixtureSends::Slow(Some(_))),
+                ..
+            })
+        ));
+        assert!(p(&["--fixture-send=slow"]).is_err());
+        assert!(p(&["--fixture", "--fixture-send=nope"]).is_err());
         assert!(start_options(&p(&["--profile=a/b"]).expect("parse")).is_err());
         assert!(p(&["--fixture", "--fixture-link"]).is_err());
         assert!(p(&["--page=nope"]).is_err());

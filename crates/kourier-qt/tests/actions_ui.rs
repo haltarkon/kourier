@@ -10,6 +10,8 @@
 //! clipboard. The rows' action flags are the core's; the timeline's popups and the
 //! composer are the app's own QML. Offscreen, `harness = false`.
 
+mod support;
+
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_app::{App, FixtureOptions, Launch, StartOptions};
 use kourier_qt::{UiContext, UiOptions};
@@ -307,13 +309,31 @@ Window {
                 App.composer.cancelReply();
                 App.composer.clearNotice();
                 composerItem.setText("");
-                // Delete for me: the row goes.
-                if (!test.row(test.reply).actions.deleteForMe) return fail("delete for me is offered");
+                test.step = "deleteForMe";
+                return;
+            case "deleteForMe": {
+                // Delete for me: the row goes. It is offered once the reply is no longer being
+                // sent (the core refuses a delete of a message in flight), which under load can
+                // take a moment after the earlier steps.
+                const r = test.row(test.reply);
+                if (!r || !r.actions.deleteForMe) return;
                 App.deleteMessage(test.reply, false);
                 test.step = "deletedForMe";
                 return;
+            }
             case "deletedForMe":
-                if (test.row(test.reply)) return;
+                if (test.row(test.reply)) {
+                    // The core refuses a delete of a message that is in flight, and the row's
+                    // flag can still be set in the moment before it looks (two other UI tests
+                    // run beside this one under nextest): when the refusal comes, wait for the
+                    // row to offer the delete again and ask again. A delete that is refused for
+                    // good ends in the test's own timeout, with the notice in its message.
+                    if (App.composer.notice !== "") {
+                        App.composer.clearNotice();
+                        test.step = "deleteForMe";
+                    }
+                    return;
+                }
                 // Delete for everyone: a tombstone.
                 App.deleteMessage(test.target, true);
                 test.step = "deletedForEveryone";
@@ -396,6 +416,7 @@ Window {
 "#;
 
 fn main() {
+    support::answer_list("actions_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

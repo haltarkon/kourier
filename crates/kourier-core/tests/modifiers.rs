@@ -1719,7 +1719,7 @@ fn message_ids_are_never_reused() {
     )
     .expect("rows");
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (2, 12));
+    assert_eq!((out.from, out.to), (2, 14));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
     assert_eq!(count("SELECT count(*) FROM messages"), 2);
     for table in [
@@ -1854,7 +1854,7 @@ fn the_accounts_rebuild_keeps_every_row_and_never_reuses_an_id() {
     assert_eq!(before.len(), 2);
 
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (7, 12));
+    assert_eq!((out.from, out.to), (7, 14));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
     assert_eq!(rows(&conn), before, "every column of every account");
     for table in [
@@ -1931,7 +1931,7 @@ fn the_accounts_rebuild_keeps_every_row_and_never_reuses_an_id() {
     // A database that is already at the newest version opens as it is.
     let mut again = kourier_db::open(&path, &key).expect("open");
     let out = kourier_db::migrate(&mut again, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (12, 12));
+    assert_eq!((out.from, out.to), (14, 14));
 }
 
 /// Migration 4 alone, as a schema-3 `core.db` gets it (a plain step, foreign keys enforced):
@@ -2001,7 +2001,7 @@ fn the_outbox_rebuild_keeps_its_rows_and_shape() {
     assert_eq!(count("PRAGMA foreign_keys"), 1, "enforced during the step");
 
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (3, 12));
+    assert_eq!((out.from, out.to), (3, 14));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
     assert_eq!(shape(&conn), shape_before);
     assert_eq!(rows(&conn), rows_before);

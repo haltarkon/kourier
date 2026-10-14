@@ -127,11 +127,22 @@ pub struct TransferScript {
     /// How it ends when every stage ran out: done, skipped (the phone's user declined, or
     /// the phone did not answer) or failed with a kind.
     pub end: HistoryTransfer,
+    /// The messages of the history, counted while it is read as Signal's delivery counts
+    /// them (`BackendEvent::AccountProgress`): a read held for a time reports 0, ¼, ½ and ¾
+    /// of them over its time, one held until it is skipped reports [`Self::HELD_SHARE`] of
+    /// them; the walk's end reports `AccountProgress::finished()`. `None`: no numbers.
+    pub import: Option<u64>,
 }
 
 impl TransferScript {
     /// The size of the download of [`Self::walk`] and [`Self::failing`], in bytes.
     pub const TOTAL: u64 = 45_600_000;
+
+    /// The messages of the history of [`Self::walk`] and [`Self::failing`].
+    pub const MESSAGES: u64 = 50_000;
+
+    /// The share of [`Self::import`], in thousandths, a read that is held reports.
+    pub const HELD_SHARE: u64 = 248;
 
     /// A whole transfer: the wait, a download whose size becomes known after its first
     /// report, the read, and `end`. Every stage is held for `hold`.
@@ -149,6 +160,7 @@ impl TransferScript {
                 (HistoryTransfer::Reading, Some(hold)),
             ],
             end,
+            import: Some(Self::MESSAGES),
         }
     }
 
@@ -158,6 +170,7 @@ impl TransferScript {
         Self {
             stages: vec![(state, None)],
             end: HistoryTransfer::Skipped,
+            import: (state == HistoryTransfer::Reading).then_some(Self::MESSAGES),
         }
     }
 
@@ -167,6 +180,7 @@ impl TransferScript {
         Self {
             stages: vec![(HistoryTransfer::Waiting, Some(hold))],
             end,
+            import: None,
         }
     }
 
@@ -319,6 +333,11 @@ pub struct Script {
     /// server at once (its outcome is decided and recorded), but the reply reaches the core only
     /// after the delay on the account clock. The actor handles other commands meanwhile.
     pub reply_delays: Vec<(ConvKey, Duration)>,
+    /// Slow sends in EVERY conversation (fixture runs that show the line under a message on its
+    /// way, link feedback L6): each transmit reports `phase` (as `BackendEvent::TransmitProgress`)
+    /// and its answer reaches the core `after` this long on the account clock. Rules in
+    /// [`Self::reply_delays`] win for their conversations. `None`: answers at once.
+    pub slow_sends: Option<(Option<kourier_model::SendPhase>, Duration)>,
     /// The answer the fake server accepts for a challenge (`Command::SubmitChallenge`); `None`
     /// accepts any answer. A wrong answer is refused and the challenge stands.
     pub challenge_answer: Option<String>,
@@ -341,6 +360,37 @@ pub struct Script {
     /// The history transfer a fresh link of this account starts ([`TransferScript`]); `None`:
     /// the link has none, like a network without history.
     pub transfer: Option<TransferScript>,
+    /// How the account's phone answers a request to upload lost files again
+    /// (`Command::RequestAttachments`, [`BackfillScript`]); `None`: the account cannot ask
+    /// (no `attachment_restore` capability), so a lost file stays lost.
+    pub backfill: Option<BackfillScript>,
+    /// The fake server cannot be reached for a logout (`Command::Logout`): the report says
+    /// `NotReached` and the server keeps the device, as when the network is down while the
+    /// user removes or unlinks the account (link feedback L4).
+    pub logout_unreachable: bool,
+    /// The name the device was linked with, reported with the logout (`LogoutReport`).
+    pub device_name: Option<String>,
+    /// The fake takes this long (on its clock) to answer a logout: a test sees the account
+    /// `Unlinking` or `Removing` meanwhile.
+    pub logout_delay: Option<std::time::Duration>,
+    /// How many progress events the fake sends before its report of a logout, and then exits
+    /// at once (without draining its outbox), so that the actor's exit is ready while the core
+    /// has not read the report yet: a test of the core taking the report after the exit. At
+    /// most 6 (the event queue holds 8).
+    pub logout_backlog: usize,
+}
+
+/// How the fake account's phone answers a request for the files of a message the network
+/// lost (S6): the request is reported `Sent` first, then this.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackfillScript {
+    /// It never answers: the core's wait ends as "did not answer".
+    Silent,
+    /// It no longer has the message.
+    NotFound,
+    /// One answer, a slot per file in the message's order: `Some` uploads it again (the
+    /// download yields that pointer's bytes), `None` it does not have that file.
+    Files(Vec<Option<crate::attachments::Pointer>>),
 }
 
 impl Script {
@@ -360,13 +410,49 @@ impl Script {
             early_events: Vec::new(),
             catch_up_on_resume: None,
             reply_delays: Vec::new(),
+            slow_sends: None,
             challenge_answer: None,
             online_while_linking: false,
             with_ready: Vec::new(),
             fail_relinks: 0,
             download_delay: None,
             transfer: None,
+            backfill: None,
+            logout_unreachable: false,
+            logout_backlog: 0,
+            logout_delay: None,
+            device_name: None,
         }
+    }
+
+    /// Lets the account ask its phone for lost files, answered as `backfill` says
+    /// ([`backfill`](Self::backfill)): every `AccountCaps` the script delivers gets the
+    /// `attachment_restore` flag, and one with only that flag is delivered first when it
+    /// has none. Call it after the deliveries that carry the account's caps.
+    pub fn with_backfill(mut self, backfill: BackfillScript) -> Self {
+        use kourier_model::AccountCaps;
+        self.backfill = Some(backfill);
+        let flag = AccountCaps::FLAG_ATTACHMENT_RESTORE.to_owned();
+        let mut found = false;
+        for step in &mut self.steps {
+            if let Step::Deliver(d) = step {
+                for e in &mut d.events {
+                    if let BackendEvent::AccountCaps(caps) = e {
+                        caps.flags.insert(flag.clone(), true);
+                        found = true;
+                    }
+                }
+            }
+        }
+        if !found {
+            let mut caps = AccountCaps::default();
+            caps.flags.insert(flag, true);
+            self.steps.insert(
+                0,
+                Step::Deliver(Delivery::new(vec![BackendEvent::AccountCaps(caps)])),
+            );
+        }
+        self
     }
 
     /// Gives a fresh link of the account a history transfer ([`transfer`](Self::transfer)).
@@ -416,6 +502,13 @@ impl Script {
     /// Holds the answers to transmits in `conv` for `delay` on the account clock.
     pub fn delay_reply(mut self, conv: ConvKey, delay: Duration) -> Self {
         self.reply_delays.push((conv, delay));
+        self
+    }
+
+    /// Every transmit reports `phase` and is answered `after` this long
+    /// ([`Self::slow_sends`]).
+    pub fn slow_sends(mut self, phase: Option<kourier_model::SendPhase>, after: Duration) -> Self {
+        self.slow_sends = Some((phase, after));
         self
     }
 

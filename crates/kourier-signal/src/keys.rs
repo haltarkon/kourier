@@ -316,10 +316,18 @@ fn prepare<R: Rng + CryptoRng>(
 /// How long a rotated signed prekey or last-resort key may still be needed: the server's
 /// message queue time from the remote config, at least 30 days (`getMessageQueueTime`).
 fn queue_time(conn: &Connection) -> Result<Duration> {
-    let configured = crate::maintenance::remote_config_value(conn, QUEUE_TIME_KEY)?
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let configured = configured_queue_time(conn)?;
     Ok(configured.map_or(QUEUE_TIME_MIN, |time| time.max(QUEUE_TIME_MIN)))
+}
+
+/// The server's message queue time as the stored remote config states it (`None`: no
+/// config stored yet, or no such value), without the floor.
+pub(crate) fn configured_queue_time(conn: &Connection) -> Result<Option<Duration>> {
+    Ok(
+        crate::maintenance::remote_config_value(conn, QUEUE_TIME_KEY)?
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs),
+    )
 }
 
 /// After the server accepted an upload (`_confirmKeys`, then the `_clean*` functions): marks

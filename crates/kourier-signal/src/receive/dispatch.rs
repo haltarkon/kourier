@@ -857,33 +857,42 @@ fn message_body(ctx: &Ctx<'_>, message: &proto::DataMessage) -> Option<Body> {
 /// ranges that do not map or fit are dropped (the core drops invalid ones again on ingest).
 fn text(body: &str, ranges: &[proto::BodyRange]) -> Text {
     use proto::body_range::{AssociatedValue, Style};
-    let map = Utf16Map::new(body);
+    ranged_text(
+        body,
+        ranges.iter().filter_map(|range| {
+            let kind = match &range.associated_value {
+                Some(AssociatedValue::Style(style)) => match Style::try_from(*style) {
+                    Ok(Style::Bold) => RangeKind::Bold,
+                    Ok(Style::Italic) => RangeKind::Italic,
+                    Ok(Style::Spoiler) => RangeKind::Spoiler,
+                    Ok(Style::Strikethrough) => RangeKind::Strike,
+                    Ok(Style::Monospace) => RangeKind::Mono,
+                    Ok(Style::None) | Err(_) => return None,
+                },
+                Some(AssociatedValue::MentionAci(aci)) => mention(None, Some(aci))?,
+                Some(AssociatedValue::MentionAciBinary(aci)) => mention(Some(aci), None)?,
+                None => return None,
+            };
+            Some((range.start?, range.length?, kind))
+        }),
+    )
+}
+
+/// `body` with `ranges` given as (start, length) in UTF-16 code units, the way Signal counts
+/// them on the wire and in a transfer archive, as a Kourier [`Text`] with UTF-8 byte offsets.
+/// A range that does not map (inside a surrogate pair, past the end) or does not fit the text
+/// (a mention that does not cover its placeholder) is dropped. The live mapper and the history
+/// import's (`transfer::map`) both go through this.
+pub(crate) fn ranged_text(
+    body: impl Into<String>,
+    ranges: impl IntoIterator<Item = (u32, u32, RangeKind)>,
+) -> Text {
+    let body = body.into();
+    let map = Utf16Map::new(&body);
     let mut text = Text::plain(body);
-    for range in ranges {
-        let (Some(start), Some(length)) = (range.start, range.length) else {
-            continue;
-        };
+    for (start, length, kind) in ranges {
         let Some((start, len)) = map.range_to_utf8(start, length) else {
             continue;
-        };
-        let kind = match &range.associated_value {
-            Some(AssociatedValue::Style(style)) => match Style::try_from(*style) {
-                Ok(Style::Bold) => RangeKind::Bold,
-                Ok(Style::Italic) => RangeKind::Italic,
-                Ok(Style::Spoiler) => RangeKind::Spoiler,
-                Ok(Style::Strikethrough) => RangeKind::Strike,
-                Ok(Style::Monospace) => RangeKind::Mono,
-                Ok(Style::None) | Err(_) => continue,
-            },
-            Some(AssociatedValue::MentionAci(aci)) => match mention(None, Some(aci)) {
-                Some(kind) => kind,
-                None => continue,
-            },
-            Some(AssociatedValue::MentionAciBinary(aci)) => match mention(Some(aci), None) {
-                Some(kind) => kind,
-                None => continue,
-            },
-            None => continue,
         };
         text.ranges.push(TextRange { start, len, kind });
     }
@@ -892,7 +901,7 @@ fn text(body: &str, ranges: &[proto::BodyRange]) -> Text {
 }
 
 /// A mention range of a user.
-fn mention(binary: Option<&[u8]>, string: Option<&str>) -> Option<RangeKind> {
+pub(crate) fn mention(binary: Option<&[u8]>, string: Option<&str>) -> Option<RangeKind> {
     let aci = aci_from_wire(binary, string).ok().flatten()?;
     aci_user_id(aci).ok().map(RangeKind::Mention)
 }
@@ -928,9 +937,7 @@ fn reply_to(ctx: &Ctx<'_>, conv: &ConvKey, quote: &proto::data_message::Quote) -
     // The first quoted attachment as the sender named it (`Quote.QuotedAttachment`): its type
     // says what kind of file the quote shows; the thumbnail is not fetched.
     let file = quote.attachments.first();
-    let mime = file
-        .and_then(|f| f.content_type.clone())
-        .filter(|m| !m.is_empty() && m.len() <= 255);
+    let mime = file.and_then(|f| media::kept_mime(f.content_type.as_deref()));
     Some(ReplyTo {
         target: MsgTarget {
             conv: Some(conv.clone()),
@@ -1184,13 +1191,15 @@ fn sync_message(
         Some(Sync::CallLogEvent(_) | Sync::CallLinkUpdate(_)) => {
             Outcome::dropped("call log or call link sync (not shown)")
         }
-        Some(
-            Sync::OutgoingPayment(_)
-            | Sync::DeviceNameChange(_)
-            | Sync::AttachmentBackfillRequest(_)
-            | Sync::AttachmentBackfillResponse(_)
-            | Sync::UsernameChange(_),
-        ) => Outcome::dropped("sync message not in M1"),
+        // Only the primary answers a request for lost files; Kourier is never the primary
+        // (Desktop and a linked Android drop it too).
+        Some(Sync::AttachmentBackfillRequest(_)) => {
+            Outcome::dropped("attachment backfill request (only the primary answers)")
+        }
+        Some(Sync::AttachmentBackfillResponse(response)) => backfill_response(ctx, row, &response),
+        Some(Sync::OutgoingPayment(_) | Sync::DeviceNameChange(_) | Sync::UsernameChange(_)) => {
+            Outcome::dropped("sync message not in M1")
+        }
         None => Outcome::dropped("empty sync message"),
     })
 }
@@ -1314,6 +1323,57 @@ fn viewed_elsewhere(ctx: &Ctx<'_>, row: &Row, entries: &[Seen<'_>]) -> Outcome {
         at: i64::try_from(row.timestamp).unwrap_or(i64::MAX),
     }])
 }
+
+/// The primary's answer to a request for the files of one message (ours or another device's:
+/// the phone sends every answer to all our devices), as `AttachmentRestore`
+/// ([`crate::backfill::answer`]).
+///
+/// - Only from device 1 of our account (the primary, the only device that answers; the sync
+///   check above already requires our ACI). Desktop and Android take one from any of our
+///   devices; Kourier does not, so a linked device cannot give its files a pointer.
+/// - The message is named as the request named it (binary or string service ids; the answer
+///   echoes the request), WITH its conversation: the core finds the message only in that
+///   conversation, so an answer whose conversation does not match the message changes
+///   nothing. A target by phone number alone, or one missing, is dropped with a reason.
+fn backfill_response(
+    ctx: &Ctx<'_>,
+    row: &Row,
+    response: &proto::sync_message::AttachmentBackfillResponse,
+) -> Outcome {
+    if row.sender_device != PRIMARY_DEVICE {
+        return Outcome::dropped(
+            "attachment backfill answer from a device that is not the primary",
+        );
+    }
+    let Some(conv) = response.target_conversation.as_ref().and_then(thread_conv) else {
+        return Outcome::dropped("attachment backfill answer without a conversation it can name");
+    };
+    let Some(message) = response.target_message.as_ref() else {
+        return Outcome::dropped("attachment backfill answer without a message");
+    };
+    let (Some(author), Some(sent)) = (addressable_author(ctx, message), message.sent_timestamp)
+    else {
+        return Outcome::dropped("attachment backfill answer without a message it can name");
+    };
+    let Some(update) = crate::backfill::answer(response) else {
+        return Outcome::dropped("empty attachment backfill answer");
+    };
+    Outcome::events(vec![BackendEvent::AttachmentRestore {
+        target: MsgTarget {
+            conv: Some(conv),
+            author,
+            local: sent.to_string().into(),
+            alternates: Vec::new(),
+        },
+        update,
+        at: i64::try_from(row.timestamp).unwrap_or(i64::MAX),
+        // An answer names no command: the phone answers about the message.
+        cmd: None,
+    }])
+}
+
+/// The device id of an account's primary (the phone that registered it).
+const PRIMARY_DEVICE: u32 = 1;
 
 /// The conversation a sync message names (`ConversationIdentifier`): a 1:1 chat by service id
 /// (ours is Note to Self) or a group by id. A chat named by phone number alone cannot be
@@ -1447,6 +1507,12 @@ fn delete_for_me(ctx: &Ctx<'_>, row: &Row, delete: &proto::sync_message::DeleteF
                     .as_deref()
                     .and_then(media::net_id_digest),
             )
+            .chain(
+                attachment
+                    .fallback_plaintext_hash
+                    .as_deref()
+                    .and_then(media::net_id_plaintext_hash),
+            )
             .collect();
         if net_ids.is_empty() {
             unnamed += 1;
@@ -1461,7 +1527,7 @@ fn delete_for_me(ctx: &Ctx<'_>, row: &Row, delete: &proto::sync_message::DeleteF
     if unnamed > 0 {
         tracing::info!(
             attachments = unnamed,
-            "delete for me: attachments named only by their plaintext hash are not applied"
+            "delete for me: attachments without a name are not applied"
         );
     }
     if events.is_empty() {

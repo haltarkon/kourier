@@ -6,29 +6,29 @@ import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import app.kourier
 
-// The history transfer of a newly linked account while it runs: waiting for the phone,
-// downloading (a bar and the bytes), reading. One presentation in two sizes: large on the
-// link page, in place of its "linking" step, and compact in the account banner of the main
-// window, where it shows after a restart in the middle of a transfer. Both are fed by the
-// same view of the viewmodel (`App.linkTransfer`, `App.bannerTransfer`): its texts, how far
-// the download is, and whether "Continue Without History" is offered (a wait or a download
-// can be skipped, a read cannot).
+// The history transfer of a newly linked account while it runs, in the account banner of the
+// main window: waiting for the phone, downloading (a bar and the bytes), reading (a bar and
+// the messages); after it the contacts and groups the account still fetches (a bar and what
+// is left). The link page shows none: the chats are usable as soon as the account is linked.
+// It is fed by the viewmodel's view (`App.bannerTransfer`): its line, how far the download
+// is, and whether "Continue Without History" is offered (a wait or a download can be
+// skipped, a read cannot).
 //
-// Every text is the application's own, except that the compact line can carry an account's
-// name: it is a plain-text label.
+// Every text is the application's own, except that the line can carry an account's name: it
+// is a plain-text label.
 ColumnLayout {
     id: root
 
-    // The small presentation of the account banner.
-    property bool compact: false
-    // The transfer to show (a map; its `phase` is empty when there is none): the banner's by
-    // itself, the link page hands in the one of the account it links.
-    property var view: root.compact ? App.bannerTransfer : ({})
+    // The transfer to show (a map; its `phase` is empty when there is none).
+    property var view: App.bannerTransfer
 
     readonly property string phase: root.view.phase ?? ""
     readonly property bool waiting: root.phase === "waiting"
     readonly property bool downloading: root.phase === "downloading"
     readonly property bool reading: root.phase === "reading"
+    // After the transfer (or without one): the profiles and groups a fresh link still
+    // fetches, counted against the most seen (banner only).
+    readonly property bool updating: root.phase === "updating"
     // 0 … 1, or below zero while it is not known how far the transfer is.
     readonly property real progress: root.view.progress ?? -1
     readonly property string detail: root.view.detail ?? ""
@@ -37,50 +37,9 @@ ColumnLayout {
     // The button that ends the wait or the download (tests press it).
     readonly property alias skipButton: skip
 
-    // "Busy" of the size `side`. In a picture taken for comparison (`--screenshot`) it stands
-    // still: the same picture every time.
-    component Spinner: Item {
-        id: spinner
+    spacing: Kirigami.Units.smallSpacing
 
-        property real side: Kirigami.Units.iconSizes.small
-        readonly property bool still: App.screenshot !== ""
-
-        implicitWidth: spinner.side
-        implicitHeight: spinner.side
-
-        QQC2.BusyIndicator {
-            anchors.fill: parent
-            visible: !spinner.still
-            running: spinner.visible && !spinner.still
-        }
-        Kirigami.Icon {
-            anchors.fill: parent
-            visible: spinner.still
-            source: "process-working-symbolic"
-        }
-    }
-
-    spacing: root.compact ? Kirigami.Units.smallSpacing : Kirigami.Units.largeSpacing
-
-    Kirigami.Icon {
-        visible: !root.compact
-        source: root.waiting ? "smartphone-symbolic" : (root.downloading ? "download" : "document-import")
-        implicitWidth: Kirigami.Units.gridUnit * 4
-        implicitHeight: Kirigami.Units.gridUnit * 4
-        Layout.alignment: Qt.AlignHCenter
-    }
-
-    Kirigami.Heading {
-        visible: !root.compact
-        text: root.view.title ?? ""
-        textFormat: Text.PlainText
-        level: 2
-        wrapMode: Text.Wrap
-        horizontalAlignment: Text.AlignHCenter
-        Layout.fillWidth: true
-    }
-
-    // What is going on: a sentence on the link page, one quiet line in the banner.
+    // What is going on: one quiet line.
     RowLayout {
         spacing: Kirigami.Units.smallSpacing
         Layout.fillWidth: true
@@ -88,35 +47,29 @@ ColumnLayout {
         Accessible.name: sentence.text
 
         Spinner {
-            visible: root.compact && root.waiting
+            visible: root.waiting
+            implicitWidth: Kirigami.Units.iconSizes.small
+            implicitHeight: Kirigami.Units.iconSizes.small
             Layout.alignment: Qt.AlignTop
         }
         QQC2.Label {
             id: sentence
-            text: (root.compact ? root.view.status : root.view.text) ?? ""
+            text: root.view.status ?? ""
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
-            horizontalAlignment: root.compact ? Text.AlignLeft : Text.AlignHCenter
             color: root.quiet
-            font: root.compact ? Kirigami.Theme.smallFont : Kirigami.Theme.defaultFont
+            font: Kirigami.Theme.smallFont
             Layout.fillWidth: true
         }
     }
 
-    Spinner {
-        visible: !root.compact && root.waiting
-        side: Kirigami.Units.iconSizes.medium
-        Layout.alignment: Qt.AlignHCenter
-    }
-
-    // The download with its bytes; the read has no measure. A count that steps back (the
-    // download went on from the file on disk after a restart) is just a shorter bar.
+    // The download with its bytes, the read with its messages, the update with what is left
+    // (each without a measure until its first count). A count that steps back (the download
+    // went on from the file on disk after a restart) is just a shorter bar.
     RowLayout {
-        visible: root.downloading || root.reading
+        visible: root.downloading || root.reading || root.updating
         spacing: Kirigami.Units.largeSpacing
         Layout.fillWidth: true
-        Layout.maximumWidth: root.compact ? -1 : Kirigami.Units.gridUnit * 20
-        Layout.alignment: Qt.AlignHCenter
 
         QQC2.ProgressBar {
             from: 0
@@ -129,21 +82,12 @@ ColumnLayout {
             Layout.fillWidth: true
         }
         QQC2.Label {
-            visible: root.compact && root.detail !== ""
+            visible: root.detail !== ""
             text: root.detail
             textFormat: Text.PlainText
             color: root.quiet
             font: Kirigami.Theme.smallFont
         }
-    }
-
-    QQC2.Label {
-        visible: !root.compact && root.detail !== ""
-        text: root.detail
-        textFormat: Text.PlainText
-        horizontalAlignment: Text.AlignHCenter
-        color: root.quiet
-        Layout.fillWidth: true
     }
 
     QQC2.Button {
@@ -153,8 +97,7 @@ ColumnLayout {
         // (An icon that points the way the text runs.)
         icon.name: root.LayoutMirroring.enabled ? "go-previous-skip" : "go-next-skip"
         Accessible.name: skip.text
-        Layout.alignment: root.compact ? Qt.AlignRight : Qt.AlignHCenter
-        Layout.topMargin: root.compact ? 0 : Kirigami.Units.largeSpacing
+        Layout.alignment: Qt.AlignRight
         onClicked: App.skipTransfer(root.view.account ?? 0)
     }
 }

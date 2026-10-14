@@ -22,7 +22,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use http::Method;
-use kourier_backend_api::{BackendEvent, Relink};
+use kourier_backend_api::{BackendEvent, Relink, TakenIdentity};
 use kourier_model::{
     BackendError, ErrorKind, InputField, InputKind, LoginStep, LoginStepKind, Redacted,
 };
@@ -167,14 +167,15 @@ fn hostname() -> String {
 pub(crate) async fn link<T: SignalTransport>(
     shared: Rc<Shared<T>>,
     relink: Option<Relink>,
+    taken: Vec<TakenIdentity>,
     mut inputs: mpsc::UnboundedReceiver<LoginInput>,
     stop: CancellationToken,
 ) -> std::result::Result<Account, LinkEnd> {
     let expect_own = relink.as_ref().map(expected_aci).transpose()?.flatten();
     // A fresh link asks the phone for the account's history (§14.2 item 14), when the
-    // offer is switched on (`Tuning::transfer_offer`: off until the import exists); a
-    // relink of a logged-out account that kept its chats never does: the archive would be
-    // laid over a history that is there.
+    // offer is on (`Tuning::transfer_offer`: the application turns it on, the library's
+    // default is off); a relink of a logged-out account that kept its chats never does: the
+    // archive would be laid over a history that is there.
     let offer = relink.is_none() && shared.tuning.transfer_offer;
 
     // Step 1: the device name.
@@ -235,6 +236,22 @@ pub(crate) async fn link<T: SignalTransport>(
     // seconds) are closed beside the link request, not before it.
     let closing = shared.clone();
     tokio::task::spawn_local(async move { close_all(&closing, open).await });
+    // An account the profile has already (L1, `buttons.md` F2): turned away before the link
+    // request, so the phone never gets a second device of one account. (The core refuses
+    // the same when `AccountReady` arrives; this is the first line, and the one that leaves
+    // nothing on the phone to clean up.)
+    if let Some(logged_out) = already_here(&taken, provisioned.aci) {
+        tracing::info!(
+            logged_out,
+            "the phone's account is in this profile already; nothing was linked"
+        );
+        return Err(failed(
+            ErrorKind::AlreadyAdded { logged_out },
+            "this account is already in the profile",
+            "This account is already in Kourier.",
+        )
+        .into());
+    }
     // The account the user meant to link (`BackendConfig::expect_number_suffix`): looked at
     // before anything is registered, so the wrong phone scanning the code links nothing.
     if let Some(expected) = &shared.config.expect_number_suffix
@@ -264,6 +281,13 @@ pub(crate) async fn link<T: SignalTransport>(
 
     // Steps 4-6.
     register(&shared, &provisioned, &device_name, offer, answered, &stop).await
+}
+
+/// Whether `aci` is the primary own id of one of the profile's other accounts; the answer is
+/// whether that account is logged out.
+fn already_here(taken: &[TakenIdentity], aci: Aci) -> Option<bool> {
+    let user = crate::service_id::aci_user_id(aci).ok()?;
+    taken.iter().find(|t| t.user == user).map(|t| t.logged_out)
 }
 
 /// The ACI a relink must find (§4.3 step 6). Fails closed: a relink that names own ids but no
@@ -776,8 +800,9 @@ async fn register<T: SignalTransport>(
             "INSERT INTO account(id, aci, pni, e164, device_id, password,
                    aci_registration_id, pni_registration_id, profile_key, master_key,
                    account_entropy_pool, storage_key, media_root_backup_key, read_receipts,
-                   linked_at, env)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                   linked_at, env, device_name)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                   ?16)",
             kourier_db::rusqlite::params![
                 aci_string,
                 Uuid::from(provisioned.pni).hyphenated().to_string(),
@@ -801,6 +826,9 @@ async fn register<T: SignalTransport>(
                 now_i,
                 // The server this device now belongs to; every later start is held to it.
                 crate::net::env::binding(&shared.config.env),
+                // The name the phone lists this device by: a logout the server does not
+                // confirm names it (`Command::Logout`'s report).
+                device_name,
             ],
         )?;
         for (kind, identity, ids, signed, kyber) in [
@@ -940,6 +968,32 @@ mod tests {
             refused.user_message.as_deref(),
             Some("This account cannot be relinked.")
         );
+    }
+
+    #[test]
+    fn an_account_the_profile_has_is_found_by_its_aci_and_says_whether_it_is_logged_out() {
+        use kourier_model::UserId;
+        let aci = "9d0652a3-dcc3-4d11-975f-74d61598733f";
+        let other = "1f7f9d84-6c3a-4f0e-8a77-0b1c2d3e4f50";
+        let taken = vec![
+            TakenIdentity {
+                user: UserId::parse(&format!("aci:{other}")).unwrap(),
+                logged_out: false,
+            },
+            TakenIdentity {
+                user: UserId::parse(&format!("aci:{aci}")).unwrap(),
+                logged_out: true,
+            },
+        ];
+        let id = |s: &str| Aci::from(Uuid::parse_str(s).unwrap());
+        assert_eq!(already_here(&taken, id(aci)), Some(true));
+        assert_eq!(already_here(&taken, id(other)), Some(false));
+        assert_eq!(
+            already_here(&taken, id("2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a")),
+            None,
+            "an account the profile does not have"
+        );
+        assert_eq!(already_here(&[], id(aci)), None, "no other account");
     }
 
     #[test]

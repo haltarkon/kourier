@@ -1190,6 +1190,20 @@ async fn an_account_being_removed_does_not_become_whoever_links_meanwhile() {
     env.handle = core.handle();
     env.events = env.handle.subscribe();
     env.core = Some(core);
+    // The start finishes it in the account's supervisor, after one logout attempt (link
+    // feedback L4), so the row goes a moment later.
+    let db = env.core_db();
+    eventually("the row deleted", WAIT, || {
+        let db = db.clone();
+        async move {
+            let conn = kourier_db::open_read_only(&db, &kourier_db::DbKey::from(support::CORE_KEY))
+                .expect("open core.db");
+            conn.query_row("SELECT count(*) FROM accounts", [], |r| r.get::<_, i64>(0))
+                .expect("count")
+                == 0
+        }
+    })
+    .await;
     assert!(env.accounts().await.is_empty());
     env.stop().await;
 }
@@ -1270,6 +1284,18 @@ async fn a_clock_set_back_does_not_stall_the_outbox() {
     env.handle.send(UiCommand::UiReady).expect("send");
     transmits(&env, uuid, 3).await;
     sent(&env, a, one.id).await;
+    // The outbox sends from the start of the catch-up on (link feedback L6), so the message
+    // above can go out before the account is online, and the look the dispatcher takes when
+    // it comes online would then fall into the check below. Wait for it first.
+    eventually("the account online again", WAIT, || {
+        let env = &env;
+        async move {
+            env.account(account)
+                .await
+                .is_some_and(|a| matches!(a.conn, ConnState::Online { .. }))
+        }
+    })
+    .await;
 
     // --- while running ---
     send(&env, b, "two");
@@ -1548,5 +1574,38 @@ async fn a_clock_that_went_wrong_while_kourier_was_off_sweeps_nothing() {
         }
     })
     .await;
+    env.stop().await;
+}
+
+// ---------- a cancel after the link ----------
+
+/// L5 (`buttons.md` §3, the rule F1 relies on): once the core took `AccountReady` a
+/// `CancelLogin` changes nothing, also while the login's tail still runs (here a history
+/// read that holds the login's `Done`): the account stays Active with its files, and the
+/// backend is never told. A UI that sends one late (a link page left in that moment) loses
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_after_the_account_ready_keeps_the_account_linked() {
+    let s = script("late-cancel").with_transfer(kourier_fake::TransferScript::holding(
+        kourier_model::HistoryTransfer::Reading,
+    ));
+    let (mut env, account, uuid) = linked(s).await;
+    env.handle
+        .send(UiCommand::CancelLogin { account })
+        .expect("send");
+    env.handle
+        .send(UiCommand::CancelLogin { account })
+        .expect("send");
+    handled_so_far(&env, account, uuid).await;
+    let row = env.account(account).await.expect("the account stays");
+    assert_eq!(row.state, AccountState::Active);
+    assert!(env.account_dir(uuid).exists(), "its directory stays");
+    assert!(env.secret_exists(uuid), "its key stays");
+    assert_eq!(
+        commands(&env, uuid, "CancelLogin"),
+        0,
+        "the backend is not told"
+    );
+    assert_eq!(commands(&env, uuid, "Logout"), 0);
     env.stop().await;
 }

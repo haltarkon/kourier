@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// `Syncing` lasts until every envelope up to the catch-up boundary has passed the backend's
 /// stage 2 *and* been acked by the core; messages emitted meanwhile carry `catch_up = true`.
-/// The core drains its outbox only in `Online`.
+/// The core drains its outbox as soon as the connection is up ([`ConnState::can_send`]: `Syncing`
+/// or `Online`, as Signal Desktop, link feedback L6); the backend's side-effect queues wait for
+/// `Online`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConnState {
     /// Not connected.
@@ -53,9 +55,15 @@ impl Default for ConnState {
 }
 
 impl ConnState {
-    /// Connected and caught up: the outbox may drain.
+    /// Connected and caught up.
     pub fn is_online(&self) -> bool {
         matches!(self, Self::Online { .. })
+    }
+
+    /// The connection is up (catching up or caught up): the outbox may drain. Signal Desktop
+    /// sends while it catches up too (its job queues wait only for the socket).
+    pub fn can_send(&self) -> bool {
+        matches!(self, Self::Syncing { .. } | Self::Online { .. })
     }
 
     /// The variant name (log-safe).

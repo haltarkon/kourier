@@ -1,5 +1,7 @@
 //! The per-account outbox scheduler (§4.8 steps 2-4). It lives in the account's supervisor:
-//! one FIFO per conversation, heads run only while the account is `Online`, at most
+//! one FIFO per conversation, heads run only while the account's connection is up (`Syncing` or
+//! `Online`, [`ConnState::can_send`]: as Signal Desktop, the outbox does not wait for the
+//! catch-up, link feedback L6), at most
 //! [`MAX_IN_FLIGHT`] transmits at a time and one per conversation. Each attempt is one
 //! `Command::Transmit`; its outcome is recorded by [`outbox::record_outcome`] and decides the
 //! backoff (on the injected clock) or a pause:
@@ -146,7 +148,12 @@ pub(crate) struct Dispatcher {
     /// The armed backoff timer: deadline (ms) and the clock's sleep. In a `Mutex` only so the
     /// supervisor stays `Sync` (it is polled through `&mut`, never locked).
     timer: Option<(i64, Mutex<Sleep>)>,
+    /// The backend's last state was `Online` (caught up): the challenge rules go by it.
     online: bool,
+    /// The connection is up (`Syncing` or `Online`): the outbox drains.
+    up: bool,
+    /// Since when (ms) the backend has not been `Online`, for the log's `after_ms`.
+    offline_since: Option<i64>,
     /// The account's outbox waits (challenge, rejected credentials).
     account_paused: bool,
     /// What the UI shows while the account's outbox waits for a solved challenge.
@@ -159,6 +166,12 @@ pub(crate) struct Dispatcher {
     /// That announcement has been on show while the backend was `Online`: the backend
     /// coming `Online` anew then ends it (one that arrived during a catch-up is still due).
     announced_shown: bool,
+    /// The account's outbox was paused by a challenge met while the connection was up but
+    /// still catching up (`Syncing`; the outbox sends there too, link feedback L6). The
+    /// `Online` that ends that catch-up is the same connection, not a return after an
+    /// interruption, so it does not lift the pause; the next connection's `Online` does. The
+    /// challenge is also on show over the catch-up's own updates.
+    paused_in_catch_up: bool,
     /// When the challenge ends by itself (the network's Retry-After): the deadline (ms) and
     /// the clock's sleep, which is `None` after a resume from suspend until it is armed again.
     challenge_end: Option<(i64, Option<Mutex<Sleep>>)>,
@@ -200,11 +213,14 @@ impl Dispatcher {
             done_rx,
             timer: None,
             online: false,
+            up: false,
+            offline_since: None,
             account_paused: false,
             challenge: None,
             challenge_token: None,
             announced: false,
             announced_shown: false,
+            paused_in_catch_up: false,
             challenge_end: None,
             backend_conn: ConnState::default(),
             paused: BTreeMap::new(),
@@ -225,6 +241,7 @@ impl Dispatcher {
         self.challenge_end = None;
         self.announced = false;
         self.announced_shown = false;
+        self.paused_in_catch_up = false;
         self.challenge_since = None;
         self.restored = false;
         std::mem::replace(&mut self.account_paused, false) || shown
@@ -348,6 +365,7 @@ impl Dispatcher {
         self.in_flight.clear();
         self.timer = None;
         self.online = false;
+        self.up = false;
         self.backend_conn = ConnState::default();
         self.clear_challenge();
         let account = self.account;
@@ -410,15 +428,36 @@ impl Dispatcher {
         self.stored = Some(stored);
     }
 
-    /// The backend published a connection state; `true` when the outbox may have work now.
-    pub(crate) fn conn(&mut self, state: &ConnState) -> bool {
+    /// The backend published a connection state at `now` (ms); `true` when the outbox may
+    /// have work now.
+    pub(crate) fn conn(&mut self, state: &ConnState, now: i64) -> bool {
         let was = self.online;
+        let was_up = self.up;
         self.online = state.is_online();
+        self.up = state.can_send();
         self.backend_conn = state.clone();
+        if !self.online && self.offline_since.is_none() {
+            self.offline_since = Some(now);
+        }
+        if !self.up {
+            // The connection the pause was met on is gone: the next `Online` is a new one.
+            self.paused_in_catch_up = false;
+        }
         if self.online && !was {
+            // How long the account could not send everything: the connect and the catch-up
+            // (diagnosis §2 item 4).
+            let after_ms = self.offline_since.take().map(|t| now.saturating_sub(t));
+            tracing::info!(
+                account = self.account.0,
+                after_ms,
+                in_flight = self.in_flight.len(),
+                "account online"
+            );
             if std::mem::take(&mut self.restored) {
                 // The pause was taken up from the last run: this is the first `Online` it
                 // is shown under, not a return after an interruption.
+            } else if std::mem::take(&mut self.paused_in_catch_up) {
+                // The end of the catch-up the send met its challenge in: the same connection.
             } else if self.account_paused || self.announced_shown {
                 // The backend is back after an interruption (for example a solved challenge).
                 self.clear_challenge();
@@ -427,7 +466,9 @@ impl Dispatcher {
                 self.announced_shown = true;
             }
         }
-        self.online && !was
+        // A connection that came up drains what waits; `Online` after a catch-up may lift a
+        // challenge's pause (above), which frees the outbox too.
+        (self.up && !was_up) || (self.online && !was)
     }
 
     /// The token of the challenge the account's outbox waits on, if it waits on one.
@@ -440,7 +481,12 @@ impl Dispatcher {
     /// (a repeated `Online` must not hide it).
     pub(crate) fn shown(&self, state: ConnState) -> ConnState {
         match &self.challenge {
-            Some(c) if (self.account_paused || self.announced) && state.is_online() => c.clone(),
+            Some(c)
+                if (self.account_paused || self.announced)
+                    && (state.is_online() || (self.paused_in_catch_up && state.can_send())) =>
+            {
+                c.clone()
+            }
             _ => state,
         }
     }
@@ -613,7 +659,7 @@ impl Dispatcher {
             self.arm(sh, next);
             return Ok(kicked);
         }
-        if !self.linked || !self.online || self.account_paused {
+        if !self.linked || !self.up || self.account_paused {
             return Ok(Kicked::default());
         }
         let now = i64::try_from(sh.clock.now_ms()).unwrap_or(i64::MAX);
@@ -683,6 +729,17 @@ impl Dispatcher {
             reply,
         };
         let outbox = attempt.outbox;
+        tracing::info!(
+            account = self.account.0,
+            conv = attempt.conv.0,
+            msg = attempt.message.0,
+            kind = attempt.req.kind.name(),
+            attempt = attempt.number,
+            waited_ms = attempt.started_at.saturating_sub(attempt.req.sent_at),
+            in_flight = self.in_flight.len(),
+            online = self.online,
+            "transmit started"
+        );
         self.in_flight.insert(outbox, attempt);
         match tokio::time::timeout(SEND_TIMEOUT, commands.send(cmd)).await {
             Ok(Ok(())) => {}
@@ -723,11 +780,10 @@ impl Dispatcher {
             Some(TransmitOutcome::Failed(e)) => e.kind.name(),
             None => "no reply",
         };
-        tracing::debug!(
-            account = account.0,
-            message = attempt.message.0,
-            outcome = name,
-            "transmit finished"
+        let (message, number, took_ms) = (
+            attempt.message.0,
+            attempt.number,
+            now.saturating_sub(attempt.started_at),
         );
         let outcome = done.outcome;
         let recorded = match sh
@@ -754,6 +810,17 @@ impl Dispatcher {
                 return Err(e);
             }
         };
+        // At the end, with the next try the outcome chose (diagnosis §2 item 2).
+        tracing::info!(
+            account = account.0,
+            msg = message,
+            attempt = number,
+            outcome = name,
+            took_ms,
+            next_try_ms = recorded.retry_in.map(outbox::ms),
+            paused = recorded.pause.is_some(),
+            "transmit finished"
+        );
         let mut effect = Effect {
             changes: recorded.changes,
             failed: recorded.failed,
@@ -779,6 +846,7 @@ impl Dispatcher {
                 // one the answer needs.
                 self.clear_challenge();
                 self.account_paused = true;
+                self.paused_in_catch_up = self.up && !self.online;
                 if let Some(c) = challenge {
                     // As the transaction that recorded the answer stored it.
                     self.stored = Some(c.stored(now));

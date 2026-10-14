@@ -43,6 +43,9 @@ Kirigami.ScrollablePage {
     signal openConversation(real id)
     // The quick switch chose a chat: it opens and the composer takes the keyboard.
     signal switchedByKeyboard(real id)
+    // The banner's button (link again, solve the challenge, restart): the window decides
+    // whether a link in progress must be asked about first.
+    signal bannerActivated
 
     // The keyboard goes to the search field, with what is typed there selected.
     function focusSearch(): void {
@@ -112,11 +115,12 @@ Kirigami.ScrollablePage {
                 QQC2.ToolTip.text: page.searchKeys !== "" ? L10n.i18nc("@info:tooltip, %1 a keyboard shortcut", "Search conversations (%1)", page.searchKeys) : L10n.i18nc("@info:tooltip", "Search conversations")
                 onTextChanged: App.setSearch(text)
                 // The quick switch: type a name, Enter opens the first chat that matches, and
-                // the keyboard goes on to the message.
+                // the keyboard goes on to the message. The window empties the field once the
+                // chat opens (`MainWindow.switchTo`): kept when the switch is not made (it
+                // asks "Stop Linking?" first and the answer is "Continue Linking").
                 onAccepted: {
                     const id = App.conversationAt(0);
                     if (id !== 0) {
-                        search.text = "";
                         page.switchedByKeyboard(id);
                     }
                 }
@@ -125,6 +129,7 @@ Kirigami.ScrollablePage {
             AccountBanner {
                 id: banner
                 Layout.fillWidth: true
+                onActivated: page.bannerActivated()
             }
             Kirigami.InlineMessage {
                 visible: page.showsNotice && App.composer.notice !== ""
@@ -194,13 +199,53 @@ Kirigami.ScrollablePage {
             Component.onCompleted: page.delegatesCreated += 1
         }
 
+        // An empty list says why while a new link still brings its chats (link feedback L3:
+        // the list opens as soon as the account is linked): the history on its way, its
+        // import, or the contacts and groups still coming (the banner counts them).
         Kirigami.PlaceholderMessage {
+            id: emptyList
+
+            readonly property string phase: App.bannerTransfer.phase ?? ""
+            // What the user searches for (the filter ignores the space around it): a search
+            // that matches nothing says so, whatever else goes on with the account.
+            readonly property string query: search.text.trim()
+
             anchors.centerIn: parent
-            width: parent.width - Kirigami.Units.gridUnit * 4
+            width: parent.width - Kirigami.Units.gridUnit * 2
             visible: page.rowsShown && list.count === 0
             icon.name: "dialog-messages"
-            text: L10n.i18nc("@info:placeholder", "No conversations")
-            explanation: L10n.i18nc("@info:placeholder", "Chats from your phone appear here once they sync.")
+            text: {
+                if (emptyList.query !== "") {
+                    return L10n.i18nc("@info:placeholder, %1 what was searched for", "No chats match “%1”", Style.plain(emptyList.query));
+                }
+                switch (emptyList.phase) {
+                case "waiting":
+                case "downloading":
+                    return L10n.i18nc("@info:placeholder", "Your history is on its way");
+                case "reading":
+                    return L10n.i18nc("@info:placeholder", "Importing your message history");
+                case "updating":
+                    return L10n.i18nc("@info:placeholder", "Getting your chats");
+                default:
+                    return L10n.i18nc("@info:placeholder", "No conversations");
+                }
+            }
+            explanation: {
+                if (emptyList.query !== "") {
+                    return "";
+                }
+                switch (emptyList.phase) {
+                case "waiting":
+                case "downloading":
+                    return L10n.i18nc("@info:placeholder", "Chats appear here when your phone sends them.");
+                case "reading":
+                    return L10n.i18nc("@info:placeholder", "Chats appear here as they are imported.");
+                case "updating":
+                    return L10n.i18nc("@info:placeholder", "Chats appear here as contacts and groups arrive.");
+                default:
+                    return L10n.i18nc("@info:placeholder", "Chats from your phone appear here once they sync.");
+                }
+            }
         }
     }
 
@@ -225,6 +270,8 @@ Kirigami.ScrollablePage {
             // Only while the chat has unread messages or was marked unread on another
             // device; no room taken otherwise.
             visible: rowMenu.row !== null && rowMenu.row.hasUnread
+            // Disabled while hidden: the keyboard would reach an invisible item otherwise.
+            enabled: visible
             height: visible ? implicitHeight : 0
             icon.name: "mail-mark-read"
             text: L10n.i18nc("@action:inmenu", "Mark as Read")

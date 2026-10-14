@@ -3,6 +3,8 @@
 //!
 //! `KOURIER_DUMP_PIXELS=<dir>` also writes them as PAM images (RGB_ALPHA) for a look.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use cxx_qt_lib::QGuiApplication;
@@ -198,6 +200,7 @@ fn run(dump_dir: Option<&Path>) -> Result<(), String> {
 }
 
 fn main() {
+    support::answer_list("desktop");
     if std::env::var_os("QT_QPA_PLATFORM").is_none() {
         // SAFETY: single-threaded test binary, before Qt starts.
         unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

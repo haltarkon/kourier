@@ -26,6 +26,7 @@ mod i18n;
 mod install;
 mod perf;
 mod quick;
+mod runner;
 mod seam;
 mod shots;
 mod smoke;
@@ -123,16 +124,7 @@ fn lint_steps() -> Result<()> {
 
 fn ci_full() -> Result<()> {
     lint_steps()?;
-    run(
-        "tests (non-Qt)",
-        cargo().args(["test", "--workspace", "--exclude", "kourier-qt"]),
-    )?;
-    run(
-        "tests (Qt, offscreen)",
-        cargo()
-            .args(["test", "-p", "kourier-qt"])
-            .env("QT_QPA_PLATFORM", "offscreen"),
-    )?;
+    runner::full(runner::engine())?;
     qmllint()?;
     shots::ci_step()?;
     eprintln!("\nci: all steps passed");
@@ -466,7 +458,7 @@ fn target_dir() -> PathBuf {
 /// network's linking walk) for the first three, `--fixture` (the fake account's demo data in
 /// `core.db`) for the rest. Every `--page` value is here (`PAGES` in `crates/kourier-qt/src/lib.rs`;
 /// a test compares the two).
-const SHOT_PAGES: [&str; 47] = [
+const SHOT_PAGES: [&str; 49] = [
     "welcome",
     "link",
     "qr",
@@ -508,9 +500,11 @@ const SHOT_PAGES: [&str; 47] = [
     "readmore",
     "about",
     "calls",
+    "unavailable",
     "transferwait",
     "transferdownload",
     "transferread",
+    "transferupdate",
     "transferbanner",
     "transferfailed",
     "transferask",
@@ -553,20 +547,41 @@ fn color_scheme_file(scheme: &str) -> PathBuf {
     Path::new("/usr/share/color-schemes").join(format!("{scheme}.colors"))
 }
 
+/// The `[KDE]` line that stops the style's animations: `org.kde.desktop` reads Plasma's
+/// "animation speed" from it (0 = instant), and every duration of `Kirigami.Units` (the fade of
+/// a menu, a dialog, a tip and of the scroll bar, the slide of a page) becomes 0 to 2 ms
+/// (measured: short 0, long 1, very long 2, against 100, 200 and 400 ms). A picture for
+/// comparison is taken when nothing moves (`shotTimer`, two equal frames 50 ms apart); a
+/// transition that waits before it starts (QTBUG-106118: a `Binding` with `delayed: true`
+/// ahead of a fade) fits between those two frames, so it is removed at its source.
+const STILL_STYLE: &str = "AnimationDurationFactor=0\n";
+
+/// The text of a render's `kdeglobals`: the color scheme file `colors`, the icon theme, a text
+/// cursor that does not blink (`CursorBlinkRate=0`, so two pictures of a page with a focused
+/// text field are the same), the animations stopped when `still`, then `other_groups` (more
+/// groups, e.g. fonts).
+fn render_kdeglobals(colors: &str, icons: &str, still: bool, other_groups: &str) -> String {
+    format!(
+        "{colors}\n[Icons]\nTheme={icons}\n\n[KDE]\nCursorBlinkRate=0\n{}\n{other_groups}",
+        if still { STILL_STYLE } else { "" }
+    )
+}
+
 /// A config home whose `kdeglobals` selects one Breeze color scheme and its icon theme, so the
 /// KDE platform theme renders that scheme regardless of the desktop's own settings. The text
-/// cursor does not blink (`CursorBlinkRate=0`), so two pictures of a page with a focused text
-/// field are the same.
-fn theme_home(base: &Path, theme: &str, scheme: &str, icons: &str) -> Result<PathBuf> {
+/// cursor does not blink (see [`render_kdeglobals`]); with `still` the style's animations stop
+/// too ([`STILL_STYLE`]: the pictures for comparison, not the demo or the measurements, which
+/// show and time the animations).
+fn theme_home(base: &Path, theme: &str, scheme: &str, icons: &str, still: bool) -> Result<PathBuf> {
     let home = base.join(theme);
     std::fs::create_dir_all(&home)?;
     let colors = color_scheme_file(scheme);
-    let mut globals =
+    let globals =
         std::fs::read_to_string(&colors).with_context(|| format!("read {}", colors.display()))?;
-    globals.push_str(&format!(
-        "\n[Icons]\nTheme={icons}\n\n[KDE]\nCursorBlinkRate=0\n"
-    ));
-    std::fs::write(home.join("kdeglobals"), globals)?;
+    std::fs::write(
+        home.join("kdeglobals"),
+        render_kdeglobals(&globals, icons, still, ""),
+    )?;
     Ok(home)
 }
 
@@ -603,13 +618,31 @@ fn qml_problems(stderr: &str) -> Vec<String> {
 /// Where Kirigami's drawer handle lives (see [`qml_problems`]).
 const KIRIGAMI_DRAWER_HANDLE: &str = "org/kde/kirigami/templates/private/DrawerHandle.qml";
 
-/// Mean luminance from the app's `shot: <path> luma=<n>` line.
+/// Mean luminance from the app's `shot: <path> luma=<n> settle_ms=<n>` line.
 fn shot_luma(stdout: &str) -> Option<u32> {
-    stdout
+    shot_field(stdout, "luma")
+}
+
+/// Milliseconds from the page's ready moment to the grab, from the same line.
+fn shot_settle_ms(stdout: &str) -> Option<u32> {
+    shot_field(stdout, "settle_ms")
+}
+
+/// The number after ` <name>=` on the app's `shot: <path> luma=<n> settle_ms=<n>` line (the
+/// path may hold spaces: the words are read from the end).
+fn shot_field(stdout: &str, name: &str) -> Option<u32> {
+    let line = stdout.lines().find_map(|l| l.strip_prefix("shot: "))?;
+    line.rsplit(' ')
+        .find_map(|w| w.strip_prefix(name)?.strip_prefix('=')?.trim().parse().ok())
+}
+
+/// What kept a picture from being final, from the app's `shot: unsettled <what>` line on stderr
+/// (it saved the frame as it was after 30 s).
+fn shot_unsettled(stderr: &str) -> Option<String> {
+    stderr
         .lines()
-        .find_map(|l| l.strip_prefix("shot: "))
-        .and_then(|l| l.rsplit_once(" luma="))
-        .and_then(|(_, n)| n.trim().parse().ok())
+        .find_map(|l| l.strip_prefix("shot: unsettled"))
+        .map(|what| what.trim().to_owned())
 }
 
 #[cfg(test)]
@@ -708,6 +741,17 @@ mod tests {
     fn shot_output_parsing() {
         assert_eq!(shot_luma("noise\nshot: /a b/c.png luma=187\n"), Some(187));
         assert_eq!(shot_luma("shot: x"), None);
+        let line = "shot: /a luma=9/c.png luma=187 settle_ms=2450\n";
+        assert_eq!(
+            (shot_luma(line), shot_settle_ms(line)),
+            (Some(187), Some(2450))
+        );
+        assert_eq!(shot_settle_ms("shot: /a.png luma=187\n"), None);
+        assert_eq!(
+            shot_unsettled("x\nshot: unsettled images 2, moving\n").as_deref(),
+            Some("images 2, moving")
+        );
+        assert_eq!(shot_unsettled("shot: /a.png luma=1\n"), None);
         let stderr = "kf.config.core: whatever\nqrc:/qt/qml/x/Main.qml:3:5: Unable to assign\n";
         assert_eq!(qml_problems(stderr).len(), 1);
         // Kirigami's own drawer handle: its two lines are passed over, a loop of ours next

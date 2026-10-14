@@ -242,7 +242,7 @@ pub fn test_args(package: &str, tests: &[String]) -> Vec<String> {
 }
 
 /// The Qt crate's tests need a platform plugin; the full run gives them the offscreen one.
-fn needs_offscreen(package: &str) -> bool {
+pub fn needs_offscreen(package: &str) -> bool {
     package == "kourier-qt"
 }
 
@@ -331,32 +331,10 @@ pub fn run(since: Option<&str>) -> Result<()> {
     describe(&files, since, &plan, &reached);
 
     crate::lint_steps()?;
-    crate::run(
-        "unit tests of every package (non-Qt)",
-        crate::cargo().args([
-            "test",
-            "--workspace",
-            "--exclude",
-            "kourier-qt",
-            "--lib",
-            "--bins",
-        ]),
-    )?;
-    crate::run(
-        "unit tests of kourier-qt (offscreen)",
-        crate::cargo()
-            .args(["test", "-p", "kourier-qt", "--lib", "--bins"])
-            .env("QT_QPA_PLATFORM", "offscreen"),
-    )?;
+    let engine = crate::runner::engine();
+    crate::runner::quick_unit(engine)?;
     let selected = integration_tests(&ws, &reached);
-    for (package, tests) in &selected {
-        let mut cmd = crate::cargo();
-        cmd.args(test_args(package, tests));
-        if needs_offscreen(package) {
-            cmd.env("QT_QPA_PLATFORM", "offscreen");
-        }
-        crate::run(&format!("integration tests of {package}"), &mut cmd)?;
-    }
+    crate::runner::quick_integration(engine, &selected)?;
     if !plan.qml.is_empty() {
         crate::qmllint()?;
     }

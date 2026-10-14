@@ -75,8 +75,10 @@ commands:
              --offscreen | --window  no window (default for local) or a window (default else)
              --desktop               notifications, tray and bus name on (off by default)
              --allow-schema-change   start a build whose database schema is newer than the profile's
-             --history-transfer      offer the phone the history transfer at a first link
-                                     (experimental: the import is not whole yet)
+             --no-history-transfer   do not offer the phone the history transfer at a first link
+                                     (it is offered by default, as the app does); the app gets
+                                     KOURIER_HISTORY_TRANSFER=0
+             --history-transfer      the default now; accepted and does nothing
              --allow-unencrypted-disk  keep a real login on a disk without encryption
              --no-build              do not rebuild the app first
   step <name> [--wait <s>] [--seconds <s>] [--timer <off|s>] [--expect <n>] [--device-name <text>]
@@ -892,10 +894,11 @@ fn app_command(bin: &Path, dir: &ProfileDir, launch: &Value) -> Result<Command> 
     if let Some(tail) = launch["expect_tail"].as_str() {
         cmd.env("KOURIER_DEV_EXPECT_NUMBER_TAIL", tail);
     }
-    if launch["history_transfer"] == json!(true) {
-        // Only the launch order switches the transfer on: an inherited variable was
-        // stripped above with every other `KOURIER_` one.
-        cmd.env("KOURIER_HISTORY_TRANSFER", "1");
+    if launch["no_history_transfer"] == json!(true) {
+        // Only the launch order switches the transfer off, and only for this run: an
+        // inherited variable was stripped above with every other `KOURIER_` one, so with no
+        // order the app offers the transfer, as it does by default.
+        cmd.env("KOURIER_HISTORY_TRANSFER", "0");
     }
     if launch["desktop"] != json!(true) {
         // No notifications (they would show names and texts on the desktop and stay in its
@@ -1383,7 +1386,10 @@ struct Args {
     offscreen: Option<bool>,
     desktop: bool,
     allow_schema_change: bool,
+    /// `--history-transfer`: the app's default now; accepted and does nothing.
     history_transfer: bool,
+    /// `--no-history-transfer`: the app is started with `KOURIER_HISTORY_TRANSFER=0`.
+    no_history_transfer: bool,
     allow_unencrypted: bool,
     no_build: bool,
     force: bool,
@@ -1436,6 +1442,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--desktop" => a.desktop = true,
             "--allow-schema-change" => a.allow_schema_change = true,
             "--history-transfer" => a.history_transfer = true,
+            "--no-history-transfer" => a.no_history_transfer = true,
             "--allow-unencrypted-disk" => a.allow_unencrypted = true,
             "--no-build" => a.no_build = true,
             "--force" => a.force = true,
@@ -1603,6 +1610,14 @@ fn start_in(a: &Args, vars: &dyn Fn(&str) -> Option<String>) -> Result<i32> {
         .env
         .clone()
         .ok_or_else(|| anyhow!("start needs --env <production|staging|local:<handshake.json>>"))?;
+    if a.history_transfer && a.no_history_transfer {
+        bail!("--history-transfer and --no-history-transfer contradict each other");
+    }
+    if a.history_transfer {
+        eprintln!(
+            "note: --history-transfer does nothing now: the app offers the history transfer at a first link by default (--no-history-transfer turns it off for the run)"
+        );
+    }
     let local = env.is_local();
     let dir = a.place.resolve(Some(&env), vars)?;
     // The user's go comes first: nothing below may contact a real server without it.
@@ -1715,7 +1730,7 @@ fn start_in(a: &Args, vars: &dyn Fn(&str) -> Option<String>) -> Result<i32> {
             "offscreen": offscreen,
             "desktop": a.desktop,
             "expect_tail": tail,
-            "history_transfer": a.history_transfer,
+            "no_history_transfer": a.no_history_transfer,
         })
         .to_string(),
     )?;
@@ -3127,6 +3142,7 @@ fn step_link(run: &mut StepRun<'_>) -> Result<()> {
         seq
     };
     run.phone("on the TEST phone (never the personal one): Signal > Settings > Linked devices > Link a new device. Scan the QR code in the Kourier window and confirm. Keep the phone unlocked and online for a minute.");
+    run.phone("after the scan the phone asks whether to transfer the message history, because Kourier's link offers it (as Signal Desktop's does). A default run is not about the history: choose \"Don't transfer\" (a run started with --no-history-transfer does not ask). To try the transfer, choose to transfer it (docs/smoke-run.md, \"A link with the history transfer\").");
     run.waiting("for the phone to scan a code (a new one every 45 s, six in all)");
     let shown = Instant::now();
     let outcome = poll(run.wait_secs(330), Duration::from_millis(500), || {
@@ -3157,10 +3173,7 @@ fn step_link(run: &mut StepRun<'_>) -> Result<()> {
             "no phone answered a QR code in time. Look at the TEST phone's list of linked devices before anything else. Do not stop the app while a link may be in flight"
         ),
     }
-    run.note(format!(
-        "linked {:.1} s after the first code was shown (contacts and Storage Service synced)",
-        shown.elapsed().as_secs_f32()
-    ));
+    run.note(linked_note(shown.elapsed().as_secs_f32()));
     run.client
         .wait("account_active", Duration::from_secs(120))
         .context("linked, but the account did not come online (read the log for \"post-connect steps failed\")")?;
@@ -3168,13 +3181,32 @@ fn step_link(run: &mut StepRun<'_>) -> Result<()> {
         &run.client
             .ctl("chats", json!({}), Duration::from_secs(30))?,
     );
-    run.note(format!(
-        "online; {} conversations listed ({} group)",
+    run.note(online_note(
         chats.len(),
-        chats.iter().filter(|c| c.kind == "group").count()
+        chats.iter().filter(|c| c.kind == "group").count(),
     ));
     run.note("on the TEST phone: Kourier is listed under Linked devices");
     Ok(())
+}
+
+/// What the link step says when the login is done. The link's `Done` waits for the phone's
+/// contact sync, but after an imported history archive NOT for the first Storage Service
+/// sync (it runs after `Done`): the note claims only what is certain (link feedback L2).
+fn linked_note(secs: f32) -> String {
+    format!(
+        "linked {secs:.1} s after the first code was shown (contact sync done; the Storage \
+         Service sync too unless the history was imported)"
+    )
+}
+
+/// What the link step says about the list once the account is online. The groups the
+/// Storage Service named arrive one refresh at a time after `Done` (a link without an
+/// import opens the list before them), so the count is a lower bound.
+fn online_note(chats: usize, groups: usize) -> String {
+    format!(
+        "online; {chats} conversations listed ({groups} group; groups the Storage Service \
+         named may still be arriving)"
+    )
 }
 
 fn step_passive(run: &mut StepRun<'_>) -> Result<()> {
@@ -4428,6 +4460,17 @@ fn rehearsal(node: &Path, base: &Path, profile: &ProfileDir) -> Result<usize> {
             T,
         )?;
         device = field(&linked, "ref")?;
+        // The app's default: a new link offers the history transfer (the phone is asked).
+        // The mock phone's user declines unless a test gave it a key, so the link goes on.
+        if !linked["capabilities"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|c| c == "backup5"))
+            || linked["sentTransferKey"] != json!(false)
+        {
+            bail!(
+                "a new link must offer the history transfer by default (backup5), and the mock phone declines it: {linked}"
+            );
+        }
         Ok(())
     };
     // A link step that gives up waiting (as a shell call that is cut off would) leaves the
@@ -4874,6 +4917,30 @@ mod tests {
         parse_args(&a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
     }
 
+    /// After an imported history the link's `Done` does not wait for the Storage Service sync,
+    /// and the list opens before the groups it names: the link step's notes must not claim
+    /// either (link feedback L2).
+    #[test]
+    fn the_link_notes_claim_no_storage_sync_and_no_complete_group_list() {
+        let linked = linked_note(75.04);
+        assert!(linked.contains("75.0 s"), "{linked}");
+        assert!(linked.contains("contact sync done"), "{linked}");
+        assert!(
+            linked.contains("Storage Service sync too unless the history was imported"),
+            "{linked}"
+        );
+        assert!(
+            !linked.contains("contacts and Storage Service synced"),
+            "{linked}"
+        );
+        let online = online_note(12, 3);
+        assert!(
+            online.contains("12 conversations listed (3 group"),
+            "{online}"
+        );
+        assert!(online.contains("may still be arriving"), "{online}");
+    }
+
     /// A scratch directory below the target directory, removed when dropped.
     struct Scratch(PathBuf);
 
@@ -4899,6 +4966,26 @@ mod tests {
             "HOME" => Some("/home/u".to_owned()),
             _ => None,
         }
+    }
+
+    /// The history transfer follows the app's default; `--no-history-transfer` is the only
+    /// switch, `--history-transfer` is a no-op, and both together are refused.
+    #[test]
+    fn the_history_transfer_flags() {
+        let a = args(&["start", "--env", "production"]).expect("parses");
+        assert!(!a.history_transfer && !a.no_history_transfer);
+        let a = args(&["start", "--env", "production", "--no-history-transfer"]).expect("parses");
+        assert!(a.no_history_transfer && !a.history_transfer);
+        let a = args(&["start", "--env", "production", "--history-transfer"]).expect("parses");
+        assert!(a.history_transfer && !a.no_history_transfer);
+        let both = Args {
+            env: Some(EnvArg::Production),
+            history_transfer: true,
+            no_history_transfer: true,
+            ..Args::default()
+        };
+        let error = start_in(&both, &|_| None).expect_err("refused").to_string();
+        assert!(error.contains("contradict"), "{error}");
     }
 
     #[test]
@@ -5008,6 +5095,7 @@ mod tests {
             "KOURIER_HOME",
             "KOURIER_LOG",
             "KOURIER_DEV_DEMO_STATE",
+            "KOURIER_HISTORY_TRANSFER",
             "PATH",
             "WAYLAND_DISPLAY",
             "MY_KOURIER_NOTE",
@@ -5015,7 +5103,7 @@ mod tests {
         let stripped = inherited_to_strip(keys.iter().map(std::ffi::OsString::from));
         assert_eq!(
             stripped,
-            keys[..5]
+            keys[..6]
                 .iter()
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
@@ -6092,13 +6180,14 @@ mod tests {
         assert_eq!(
             set(&real, "KOURIER_HISTORY_TRANSFER"),
             None,
-            "the history transfer is offered only when the launch order says so"
+            "the history transfer follows the app's default (on) unless the launch order says so"
         );
-        let transfer =
-            envs(json!({"env_arg": "production", "local": false, "history_transfer": true}));
+        let off =
+            envs(json!({"env_arg": "production", "local": false, "no_history_transfer": true}));
         assert_eq!(
-            set(&transfer, "KOURIER_HISTORY_TRANSFER").as_deref(),
-            Some("1")
+            set(&off, "KOURIER_HISTORY_TRANSFER").as_deref(),
+            Some("0"),
+            "--no-history-transfer switches the offer off for the run"
         );
         assert_eq!(set(&real, "QT_QPA_PLATFORM"), None, "a window by default");
         // The filter never opens libsignal's protocol log and never is a bare level.

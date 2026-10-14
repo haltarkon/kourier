@@ -188,6 +188,20 @@ impl<'a> TimeContext<'a> {
         }
     }
 
+    /// A local date in short form, for a date that is not "recent" (when a link was made):
+    /// `12 Sep` this year, `12 Sep 2025` before. Unlike [`Self::list_label`] it never says a
+    /// time, `Yesterday` or a weekday.
+    pub fn short_date(&self, ts_ms: i64) -> String {
+        let day = self.day_number(ts_ms);
+        let d = civil_from_days(day);
+        let month = trm(MONTHS_SHORT[(d.month - 1) as usize]);
+        if d.year == civil_from_days(self.day_number(self.now_ms)).year {
+            format!("{} {month}", d.day)
+        } else {
+            format!("{} {month} {}", d.day, d.year)
+        }
+    }
+
     /// Label of a timeline date header for a local day number: `Today`, `Yesterday`, the
     /// weekday within the last week, `Saturday, 12 September` this year, `12 September 2025`
     /// before.

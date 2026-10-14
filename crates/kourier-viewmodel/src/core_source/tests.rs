@@ -71,6 +71,7 @@ pub(super) fn account() -> CoreAccount {
         own_device: Some(2),
         avatar: None,
         number: None,
+        linked_at: 0,
     }
 }
 
@@ -150,6 +151,7 @@ pub(super) fn message(conv: i64, n: i64, unread: bool) -> CoreMessage {
         view_once: false,
         history: false,
         mentions_me: false,
+        outbox: None,
         actions: Default::default(),
     }
 }
@@ -415,6 +417,45 @@ fn first_load_and_coalesced_invalidations() {
     let (t, q) = follow[0].clone();
     src.on_event(&result(t, store.answer(&q)));
     assert!(take_queries(&sent).is_empty());
+}
+
+#[test]
+fn a_read_asked_of_the_core_and_not_applied_is_in_flight() {
+    let (mut src, sent) = source();
+    let store = Store::new(&[(1, 10), (2, 5)]);
+    assert_eq!(src.queries_in_flight(), 0);
+    src.reload();
+    let first = take_queries(&sent);
+    assert_eq!(
+        src.queries_in_flight(),
+        2,
+        "the accounts and the list are asked for"
+    );
+    for (t, q) in first {
+        src.on_event(&result(t, store.answer(&q)));
+    }
+    assert_eq!(src.queries_in_flight(), 0, "everything applied");
+
+    // An invalidation: the list is going to change until its answer is applied.
+    src.on_event(&UiEvent::ConversationsChanged {
+        ids: vec![ConversationId(1)],
+    });
+    let inflight = take_queries(&sent);
+    assert_eq!(src.queries_in_flight(), 1);
+    // A second one while it is in flight waits as a follow-up: still the one list.
+    src.on_event(&UiEvent::ConversationsChanged {
+        ids: vec![ConversationId(2)],
+    });
+    assert_eq!(src.queries_in_flight(), 1);
+    let (t, q) = inflight[0].clone();
+    src.on_event(&result(t, store.answer(&q)));
+    // (The answer started the follow-up.)
+    let follow = take_queries(&sent);
+    assert_eq!(follow.len(), 1);
+    assert_eq!(src.queries_in_flight(), 1, "the follow-up is in flight");
+    let (t, q) = follow[0].clone();
+    src.on_event(&result(t, store.answer(&q)));
+    assert_eq!(src.queries_in_flight(), 0);
 }
 
 #[test]
@@ -1810,4 +1851,451 @@ fn group_authors_get_the_avatar_of_their_direct_chat() {
             .filter(|r| !r.show_avatar)
             .all(|r| r.avatar_url.is_empty())
     );
+}
+
+#[test]
+fn the_line_under_a_message_on_its_way_follows_the_connection_and_the_send() {
+    use kourier_core::facade::{OutboxWait, Progress};
+    use kourier_model::{OutgoingState, SendPhase};
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 3)]);
+    let pending = |m: &mut CoreMessage, in_flight: bool, next: Option<i64>| {
+        m.origin = OriginKind::OwnThisDevice;
+        m.author = None;
+        m.read_state = None;
+        m.sent_at = NOW - 42_000;
+        m.out_state = Some(OutgoingState::Sending { progress: None });
+        m.outbox = Some(OutboxWait {
+            in_flight,
+            attempts: 1,
+            next_attempt_at: next,
+            last_error: None,
+        });
+    };
+    let msgs = store.convs.get_mut(&1).expect("conv");
+    pending(&mut msgs[2], true, None);
+    let id = msgs[2].id;
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    let line = |src: &CoreSource| {
+        src.timeline(ConversationId(1))
+            .iter()
+            .find(|r| r.key == RowKey::Message(id))
+            .map(|r| format!("{} {}", r.wait, r.wait_timer).trim().to_owned())
+            .expect("row")
+    };
+    // The account is still connecting.
+    assert_eq!(line(&src), "Waiting for the connection · 0:42");
+    // The seconds count: a timer runs and every tick brings the lines up to date (not the
+    // whole timeline: `the_tick_changes_only_the_wait_lines`).
+    assert!(src.has_timers());
+    assert!(src.tick().waits);
+    // The connection comes up (still catching up): the outbox drains.
+    let ch = src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Syncing { fraction: None },
+    });
+    assert!(ch.timeline);
+    assert_eq!(line(&src), "Sending… 0:42");
+    // The backend's steps of the running attempt.
+    let ch = src.on_event(&UiEvent::Progress(Progress::Transmit {
+        message: id,
+        progress: 0.0,
+        phase: Some(SendPhase::SettingUpKeys { done: 3, of: 12 }),
+    }));
+    assert!(ch.waits && !ch.timeline, "the one line, not the timeline");
+    assert_eq!(line(&src), "Setting up encryption with 12 members · 0:42");
+    src.on_event(&UiEvent::Progress(Progress::Transmit {
+        message: id,
+        progress: 0.0,
+        phase: Some(SendPhase::Sending { done: 8, of: 20 }),
+    }));
+    assert_eq!(line(&src), "Sent to 8 of 20 members · 0:42");
+    // A step of a message the window does not hold changes nothing.
+    let ch = src.on_event(&UiEvent::Progress(Progress::Transmit {
+        message: MessageId(9),
+        progress: 0.0,
+        phase: Some(SendPhase::RepairingDevices),
+    }));
+    assert!(!ch.any());
+    // The attempt failed: the row waits for its next try, and the step is forgotten.
+    pending(
+        &mut store.convs.get_mut(&1).expect("conv")[2],
+        false,
+        Some(NOW + 30_000),
+    );
+    src.on_event(&UiEvent::MessagesChanged {
+        conv: ConversationId(1),
+        ids: vec![id],
+    });
+    settle(&mut src, &sent, &store);
+    assert_eq!(line(&src), "Next try in 0:30");
+    // The next attempt runs without a step reported yet: plain sending, not the old step.
+    pending(&mut store.convs.get_mut(&1).expect("conv")[2], true, None);
+    src.on_event(&UiEvent::MessagesChanged {
+        conv: ConversationId(1),
+        ids: vec![id],
+    });
+    settle(&mut src, &sent, &store);
+    assert_eq!(line(&src), "Sending… 0:42");
+    // Sent: no line, no timer.
+    let m = &mut store.convs.get_mut(&1).expect("conv")[2];
+    m.out_state = Some(OutgoingState::Sent { server_at: None });
+    m.outbox = None;
+    src.on_event(&UiEvent::MessagesChanged {
+        conv: ConversationId(1),
+        ids: vec![id],
+    });
+    settle(&mut src, &sent, &store);
+    assert_eq!(line(&src), "");
+    assert!(!src.has_timers());
+    assert!(!src.tick().waits);
+}
+
+/// A pending own message (the third of conversation 1) with the given outbox row.
+fn make_pending(m: &mut CoreMessage, in_flight: bool, next: Option<i64>) {
+    use kourier_core::facade::OutboxWait;
+    m.origin = OriginKind::OwnThisDevice;
+    m.author = None;
+    m.read_state = None;
+    m.sent_at = NOW - 42_000;
+    m.out_state = Some(OutgoingState::Queued);
+    m.outbox = Some(OutboxWait {
+        in_flight,
+        attempts: 1,
+        next_attempt_at: next,
+        last_error: None,
+    });
+}
+
+/// The reason under a message that waits names the REAL hold, never "the connection" for
+/// something else (link feedback L6): a challenge, a wrong clock, a logged-out or restricted
+/// account, an old version, a connection another session took. Each has its own words, in the
+/// terms of the banner above the chat.
+#[test]
+fn the_line_names_what_holds_the_account() {
+    use kourier_model::UserAction;
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 3)]);
+    make_pending(&mut store.convs.get_mut(&1).expect("conv")[2], false, None);
+    let id = store.convs[&1][2].id;
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    let line = |src: &CoreSource| {
+        src.timeline(ConversationId(1))
+            .iter()
+            .find(|r| r.key == RowKey::Message(id))
+            .map(|r| format!("{} {}", r.wait, r.wait_timer).trim().to_owned())
+            .expect("row")
+    };
+    let state = |src: &mut CoreSource, state: ConnState| {
+        src.on_event(&UiEvent::ConnState {
+            account: AccountId(1),
+            state,
+        });
+    };
+    let url = || "https://signalcaptchas.example/x".to_owned();
+    let cases = [
+        (ConnState::Connecting, "Waiting for the connection · 0:42"),
+        (
+            ConnState::Offline { retry_at_ms: None },
+            "Waiting for the connection · 0:42",
+        ),
+        (
+            ConnState::NeedsUserAction(UserAction::SolveChallenge { url: url() }),
+            "Waiting for you to verify · 0:42",
+        ),
+        (
+            ConnState::NeedsUserAction(UserAction::FixClock { skew_ms: 7_200_000 }),
+            "Waiting for the computer's clock to be set · 0:42",
+        ),
+        (
+            ConnState::NeedsUserAction(UserAction::Relink),
+            "Waiting for this device to be linked again · 0:42",
+        ),
+        (
+            ConnState::LoggedOut {
+                reason: "unlinked".into(),
+            },
+            "Waiting for this device to be linked again · 0:42",
+        ),
+        (
+            ConnState::NeedsUserAction(UserAction::UpdateApp),
+            "Waiting for Kourier to be updated · 0:42",
+        ),
+        (
+            ConnState::NeedsUserAction(UserAction::Reconnect),
+            "Waiting for you to reconnect · 0:42",
+        ),
+        (
+            ConnState::Restricted {
+                until_ms: None,
+                reason: "later".into(),
+            },
+            "Waiting: the network restricted this account · 0:42",
+        ),
+        // Connected again (still catching up, then caught up): its own send.
+        (ConnState::Syncing { fraction: None }, "Sending… 0:42"),
+        (ConnState::Online { detail: None }, "Sending… 0:42"),
+    ];
+    for (conn, want) in cases {
+        state(&mut src, conn.clone());
+        assert_eq!(line(&src), want, "{conn:?}");
+    }
+}
+
+/// The queue of a conversation waits for the user to confirm a changed safety number: its
+/// head shows as failed (no line), the messages behind it say what they wait for, and so
+/// does no message of another conversation.
+#[test]
+fn a_queue_that_waits_for_a_safety_number_says_so() {
+    use kourier_core::facade::OutboxWait;
+    use kourier_model::{FailReason, OutgoingState};
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 4), (2, 3)]);
+    let msgs = store.convs.get_mut(&1).expect("conv");
+    // The head: paused by the changed safety number, shown as failed, still in the outbox.
+    make_pending(&mut msgs[2], false, None);
+    msgs[2].out_state = Some(OutgoingState::Failed {
+        reason: FailReason::UntrustedIdentity,
+        retryable: true,
+    });
+    msgs[2].outbox = Some(OutboxWait {
+        in_flight: false,
+        attempts: 1,
+        next_attempt_at: None,
+        last_error: Some("UntrustedIdentity".into()),
+    });
+    // Behind it: queued, never tried.
+    make_pending(&mut msgs[3], false, None);
+    msgs[3].outbox = Some(OutboxWait {
+        in_flight: false,
+        attempts: 0,
+        next_attempt_at: None,
+        last_error: None,
+    });
+    let (head, behind) = (msgs[2].id, msgs[3].id);
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Online { detail: None },
+    });
+    let rows = src.timeline(ConversationId(1));
+    let line = |id: MessageId| {
+        let r = rows
+            .iter()
+            .find(|r| r.key == RowKey::Message(id))
+            .expect("row");
+        format!("{} {}", r.wait, r.wait_timer).trim().to_owned()
+    };
+    assert_eq!(line(head), "", "the failed head shows its failure, no line");
+    assert_eq!(
+        line(behind),
+        "Waiting for you to confirm the new safety number · 0:42"
+    );
+    // The account's own hold goes first: offline, the connection is what is missing.
+    src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Offline { retry_at_ms: None },
+    });
+    let rows = src.timeline(ConversationId(1));
+    let r = rows
+        .iter()
+        .find(|r| r.key == RowKey::Message(behind))
+        .expect("row");
+    assert_eq!(r.wait, "Waiting for the connection");
+}
+
+/// The per-second tick brings up to date the lines under the messages that show one, row by
+/// row (`UiSource::wait_lines`), and never rebuilds the timeline (link feedback L6): what it
+/// hands out is what a rebuilt timeline would show.
+#[test]
+fn the_tick_changes_only_the_wait_lines() {
+    use std::cell::Cell;
+    let clock = Rc::new(Cell::new(NOW));
+    let sent: Sent = Rc::default();
+    let s2 = sent.clone();
+    let c2 = clock.clone();
+    let mut src = CoreSource::new(
+        Box::new(move |c: UiCommand| {
+            s2.borrow_mut().push(c);
+            true
+        }),
+        CoreSourceConfig {
+            now: Box::new(move || c2.get()),
+            calendar: Box::new(FixedOffset(0)),
+            networks: network_choices(),
+            hostname: "workstation".into(),
+            demo: None,
+        },
+    );
+    let mut store = Store::new(&[(1, 3)]);
+    make_pending(&mut store.convs.get_mut(&1).expect("conv")[2], true, None);
+    let id = store.convs[&1][2].id;
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Online { detail: None },
+    });
+    let conv = ConversationId(1);
+    let ch = src.tick();
+    assert!(ch.waits, "a line shows: the tick asks for the lines");
+    assert!(!ch.timeline, "and does not rebuild the timeline");
+    assert!(ch.any());
+    let lines = src.wait_lines(conv);
+    assert_eq!(lines.len(), 1, "only the message on its way has a line");
+    let rebuilt = |src: &CoreSource| {
+        let rows = src.timeline(conv);
+        let r = rows
+            .iter()
+            .find(|r| r.key == RowKey::Message(id))
+            .expect("row");
+        (r.wait.clone(), r.wait_timer.clone())
+    };
+    assert_eq!(lines[0].0, id);
+    assert_eq!(
+        (lines[0].1.reason.clone(), lines[0].1.timer.clone()),
+        rebuilt(&src)
+    );
+    assert_eq!(lines[0].1.timer, "0:42");
+    // A second later the lines count on, the same as a rebuilt timeline says.
+    clock.set(NOW + 1_000);
+    let lines = src.wait_lines(conv);
+    assert_eq!(lines[0].1.timer, "0:43");
+    assert_eq!(
+        (lines[0].1.reason.clone(), lines[0].1.timer.clone()),
+        rebuilt(&src)
+    );
+    // Another conversation (or none open) has nothing to bring up to date.
+    assert!(src.wait_lines(ConversationId(2)).is_empty());
+    // A message that left the outbox has no line and no tick.
+    let m = &mut store.convs.get_mut(&1).expect("conv")[2];
+    m.out_state = Some(OutgoingState::Sent { server_at: None });
+    m.outbox = None;
+    src.on_event(&UiEvent::MessagesChanged {
+        conv,
+        ids: vec![id],
+    });
+    settle(&mut src, &sent, &store);
+    assert!(src.wait_lines(conv).is_empty());
+    assert!(!src.tick().any());
+}
+
+/// A step a send reports (a group send: "Setting up encryption with 12 members", up to four a
+/// second) changes the reason under that one message and nothing else (link feedback L6): the
+/// report asks for the lines (`Changes::waits`, what the tick asks for), never for the
+/// timeline to be rebuilt, and `wait_lines` hands out the new reason for that row only. A
+/// repeated step changes nothing; the end of the steps (`None`) falls back to "Sending…".
+#[test]
+fn a_send_step_changes_one_line_and_rebuilds_nothing() {
+    use kourier_core::facade::Progress;
+    use kourier_model::SendPhase;
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 4)]);
+    make_pending(&mut store.convs.get_mut(&1).expect("conv")[2], true, None);
+    let id = store.convs[&1][2].id;
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Syncing { fraction: None },
+    });
+    let conv = ConversationId(1);
+    let report = |src: &mut CoreSource, message: MessageId, phase: Option<SendPhase>| {
+        src.on_event(&UiEvent::Progress(Progress::Transmit {
+            message,
+            progress: 0.0,
+            phase,
+        }))
+    };
+    let lines = |src: &CoreSource| {
+        let lines = src.wait_lines(conv);
+        assert_eq!(lines.len(), 1, "only the message on its way has a line");
+        assert_eq!(lines[0].0, id);
+        format!("{} {}", lines[0].1.reason, lines[0].1.timer)
+    };
+    assert_eq!(lines(&src), "Sending… 0:42");
+    let rows_before = src.timeline(conv);
+
+    // A step: the lines are asked for, nothing else (not the timeline, header, list, ...).
+    let ch = report(
+        &mut src,
+        id,
+        Some(SendPhase::SettingUpKeys { done: 3, of: 12 }),
+    );
+    assert_eq!(
+        ch,
+        Changes {
+            waits: true,
+            ..Changes::default()
+        }
+    );
+    assert_eq!(lines(&src), "Setting up encryption with 12 members · 0:42");
+    // The rows a rebuild would give differ from before in this one row's line only.
+    let rows_after = src.timeline(conv);
+    assert_eq!(rows_before.len(), rows_after.len());
+    for (before, after) in rows_before.iter().zip(&rows_after) {
+        if before.key == RowKey::Message(id) {
+            assert_ne!(before.wait, after.wait);
+            continue;
+        }
+        assert!(before == after, "no other row changes");
+    }
+
+    // The same step again (the backend repeats it while it lasts) changes nothing.
+    let ch = report(
+        &mut src,
+        id,
+        Some(SendPhase::SettingUpKeys { done: 3, of: 12 }),
+    );
+    assert!(!ch.any());
+    // The next step is again the one line.
+    let ch = report(&mut src, id, Some(SendPhase::Sending { done: 8, of: 20 }));
+    assert_eq!((ch.waits, ch.timeline), (true, false));
+    assert_eq!(lines(&src), "Sent to 8 of 20 members · 0:42");
+    // The steps end (a 1:1 send after its uploads): back to plain sending.
+    let ch = report(&mut src, id, None);
+    assert_eq!((ch.waits, ch.timeline), (true, false));
+    assert_eq!(lines(&src), "Sending… 0:42");
+    assert!(!report(&mut src, id, None).any(), "nothing to forget");
+}
+
+/// An account that is logged out holds its queue whatever its last connection state says.
+#[test]
+fn a_logged_out_account_holds_its_queue_whatever_the_connection_says() {
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 3)]);
+    make_pending(&mut store.convs.get_mut(&1).expect("conv")[2], false, None);
+    let id = store.convs[&1][2].id;
+    let answer = |q: &Query| match q {
+        Query::Accounts => {
+            let mut a = account();
+            a.state = AccountState::LoggedOut {
+                reason: "unlinked".into(),
+            };
+            a.conn = ConnState::Online { detail: None };
+            QueryData::Accounts(vec![a])
+        }
+        other => store.answer(other),
+    };
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    for _ in 0..10 {
+        for (t, q) in take_queries(&sent) {
+            src.on_event(&result(t, answer(&q)));
+        }
+    }
+    let rows = src.timeline(ConversationId(1));
+    let r = rows
+        .iter()
+        .find(|r| r.key == RowKey::Message(id))
+        .expect("row");
+    assert_eq!(r.wait, "Waiting for this device to be linked again");
 }

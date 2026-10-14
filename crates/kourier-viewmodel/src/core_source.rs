@@ -29,10 +29,12 @@ use kourier_core::facade::{
 };
 use kourier_model::{
     AccountId, AccountState, AttachmentId, AttachmentKind, AttachmentState, Body, ConnState,
-    ConvKind, ConversationId, ErrorKind, HistoryTransfer, LoginStepKind, MessageId, NetworkKind,
-    OutgoingState, ReadState, Redacted, Text, UserId,
+    ConvKind, ConversationId, ErrorKind, FailReason, HistoryTransfer, LoginStep, LoginStepKind,
+    MessageId, NetworkKind, OutgoingState, ReadState, Redacted, SendPhase, Text, UserAction,
+    UserId,
 };
 
+use crate::account_actions::{AccountAction, LogoutNotice};
 use crate::conversations::{
     AccountRow, AccountStatus, Banner, BannerKind, ChatHeader, ConversationFilter, ConversationRow,
     PreviewSource, account_banner, network_icon, network_name, timer_menu, timer_secs, timer_span,
@@ -54,7 +56,10 @@ use crate::time::{Calendar, TimeContext};
 use crate::timeline::{
     self, Block, Item, MessageRow, QuoteBlock, QuoteState, ReactionChip, Receipt, RowActions,
 };
-use crate::transfer::{ReplaceQuestion, TransferBook, TransferView, replace_question};
+use crate::transfer::{
+    AbandonQuestion, QuitWork, ReplaceQuestion, TransferBook, abandon_question, quit_question,
+    replace_question, replace_question_cancelling,
+};
 
 /// Query model id of the accounts drawer.
 pub const MODEL_ACCOUNTS: u32 = 1;
@@ -109,6 +114,9 @@ pub struct Changes {
     pub conversations: bool,
     /// The open timeline's rows.
     pub timeline: bool,
+    /// Only the lines under the open timeline's messages on their way count time
+    /// ([`UiSource::wait_lines`]); the rows are not rebuilt.
+    pub waits: bool,
     /// The open conversation's header (or it was closed).
     pub header: bool,
     /// The login page.
@@ -138,11 +146,13 @@ pub struct Changes {
     /// Conversations were merged ([`UiSource::take_merges`]): what waits for a merged-away
     /// chat (the files in its composer) goes on waiting for the one that is left.
     pub merged: bool,
-    /// The history transfer of an account changed: what the link page shows of it
-    /// ([`UiSource::link_transfer`]), the banner ([`UiSource::banner`]), which accounts
-    /// offer a transfer ([`UiSource::accounts`]), or a notice waits
+    /// The history transfer of an account changed: the banner ([`UiSource::banner`]), which
+    /// accounts offer a transfer ([`UiSource::accounts`]), or a notice waits
     /// ([`UiSource::take_transfer_notices`]).
     pub transfer: bool,
+    /// A notice about the device of a removed or unlinked account waits
+    /// ([`UiSource::take_logout_notices`]).
+    pub account_notice: bool,
 }
 
 impl Changes {
@@ -151,6 +161,7 @@ impl Changes {
         accounts: true,
         conversations: true,
         timeline: true,
+        waits: false,
         header: true,
         login: true,
         notice: true,
@@ -164,6 +175,7 @@ impl Changes {
         settings: false,
         merged: false,
         transfer: true,
+        account_notice: true,
     };
 
     /// Whether anything changed.
@@ -171,6 +183,7 @@ impl Changes {
         self.accounts
             || self.conversations
             || self.timeline
+            || self.waits
             || self.header
             || self.login
             || self.notice
@@ -191,6 +204,7 @@ impl Changes {
         self.accounts |= other.accounts;
         self.conversations |= other.conversations;
         self.timeline |= other.timeline;
+        self.waits |= other.waits;
         self.header |= other.header;
         self.login |= other.login;
         self.notice |= other.notice;
@@ -202,6 +216,7 @@ impl Changes {
         self.settings |= other.settings;
         self.merged |= other.merged;
         self.transfer |= other.transfer;
+        self.account_notice |= other.account_notice;
         if other.switch_to.is_some() {
             self.switch_to = other.switch_to;
         }
@@ -298,6 +313,11 @@ impl QueryTracker {
         self.in_flight.is_some()
     }
 
+    /// A query is in flight or a follow-up waits for it: the model is going to change.
+    pub fn pending(&self) -> bool {
+        self.in_flight.is_some() || self.dirty
+    }
+
     /// Generation of the last applied result (0 = none).
     pub fn applied(&self) -> u64 {
         self.applied
@@ -356,6 +376,12 @@ struct Login {
     /// The login links this existing (logged-out) account again: a retry after a failure
     /// must do the same, never add a second account.
     relink: Option<AccountId>,
+    /// The backend reported a history transfer of this login's account: it is linked (a
+    /// backend reports a transfer only after the link), and leaving the page loses nothing.
+    transferred: bool,
+    /// The page ended because the core has the account ([`CoreSource::end_link_page`]):
+    /// the backend's later steps of this login (its tail, its `Done`) change nothing.
+    ended_linked: bool,
 }
 
 /// What [`CoreSource::new`] needs besides the sink.
@@ -429,6 +455,13 @@ pub struct CoreSource {
     /// Accounts whose login was cancelled before the core announced them: their steps are
     /// ignored.
     cancelled: HashSet<AccountId>,
+    /// Accounts whose login has started and not ended (`Done` or `Failed`), whether or not
+    /// the link page still shows it: after the transfer a link goes on with its tail, and
+    /// "Transfer History from Phone…" is not offered for it meanwhile (`buttons.md` F4).
+    unfinished_links: HashSet<AccountId>,
+    /// Chats an imported history still fills (`UiEvent::HistoryProgress` with more to
+    /// come) → their account: clearing or deleting them waits (link feedback L3).
+    filling: HashMap<ConversationId, AccountId>,
     /// Conversations merged away this session → the surviving one (§3.3).
     merged: HashMap<ConversationId, ConversationId>,
     /// Merges the composer has not heard of yet: `(merged away, surviving)`, oldest first.
@@ -454,6 +487,10 @@ pub struct CoreSource {
     avatars_waiting: std::cell::Cell<bool>,
     /// Live download progress of the open timeline's attachments (`Progress::Download`).
     downloads: HashMap<AttachmentId, f32>,
+    /// The step of each running send of the open timeline (`Progress::Transmit`'s phase, link
+    /// feedback L6): ephemeral, kept while the row says its attempt runs, for the line under
+    /// the message.
+    send_phases: HashMap<MessageId, SendPhase>,
     /// Answers to `OpenMedia` not taken yet.
     media_answers: Vec<MediaAnswer>,
     /// Files of every `SendFiles` the core did not take, oldest first, until the composer
@@ -489,6 +526,14 @@ pub struct CoreSource {
     /// Only a confirmation of that question, naming that account, removes an account, and
     /// it takes the question with it.
     replace_asked: Option<AccountId>,
+    /// The open question of "Remove Account…" or "Unlink…" (`ask_account_action`).
+    action_asked: Option<(AccountId, AccountAction)>,
+    /// What is told once about removed or unlinked accounts' devices.
+    logout_notices: Vec<LogoutNotice>,
+    /// The `seq`s of the `LogoutOutcome`s told (the newest [`LOGOUT_SEEN_KEPT`]): the core
+    /// tells the ones that came before the front-end was ready once more at `UiReady`, and an
+    /// outcome told live in between may have a higher number than ones only the replay brings.
+    logout_seen: std::collections::BTreeSet<u64>,
 }
 
 /// One `SendFiles` the core is importing: nothing of it is in the timeline yet. It ends with
@@ -534,6 +579,9 @@ impl std::fmt::Debug for CoreSource {
 /// Typing "on" without a refresh expires after this long when the event gave no TTL.
 const DEFAULT_TYPING_TTL_MS: i64 = 15_000;
 
+/// How many `LogoutOutcome` numbers [`CoreSource`] remembers (the core keeps 32 for a replay).
+const LOGOUT_SEEN_KEPT: usize = 64;
+
 impl CoreSource {
     /// A source over `sink`. Call [`UiSource::reload`] to load the first data.
     pub fn new(sink: Box<dyn CommandSink>, config: CoreSourceConfig) -> Self {
@@ -573,6 +621,8 @@ impl CoreSource {
             login: None,
             adds: VecDeque::new(),
             cancelled: HashSet::new(),
+            unfinished_links: HashSet::new(),
+            filling: HashMap::new(),
             merged: HashMap::new(),
             focused: false,
             chat_visible: false,
@@ -586,6 +636,7 @@ impl CoreSource {
             avatars: None,
             avatars_waiting: std::cell::Cell::new(false),
             downloads: HashMap::new(),
+            send_phases: HashMap::new(),
             media_answers: Vec::new(),
             refused_files: VecDeque::new(),
             next_request: 0,
@@ -607,6 +658,9 @@ impl CoreSource {
             transfers: TransferBook::default(),
             transfer_notices: Vec::new(),
             replace_asked: None,
+            action_asked: None,
+            logout_notices: Vec::new(),
+            logout_seen: std::collections::BTreeSet::new(),
         }
     }
 
@@ -845,12 +899,15 @@ impl CoreSource {
                     // lost): the backend deleted a transfer that ran with the login.
                     for a in rows {
                         if matches!(a.state, AccountState::LoggedOut { .. }) {
-                            ch.transfer |= self.transfers.logged_out(a.id);
+                            self.filling.retain(|_, f| *f != a.id);
+                            ch.transfer |= self.transfers.logged_out(a.id)
+                                | self.transfers.forget_progress(a.id);
                         }
                     }
                     self.accounts = rows.clone();
                     ch.accounts = true;
                     ch.conversations = true;
+                    ch.login |= self.end_link_page();
                     // What the open chat says about sending (and about deleting) goes by
                     // its account's state. The answers about the chat itself may have come
                     // before this one (the queries run on two connections): without this
@@ -1306,6 +1363,17 @@ impl CoreSource {
                 .collect();
             self.downloads.retain(|id, _| running.contains(id));
         }
+        // A phase is kept while the row says its attempt runs; the next attempt reports again.
+        if !self.send_phases.is_empty() {
+            let running: HashSet<MessageId> = self
+                .window
+                .rows
+                .iter()
+                .filter(|r| r.outbox.as_ref().is_some_and(|o| o.in_flight))
+                .map(|r| r.id)
+                .collect();
+            self.send_phases.retain(|id, _| running.contains(id));
+        }
     }
 
     /// What an edit of `message` changes, from the core's row: its text, or its caption
@@ -1429,6 +1497,7 @@ impl CoreSource {
         self.following = false;
         self.flags_deadline = None;
         self.downloads.clear();
+        self.send_phases.clear();
         self.revisions_shown = None;
         self.send_presence();
         Changes {
@@ -1857,6 +1926,13 @@ impl CoreSource {
     /// it reports it, so a dismissal that crossed a report is made up for.
     fn on_history_transfer(&mut self, account: AccountId, state: HistoryTransfer) -> Changes {
         let out = self.transfers.on_state(account, state);
+        if let Some(login) = self.login.as_mut()
+            && login.relink.is_none()
+            && login.account == Some(account)
+        {
+            login.transferred = true;
+        }
+        let page_ended = self.end_link_page();
         if out.dismiss {
             self.send(UiCommand::DismissHistoryTransfer { account });
         }
@@ -1870,10 +1946,87 @@ impl CoreSource {
             }
             self.transfer_notices.push(text);
         }
+        // A transfer that ended (a failed import too) fills nothing any more.
+        if state.is_over() {
+            self.filling.retain(|_, a| *a != account);
+        }
         Changes {
             transfer: out.changed || out.notice.is_some(),
+            login: page_ended,
+            // Whether the open chat can be cleared or deleted depends on the transfer.
+            header: out.changed && self.open_account() == Some(account),
             ..Changes::default()
         }
+    }
+
+    /// The account of the open chat.
+    fn open_account(&self) -> Option<AccountId> {
+        self.detail.as_ref().map(|d| d.row.account)
+    }
+
+    /// Whether the chat `conv` cannot be cleared or deleted now ([`Self::still_filling`]);
+    /// its account from the open chat or the list.
+    fn fills_now(&self, conv: ConversationId) -> bool {
+        let account = self
+            .detail
+            .as_ref()
+            .map(|d| &d.row)
+            .filter(|c| c.id == conv)
+            .or_else(|| self.list.iter().find(|c| c.id == conv))
+            .map(|c| c.account);
+        match account {
+            Some(account) => !self.still_filling(conv, account).is_empty(),
+            None => self.filling.contains_key(&conv),
+        }
+    }
+
+    /// Why the chat `conv` of `account` cannot be cleared or deleted now; empty when it
+    /// can. While a history transfer of its account runs, or its imported history still
+    /// arrives, a cleared chat would fill again (the user's decision, link feedback L3).
+    fn still_filling(&self, conv: ConversationId, account: AccountId) -> String {
+        let runs = self.transfers.running(account) && !self.logged_out(account);
+        if !runs && !self.filling.contains_key(&conv) {
+            return String::new();
+        }
+        trc(
+            "@info:status a disabled entry of the chat menu: why the chat cannot be cleared or deleted yet",
+            "Available once this chat's history has arrived",
+        )
+        .into_owned()
+    }
+
+    /// Ends the link page as soon as the core has the login's account (link feedback L3,
+    /// the user's decision: chats usable as soon as the account is linked): it is Active in
+    /// the core's list (it took `AccountReady`), or the backend reported a history transfer
+    /// of a fresh link (it comes only after the link). The page says "Linked" and leaves as
+    /// at the backend's `Done`; the transfer and the rest of the link's work show in the
+    /// banner. The backend's later steps of this login find the page ended. Returns whether
+    /// the page changed.
+    fn end_link_page(&mut self) -> bool {
+        let Some(login) = self.login.as_ref() else {
+            return false;
+        };
+        if matches!(login.view.kind, LoginViewKind::Done | LoginViewKind::Failed) {
+            return false;
+        }
+        if !(login.transferred || self.login_account_active(login)) {
+            return false;
+        }
+        let network = login.network;
+        let view = login_view(
+            &LoginStep {
+                step_id: "done".to_owned(),
+                txn: 0,
+                kind: LoginStepKind::Done,
+            },
+            network,
+        );
+        if let Some(login) = self.login.as_mut() {
+            login.view = view;
+            login.ended_linked = true;
+        }
+        self.request_list();
+        true
     }
 
     /// Sends `AddAccount` for `network` and makes its login the one the link page shows.
@@ -1893,6 +2046,8 @@ impl CoreSource {
             account: None,
             view: view.clone(),
             relink: None,
+            transferred: false,
+            ended_linked: false,
         });
         if !self.send(UiCommand::AddAccount {
             network,
@@ -1948,6 +2103,8 @@ impl CoreSource {
                     avatar_url: self.avatar_url(a.id, a.avatar.as_ref()),
                     number: a.number.as_deref().map(single_line).unwrap_or_default(),
                     offers_history: self.offers_history(a),
+                    offers_unlink: self.offers_unlink(a),
+                    device: self.twin_label(a).unwrap_or_default(),
                 }
             })
             .collect()
@@ -1955,12 +2112,68 @@ impl CoreSource {
 
     /// Whether `a` offers "Transfer History from Phone…": its network hands a newly linked
     /// device the history (the descriptor's `HistorySource::PushedOnLink`), it can be linked
-    /// in this build, and no transfer of it runs.
+    /// in this build, no transfer of it runs, and its link is not still going on (a link's
+    /// tail after the transfer, `buttons.md` F4: confirming would delete what just arrived
+    /// and ask the phone for all of it again).
     fn offers_history(&self, a: &CoreAccount) -> bool {
         self.networks
             .iter()
             .any(|n| n.kind == a.network && n.available && n.history_on_link)
             && !self.transfer_runs(a)
+            && !self.links_now(a.id)
+    }
+
+    /// Which link `a` is ("device 3 · linked 12 Sep") when another visible account of its
+    /// network has the same name and number: two links of one identity (a profile from before
+    /// one identity was one account, link feedback D10) are told apart by what the phone shows
+    /// of each (its link date) and the device number, where the user picks one.
+    fn twin_label(&self, a: &CoreAccount) -> Option<String> {
+        let label = Self::account_label(a);
+        self.visible_accounts()
+            .any(|b| {
+                b.id != a.id
+                    && b.network == a.network
+                    && b.number == a.number
+                    && Self::account_label(b) == label
+            })
+            .then(|| crate::transfer::device_label(a.own_device, &self.link_date(a.linked_at)))
+            .filter(|label| !label.is_empty())
+    }
+
+    /// The day a device was linked, in the user's locale; empty when it is not known.
+    fn link_date(&self, linked_at: i64) -> String {
+        if linked_at <= 0 {
+            return String::new();
+        }
+        UiSource::time(self).short_date(linked_at)
+    }
+
+    /// Which account `a` is, for a question about it: its name, its number where the network
+    /// has one, and its device when another account looks the same.
+    fn account_about(&self, a: &CoreAccount) -> String {
+        let number = a.number.as_deref().map(single_line).unwrap_or_default();
+        let about = crate::transfer::account_line(
+            &Self::account_label(a),
+            &number,
+            network_name(a.network),
+        );
+        match self.twin_label(a) {
+            Some(label) => crate::transfer::with_device(&about, &label),
+            None => about,
+        }
+    }
+
+    /// Whether `a` offers "Unlink…": it is linked (Active, its live state not logged out)
+    /// and its link is not still going on.
+    fn offers_unlink(&self, a: &CoreAccount) -> bool {
+        matches!(a.state, AccountState::Active) && !self.logged_out(a.id) && !self.links_now(a.id)
+    }
+
+    /// Whether a login of `account` runs: on the link page or left to the background. A
+    /// logged-out account has none (its backend forgot it with the login).
+    fn links_now(&self, account: AccountId) -> bool {
+        self.linking(account)
+            || (self.unfinished_links.contains(&account) && !self.logged_out(account))
     }
 
     /// Whether a history transfer of `a` runs. A logged-out account has none: its backend
@@ -1980,23 +2193,64 @@ impl CoreSource {
 
     /// The history transfer of `a` as a banner: while it runs, or failed and not dismissed.
     /// Not while the link page of this very account is up: the page shows it large.
+    /// After it (or without one), the profiles and groups a fresh link still fetches.
     fn transfer_of(&self, a: &CoreAccount) -> Option<Banner> {
-        let view = self.transfers.view(a.id)?;
-        let failed = view.phase == crate::transfer::TransferPhase::Failed;
-        if !failed && (!self.transfer_runs(a) || self.linking(a.id)) {
+        let view = self
+            .transfers
+            .view(a.id)
+            .filter(|v| v.phase == crate::transfer::TransferPhase::Failed || self.transfer_runs(a))
+            .or_else(|| {
+                self.transfers
+                    .updating(a.id)
+                    .filter(|_| !self.logged_out(a.id))
+            })?;
+        if view.phase != crate::transfer::TransferPhase::Failed && self.linking(a.id) {
             return None;
         }
         Some(Banner {
             account: a.id,
-            kind: if failed {
-                BannerKind::TransferFailed
-            } else {
-                BannerKind::Transfer
+            kind: match view.phase {
+                crate::transfer::TransferPhase::Failed => BannerKind::TransferFailed,
+                crate::transfer::TransferPhase::Updating => BannerKind::Updating,
+                _ => BannerKind::Transfer,
             },
             text: view.status.clone(),
             action: String::new(),
             url: String::new(),
             transfer: Some(view),
+        })
+    }
+
+    /// The messenger of the login that [`Source::cancel_login`] would stop now: one that
+    /// has not ended and whose account the core has not linked yet. Once the core took
+    /// `AccountReady` the account is Active in its list and a cancel is dropped
+    /// (`supervisor.rs` `Control::CancelLogin if !linked`), so nothing is lost by leaving
+    /// the page: also in the tail of a link WITHOUT a transfer (the phone declined the
+    /// history) and in the tail of "Link Again", where the account was logged out before.
+    /// A history transfer reported by the backend says the same sooner than the account
+    /// rows do (it comes only after the link).
+    fn abandoned_network(&self) -> Option<&'static str> {
+        let login = self.login.as_ref()?;
+        if matches!(login.view.kind, LoginViewKind::Done | LoginViewKind::Failed) {
+            return None;
+        }
+        if login.transferred || self.login_account_active(login) {
+            return None;
+        }
+        Some(network_name(login.network))
+    }
+
+    /// Whether the core's account list holds the login's account as Active (it took
+    /// `AccountReady`).
+    /// The live state must not say logged out either: a row of a relinked account can be
+    /// older than its logout (the answer to the accounts query follows the event).
+    fn login_account_active(&self, login: &Login) -> bool {
+        login.account.is_some_and(|id| {
+            self.accounts.iter().any(|a| {
+                a.id == id
+                    && matches!(a.state, AccountState::Active)
+                    && !matches!(self.conn_of(a), ConnState::LoggedOut { .. })
+            })
         })
     }
 
@@ -2232,6 +2486,7 @@ impl CoreSource {
             // The core tells the other devices only where the network has such a message
             // and the account is linked.
             deletes_sync: d.features.delete_for_me && !self.logged_out(c.account),
+            still_filling: self.still_filling(c.id, c.account),
         }
     }
 
@@ -2243,6 +2498,7 @@ impl CoreSource {
         let rows = &self.window.rows;
         let by_id: HashMap<MessageId, &CoreMessage> = rows.iter().map(|r| (r.id, r)).collect();
         let names = &self.names;
+        let (hold, safety_number) = self.wait_context();
         let items = rows.iter().map(|r| Item {
             id: r.id,
             sent_at: r.sent_at,
@@ -2259,7 +2515,9 @@ impl CoreSource {
             },
             reactions: reaction_chips(r, names),
             actions: row_actions(&r.actions),
+            ask: &r.actions.ask_attachments,
             expiry: r.expiry.as_ref(),
+            wait: self.send_wait(r, hold, safety_number),
         });
         let mut rows = timeline::build_rows(
             items,
@@ -2273,6 +2531,104 @@ impl CoreSource {
         timeline::apply_progress(&mut rows, &self.downloads);
         self.author_avatars(&mut rows);
         rows
+    }
+
+    /// What holds every own message of the open chat that is on its way: the account (not
+    /// connected, a challenge, a wrong clock, logged out …, [`Self::account_hold`]) and
+    /// whether its queue waits for a changed safety number to be confirmed.
+    fn wait_context(&self) -> (Option<timeline::WaitReason>, bool) {
+        let hold = self
+            .detail
+            .as_ref()
+            .and_then(|d| self.account_hold(d.row.account));
+        let safety_number = self.window.rows.iter().any(|r| {
+            r.outbox.is_some()
+                && matches!(
+                    r.out_state,
+                    Some(OutgoingState::Failed {
+                        reason: FailReason::UntrustedIdentity,
+                        ..
+                    })
+                )
+        });
+        (hold, safety_number)
+    }
+
+    /// What the line under an own message on its way is built from (link feedback L6):
+    /// `None` for every other row. `hold`: what keeps the chat's account from sending
+    /// ([`Self::account_hold`]); `safety_number`: the chat's queue waits for the user to
+    /// confirm a changed safety number (its head shows as failed, the rows behind it wait).
+    fn send_wait(
+        &self,
+        r: &CoreMessage,
+        hold: Option<timeline::WaitReason>,
+        safety_number: bool,
+    ) -> Option<timeline::SendWait> {
+        let outbox = r.outbox.as_ref()?;
+        let reason = if let Some(hold) = hold {
+            hold
+        } else if safety_number && !outbox.in_flight {
+            timeline::WaitReason::SafetyNumber
+        } else if let Some(phase) = self.send_phases.get(&r.id).filter(|_| outbox.in_flight) {
+            timeline::WaitReason::Phase(*phase)
+        } else {
+            timeline::WaitReason::Sending
+        };
+        Some(timeline::SendWait {
+            reason,
+            since: r.sent_at,
+            retry_at: outbox.next_attempt_at.filter(|_| !outbox.in_flight),
+        })
+    }
+
+    /// What keeps the account from sending its queue now, in the terms of its banner; `None`
+    /// while the connection is up (the outbox drains, link feedback L6).
+    fn account_hold(&self, account: AccountId) -> Option<timeline::WaitReason> {
+        use timeline::WaitReason as W;
+        let row = self.accounts.iter().find(|a| a.id == account);
+        if row.is_some_and(|a| matches!(a.state, AccountState::LoggedOut { .. })) {
+            return Some(W::LoggedOut);
+        }
+        let Some(conn) = self.conn.get(&account).or(row.map(|a| &a.conn)) else {
+            // An account nothing is known about is not connected.
+            return Some(W::Connection);
+        };
+        match conn {
+            ConnState::Syncing { .. } | ConnState::Online { .. } => None,
+            ConnState::Offline { .. } | ConnState::Connecting => Some(W::Connection),
+            ConnState::NeedsUserAction(UserAction::SolveChallenge { .. }) => Some(W::Challenge),
+            ConnState::NeedsUserAction(UserAction::FixClock { .. }) => Some(W::Clock),
+            ConnState::NeedsUserAction(UserAction::Relink) | ConnState::LoggedOut { .. } => {
+                Some(W::LoggedOut)
+            }
+            ConnState::NeedsUserAction(UserAction::UpdateApp) => Some(W::UpdateApp),
+            ConnState::NeedsUserAction(UserAction::Reconnect) => Some(W::Reconnect),
+            ConnState::Restricted { .. } => Some(W::Restricted),
+        }
+    }
+
+    /// The open timeline holds an own message on its way (the line under it counts time).
+    fn sends_waiting(&self) -> bool {
+        self.open.is_some() && self.window.rows.iter().any(|r| r.outbox.is_some())
+    }
+
+    /// Live step of a send of the open timeline (`Progress::Transmit`). A step changes the
+    /// reason under that one message only (a group send reports up to four a second): the
+    /// lines are brought up to date like the tick does ([`Changes::waits`]), the timeline is
+    /// not rebuilt.
+    fn on_send_phase(&mut self, message: MessageId, phase: Option<SendPhase>) -> Changes {
+        let Some(row) = self.window.rows.iter().find(|r| r.id == message) else {
+            return Changes::default();
+        };
+        let shown = self.now_ms().saturating_sub(row.sent_at) >= timeline::WAIT_SHOWN_AFTER_MS;
+        let old = match phase {
+            Some(p) => self.send_phases.insert(message, p),
+            None => self.send_phases.remove(&message),
+        };
+        Changes {
+            waits: shown && old != phase,
+            ..Changes::default()
+        }
     }
 
     /// Authors' avatars (groups): the author's own picture, else the picture of their direct
@@ -2325,6 +2681,7 @@ fn row_actions(a: &MessageActions) -> RowActions {
         delete_attachment: a.delete_attachment,
         take_back: a.take_back,
         retry: false,
+        ask_attachments: !a.ask_attachments.is_empty(),
     }
 }
 
@@ -2692,6 +3049,29 @@ impl UiSource for CoreSource {
         self.timeline_rows(&self.time())
     }
 
+    fn wait_lines(&self, id: ConversationId) -> Vec<(MessageId, timeline::WaitLine)> {
+        if self.open != Some(id) || !self.window.loaded {
+            return Vec::new();
+        }
+        let now = self.now_ms();
+        let (hold, safety_number) = self.wait_context();
+        self.window
+            .rows
+            .iter()
+            .filter(|r| r.outbox.is_some())
+            .map(|r| {
+                // The rule of `build_rows`: a pending own message that was not deleted.
+                let receipt = if r.origin != OriginKind::Remote && r.deleted.is_none() {
+                    timeline::Receipt::from_state(r.out_state.as_ref())
+                } else {
+                    timeline::Receipt::None
+                };
+                let wait = self.send_wait(r, hold, safety_number);
+                (r.id, timeline::row_wait_line(receipt, wait, now))
+            })
+            .collect()
+    }
+
     fn networks(&self) -> Vec<NetworkChoice> {
         self.networks.clone()
     }
@@ -3019,12 +3399,18 @@ impl UiSource for CoreSource {
 
     fn clear_conversation(&mut self, conv: ConversationId) -> bool {
         let conv = self.survivor(conv);
+        if self.fills_now(conv) {
+            return false;
+        }
         self.notice.clear();
         self.send(UiCommand::ClearConversation { conv })
     }
 
     fn delete_conversation(&mut self, conv: ConversationId) -> bool {
         let conv = self.survivor(conv);
+        if self.fills_now(conv) {
+            return false;
+        }
         self.notice.clear();
         // The core deletes the stored draft with the chat; this session's copy goes too, or
         // the list would show a draft for a chat that is gone.
@@ -3072,6 +3458,18 @@ impl UiSource for CoreSource {
         self.flags_deadline
     }
 
+    fn queries_in_flight(&self) -> usize {
+        [
+            &self.accounts_q,
+            &self.list_q,
+            &self.detail_q,
+            &self.timeline_q,
+        ]
+        .into_iter()
+        .filter(|q| q.pending())
+        .count()
+    }
+
     fn refresh_flags(&mut self) -> Changes {
         if self.flags_deadline.is_some_and(|at| at <= Instant::now()) {
             // Read once; the answer sets the next deadline.
@@ -3115,6 +3513,8 @@ impl UiSource for CoreSource {
             account: Some(account),
             view: view.clone(),
             relink: Some(account),
+            transferred: false,
+            ended_linked: false,
         });
         Ok(view)
     }
@@ -3150,22 +3550,6 @@ impl UiSource for CoreSource {
             .map(|a| a.id)
     }
 
-    fn link_transfer(&self) -> Option<TransferView> {
-        let login = self.login.as_ref()?;
-        // "Link Again" of an account that kept its chats transfers nothing: its page shows
-        // the steps of that login, whatever was last heard of a transfer of the account.
-        if login.relink.is_some() {
-            return None;
-        }
-        let account = login.account?;
-        if !self.linking(account) {
-            return None;
-        }
-        self.transfers
-            .view(account)
-            .filter(|v| v.phase != crate::transfer::TransferPhase::Failed)
-    }
-
     fn skip_transfer(&mut self, account: AccountId) -> bool {
         self.transfers.skip(account) && self.send(UiCommand::SkipHistoryTransfer { account })
     }
@@ -3180,15 +3564,23 @@ impl UiSource for CoreSource {
 
     fn ask_replace(&mut self, account: AccountId) -> Option<ReplaceQuestion> {
         let a = self.visible_accounts().find(|a| a.id == account)?;
+        // Only where the action is offered (`offers_history`): a front-end path that reaches
+        // the question some other way (a menu item that is hidden but not disabled, a stale
+        // click) must not remove the account whose history is being imported, or one whose
+        // network has no transfer (`buttons.md` F4).
+        if !self.offers_history(a) {
+            return None;
+        }
         // Which account it is: its name and, where the network has one, its number.
-        let number = a.number.as_deref().map(single_line).unwrap_or_default();
-        let about = crate::transfer::account_line(
-            &Self::account_label(a),
-            &number,
-            network_name(a.network),
-        );
+        let about = self.account_about(a);
         self.replace_asked = Some(account);
-        Some(replace_question(account, about))
+        self.action_asked = None;
+        // Confirming cancels a link in progress (of another account: this one's link page
+        // offers no question): the question says so (`buttons.md` F3).
+        Some(match self.abandoned_network() {
+            Some(network) => replace_question_cancelling(account, about, network),
+            None => replace_question(account, about),
+        })
     }
 
     fn confirm_replace(&mut self, account: AccountId) -> Result<LoginView, SourceError> {
@@ -3220,6 +3612,59 @@ impl UiSource for CoreSource {
 
     fn cancel_replace(&mut self) {
         self.replace_asked = None;
+    }
+
+    fn ask_account_action(
+        &mut self,
+        account: AccountId,
+        action: AccountAction,
+    ) -> Option<ReplaceQuestion> {
+        let a = self.visible_accounts().find(|a| a.id == account)?;
+        if action == AccountAction::Unlink && !self.offers_unlink(a) {
+            return None;
+        }
+        let about = self.account_about(a);
+        // A logged-out account has been unlinked already (by the phone, or by "Unlink…"):
+        // there is nothing for Kourier to unlink.
+        let linked =
+            !matches!(a.state, AccountState::LoggedOut { .. }) && !self.logged_out(account);
+        // One question about an account at a time: this one replaces any other.
+        self.replace_asked = None;
+        self.action_asked = Some((account, action));
+        Some(match action {
+            AccountAction::Remove => {
+                crate::account_actions::remove_question(account, about, linked)
+            }
+            AccountAction::Unlink => crate::account_actions::unlink_question(account, about),
+        })
+    }
+
+    fn confirm_account_action(&mut self, account: AccountId, action: AccountAction) -> bool {
+        // Only the open question about this very account and action, and once. Nothing
+        // else is sent: no other login is cancelled (`buttons.md` F3), nothing is linked.
+        if self.action_asked != Some((account, action)) {
+            return false;
+        }
+        self.action_asked = None;
+        let Some(a) = self.visible_accounts().find(|a| a.id == account) else {
+            return false;
+        };
+        match action {
+            AccountAction::Remove => self.send(UiCommand::RemoveAccount { account }),
+            AccountAction::Unlink => {
+                // The account may have logged out or begun linking while the question was
+                // open: it has no device to unlink then.
+                self.offers_unlink(a) && self.send(UiCommand::Unlink { account })
+            }
+        }
+    }
+
+    fn cancel_account_action(&mut self) {
+        self.action_asked = None;
+    }
+
+    fn take_logout_notices(&mut self) -> Vec<LogoutNotice> {
+        std::mem::take(&mut self.logout_notices)
     }
 
     fn download_attachment(&mut self, id: AttachmentId) -> bool {
@@ -3269,14 +3714,64 @@ impl UiSource for CoreSource {
                 self.request_accounts();
                 Changes::default()
             }
+            UiEvent::LogoutOutcome {
+                seq,
+                account,
+                removed,
+                report,
+                who,
+            } => {
+                // Told once: the core sends the outcomes of before `UiReady` again at it.
+                if !self.logout_seen.insert(*seq) {
+                    return Changes::default();
+                }
+                while self.logout_seen.len() > LOGOUT_SEEN_KEPT {
+                    self.logout_seen.pop_first();
+                }
+                // Named by what the event carries (the account's row may be gone, or the
+                // list not loaded yet): as the lists name it, and two links that look the
+                // same by device and link date.
+                let name = single_line(who.display_name.as_deref().unwrap_or_default());
+                let name = if name.is_empty() {
+                    network_name(who.network).to_owned()
+                } else {
+                    name
+                };
+                let link = crate::account_actions::LinkInfo {
+                    twin: who.twin,
+                    label: crate::transfer::device_label(
+                        who.own_device,
+                        &self.link_date(who.linked_at),
+                    ),
+                    date: self.link_date(who.linked_at),
+                };
+                self.logout_notices
+                    .push(crate::account_actions::logout_notice(
+                        *account,
+                        *removed,
+                        report,
+                        &name,
+                        network_name(who.network),
+                        &link,
+                    ));
+                Changes {
+                    account_notice: true,
+                    ..Changes::default()
+                }
+            }
             UiEvent::AccountRemoved { account } => {
+                self.filling.retain(|_, a| a != account);
                 self.account_errors.remove(account);
                 self.cancelled.remove(account);
+                self.unfinished_links.remove(account);
                 // Nothing of its history transfer is shown any more, and a question about
                 // it has lost its subject.
                 let transfer = self.transfers.remove(*account);
                 if self.replace_asked == Some(*account) {
                     self.replace_asked = None;
+                }
+                if self.action_asked.is_some_and(|(a, _)| a == *account) {
+                    self.action_asked = None;
                 }
                 self.request_accounts();
                 self.request_list();
@@ -3299,10 +3794,27 @@ impl UiSource for CoreSource {
                 self.conn.insert(*account, state.clone());
                 // The backend deleted a transfer that ran with the login, and says nothing
                 // about it.
-                let transfer = matches!(state, ConnState::LoggedOut { .. })
-                    && self.transfers.logged_out(*account);
+                let out = matches!(state, ConnState::LoggedOut { .. });
+                if out {
+                    // The backend stopped the delivery with the login.
+                    self.filling.retain(|_, a| a != account);
+                }
+                // (Both: the numbers go with the backend's work, whatever the transfer did.)
+                let transfer = out
+                    && (self.transfers.logged_out(*account)
+                        | self.transfers.forget_progress(*account));
+                // A relinked account connects again: its row may have said Active already.
+                let login = self.end_link_page();
+                let open_here = self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.row.account == *account);
                 Changes {
                     accounts: true,
+                    login,
+                    // The line under a message on its way says whether it waits for the
+                    // connection.
+                    timeline: open_here && self.sends_waiting(),
                     // The composer of a chat of this account says when it cannot send.
                     header: self
                         .detail
@@ -3313,8 +3825,22 @@ impl UiSource for CoreSource {
                 }
             }
             UiEvent::LoginStep { account, step } => {
+                // Every login's steps, the page's or one it left: whether the account still
+                // links (what it offers depends on it).
+                let ended = matches!(
+                    step.kind,
+                    LoginStepKind::Done | LoginStepKind::Failed { .. }
+                );
+                let changed = if ended {
+                    self.unfinished_links.remove(account)
+                } else {
+                    !self.cancelled.contains(account) && self.unfinished_links.insert(*account)
+                };
                 let Some(login) = self.login.as_ref() else {
-                    return Changes::default();
+                    return Changes {
+                        accounts: changed,
+                        ..Changes::default()
+                    };
                 };
                 let ours = match login.account {
                     Some(a) => a == *account,
@@ -3323,8 +3849,15 @@ impl UiSource for CoreSource {
                     // pending `AddAccount` (lost to a lagged channel) the step is taken.
                     None => self.adds.is_empty() && !self.cancelled.contains(account),
                 };
-                if !ours {
-                    return Changes::default();
+                // The page ended when the core took the account (`end_link_page`): the
+                // backend's later steps of that login (its tail, its `Done`) change nothing.
+                // (Only then: after the backend's own `Done` the core can still refuse the
+                // account, a second link of one that is here, and that failure shows.)
+                if !ours || login.ended_linked {
+                    return Changes {
+                        accounts: changed,
+                        ..Changes::default()
+                    };
                 }
                 let view = self.device_name_default(login_view(step, login.network));
                 let done = matches!(step.kind, LoginStepKind::Done);
@@ -3339,6 +3872,7 @@ impl UiSource for CoreSource {
                 }
                 Changes {
                     login: true,
+                    accounts: changed,
                     ..Changes::default()
                 }
             }
@@ -3429,6 +3963,9 @@ impl UiSource for CoreSource {
                 ..
             } => self.on_action_failed(action, error, subject),
             UiEvent::QueryResult { token, result } => self.on_query_result(*token, result),
+            UiEvent::Progress(Progress::Transmit { message, phase, .. }) => {
+                self.on_send_phase(*message, *phase)
+            }
             UiEvent::Progress(Progress::Download {
                 attachment,
                 done,
@@ -3445,9 +3982,34 @@ impl UiSource for CoreSource {
             UiEvent::HistoryTransfer { account, state } => {
                 self.on_history_transfer(*account, *state)
             }
+            UiEvent::AccountProgress { account, progress } => {
+                let changed = self.transfers.on_progress(*account, *progress);
+                Changes {
+                    // The transfer's banner counts the messages, the account's banner the
+                    // profiles and groups.
+                    transfer: changed,
+                    accounts: changed,
+                    ..Changes::default()
+                }
+            }
+            UiEvent::HistoryProgress {
+                account,
+                conv,
+                has_more,
+                ..
+            } => {
+                let changed = if *has_more {
+                    self.filling.insert(*conv, *account).is_none()
+                } else {
+                    self.filling.remove(conv).is_some()
+                };
+                Changes {
+                    header: changed && self.open == Some(*conv),
+                    ..Changes::default()
+                }
+            }
             UiEvent::Notify(_)
             | UiEvent::CatchUpSummary { .. }
-            | UiEvent::HistoryProgress { .. }
             | UiEvent::Progress(_)
             | UiEvent::Notice { .. } => Changes::default(),
         }
@@ -3464,6 +4026,10 @@ impl UiSource for CoreSource {
         for request in lost {
             self.end_preparing(request, SendOutcome::Unknown);
         }
+        // And a lost `finished` of the work after a link, which is sent once: the numbers are
+        // forgotten (the next changed report brings them back) or the update's banner and the
+        // question on quitting would stay up for the rest of the session.
+        let progress = self.transfers.forget_all_progress();
         self.window.failed = false;
         self.request_accounts();
         self.request_list();
@@ -3471,6 +4037,8 @@ impl UiSource for CoreSource {
         self.reload_timeline();
         Changes {
             files,
+            transfer: progress,
+            accounts: progress,
             ..Changes::default()
         }
     }
@@ -3558,6 +4126,24 @@ impl UiSource for CoreSource {
         } else {
             Err(SourceError::Unavailable)
         }
+    }
+
+    fn abandon_question(&self) -> Option<AbandonQuestion> {
+        self.abandoned_network().map(abandon_question)
+    }
+
+    fn quit_question(&self) -> Option<AbandonQuestion> {
+        let work = if self.visible_accounts().any(|a| self.transfer_runs(a)) {
+            QuitWork::Import
+        } else if self
+            .visible_accounts()
+            .any(|a| !self.logged_out(a.id) && self.transfers.updating(a.id).is_some())
+        {
+            QuitWork::Update
+        } else {
+            return None;
+        };
+        Some(quit_question(work))
     }
 
     fn cancel_login(&mut self) {
@@ -3667,11 +4253,23 @@ impl UiSource for CoreSource {
             ch.conversations = true;
             ch.header = true;
         }
+        // The line under a message on its way counts the seconds once it is shown: those
+        // rows only, never the whole timeline (`UiSource::wait_lines`).
+        let shown_from = now.saturating_sub(timeline::WAIT_SHOWN_AFTER_MS);
+        if self.open.is_some()
+            && self
+                .window
+                .rows
+                .iter()
+                .any(|r| r.outbox.is_some() && r.sent_at <= shown_from)
+        {
+            ch.waits = true;
+        }
         ch
     }
 
     fn has_timers(&self) -> bool {
-        !self.typing.is_empty() || self.avatars_waiting.get()
+        !self.typing.is_empty() || self.avatars_waiting.get() || self.sends_waiting()
     }
 
     fn unread_total(&self) -> u32 {

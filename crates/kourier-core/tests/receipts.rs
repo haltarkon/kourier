@@ -384,6 +384,30 @@ fn a_receipt_under_another_identity_counts_once_the_identities_merge() {
     assert_eq!(count(&h, "pending_modifiers"), 1);
 }
 
+/// A receipt from a contact's number-user (PNI) for a message in the chat keyed by the ACI
+/// waits; the merge that makes the PNI an alias has nothing to move (the PNI owns no row) and
+/// still lets the receipt count: the early return of a merge retries parked receipts too.
+#[test]
+fn a_receipt_counts_after_a_merge_that_moves_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+    h.apply(vec![
+        chat(&direct(CAROL_ACI), None),
+        mine(&direct(CAROL_ACI), 1),
+        receipt(CAROL_PNI, 1, ReceiptKind::Read),
+    ])
+    .expect("apply");
+    assert_eq!(states(&h, &direct(CAROL_ACI)), [sent()], "not yet");
+    assert_eq!(count(&h, "pending_modifiers"), 1);
+    h.apply(vec![BackendEvent::IdentityMerged {
+        from: uid(CAROL_PNI),
+        into: uid(CAROL_ACI),
+    }])
+    .expect("apply");
+    assert_eq!(states(&h, &direct(CAROL_ACI)), [Some(OutgoingState::Read)]);
+    assert_eq!(count(&h, "pending_modifiers"), 0);
+}
+
 /// A network whose receipts name their conversation (per-conversation ids, as WhatsApp and
 /// Threema): the receipt lands on the message of that conversation only, also when another
 /// conversation has a message with the same id.

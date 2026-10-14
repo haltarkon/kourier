@@ -28,14 +28,31 @@ impl Apply<'_> {
         // An account that is being removed stays so (§4.3 step 7): a late `AccountReady` must
         // not bring it back as `Active` when its removal then has to be finished at the next
         // start.
-        let removing = self.acc.state == kourier_model::AccountState::Removing;
+        // (An unlink in progress likewise stays: the actor started just for its logout
+        // announces the account again.)
+        let removing = matches!(
+            self.acc.state,
+            kourier_model::AccountState::Removing | kourier_model::AccountState::Unlinking
+        );
+        // One identity is one account of a profile (L1, `buttons.md` F2): a link (fresh or
+        // again) that brings the primary own id of another account of the same network is
+        // refused here, in the transaction that would make it an account, so two links that
+        // end in the same moment cannot both pass. An account that is already Active keeps
+        // running (a profile made before this rule may hold two).
+        if !removing
+            && self.acc.state != kourier_model::AccountState::Active
+            && let Some(logged_out) = same_identity(self.conn, self.acc.id, own_ids.first())?
+        {
+            return Err(CoreError::AlreadyAdded { logged_out });
+        }
         self.conn
             .prepare_cached(
                 "UPDATE accounts SET own_ids = ?2, own_device = ?3,
                    display_name = coalesce(?4, display_name),
                    state = CASE WHEN ?5 THEN state ELSE 'Active' END,
                    state_reason = CASE WHEN ?5 THEN state_reason ELSE NULL END,
-                   number = coalesce(?6, number)
+                   number = coalesce(?6, number),
+                   created_at = CASE WHEN ?5 OR state = 'Active' THEN created_at ELSE ?7 END
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -44,7 +61,8 @@ impl Apply<'_> {
                 device,
                 display_name,
                 removing,
-                number
+                number,
+                self.now
             ])?;
         // Direct chats with ourselves are notes to self.
         for id in &own_ids {
@@ -590,4 +608,46 @@ impl From<kourier_model::IdError> for CoreError {
     fn from(_: kourier_model::IdError) -> Self {
         CoreError::Json("malformed id".into())
     }
+}
+
+/// The primary own ids of the other accounts of `id`'s network that are not being removed,
+/// each with whether that account is logged out, in the order of their ids. An account that
+/// has no own id yet (a link in progress) has none to name.
+pub(crate) fn other_identities(
+    conn: &kourier_db::rusqlite::Connection,
+    id: kourier_model::AccountId,
+) -> Result<Vec<(UserId, bool)>> {
+    let rows: Vec<(String, String)> = conn
+        .prepare_cached(
+            "SELECT state, own_ids FROM accounts
+             WHERE id <> ?1 AND state <> 'Removing'
+               AND network = (SELECT network FROM accounts WHERE id = ?1)
+             ORDER BY id",
+        )?
+        .query_map([id.0], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let mut out = Vec::new();
+    for (state, own) in rows {
+        let own: Vec<UserId> = sql::from_json(&own)?;
+        if let Some(primary) = own.into_iter().next() {
+            out.push((primary, state == "LoggedOut"));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether another account of `id`'s network, not being removed, has `primary` as its primary
+/// own id; `Some(logged_out)` of the first such account.
+fn same_identity(
+    conn: &kourier_db::rusqlite::Connection,
+    id: kourier_model::AccountId,
+    primary: Option<&UserId>,
+) -> Result<Option<bool>> {
+    let Some(primary) = primary else {
+        return Ok(None);
+    };
+    Ok(other_identities(conn, id)?
+        .into_iter()
+        .find(|(user, _)| user == primary)
+        .map(|(_, logged_out)| logged_out))
 }

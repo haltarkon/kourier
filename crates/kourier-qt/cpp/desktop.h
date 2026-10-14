@@ -36,4 +36,17 @@ rust::Vec<uint8_t> renderAvatarRgba(const QString& name, bool anonymous, int32_t
 // Returns free heap memory to the system (glibc malloc_trim(0)).
 void trimMemory();
 
+// Makes the application notice the end of the desktop session: the session manager's
+// commitDataRequest (XSMP; a compositor that simply closes every window cannot be told apart
+// from the user's close button). Qt thread, after the application exists.
+void watchSessionEnd();
+
+// Whether the session is ending (the session manager asked the application to save, or Qt
+// says it is saving its session). A close then asks no question: the work goes on at the next
+// start, and the question would hold the logout.
+bool sessionEnding();
+
+// Sets or clears what sessionEnding() says (tests: no session manager is there to ask).
+void setSessionEnding(bool ending);
+
 } // namespace kourier

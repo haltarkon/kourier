@@ -3,7 +3,7 @@
 //! the new revision, snapshot, endorsements and avatar and returns the events that go into
 //! `core_outbox` in the *same* zone: the `ConversationUpsert{title, avatar, members (full),
 //! timer, features}` and one `System` message per event of every change since the stored
-//! revision (none on the first fetch, Desktop drops the "you joined" history too). A kill after
+//! revision (none on the first fetch: there is no stored revision to count from). A kill after
 //! this commit leaves the events in `core_outbox`, so the core gets them on the next start; a
 //! kill before leaves the old revision, so the next fetch computes them again.
 //!
@@ -20,7 +20,7 @@ use kourier_model::{
     BlobRef, Body, ConversationPatch, Member, MemberList, MemberRole, Origin, Patch, SystemEvent,
     UserId,
 };
-use libsignal_core::{Aci, ServiceId};
+use libsignal_core::{Aci, Pni, ServiceId};
 
 use super::decode::{self, DecodedChange, DecodedState};
 use super::fetch::{self, Fetched};
@@ -31,7 +31,7 @@ use crate::db::Account;
 use crate::error::Result;
 use crate::net::SignalTransport;
 use crate::service_id::{aci_user_id, service_id_user_id};
-use crate::{features, peers, profile};
+use crate::{features, peers, profile, storage};
 
 /// Validated send endorsements (`GroupSendEndorsementsResponse`) and their expiry.
 #[derive(Debug)]
@@ -289,14 +289,18 @@ pub(crate) struct Applied {
     pub(crate) profile_fetches: bool,
 }
 
-/// The membership `snapshot` gives us.
-fn membership_of(snapshot: &Snapshot, account: &Account) -> Membership {
-    if snapshot.is_member(account.aci) {
+/// The membership `snapshot` gives the account `aci` / `pni`: a full member, invited (by
+/// either id), asking to join (only among the requesting), or left. The history import reads
+/// the phone's snapshot with the same rule (`transfer::map`).
+pub(crate) fn membership_of(snapshot: &Snapshot, aci: Aci, pni: Pni) -> Membership {
+    if snapshot.is_member(aci) {
         Membership::Member
-    } else if snapshot.is_pending(&ServiceId::from(account.aci).service_id_string())
-        || snapshot.is_pending(&ServiceId::from(account.pni).service_id_string())
+    } else if snapshot.is_pending(&ServiceId::from(aci).service_id_string())
+        || snapshot.is_pending(&ServiceId::from(pni).service_id_string())
     {
         Membership::Pending
+    } else if snapshot.requesting.contains(&uuid::Uuid::from(aci)) {
+        Membership::Requesting
     } else {
         Membership::Left
     }
@@ -422,7 +426,7 @@ fn apply_current(
         return Ok(Applied::default());
     }
     let first = row.snapshot.is_none();
-    let membership = membership_of(&snapshot, account);
+    let membership = membership_of(&snapshot, account.aci, account.pni);
     tx.prepare_cached(
         "UPDATE groups SET revision = ?2, state = ?3, membership = ?4, fetched_at = ?5,
            dirty = 0, updated_at = ?5 WHERE master_key = ?1",
@@ -490,10 +494,17 @@ fn apply_current(
     }
     if !in_core {
         roaming(&mut patch, row, membership);
+    } else if first {
+        // A group the core has from a history import before its first fetch: the import said
+        // "invited" from the phone's snapshot, and the server's state says what stands now.
+        patch.request_pending = Some(membership == Membership::Pending);
     }
     tx.prepare_cached("UPDATE groups SET features_hash = ?2 WHERE master_key = ?1")?
         .execute((&keys.master[..], hash))?;
     let mut events = vec![BackendEvent::ConversationUpsert(patch)];
+    if !in_core {
+        events.extend(storage::pins_with_new_group(tx, keys)?);
+    }
     if !first {
         let after = stored.unwrap_or(0);
         let mut changes = changes;
@@ -568,6 +579,15 @@ fn record_avatar(
 
 /// We are not a member (or the group is gone): the stored state loses us, the core learns that
 /// we cannot send, and, when the message that told us carried a verified change, its events.
+///
+/// - An invitation that ends here (a 403 or 404 on an invited row: Desktop's pre-join fetch
+///   fails the same way and its `generateLeftGroupChanges` takes our pending entry out and
+///   marks the group left) is no longer offered for acceptance: `request_pending` is stated
+///   `false`. The same for the first answer about a group the core has from a history
+///   import, whose upsert may have said "invited".
+/// - A request to join keeps standing: the server gives a requester no state (403) while the
+///   request may still be open, so a 403 leaves a `requesting` row as it is and its features
+///   keep the reason "waiting for an administrator". A 404 is a group that is gone.
 fn apply_left(
     tx: &mut Tx<'_>,
     account: &Account,
@@ -581,6 +601,11 @@ fn apply_left(
     if row.membership == membership {
         return Ok(Applied::default());
     }
+    if membership == Membership::Left && row.membership == Membership::Requesting {
+        return Ok(Applied::default());
+    }
+    let invitation_over = row.membership == Membership::Pending
+        || (row.snapshot.is_none() && row.features_hash.is_some());
     let snapshot = row.snapshot.clone().map(|mut snapshot| {
         let own = uuid::Uuid::from(account.aci);
         snapshot.members.retain(|m| m.aci != own);
@@ -626,9 +651,15 @@ fn apply_left(
     if row.features_hash.is_none() {
         roaming(&mut patch, row, membership);
     }
+    if invitation_over {
+        patch.request_pending = Some(false);
+    }
     tx.prepare_cached("UPDATE groups SET features_hash = ?2 WHERE master_key = ?1")?
         .execute((&keys.master[..], hash))?;
     let mut events = vec![BackendEvent::ConversationUpsert(patch)];
+    if row.features_hash.is_none() {
+        events.extend(storage::pins_with_new_group(tx, keys)?);
+    }
     if let Some(change) = &change
         && row.snapshot.is_some()
     {

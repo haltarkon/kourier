@@ -10,7 +10,7 @@ use crate::actor::testing;
 use crate::receive::tests::fixture;
 use crate::transfer::{ArchivePointer, StageTotals, Step, WAIT, apply, begin, commit_import};
 
-fn aci(i: u32) -> uuid::Uuid {
+pub(super) fn aci(i: u32) -> uuid::Uuid {
     uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{i:012x}")).unwrap()
 }
 
@@ -35,10 +35,7 @@ fn stage_of_people(dir: &std::path::Path, sizes: &[u64]) -> Recorded {
             nickname: None,
         };
         writer.contact(i, &contact).unwrap();
-        let chat = StagedChat {
-            is_self: false,
-            peer: Some(i),
-        };
+        let chat = StagedChat::direct(i);
         writer
             .chat(i, &ConvKey::Direct(peer(i)), &chat, None)
             .unwrap();
@@ -73,7 +70,7 @@ fn stage_of_people(dir: &std::path::Path, sizes: &[u64]) -> Recorded {
 }
 
 /// The stored transfer of `db` reads, and its stage is recorded.
-fn reading(db: &ZoneDb, recorded: Recorded) {
+pub(super) fn reading(db: &ZoneDb, recorded: Recorded) {
     db.zone(|tx| begin(tx, &EPHEMERAL, NOW, WAIT)).unwrap();
     let pointer = Step::Pointer(ArchivePointer {
         cdn: 3,
@@ -94,7 +91,7 @@ fn reading(db: &ZoneDb, recorded: Recorded) {
 
 /// What a feeder that starts from the stored state of `db` hands over. The feeder blocks,
 /// so it runs on a thread of its own, as in the application.
-fn fed_from(db: &ZoneDb, dir: &std::path::Path, recorded: Recorded) -> Vec<Chunk> {
+pub(super) fn fed_from(db: &ZoneDb, dir: &std::path::Path, recorded: Recorded) -> Vec<Chunk> {
     let start = db.read(load_start).unwrap();
     let dir = dir.to_owned();
     std::thread::spawn(move || chunks(fed(&dir, recorded, &start, DeliveryBounds::DEFAULT)))
@@ -102,7 +99,7 @@ fn fed_from(db: &ZoneDb, dir: &std::path::Path, recorded: Recorded) -> Vec<Chunk
         .unwrap()
 }
 
-fn outbox(db: &ZoneDb) -> Vec<(i64, Vec<BackendEvent>)> {
+pub(super) fn outbox(db: &ZoneDb) -> Vec<(i64, Vec<BackendEvent>)> {
     db.read(|c| -> Result<Vec<(i64, Vec<u8>)>> {
         let mut stmt = c.prepare("SELECT seq, envelope FROM core_outbox ORDER BY seq")?;
         let rows = stmt
@@ -305,10 +302,7 @@ async fn review_a_chat_whose_last_row_is_dropped_still_hears_that_nothing_follow
             nickname: None,
         };
         writer.contact(0, &contact).unwrap();
-        let chat = StagedChat {
-            is_self: false,
-            peer: Some(0),
-        };
+        let chat = StagedChat::direct(0);
         writer
             .chat(0, &ConvKey::Direct(peer(0)), &chat, None)
             .unwrap();

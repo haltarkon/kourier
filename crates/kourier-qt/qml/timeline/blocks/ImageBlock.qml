@@ -8,9 +8,10 @@ import app.kourier
 // A photo, GIF, video or sticker (§8.6), laid out in the picture's proportions before anything
 // is downloaded: the blurhash placeholder first, then the thumbnail from the image provider
 // (decoded at display size), the full picture in the viewer on a tap. Not downloaded yet: a
-// download button with the size; downloading: progress; failed: retry; gone: a note. GIFs and
-// animated stickers play from a tmpfs copy (AnimatedImage cannot read image providers) over
-// their still, which stays when the copy is no GIF or WebP after all.
+// download button with the size; downloading: progress; failed: retry; gone: a note (a
+// sticker that is gone has no picture to put one over: it is a small framed box with the
+// note instead). GIFs and animated stickers play from a tmpfs copy (AnimatedImage cannot read
+// image providers) over their still, which stays when the copy is no GIF or WebP after all.
 Item {
     id: root
 
@@ -31,6 +32,10 @@ Item {
     readonly property real attachment: root.block.attachment ?? 0
     readonly property string mediaState: root.block.state
     readonly property bool local: root.mediaState === "local"
+    // Gone here, and Download asks the user's phone to upload it again (the core decides it).
+    readonly property bool ask: root.block.ask === true
+    // What a tap fetches: a download, a retry, or the question to the phone.
+    readonly property bool downloadable: root.mediaState === "remote" || root.mediaState === "failed" || root.ask
     readonly property bool sticker: root.block.sticker
     readonly property bool animated: root.block.animated && root.local
     // Height / width, clamped so very tall or wide pictures stay readable (they are cropped).
@@ -41,15 +46,30 @@ Item {
     readonly property real minWidth: root.sticker ? Kirigami.Units.gridUnit * 4 : Kirigami.Units.gridUnit * 7
     readonly property real hue: Style.hueOf(root.block.blurhash)
     readonly property bool playing: root.animated && animation.status === AnimatedImage.Ready
-    readonly property bool shown: root.playing || picture.status === Image.Ready
+    // The attachment whose pixels `picture` holds: set when it is decoded, kept while the next
+    // URL loads, cleared when there is none or it failed (`paintedWidth` keeps its old value
+    // after an error, though nothing is drawn).
+    property real heldFor: 0
+    // The picture is on screen: decoded, or still the previous pixels of THIS attachment while
+    // a new URL loads (`retainWhileLoading`: the URL changes once more after a download, when
+    // the core has derived the thumbnail and the blurhash). Neither the stand-in nor the
+    // blurhash shows then. Another attachment's pixels (an album's tiles are reused by index)
+    // are never held: a tile shows the stand-in until its own picture is there.
+    readonly property bool pictureHeld: picture.status === Image.Ready || (picture.status === Image.Loading && root.heldFor === root.attachment && picture.paintedWidth > 0)
+    readonly property bool shown: root.playing || root.pictureHeld
     // What activating the picture does now: "download", "open" (a video: another application
-    // plays it), "view", or "" (a sticker, a download in progress, no longer available).
+    // plays it), "view", or "" (a sticker that is here, a download in progress, no longer
+    // available). A sticker that is not here is a download like a picture: an imported one
+    // is never fetched by itself, and the tap and the badge already offer it.
     readonly property string mediaAction: {
-        if (root.attachment <= 0 || root.sticker) {
+        if (root.attachment <= 0) {
             return "";
         }
         if (!root.local) {
-            return root.mediaState === "remote" || root.mediaState === "failed" ? "download" : "";
+            return root.downloadable ? "download" : "";
+        }
+        if (root.sticker) {
+            return "";
         }
         return root.block.kind === "video" ? "open" : "view";
     }
@@ -60,7 +80,7 @@ Item {
             return;
         }
         if (!root.local) {
-            if (root.mediaState === "remote" || root.mediaState === "failed") {
+            if (root.downloadable) {
                 App.downloadAttachment(root.attachment);
             }
         } else if (root.block.kind === "video") {
@@ -79,11 +99,102 @@ Item {
         }
     }
 
+    // A sticker that is gone: a box as high as its note, not a sticker-sized hole (the height
+    // follows from `implicitWidth`, never from the width the layout gives the block).
+    readonly property bool standIn: root.sticker && root.gone
+    // Size or duration, and what went wrong.
+    // (Also while the phone is asked, and when it could not help.)
+    readonly property bool gone: ["expired", "unavailable", "asking", "noanswer", "nomessage", "nofile"].includes(root.mediaState)
+    readonly property string note: {
+        switch (root.mediaState) {
+        case "failed":
+            return L10n.i18nc("@info", "Download failed");
+        case "expired":
+            return L10n.i18nc("@info", "No longer available");
+        case "unavailable":
+            return L10n.i18nc("@info", "Not available on this device");
+        case "asking":
+            return L10n.i18nc("@info", "Asking your phone…");
+        case "noanswer":
+        case "nomessage":
+        case "nofile":
+            return MediaActions.askNote(root.mediaState);
+        default:
+            return root.block.label;
+        }
+    }
+
+    // The note in the pill over a picture: the endings of an ask in a few words (the whole
+    // sentence is the pill's tooltip, `note`).
+    readonly property string shortNote: {
+        const short = MediaActions.askShortNote(root.mediaState);
+        return short !== "" ? short : root.note;
+    }
+
     implicitWidth: Math.round(Math.max(root.minWidth, Math.min(root.maxWidth, root.naturalWidth)))
-    implicitHeight: Math.round(Math.min(root.implicitWidth, root.available) * root.ratio)
+    implicitHeight: root.standIn && standInLoader.item ? Math.ceil((standInLoader.item as Item).implicitHeight) : Math.round(Math.min(root.implicitWidth, root.available) * root.ratio)
 
     Accessible.role: Accessible.Graphic
     Accessible.name: root.block.kind === "video" ? L10n.i18nc("@info accessible", "Video") : L10n.i18nc("@info accessible", "Picture")
+    // Why it is not shown, whole, though a tile may cut the note on the screen.
+    Accessible.description: root.gone ? root.note : ""
+
+    // A sticker that is gone: a framed box in the theme's colors (a step from the page towards
+    // the text, a frame at the theme's frame contrast) with a glyph and the note, quiet. A
+    // sticker has no bubble, so it stands on the page. Made only for such a sticker: every
+    // picture of a chat has this block.
+    Loader {
+        id: standInLoader
+        active: root.standIn
+        sourceComponent: Rectangle {
+            id: box
+            objectName: "standInBox"
+            width: root.implicitWidth
+            implicitHeight: standInColumn.implicitHeight + Kirigami.Units.largeSpacing * 2
+            height: implicitHeight
+            radius: Style.bubbleRadiusTight
+            color: Style.peerBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor)
+            border.width: 1
+            border.color: Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
+            readonly property color ink: Style.secondary(Kirigami.Theme.textColor, box.color)
+
+            Column {
+                id: standInColumn
+                anchors.centerIn: parent
+                width: box.width - Kirigami.Units.largeSpacing * 2
+                spacing: Kirigami.Units.smallSpacing
+                Kirigami.Icon {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: Kirigami.Units.iconSizes.smallMedium
+                    height: width
+                    // The waiting glyph while the phone is asked, the final one otherwise.
+                    source: root.mediaState === "asking" ? "appointment-soon" : "dialog-cancel"
+                    color: box.ink
+                    isMask: true
+                }
+                QQC2.Label {
+                    width: parent.width
+                    text: root.note
+                    color: box.ink
+                    font: Kirigami.Theme.smallFont
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                }
+                // The Download of a sticker the phone can be asked for: inside the box, below
+                // the note (the round badge over a picture would cover both).
+                QQC2.Button {
+                    objectName: "standInDownload"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    visible: root.ask
+                    flat: true
+                    icon.name: "download"
+                    text: L10n.i18nc("@action:button", "Download")
+                    onClicked: root.activate()
+                }
+            }
+        }
+    }
 
     // Before any blurhash: a soft gradient in a color derived from the attachment.
     Rectangle {
@@ -121,16 +232,27 @@ Item {
 
     Image {
         id: picture
+        objectName: "picture"
         anchors.fill: parent
         // Also the poster of an animation until (or unless) it plays.
-        visible: status === Image.Ready && !root.playing
+        visible: root.pictureHeld && !root.playing
         source: root.block.url
         asynchronous: true
+        retainWhileLoading: true
         smooth: true
         mipmap: true
         fillMode: root.sticker ? Image.PreserveAspectFit : Image.PreserveAspectCrop
-        sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-        sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+        // (Logical pixels: Qt multiplies `sourceSize` by the device pixel ratio itself, so the
+        // provider is asked for the physical size.)
+        sourceSize.width: Math.ceil(width)
+        sourceSize.height: Math.ceil(height)
+        onStatusChanged: {
+            if (picture.status === Image.Ready) {
+                root.heldFor = root.attachment;
+            } else if (picture.status !== Image.Loading) {
+                root.heldFor = 0;
+            }
+        }
     }
 
     MediaCopy {
@@ -159,7 +281,7 @@ Item {
         id: badge
         anchors.centerIn: parent
         readonly property bool busy: root.mediaState === "downloading"
-        visible: !root.local && root.mediaState !== "expired" || root.local && root.block.kind === "video"
+        visible: !root.standIn && (!root.local && (!root.gone || root.ask) || root.local && root.block.kind === "video")
         width: Kirigami.Units.gridUnit * 2.6
         height: width
         radius: width / 2
@@ -200,13 +322,16 @@ Item {
         }
     }
 
-    // Size or duration, and what went wrong.
+    // The note over the picture. A sticker has none (a gone one is the box above). In a small
+    // tile the note is cut to the tile's width, its whole text a tooltip away.
     Rectangle {
+        id: pill
+        objectName: "note"
         anchors.left: parent.left
         anchors.bottom: parent.bottom
         anchors.margins: Kirigami.Units.smallSpacing
         visible: label.text !== "" && (!root.local || root.block.kind !== "image") && !root.sticker && !(root.tile && root.local)
-        width: label.implicitWidth + Kirigami.Units.largeSpacing
+        width: Math.max(0, Math.min(label.implicitWidth, root.width - Kirigami.Units.smallSpacing * 2 - Kirigami.Units.largeSpacing)) + Kirigami.Units.largeSpacing
         height: label.implicitHeight + Kirigami.Units.smallSpacing
         radius: height / 2
         Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
@@ -214,19 +339,20 @@ Item {
         color: Qt.alpha(Kirigami.Theme.backgroundColor, Style.overlayOpacity)
         QQC2.Label {
             id: label
+            objectName: "noteLabel"
             anchors.centerIn: parent
-            text: {
-                switch (root.mediaState) {
-                case "failed":
-                    return L10n.i18nc("@info", "Download failed");
-                case "expired":
-                    return L10n.i18nc("@info", "No longer available");
-                default:
-                    return root.block.label;
-                }
-            }
+            width: pill.width - Kirigami.Units.largeSpacing
+            text: root.shortNote
             color: Kirigami.Theme.textColor
             font: Kirigami.Theme.smallFont
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
         }
+        HoverHandler {
+            id: pillHover
+        }
+        QQC2.ToolTip.visible: pillHover.hovered && (label.truncated || label.text !== root.note)
+        QQC2.ToolTip.text: root.note
+        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
     }
 }

@@ -284,6 +284,12 @@ impl UserId {
         self.0.split_once(':').map_or("", |(_, v)| v)
     }
 
+    /// The person is known by a phone number alone (Signal `e164:`, WhatsApp `pn:`): the
+    /// network has no stable identity for them yet, and a chat with them is read-only.
+    pub fn is_phone_number(&self) -> bool {
+        matches!(self.scheme(), "e164" | "pn")
+    }
+
     /// Log-safe display: `aci:…1f2e` (last 4 characters), phone numbers fully hidden (§9.1).
     pub fn log_safe(&self) -> crate::log::LogSafeUserId<'_> {
         crate::log::LogSafeUserId(self)
@@ -320,6 +326,11 @@ impl ConvKey {
     const GROUP: &'static str = "group";
     const BROADCAST: &'static str = "broadcast";
     const CHANNEL: &'static str = "channel";
+
+    /// A 1:1 chat with a person known by a phone number alone ([`UserId::is_phone_number`]).
+    pub fn is_number_only(&self) -> bool {
+        matches!(self, Self::Direct(user) if user.is_phone_number())
+    }
 
     /// Parses the string form (`direct:aci:…`, `group:gv2:…`, …).
     pub fn parse(s: &str) -> Result<Self, IdError> {

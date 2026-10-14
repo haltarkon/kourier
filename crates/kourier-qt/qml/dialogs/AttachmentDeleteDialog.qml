@@ -105,8 +105,8 @@ Kirigami.PromptDialog {
                                 source: choice.modelData.thumb
                                 asynchronous: true
                                 fillMode: Image.PreserveAspectCrop
-                                sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-                                sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+                                sourceSize.width: Math.ceil(width)
+                                sourceSize.height: Math.ceil(height)
                             }
                             Kirigami.Icon {
                                 anchors.centerIn: parent

@@ -9,14 +9,18 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use kourier_model::{Attachment, AttachmentId, AttachmentKind, AttachmentState, FileLimits};
+use kourier_model::{
+    AskFailure, Attachment, AttachmentId, AttachmentKind, AttachmentState, FileLimits,
+};
 
 /// What the provider serves for an attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MediaVariant {
     /// The full file, decoded at the requested size.
     Full,
-    /// The thumbnail (the provider falls back to the file when there is none).
+    /// The timeline's picture: the provider serves the 400 px thumbnail when it covers the
+    /// size the item is drawn at, the file when it does not or when there is no thumbnail (the
+    /// core decides, `MediaEntry::timeline_blob`).
     Thumb,
     /// The blurhash placeholder.
     Blurhash,
@@ -41,6 +45,13 @@ fn fnv(hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// The revision of an attachment's URLs: changes whenever the decoded picture can change.
+///
+/// Whether a thumbnail exists IS in it: a picture drawn from the file before its thumbnail
+/// existed is the same picture, but the provider may serve other pixels once it does (the
+/// thumbnail where it covers the size asked for, `MediaEntry::timeline_blob`; a decode from
+/// the file and one from a thumbnail differ by a grey level or two), so the picture is asked
+/// for again when the thumbnail appears. The timeline keeps the old pixels on screen until
+/// the new ones are ready (`retainWhileLoading`), so the second request shows no flash.
 pub fn revision(att: &Attachment) -> u32 {
     let state: u8 = match att.state {
         AttachmentState::Remote => 0,
@@ -48,6 +59,13 @@ pub fn revision(att: &Attachment) -> u32 {
         AttachmentState::Local => 2,
         AttachmentState::Failed { .. } => 3,
         AttachmentState::Expired => 4,
+        AttachmentState::Unavailable => 5,
+        AttachmentState::Asking => 6,
+        AttachmentState::AskFailed { why } => match why {
+            AskFailure::NoAnswer => 7,
+            AskFailure::NoMessage => 8,
+            AskFailure::NoFile => 9,
+        },
     };
     let (w, h) = att.dims.unwrap_or((0, 0));
     let mut x = fnv(0xcbf2_9ce4_8422_2325, &[state]);
@@ -56,6 +74,7 @@ pub fn revision(att: &Attachment) -> u32 {
     x = fnv(x, &h.to_le_bytes());
     x = fnv(x, att.mime.as_bytes());
     x = fnv(x, att.blurhash.as_deref().unwrap_or("").as_bytes());
+    x = fnv(x, &[u8::from(att.thumb.is_some())]);
     // Fold to 32 bits; the value only has to change, not to be unique.
     (x ^ (x >> 32)) as u32
 }
@@ -248,6 +267,15 @@ mod tests {
         let mut hashed = local.clone();
         hashed.blurhash = Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".into());
         assert_ne!(revision(&local), revision(&hashed));
+        // The thumbnail appearing is a new revision (the picture is asked for again), and it
+        // is the only thing that changed.
+        let mut derived = local.clone();
+        derived.thumb = Some(kourier_model::BlobRef {
+            path: "thumb".into(),
+            key: kourier_model::BlobKey::new([1; 32]),
+        });
+        assert_ne!(revision(&local), revision(&derived));
+        assert_eq!(revision(&derived), revision(&derived.clone()));
         let url = media_url(MediaVariant::Thumb, AttachmentId(42), 7);
         assert_eq!(url, "image://kourier/thumb/42?v=7");
         assert_eq!(

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use kourier_backend_api::{BlobTarget, Command};
 use kourier_blob::{BlobId, BlobStore};
 use kourier_model::{
-    AttachmentId, AttachmentKind, BackendBlob, BlobKey, ConversationId, MessageId,
+    AttachmentId, AttachmentKind, BackendBlob, BlobKey, ConversationId, MessageId, Redacted,
 };
 
 /// The core's own subtree of an account's blob directory: attachments, download targets and
@@ -73,6 +73,9 @@ pub(crate) struct DownloadJob {
     pub path: PathBuf,
     /// The target's file key.
     pub key: BlobKey,
+    /// The attachment's names (`Attachment::net_ids`), handed to the backend so that it can
+    /// check the file against a name that names content (a plaintext hash).
+    pub net_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for DownloadJob {
@@ -95,6 +98,7 @@ impl DownloadJob {
                 path: blob_dir.join(&self.path),
                 key: self.key.clone(),
             },
+            net_ids: Redacted::new(self.net_ids.clone()),
         }
     }
 }
@@ -226,6 +230,7 @@ mod tests {
             remote: BackendBlob::new(1, vec![1]),
             path: PathBuf::from("ab/abcd"),
             key: BlobKey::new([9; 32]),
+            net_ids: vec!["plaintext:9".into()],
         };
         assert!(!format!("{job:?}").contains("9, 9"));
         match job.command(Path::new("/blobs")) {

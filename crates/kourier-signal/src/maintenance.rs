@@ -60,9 +60,13 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// The server derives an account's capabilities from its devices, and which ones it takes
 /// from the primary alone cannot be read from any source available here, so a linked device
-/// that claims less than Desktop could lower what the whole account has. `attachmentBackfill`
-/// puts no duty on Kourier: a linked device only ever gets answers to backfill requests it
-/// sent itself (`SD/ts/textsecure/MessageReceiver.preload.ts:3150`), and Kourier sends none.
+/// that claims less than Desktop could lower what the whole account has. `attachmentBackfill`:
+/// Kourier asks the primary for files the server lost ([`crate::backfill`]) and applies its
+/// answers. The primary sends every answer to ALL our linked devices, also answers to another
+/// device's request (Signal Android `SignalServiceMessageSender.java` `sendSyncMessage`;
+/// Desktop applies those too, `SD/ts/jobs/helpers/attachmentBackfill.preload.ts`), so Kourier
+/// gets answers it did not ask for and gives those attachments the new pointer without
+/// downloading anything. It never answers a request: only the primary does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Capabilities {
@@ -149,11 +153,30 @@ pub(crate) fn account_caps(config: &BTreeMap<String, String>) -> AccountCaps {
         // Both are part of every chat's features (`crate::features::Limits`): a change sends
         // the features again.
         delete_for_everyone_max_age_secs: Some(crate::features::delete_max_age(config)),
-        flags: BTreeMap::from([(
-            "admin_delete".to_owned(),
-            crate::features::flag(config, crate::features::CONFIG_ADMIN_DELETE),
-        )]),
+        flags: BTreeMap::from([
+            (
+                "admin_delete".to_owned(),
+                crate::features::flag(config, crate::features::CONFIG_ADMIN_DELETE),
+            ),
+            // The core may ask the primary for lost files (`Command::RequestAttachments`).
+            // No gate on our own profile's `attachmentBackfill` capability (Desktop's): Kourier
+            // never fetches its own profile, and a primary that cannot answer costs one
+            // "did not answer" after the wait (Signal Android's requester has no gate either).
+            (AccountCaps::FLAG_ATTACHMENT_RESTORE.to_owned(), true),
+        ]),
     }
+}
+
+/// The backend's own statement of what the account can do, for the core: written at EVERY
+/// start (`actor.rs`), after a rebuild too. The limits come from the stored remote config when
+/// there is one; the flags that are the backend's own (the one for asking the phone,
+/// [`AccountCaps::FLAG_ATTACHMENT_RESTORE`]) do not depend on it. Stated only when a config
+/// had been fetched, they would be missing from an account whose config never arrived (the
+/// first start offline) and from a `core.db` made before the flag existed (the comparison
+/// that sends a changed config's caps sees no change in them).
+pub(crate) fn append_account_caps(tx: &mut Tx<'_>, now: i64, wake: &Rc<Notify>) -> Result<()> {
+    let caps = account_caps(&load_remote_config(tx)?);
+    crate::outbox::append_events(tx, &[BackendEvent::AccountCaps(caps)], now, wake).map(drop)
 }
 
 /// One entry of the stored remote config.
@@ -162,6 +185,20 @@ pub(crate) fn remote_config_value(conn: &Connection, name: &str) -> Result<Optio
         .prepare_cached("SELECT value FROM remote_config WHERE name = ?1")?
         .query_row([name], |r| r.get(0))
         .optional()?)
+}
+
+/// What the age rule of a history import's attachments needs of the stored remote config
+/// (`transfer::read_into_stage`): the server's message queue time (none stored: `None`, and
+/// the rule counts with its 30-day floor) and the receive limit (none stored: the default
+/// limit). That a config is NOT STORED YET is an answer (a link that has not fetched it
+/// yet); a database ERROR is not, and is returned, so that the read fails instead of
+/// judging every attachment by floors that may be wrong.
+pub(crate) fn import_media_config(conn: &Connection) -> Result<(Option<Duration>, u64)> {
+    let queue_time = crate::keys::configured_queue_time(conn)?;
+    let receive_limit = account_caps(&load_remote_config(conn)?)
+        .max_receive_attachment_bytes
+        .unwrap_or(crate::attachment::DEFAULT_MAX_RECEIVE_BYTES);
+    Ok((queue_time, receive_limit))
 }
 
 /// The stored remote config.
@@ -322,6 +359,7 @@ pub(crate) fn enqueue_at_start(conn: &Connection, now: i64) -> Result<()> {
     // The Storage Service at every start (§6.9), and the routine profile refresh (§6.10).
     jobs::enqueue(conn, JobKind::StorageSync, "", now, None)?;
     jobs::schedule_now(conn, JobKind::ProfileRefresh, "", now)?;
+    enqueue_stranded_group_refreshes(conn, now)?;
     let version: Option<String> =
         conn.query_row("SELECT app_version FROM account WHERE id = 1", [], |r| {
             r.get(0)
@@ -331,6 +369,36 @@ pub(crate) fn enqueue_at_start(conn: &Connection, now: i64) -> Result<()> {
             "sync requests again: the first start of this version, or one was dropped before"
         );
         enqueue_sync_requests(conn, now)?;
+    }
+    Ok(())
+}
+
+/// A refresh for every group the core has from a history import that was never fetched
+/// (`groups.state` NULL with `features_hash` set, and not left or gone): its refresh job may
+/// have been dropped (a permanent error), and nothing else would fetch a quiet group, which
+/// would stay "still loading" for good. Idempotent: a queued refresh stays as it is.
+pub(crate) fn enqueue_stranded_group_refreshes(conn: &Connection, now: i64) -> Result<()> {
+    let ids: Vec<Vec<u8>> = conn
+        .prepare(
+            "SELECT group_id FROM groups WHERE state IS NULL AND features_hash IS NOT NULL
+               AND membership NOT IN ('left', 'gone')",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    for id in &ids {
+        jobs::enqueue(
+            conn,
+            JobKind::GroupRefresh,
+            &crate::groups::job_key(id),
+            now,
+            None,
+        )?;
+    }
+    if !ids.is_empty() {
+        tracing::info!(
+            groups = ids.len(),
+            "refreshes of imported groups queued at start"
+        );
     }
     Ok(())
 }
@@ -398,26 +466,22 @@ pub(crate) fn rebuild_events(
     let own_ids = account.own_ids()?;
     db.zone(|tx| -> Result<()> {
         let config = load_remote_config(tx)?;
-        let configured: bool = tx.query_row(
-            "SELECT remote_config_at IS NOT NULL FROM account WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )?;
         let mut events = vec![BackendEvent::AccountReady {
             own_ids,
             device: Some(u32::from(account.device_id)),
             display_name: None,
             number: account.number(),
         }];
-        if configured {
-            events.push(BackendEvent::AccountCaps(account_caps(&config)));
-        }
+        // (Stated without a fetched config too: the backend's own flags do not depend on it.)
+        events.push(BackendEvent::AccountCaps(account_caps(&config)));
         // The new core.db has no conversation features: send them again with the next event
         // that touches each chat (§6.7, `crate::features`).
         tx.execute("UPDATE peers SET features_hash = NULL", [])?;
-        // The new core.db has lost its aliases: every PNI and ACI pair this device learned,
-        // from whichever source, is told again (the Storage Service sync below repeats only
-        // the pairs of its own records).
+        // The new core.db has lost its aliases: every PNI to ACI and number to ACI pair this
+        // device learned, from whichever source, is told again here (`identity_links` and
+        // `number_links` hold them; the Storage Service sync below tells none of them a
+        // second time, because `links::learn` and `links::learn_number` stay silent about a
+        // pair that is known).
         events.extend(crate::links::all(tx)?);
         append_events(tx, &events, now, wake)?;
         // Contacts and settings again (the old avatar files belong to the lost core.db rows).
@@ -508,6 +572,7 @@ pub(crate) async fn run_job<T: SignalTransport>(
         JobKind::TimerUpdate => crate::timer::run_update(shared, socket, job).await,
         JobKind::KeyMaintenance => key_maintenance(shared, socket, job).await,
         JobKind::DeleteSync => crate::delete_sync::run(shared, socket, job).await,
+        JobKind::BackfillRequest => crate::backfill::run(shared, socket, job).await,
         JobKind::ProfileRefresh => {
             let account = shared.account().ok_or(Error::NotLinked)?;
             crate::profile::refresh(shared, account.aci)
@@ -806,6 +871,50 @@ mod tests {
         );
     }
 
+    /// The import's age rule reads the queue time and the receive limit of the stored config:
+    /// none stored is the floors, a stored one is read, and a database ERROR is an error (the
+    /// read of the archive fails), never the floors.
+    #[test]
+    fn the_import_reads_the_stored_config_and_a_database_error_is_not_the_floors() {
+        let (_dir, db) = linked_db(Some("aep"));
+        let wake = Rc::new(Notify::new());
+        assert_eq!(
+            db.read(import_media_config).unwrap(),
+            (None, crate::attachment::DEFAULT_MAX_RECEIVE_BYTES),
+            "nothing stored yet: the floors"
+        );
+        let fetched = Fetched::Config {
+            etag: None,
+            entries: BTreeMap::from([
+                (
+                    "global.messageQueueTimeInSeconds".to_owned(),
+                    "5184000".to_owned(),
+                ),
+                (
+                    "global.attachments.maxReceiveBytes".to_owned(),
+                    "25000".to_owned(),
+                ),
+            ]),
+        };
+        db.zone(|tx| store_remote_config(tx, &fetched, 1, &wake))
+            .map(drop)
+            .unwrap();
+        assert_eq!(
+            db.read(import_media_config).unwrap(),
+            (Some(Duration::from_secs(60 * 86_400)), 25_000),
+            "stored: read"
+        );
+        db.zone(|tx| -> Result<()> {
+            tx.execute("DROP TABLE remote_config", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            db.read(import_media_config).is_err(),
+            "a database error is an error, not the floors"
+        );
+    }
+
     #[test]
     fn caps_are_emitted_for_the_first_config_and_changes_only() {
         let (_dir, db) = linked_db(Some("aep"));
@@ -910,6 +1019,53 @@ mod tests {
         .unwrap();
     }
 
+    /// The backend states what the account can do at every start, whatever the stored remote
+    /// config: without one (the first start offline) the flag for asking the phone is there and
+    /// the limits are not; with one the limits come too. A `core.db` made before the flag
+    /// existed, or never told, gets it from the next start.
+    #[test]
+    fn every_start_states_the_capabilities_without_a_fetched_config() {
+        let (_dir, db) = linked_db(Some("aep"));
+        let wake = Rc::new(Notify::new());
+        let caps = |db: &ZoneDb| -> Vec<AccountCaps> {
+            db.read(|c| -> Result<Vec<Vec<u8>>> {
+                let mut stmt = c.prepare("SELECT envelope FROM core_outbox ORDER BY seq")?;
+                Ok(stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<kourier_db::rusqlite::Result<_>>()?)
+            })
+            .unwrap()
+            .iter()
+            .flat_map(|row| kourier_backend_api::decode_outbox_row(row).unwrap())
+            .filter_map(|e| match e {
+                BackendEvent::AccountCaps(caps) => Some(caps),
+                _ => None,
+            })
+            .collect()
+        };
+        assert_eq!(db.read(load_remote_config).unwrap().len(), 0);
+        db.zone(|tx| append_account_caps(tx, 5, &wake)).unwrap();
+        let first = caps(&db);
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].restores_attachments(),
+            "no config, and the flag is stated"
+        );
+        assert_eq!(first[0].max_receive_attachment_bytes, None);
+        db.zone(|tx| -> Result<()> {
+            tx.execute(
+                "INSERT INTO remote_config(name, value) VALUES ('global.attachments.maxBytes', '1000')",
+                [],
+            )?;
+            append_account_caps(tx, 6, &wake)
+        })
+        .unwrap();
+        let second = caps(&db);
+        assert_eq!(second.len(), 2);
+        assert!(second[1].restores_attachments());
+        assert_eq!(second[1].max_receive_attachment_bytes, Some(1250));
+    }
+
     #[test]
     fn starts_register_capabilities_and_a_new_version_syncs_again() {
         let (_dir, db) = linked_db(Some("aep"));
@@ -966,6 +1122,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, APP_VERSION);
+    }
+
+    /// The start itself queues the refresh of an imported group that was never fetched (its
+    /// refresh job may have been dropped): the call in [`enqueue_at_start`], not only the
+    /// function behind it ([`enqueue_stranded_group_refreshes`] has its own test in `groups`).
+    /// A group fetched since, one that was left and one the core does not have get none.
+    #[test]
+    fn a_start_queues_the_refresh_of_a_stranded_group() {
+        let (_dir, db) = linked_db(None);
+        let group = |i: u8, membership: &str, hash: Option<i64>| -> String {
+            let keys = crate::groups::GroupKeys::from_master([i; 32]);
+            db.zone(|tx| -> Result<()> {
+                crate::groups::ensure(tx, &keys, 1)?;
+                tx.execute(
+                    "UPDATE groups SET membership = ?2, features_hash = ?3 WHERE master_key = ?1",
+                    (&[i; 32][..], membership, hash),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            crate::groups::job_key(&keys.id)
+        };
+        let refreshes = || -> Vec<String> {
+            db.read(|c| -> Result<_> {
+                let mut stmt =
+                    c.prepare("SELECT key FROM jobs WHERE kind = 'group_refresh' ORDER BY key")?;
+                Ok(stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<kourier_db::rusqlite::Result<_>>()?)
+            })
+            .unwrap()
+        };
+        let stranded = group(1, "unknown", Some(5));
+        group(2, "left", Some(5));
+        group(3, "unknown", None);
+        assert!(refreshes().is_empty(), "nothing is queued before a start");
+        db.zone(|tx| enqueue_at_start(tx, 2)).unwrap();
+        assert_eq!(refreshes(), std::slice::from_ref(&stranded));
+        // Another start adds nothing.
+        db.zone(|tx| enqueue_at_start(tx, 3)).unwrap();
+        assert_eq!(refreshes(), [stranded]);
     }
 
     /// A sync request of the link that is dropped (a failure no retry mends, or its day ran
@@ -1113,8 +1310,18 @@ mod tests {
             !avatar_path.exists(),
             "avatar files of the lost core.db are deleted"
         );
-        let names: Vec<&str> = outbox_events(&db).iter().map(BackendEvent::name).collect();
-        assert_eq!(names, ["AccountReady"], "no config fetched yet: no caps");
+        let events = outbox_events(&db);
+        let names: Vec<&str> = events.iter().map(BackendEvent::name).collect();
+        assert_eq!(
+            names,
+            ["AccountReady", "AccountCaps"],
+            "no config fetched yet: the caps are stated all the same"
+        );
+        let BackendEvent::AccountCaps(caps) = &events[1] else {
+            panic!("caps")
+        };
+        assert!(caps.restores_attachments(), "the backend's own flag");
+        assert_eq!(caps.max_attachment_bytes, None, "and no limits yet");
         db.zone(|tx| {
             store_remote_config(
                 tx,

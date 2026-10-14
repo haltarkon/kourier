@@ -390,6 +390,54 @@ fn contacts_map_to_contacts_peers_and_chats() {
     .unwrap();
 }
 
+/// A number's merge is told once (link feedback L2): a record that comes back after
+/// `reset` (or removed and added) tells the core nothing again; a number that moved to
+/// another ACI is told; a rebuilt core gets the pair from `links::all`.
+#[test]
+fn a_numbers_merge_is_told_once_whatever_record_repeats_it() {
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let bruno = Aci::from(uuid::Uuid::from_u128(0xb0b));
+    let numbered = |key: u8, aci: Aci| contact_keyed(key, aci, |c| c.e164 = "+15550111".to_owned());
+    let merges = |events: &[BackendEvent]| -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::IdentityMerged { from, into } => {
+                    Some((from.as_str().to_owned(), into.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let ada_pair = ("e164:+15550111".to_owned(), user(ada).as_str().to_owned());
+    db.zone(|tx| merge_zone(tx, account, &[numbered(1, ada)], None, true, 100, &wake))
+        .unwrap();
+    assert_eq!(
+        merges(&outbox(db)),
+        std::slice::from_ref(&ada_pair),
+        "the first record tells it"
+    );
+    // Every record is merged again after a reset (a new storage key): nothing to tell.
+    db.zone(|tx| reset(tx, 150)).unwrap();
+    db.zone(|tx| merge_zone(tx, account, &[numbered(2, ada)], None, true, 200, &wake))
+        .unwrap();
+    assert_eq!(merges(&outbox(db)), [], "known: told once");
+    // The number went to another account.
+    db.zone(|tx| merge_zone(tx, account, &[numbered(3, bruno)], None, false, 300, &wake))
+        .unwrap();
+    let bruno_pair = ("e164:+15550111".to_owned(), user(bruno).as_str().to_owned());
+    assert_eq!(
+        merges(&outbox(db)),
+        std::slice::from_ref(&bruno_pair),
+        "moved: told again"
+    );
+    let all = db.read(crate::links::all).unwrap();
+    assert_eq!(merges(&all), [bruno_pair], "a rebuilt core gets the pair");
+}
+
 #[test]
 fn quiet_contacts_create_no_chats_and_accepting_updates_known_ones() {
     let fixture = fixture();
@@ -518,7 +566,7 @@ fn account_record_maps_settings_note_to_self_and_pins() {
     assert_eq!(
         pinned,
         [ConvKey::Direct(user(ada)), ConvKey::Direct(user(bruno))],
-        "1:1 pins in order; group and number-only pins wait"
+        "1:1 pins in order; a group the core does not have and number-only pins are left out"
     );
     // Pinned chats come with their features, before the pin list.
     let pin_at = events
@@ -698,4 +746,438 @@ fn gcm_values_of_the_storage_service_decrypt_with_the_shared_helper() {
         decrypt_manifest(&[0x11; 32], 7, &sealed).unwrap().version,
         7
     );
+}
+
+/// D10 (history import, step S4a): the FIRST record of a contact whose chat the core has
+/// states the roaming flags and blocked even where they are false (the archive said true),
+/// and so does the first account record for Note to Self. A first record of a contact
+/// whose chat the core does not have makes no chat.
+#[test]
+fn the_first_record_of_a_chat_the_core_has_states_its_flags_whatever_they_are() {
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let bruno = Aci::from(uuid::Uuid::from_u128(0xb0b));
+    // The core has Ada's chat and Note to Self (an import made them: their features are
+    // recorded); it does not have Bruno's.
+    for chat in [user(ada), user(account.aci)] {
+        db.zone(|tx| crate::features::features_event(tx, account, &chat, 2).map(|_| ()))
+            .unwrap();
+    }
+    let record = proto::AccountRecord {
+        given_name: "Demo".to_owned(),
+        ..Default::default()
+    };
+    let batch = vec![
+        contact_keyed(1, ada, |c| c.given_name = "Ada".to_owned()),
+        contact_keyed(2, bruno, |c| c.given_name = "Bruno".to_owned()),
+        item(3, ItemType::Account, Record::Account(record)),
+    ];
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let events = outbox(db);
+    let chat = conversation(&events, &user(ada)).expect("Ada's flags are stated");
+    assert_eq!(chat.archived, Some(false));
+    assert_eq!(chat.marked_unread, Some(false));
+    assert_eq!(chat.muted_until, Patch::Clear);
+    assert_eq!(chat.blocked, Some(false));
+    assert!(
+        conversation(&events, &user(bruno)).is_none(),
+        "no chat for a contact the core has no chat with"
+    );
+    let note = conversation(&events, &user(account.aci)).expect("Note to Self's flags");
+    assert_eq!(note.archived, Some(false));
+    assert_eq!(note.marked_unread, Some(false));
+
+    // The next record of the same contact compares with this one again: nothing changed,
+    // nothing is said.
+    let again = vec![contact_keyed(4, ada, |c| c.given_name = "Ada".to_owned())];
+    db.zone(|tx| merge_zone(tx, account, &again, None, false, 11, &wake))
+        .unwrap();
+    assert!(conversation(&outbox(db), &user(ada)).is_none());
+}
+
+/// Design §3 S4: the pinned list keeps the record's order across kinds, with a group the
+/// core has; a group the core does not have is left out (the core would make a bare chat).
+#[test]
+fn a_group_the_core_has_keeps_its_pin_in_the_records_order() {
+    use proto::account_record::PinnedConversation;
+    use proto::account_record::pinned_conversation::{Contact as PinContact, Identifier as Pin};
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let known = crate::groups::GroupKeys::from_master([7; 32]);
+    let unknown = [8u8; 32];
+    db.zone(|tx| -> Result<()> {
+        crate::groups::ensure(tx, &known, 1)?;
+        tx.execute(
+            "UPDATE groups SET features_hash = 42 WHERE master_key = ?1",
+            [&known.master[..]],
+        )?;
+        // A group the backend knows and the core does not.
+        crate::groups::ensure(tx, &crate::groups::GroupKeys::from_master(unknown), 1)?;
+        Ok(())
+    })
+    .unwrap();
+    let pin_group = |master: &[u8]| PinnedConversation {
+        identifier: Some(Pin::GroupMasterKey(master.to_vec())),
+    };
+    let record = proto::AccountRecord {
+        pinned_conversations: vec![
+            pin_group(&known.master),
+            pin_group(&unknown),
+            PinnedConversation {
+                identifier: Some(Pin::Contact(PinContact {
+                    service_id_binary: ada.service_id_binary(),
+                    ..Default::default()
+                })),
+            },
+            // Not a master key.
+            pin_group(&[9; 16]),
+        ],
+        ..Default::default()
+    };
+    let batch = vec![item(1, ItemType::Account, Record::Account(record))];
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let events = outbox(db);
+    let pinned = events
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::PinnedConversations(keys) => Some(keys.clone()),
+            _ => None,
+        })
+        .expect("pins");
+    assert_eq!(pinned, [known.conv_key(), ConvKey::Direct(user(ada))]);
+    assert!(
+        !events.iter().any(|e| matches!(e,
+            BackendEvent::ConversationUpsert(p) if p.key == known.conv_key())),
+        "no bare upsert of a group"
+    );
+}
+
+/// A group the stored account record pins gets the pin list again when its first fetch gives
+/// the core its features: the whole list, in the record's order across kinds, naming only
+/// chats the core has. A group the record does not pin, and an account without a stored
+/// record, give nothing.
+#[test]
+fn the_first_fetch_of_a_pinned_group_pins_it_from_the_stored_account_record() {
+    use proto::account_record::PinnedConversation;
+    use proto::account_record::pinned_conversation::{Contact as PinContact, Identifier as Pin};
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let bob = Aci::from(uuid::Uuid::from_u128(0xb0b));
+    let first = crate::groups::GroupKeys::from_master([7; 32]);
+    let second = crate::groups::GroupKeys::from_master([8; 32]);
+    let unpinned = crate::groups::GroupKeys::from_master([9; 32]);
+    let pin_group = |keys: &crate::groups::GroupKeys| PinnedConversation {
+        identifier: Some(Pin::GroupMasterKey(keys.master.to_vec())),
+    };
+    let pin_contact = |aci: Aci| PinnedConversation {
+        identifier: Some(Pin::Contact(PinContact {
+            service_id_binary: aci.service_id_binary(),
+            ..Default::default()
+        })),
+    };
+    let fetched = |keys: &crate::groups::GroupKeys| {
+        db.zone(|tx| -> Result<()> {
+            crate::groups::ensure(tx, keys, 1)?;
+            tx.execute(
+                "UPDATE groups SET features_hash = 42 WHERE master_key = ?1",
+                [&keys.master[..]],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    };
+    let list = |keys: &crate::groups::GroupKeys| {
+        db.read(|c| pins_with_new_group(c, keys))
+            .unwrap()
+            .map(|event| match event {
+                BackendEvent::PinnedConversations(list) => list,
+                other => panic!("{other:?}"),
+            })
+    };
+    // No account record has been merged yet.
+    fetched(&first);
+    assert_eq!(list(&first), None, "nothing is stored to pin from");
+
+    // The first sync of a fresh link: the groups are not fetched yet, so the pin list the
+    // sync sends names the two people only.
+    let record = proto::AccountRecord {
+        pinned_conversations: vec![
+            pin_group(&first),
+            pin_contact(ada),
+            pin_group(&second),
+            pin_contact(bob),
+        ],
+        ..Default::default()
+    };
+    db.zone(|tx| {
+        tx.execute("DELETE FROM groups", [])?;
+        Ok::<_, crate::error::Error>(())
+    })
+    .unwrap();
+    let batch = vec![item(1, ItemType::Account, Record::Account(record))];
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let sent = outbox(db)
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::PinnedConversations(keys) => Some(keys.clone()),
+            _ => None,
+        })
+        .expect("pins");
+    assert_eq!(
+        sent,
+        [ConvKey::Direct(user(ada)), ConvKey::Direct(user(bob))]
+    );
+
+    // The first group is fetched: the record's whole list, its order across kinds, with the
+    // group where the phone put it. The second is not in the core yet and stays out.
+    fetched(&first);
+    assert_eq!(
+        list(&first),
+        Some(vec![
+            first.conv_key(),
+            ConvKey::Direct(user(ada)),
+            ConvKey::Direct(user(bob))
+        ])
+    );
+    // Then the second: both groups, still in the record's order.
+    fetched(&second);
+    assert_eq!(
+        list(&second),
+        Some(vec![
+            first.conv_key(),
+            ConvKey::Direct(user(ada)),
+            second.conv_key(),
+            ConvKey::Direct(user(bob))
+        ])
+    );
+    // A person whose chat the core does not have is not named (nothing makes it here).
+    db.zone(|tx| peers::clear_features_hash(tx, &ServiceId::from(bob).service_id_string()))
+        .unwrap();
+    assert_eq!(
+        list(&second),
+        Some(vec![
+            first.conv_key(),
+            ConvKey::Direct(user(ada)),
+            second.conv_key()
+        ])
+    );
+    // A group the record does not pin gets nothing.
+    fetched(&unpinned);
+    assert_eq!(list(&unpinned), None);
+}
+
+/// The hook in `groups::apply::apply_left` (S4a, finding 1): a group that the stored account
+/// record pins and that the core does not have yet gets the pin list again with its first
+/// event, also when that event says we are not in it. This is the case where the backend has
+/// the group's state and the core lacks the group (the core's database was lost: `maintenance`
+/// clears `features_hash` and keeps the state), so the group is fetched again and is gone.
+/// What the code does for a left group is what a group we are in does: the group is named in
+/// the record's order, because `groups.features_hash` is set just before the list is built.
+/// A group the core already has, a group the record does not pin, and a group that was never
+/// fetched (the core never had it: `apply_left` sends nothing) get no list.
+#[test]
+fn the_first_event_of_a_pinned_group_we_are_not_in_pins_it_from_the_stored_account_record() {
+    use crate::groups::apply::{Outcome, Update, apply};
+    use crate::groups::{GroupKeys, SnapMember, Snapshot};
+    use proto::account_record::PinnedConversation;
+    use proto::account_record::pinned_conversation::{Contact as PinContact, Identifier as Pin};
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let wake = Rc::new(Notify::new());
+    let ada = Aci::from(uuid::Uuid::from_u128(0xada));
+    let pinned = GroupKeys::from_master([7; 32]);
+    let unpinned = GroupKeys::from_master([8; 32]);
+    let had = GroupKeys::from_master([9; 32]);
+    let never_fetched = GroupKeys::from_master([10; 32]);
+    // The phone pins the group before Ada: a list that put people first would differ.
+    let record = proto::AccountRecord {
+        pinned_conversations: [&pinned, &had, &never_fetched]
+            .into_iter()
+            .map(|keys| PinnedConversation {
+                identifier: Some(Pin::GroupMasterKey(keys.master.to_vec())),
+            })
+            .chain([PinnedConversation {
+                identifier: Some(Pin::Contact(PinContact {
+                    service_id_binary: ada.service_id_binary(),
+                    ..Default::default()
+                })),
+            }])
+            .collect(),
+        ..Default::default()
+    };
+    // Ada's chat is in the core (the first sync made it); the groups are not fetched yet, so
+    // the sync's list names Ada alone.
+    db.zone(|tx| crate::features::features_event(tx, account, &user(ada), 2).map(|_| ()))
+        .unwrap();
+    let batch = vec![item(1, ItemType::Account, Record::Account(record))];
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let first_list = outbox(db)
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::PinnedConversations(keys) => Some(keys.clone()),
+            _ => None,
+        })
+        .expect("the sync's pins");
+    assert_eq!(first_list, [ConvKey::Direct(user(ada))]);
+
+    // The backend has the state of each group (we were a member), the core has `had` only.
+    let snapshot = Snapshot {
+        revision: 3,
+        title: "Climbing".to_owned(),
+        members: vec![SnapMember {
+            aci: uuid::Uuid::from(ada),
+            admin: true,
+            joined_at: 0,
+        }],
+        ..Snapshot::default()
+    };
+    db.zone(|tx| -> Result<()> {
+        for (keys, features_hash) in [(&pinned, None), (&unpinned, None), (&had, Some(42i64))] {
+            tx.execute(
+                "INSERT INTO groups(master_key, group_id, updated_at, revision, state,
+                   membership, features_hash) VALUES (?1, ?2, 0, 3, ?3, 'member', ?4)",
+                (
+                    &keys.master[..],
+                    &keys.id[..],
+                    snapshot.to_json()?,
+                    features_hash,
+                ),
+            )?;
+        }
+        // Fetched for the first time and gone: no state, nothing the core ever had.
+        crate::groups::ensure(tx, &never_fetched, 1)?;
+        Ok(())
+    })
+    .unwrap();
+    let left = |keys: &GroupKeys| {
+        db.zone(|tx| -> Result<_> {
+            let update = Update {
+                keys: *keys,
+                outcome: Outcome::NotMember { change: None },
+            };
+            Ok(apply(tx, account, std::path::Path::new("."), update, None, 20)?.events)
+        })
+        .unwrap()
+    };
+    let pins_of = |events: &[BackendEvent]| {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::PinnedConversations(list) => Some(list.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let upserts_of = |events: &[BackendEvent], keys: &GroupKeys| {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, BackendEvent::ConversationUpsert(p) if p.key == keys.conv_key()),
+            )
+            .count()
+    };
+
+    // The group the record pins: its upsert (we cannot write there), then the whole list in
+    // the record's order, the group where the phone put it. The list names the other group
+    // the core has and leaves out the one it has not (`never_fetched`).
+    let events = left(&pinned);
+    assert_eq!(upserts_of(&events, &pinned), 1, "{events:?}");
+    let BackendEvent::ConversationUpsert(patch) = &events[0] else {
+        panic!("the group's upsert comes first: {events:?}");
+    };
+    assert_eq!(
+        patch.features.as_ref().and_then(|f| f.cannot_send.clone()),
+        Some(kourier_model::CannotSend::NotMember)
+    );
+    assert_eq!(
+        pins_of(&events),
+        [vec![
+            pinned.conv_key(),
+            had.conv_key(),
+            ConvKey::Direct(user(ada))
+        ]],
+        "{events:?}"
+    );
+    assert!(
+        matches!(&events[1], BackendEvent::PinnedConversations(_)),
+        "the list follows the group's upsert: {events:?}"
+    );
+    // A group the record does not pin gets its upsert and no list.
+    let events = left(&unpinned);
+    assert_eq!(upserts_of(&events, &unpinned), 1);
+    assert!(pins_of(&events).is_empty(), "{events:?}");
+    // A group the core has already keeps the pin the sync gave it: no list again.
+    let events = left(&had);
+    assert_eq!(upserts_of(&events, &had), 1);
+    assert!(pins_of(&events).is_empty(), "{events:?}");
+    // A group never fetched before: the core never had it, nothing is sent, not a pin.
+    let events = left(&never_fetched);
+    assert!(events.is_empty(), "{events:?}");
+}
+
+/// The Note to Self half of the first-record rule (`merge_account`): on a fresh link without
+/// an import the first account record must not make an empty Note to Self chat, as an upsert
+/// would; once the core has the chat (an import made it) the first record states its flags
+/// whatever they are, so that the sync wins over the archive (D10).
+#[test]
+fn a_first_account_record_makes_no_note_to_self_chat_and_states_the_flags_of_one_the_core_has() {
+    let record = || proto::AccountRecord {
+        given_name: "Demo".to_owned(),
+        ..Default::default()
+    };
+    let note_to_self = |events: &[BackendEvent], account: &crate::db::Account| {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::ConversationUpsert(p)
+                    if p.key == ConvKey::Direct(user(account.aci)) =>
+                {
+                    Some(p.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let wake = Rc::new(Notify::new());
+
+    // A fresh link: the core has no Note to Self chat.
+    let fresh = fixture();
+    let (db, account) = (&fresh.db, &fresh.account);
+    let batch = vec![item(1, ItemType::Account, Record::Account(record()))];
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let events = outbox(db);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::AccountSettings(_))),
+        "the record was merged"
+    );
+    assert!(
+        note_to_self(&events, account).is_empty(),
+        "no chat for Note to Self: {events:?}"
+    );
+
+    // After an import the core has the chat: the same record states its flags.
+    let imported = fixture();
+    let (db, account) = (&imported.db, &imported.account);
+    db.zone(|tx| crate::features::features_event(tx, account, &user(account.aci), 2).map(|_| ()))
+        .unwrap();
+    db.zone(|tx| merge_zone(tx, account, &batch, None, true, 10, &wake))
+        .unwrap();
+    let events = outbox(db);
+    let stated = note_to_self(&events, account);
+    assert_eq!(stated.len(), 1, "{events:?}");
+    assert_eq!(stated[0].archived, Some(false));
+    assert_eq!(stated[0].marked_unread, Some(false));
 }

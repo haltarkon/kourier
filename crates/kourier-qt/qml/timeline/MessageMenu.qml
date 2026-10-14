@@ -43,8 +43,11 @@ QQC2.Menu {
     // In the window's scene (also on Wayland, and in headless screenshots).
     popupType: QQC2.Popup.Item
 
-    // An entry that takes no room while it does not apply.
+    // An entry that takes no room while it does not apply. It is also disabled then: the
+    // menu's keyboard navigation does not skip an item that is only invisible, so a hidden
+    // entry could be reached and triggered with Down and Return.
     component Entry: QQC2.MenuItem {
+        enabled: visible
         height: visible ? implicitHeight : 0
     }
 

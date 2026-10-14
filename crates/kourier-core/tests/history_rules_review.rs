@@ -772,7 +772,9 @@ fn review_schema_12_does_not_double_what_an_earlier_delivery_counted() {
         .expect("unread")
     };
     assert_eq!(unread(&conn), 3, "what the user saw under schema 11");
-    let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
+    // Only the step to 12 (later schemas add steps of their own).
+    let v12 = kourier_db::Migrations::new("core", &kourier_core::MIGRATIONS.steps[..12]);
+    let out = kourier_db::migrate(&mut conn, &v12).expect("migrate");
     assert_eq!((out.from, out.to), (11, 12));
     assert_eq!(unread(&conn), 3, "and sees after the step");
 }

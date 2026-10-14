@@ -57,6 +57,14 @@ pub enum CoreError {
     /// The blob store (encrypted attachment files) failed.
     #[error("attachment file: {0}")]
     Blob(#[from] kourier_blob::BlobError),
+    /// A link brought an identity that another account of this profile already has (the
+    /// same primary own id, on the same network): two devices of one account in one profile
+    /// would show every chat twice. `logged_out`: that account is logged out.
+    #[error("this account is already in the profile")]
+    AlreadyAdded {
+        /// The existing account is logged out ("Link Again" on it is the way back).
+        logged_out: bool,
+    },
     /// The core is shutting down or has stopped.
     #[error("the core has stopped")]
     Stopped,

@@ -160,6 +160,30 @@ impl App {
         .await
     }
 
+    /// [`Self::start_with_media`] with the waits for our phone's answer to a request for lost
+    /// files shortened (`Timeouts::restore_answer`, `restore_pending`): a phone that never
+    /// answers ends as "did not answer" in seconds.
+    pub async fn start_with_restore_waits(
+        dir: &Path,
+        env: &BackendEnv,
+        media: &Path,
+        answer: Duration,
+        pending: Duration,
+    ) -> Self {
+        Self::start_cfg(
+            dir,
+            env,
+            InitialSync::LinkOnly,
+            Some(media.to_owned()),
+            SignalNetwork::new(),
+            |cfg| {
+                cfg.timeouts.restore_answer = answer;
+                cfg.timeouts.restore_pending = pending;
+            },
+        )
+        .await
+    }
+
     async fn start_full(
         dir: &Path,
         env: &BackendEnv,
@@ -175,6 +199,17 @@ impl App {
         initial_sync: InitialSync,
         media: Option<std::path::PathBuf>,
         network: SignalNetwork,
+    ) -> Self {
+        Self::start_cfg(dir, env, initial_sync, media, network, |_| {}).await
+    }
+
+    async fn start_cfg(
+        dir: &Path,
+        env: &BackendEnv,
+        initial_sync: InitialSync,
+        media: Option<std::path::PathBuf>,
+        network: SignalNetwork,
+        tune: impl FnOnce(&mut CoreConfig),
     ) -> Self {
         let data = dir.join("data");
         std::fs::create_dir_all(&data).expect("data dir");
@@ -195,6 +230,7 @@ impl App {
             ..BackendConfig::default()
         };
         cfg.media_cache = media;
+        tune(&mut cfg);
         let core = Core::start(cfg).await.expect("core starts");
         let handle = core.handle();
         let events = handle.subscribe();

@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use kourier_backend_api::{BackendEnv, Command, Exit, InitialSync, StartMode, TransmitOutcome};
+use kourier_backend_api::{
+    BackendEnv, BackendEvent, Command, Exit, InitialSync, StartMode, TransmitOutcome,
+};
 use kourier_model::{LoginStepKind, UserId};
 use kourier_signal::SignalNetwork;
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,7 @@ use serde_json::Value;
 use support::fake_core::{AccountFiles, FakeCore, Sink, SinkMessage, WAIT, local_env};
 use support::harness::{
     CreateGroup, CreatePrimary, DeviceInfo, GroupInfo, Harness, ModifyGroup, Primary,
-    SendGroupText, SendText, StorageGroup, StorageSpec,
+    SendGroupText, SendText, StorageAccount, StorageContact, StorageGroup, StorageSpec,
 };
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
@@ -296,6 +298,68 @@ async fn group_reaches_the_core_with_title_members_and_avatar() {
         world.system_messages(&group).is_empty(),
         "no system messages on the first fetch"
     );
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Design §3 S4: the Storage Service's pinned list keeps a group the core has, in the
+/// record's order beside a contact. On a fresh link the first sync finds the group before its
+/// first fetch (the core does not have it) and leaves it out, as a pin of it would be a bare
+/// chat; the group's first fetch then pins it from the stored account record, with NO second
+/// account record from the phone (it may not write one for days).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_group_stays_pinned_after_a_storage_sync() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let group = make_group(&world).await;
+    let storage = StorageSpec {
+        primary: world.phone.device_ref.clone(),
+        contacts: vec![StorageContact {
+            pinned: Some(true),
+            ..StorageContact::of(&world.ada.device_ref)
+        }],
+        groups: vec![StorageGroup {
+            id: group.id.clone(),
+            pinned: Some(true),
+            ..StorageGroup::default()
+        }],
+        account: Some(StorageAccount {
+            link_previews: Some(false),
+            ..StorageAccount::default()
+        }),
+        ..StorageSpec::default()
+    };
+    let (mut core, _device) = world.link(&storage).await;
+    core.wait_online().await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !world.upsert(&group).contains_key("title") {
+        assert!(tokio::time::Instant::now() < deadline, "group fetched");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ada = format!("direct:{}", World::user(&world.ada));
+    let key = World::conv_key(&group);
+    let pins = world.sink.event_values("PinnedConversations");
+    assert_eq!(
+        pins.first(),
+        Some(&serde_json::json!([ada])),
+        "before its first fetch the group is not named"
+    );
+    // The first fetch of the group pins it, in the record's order.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let pins = world.sink.event_values("PinnedConversations");
+        if pins.last() == Some(&serde_json::json!([ada, key])) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the group stays pinned after its first fetch: {:?}",
+            pins.last().map(|p| p.as_array().map(Vec::len))
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    core.wait_online().await;
     assert_eq!(core.shutdown().await, Exit::Shutdown);
     world.harness.shutdown().await.expect("harness shutdown");
 }
@@ -607,6 +671,123 @@ async fn a_removal_survives_a_kill_after_the_backend_commit() {
     core.wait_online().await;
     assert_eq!(core.shutdown().await, Exit::Shutdown);
     assert_eq!(world.files.count_rows("core_outbox").expect("outbox"), 0);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Link feedback L3: a fresh link reports the groups the server has not given yet (the link's
+/// `Done` does not wait for them), and once the group's state arrived, a last report says
+/// `finished`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_link_reports_its_groups_still_loading_and_then_that_it_finished() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let group = make_group(&world).await;
+    world
+        .harness
+        .fail_group_fetch(&group.id, true)
+        .await
+        .expect("fail group fetch");
+    let (mut core, _device) = world.link(&storage_with(&world, &group)).await;
+    let mut seen = core.progress_seen.clone();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !seen.iter().any(|p| p.groups_left == 1) {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) => {
+                assert!(!p.finished, "finished while the group still loads");
+                seen.push(p);
+            }
+            Some(_) => {}
+            None => panic!("no report of the group still loading: {seen:?}"),
+        }
+    }
+    world
+        .harness
+        .fail_group_fetch(&group.id, false)
+        .await
+        .expect("unfail group fetch");
+    let deadline = tokio::time::Instant::now() + 2 * WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) if p.finished => break,
+            Some(_) => {}
+            None => panic!("no finished report after the group was fetched"),
+        }
+    }
+    assert!(
+        world.upsert(&group).contains_key("title"),
+        "the group was fetched"
+    );
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Link feedback L3 (F3, F5): a start that finds a group still without its state reports it
+/// as the link's tail within a day of the link, and says nothing for an older account (a
+/// group the server never gives is no news every day: no banner, no question on quitting).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_reports_a_stranded_group_only_within_a_day_of_the_link() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let group = make_group(&world).await;
+    world
+        .harness
+        .fail_group_fetch(&group.id, true)
+        .await
+        .expect("fail group fetch");
+    let (core, _device) = world.link(&storage_with(&world, &group)).await;
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    // The link was cut off with the group still loading (the core has it).
+    world
+        .files
+        .execute("UPDATE groups SET features_hash = COALESCE(features_hash, 42)")
+        .expect("the core has the group");
+    assert_eq!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM groups WHERE state IS NULL")
+            .expect("groups"),
+        Some(1),
+        "the group waits for its state"
+    );
+
+    // Just linked: the start reports the group again.
+    let mut core =
+        FakeCore::start(&world.env, &world.files, StartMode::Resume, &world.sink).expect("start");
+    core.send(Command::Connect).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match core.next_ephemeral(left).await {
+            Some(BackendEvent::AccountProgress(p)) if p.groups_left == 1 => {
+                assert!(!p.finished);
+                break;
+            }
+            Some(_) => {}
+            None => panic!("a start within a day of the link did not report the group"),
+        }
+    }
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+
+    // A month later the same group is old news: nothing is reported, the refresh goes on.
+    world
+        .files
+        .execute("UPDATE account SET linked_at = linked_at - 2592000000")
+        .expect("an old account");
+    let mut core =
+        FakeCore::start(&world.env, &world.files, StartMode::Resume, &world.sink).expect("start");
+    core.send(Command::Connect).await;
+    core.wait_online().await;
+    while let Some(event) = core.next_ephemeral(Duration::from_secs(2)).await {
+        assert!(
+            !matches!(event, BackendEvent::AccountProgress(_)),
+            "an old account's stranded group was reported: {event:?}"
+        );
+    }
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
     world.harness.shutdown().await.expect("harness shutdown");
 }
 

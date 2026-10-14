@@ -15,6 +15,23 @@ namespace kourier {
 // luminance (0 … 255) of the image, or -1 when the object is not a window or saving fails.
 int grabWindowToFile(QObject* window, const QString& path);
 
+// How many images of `window` (a QQuickWindow) are loading: the items below its content item,
+// popups and the viewer included (they live in the overlay), that are a QQuickImageBase (Image,
+// AnimatedImage, BorderImage) with status Loading. -1 when the object is not a window.
+int imagesLoading(QObject* window);
+
+// How many visible images of `window` (a QQuickWindow) draw an attachment: a QQuickImageBase
+// whose source is `image://kourier/thumb/…` or `image://kourier/att/…`, whatever its status.
+// What `--screenshot` asks before it waits for the core's thumbnail derive: a window that shows
+// none has nothing the derive could change. -1 when the object is not a window.
+int attachmentPictures(QObject* window);
+
+// Grabs `window` and compares the grab with the previous call's (kept here, one per process):
+// equal -> saves it as a PNG at `path` and returns its mean luminance (as grabWindowToFile);
+// different or the first -> keeps it and returns -2; -1 when the object is not a window or
+// saving fails. `--screenshot` runs: two equal frames in a row are the picture that is final.
+int grabIfStable(QObject* window, const QString& path);
+
 // The plain text QTextDocument makes of `html`: what a read-only TextEdit displays, with line
 // separators as '\n' and non-breaking spaces as ' '.
 QString richTextPlain(const QString& html);

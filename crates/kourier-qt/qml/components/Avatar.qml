@@ -34,8 +34,8 @@ Item {
     // The corner radius of the shape: half the side (a circle), or the theme's own corner
     // radius when avatars are not round (never more than a circle).
     readonly property real cornerRadius: App.settings.roundAvatars ? root.side / 2 : Math.min(Kirigami.Units.cornerRadius, root.side / 2)
-    // The same in pixels of the picture's requested size (`sourceSize` below), which is
-    // `Screen.devicePixelRatio` times the item's size.
+    // The same in pixels of the size the provider is asked for: `sourceSize` below is the item's
+    // size in logical pixels, which Qt multiplies by `Screen.devicePixelRatio` itself.
     readonly property int pictureRadius: Math.ceil(root.cornerRadius * Screen.devicePixelRatio)
     // The picture asked for from the provider, with the shape in the request: a change of the
     // setting is a new request, so avatars already on screen are cut again at once.
@@ -108,8 +108,8 @@ Item {
         smooth: true
         mipmap: true
         fillMode: Image.PreserveAspectFit
-        sourceSize.width: Math.ceil(width * Screen.devicePixelRatio)
-        sourceSize.height: Math.ceil(height * Screen.devicePixelRatio)
+        sourceSize.width: Math.ceil(width)
+        sourceSize.height: Math.ceil(height)
     }
 
     // Note to self: a bookmark-like glyph on the accent color.

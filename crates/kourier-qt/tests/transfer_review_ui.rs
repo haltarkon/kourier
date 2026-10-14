@@ -18,12 +18,24 @@
 //!   open 200 ms after the first click); `double-instant`: animations switched off.
 //! - `late`: the same place, clicked again once the button acts: the account is replaced
 //!   (the delay does not make the button dead).
+//! - `wide-many`: the user's segfault of 2026-10-12 (`target/link-feedback/crash.md`). A
+//!   WIDE window (the accounts drawer is a rail), about 200 chats, Qt Quick's RHI scene
+//!   graph (null backend: no GPU) with the THREADED render loop, as on Plasma Wayland; the
+//!   only account is replaced. When `App.hasAccounts` turned false, the drawer flipped from
+//!   the rail to a modal drawer in the same moment its Repeater deleted the account's entry,
+//!   and Kirigami's GlobalDrawer read the size of a layout that still held the freed entry
+//!   (a use-after-free in Qt Quick Layouts). The drawer now follows `hasAccounts` a moment
+//!   later (`AccountsDrawer.accountsShown`). The process must live on for three seconds
+//!   after the account is gone; without the fix it dies by SIGSEGV. Run twice: before the
+//!   fix a debug build crashed every time.
+
+mod support;
 
 use std::process::{Command, ExitCode, Stdio};
 
 use cxx_qt_lib::{QByteArray, QQmlApplicationEngine, QUrl};
 use cxx_qt_lib_extras::QApplication;
-use kourier_app::{App, FixtureOptions, Launch, StartOptions};
+use kourier_app::{App, FixtureOptions, FixtureSecondLink, Launch, StartOptions};
 use kourier_qt::{UiContext, UiOptions};
 
 const SCRIPT: &str = r##"
@@ -36,7 +48,7 @@ import app.kourier
 MainWindow {
     id: win
 
-    width: 520
+    width: WINDOW_WIDTH
     height: WINDOW_HEIGHT
     visible: true
 
@@ -118,6 +130,28 @@ MainWindow {
         }
     }
 
+    // Every chat of the list as an object (as the crash probe had): more objects that go
+    // with the account, which is the timing the crash needed.
+    Instantiator {
+        id: convs
+        model: App.conversations
+        delegate: QtObject {
+            required property real conversationId
+            required property string previewIcon
+        }
+    }
+
+    // wide-many: the moment that crashed is the only account leaving (no account at all).
+    property bool noAccountSeen: false
+    Connections {
+        target: App
+        function onHasAccountsChanged(): void {
+            if (!App.hasAccounts && win.step !== "start") {
+                win.noAccountSeen = true;
+            }
+        }
+    }
+
     Connections {
         target: win.replaceDialog
         function onOpened(): void {
@@ -148,9 +182,39 @@ MainWindow {
         case "start":
             if (!win.started || !App.hasAccounts) return win.later("the fixture account");
             win.ev = Qt.createQmlObject("import QtTest\nTestEvent {}", win.contentItem, "transfer_review_events.qml");
+            if (win.mode === "wide-many") {
+                win.next("chat");
+                return;
+            }
             win.openSettings();
             win.next("settings");
             return;
+        // wide-many: a chat with pictures open and scrolled, as the user had.
+        case "chat": {
+            if (convs.count < 150) return win.later("about 200 chats");
+            let id = convs.objectAt(0).conversationId;
+            for (let i = 0; i < convs.count; ++i) {
+                if (convs.objectAt(i).previewIcon !== "") {
+                    id = convs.objectAt(i).conversationId;
+                    break;
+                }
+            }
+            win.openConversation(id);
+            win.next("chat-rows");
+            return;
+        }
+        case "chat-rows": {
+            if (!win.chatPage || win.chatPage.timeline.rowList.count < 5) return win.later("the chat's rows");
+            win.quiet += 1;
+            const list = win.chatPage.timeline.rowList;
+            if (win.quiet % 10 === 0 && win.quiet < 60) {
+                list.contentY = list.contentY - list.height * 3;
+            }
+            if (win.quiet < 70) return;
+            win.openSettings();
+            win.next("settings");
+            return;
+        }
         case "settings": {
             const row = win.row();
             if (!row || App.historyAccounts.length !== 1) return win.later("the row of the account");
@@ -167,9 +231,43 @@ MainWindow {
             if (!row || !row.visible) return win.later("the row");
             win.clickedAt = Date.now();
             win.click(row, row.width / 2, row.height / 2);
-            win.next(win.mode === "keys" ? "key" : "measure");
+            win.next(win.mode === "keys" ? "key" : win.mode === "wide-many" ? "confirm" : "measure");
             return;
         }
+
+        // ---- wide-many ----
+        case "confirm": {
+            if (!win.asking()) return win.later("the question");
+            if (!win.replaceDialog.armed) return win.later("the confirming button acts");
+            if (!win.globalDrawer.rail) return win.fail("the drawer is not a rail in a wide window: the case tests nothing");
+            const b = win.replaceDialog.confirmButton;
+            console.warn("review: " + convs.count + " chats, a chat open; confirming the replacement of the only account");
+            win.click(b, b.width / 2, b.height / 2);
+            win.next("gone");
+            return;
+        }
+        case "gone":
+            for (let i = 0; i < accounts.count; ++i) {
+                if (accounts.objectAt(i).accountId === win.firstAccount) return win.later("the account is removed");
+            }
+            win.next("alive");
+            return;
+        // The crash came within a second of the removal: live on for three.
+        case "alive":
+            win.quiet += 1;
+            if (win.quiet < 150) return;
+            if (!win.noAccountSeen) return win.fail("the window never had no account: the case tests nothing");
+            // The late flip (`AccountsDrawer.accountsShown`): the replacement waits at its QR
+            // code, so no account is shown, and 300 ms after the last one went the drawer
+            // is a modal one and disabled; the replacement's link page is the last page. A
+            // timer that never flips fails here, as the old flip in the same moment crashed.
+            if (App.hasAccounts) return win.fail("an account is shown while the replacement waits at its code");
+            if (!win.globalDrawer.modal) return win.fail("the drawer is still a rail with no account: it never followed hasAccounts");
+            if (win.globalDrawer.enabled) return win.fail("the drawer is still enabled with no account");
+            if (!win.linking()) return win.fail("the replacement's link page is not the last page");
+            console.warn("review: the window lived on for three seconds after the only account was removed");
+            Qt.exit(0);
+            return;
 
         // ---- keys ----
         case "key": {
@@ -297,19 +395,66 @@ MainWindow {
 /// The environment variable that names the case of a child process.
 const RUN: &str = "KOURIER_TRANSFER_REVIEW_CASE";
 
-/// The cases: name, window height, KDE's animation factor, the gap of the double click in
-/// milliseconds, and whether the case shows a defect (ignored unless asked for; none does
-/// today).
-const CASES: [(&str, u32, f32, u32, bool); 4] = [
-    ("keys", 760, 1.0, 0, false),
-    ("double", 440, 1.0, 250, false),
-    ("double-instant", 440, 0.0, 120, false),
-    ("late", 440, 1.0, 250, false),
+/// One case.
+struct Case {
+    name: &'static str,
+    width: u32,
+    height: u32,
+    /// KDE's animation factor.
+    animation: f32,
+    /// The gap of the double click in milliseconds.
+    gap: u32,
+    /// The case shows a defect (ignored unless asked for; none does today).
+    shows_defect: bool,
+    /// Qt Quick's RHI scene graph (null backend) with the threaded render loop, the way
+    /// a desktop renders, instead of the software scene graph and the basic loop that
+    /// `offscreen` picks by itself.
+    threaded: bool,
+    /// Generated contacts (each a chat) and groups of the fixture.
+    chats: (usize, usize),
+    /// Messages per chat.
+    messages: usize,
+    /// How many times the case runs.
+    runs: u32,
+}
+
+const fn case(name: &'static str, height: u32, animation: f32, gap: u32) -> Case {
+    Case {
+        name,
+        width: 520,
+        height,
+        animation,
+        gap,
+        shows_defect: false,
+        threaded: false,
+        chats: (12, 4),
+        messages: 6,
+        runs: 1,
+    }
+}
+
+/// Messages per chat of `wide-many` (`KOURIER_TRANSFER_REVIEW_MESSAGES` while working).
+const MANY_MESSAGES: usize = 120;
+
+/// The cases.
+const CASES: [Case; 5] = [
+    case("keys", 760, 1.0, 0),
+    case("double", 440, 1.0, 250),
+    case("double-instant", 440, 0.0, 120),
+    case("late", 440, 1.0, 250),
+    Case {
+        width: 1400,
+        threaded: true,
+        chats: (192, 8),
+        messages: MANY_MESSAGES,
+        runs: 2,
+        ..case("wide-many", 900, 1.0, 0)
+    },
 ];
 
 /// Runs one case in this process.
 fn run(case: &str) -> ExitCode {
-    let Some((_, height, _, gap, _)) = CASES.iter().find(|c| c.0 == case) else {
+    let Some(c) = CASES.iter().find(|c| c.name == case) else {
         eprintln!("FAIL: no case named {case}");
         return ExitCode::FAILURE;
     };
@@ -317,12 +462,21 @@ fn run(case: &str) -> ExitCode {
     let height = std::env::var("KOURIER_TRANSFER_REVIEW_HEIGHT")
         .ok()
         .and_then(|h| h.parse::<u32>().ok())
-        .unwrap_or(*height);
+        .unwrap_or(c.height);
     let app = App::start(StartOptions {
         launch: Launch::Fixture(FixtureOptions {
-            messages_per_conversation: 6,
+            messages_per_conversation: std::env::var("KOURIER_TRANSFER_REVIEW_MESSAGES")
+                .ok()
+                .and_then(|m| m.parse().ok())
+                .unwrap_or(c.messages),
+            contacts: c.chats.0,
+            groups: c.chats.1,
             // The fixture account offers "Transfer History from Phone…".
             history_on_link: true,
+            // The replacement of the only account waits at its QR code, as with the user's
+            // phone in his hand: no account is shown meanwhile (`wide-many` looks at the
+            // drawer then).
+            second_link: (case == "wide-many").then_some(FixtureSecondLink::AtQr),
             ..FixtureOptions::default()
         }),
         ..StartOptions::default()
@@ -339,8 +493,9 @@ fn run(case: &str) -> ExitCode {
     let mut qt = QApplication::new();
     let script = SCRIPT
         .replace("CASE", case)
+        .replace("WINDOW_WIDTH", &c.width.to_string())
         .replace("WINDOW_HEIGHT", &height.to_string())
-        .replace("DOUBLE_CLICK_GAP", &gap.to_string());
+        .replace("DOUBLE_CLICK_GAP", &c.gap.to_string());
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
         kourier_qt::install_image_provider(engine.as_mut());
@@ -361,6 +516,7 @@ fn run(case: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    support::answer_list("transfer_review_ui");
     if let Ok(case) = std::env::var(RUN) {
         return run(&case);
     }
@@ -370,64 +526,87 @@ fn main() -> ExitCode {
         .join(format!("transfer-review-ui-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (mut passed, mut failed, mut ignored) = (0, 0, 0);
-    for (case, _, animation, _, shows_defect) in CASES {
-        if shows_defect && !all {
+    // `KOURIER_TRANSFER_REVIEW_ONLY=a,b` runs only those cases (while working on one).
+    let only = std::env::var("KOURIER_TRANSFER_REVIEW_ONLY").ok();
+    for c in &CASES {
+        let case = c.name;
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|n| n == case))
+        {
+            continue;
+        }
+        if c.shows_defect && !all {
             println!(
                 "test the question in the app's style: {case} ... ignored, review: a double click on the settings row can press \"Remove and Link Again\""
             );
             ignored += 1;
             continue;
         }
-        // A private configuration, data, cache and state directory: nothing of the
-        // session's own is read or written.
-        let home = base.join(case);
-        for dir in ["config", "data", "cache", "state"] {
-            std::fs::create_dir_all(home.join(dir)).expect("a private directory");
-        }
-        std::fs::write(
-            home.join("config/kdeglobals"),
-            format!("[KDE]\nAnimationDurationFactor={animation}\n"),
-        )
-        .expect("kdeglobals");
-        let out = Command::new(&exe)
-            .env(RUN, case)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("XDG_STATE_HOME", home.join("state"))
-            // Never on the user's desktop, and in the style of the desktop.
-            .env("QT_QPA_PLATFORM", "offscreen")
-            .env("QT_QPA_PLATFORMTHEME", "kde")
-            .env("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
-            .env("QT_SCALE_FACTOR", "1")
-            .env("QT_FORCE_STDERR_LOGGING", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("run a case");
-        let said = String::from_utf8_lossy(&out.stderr);
-        for line in said
-            .lines()
-            .filter(|l| l.contains("review:") || l.contains("FAIL"))
-        {
-            println!("    {line}");
-        }
-        if out.status.success() {
-            println!("test the question in the app's style: {case} ... ok");
-            passed += 1;
-        } else {
-            println!(
-                "test the question in the app's style: {case} ... FAILED ({})",
-                out.status
-            );
-            if !said.contains("FAIL") {
-                let lines: Vec<&str> = said.lines().collect();
-                for line in &lines[lines.len().saturating_sub(15)..] {
-                    println!("    {line}");
-                }
+        for run in 0..c.runs {
+            // A private configuration, data, cache and state directory: nothing of the
+            // session's own is read or written.
+            let home = base.join(format!("{case}-{run}"));
+            for dir in ["config", "data", "cache", "state"] {
+                std::fs::create_dir_all(home.join(dir)).expect("a private directory");
             }
-            failed += 1;
+            std::fs::write(
+                home.join("config/kdeglobals"),
+                format!("[KDE]\nAnimationDurationFactor={}\n", c.animation),
+            )
+            .expect("kdeglobals");
+            let mut cmd = Command::new(&exe);
+            cmd.env(RUN, case)
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("XDG_STATE_HOME", home.join("state"))
+                // Never on the user's desktop, and in the style of the desktop.
+                .env("QT_QPA_PLATFORM", "offscreen")
+                .env("QT_QPA_PLATFORMTHEME", "kde")
+                .env("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
+                .env("QT_SCALE_FACTOR", "1")
+                .env("QT_FORCE_STDERR_LOGGING", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for var in ["QT_QUICK_BACKEND", "QSG_RHI_BACKEND", "QSG_RENDER_LOOP"] {
+                cmd.env_remove(var);
+            }
+            if c.threaded {
+                cmd.env("QT_QUICK_BACKEND", "rhi")
+                    .env("QSG_RHI_BACKEND", "null")
+                    .env("QSG_RENDER_LOOP", "threaded");
+            }
+            let out = cmd.output().expect("run a case");
+            let label = if c.runs > 1 {
+                format!("{case} (run {})", run + 1)
+            } else {
+                case.to_owned()
+            };
+            let said = String::from_utf8_lossy(&out.stderr);
+            for line in said
+                .lines()
+                .filter(|l| l.contains("review:") || l.contains("FAIL"))
+            {
+                println!("    {line}");
+            }
+            if out.status.success() {
+                println!("test the question in the app's style: {label} ... ok");
+                passed += 1;
+            } else {
+                println!(
+                    "test the question in the app's style: {label} ... FAILED ({})",
+                    out.status
+                );
+                if !said.contains("FAIL") {
+                    let lines: Vec<&str> = said.lines().collect();
+                    for line in &lines[lines.len().saturating_sub(15)..] {
+                        println!("    {line}");
+                    }
+                }
+                failed += 1;
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&base);

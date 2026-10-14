@@ -26,6 +26,10 @@ on it for anything you cannot afford to lose or leak.
   accounts side by side.
 - Contacts, groups and chat state (archived, pinned, muted, blocked) are read from your account.
   Kourier does not write them back: change those on the phone.
+- A new link offers to bring the message history from the phone, as Signal Desktop does: the phone
+  asks whether to transfer it, and you can decline there. Chats and texts come over; imported
+  attachments are downloaded on a click while Signal's servers still have them, and asked from
+  the phone after that.
 - Send and receive text in 1:1 chats and in groups, with delivery and read receipts and typing
   indicators.
 - Replies with quotes, reactions, edits (with their history), delete for everyone and delete for
@@ -45,8 +49,7 @@ on it for anything you cannot afford to lose or leak.
 - Not a way to register with Signal: Kourier cannot create an account or a primary device, you
   need the Signal app on a phone.
 - Not feature-complete: no calls, no stories, no payments, no group management (creating groups,
-  inviting, admin actions), no profile editing, no message history transfer from the phone, no
-  link previews.
+  inviting, admin actions), no profile editing, no link previews.
 - Not a multi-protocol messenger yet. The core is written so that other networks can be added
   as backends (Threema and WhatsApp are planned); only the Signal backend exists.
 - Not packaged. There is no Flatpak, distribution package or installer yet.

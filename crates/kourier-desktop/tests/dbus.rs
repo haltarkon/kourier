@@ -354,7 +354,26 @@ async fn tray(bus: &PrivateBus) -> TestResult {
     Ok(())
 }
 
+/// The one test this binary is, for cargo-nextest: it lists a binary with `--list` and runs a
+/// test as `--exact <name> --nocapture`, which a `harness = false` binary does not know.
+const LISTED_AS: &str = "dbus";
+
+/// Answers `--list` (nextest's listing) with [`LISTED_AS`] and exits; any other arguments
+/// return and `main` runs every case.
+fn answer_list() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.iter().any(|a| a == "--list") {
+        return;
+    }
+    // `--ignored` asks for the ignored tests only; this binary has none.
+    if !args.iter().any(|a| a == "--ignored") {
+        println!("{LISTED_AS}: test");
+    }
+    std::process::exit(0);
+}
+
 fn main() {
+    answer_list();
     let bus = match PrivateBus::start() {
         Ok(b) => b,
         Err(e) => {
@@ -378,7 +397,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+    // A name by hand narrows the run to the cases it is part of; nextest names the whole
+    // binary ([`LISTED_AS`]), which narrows nothing.
+    let filter: Option<String> = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-') && a != LISTED_AS);
     let tests: [(&str, TestFn); 4] = [
         ("notifications", |b| Box::pin(notifications(b))),
         ("notifications_plain_server", |b| Box::pin(plain_server(b))),

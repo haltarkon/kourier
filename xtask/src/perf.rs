@@ -49,13 +49,14 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use super::{cargo, qml_problems, root, run, target_dir, theme_home};
 
 const USAGE: &str = "usage: cargo xtask perf [--out <file>] [--quick] [--start] [--report-only] \
-[--idle <seconds>] [--runs <n>] [--no-mock] [--no-build] [--keep-profile]
+[--idle <seconds>] [--runs <n>] [--scale <factor>] [--no-mock] [--no-build] [--keep-profile]
 
   --out <file>     write the report there too (default: target/perf/report.md; a --start
                    run: target/perf/report-start.md)
@@ -73,6 +74,9 @@ const USAGE: &str = "usage: cargo xtask perf [--out <file>] [--quick] [--start] 
                    below 300 the idle CPU lines are for information: their budgets are
                    per 5 min, so --quick does not judge them); not with --start
   --runs <n>       starts measured (default 10)
+  --scale <x>      the display scale of every app start (QT_SCALE_FACTOR; default 1, 0.5 to 4):
+                   --scale 1.25 is the user's 125 % display, where tall pictures are drawn from
+                   the file (P1); the report says which scale it measured
   --no-mock        skip the catch-up test on the Signal mock server
   --no-build       measure the binaries as they are in target/
   --keep-profile   reuse target/perf/profile even when the code that fills it changed
@@ -161,6 +165,8 @@ pub struct Options {
     pub build: bool,
     /// Reuse the profile even when the code that fills it changed.
     pub keep_profile: bool,
+    /// The display scale of every app start (`QT_SCALE_FACTOR`), as the user wrote it.
+    pub scale: String,
 }
 
 impl Options {
@@ -187,6 +193,7 @@ pub fn parse_options(args: &[String]) -> Result<Options> {
         mock: true,
         build: true,
         keep_profile: false,
+        scale: "1".to_owned(),
     };
     let mut idle = None;
     let mut runs = None;
@@ -205,6 +212,14 @@ pub fn parse_options(args: &[String]) -> Result<Options> {
             "--no-mock" => o.mock = false,
             "--no-build" => o.build = false,
             "--keep-profile" => o.keep_profile = true,
+            "--scale" => {
+                let v = value("--scale")?;
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|x| (0.5..=4.0).contains(x))
+                    .with_context(|| format!("bad --scale {v:?} (0.5 to 4)"))?;
+                o.scale = v;
+            }
             "--idle" => {
                 let v = value("--idle")?;
                 idle = Some(
@@ -2142,10 +2157,24 @@ fn no_bus() -> String {
     format!("unix:path={}", perf_dir().join("env/no-such-bus").display())
 }
 
+/// The display scale of the run (`--scale`), set once by [`run_perf`]'s caller before any child
+/// starts.
+static DISPLAY_SCALE: OnceLock<String> = OnceLock::new();
+
+/// `QT_SCALE_FACTOR` of every child: the run's `--scale`, 1 without it.
+fn display_scale() -> &'static str {
+    DISPLAY_SCALE.get().map_or("1", String::as_str)
+}
+
 /// Gives a child directories of its own below `target/perf/env` (configuration with the
 /// Breeze light scheme, cache, data, state) and names its session bus: no run reads or
 /// changes anything of the user's, and the start that is not counted fills the caches.
-fn private_env(cmd: &mut Command, config_home: &Path, session_bus: &str) -> Result<()> {
+fn private_env(
+    cmd: &mut Command,
+    config_home: &Path,
+    session_bus: &str,
+    scale: &str,
+) -> Result<()> {
     for (var, name) in [
         ("XDG_CACHE_HOME", "cache"),
         ("XDG_DATA_HOME", "data"),
@@ -2165,7 +2194,7 @@ fn private_env(cmd: &mut Command, config_home: &Path, session_bus: &str) -> Resu
         .env("QT_QUICK_BACKEND", "software")
         .env("QT_QPA_PLATFORMTHEME", "kde")
         .env("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
-        .env("QT_SCALE_FACTOR", "1")
+        .env("QT_SCALE_FACTOR", scale)
         .env("QT_FORCE_STDERR_LOGGING", "1")
         .env("LANG", "en_US.UTF-8")
         .env("LANGUAGE", "en");
@@ -2207,7 +2236,7 @@ fn tray_on(profile: &Path) -> Result<()> {
 /// desktop services on the private bus `bus`, traces on.
 fn app_command(bin: &Path, config_home: &Path, bus: &str) -> Result<Command> {
     let mut cmd = Command::new(bin);
-    private_env(&mut cmd, config_home, bus)?;
+    private_env(&mut cmd, config_home, bus, display_scale())?;
     cmd.env("KOURIER_TRACE_STARTUP", "1")
         .env("KOURIER_LOG", "warn")
         // Desktop services on, but only on the private bus: no real notification, no icon in
@@ -2974,7 +3003,7 @@ fn ensure_profile(
     remove_dir(profile)?;
     let mut cmd = Command::new(bin);
     // (The seeding ends before Qt starts and uses no bus.)
-    private_env(&mut cmd, config_home, &no_bus())?;
+    private_env(&mut cmd, config_home, &no_bus(), display_scale())?;
     let out = cmd
         .arg(format!("--perf-profile={}", profile.display()))
         .arg("--perf-seed")
@@ -3002,7 +3031,7 @@ fn ensure_profile(
 /// fixture, offscreen, and tries to read its `smaps_rollup`.
 fn release_non_dumpable(bin: &Path, config_home: &Path) -> Result<bool> {
     let mut cmd = Command::new(bin);
-    private_env(&mut cmd, config_home, &no_bus())?;
+    private_env(&mut cmd, config_home, &no_bus(), display_scale())?;
     let mut child = cmd
         .args(["--fixture", "--page=list", &format!("--size={WINDOW}")])
         .env("KOURIER_DESKTOP", "0")
@@ -3228,7 +3257,7 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
         }
     }
 
-    let config_home = theme_home(&dir.join("env"), "light", "BreezeLight", "breeze")?;
+    let config_home = theme_home(&dir.join("env"), "light", "BreezeLight", "breeze", false)?;
     let mut m = Measured::default();
     if plain_binary {
         m.binary_bytes = Some(std::fs::metadata(&plain)?.len());
@@ -3267,7 +3296,7 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
         } else {
             ""
         }
-    );
+    ) + &scale_note(&opts.scale);
     let cold_runs = if opts.quick || opts.start {
         1
     } else {
@@ -3342,6 +3371,15 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
     Ok(status)
 }
 
+/// The sentence of the report that names a display scale other than 1.
+fn scale_note(scale: &str) -> String {
+    if scale.parse::<f64>().is_ok_and(|x| (x - 1.0).abs() < 1e-9) {
+        String::new()
+    } else {
+        format!(" Display scale {scale} (`QT_SCALE_FACTOR={scale}`, `--scale`).")
+    }
+}
+
 fn date() -> String {
     Command::new("date")
         .arg("+%Y-%m-%d %H:%M")
@@ -3404,6 +3442,42 @@ mod tests {
         ] {
             assert!(parse_options(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_display_scale_is_an_option_and_reaches_the_children() {
+        // (F8, 2026-10-14: the run measured scale 1 only, where no picture comes from its file.)
+        assert_eq!(parse_options(&args(&[])).unwrap().scale, "1");
+        assert_eq!(
+            parse_options(&args(&["--quick", "--scale", "1.25"]))
+                .unwrap()
+                .scale,
+            "1.25"
+        );
+        for bad in [
+            &["--scale"][..],
+            &["--scale", "0"],
+            &["--scale", "x"],
+            &["--scale", "9"],
+        ] {
+            assert!(parse_options(&args(bad)).is_err(), "{bad:?}");
+        }
+        let home =
+            std::env::temp_dir().join(format!("xtask-perf-scale-{}/config", std::process::id()));
+        for scale in ["1", "1.25"] {
+            let mut cmd = Command::new("true");
+            private_env(&mut cmd, &home, "unix:path=/nonexistent", scale).unwrap();
+            let got = cmd
+                .get_envs()
+                .find(|(k, _)| *k == "QT_SCALE_FACTOR")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            assert_eq!(got.as_deref(), Some(scale));
+        }
+        let _ = std::fs::remove_dir_all(home.parent().unwrap());
+        // The report says so only when the scale is not 1.
+        assert_eq!(scale_note("1"), "");
+        assert_eq!(scale_note("1.0"), "");
+        assert!(scale_note("1.25").contains("Display scale 1.25"));
     }
 
     #[test]

@@ -25,20 +25,26 @@ import app.kourier
 // software renderer a button that repaints over a Kirigami dialog leaves a sliver of the
 // page behind it.)
 //
+// The same dialog asks before "Remove Account…" and "Unlink…" of an account (link feedback
+// L4): then the question carries its `action` ("remove", "unlink") and the answer goes to
+// `App.confirmAccountAction` / `App.cancelAccountAction`.
+//
 // The footer is the dialog's own: two buttons side by side at the trailing edge, as KDE's
 // dialogs have them, and one above the other when the dialog is too narrow for both (a
 // long translation, a large font, a narrow window).
 Kirigami.PromptDialog {
     id: root
 
-    // What to ask (`App.replaceAsked`): `account`, `title`, `about`, `paragraphs`,
-    // `confirm`, `cancel`.
+    // What to ask (`App.replaceAsked`, `App.accountActionAsked`): `account`, `title`,
+    // `about`, `paragraphs`, `confirm`, `cancel`, and for an account action its `action`.
     property var question: ({})
     // The question was confirmed: a second activation does nothing.
     property bool answered: false
     // The question has been open long enough to have been seen: the confirming button
     // acts. Longer than a double click, however slowly the user has set that up.
     property bool armed: false
+    // "remove" or "unlink" for an account action; empty for "Remove and Link Again?".
+    readonly property string action: root.question.action ?? ""
     readonly property int armDelay: Math.max(1000, 2 * Application.styleHints.mouseDoubleClickInterval)
 
     // The two buttons (tests press them).
@@ -52,7 +58,11 @@ Kirigami.PromptDialog {
             return;
         }
         root.answered = true;
-        App.confirmReplace(root.question.account ?? 0);
+        if (root.action === "") {
+            App.confirmReplace(root.question.account ?? 0);
+        } else {
+            App.confirmAccountAction(root.question.account ?? 0, root.action);
+        }
         root.close();
     }
 
@@ -92,8 +102,8 @@ Kirigami.PromptDialog {
             QQC2.Button {
                 id: removeButton
                 text: root.question.confirm ?? ""
-                // The icon of an action that removes something.
-                icon.name: "edit-delete"
+                // The icon of an action that removes something; unlinking keeps the chats.
+                icon.name: root.action === "unlink" ? "network-disconnect" : "edit-delete"
                 Accessible.name: removeButton.text
                 Layout.fillWidth: footerBar.stacked
                 onClicked: root.confirm()
@@ -123,7 +133,11 @@ Kirigami.PromptDialog {
     }
     onClosed: {
         if (!root.answered) {
-            App.cancelReplace();
+            if (root.action === "") {
+                App.cancelReplace();
+            } else {
+                App.cancelAccountAction();
+            }
         }
         root.destroy();
     }

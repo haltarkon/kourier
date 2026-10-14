@@ -1,7 +1,7 @@
 //! The auto-download policy (§5.8): images, stickers, voice notes and files up to 25 MiB by
 //! default, videos and bigger files on click, never above the network's receive limit.
 
-use kourier_model::{AttachmentKind, AttachmentState, AutoDownloadPolicy};
+use kourier_model::{AskFailure, AttachmentKind, AttachmentState, AutoDownloadPolicy};
 
 /// Largest image, sticker, voice note or video fetched without a click (files follow
 /// [`AutoDownloadPolicy::files_max_bytes`]).
@@ -57,7 +57,10 @@ pub(crate) fn decide(
     if receive_limit.is_some_and(|limit| c.size > limit) {
         return Decision::TooLarge;
     }
-    if c.history || c.untrusted {
+    // Imported history waits for a click, all but the rest of a long text (user decision,
+    // 2026-10-10: "fetch automatically"): a backend gives an imported long text a pointer only
+    // while the server may still have it, and without it the message stays cut off.
+    if (c.history && !c.long_text) || c.untrusted {
         return Decision::OnClick;
     }
     let media = |enabled: bool| enabled && c.size <= AUTO_MEDIA_MAX_BYTES;
@@ -82,25 +85,64 @@ pub(crate) fn decide(
     }
 }
 
-/// Whether the user may (re)start a download of an attachment in `state` of `size` bytes.
+/// What a click on an attachment does ([`may_click`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Click {
+    /// Download it from its pointer.
+    Download,
+    /// The network no longer has it: ask the account's other device to upload it again
+    /// (Signal's attachment backfill). Also a click on an attachment being asked for already
+    /// (it joins the open request).
+    Ask,
+}
+
+/// What a click on an attachment in `state` of `size` bytes does, or why it does nothing.
+/// `can_ask` says whether the account's other device can be asked for this attachment (the
+/// account is linked, its network can ask, the message can be named, it is not view-once,
+/// it is a file and not the rest of a long text).
+///
+/// The size comes first: neither a download nor the other device can bring a file above the
+/// network's receive limit. The gone states come before the pointer: an `Unavailable`
+/// attachment has none, an `Expired` one a dead one.
 pub(crate) fn may_click(
     state: AttachmentState,
     has_remote: bool,
     size: u64,
     receive_limit: Option<u64>,
-) -> Result<(), &'static str> {
-    if !has_remote {
-        return Err("the attachment has no network pointer");
-    }
+    can_ask: bool,
+) -> Result<Click, &'static str> {
     if receive_limit.is_some_and(|limit| size > limit) {
         return Err("the attachment is larger than the network allows");
     }
+    let ask = || {
+        if can_ask {
+            Ok(Click::Ask)
+        } else {
+            Err("the attachment is not available on this device")
+        }
+    };
     match state {
-        AttachmentState::Remote | AttachmentState::Failed { .. } => Ok(()),
+        AttachmentState::Remote | AttachmentState::Failed { .. } if has_remote => {
+            Ok(Click::Download)
+        }
+        AttachmentState::Remote | AttachmentState::Failed { .. } => {
+            Err("the attachment has no network pointer")
+        }
         AttachmentState::Downloading { .. } | AttachmentState::Local => {
             Err("the attachment is downloading or downloaded")
         }
-        AttachmentState::Expired => Err("the network no longer has the attachment"),
+        AttachmentState::Expired
+        | AttachmentState::Unavailable
+        | AttachmentState::Asking
+        | AttachmentState::AskFailed {
+            why: AskFailure::NoAnswer,
+        } => ask(),
+        AttachmentState::AskFailed {
+            why: AskFailure::NoMessage,
+        } => Err("the account's other device no longer has the message"),
+        AttachmentState::AskFailed {
+            why: AskFailure::NoFile,
+        } => Err("the account's other device does not have the attachment"),
     }
 }
 
@@ -204,8 +246,20 @@ mod tests {
             ..big
         };
         assert_eq!(decide(&old, &prefs, limit), Decision::TooLarge);
-        assert!(may_click(AttachmentState::Remote, true, 10 * MIB + 1, limit).is_err());
-        assert!(may_click(AttachmentState::Remote, true, 10 * MIB, limit).is_ok());
+        assert!(may_click(AttachmentState::Remote, true, 10 * MIB + 1, limit, true).is_err());
+        assert!(may_click(AttachmentState::Remote, true, 10 * MIB, limit, true).is_ok());
+        // The other device cannot bring a file above the limit either.
+        assert!(
+            may_click(
+                AttachmentState::Unavailable,
+                false,
+                10 * MIB + 1,
+                limit,
+                true
+            )
+            .is_err()
+        );
+        assert!(may_click(AttachmentState::Expired, true, 10 * MIB + 1, limit, true).is_err());
     }
 
     #[test]
@@ -238,16 +292,83 @@ mod tests {
     }
 
     #[test]
-    fn clicks_restart_remote_and_failed_only() {
-        assert!(may_click(AttachmentState::Remote, true, 1, None).is_ok());
-        assert!(may_click(AttachmentState::Failed { retryable: false }, true, 1, None).is_ok());
+    fn clicks_download_remote_and_failed() {
+        let click = |s, remote| may_click(s, remote, 1, None, true);
+        assert_eq!(click(AttachmentState::Remote, true), Ok(Click::Download));
+        let failed = AttachmentState::Failed { retryable: false };
+        assert_eq!(click(failed, true), Ok(Click::Download));
         for s in [
             AttachmentState::Local,
-            AttachmentState::Expired,
             AttachmentState::Downloading { done: 0, total: 1 },
         ] {
-            assert!(may_click(s, true, 1, None).is_err(), "{s:?}");
+            assert!(click(s, true).is_err(), "{s:?}");
         }
-        assert!(may_click(AttachmentState::Remote, false, 1, None).is_err());
+        assert!(click(AttachmentState::Remote, false).is_err());
+        assert!(click(failed, false).is_err());
+    }
+
+    /// S6: a file the network lost (`Unavailable`: no pointer, `Expired`: a dead one) asks
+    /// the other device, also after it did not answer; never after it said it has neither the
+    /// message nor the file, and never where it cannot be asked.
+    #[test]
+    fn clicks_on_gone_files_ask_the_other_device() {
+        let no_answer = AttachmentState::AskFailed {
+            why: AskFailure::NoAnswer,
+        };
+        for (s, remote) in [
+            (AttachmentState::Unavailable, false),
+            (AttachmentState::Expired, true),
+            (AttachmentState::Expired, false),
+            (AttachmentState::Asking, false),
+            (no_answer, false),
+            (no_answer, true),
+        ] {
+            assert_eq!(may_click(s, remote, 1, None, true), Ok(Click::Ask), "{s:?}");
+            assert!(may_click(s, remote, 1, None, false).is_err(), "{s:?}");
+        }
+        for why in [AskFailure::NoMessage, AskFailure::NoFile] {
+            let s = AttachmentState::AskFailed { why };
+            assert!(may_click(s, false, 1, None, true).is_err(), "{s:?}");
+            assert!(may_click(s, true, 1, None, true).is_err(), "{s:?}");
+        }
+    }
+
+    /// The one exception to "history waits for a click": the rest of an imported long text
+    /// (user decision, 2026-10-10), while it has a pointer and the size of a text; never in a
+    /// chat that is a request or blocked, and never anything else of the history.
+    #[test]
+    fn the_rest_of_an_imported_long_text_is_fetched_by_itself() {
+        let text = Candidate {
+            long_text: true,
+            history: true,
+            ..c(AttachmentKind::File, 3000)
+        };
+        assert_eq!(d(&text), Decision::Auto);
+        for cand in [
+            Candidate {
+                untrusted: true,
+                ..text
+            },
+            Candidate {
+                has_remote: false,
+                state: AttachmentState::Unavailable,
+                ..text
+            },
+            Candidate {
+                size: MAX_LONG_TEXT_BYTES + 1,
+                ..text
+            },
+            Candidate {
+                long_text: false,
+                ..text
+            },
+            Candidate {
+                long_text: false,
+                sticker: true,
+                ..text
+            },
+        ] {
+            assert_eq!(d(&cand), Decision::OnClick, "{cand:?}");
+        }
     }
 }

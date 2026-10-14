@@ -11,7 +11,17 @@
 //! shows the phone's unread count because its rows say so; reading it here clears the
 //! count for good, also while the rest of the chat is still delivered and when every row
 //! is delivered a second time; a read sync of the phone lowers it; reading an imported
-//! chat tells our other devices and never the sender of an imported message.
+//! chat tells our other devices and never the sender of an imported message. The content
+//! of 1:1 chats (step S3b): every kind the mapper maps arrives as its row (formatting,
+//! quotes, reactions, edits, a sticker, placeholders, notices, call lines), and a reaction
+//! the phone sends later for an imported edited message's newest version lands on it. What
+//! roams for direct chats and Note to Self (step S4a): the list shows the phone's pins in its
+//! order (a pinned chat with no message among them), the archived chat on the archive's page,
+//! the mute (for ever, or over), the marked unread dot and the blocked chat; a live message
+//! into a chat muted for ever is silent, and one into a chat whose mute is over is announced;
+//! a message sent into an imported chat carries the archive's timer and its version. A chat
+//! deleted while its history is still delivered stays deleted and the delivery goes on to its
+//! end (link feedback L5).
 //!
 //! The kills, the bounds and the cursor are tested against the mock in
 //! `kourier-signal/tests/history_import.rs`. One measurement, not a test:
@@ -36,7 +46,7 @@ use kourier_signal::archive_testing::{
     ChatSpec, ChatWith, ContactSpec, GeneratedSpec, HistorySpec, SendStatusSpec, TextSpec,
     generated_aci, write_history_archive,
 };
-use support::harness::{DeviceInfo, SendText};
+use support::harness::{DeviceInfo, Primary, SendText};
 use support::{App, WAIT, World, user};
 
 /// A person of the archive nobody on the mock server is: the generated contact of this
@@ -50,7 +60,7 @@ const EVE_NUMBER: u64 = 15_550_100_044;
 const QUIET: Duration = Duration::from_millis(1500);
 
 fn network() -> SignalNetwork {
-    // The app keeps the offer of the transfer off until it is switched on; here it is on.
+    // The library's default is no offer (the app turns it on); a test of the import does.
     SignalNetwork::new()
         .with_history_transfer_offer(true)
         .with_history_transfer_wait(Duration::from_secs(120), Duration::from_secs(1))
@@ -305,6 +315,7 @@ async fn a_linked_account_shows_the_archives_chats_after_the_transfer() {
                     },
                     incoming(queued_text, queued_at, false),
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
@@ -318,14 +329,17 @@ async fn a_linked_account_shows_the_archives_chats_after_the_transfer() {
                     incoming("b1", base + 10, false),
                     incoming("b2", base + 11, false),
                 ],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(2),
                 texts: vec![incoming("e1", base + 5, true)],
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::NoteToSelf,
                 texts: vec![outgoing("note", base + 3, &[])],
+                ..ChatSpec::default()
             },
         ],
         interleaved: true,
@@ -513,6 +527,7 @@ async fn an_archive_that_fails_leaves_the_account_without_chats() {
             texts: (0..200)
                 .map(|i| incoming(&format!("b{i}"), base + i, true))
                 .collect(),
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     };
@@ -566,6 +581,7 @@ async fn the_re_read_after_a_lost_stage_doubles_nothing() {
                 incoming("b1", base + 1, false),
                 incoming("b2", base + 2, false),
             ],
+            ..ChatSpec::default()
         }],
         generated: Some(GeneratedSpec {
             chats,
@@ -777,6 +793,7 @@ async fn review_a_rebuilt_core_db_gets_the_whole_import() {
                 incoming("b1", base + 1, false),
                 incoming("b2", base + 2, false),
             ],
+            ..ChatSpec::default()
         }],
         generated: Some(GeneratedSpec {
             chats,
@@ -881,6 +898,7 @@ async fn the_end_of_a_chat_is_heard_when_its_last_row_is_due() {
                     ..incoming("b3, long gone", base + 3, true)
                 },
             ],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     };
@@ -983,6 +1001,7 @@ async fn the_unread_count_of_an_imported_chat_is_its_unread_rows() {
             ChatSpec {
                 with: ChatWith::Contact(0),
                 texts: bob_texts,
+                ..ChatSpec::default()
             },
             ChatSpec {
                 with: ChatWith::Contact(1),
@@ -993,6 +1012,7 @@ async fn the_unread_count_of_an_imported_chat_is_its_unread_rows() {
                     incoming("c unread 2", carol_at + 3, false),
                     incoming("c unread 3", carol_at + 4, false),
                 ],
+                ..ChatSpec::default()
             },
         ],
         ..HistorySpec::default()
@@ -1134,6 +1154,7 @@ async fn reading_an_imported_chat_tells_our_devices_and_not_the_sender() {
                 outgoing("mine", base + 3, &[SendStatusSpec::Read]),
                 incoming("not seen either", unread_at[1], false),
             ],
+            ..ChatSpec::default()
         }],
         ..HistorySpec::default()
     };
@@ -1230,6 +1251,1596 @@ async fn reading_an_imported_chat_tells_our_devices_and_not_the_sender() {
     }
     // (The live message may be announced: only the import must not be.)
     app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// What a row of the timeline is, as one line of a dump: its kind and the parts of it the
+/// mapper decides (never a text of the user's: these are the test's own).
+fn dump(row: &kourier_core::facade::MessageRow) -> String {
+    use kourier_model::SystemEvent;
+    let kind = match &row.body {
+        Body::Text(text) => format!("text {:?} ranges {}", text.body, text.ranges.len()),
+        Body::Sticker(image) => format!("sticker {:?}", image.state),
+        Body::Unsupported { kind_hint, .. } => format!("placeholder {kind_hint}"),
+        Body::System(SystemEvent::Call(line)) => {
+            format!("call {:?} {:?}", line.direction, line.state)
+        }
+        Body::System(SystemEvent::TimerChanged { timer, .. }) => format!("timer {timer:?}"),
+        Body::System(SystemEvent::IdentityKeyChanged { .. }) => "safety number".to_owned(),
+        other => format!("{other:?}"),
+    };
+    let reply = row
+        .reply
+        .as_ref()
+        .map(|reply| format!(" reply {:?}", reply.state))
+        .unwrap_or_default();
+    let reactions: Vec<String> = row
+        .reactions
+        .iter()
+        .map(|group| format!("{}x{}", group.emoji, group.users.len()))
+        .collect();
+    format!(
+        "{kind}{reply} reactions {reactions:?} edited {} read {:?}",
+        row.revision > 0,
+        row.read_state
+    )
+}
+
+/// Step S3b with the real core: every content kind of a 1:1 chat that the mapper maps
+/// arrives as the row the spec says (formatting and a mention of us, a quote that was found
+/// and one that was not, reactions, an edited message, a sticker (young: a download on a
+/// click), the placeholders, the notices, the call lines and their timers), the chat counts the unread
+/// message and the unread missed call, and a chat of quiet notices only is not listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rich_archive_becomes_these_chats() {
+    use kourier_model::SystemEvent;
+    use kourier_signal::archive_testing::{
+        CallSpec, IndividualCallSpec, ItemSpec, NoticeSpec, QuoteSpec, RangeKindSpec, RangeSpec,
+        ReactionSpec, SimpleSpec, Who,
+    };
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let test_began = i64::try_from(now_ms()).expect("ms");
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let base = now_ms() - 3_600_000;
+    let own_aci = device.aci.parse().expect("own ACI");
+    let range = |start, length, kind| RangeSpec {
+        start,
+        length,
+        kind,
+    };
+    let of_kind = |kind: ItemSpec, sent_at: u64, outgoing: bool| TextSpec {
+        kind,
+        outgoing,
+        statuses: if outgoing {
+            vec![SendStatusSpec::Delivered]
+        } else {
+            Vec::new()
+        },
+        ..incoming("", sent_at, true)
+    };
+    let notice =
+        |notice: NoticeSpec, sent_at: u64| of_kind(ItemSpec::Notice(notice), sent_at, false);
+    let call = |state, outgoing, sent_at: u64| {
+        of_kind(
+            ItemSpec::Call(CallSpec::Individual {
+                call_id: Some(sent_at),
+                video: false,
+                outgoing,
+                state,
+                read: false,
+                started_at: sent_at,
+            }),
+            sent_at,
+            false,
+        )
+    };
+    let alice_items = vec![
+        TextSpec {
+            ranges: vec![
+                range(0, 1, RangeKindSpec::Mention(own_aci)),
+                range(2, 4, RangeKindSpec::Bold),
+            ],
+            ..incoming("\u{fffc} look here", base + 1, false)
+        },
+        TextSpec {
+            quote: Some(QuoteSpec {
+                target: Some(base + 1),
+                author: Some(Who::Peer),
+                text: "\u{fffc} look here".to_owned(),
+                ..QuoteSpec::default()
+            }),
+            ..outgoing("the reply", base + 2, &[SendStatusSpec::Read])
+        },
+        TextSpec {
+            quote: Some(QuoteSpec {
+                target: None,
+                author: Some(Who::Own),
+                text: "gone".to_owned(),
+                ..QuoteSpec::default()
+            }),
+            ..incoming("about something lost", base + 3, true)
+        },
+        TextSpec {
+            reactions: vec![
+                ReactionSpec {
+                    by: Who::Own,
+                    emoji: "\u{1f44d}".to_owned(),
+                    sent_at: base + 100,
+                    sort_order: 1,
+                },
+                ReactionSpec {
+                    by: Who::Peer,
+                    emoji: "\u{1f600}".to_owned(),
+                    sent_at: base + 101,
+                    sort_order: 2,
+                },
+            ],
+            ..incoming("liked", base + 4, true)
+        },
+        TextSpec {
+            revisions: vec![base + 5, base + 6],
+            ..incoming("newest words", base + 7, true)
+        },
+        of_kind(ItemSpec::Sticker { data: true }, base + 8, false),
+        of_kind(ItemSpec::ViewOnce, base + 9, false),
+        of_kind(
+            ItemSpec::Poll {
+                question: "Lunch?".to_owned(),
+            },
+            base + 10,
+            true,
+        ),
+        notice(
+            NoticeSpec::TimerChange {
+                expires_in_ms: 3_600_000,
+            },
+            base + 11,
+        ),
+        notice(NoticeSpec::Simple(SimpleSpec::IdentityUpdate), base + 12),
+        call(IndividualCallSpec::Missed, false, base + 13),
+        TextSpec {
+            expires_in_ms: Some(86_400_000),
+            ..call(IndividualCallSpec::Accepted, true, base + 14)
+        },
+    ];
+    let spec = HistorySpec {
+        contacts: vec![
+            ContactSpec {
+                aci: Some(world.alice.aci.parse().expect("Alice's ACI")),
+                profile_name: "Alice".to_owned(),
+                profile_sharing: true,
+                ..ContactSpec::default()
+            },
+            ContactSpec {
+                aci: Some(generated_aci(BOB)),
+                profile_name: "Bob".to_owned(),
+                profile_sharing: true,
+                ..ContactSpec::default()
+            },
+        ],
+        chats: vec![
+            ChatSpec {
+                with: ChatWith::Contact(0),
+                texts: alice_items,
+                ..ChatSpec::default()
+            },
+            // Quiet notices only: staged, not listed.
+            ChatSpec {
+                with: ChatWith::Contact(1),
+                texts: vec![
+                    notice(NoticeSpec::Simple(SimpleSpec::IdentityUpdate), base + 20),
+                    notice(
+                        NoticeSpec::Simple(SimpleSpec::MessageRequestAccepted),
+                        base + 21,
+                    ),
+                ],
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    let list = conversations(&app, account).await;
+    let peers: Vec<Option<UserId>> = list.iter().map(|row| row.peer.clone()).collect();
+    assert_eq!(
+        peers,
+        [Some(user(&world.alice))],
+        "Bob's chat has no loud row"
+    );
+    assert_eq!(
+        list[0].unread, 2,
+        "the unread message and the unread missed call"
+    );
+    let mut rows = app.rows(list[0].id).await;
+    rows.sort_by_key(|row| row.sent_at);
+    assert!(rows.iter().all(|row| row.history));
+    let lines: Vec<String> = rows.iter().map(dump).collect();
+    let read = "read Some(Read)";
+    let unread = "read Some(Unread)";
+    let mine = "read None";
+    assert_eq!(
+        lines,
+        [
+            format!("text \"\u{fffc} look here\" ranges 2 reactions [] edited false {unread}"),
+            format!("text \"the reply\" ranges 0 reply Known reactions [] edited false {mine}"),
+            format!(
+                "text \"about something lost\" ranges 0 reply Missing reactions [] edited false {read}"
+            ),
+            format!(
+                "text \"liked\" ranges 0 reactions [\"\u{1f44d}x1\", \"\u{1f600}x1\"] edited false {read}"
+            ),
+            format!("text \"newest words\" ranges 0 reactions [] edited true {read}"),
+            format!("sticker Remote reactions [] edited false {read}"),
+            format!("placeholder view-once reactions [] edited false {read}"),
+            format!("placeholder poll reactions [] edited false {mine}"),
+            "timer Some(3600s) reactions [] edited false read None".to_owned(),
+            "safety number reactions [] edited false read None".to_owned(),
+            "call Incoming Missed reactions [] edited false read Some(Unread)".to_owned(),
+            "call Outgoing Answered reactions [] edited false read None".to_owned(),
+        ],
+        "the rows of the spec, in sent order"
+    );
+    let row = |i: usize| &rows[i];
+    assert!(row(0).mentions_me, "a mention of us");
+    assert!(row(6).view_once);
+    // The quote that was found names the message it quotes.
+    let quoted = row(1).reply.as_ref().and_then(|reply| reply.target);
+    assert_eq!(quoted, Some(row(0).id));
+    assert_eq!(
+        row(4).edited_at,
+        Some(i64::try_from(base + 7).expect("ms")),
+        "the newest version's time"
+    );
+    assert_eq!(
+        row(4).sent_at,
+        i64::try_from(base + 5).expect("ms"),
+        "the original's"
+    );
+    let by_me = row(3)
+        .reactions
+        .iter()
+        .find(|group| group.emoji == "\u{1f44d}")
+        .expect("ours");
+    assert!(by_me.by_me());
+    // The timer-change notice has no timer of its own (Android never starts it).
+    assert!(matches!(
+        row(8).body,
+        Body::System(SystemEvent::TimerChanged { .. })
+    ));
+    assert_eq!(row(8).expiry, None);
+    // The outgoing call line without a start: its timer starts at the import, not at the
+    // call an hour ago (which would erase it at once with a shorter timer).
+    let timer = row(11).expiry.expect("the call's timer");
+    assert_eq!(
+        (timer.kind, timer.timer),
+        (DisappearKind::AfterSend, Duration::from_secs(86_400))
+    );
+    assert!(timer.started_at.expect("started") >= test_began);
+    login_done(&mut app, account, &mut heard).await;
+    while let Ok(event) = app.events.try_recv() {
+        heard.notifications += usize::from(matches!(event, UiEvent::Notify(_)));
+    }
+    assert_eq!(heard.notifications, 0, "an import notifies nobody");
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// An imported message that was edited on the phone keeps the ids of its versions: a
+/// reaction the phone sends afterwards for the NEWEST version (its id is the edit's time)
+/// lands on the imported row, and so does one of the contact for the original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reaction_from_the_phone_lands_on_an_imported_edited_message() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let base = now_ms() - 3_600_000;
+    let spec = HistorySpec {
+        contacts: vec![ContactSpec {
+            aci: Some(world.alice.aci.parse().expect("Alice's ACI")),
+            profile_name: "Alice".to_owned(),
+            profile_sharing: true,
+            ..ContactSpec::default()
+        }],
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts: vec![TextSpec {
+                revisions: vec![base + 1, base + 2],
+                ..incoming("edited twice on the phone", base + 3, true)
+            }],
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    app.wait_online(account).await;
+    let conv = conversations(&app, account).await[0].id;
+    let text = "edited twice on the phone";
+    let rows = app.rows_with_text(conv, text).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].revision > 0, "shown as edited");
+
+    // The phone reacts to the message as it stands now: the newest version's id.
+    world
+        .harness
+        .send_data(serde_json::json!({
+            "from": world.phone.aci, "to": device.device_ref,
+            "reaction": {
+                "emoji": "\u{1f44d}", "targetAuthor": world.alice.aci,
+                "targetTimestamp": base + 3,
+            },
+            "sync": { "destination": world.alice.aci },
+            "awaitDelivery": true, "timeout": 60_000,
+        }))
+        .await
+        .expect("sendData");
+    let row = app
+        .wait_row(
+            conv,
+            text,
+            "the phone's reaction on the imported row",
+            |row| row.reactions.iter().any(|group| group.by_me()),
+        )
+        .await;
+    assert_eq!(row.id, rows[0].id);
+    // Alice reacts to the original (its id is the message's own).
+    world
+        .harness
+        .send_data(serde_json::json!({
+            "from": world.alice.aci, "to": device.device_ref, "sealed": true,
+            "withProfileKey": true,
+            "reaction": {
+                "emoji": "\u{1f600}", "targetAuthor": world.alice.aci,
+                "targetTimestamp": base + 1,
+            },
+            "awaitDelivery": true, "timeout": 60_000,
+        }))
+        .await
+        .expect("sendData");
+    let alice = user(&world.alice);
+    let row = app
+        .wait_row(conv, text, "Alice's reaction on the same row", |row| {
+            row.reactions
+                .iter()
+                .any(|group| group.users.contains(&Some(alice.clone())))
+        })
+        .await;
+    assert_eq!(row.reactions.len(), 2);
+    assert_eq!(app.rows(conv).await.len(), 1, "no second row");
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// A person of the archive that nobody pins, archives or mutes (made up, not on the server).
+const DAVE: u32 = 902;
+
+/// One page of the list (the inbox, or the archived chats), in its order.
+async fn page(app: &App, account: AccountId, archived: bool) -> Vec<ConversationRow> {
+    let query = ConversationListQuery {
+        account: Some(account),
+        archived,
+        limit: 500,
+        ..ConversationListQuery::default()
+    };
+    match app
+        .handle
+        .query(Query::Conversations(query))
+        .await
+        .expect("conversations")
+    {
+        QueryData::Conversations(page) => page.rows,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A live message of `from` into `conv`, sealed, after the import: the notifications the UI
+/// hears until the row is there and a quiet moment after it.
+async fn notifications_of_a_live_message(
+    app: &mut App,
+    world: &World,
+    device: &DeviceInfo,
+    from: &Primary,
+    conv: ConversationId,
+    text: &str,
+) -> usize {
+    // What came before is not this message's.
+    while app.events.try_recv().is_ok() {}
+    world
+        .harness
+        .send_text(&SendText {
+            sealed: true,
+            with_profile_key: true,
+            await_delivery: true,
+            timeout: Some(60_000),
+            ..SendText::new(&from.aci, &device.device_ref, text)
+        })
+        .await
+        .expect("sendText");
+    app.wait_text(conv, text).await;
+    tokio::time::sleep(QUIET).await;
+    let mut heard = 0;
+    loop {
+        match app.events.try_recv() {
+            Ok(UiEvent::Notify(_)) => heard += 1,
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return heard,
+        }
+    }
+}
+
+/// Step S4a with the real core: the list after an import shows what the phone's chat frames
+/// say. Its inbox has the pinned chats first, in the phone's order (a pinned chat without
+/// any message among them), then the rest; a muted chat (for ever, or until a time that has
+/// passed), a chat marked unread and a blocked one say so; the archived chat is on the
+/// archive's page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_list_after_an_import_has_the_phones_pins_archive_mute_and_marks() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    // A second person on the mock, who writes live after the import.
+    let zed = world
+        .harness
+        .create_primary(&support::harness::CreatePrimary::named("Zed"))
+        .await
+        .expect("Zed");
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let base = now_ms() - 3_600_000;
+    let person = |i: u32, name: &str| ContactSpec {
+        aci: Some(generated_aci(i)),
+        profile_name: name.to_owned(),
+        profile_sharing: true,
+        ..ContactSpec::default()
+    };
+    let past_mute = base - 1_000;
+    let spec = HistorySpec {
+        contacts: vec![
+            person(BOB, "Bob"),
+            person(CAROL, "Carol"),
+            ContactSpec {
+                blocked: true,
+                ..person(DAVE, "Dave")
+            },
+            ContactSpec {
+                aci: Some(world.alice.aci.parse().expect("Alice's ACI")),
+                ..person(0, "Alice")
+            },
+            ContactSpec {
+                aci: Some(zed.aci.parse().expect("Zed's ACI")),
+                ..person(0, "Zed")
+            },
+        ],
+        chats: vec![
+            ChatSpec {
+                with: ChatWith::Contact(0),
+                texts: vec![incoming("b1", base + 1, true)],
+                pinned_order: Some(30),
+                mute_until_ms: Some(i64::MAX as u64),
+                ..ChatSpec::default()
+            },
+            // Pinned, and not a single message.
+            ChatSpec {
+                with: ChatWith::Contact(1),
+                pinned_order: Some(4),
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::NoteToSelf,
+                texts: vec![outgoing("note", base + 2, &[])],
+                pinned_order: Some(7),
+                marked_unread: true,
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::Contact(2),
+                texts: vec![incoming("d1", base + 3, true)],
+                mute_until_ms: Some(past_mute),
+                ..ChatSpec::default()
+            },
+            // Archived and muted for ever, with a message.
+            ChatSpec {
+                with: ChatWith::Contact(3),
+                texts: vec![incoming("a1", base + 4, true)],
+                archived: true,
+                mute_until_ms: Some(i64::MAX as u64),
+                ..ChatSpec::default()
+            },
+            // Muted until a time that has passed (the oldest message: the last place).
+            ChatSpec {
+                with: ChatWith::Contact(4),
+                texts: vec![incoming("z1", base, true)],
+                mute_until_ms: Some(past_mute),
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    app.wait_online(account).await;
+
+    let own = UserId::parse(&format!("aci:{}", device.aci)).expect("own id");
+    let alice = user(&world.alice);
+    let names = [
+        (generated_user(BOB), "Bob"),
+        (generated_user(CAROL), "Carol"),
+        (generated_user(DAVE), "Dave"),
+        (alice.clone(), "Alice"),
+        (user(&zed), "Zed"),
+        (own, "Note to Self"),
+    ];
+    let line = |row: &ConversationRow| -> String {
+        let name = names
+            .iter()
+            .find(|(user, _)| row.peer.as_ref() == Some(user))
+            .map_or("?", |(_, name)| *name);
+        let muted = match row.muted_until {
+            None => "-".to_owned(),
+            Some(i64::MAX) => "for ever".to_owned(),
+            Some(at) if at == i64::try_from(past_mute).unwrap() => "until the past".to_owned(),
+            Some(_) => "until another time".to_owned(),
+        };
+        format!(
+            "{name} pin {:?} archived {} muted {muted} marked {} blocked {}",
+            row.pinned_order, row.archived, row.marked_unread, row.blocked
+        )
+    };
+    let inbox: Vec<String> = page(&app, account, false).await.iter().map(line).collect();
+    let archived: Vec<String> = page(&app, account, true).await.iter().map(line).collect();
+    assert_eq!(
+        inbox,
+        [
+            "Carol pin Some(0) archived false muted - marked false blocked false",
+            "Note to Self pin Some(1) archived false muted - marked true blocked false",
+            "Bob pin Some(2) archived false muted for ever marked false blocked false",
+            "Dave pin None archived false muted until the past marked false blocked true",
+            "Zed pin None archived false muted until the past marked false blocked false",
+        ],
+        "the inbox"
+    );
+    assert_eq!(
+        archived,
+        ["Alice pin None archived true muted for ever marked false blocked false"],
+        "the archive"
+    );
+    assert_eq!(heard.notifications, 0, "the import notified nobody");
+
+    // The mute outlives the import. A live message into the chat muted for ever is silent;
+    // one into the chat whose mute ran out on the phone is announced like any other.
+    let alice_conv = page(&app, account, true).await[0].id;
+    assert_eq!(
+        notifications_of_a_live_message(
+            &mut app,
+            &world,
+            &device,
+            &world.alice,
+            alice_conv,
+            "live, into a chat muted for ever"
+        )
+        .await,
+        0,
+        "a chat muted for ever stays silent"
+    );
+    let zed_conv = app.conversation_with(account, &user(&zed)).await;
+    assert_eq!(
+        notifications_of_a_live_message(
+            &mut app,
+            &world,
+            &device,
+            &zed,
+            zed_conv,
+            "live, into a chat whose mute is over"
+        )
+        .await,
+        1,
+        "a mute in the past is no mute"
+    );
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// Step S4a: the 1:1 timer is the one chat field only the archive has (the Storage Service
+/// does not carry it). A message Kourier sends into an imported chat carries the archive's
+/// timer and its version. The person is one the phone's contact sync does not name (the
+/// initial contact sync states each contact's timer and wins for those).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_sent_into_an_imported_chat_carries_the_archives_timer() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let zed = world
+        .harness
+        .create_primary(&support::harness::CreatePrimary::named("Zed"))
+        .await
+        .expect("Zed");
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let base = now_ms() - 3_600_000;
+    let zed_aci = zed.aci.parse().expect("Zed's ACI");
+    let spec = HistorySpec {
+        contacts: vec![ContactSpec {
+            aci: Some(zed_aci),
+            profile_name: "Zed".to_owned(),
+            profile_sharing: true,
+            ..ContactSpec::default()
+        }],
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts: vec![incoming("z1", base + 1, true)],
+            expiration_timer_ms: Some(3_600_000),
+            expire_timer_version: 5,
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    app.wait_online(account).await;
+    let conv = app.conversation_with(account, &user(&zed)).await;
+    app.send(UiCommand::SendText {
+        conv,
+        text: kourier_model::Text::plain("after the import"),
+        reply_to: None,
+    });
+    let got = world
+        .harness
+        .wait_for_data(&zed.aci, "message", Some(&device.device_ref), None, WAIT)
+        .await
+        .expect("Zed got it");
+    assert_eq!(
+        got.data_message["expireTimer"], 3_600,
+        "the archive's timer"
+    );
+    assert_eq!(got.data_message["expireTimerVersion"], 5, "and its version");
+    let row = app
+        .wait_row(conv, "after the import", "sent", |row| {
+            row.out_state.is_some()
+        })
+        .await;
+    assert_eq!(
+        row.expiry.map(|e| e.timer),
+        Some(Duration::from_secs(3_600)),
+        "the core gave the message the chat's timer"
+    );
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// The group conversation of `key` in the list, once there.
+async fn group_row(app: &App, account: AccountId, conv_key: &str) -> ConversationRow {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let rows = conversations(app, account).await;
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| matches!(row.kind, kourier_model::ConvKind::Group))
+        {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the group {conv_key} is not listed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn detail(app: &App, conv: ConversationId) -> kourier_core::facade::ConversationDetail {
+    match app
+        .handle
+        .query(Query::Conversation(conv))
+        .await
+        .expect("detail")
+    {
+        QueryData::Conversation(Some(detail)) => *detail,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Step S4b with the real core, e2e tests A, C, D and G: an imported group is listed with the
+/// archive's title and members (with their roles) before its first fetch and cannot be sent
+/// to ("still loading"); its rows are the archive's (members' texts, a quote, a reaction, a
+/// mention of us, the mapped notices, a missed group call) and its unread count is the
+/// unread rows plus the unread missed call; a group of quiet notices only is not listed; the
+/// import notifies nobody. Then the server's group: a member's live message joins the same
+/// conversation, the chat can be sent to, and a send reaches the server's members and not
+/// the member the archive still names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_imported_group_is_listed_from_the_archive_and_a_send_reaches_the_servers_members() {
+    use base64::Engine as _;
+    use kourier_model::{MemberRole, SystemEvent};
+    use kourier_signal::archive_testing::{
+        CallSpec, GroupCallSpec, GroupChangeSpec, GroupSpec, ItemSpec, NoticeSpec, Party,
+        QuoteSpec, RangeKindSpec, RangeSpec, ReactionSpec, SnapshotSpec, Who,
+    };
+    use support::harness::{CreateGroup, CreatePrimary, ModifyGroup, SendGroupText};
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut people = Vec::new();
+    for name in ["Ada", "Bo", "Cal"] {
+        people.push(
+            world
+                .harness
+                .create_primary(&CreatePrimary::named(name))
+                .await
+                .expect(name),
+        );
+    }
+    let (ada, bo, cal) = (&people[0], &people[1], &people[2]);
+    let group = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.phone.device_ref.clone(),
+            title: "Server title".to_owned(),
+            members: vec![
+                ada.device_ref.clone(),
+                bo.device_ref.clone(),
+                cal.device_ref.clone(),
+            ],
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("createGroup");
+    // Cal left on the server after the phone's export.
+    world
+        .harness
+        .modify_group(&ModifyGroup {
+            from: world.phone.device_ref.clone(),
+            group: group.id.clone(),
+            remove_members: vec![cal.device_ref.clone()],
+            ..ModifyGroup::default()
+        })
+        .await
+        .expect("modifyGroup");
+    let quiet = [0x5e_u8; 32];
+    let base = now_ms() - 3_600_000;
+    let contact = |p: &Primary| ContactSpec {
+        aci: Some(p.aci.parse().expect("ACI")),
+        profile_name: p.profile_name.clone(),
+        profile_sharing: true,
+        ..ContactSpec::default()
+    };
+    let own = world.phone.aci.parse().expect("our ACI");
+    let spec = HistorySpec {
+        contacts: vec![contact(ada), contact(bo), contact(cal)],
+        groups: vec![
+            GroupSpec {
+                master_key: base64::engine::general_purpose::STANDARD
+                    .decode(&group.master_key)
+                    .expect("master key"),
+                whitelisted: true,
+                blocked: false,
+                snapshot: Some(SnapshotSpec {
+                    title: Some("Archive title".to_owned()),
+                    members: vec![
+                        (Party::Own, false),
+                        (Party::Contact(0), true),
+                        (Party::Contact(1), false),
+                        (Party::Contact(2), false),
+                    ],
+                    ..SnapshotSpec::default()
+                }),
+            },
+            // A group whose only item is a member leaving: quiet, not listed.
+            GroupSpec {
+                master_key: quiet.to_vec(),
+                snapshot: Some(SnapshotSpec {
+                    title: Some("Quiet".to_owned()),
+                    members: vec![(Party::Own, false), (Party::Contact(0), false)],
+                    ..SnapshotSpec::default()
+                }),
+                ..GroupSpec::default()
+            },
+        ],
+        chats: vec![
+            ChatSpec {
+                with: ChatWith::Group(0),
+                texts: vec![
+                    TextSpec {
+                        author: Some(Who::Contact(0)),
+                        ..incoming("from Ada", base + 1, false)
+                    },
+                    TextSpec {
+                        author: Some(Who::Contact(1)),
+                        quote: Some(QuoteSpec {
+                            target: Some(base + 1),
+                            author: Some(Who::Contact(0)),
+                            text: "from Ada".to_owned(),
+                            ..QuoteSpec::default()
+                        }),
+                        reactions: vec![ReactionSpec {
+                            by: Who::Contact(2),
+                            emoji: "\u{1f44d}".to_owned(),
+                            sent_at: base + 3,
+                            sort_order: 1,
+                        }],
+                        ranges: vec![RangeSpec {
+                            start: 0,
+                            length: 1,
+                            kind: RangeKindSpec::Mention(own),
+                        }],
+                        body: "\u{fffc} look".to_owned(),
+                        ..incoming("", base + 2, true)
+                    },
+                    TextSpec {
+                        outgoing: true,
+                        kind: ItemSpec::Notice(NoticeSpec::GroupChange(vec![
+                            GroupChangeSpec::Name {
+                                by: Party::Contact(0),
+                                name: Some("Archive title".to_owned()),
+                            },
+                            GroupChangeSpec::Avatar { by: Party::Absent },
+                        ])),
+                        sent_at: base + 4,
+                        ..TextSpec::default()
+                    },
+                    TextSpec {
+                        kind: ItemSpec::Call(CallSpec::Group {
+                            call_id: Some(31),
+                            state: GroupCallSpec::Missed,
+                            ringer: Some(Who::Contact(1)),
+                            started_by: None,
+                            read: false,
+                            started_at: base + 5,
+                        }),
+                        sent_at: base + 5,
+                        ..TextSpec::default()
+                    },
+                ],
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::Group(1),
+                texts: vec![TextSpec {
+                    kind: ItemSpec::Notice(NoticeSpec::GroupChange(vec![
+                        GroupChangeSpec::MemberLeft {
+                            who: Party::Contact(0),
+                        },
+                    ])),
+                    sent_at: base + 6,
+                    ..TextSpec::default()
+                }],
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    // The first fetch waits until the test lets it.
+    world
+        .harness
+        .fail_group_fetch(&group.id, true)
+        .await
+        .expect("failGroupFetch");
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    assert_eq!(heard.notifications, 0, "an import notifies nobody");
+
+    // Before its first fetch: the archive's group.
+    let row = group_row(&app, account, "imported").await;
+    assert_eq!(row.title.as_deref(), Some("Archive title"));
+    let groups = conversations(&app, account)
+        .await
+        .into_iter()
+        .filter(|row| matches!(row.kind, kourier_model::ConvKind::Group))
+        .count();
+    assert_eq!(groups, 1, "the quiet group is not listed");
+    assert_eq!(row.unread, 2, "Ada's unread text and the missed call");
+    let conv = row.id;
+    let before = detail(&app, conv).await;
+    let roles: Vec<(UserId, MemberRole)> = before
+        .members
+        .iter()
+        .map(|m| (m.user.clone(), m.role))
+        .collect();
+    assert!(roles.contains(&(user(ada), MemberRole::Admin)), "{roles:?}");
+    assert!(roles.contains(&(user(cal), MemberRole::Member)));
+    assert_eq!(before.features.cannot_send, Some(CannotSend::StillLoading));
+    let rows = app.rows(conv).await;
+    let lines: Vec<String> = rows.iter().map(dump).collect();
+    assert_eq!(rows.len(), 4, "{lines:#?}");
+    assert_eq!(rows[0].author.as_ref(), Some(&user(ada)));
+    assert_eq!(rows[1].author.as_ref(), Some(&user(bo)));
+    assert!(rows[1].reply.is_some(), "the quote");
+    assert_eq!(rows[1].reactions.len(), 1, "Cal's reaction");
+    assert!(matches!(
+        &rows[2].body,
+        Body::System(SystemEvent::TitleChanged { by: Some(by), .. }) if *by == user(ada)
+    ));
+    assert!(matches!(&rows[3].body, Body::System(SystemEvent::Call(_))));
+
+    // The server's group: a live message of Ada's makes it fetch, in the same chat.
+    world
+        .harness
+        .fail_group_fetch(&group.id, false)
+        .await
+        .expect("failGroupFetch");
+    app.wait_online(account).await;
+    world
+        .harness
+        .send_group_text(&SendGroupText {
+            from: ada.aci.clone(),
+            group: group.id.clone(),
+            to: vec![device.device_ref.clone()],
+            text: "live from Ada".to_owned(),
+            ..SendGroupText::default()
+        })
+        .await
+        .expect("sendGroupText");
+    app.wait_text(conv, "live from Ada").await;
+    app.wait_cannot_send(conv, None).await;
+    assert_eq!(
+        conversations(&app, account)
+            .await
+            .into_iter()
+            .filter(|row| matches!(row.kind, kourier_model::ConvKind::Group))
+            .count(),
+        1,
+        "still one group conversation"
+    );
+    let after = detail(&app, conv).await;
+    assert!(
+        !after.members.iter().any(|m| m.user == user(cal)),
+        "the server's members replace the archive's"
+    );
+    let stats = world.harness.send_stats().await.expect("sendStats");
+    let to_cal_before = stats.single.get(&cal.aci).copied().unwrap_or(0);
+    app.send(UiCommand::SendText {
+        conv,
+        text: kourier_model::Text::plain("to the group"),
+        reply_to: None,
+    });
+    for member in [ada, bo] {
+        world
+            .harness
+            .wait_for_group_message(&member.aci, &group.id, None, WAIT)
+            .await
+            .expect("a member got it");
+    }
+    let stats = world.harness.send_stats().await.expect("sendStats");
+    assert_eq!(
+        stats.single.get(&cal.aci).copied().unwrap_or(0),
+        to_cal_before,
+        "nothing went to the member the archive still named"
+    );
+    assert!(
+        !stats.multi_recipients.iter().any(|r| r.contains(&cal.aci)),
+        "nor in a multi-recipient send"
+    );
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// Step S4b with the real core: a group we are INVITED to is listed with the request to
+/// accept it and a reason that says what to do (accept the invitation on the phone), before
+/// its first fetch, not "still loading" and not "no longer a member". The invitation is the
+/// group's one item and is no notice, so the chat lists after every chat that has a row.
+/// When the first fetch finds the invitation over (the server's state does not list us), the
+/// request is gone from the chat and the reason is the true one: we are not in the group.
+/// A group we asked to join says that its request waits for an administrator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_imported_invitation_is_offered_with_its_reason_until_the_first_fetch_finds_it_over() {
+    use base64::Engine as _;
+    use kourier_signal::archive_testing::{
+        GroupChangeSpec, GroupSpec, ItemSpec, NoticeSpec, Party, SnapshotSpec, Who,
+    };
+    use support::harness::{CreateGroup, CreatePrimary};
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut people = Vec::new();
+    for name in ["Ada", "Bo"] {
+        people.push(
+            world
+                .harness
+                .create_primary(&CreatePrimary::named(name))
+                .await
+                .expect(name),
+        );
+    }
+    let (ada, bo) = (&people[0], &people[1]);
+    // On the server we are in neither group (Ada made them), and the first fetch of the
+    // first waits until the test lets it.
+    let mut groups = Vec::new();
+    for title in ["Invited", "Asked"] {
+        groups.push(
+            world
+                .harness
+                .create_group(&CreateGroup {
+                    from: ada.device_ref.clone(),
+                    title: title.to_owned(),
+                    members: vec![bo.device_ref.clone()],
+                    ..CreateGroup::default()
+                })
+                .await
+                .expect("createGroup"),
+        );
+    }
+    for group in &groups {
+        world
+            .harness
+            .fail_group_fetch(&group.id, true)
+            .await
+            .expect("failGroupFetch");
+    }
+    let base = now_ms() - 3_600_000;
+    let contact = |p: &Primary| ContactSpec {
+        aci: Some(p.aci.parse().expect("ACI")),
+        profile_name: p.profile_name.clone(),
+        profile_sharing: true,
+        ..ContactSpec::default()
+    };
+    let key_of = |group: &support::harness::GroupInfo| {
+        base64::engine::general_purpose::STANDARD
+            .decode(&group.master_key)
+            .expect("master key")
+    };
+    let invitation = |inviter: usize| TextSpec {
+        outgoing: true,
+        kind: ItemSpec::Notice(NoticeSpec::GroupChange(vec![
+            GroupChangeSpec::SelfInvited {
+                inviter: Party::Contact(inviter),
+            },
+        ])),
+        sent_at: base + 1,
+        ..TextSpec::default()
+    };
+    let spec = HistorySpec {
+        contacts: vec![contact(ada), contact(bo)],
+        groups: vec![
+            GroupSpec {
+                master_key: key_of(&groups[0]),
+                whitelisted: false,
+                snapshot: Some(SnapshotSpec {
+                    title: Some("Invited".to_owned()),
+                    members: vec![(Party::Contact(0), true), (Party::Contact(1), false)],
+                    pending: vec![Party::Own],
+                    ..SnapshotSpec::default()
+                }),
+                ..GroupSpec::default()
+            },
+            GroupSpec {
+                master_key: key_of(&groups[1]),
+                whitelisted: false,
+                snapshot: Some(SnapshotSpec {
+                    title: Some("Asked".to_owned()),
+                    members: vec![(Party::Contact(0), true)],
+                    requesting: vec![Party::Own],
+                    ..SnapshotSpec::default()
+                }),
+                ..GroupSpec::default()
+            },
+        ],
+        chats: vec![
+            // A chat with a row, to see where the invitation lists.
+            ChatSpec {
+                with: ChatWith::Contact(0),
+                texts: vec![TextSpec {
+                    author: Some(Who::Contact(0)),
+                    ..incoming("hello from Ada", base + 2, true)
+                }],
+                ..ChatSpec::default()
+            },
+            ChatSpec {
+                with: ChatWith::Group(0),
+                texts: vec![invitation(0)],
+                ..ChatSpec::default()
+            },
+            // A request to join has nothing to show either, and is pinned on the phone.
+            ChatSpec {
+                with: ChatWith::Group(1),
+                pinned_order: Some(1),
+                texts: Vec::new(),
+                ..ChatSpec::default()
+            },
+        ],
+        ..HistorySpec::default()
+    };
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    upload(&world, &device, &key, &spec).await;
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    assert_eq!(heard.notifications, 0, "an import notifies nobody");
+
+    // Before the first fetch of either.
+    let find = |rows: &[ConversationRow], title: &str| {
+        rows.iter()
+            .position(|row| row.title.as_deref() == Some(title))
+    };
+    let rows = conversations(&app, account).await;
+    let invited_at = find(&rows, "Invited").expect("the invitation is listed");
+    let asked_at = find(&rows, "Asked").expect("the request to join is listed (pinned)");
+    assert!(
+        asked_at == 0 && rows[asked_at].pinned_order.is_some(),
+        "the pinned chat is on top"
+    );
+    let ada_at = rows
+        .iter()
+        .position(|row| row.peer.as_ref() == Some(&user(ada)))
+        .expect("the chat with Ada");
+    assert!(
+        ada_at < invited_at,
+        "the invitation has no row and lists after a chat that has one"
+    );
+    let invited = rows[invited_at].clone();
+    assert!(invited.request_pending, "the invitation is offered");
+    assert!(!rows[asked_at].request_pending, "a request to join is not");
+    assert_eq!(
+        detail(&app, invited.id).await.features.cannot_send,
+        Some(CannotSend::InvitationPending)
+    );
+    assert_eq!(
+        detail(&app, rows[asked_at].id).await.features.cannot_send,
+        Some(CannotSend::JoinRequestPending)
+    );
+
+    // The first fetch of the invited group: the server's state does not list us.
+    world
+        .harness
+        .fail_group_fetch(&groups[0].id, false)
+        .await
+        .expect("failGroupFetch");
+    app.wait_online(account).await;
+    app.wait_cannot_send(invited.id, Some(CannotSend::NotMember))
+        .await;
+    let rows = conversations(&app, account).await;
+    let invited = rows
+        .iter()
+        .find(|row| row.title.as_deref() == Some("Invited"))
+        .expect("still listed");
+    assert!(
+        !invited.request_pending,
+        "the invitation is over: nothing to accept"
+    );
+    // The request to join is still waiting for its first fetch, and is no member either.
+    let asked = rows
+        .iter()
+        .find(|row| row.title.as_deref() == Some("Asked"))
+        .expect("listed");
+    assert_eq!(
+        detail(&app, asked.id).await.features.cannot_send,
+        Some(CannotSend::JoinRequestPending)
+    );
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// The keys of the CDN objects asked for so far, without the archive's.
+async fn asked_of_the_cdn(world: &World, archive: &str) -> Vec<String> {
+    let mut keys: Vec<String> = world
+        .harness
+        .downloads()
+        .await
+        .expect("downloadStats")
+        .into_iter()
+        .filter(|d| d.key != archive)
+        .map(|d| d.key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Step S5 with the real core: an import starts no download by itself except the rest of a
+/// YOUNG long text (user decision, 2026-10-10: "fetch automatically"), which completes its
+/// message, also an edited one (its newest version shows the whole text); an old long text
+/// is not fetched and its message keeps the inline part; a young file is a download on a
+/// click (one request, the bytes as sent), an old one is "not available on this device" at
+/// once and a click on it asks nothing; a young file the server lost becomes "no longer
+/// available" at its click (one request, 404) and a second click asks nothing; a restart asks
+/// nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_import_fetches_its_young_long_texts_and_nothing_else_by_itself() {
+    use kourier_model::{Attachment, AttachmentState};
+    use kourier_signal::archive_testing::{
+        AttachmentSpec, LocatorSpec, PointerSpec, encrypt_attachment,
+    };
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut app = start(&world, network()).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let now = now_ms();
+    let hour = 3_600_000;
+    let old = now - 200 * 24 * hour;
+    // Objects on CDN 3 under keys as the server makes them (route words would be logged).
+    let cdn3 = world
+        .harness
+        .handshake()
+        .state_dir
+        .join("cdn3")
+        .join("attachments");
+    std::fs::create_dir_all(&cdn3).expect("cdn3");
+    let object_key = [0x3c; 64];
+    let store = |name: &str, plain: &[u8]| {
+        let encrypted = encrypt_attachment(plain, &object_key, [2; 16]).expect("encrypt");
+        std::fs::write(cdn3.join(name), &encrypted.blob).expect("store");
+        PointerSpec {
+            content_type: Some("text/x-signal-plain".to_owned()),
+            locator: Some(LocatorSpec::of(
+                &encrypted,
+                &object_key,
+                3,
+                name,
+                None,
+                true,
+            )),
+            ..PointerSpec::default()
+        }
+    };
+    let whole = |n: &str| format!("{n}: ") + &"every word of the whole text. ".repeat(120);
+    let inline = |text: &str| text[..2048].to_owned();
+    let (young, edited, aged) = (whole("young"), whole("edited"), whole("old"));
+    let file_bytes: Vec<u8> = (0..20_000u32).map(|i| (i % 241) as u8).collect();
+    let file = |name: &str| AttachmentSpec {
+        pointer: Some(PointerSpec {
+            content_type: Some("application/pdf".to_owned()),
+            file_name: Some("plan.pdf".to_owned()),
+            ..store(name, &file_bytes)
+        }),
+        flag: 0,
+        client_uuid: None,
+    };
+    let texts = vec![
+        TextSpec {
+            long_text: Some(store("S5LongYoung", young.as_bytes())),
+            ..incoming(&inline(&young), now - hour, true)
+        },
+        TextSpec {
+            revisions: vec![now - hour + 10],
+            long_text: Some(store("S5LongEdited", edited.as_bytes())),
+            ..incoming(&inline(&edited), now - hour + 20, true)
+        },
+        TextSpec {
+            long_text: Some(store("S5LongOld", aged.as_bytes())),
+            ..incoming(&inline(&aged), old, true)
+        },
+        TextSpec {
+            attachments: vec![file("S5FileYoung")],
+            ..incoming("the young file", now - hour + 30, true)
+        },
+        TextSpec {
+            attachments: vec![file("S5FileOld")],
+            ..incoming("the old file", old + 1, true)
+        },
+        TextSpec {
+            attachments: vec![file("S5FileGone")],
+            ..incoming("the gone file", now - hour + 40, true)
+        },
+    ];
+    // The server lost this one although the archive's pointer is young.
+    std::fs::remove_file(cdn3.join("S5FileGone")).expect("gone");
+    let spec = HistorySpec {
+        contacts: vec![ContactSpec {
+            aci: Some(world.alice.aci.parse().expect("Alice's ACI")),
+            profile_name: "Alice".to_owned(),
+            profile_sharing: true,
+            ..ContactSpec::default()
+        }],
+        chats: vec![ChatSpec {
+            with: ChatWith::Contact(0),
+            texts,
+            ..ChatSpec::default()
+        }],
+        ..HistorySpec::default()
+    };
+    let path = world.tmp.path().join("phone-archive");
+    write_history_archive(&path, &key, device.aci.parse().expect("ACI"), &spec).expect("archive");
+    let place = world
+        .harness
+        .store_transfer_archive(&path)
+        .await
+        .expect("storeTransferArchive");
+    world
+        .harness
+        .provide_transfer_archive(&device.device_ref, &place)
+        .await
+        .expect("provideTransferArchive");
+    let mut heard = Heard::default();
+    assert_eq!(
+        follow(&mut app, account, &mut heard).await,
+        HistoryTransfer::Done
+    );
+    login_done(&mut app, account, &mut heard).await;
+    app.wait_online(account).await;
+    let chat = conversations(&app, account).await[0].id;
+
+    // The young long texts complete their messages by themselves.
+    let by_time = |rows: &[kourier_core::facade::MessageRow], at: u64| {
+        rows.iter()
+            .find(|row| row.sent_at == i64::try_from(at).expect("ms"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the row of {at}"))
+    };
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let rows = loop {
+        let rows = app.rows(chat).await;
+        if rows.len() == 6
+            && [now - hour, now - hour + 10]
+                .iter()
+                .all(|at| matches!(by_time(&rows, *at).body, Body::Text(_)))
+        {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the long texts were not joined"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(text_of(&by_time(&rows, now - hour).body), young);
+    let edited_row = by_time(&rows, now - hour + 10);
+    assert_eq!(
+        text_of(&edited_row.body),
+        edited,
+        "the newest version is whole"
+    );
+    assert!(edited_row.revision > 0, "and it is the edited message");
+    let attachments = |row: &kourier_core::facade::MessageRow| -> Vec<Attachment> {
+        match &row.body {
+            Body::Media { attachments, .. } => attachments.clone(),
+            other => panic!("media: {}", other.kind_name()),
+        }
+    };
+    let aged_row = by_time(&rows, old);
+    let Body::Media { caption, .. } = &aged_row.body else {
+        panic!("the old long text keeps its pointer-less attachment");
+    };
+    assert_eq!(
+        caption.as_ref().map(|c| c.body.as_str()),
+        Some(&inline(&aged)[..])
+    );
+    let states = |rows: &[kourier_core::facade::MessageRow]| -> Vec<AttachmentState> {
+        [old, now - hour + 30, old + 1, now - hour + 40]
+            .iter()
+            .map(|at| attachments(&by_time(rows, *at))[0].state)
+            .collect()
+    };
+    assert_eq!(
+        states(&rows),
+        [
+            AttachmentState::Unavailable,
+            AttachmentState::Remote,
+            AttachmentState::Unavailable,
+            AttachmentState::Remote
+        ]
+    );
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        asked_of_the_cdn(&world, &place.key).await,
+        ["S5LongEdited", "S5LongYoung"],
+        "the young long texts and nothing else"
+    );
+
+    // A click on the young file: one request, the bytes as the phone had them.
+    let young_file = attachments(&by_time(&rows, now - hour + 30))[0]
+        .id
+        .expect("an id");
+    app.send(UiCommand::DownloadAttachment {
+        attachment: young_file,
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while attachments(&by_time(&app.rows(chat).await, now - hour + 30))[0].state
+        != AttachmentState::Local
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the file did not arrive"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    app.send(UiCommand::OpenMedia {
+        attachment: young_file,
+    });
+    let opened = app
+        .event("MediaOpened", |e| match e {
+            UiEvent::MediaOpened { attachment, path } if *attachment == young_file => {
+                Some(path.clone())
+            }
+            UiEvent::ActionFailed { .. } => panic!("OpenMedia failed"),
+            _ => None,
+        })
+        .await;
+    assert!(
+        std::fs::read(&opened).expect("media file") == file_bytes,
+        "the bytes as sent"
+    );
+    app.send(UiCommand::CloseMedia {
+        attachment: young_file,
+    });
+
+    // A click on the old file asks the CDN nothing: it asks the phone (S6).
+    let old_file = attachments(&by_time(&rows, old + 1))[0].id.expect("an id");
+    app.send(UiCommand::DownloadAttachment {
+        attachment: old_file,
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while attachments(&by_time(&app.rows(chat).await, old + 1))[0].state != AttachmentState::Asking
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the old file was not asked of the phone"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(QUIET).await;
+    let asked = ["S5FileYoung", "S5LongEdited", "S5LongYoung"];
+    assert_eq!(asked_of_the_cdn(&world, &place.key).await, asked);
+
+    // A click on a young file the server lost: one request, answered 404, and the user's
+    // click then asks the phone at once (S6); a second click joins that ask and asks the CDN
+    // nothing.
+    let gone_at = now - hour + 40;
+    let gone_file = attachments(&by_time(&rows, gone_at))[0].id.expect("an id");
+    assert_eq!(
+        attachments(&by_time(&rows, gone_at))[0].state,
+        AttachmentState::Remote
+    );
+    app.send(UiCommand::DownloadAttachment {
+        attachment: gone_file,
+    });
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while attachments(&by_time(&app.rows(chat).await, gone_at))[0].state != AttachmentState::Asking
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the lost file was not asked of the phone after its 404"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let asked = ["S5FileGone", "S5FileYoung", "S5LongEdited", "S5LongYoung"];
+    assert_eq!(asked_of_the_cdn(&world, &place.key).await, asked);
+    app.send(UiCommand::DownloadAttachment {
+        attachment: gone_file,
+    });
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(
+        asked_of_the_cdn(&world, &place.key).await,
+        asked,
+        "the second click asks nothing"
+    );
+
+    // A restart asks the CDN nothing again and keeps the file; the two asks still wait (the
+    // mock's phone does not answer within the test).
+    app.send(UiCommand::DismissHistoryTransfer { account });
+    app.stop().await;
+    let app = start(&world, network()).await;
+    app.wait_online(account).await;
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(asked_of_the_cdn(&world, &place.key).await, asked);
+    assert_eq!(
+        states(&app.rows(chat).await),
+        [
+            AttachmentState::Unavailable,
+            AttachmentState::Local,
+            AttachmentState::Asking,
+            AttachmentState::Asking
+        ]
+    );
+    app.stop().await;
+    world.shutdown().await;
+}
+
+/// Link feedback L5 (`target/link-feedback/buttons.md` 1.5): a chat is deleted while its
+/// history is still being delivered (the UI refuses it while a chat fills, but the core does
+/// not: the phone can delete a chat as well). The rows of that chat still to come must neither
+/// bring it back to the list with the old messages nor fail the delivery: the transfer ends
+/// `Done`, the other chats hold every row, the deleted one is not listed and holds none.
+/// Rows of one message each make the delivery a long run of single round trips, so the chat is
+/// deleted well before its last row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_deleted_during_its_delivery_does_not_come_back_and_the_delivery_goes_on() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut app = start(&world, network().with_history_delivery_rows(1, 1024 * 1024)).await;
+    let (account, device, key) = link_with_transfer(&mut app, &world).await;
+    let (chats, messages) = (3u32, 900u32);
+    let per_chat = (messages / chats) as usize;
+    let spec = HistorySpec {
+        generated: Some(GeneratedSpec {
+            chats,
+            messages,
+            text: "A message of the generated history.".to_owned(),
+            first_sent_at: now_ms() - 3_600_000,
+        }),
+        ..HistorySpec::default()
+    };
+    upload(&world, &device, &key, &spec).await;
+
+    // The first chat of the list, as soon as it has a few rows and is far from its last.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (victim, victim_peer, rows_then) = loop {
+        let listed = conversations(&app, account).await;
+        if let Some(row) = listed.first() {
+            let rows = app.rows(row.id).await.len();
+            if rows >= 3 {
+                break (row.id, row.peer.clone().expect("a direct chat"), rows);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no chat with rows in the list: {listed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        rows_then < per_chat - 20,
+        "the chat was already whole ({rows_then} of {per_chat} rows): the test proves nothing"
+    );
+    app.send(UiCommand::DeleteConversation { conv: victim });
+
+    let mut heard = Heard::default();
+    let end = follow(&mut app, account, &mut heard).await;
+    assert_eq!(
+        end,
+        HistoryTransfer::Done,
+        "the delivery went on to its end"
+    );
+    login_done(&mut app, account, &mut heard).await;
+    let listed = conversations(&app, account).await;
+    println!(
+        "deleted at {rows_then} of {per_chat} rows; listed at the end: {} chats",
+        listed.len()
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|row| row.peer.as_ref() != Some(&victim_peer)),
+        "the deleted chat is back in the list: {listed:?}"
+    );
+    assert_eq!(listed.len(), chats as usize - 1);
+    for row in &listed {
+        assert_eq!(app.rows(row.id).await.len(), per_chat, "{:?}", row.peer);
+    }
+    assert!(
+        app.rows(victim).await.is_empty(),
+        "rows of the deleted chat were stored after the delete"
+    );
     app.stop().await;
     world.shutdown().await;
 }

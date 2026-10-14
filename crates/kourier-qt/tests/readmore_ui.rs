@@ -14,6 +14,8 @@
 //! - From the keyboard: Enter on the current row shows more of the text, and does not open the
 //!   row's menu.
 
+mod support;
+
 use std::time::Duration;
 
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
@@ -336,6 +338,7 @@ MainWindow {
 "##;
 
 fn main() {
+    support::answer_list("readmore_ui");
     // This test shows a window: always offscreen, whatever the session's platform is.
     // SAFETY: single-threaded test binary, before the app and Qt start.
     unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };

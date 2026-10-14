@@ -151,8 +151,11 @@ own, and the commands find it through the profile directory.
 
 The user: on the TEST phone, Signal > Settings > Linked devices > Link a new device. Scan the
 code in the Kourier window and confirm. Keep the phone unlocked and online for a minute. A new
-code appears every 45 seconds, six in all. If the phone offers to transfer the message
-history, choose not to transfer: Kourier does not ask for it and cannot take it.
+code appears every 45 seconds, six in all. The phone asks whether to transfer the message
+history, because Kourier's link offers it (as Signal Desktop's does). In the default run,
+which is not about the history, choose "Don't transfer", or start the run with
+`--no-history-transfer`, which links without the offer (see "A link with the history
+transfer" below). The mock phone declines on its own.
 
 Proof: the step reports the link done and the account online. The test phone lists the device
 as "Kourier smoke test" (`--device-name <text>` on `step link` gives another name).
@@ -473,29 +476,52 @@ user's say.
 - "Remove account" and "Link again" have no tool step. They are done by hand in the window,
   and only on purpose.
 
-## A link with the history transfer (experimental)
+## A link with the history transfer
 
-The transfer of the account's history at link time is switched off in the app until the
-import is whole (architecture §14.2 item 14). A run can switch it on: `start
---history-transfer` (the tool sets `KOURIER_HISTORY_TRANSFER=1` for the app; a variable
-inherited from the shell has no say). It matters only for a FIRST link, so it needs a
-profile without an account. Use a profile of its own and leave the kept `default` login
-alone:
+A new link offers the transfer of the account's history by default, as the app does
+(architecture §14.2 item 14): the linking URL carries `backup5` and the phone asks its
+user. The tool adds nothing: `start` leaves the choice to the app, and a `KOURIER_*`
+variable inherited from the shell has no say (the tool strips it). Two ways to the other
+side: choose "Don't transfer" on the phone, or start the run with `--no-history-transfer`
+(the tool then sets `KOURIER_HISTORY_TRANSFER=0` for the app, the log says the offer is off,
+and the phone is not asked). `--history-transfer` is still accepted and does nothing, with a
+note. The choice matters only for a FIRST link, so a run about the transfer needs a profile
+without an account. Use a profile of its own and leave the kept `default` login alone:
 
 ```bash
 cargo xtask smoke start --profile transfer --env production --confirmed-by-user \
-    --expect-tail <last four digits> --history-transfer
+    --expect-tail <last four digits>
 cargo xtask smoke step link --profile transfer --wait 1800
 ```
 
 - The test phone then holds two Kourier devices, the kept login and this one. Remove the
   new one on the phone when the rehearsal is over, or keep the profile for another run.
-- After the scan the phone asks whether to transfer the message history. Choose to
-  transfer. The link page shows "Waiting for Your Phone", then the download, then
+- After the scan the phone asks whether to transfer the message history. For this run
+  choose to transfer. The link page shows "Waiting for Your Phone", then the download, then
   "Importing Messages". The login ends after the transfer ends, which is why the step gets
   a long `--wait`.
-- The import brings people, 1:1 chats and plain text today. Everything else is counted
-  and skipped.
+- The import brings people, 1:1 chats and groups today, with formatting, mentions, quotes,
+  reactions, the edited mark, notices (in groups the changes the live path shows) and call
+  lines; contact cards, polls, payments and the like come as placeholders. A group says
+  "This group is still loading." until its first fetch from the server (a group we are
+  invited to says to accept the invitation on the phone, a request to join that it waits
+  for an admin). Pictures, files, voice notes and stickers come with a Download action
+  while the server can still have them (younger than twice its message queue time, at
+  least 60 days, counted from the phone's export); older ones say "Not available on this
+  device" and still offer Download: the click asks the phone to upload the file again
+  (the note says "Asking your phone…", then the file downloads, or the note says the phone
+  did not answer, no longer has the message, or does not have the file). Nothing is
+  downloaded by itself except the rest of a long text the phone never fetched. Worth one
+  check each: an imported picture of the last weeks downloads on a click, an older one
+  says "Not available on this device" and comes after a click with the phone online
+  (an iPhone was never tried: expect "did not answer"), and the log line "the import
+  judges the age of attachments" says whether the server's queue time was known.
+  `backend.db` becomes schema 22 (21 added `number_links`, 22 the name a device was linked with) and `core.db` schema 14 (the kept smoke profile needs
+  `smoke backup` first and `start --allow-schema-change`: the first start builds ten
+  indexes of `core.db`, and a link's `Done` no longer waits for the first Storage Service
+  sync after an imported history, so the note of `step link` says "unless the history was
+  imported", and the groups the Storage Service names may still be arriving when the list
+  opens).
 - What to read in the log afterwards, counts and times only (the log holds no content):
   the line "device linked" with `envelope_to_linked_ms` (the phone waits 60 seconds for
   the link), the lines of the transfer's states, the import's summary (frames by kind,
@@ -565,7 +591,8 @@ These are open until the first real run answers them:
 - which capabilities the server takes from a linked device, and what the link request must
   carry today to avoid 409;
 - what the server answers for a removed device, and after how long it removes an idle one;
-- whether the phone links from a QR code without offering a history transfer;
+- whether the real phone, offered the history transfer by the link, asks its user and links as
+  before when he declines (the mock phone declines unless a test gives it a key);
 - the real answers of the key uploads, of the multi-recipient send, and of a challenge;
 - the CDN's behaviour for uploads, resumes and range requests;
 - server timestamps that differ from the client's, and a catch-up after days offline;

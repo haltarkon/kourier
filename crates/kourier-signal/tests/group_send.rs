@@ -18,10 +18,12 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use kourier_backend_api::{BackendEnv, Command, Exit, InitialSync, StartMode, TransmitOutcome};
+use kourier_backend_api::{
+    BackendEnv, BackendEvent, Command, Exit, InitialSync, StartMode, TransmitOutcome,
+};
 use kourier_model::{
-    CmdId, ConvKey, ErrorKind, LoginStepKind, MsgTarget, ReceiptKind, RecipientState, TargetAuthor,
-    UserId,
+    CmdId, ConvKey, ErrorKind, LoginStepKind, MsgTarget, ReceiptKind, RecipientState, SendPhase,
+    TargetAuthor, UserId,
 };
 use kourier_signal::SignalNetwork;
 use serde_json::Value;
@@ -47,7 +49,7 @@ struct World {
     _tmp: tempfile::TempDir,
     env: BackendEnv,
     phone: Primary,
-    members: [Primary; 3],
+    members: Vec<Primary>,
     group: GroupInfo,
     sink: Sink,
     files: AccountFiles,
@@ -55,20 +57,24 @@ struct World {
 
 impl World {
     async fn start() -> Option<Self> {
+        Self::start_with(&["Ada", "Bo", "Cal"]).await
+    }
+
+    /// The same world with these members.
+    async fn start_with(names: &[&str]) -> Option<Self> {
         init_tracing();
         let harness = Harness::start_or_skip().await.expect("mock harness")?;
         let tmp = tempfile::tempdir().expect("temp dir");
         let env = local_env(harness.handshake(), tmp.path()).expect("local env");
         let mut members = Vec::new();
-        for name in ["Ada", "Bo", "Cal"] {
+        for name in names {
             members.push(
                 harness
-                    .create_primary(&CreatePrimary::named(name))
+                    .create_primary(&CreatePrimary::named(*name))
                     .await
                     .expect("member"),
             );
         }
-        let members: [Primary; 3] = members.try_into().expect("three members");
         let phone = harness
             .create_primary(&CreatePrimary {
                 contacts: members.iter().map(|m| m.device_ref.clone()).collect(),
@@ -1005,4 +1011,178 @@ async fn a_group_read_receipt_names_no_group_and_carries_no_pni_signature() {
     );
     assert_eq!(receipt.sealed_group_id, None);
     world.shutdown(core).await;
+}
+
+/// How many members the measured group has, and the round trip the mock adds to every request.
+const BIG_GROUP: usize = 100;
+const RTT: Duration = Duration::from_millis(125);
+
+/// The round trip of the measurement: `RTT`, or `KOURIER_TEST_RTT_MS` when set (by hand, to
+/// see the share of the CPU at 0).
+fn rtt() -> Duration {
+    std::env::var("KOURIER_TEST_RTT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(RTT, Duration::from_millis)
+}
+
+/// The first send to a 100-member group after the link, at 125 ms round trip: no member has a
+/// session and none has our sender key, so every member needs a prekey fetch and a
+/// distribution message before the one multi-recipient send. One after another that is about
+/// 2 round trips per member (25 s and more); with the bounded concurrency of the key setup
+/// (`PREKEY_FETCHES_AT_ONCE`, `MEMBER_SENDS_AT_ONCE`) a few seconds. Measured 2026-10-13 (L6):
+/// see `target/link-feedback/L6-build.md`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_send_to_a_big_group_sets_up_its_keys_at_once() {
+    let names: Vec<String> = (0..BIG_GROUP).map(|i| format!("Member {i}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let Some(world) = World::start_with(&names).await else {
+        return;
+    };
+    let (mut core, device) = world.link().await;
+    let before = world.harness.send_stats().await.expect("stats");
+    phases(&mut core).await;
+    let rtt = rtt();
+    world.harness.set_latency(rtt).await.expect("latency");
+
+    let started = std::time::Instant::now();
+    let (_, outcome) = world.say(&core, "Meeting at eight.").await;
+    let took = started.elapsed();
+    world
+        .harness
+        .set_latency(Duration::ZERO)
+        .await
+        .expect("latency");
+    eprintln!(
+        "first send to {BIG_GROUP} members at {} ms RTT took {} ms",
+        rtt.as_millis(),
+        took.as_millis()
+    );
+    assert_eq!(sent_to(&outcome).len(), BIG_GROUP, "every member");
+    assert!(
+        sent_to(&outcome).iter().all(|(_, sealed)| *sealed),
+        "every member sealed"
+    );
+    let stats = world.harness.send_stats().await.expect("stats");
+    assert_eq!(stats.multi, before.multi + 1, "one multi-recipient send");
+    // One after another the key setup alone is 2 × 100 round trips = 25 s (the serial version
+    // took 30 s here); 6 s alone on a quiet machine, so the bound leaves a loaded CI room.
+    assert!(
+        took < Duration::from_secs(15),
+        "the key setup ran one member after another: {took:?}"
+    );
+    let got = world
+        .received(BIG_GROUP - 1, &device, "Meeting at eight.")
+        .await;
+    assert_eq!(got.message_type, "SenderKey");
+
+    // What the send said while it ran (link feedback L6): the key setup with its member count
+    // up to the last one, the members the server took it for, the transcript; throttled.
+    let seen = phases(&mut core).await;
+    let of = u32::try_from(BIG_GROUP).expect("count");
+    let full = SendPhase::SettingUpKeys { done: of, of };
+    assert!(
+        seen.iter().filter(|p| **p == full).count() >= 2,
+        "both key steps reported their last member: {seen:?}"
+    );
+    assert!(seen.contains(&SendPhase::SettingUpKeys { done: 0, of }));
+    assert!(seen.contains(&SendPhase::Sending { done: 0, of }));
+    let sent = seen
+        .iter()
+        .position(|p| *p == SendPhase::Sending { done: of, of })
+        .expect("sent to every member");
+    let synced = seen
+        .iter()
+        .position(|p| *p == SendPhase::SyncingOwnDevices)
+        .expect("own devices");
+    assert!(sent < synced, "the transcript comes last: {seen:?}");
+    // 200 member steps, a report each at most every 250 ms (plus the first and last of a step).
+    assert!(seen.len() < 60, "not throttled: {} reports", seen.len());
+    world.shutdown(core).await;
+}
+
+/// Runs `sql` on the account's `backend.db` while the actor runs (a short write: the busy
+/// timeout waits for the actor's own).
+fn forget(world: &World, sql: &str) {
+    world.files.execute(sql).expect(sql);
+}
+
+/// The sender certificate is fetched ONCE for a group send, whichever step needs it first
+/// (link feedback L6): the key setup of members without a session, the distribution messages
+/// to members who have one, or the 1:1 sends when the sender-key way is not taken: never
+/// by every one of the (up to 16) parallel sends of the step at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sender_certificate_is_fetched_once_for_a_group_send_whichever_step_needs_it() {
+    let names: Vec<String> = (0..24).map(|i| format!("Member {i}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let Some(world) = World::start_with(&names).await else {
+        return;
+    };
+    let (core, _device) = world.link().await;
+    let certificates = || async {
+        world
+            .harness
+            .send_stats()
+            .await
+            .expect("stats")
+            .certificate_requests
+    };
+    // Each kind of certificate (with or without our number: the sender-key send seals with
+    // the one, the 1:1 sends with the other) is asked for once, never by every parallel send.
+    let once_each = |asked: &[String], what: &str| {
+        let mut seen = std::collections::BTreeSet::new();
+        for path in asked {
+            assert!(
+                seen.insert(path),
+                "{what} asked for {path} twice: {asked:?}"
+            );
+        }
+    };
+
+    // 1. Nobody has a session yet: the prekey fetches (step 4).
+    let before = certificates().await.len();
+    let (_, outcome) = world.say(&core, "one").await;
+    assert_eq!(sent_to(&outcome).len(), 24);
+    once_each(&certificates().await[before..], "the key setup");
+
+    // 2. Everybody has a session, the certificates are gone and every member needs our
+    // distribution message again (step 6).
+    forget(&world, "DELETE FROM sender_certs");
+    forget(&world, "DELETE FROM sender_key_devices");
+    let before = certificates().await.len();
+    let (_, outcome) = world.say(&core, "two").await;
+    assert_eq!(sent_to(&outcome).len(), 24);
+    let asked = certificates().await[before..].to_vec();
+    assert!(!asked.is_empty(), "the certificates were gone");
+    once_each(&asked, "the distribution messages");
+
+    // 3. The server will not take the sender-key send: every member gets a 1:1 send (step 9),
+    // and the certificates are gone again.
+    world
+        .harness
+        .answer_multi_recipient_unexpectedly(true)
+        .await
+        .expect("unexpected answers");
+    forget(&world, "DELETE FROM sender_certs");
+    let before = certificates().await.len();
+    let (_, outcome) = world.say(&core, "three").await;
+    assert_eq!(sent_to(&outcome).len(), 24);
+    let asked = certificates().await[before..].to_vec();
+    assert!(!asked.is_empty(), "the certificates were gone");
+    once_each(&asked, "the 1:1 sends");
+    world.shutdown(core).await;
+}
+
+/// The phases of `TransmitProgress` events that came since the last call (others dropped).
+async fn phases(core: &mut FakeCore) -> Vec<SendPhase> {
+    let mut seen = Vec::new();
+    while let Some(event) = core.next_ephemeral(Duration::from_millis(300)).await {
+        if let BackendEvent::TransmitProgress {
+            phase: Some(phase), ..
+        } = event
+        {
+            seen.push(phase);
+        }
+    }
+    seen
 }

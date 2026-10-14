@@ -103,10 +103,41 @@ msgstr ""
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
+#: crates/kourier-viewmodel/src/account_actions.rs
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
 msgctxt "@action:button"
 msgid "Cancel"
+msgstr ""
+
+#: crates/kourier-qt/qml/MediaActions.qml
+#, kde-format
+msgctxt "@info"
+msgid "Your phone did not answer. Open Signal on your phone and try again."
+msgstr ""
+
+#: crates/kourier-qt/qml/MediaActions.qml
+#, kde-format
+msgctxt "@info"
+msgid "Your phone no longer has this message."
+msgstr ""
+
+#: crates/kourier-qt/qml/MediaActions.qml
+#, kde-format
+msgctxt "@info"
+msgid "Not on your phone either."
+msgstr ""
+
+#: crates/kourier-qt/qml/MediaActions.qml
+#, kde-format
+msgctxt "@info"
+msgid "No answer from your phone"
+msgstr ""
+
+#: crates/kourier-qt/qml/MediaActions.qml
+#, kde-format
+msgctxt "@info"
+msgid "Not on your phone"
 msgstr ""
 
 #: crates/kourier-qt/qml/components/ChatEmptyState.qml
@@ -450,6 +481,7 @@ msgstr ""
 
 #: crates/kourier-qt/qml/dialogs/ChallengeDialog.qml
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/dialogs/LogoutNoticeDialog.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Close"
@@ -615,7 +647,21 @@ msgstr ""
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #, kde-format
 msgctxt "@info:placeholder"
+msgid "Not available on this device"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@info:placeholder"
 msgid "The download failed"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info"
+msgid "Asking your phone…"
 msgstr ""
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
@@ -632,6 +678,7 @@ msgstr ""
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Download"
@@ -930,8 +977,50 @@ msgstr ""
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
+msgctxt "@info:placeholder, %1 what was searched for"
+msgid "No chats match “%1”"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Your history is on its way"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Importing your message history"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Getting your chats"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
 msgctxt "@info:placeholder"
 msgid "No conversations"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Chats appear here when your phone sends them."
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Chats appear here as they are imported."
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Chats appear here as contacts and groups arrive."
 msgstr ""
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
@@ -1045,7 +1134,7 @@ msgstr ""
 #: crates/kourier-qt/qml/pages/WelcomePage.qml
 #, kde-format
 msgctxt "@info"
-msgid "Kourier links as an additional device: your phone stays the main device and your history stays on it."
+msgid "Kourier links as an additional device: your phone stays the main device, keeps your message history and can send a copy of it."
 msgstr ""
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
@@ -1404,6 +1493,12 @@ msgstr ""
 
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
+msgctxt "@info accessible"
+msgid "Not sent yet, trying again."
+msgstr ""
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#, kde-format
 msgctxt "@action:button"
 msgid "Read more"
 msgstr ""
@@ -1632,6 +1727,13 @@ msgid "No longer available"
 msgstr ""
 
 #: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info"
+msgid "Not available on this device"
+msgstr ""
+
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
 #, kde-format
 msgctxt "@info"
 msgid "could not be played"
@@ -1651,6 +1753,12 @@ msgstr ""
 
 #: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
 #, kde-format
+msgctxt "@info"
+msgid "Download failed"
+msgstr ""
+
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
 msgctxt "@info accessible"
 msgid "Picture"
 msgstr ""
@@ -1659,12 +1767,6 @@ msgstr ""
 #, kde-format
 msgctxt "@info accessible"
 msgid "Video"
-msgstr ""
-
-#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
-#, kde-format
-msgctxt "@info"
-msgid "Download failed"
 msgstr ""
 
 #: crates/kourier-qt/qml/timeline/blocks/QuoteBlock.qml
@@ -1764,6 +1866,120 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status"
 msgid "Linking is not available in this build yet."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@action:button unlink this computer from an account and delete the account's data here"
+msgid "Remove Account…"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@action:button unlink this computer from an account, keeping its chats readable here"
+msgid "Unlink…"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@title:dialog question before an account is removed from this computer"
+msgid "Remove Account?"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account is removed from this computer"
+msgid "Kourier unlinks this computer from your account and deletes this account's chats, messages and files from this computer."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account that is not linked any more is removed from this computer"
+msgid "Kourier deletes this account's chats, messages and files from this computer."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account is removed from this computer"
+msgid "Your account, and the messages on your phone and your other devices, stay as they are."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account is removed from this computer"
+msgid "To use this account here again, link it again with your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@action:button remove an account from this computer"
+msgid "Remove Account"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@title:dialog question before this computer is unlinked from an account"
+msgid "Unlink This Computer?"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before this computer is unlinked from an account"
+msgid "Kourier unlinks this computer from your account. Your chats stay readable on this computer."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before this computer is unlinked from an account"
+msgid "New messages stop arriving here until you link the account again with your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@action:button unlink this computer from an account"
+msgid "Unlink"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info:status after an account was removed, %1 the account's name"
+msgid "The account “%1” was removed from this computer."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info:status after this computer was unlinked from an account, %1 the account's name"
+msgid "This computer was unlinked from the account “%1”. Its chats stay readable here."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info %1 the messenger (Signal), %2 the name of this computer among the phone's linked devices, %3 the date it was linked"
+msgid "%1 could not be reached: remove “%2” linked on %3 from the linked devices on your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info %1 the messenger (Signal), %2 the date this computer was linked; the name it was linked with is not known"
+msgid "%1 could not be reached: remove the device linked on %2 from the linked devices on your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info %1 the messenger (Signal), %2 the name of this computer among the phone's linked devices"
+msgid "%1 could not be reached: remove “%2” from the linked devices on your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info %1 the messenger (Signal); the name this computer was linked with is not known"
+msgid "%1 could not be reached: remove this computer from the linked devices on your phone."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@title:dialog the network could not be told that this computer left an account"
+msgid "Remove This Computer on Your Phone"
 msgstr ""
 
 #: crates/kourier-viewmodel/src/conversations.rs
@@ -2146,6 +2362,12 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status"
 msgid "The setting could not be saved."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status a disabled entry of the chat menu: why the chat cannot be cleared or deleted yet"
+msgid "Available once this chat's history has arrived"
 msgstr ""
 
 #: crates/kourier-viewmodel/src/core_source.rs
@@ -2676,6 +2898,18 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
+msgctxt "@action:button close a message and go to the chats"
+msgid "OK"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button go to the chats, where the banner of the account that must be linked again is"
+msgid "Go to Chats"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
 msgctxt "@info:status why linking failed"
 msgid "Could not reach the server. Check your connection."
 msgstr ""
@@ -2690,6 +2924,18 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status why linking failed"
 msgid "The code expired. Try again for a new one."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
+msgid "This account is already in Kourier."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
+msgid "This account is already in Kourier. To use it again, choose “Link Again” in its banner."
 msgstr ""
 
 #: crates/kourier-viewmodel/src/login.rs
@@ -3058,6 +3304,12 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
+msgctxt "@info:status chat notice, %1 who joined"
+msgid "%1 joined the group"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
 msgctxt "@info:status chat notice, %1 who added, %2 who was added"
 msgid "%1 added %2"
 msgstr ""
@@ -3078,6 +3330,18 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status chat notice, %1 a name"
 msgid "%1 left the group"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status chat notice, the user did it"
+msgid "You removed the group name"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status chat notice, %1 who"
+msgid "%1 removed the group name"
 msgstr ""
 
 #: crates/kourier-viewmodel/src/preview.rs
@@ -3598,6 +3862,120 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
+msgctxt "@info:status under a message not sent yet, %1 time left (m:ss)"
+msgid "Next try in %1"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Sending…"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for the connection"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for you to verify"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for you to confirm the new safety number"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for the computer's clock to be set"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for this device to be linked again"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting: the network restricted this account"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for Kourier to be updated"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet"
+msgid "Waiting for you to reconnect"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Uploading files"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Checking the group"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent, %1 how many members"
+msgid "Setting up encryption with %1 member"
+msgid_plural "Setting up encryption with %1 members"
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Updating the members' devices"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent, %1 how many members"
+msgid "Sending to %1 member"
+msgid_plural "Sending to %1 members"
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent, %1 all members, %2 members it went to"
+msgid "Sent to %2 of %1 member"
+msgid_plural "Sent to %2 of %1 members"
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Sending to your other devices"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status after the reason under a message on its way, %1 time since it was sent (m:ss)"
+msgid "· %1"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
 msgctxt "@item:intext the author of a message, yourself"
 msgid "You"
 msgstr ""
@@ -3646,6 +4024,24 @@ msgctxt "@info:status why the composer is off"
 msgid "Start this chat on your phone first."
 msgstr ""
 
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status why the composer is off"
+msgid "This group is still loading."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status why the composer is off"
+msgid "Accept the invitation on your phone to join this group."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status why the composer is off"
+msgid "Your request to join this group is waiting for an admin."
+msgstr ""
+
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
 msgctxt "@info:status a passing notice"
@@ -3672,32 +4068,8 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
-msgctxt "@title heading while the phone prepares the message history"
-msgid "Waiting for Your Phone"
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
-msgctxt "@info while the phone prepares the message history"
-msgid "Your phone is preparing your message history. This can take a few minutes. New messages arrive once it is here."
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
 msgctxt "@info:status banner of an account"
 msgid "Waiting for your phone to prepare the message history…"
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
-msgctxt "@title heading while the message history downloads"
-msgid "Downloading Message History"
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
-msgctxt "@info while the message history downloads"
-msgid "New messages arrive once the history is here."
 msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
@@ -3708,26 +4080,62 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
-msgctxt "@title heading while the downloaded message history is read"
-msgid "Importing Messages"
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
-msgctxt "@info while the downloaded message history is read"
-msgid "Keep Kourier open until this is finished. New messages arrive afterwards."
-msgstr ""
-
-#: crates/kourier-viewmodel/src/transfer.rs
-#, kde-format
 msgctxt "@info:status banner of an account"
-msgid "Importing messages… Keep Kourier open until this is finished."
+msgid "Importing messages… New messages arrive afterwards."
 msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
 msgctxt "@action:button transfer the message history again; it opens a question"
 msgid "Try Again…"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account while an imported message history fills the chats, %1 all the messages, %2 the ones there so far"
+msgid "Importing history: %2 of %1 message. New messages arrive afterwards."
+msgid_plural "Importing history: %2 of %1 messages. New messages arrive afterwards."
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status a count in the line of an account that fetches its contacts and groups, %1 the number"
+msgid "%1 profile"
+msgid_plural "%1 profiles"
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status a count in the line of an account that fetches its contacts and groups, %1 the number"
+msgid "%1 group"
+msgid_plural "%1 groups"
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account that fetches its contacts and groups, %1 the profiles left as in 120 profiles, %2 the groups left as in 8 groups"
+msgid "Updating contacts and groups: %1, %2 left"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account that fetches its contacts and groups, %1 what is left, as in 120 profiles or 8 groups"
+msgid "Updating contacts and groups: %1 left"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account that fetches its contacts and groups"
+msgid "Updating contacts and groups…"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info the character between the groups of three digits of a large number, as in 12,400; many languages use a no-break space"
+msgid ","
 msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
@@ -3780,6 +4188,30 @@ msgstr ""
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
+msgctxt "@info which of two links of one account this is, %1 the device number the network gave this computer, %2 the date it was linked"
+msgid "device %1 · linked %2"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info which of two links of one account this is, %1 the device number the network gave this computer"
+msgid "device %1"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info which of two links of one account this is, %1 the date it was linked"
+msgid "linked %1"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info an account told apart from another that looks the same, %1 its name and number, %2 which device it is"
+msgid "%1 · %2"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
 msgctxt "@info:status a passing notice about one of several accounts, %1 the name of the account, %2 what happened"
 msgid "%1: %2"
 msgstr ""
@@ -3818,6 +4250,66 @@ msgstr ""
 #, kde-format
 msgctxt "@action:button remove an account from this computer and link it again"
 msgid "Remove and Link Again"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@title:dialog question before a link in progress is cancelled"
+msgid "Stop Linking?"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@action:button cancel a link in progress"
+msgid "Stop Linking"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@action:button keep a link in progress"
+msgid "Continue Linking"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info question before a link in progress is cancelled, %1 the name of a messenger"
+msgid "Linking a %1 account has not finished. Opening this now cancels the link. You can link the account again later."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info question before an account is replaced while another link is in progress, %1 the name of a messenger"
+msgid "Linking another %1 account has not finished. Removing this account now cancels that link. You can link that account again later."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@title:dialog question before the application quits while a message history is transferred"
+msgid "Quit While Importing History?"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info question before the application quits while a message history is transferred"
+msgid "Kourier is still importing your message history. It goes on at the next start."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@title:dialog question before the application quits while a new link fetches its contacts and groups"
+msgid "Quit While Updating Contacts and Groups?"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info question before the application quits while a new link fetches its contacts and groups"
+msgid "Kourier is still fetching your contacts and groups. It goes on at the next start."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@action:button quit the application"
+msgid "Quit"
 msgstr ""
 
 #: packaging/app.kourier.Kourier.desktop

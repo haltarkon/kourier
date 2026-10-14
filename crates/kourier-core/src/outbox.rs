@@ -1275,6 +1275,10 @@ pub(crate) struct Attempt {
     pub message: MessageId,
     /// What to send.
     pub req: OutgoingRequest,
+    /// Which attempt of the row this is (1 = the first), for the log.
+    pub number: i64,
+    /// When it started (ms), for the log's `took_ms`.
+    pub started_at: i64,
 }
 
 /// What [`take_due`] found and started.
@@ -1451,16 +1455,19 @@ pub(crate) fn take_due(
             // An edit, delete or reaction: its own `only` (the members a partial attempt
             // missed); `send_state` belongs to the target's own send.
             retarget_edit(&tx, message, &mut req)?;
-            tx.prepare_cached(
-                "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
-                   request = ?3 WHERE id = ?1",
-            )?
-            .execute((outbox, TRANSMITTING, sql::to_json(&req)?))?;
+            let number: i64 = tx
+                .prepare_cached(
+                    "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
+                       request = ?3 WHERE id = ?1 RETURNING attempts",
+                )?
+                .query_row((outbox, TRANSMITTING, sql::to_json(&req)?), |r| r.get(0))?;
             due.attempts.push(Attempt {
                 outbox,
                 conv,
                 message,
                 req,
+                number,
+                started_at: now,
             });
             continue;
         }
@@ -1471,11 +1478,12 @@ pub(crate) fn take_due(
             finish_attempt(&mut apply, outbox, conv, message, None, &req)?;
             continue;
         }
-        tx.prepare_cached(
-            "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
-               request = ?3 WHERE id = ?1",
-        )?
-        .execute((outbox, TRANSMITTING, sql::to_json(&req)?))?;
+        let number: i64 = tx
+            .prepare_cached(
+                "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
+                   request = ?3 WHERE id = ?1 RETURNING attempts",
+            )?
+            .query_row((outbox, TRANSMITTING, sql::to_json(&req)?), |r| r.get(0))?;
         let f = floor(&tx, message)?;
         if f.as_ref().is_none_or(|f| f.rank().is_none_or(|r| r < 1)) {
             set_floor(
@@ -1490,6 +1498,8 @@ pub(crate) fn take_due(
             conv,
             message,
             req,
+            number,
+            started_at: now,
         });
     }
     apply.finish()?;
@@ -1879,6 +1889,8 @@ pub(crate) struct FailedChange {
 pub(crate) struct Recorded {
     pub changes: Changes,
     pub pause: Option<Pause>,
+    /// The row waits this long for its next attempt (for the log).
+    pub retry_in: Option<Duration>,
     /// An edit, delete or reaction the network refused for good: reported to the UI as
     /// `ActionFailed`, unless the user deleted its message meanwhile.
     pub failed: Option<FailedChange>,
@@ -1999,6 +2011,7 @@ pub(crate) fn record_outcome(
         ))
     });
     let mut pause = None;
+    let mut retry_in = None;
     // How a failed attempt continues: the decision, the request of the next attempt and the
     // log-safe error name stored in `last_error`.
     let mut next: Option<(Next, OutgoingRequest, &'static str)> = None;
@@ -2155,6 +2168,7 @@ pub(crate) fn record_outcome(
         let req = sql::to_json(&req)?;
         match n {
             Next::Retry(wait) => {
+                retry_in = Some(wait);
                 tx.prepare_cached(
                     "UPDATE outbox SET state = ?2, next_attempt_at = ?3, request = ?4,
                        last_error = ?5 WHERE id = ?1",
@@ -2233,6 +2247,7 @@ pub(crate) fn record_outcome(
     Ok(Recorded {
         changes,
         pause,
+        retry_in,
         failed: None,
     })
 }
@@ -3566,6 +3581,8 @@ mod tests {
                 only: None,
                 is_recipient_update: false,
             },
+            number: 1,
+            started_at: 300,
         }
     }
 

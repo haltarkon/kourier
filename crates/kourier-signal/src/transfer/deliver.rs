@@ -77,7 +77,15 @@
 //!
 //! What a zone of a chunk writes into `peers` stays when its row is taken back: a redo of a
 //! row of chats forgets that the core has their features first ([`events_of`]), or they
-//! would come again without them.
+//! would come again without them. A row of chats that is taken back forgets the features of
+//! the chats it named at once ([`take_back`], those chats and nobody else's), so that
+//! `peers.features_hash`, the backend's record of "the core has this chat", is not stale
+//! after a chat's unit is dropped for good or a lost stage discards a pending piece. The
+//! pins leave such a chat out, or the core would make a bare chat of it.
+//!
+//! The 1:1 timer of a chat frame is written into `peers` as a pair with its version, and only
+//! when the version is not below the stored one: a chats zone runs again after a redo, and
+//! the user may have changed the timer meanwhile.
 //!
 //! # What a start verifies of the stage
 //!
@@ -103,7 +111,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use kourier_backend_api::{BackendEvent, Envelope, IncomingMessage, MAX_HISTORY_BATCH};
+use kourier_backend_api::{
+    BackendEvent, Envelope, IncomingMessage, MAX_HISTORY_BATCH, decode_outbox_row,
+};
 use kourier_db::rusqlite::{Connection, OptionalExtension as _};
 use kourier_db::{Tx, ZoneDb};
 use kourier_model::{
@@ -237,6 +247,9 @@ const KIND_MESSAGES: i64 = 2;
 /// The end of a chat whose last row was dropped, owed on its own: an empty batch that says
 /// nothing follows. (The value was the kind of the "unread count" piece until step S3a.)
 const KIND_END: i64 = 3;
+/// The phone's pinned chats, one `PinnedConversations` in a row of its own after every
+/// chat's upsert (step S4a). A single unit: when the core refuses it, it is dropped.
+const KIND_PINS: i64 = 4;
 
 /// The stored cursor (migration 0019).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +310,8 @@ enum Place {
 /// What a chunk carries.
 enum Payload {
     Contacts(Vec<StagedContact>),
-    /// Chats with whether the peer is blocked.
+    /// Chats with whether the peer is blocked (false for a group and Note to Self: a group's
+    /// own flag is read where its row is made, `group_event`).
     Chats(Vec<(StagedChatRow, bool)>),
     Messages {
         conv: ConvKey,
@@ -305,11 +319,16 @@ enum Payload {
         has_more: bool,
         /// `delivered / total` after this chunk.
         progress: Option<f32>,
+        /// The messages of the shown chats in all (0 in a redo, which does not know it): the
+        /// count `AccountProgress` reports against.
+        total: u64,
     },
     /// Nothing follows for the chat (its last row was dropped).
     End {
         conv: ConvKey,
     },
+    /// The pinned chats, in the phone's order.
+    Pins(Vec<ConvKey>),
 }
 
 /// One delivery row to be: a typed piece of the stage.
@@ -331,7 +350,7 @@ impl Chunk {
             Payload::Contacts(list) => list.len() as u64,
             Payload::Chats(list) => list.len() as u64,
             Payload::Messages { messages, .. } => messages.len() as u64,
-            Payload::End { .. } => 1,
+            Payload::End { .. } | Payload::Pins(_) => 1,
         }
     }
 }
@@ -365,10 +384,7 @@ pub(crate) enum Delivered {
 }
 
 /// What [`rebuild`] and [`forget`] reset of the cursor. `deliver_stuck_ms` stays on purpose
-/// in [`forget`] (module docs, the migration). The column `deliver_hinted` of migration
-/// 0019 (how many chats had been given their unread count) is no longer read or written
-/// since no count is sent: it stays in the schema, whatever a transfer that began under
-/// the earlier code left in it.
+/// in [`forget`] (module docs, the migration).
 const RESET_CURSOR: &str = "deliver_phase = 0, deliver_pos = 0, deliver_n = -1,
     delivered_messages = 0, deliver_idle_ms = 0, deliver_strikes = 0, deliver_refused = 0";
 
@@ -507,7 +523,7 @@ fn feed_all(
     let shown: Vec<StagedChatRow> = reader
         .chats()?
         .into_iter()
-        .filter(|chat| chat.counters.n_loud > 0)
+        .filter(StagedChatRow::shown)
         .collect();
     let total: u64 = shown.iter().map(|chat| chat.counters.n_rows).sum();
     let send = |chunk: Chunk| out.blocking_send(Fed::Chunk(Box::new(chunk))).is_ok();
@@ -522,8 +538,9 @@ fn feed_all(
             .checked_sub(place + 1)
             .and_then(|i| shown.get(i))
     };
+    // Whether the chat's contact is blocked; a group says it itself (`group_event`).
     let blocked_peer = |chat: &StagedChatRow| -> std::result::Result<bool, StageError> {
-        let Some(peer) = chat.op.peer else {
+        let Some(peer) = chat.op.peer() else {
             return Ok(false);
         };
         let row = reader.contacts(peer.checked_sub(1), 1)?;
@@ -642,6 +659,7 @@ fn feed_all(
                             messages: vec![item.msg],
                             has_more: !ends,
                             progress: None,
+                            total: 0,
                         },
                     };
                     if !send(chunk) {
@@ -741,7 +759,31 @@ fn feed_all(
             pos: 0,
             n: -1,
         };
-        if !send(step(cursor, next)) {
+        // The step into the messages carries the pins: ONE list after every chat's upsert
+        // (the core makes a bare chat of every key the list names that it does not know),
+        // naming only chats that are upserted, in the phone's order. `pinnedOrder` is
+        // ascending and may have gaps: sorted, never used as an index.
+        let mut pinned: Vec<&StagedChatRow> =
+            shown.iter().filter(|chat| chat.pinned.is_some()).collect();
+        pinned.sort_by_key(|chat| (chat.pinned, chat.counters.idx));
+        let chunk = if pinned.is_empty() {
+            step(cursor, next)
+        } else {
+            Chunk {
+                place: Place::Advance {
+                    before: cursor,
+                    after: next,
+                },
+                kind: KIND_PINS,
+                chat: 0,
+                after_n: 0,
+                through_n: 0,
+                ends_chat: false,
+                single: true,
+                payload: Payload::Pins(pinned.into_iter().map(|chat| chat.conv.clone()).collect()),
+            }
+        };
+        if !send(chunk) {
             return Ok(None);
         }
         cursor = next;
@@ -803,6 +845,7 @@ fn feed_all(
                     messages: batch.into_iter().map(|item| item.msg).collect(),
                     has_more: !ends,
                     progress,
+                    total,
                 },
             };
             if !send(chunk) {
@@ -916,14 +959,28 @@ fn number_only_features() -> ConversationFeatures {
     }
 }
 
-/// The upsert of one shown chat (its features are put in front by the caller).
+/// The upsert of one shown chat (its features are put in front by the caller). What the
+/// chat frame says is set where it differs from a new chat's default (the core's chat is
+/// new: an import runs into an account without chats); the Storage Service sync that
+/// follows the transfer owns these flags and wins where it differs (`storage`, D10). The
+/// pinned order is not here: the pins come as one list after every upsert.
 fn chat_event(chat: &StagedChatRow, blocked: bool) -> BackendEvent {
     let mut patch = ConversationPatch::new(chat.conv.clone());
-    if chat.op.is_self {
+    if chat.op.is_self() {
         patch.is_self = Some(true);
     }
     if blocked {
         patch.blocked = Some(true);
+    }
+    let frame = &chat.op.frame;
+    if frame.archived {
+        patch.archived = Some(true);
+    }
+    if frame.marked_unread {
+        patch.marked_unread = Some(true);
+    }
+    if let Some(until) = frame.muted_until {
+        patch.muted_until = Patch::Set(until);
     }
     if let ConvKey::Direct(user) = &chat.conv
         && user.scheme() == "e164"
@@ -931,6 +988,149 @@ fn chat_event(chat: &StagedChatRow, blocked: bool) -> BackendEvent {
         patch.features = Some(number_only_features());
     }
     BackendEvent::ConversationUpsert(patch)
+}
+
+/// The upsert of a shown GROUP chat, with its features, and the group's `groups` row
+/// (design 2.2, the lead's decisions of step S4b), in the chats zone:
+///
+/// - the row is written WITHOUT the phone's snapshot (`state` stays NULL: sending needs the
+///   server's member list, and the first fetch is then a "first" one that replaces title,
+///   members and timer and makes no notices), with every flag column the Storage Service
+///   merge compares (blocked, accepted, archived, marked unread, muted until by the shared
+///   conversion), `membership` as the archive's snapshot says where the row has none yet
+///   ('pending' for an invitation, 'requesting' for a request to join, 'left'; a member or an
+///   empty snapshot stays 'unknown', "still loading") and `features_hash` of the features
+///   sent (the core has the group). A verdict the server already gave ('left', 'gone')
+///   stands over the archive's word, and a redo never offers an invitation again after it;
+/// - NEVER OVER THE SERVER'S STATE: when the row has a state already (a refresh ran during
+///   the delivery, or after a rebuild), the row's flags are left alone and the upsert carries
+///   what that state says (its title, members and timer, so that a rebuilt core gets a whole
+///   group whatever the refresh does) and never the archive's;
+/// - a `GroupRefresh` is queued for every group, a left one too (D10). The caller wakes the
+///   job runner when the zone commits.
+fn group_event(
+    tx: &Tx<'_>,
+    account: &crate::db::Account,
+    chat: &StagedChatRow,
+    group: &super::stage::StagedGroup,
+    now: i64,
+) -> Result<BackendEvent> {
+    use super::stage::GroupMembership;
+    use crate::groups::{self, GroupKeys, Membership};
+    let keys = GroupKeys::from_master(group.master_key.0);
+    groups::ensure(tx, &keys, now)?;
+    let Some(row) = groups::load_by_master(tx, &keys.master)? else {
+        return Err(Error::Internal("a group row vanished"));
+    };
+    let frame = &chat.op.frame;
+    let mut patch = ConversationPatch::new(keys.conv_key());
+    let membership = match &row.snapshot {
+        None => {
+            // Where the server has not said anything yet, the archive's word is our place.
+            let membership = match row.membership {
+                Membership::Unknown => match group.membership {
+                    GroupMembership::Invited => Membership::Pending,
+                    GroupMembership::Requesting => Membership::Requesting,
+                    GroupMembership::Left => Membership::Left,
+                    GroupMembership::Member | GroupMembership::Unknown => Membership::Unknown,
+                },
+                decided => decided,
+            };
+            tx.prepare_cached(
+            "UPDATE groups SET blocked = ?2, whitelisted = ?3, archived = ?4, marked_unread = ?5,
+               muted_until = ?6, membership = ?7, updated_at = ?8
+             WHERE master_key = ?1",
+        )?
+        .execute((
+            &keys.master[..],
+            group.blocked,
+            group.whitelisted,
+            frame.archived,
+            frame.marked_unread,
+            frame.muted_until,
+            membership.as_str(),
+            now,
+        ))?;
+            if let Some(title) = &group.title {
+                patch.title = Patch::Set(title.clone());
+            }
+            // An empty snapshot says nothing of the members: an empty list would wipe one.
+            if let Some(members) = &group.members {
+                patch.members = Some(kourier_model::MemberList::snapshot(members.clone()));
+            }
+            // Display only until the first fetch: a send takes the snapshot's timer, and sending
+            // waits for the snapshot anyway. No version for a group.
+            if let Some(secs) = frame.timer_secs {
+                patch.timer = Patch::Set(Duration::from_secs(u64::from(secs)));
+            }
+            if group.blocked {
+                patch.blocked = Some(true);
+            }
+            if frame.archived {
+                patch.archived = Some(true);
+            }
+            if frame.marked_unread {
+                patch.marked_unread = Some(true);
+            }
+            if let Some(until) = frame.muted_until {
+                patch.muted_until = Patch::Set(until);
+            }
+            // Invited, as on the phone: the chat offers the invitation while the row says
+            // 'pending', and no longer once the first fetch found it over ('left', 'gone': a redo
+            // after a 403 must not offer it again). The first fetch corrects it too
+            // (`groups::apply`).
+            if group.membership == GroupMembership::Invited {
+                patch.request_pending = Some(membership == Membership::Pending);
+            }
+            membership
+        }
+        Some(snapshot) => {
+            // The server's state stands: its title, members and timer, and only what the row
+            // implies of the flags.
+            patch.title = if snapshot.title.is_empty() {
+                Patch::Clear
+            } else {
+                Patch::Set(snapshot.title.clone())
+            };
+            patch.members = Some(crate::groups::apply::member_list(snapshot));
+            patch.timer = if snapshot.timer_secs > 0 {
+                Patch::Set(Duration::from_secs(u64::from(snapshot.timer_secs)))
+            } else {
+                Patch::Clear
+            };
+            patch.blocked = Some(row.blocked);
+            patch.archived = Some(row.archived);
+            patch.marked_unread = Some(row.marked_unread);
+            patch.muted_until = row.muted_until.map_or(Patch::Clear, Patch::Set);
+            patch.request_pending = Some(row.membership == Membership::Pending);
+            row.membership
+        }
+    };
+    let features = features::group_features(
+        row.snapshot.as_ref(),
+        membership,
+        account,
+        &features::Limits::load(tx)?,
+    );
+    tx.prepare_cached("UPDATE groups SET features_hash = ?2 WHERE master_key = ?1")?
+        .execute((&keys.master[..], features::hash_value(&features)))?;
+    patch.features = Some(features);
+    crate::jobs::enqueue(
+        tx,
+        crate::jobs::JobKind::GroupRefresh,
+        &groups::job_key(&keys.id),
+        now,
+        None,
+    )?;
+    Ok(BackendEvent::ConversationUpsert(patch))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: makes the NEXT check of a whole row in [`append`] fail. By data it cannot
+    /// (every unit passed alone and the features beside a unit carry the unit's own key), so
+    /// the branch is defence in depth, and only this switch reaches it.
+    static FAIL_THE_NEXT_WHOLE_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether `events` pass the contract check the core runs on an envelope; gives them back.
@@ -949,6 +1149,8 @@ struct Appended {
     dropped: u64,
     /// Rows that were due under a confirmed clock.
     expired: u64,
+    /// Group refreshes were queued (the job runner is woken when the zone commits).
+    refreshes: bool,
 }
 
 /// The chunk's events, built inside its zone. Units that do not pass the contract check
@@ -991,12 +1193,52 @@ fn events_of<T: SignalTransport>(
             let Some(account) = shared.account() else {
                 return Err(Error::Internal("a delivery without an account"));
             };
-            let events = checked(
-                chats
-                    .iter()
-                    .map(|(chat, blocked)| chat_event(chat, *blocked))
-                    .collect(),
-            );
+            let mut units = Vec::with_capacity(chats.len());
+            let mut groups = Vec::new();
+            for (chat, blocked) in &chats {
+                units.push(match chat.op.group() {
+                    Some(group) => {
+                        groups.push(chat.conv.clone());
+                        group_event(tx, &account, chat, group, now)?
+                    }
+                    None => chat_event(chat, *blocked),
+                });
+            }
+            if !groups.is_empty() {
+                done.refreshes = true;
+            }
+            let events = checked(units);
+            // A group whose upsert did not pass is not in the core.
+            for conv in &groups {
+                let kept = events.iter().any(
+                    |event| matches!(event, BackendEvent::ConversationUpsert(p) if &p.key == conv),
+                );
+                if !kept {
+                    features::forget_group_features(tx, conv)?;
+                }
+            }
+            // The 1:1 timer and its version, from the chat frame: into `peers` BEFORE the
+            // features are computed, so that the chat's first upsert carries them
+            // (`features_event`) and what Kourier sends there carries them too. The version
+            // is written also when the timer is off. The PAIR is written only when its
+            // version is not below the stored one (the incoming rule, `timer::incoming`):
+            // this zone runs again after a redo or a lost stage, when the chat is already in
+            // the core and the user may have changed its timer meanwhile (`timer::change`
+            // stores a version above the archive's). The archive's old timer beside that
+            // newer version would undo the user's change in what Kourier sends.
+            for (chat, _) in &chats {
+                if let ConvKey::Direct(user) = &chat.conv
+                    && let Some(peer) = features::direct_service_id(&account, user)
+                {
+                    peers::set_expire_timer_unless_older(
+                        tx,
+                        &peer.service_id_string(),
+                        chat.op.frame.timer_secs.unwrap_or(0),
+                        chat.op.frame.timer_version.max(1),
+                        now,
+                    )?;
+                }
+            }
             // Chat by chat, each with its features right in front of it: the core makes a
             // chat at the first event that names it, and the order in which it makes them
             // is the order of the list until they fill (the feeder's `upsert_at`).
@@ -1006,7 +1248,7 @@ fn events_of<T: SignalTransport>(
                     && let BackendEvent::ConversationUpsert(patch) = &event
                     && let ConvKey::Direct(user) = &patch.key
                 {
-                    features::forget_features(tx, &account, user)?;
+                    features::forget_features(tx, user)?;
                 }
                 out.extend(features::with_features(tx, &account, vec![event], now)?);
             }
@@ -1017,6 +1259,7 @@ fn events_of<T: SignalTransport>(
             mut messages,
             has_more,
             progress,
+            ..
         } => {
             // A row that is due is not delivered, but only under a clock the server
             // confirmed in this run; otherwise it goes on with its expiry and the core's
@@ -1081,6 +1324,34 @@ fn events_of<T: SignalTransport>(
                 progress: None,
             }]
         }
+        // The full list: the core's pin list is idempotent (it unpins what the list does not
+        // name and orders what it does), so a row appended again after a kill sets the
+        // same pins. The core makes a bare chat of every key the list names that it does not
+        // have, so a chat whose upsert was dropped for good is left out (`take_back` forgot
+        // its features in the zone that dropped it: the records say the core never took it).
+        // A chat known only by a number has no such record and stays named.
+        Payload::Pins(keys) => {
+            let mut kept = Vec::with_capacity(keys.len());
+            let mut left_out = 0u64;
+            for key in keys {
+                if features::core_has_chat(tx, &key)? == Some(false) {
+                    left_out += 1;
+                    continue;
+                }
+                kept.push(key);
+            }
+            if left_out > 0 {
+                tracing::warn!(
+                    left_out,
+                    "pinned chats the core never took are left out of the pins"
+                );
+            }
+            if kept.is_empty() {
+                Vec::new()
+            } else {
+                checked(vec![BackendEvent::PinnedConversations(kept)])
+            }
+        }
     })
 }
 
@@ -1116,6 +1387,11 @@ fn append<T: SignalTransport>(shared: &Shared<T>, chunk: Chunk, now: i64) -> Res
         let (ends_chat, single, units) = (chunk.ends_chat, chunk.single, chunk.units());
         let is_messages = matches!(chunk.payload, Payload::Messages { .. });
         let is_contacts = matches!(chunk.payload, Payload::Contacts(_));
+        // The chats a row of chats names, for the case that the row is dropped as a whole.
+        let named: Vec<ConvKey> = match &chunk.payload {
+            Payload::Chats(list) => list.iter().map(|(chat, _)| chat.conv.clone()).collect(),
+            _ => Vec::new(),
+        };
         let mut done = Appended::default();
         // 2. and 3. The backend rows and the events.
         let events = events_of(tx, shared, chunk, now, &mut done)?;
@@ -1126,16 +1402,23 @@ fn append<T: SignalTransport>(shared: &Shared<T>, chunk: Chunk, now: i64) -> Res
             events
         } else {
             let (events, ok) = valid(events);
+            #[cfg(test)]
+            let ok = ok && !FAIL_THE_NEXT_WHOLE_ROW.replace(false);
             if ok {
                 events
             } else {
                 tracing::error!("a delivery row did not pass the contract check; dropped");
                 done.dropped += units;
+                // The zone set these chats' features as sent; the core never gets them.
+                for conv in &named {
+                    features::forget_chat_features(tx, conv)?;
+                }
                 Vec::new()
             }
         };
-        if is_contacts {
-            // Profile fetches the people of this chunk need run beside the import.
+        if is_contacts || done.refreshes {
+            // Profile fetches the people of this chunk need, and the refreshes of its
+            // groups, run beside the import.
             let jobs_wake = jobs_wake.clone();
             tx.on_commit(move || jobs_wake.notify_one());
         }
@@ -1270,6 +1553,37 @@ fn entries(conn: &Connection) -> Result<Vec<Entry>> {
         .collect::<kourier_db::rusqlite::Result<_>>()?)
 }
 
+/// The zone of a row of chats recorded in `peers` that the core has these chats' features
+/// (`features::features_event`). A row that is taken back is not delivered as it is: the
+/// chats it named are not in the core, and `peers.features_hash` must not say they are,
+/// whether the row is appended again as singles, dropped for good, or lost with a pending
+/// piece by [`forget`]. Their hashes are cleared and nobody else's: the chats are read from
+/// the row itself, in `core_outbox` or, when the core refused it, in `core_outbox_poison`.
+/// (A redo forgets them again before it states them, [`events_of`].)
+fn forget_features_of_row(tx: &Tx<'_>, seq: i64) -> Result<()> {
+    let row: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT envelope FROM core_outbox WHERE seq = ?1
+             UNION ALL SELECT envelope FROM core_outbox_poison WHERE seq = ?1 LIMIT 1",
+            [seq],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    // A row this version cannot read names nothing it could forget.
+    let Ok(events) = decode_outbox_row(&row) else {
+        return Ok(());
+    };
+    for event in events {
+        if let BackendEvent::ConversationUpsert(patch) = event {
+            features::forget_chat_features(tx, &patch.key)?;
+        }
+    }
+    Ok(())
+}
+
 /// A row the core will not take as it is (refused, or not acknowledged within the bounds)
 /// is taken back: a row of several units becomes a piece to append again as singles; a
 /// single is dropped and counted (its copy in `core_outbox_poison`, if the core refused it,
@@ -1277,6 +1591,9 @@ fn entries(conn: &Connection) -> Result<Vec<Entry>> {
 /// was the last row of its chat the chat's end is owed on its own (a piece of kind
 /// [`KIND_END`]). Returns whether a piece to append again was made.
 fn take_back(tx: &Tx<'_>, entry: &Entry) -> Result<bool> {
+    if entry.kind == KIND_CHATS {
+        forget_features_of_row(tx, entry.seq)?;
+    }
     tx.execute("DELETE FROM core_outbox WHERE seq = ?1", [entry.seq])?;
     // The refused row's copy is not kept: its content is appended again, or dropped.
     tx.execute("DELETE FROM core_outbox_poison WHERE seq = ?1", [entry.seq])?;
@@ -1546,6 +1863,10 @@ async fn run<T: SignalTransport>(
     let mut stored_idle = tokio::time::Instant::now();
     let mut restart = false;
     let mut out_of_step = 0u32;
+    // The pins' chunk, held until every row before it is settled (below).
+    let mut held: Option<Box<Chunk>> = None;
+    // The messages of the shown chats in all, as the feeder says (`AccountProgress`).
+    let mut messages_total = 0u64;
     loop {
         // Back-pressure: fewer than the window of rows may be unsettled before the next
         // chunk is taken, and at the end none.
@@ -1562,11 +1883,13 @@ async fn run<T: SignalTransport>(
         }
         if found.new_pieces || restart {
             // Pieces were taken back: a new feeder cuts them into singles first, then goes
-            // on from the cursor.
+            // on from the cursor (which still stands before a held chunk: it comes again).
             feeder = start_feeder(shared, key, recorded)?;
             ended = None;
             restart = false;
+            held = None;
         }
+        let settled = found.waiting == 0 && !found.pending;
         let room = found.waiting < bounds.window.max(1);
         if let Some(whole) = ended
             && found.waiting == 0
@@ -1578,16 +1901,46 @@ async fn run<T: SignalTransport>(
             }
             break;
         }
-        if room && ended.is_none() {
-            match feeder.rx.recv().await {
+        // The pins go to the core only when every row before them is settled: a chats row
+        // that the core refuses or does not take is taken back and appended again AFTER
+        // anything that is already behind it, and the pins must not reach the core before
+        // the chats they name (it would make bare chats of them).
+        let next = match held.take() {
+            Some(chunk) if settled => Some(Some(chunk)),
+            Some(chunk) => {
+                held = Some(chunk);
+                None
+            }
+            None if room && ended.is_none() => Some(None),
+            None => None,
+        };
+        if let Some(chunk) = next {
+            let fed = match chunk {
+                Some(chunk) => Some(Fed::Chunk(chunk)),
+                None => feeder.rx.recv().await,
+            };
+            match fed {
+                Some(Fed::Chunk(chunk)) if chunk.kind == KIND_PINS && !settled => {
+                    held = Some(chunk);
+                }
                 Some(Fed::Chunk(chunk)) => {
                     kourier_db::failpoint::hit(FAILPOINT_BEFORE_CHUNK);
                     let now = shared.now();
+                    let counted = match &chunk.payload {
+                        Payload::Messages { total, .. } => {
+                            messages_total = messages_total.max(*total);
+                            true
+                        }
+                        _ => false,
+                    };
                     match append(shared, *chunk, now) {
                         Ok(done) => {
                             out_of_step = 0;
                             if done.seq.is_some() {
                                 kourier_db::failpoint::hit(FAILPOINT_AFTER_CHUNK);
+                            }
+                            if counted {
+                                report_messages(shared, messages_total).await?;
                             }
                         }
                         Err(Error::Internal("out of step")) => {
@@ -1675,6 +2028,23 @@ async fn run<T: SignalTransport>(
     })
 }
 
+/// Tells the UI how many messages of `total` are delivered (`progress.rs`): the stored count
+/// after the chunk that was just appended.
+async fn report_messages<T: SignalTransport>(shared: &Shared<T>, total: u64) -> Result<()> {
+    if total == 0 || !shared.settling.is_on() {
+        return Ok(());
+    }
+    let delivered: i64 = shared.db.read(|c| -> Result<i64> {
+        Ok(c.query_row(
+            "SELECT delivered_messages FROM history_transfer WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?)
+    })?;
+    shared.settling.set_messages(to_u64(delivered), total);
+    crate::progress::report(shared).await
+}
+
 /// The stage is lost: its record is taken back and the cursor reset; the caller reads the
 /// archive again.
 fn lost<T: SignalTransport>(shared: &Shared<T>) -> Result<Delivered> {
@@ -1726,13 +2096,18 @@ pub(crate) fn plain_rows(
                 .collect(),
             Payload::Chats(chats) => chats
                 .iter()
-                .map(|(chat, blocked)| chat_event(chat, *blocked))
+                .map(|(chat, blocked)| {
+                    // A group's own flag (`group_event` reads it in a real delivery).
+                    let group_blocked = chat.op.group().is_some_and(|group| group.blocked);
+                    chat_event(chat, *blocked || group_blocked)
+                })
                 .collect(),
             Payload::Messages {
                 conv,
                 messages,
                 has_more,
                 progress,
+                ..
             } => {
                 let mut events = Vec::with_capacity(1);
                 if !messages.is_empty() {
@@ -1746,6 +2121,7 @@ pub(crate) fn plain_rows(
                 events
             }
             Payload::End { .. } => Vec::new(),
+            Payload::Pins(keys) => vec![BackendEvent::PinnedConversations(keys)],
         };
         if !events.is_empty() {
             rows.push(events);

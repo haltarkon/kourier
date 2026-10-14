@@ -78,6 +78,9 @@ const TYPING_ACTIONS = { started: 0, stopped: 1 };
 const CALL_EVENT_TYPES = { audio: 1, video: 2, group: 3, adHoc: 4 };
 const CALL_EVENT_DIRECTIONS = { incoming: 1, outgoing: 2 };
 const CALL_EVENT_EVENTS = { accepted: 1, notAccepted: 2, delete: 3, observed: 4 };
+/** `SyncMessage.AttachmentBackfillResponse.AttachmentData.Status` and `.Error` by name. */
+const BACKFILL_STATUS = { pending: 0, terminalError: 1 };
+const BACKFILL_ERROR = { messageNotFound: 0 };
 /** `CallMessage.Hangup.Type` by name (`sendCall {hangup}`). */
 const HANGUP_TYPES = { normal: 0, accepted: 1, declined: 2, busy: 3, needPermission: 4 };
 /** `SyncMessage.MessageRequestResponse.Type` by name. */
@@ -142,6 +145,12 @@ const PADDED_EMOJI = [32];
 /** Extra profile fields by ACI (`avatar` CDN0 path, encrypted `about`/`aboutEmoji`). */
 const profileExtras = new Map();
 
+/**
+ * `limitProfileFetches`: every profile request answers 429 with this `Retry-After` (seconds)
+ * while set (`null`: served); `refused` counts the answers.
+ */
+const profileLimit = { retryAfter: null, refused: 0 };
+
 {
   const register = Router.prototype.register;
   Router.prototype.register = function registerWithProfileExtras(method, pattern, handler) {
@@ -149,6 +158,11 @@ const profileExtras = new Map();
       return register.call(this, method, pattern, handler);
     }
     const withExtras = async (params, ...rest) => {
+      if (profileLimit.retryAfter !== null) {
+        // The real server's answer to profile fetches over its rate limit.
+        profileLimit.refused += 1;
+        return [429, { error: 'rate limited' }, { 'retry-after': String(profileLimit.retryAfter) }];
+      }
       const response = await handler(params, ...rest);
       const extras = profileExtras.get(params.serviceId);
       if (response[0] === 200 && extras && response[1] && typeof response[1] === 'object') {
@@ -176,6 +190,11 @@ const sends = {
   rejectTokens: false,
   /** 1:1 sends (`PUT /v1/messages/:serviceId`) by destination service id, rate-limited ones included. */
   single: new Map(),
+  /**
+   * The `urgent` flag of every 1:1 send by destination service id, in order: `{timestamp,
+   * urgent}` (the request's own, which the mock server does not keep).
+   */
+  urgency: new Map(),
   /** Multi-recipient sends served (after the token check). */
   multi: 0,
   /**
@@ -183,6 +202,11 @@ const sends = {
    * the websocket route the mock does not serve).
    */
   multiRequests: 0,
+  /**
+   * Every `GET /v1/certificate/delivery` (a client fetching its sender certificate), by path
+   * (with its query: the kind without the number asks `?includeE164=false`), in order.
+   */
+  certificateRequests: [],
   /** Recipients (service ids) of every multi-recipient send, in order. */
   multiRecipients: [],
   /** Multi-recipient sends refused for their group send token. */
@@ -241,6 +265,14 @@ const sends = {
     const limited = async (params, ...rest) => {
       const target = params.serviceId;
       sends.single.set(target, (sends.single.get(target) ?? 0) + 1);
+      try {
+        const list = JSON.parse(Buffer.from(rest[0] ?? []).toString());
+        const flags = sends.urgency.get(target) ?? [];
+        flags.push({ timestamp: Number(list?.timestamp ?? 0), urgent: list?.urgent === true });
+        sends.urgency.set(target, flags);
+      } catch {
+        // A body the mock refuses too: nothing to record.
+      }
       const challenge = sends.challenges.get(target);
       if (challenge) {
         // The real server's answer to a send it wants a person to vouch for.
@@ -467,6 +499,38 @@ const sends = {
   };
 }
 
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  // The sender certificate a client seals its sends with: a group send must fetch it once,
+  // not once per member (`sendStats.certificateRequests`).
+  MockConnection.prototype.handleRequest = async function handleRequestCountingCertificates(request) {
+    if (request.verb === 'GET' && /^\/v1\/certificate\/delivery(\?|$)/.test(request.path ?? '')) {
+      sends.certificateRequests.push(request.path);
+    }
+    return handleRequest.call(this, request);
+  };
+}
+
+/**
+ * A round trip added to every request a client makes (`setLatency`): its answer is held back
+ * `ms` (0 = none). Websocket requests and the gRPC multi-recipient route; the server's own
+ * pushes (envelopes) are not delayed.
+ */
+const latency = { ms: 0 };
+
+/** Waits the configured round trip, if any. */
+function roundTrip() {
+  return latency.ms > 0 ? new Promise((resolve) => setTimeout(resolve, latency.ms)) : undefined;
+}
+
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  MockConnection.prototype.handleRequest = async function handleRequestWithLatency(request) {
+    await roundTrip();
+    return handleRequest.call(this, request);
+  };
+}
+
 /**
  * The clock the server states when it delivers an envelope: `skewMs` is added to the true
  * time (`setServerTime`).
@@ -517,6 +581,7 @@ const MULTI_RECIPIENT_ROUTE = '/org.signal.chat.messages.MessagesAnonymous/SendM
     const checked = async (req, res) => {
       // micro caches the body, so the mock's handler reads it again.
       const raw = await readBody(req, { limit: '16mb' });
+      await roundTrip();
       sends.multiRequests += 1;
       if (sends.unexpected) {
         // A response without its `response` case, as a server version the client does not know
@@ -610,6 +675,44 @@ function pointerBytes(value, name) {
     return Buffer.from(value);
   }
   throw badRequest(`pointer "${name}" missing`);
+}
+
+/**
+ * A wire pointer back from its JSON (`jsonSafe`, as `sendAttachments`, `waitForMessage` and
+ * `sendSync {attachmentBackfillResponse}` print it): base64 back to bytes, numbers back to
+ * `BigInt` where the proto has a u64.
+ */
+function pointerFromJson(value, name) {
+  if (typeof value !== 'object' || value === null) {
+    throw badRequest(`"${name}" must be a pointer object`);
+  }
+  const bytes = (field) => (value[field] == null ? null : pointerBytes(value[field], `${name}.${field}`));
+  const identifier = value.attachmentIdentifier ?? {};
+  return {
+    attachmentIdentifier:
+      typeof identifier.cdnKey === 'string'
+        ? { cdnKey: identifier.cdnKey }
+        : identifier.cdnId != null
+          ? { cdnId: BigInt(identifier.cdnId) }
+          : null,
+    cdnNumber: value.cdnNumber ?? null,
+    contentType: value.contentType ?? null,
+    key: bytes('key'),
+    size: value.size ?? null,
+    digest: bytes('digest'),
+    fileName: value.fileName ?? null,
+    flags: value.flags ?? null,
+    width: value.width ?? null,
+    height: value.height ?? null,
+    caption: value.caption ?? null,
+    blurHash: value.blurHash ?? null,
+    uploadTimestamp: value.uploadTimestamp == null ? null : BigInt(value.uploadTimestamp),
+    clientUuid: bytes('clientUuid'),
+    thumbnail: null,
+    incrementalMac: bytes('incrementalMac'),
+    chunkSize: value.chunkSize ?? null,
+    audioDurationSeconds: value.audioDurationSeconds ?? null,
+  };
 }
 
 /** Desktop's long-text limit: a longer body goes out trimmed with a text attachment. */
@@ -997,6 +1100,24 @@ class HarnessServer extends Server {
       throw new Error('injected group fetch failure (failGroupFetch)');
     }
     return super.getGroup(publicParams);
+  }
+
+  /** Linked devices' manifest requests fail with 500 (`failStorageManifest`). */
+  failingManifest = false;
+  /** Manifest requests of linked devices refused that way. */
+  refusedManifests = 0;
+
+  /**
+   * The Storage Service manifest routes look the manifest up here: while `failingManifest`,
+   * a linked device's request throws (500); the primary's own writes and the harness's
+   * `storageVersion` (device 1) still see it.
+   */
+  getStorageManifest(device) {
+    if (this.failingManifest && device.deviceId !== 1) {
+      this.refusedManifests += 1;
+      throw new Error('injected manifest failure (failStorageManifest)');
+    }
+    return super.getStorageManifest(device);
   }
 
   /** Storage Service group requests by group (base64 public params), for `sendStats`. */
@@ -1702,6 +1823,61 @@ class Harness {
    * Encrypts `content` (a mock-server Content object) from primary `sender` to `target` and
    * delivers it; waits for the delivery only with `awaitDelivery`.
    */
+  /**
+   * Encrypts `plaintext` like Desktop (`encryptAttachmentV2`), stores it on the mock's CDN 3
+   * (TUS store) or CDN 0 (`spec.cdn`) and returns its wire pointer (`sendAttachments`, the
+   * pointers of `sendSync {attachmentBackfillResponse}`). `spec`: `contentType?`, `fileName?`,
+   * `width?`, `height?`, `flags?`, `caption?`, `blurHash?`, `durationSeconds?`, `cdn?` (3),
+   * `clientUuid?` (base64 of 16 bytes, as Android puts into a backfilled pointer; none by
+   * default), `uploadTimestamp?` (ms; now), `forge?` (`{digest? (true: a wrong digest;
+   * "none": no digest at all), size?, cdnNumber?, cdnKey?}`: what a hostile sender puts into
+   * the pointer in place of the truth; the blob is stored as usual).
+   */
+  async #pointerOf(plaintext, spec) {
+    const encrypted = encryptAttachment(plaintext);
+    const cdn = spec.cdn ?? 3;
+    let cdnKey;
+    if (cdn === 3) {
+      cdnKey = nodeCrypto.randomUUID();
+      await this.server.storeAttachmentOnCdn(3, cdnKey, encrypted.blob);
+    } else if (cdn === 0) {
+      cdnKey = await this.server.storeAttachment(encrypted.blob);
+    } else {
+      throw badRequest(`unsupported cdn ${cdn}`);
+    }
+    const forge = spec.forge ?? {};
+    if (typeof forge !== 'object' || forge === null) {
+      throw badRequest('"forge" must be an object');
+    }
+    let { digest } = encrypted;
+    if (forge.digest === true) {
+      digest = Buffer.from(digest);
+      digest[0] ^= 1;
+    } else if (forge.digest === 'none') {
+      digest = null;
+    }
+    return {
+      attachmentIdentifier: { cdnKey: typeof forge.cdnKey === 'string' ? forge.cdnKey : cdnKey },
+      cdnNumber: Number.isInteger(forge.cdnNumber) ? forge.cdnNumber : cdn,
+      contentType: spec.contentType ?? 'application/octet-stream',
+      key: encrypted.key,
+      size: Number.isInteger(forge.size) ? forge.size : encrypted.size,
+      digest,
+      fileName: spec.fileName ?? null,
+      flags: spec.flags ?? null,
+      width: spec.width ?? null,
+      height: spec.height ?? null,
+      caption: spec.caption ?? null,
+      blurHash: spec.blurHash ?? null,
+      uploadTimestamp: BigInt(Number.isSafeInteger(spec.uploadTimestamp) ? spec.uploadTimestamp : Date.now()),
+      clientUuid: spec.clientUuid == null ? null : pointerBytes(spec.clientUuid, 'clientUuid'),
+      thumbnail: null,
+      incrementalMac: null,
+      chunkSize: null,
+      audioDurationSeconds: spec.durationSeconds ?? null,
+    };
+  }
+
   async #sendContent(sender, target, content, { timestamp, sealed, awaitDelivery, timeout, serverTimestamp }) {
     await this.ensureSession(sender, target);
     let envelope = await sender.primary.encryptContent(target, content, { timestamp, sealed });
@@ -2408,6 +2584,15 @@ class Harness {
       const status = optInt(args, 'status', 401, { min: 400, max: 599 });
       const count = optInt(args, 'count', -1, { min: -1 });
       this.server.forcedAuth.set(username, { status, left: count });
+      return {};
+    },
+
+    /**
+     * Adds a round trip of `ms` (0, the default, removes it) to every request a client makes
+     * from now on: websocket requests and the gRPC multi-recipient send. Result: `{}`.
+     */
+    setLatency: async (args) => {
+      latency.ms = optInt(args, 'ms', 0, { min: 0, max: 10_000 });
       return {};
     },
 
@@ -3138,48 +3323,7 @@ class Harness {
         throw badRequest('"attachments" or "text" is required');
       }
       const timestamp = optInt(args, 'timestamp', Date.now(), { min: 1 });
-      const pointerOf = async (plaintext, spec) => {
-        const encrypted = encryptAttachment(plaintext);
-        const cdn = spec.cdn ?? 3;
-        let cdnKey;
-        if (cdn === 3) {
-          cdnKey = nodeCrypto.randomUUID();
-          await this.server.storeAttachmentOnCdn(3, cdnKey, encrypted.blob);
-        } else if (cdn === 0) {
-          cdnKey = await this.server.storeAttachment(encrypted.blob);
-        } else {
-          throw badRequest(`unsupported cdn ${cdn}`);
-        }
-        const forge = spec.forge ?? {};
-        if (typeof forge !== 'object' || forge === null) {
-          throw badRequest('"forge" must be an object');
-        }
-        let { digest } = encrypted;
-        if (forge.digest === true) {
-          digest = Buffer.from(digest);
-          digest[0] ^= 1;
-        }
-        return {
-          attachmentIdentifier: { cdnKey: typeof forge.cdnKey === 'string' ? forge.cdnKey : cdnKey },
-          cdnNumber: Number.isInteger(forge.cdnNumber) ? forge.cdnNumber : cdn,
-          contentType: spec.contentType ?? 'application/octet-stream',
-          key: encrypted.key,
-          size: Number.isInteger(forge.size) ? forge.size : encrypted.size,
-          digest,
-          fileName: spec.fileName ?? null,
-          flags: spec.flags ?? null,
-          width: spec.width ?? null,
-          height: spec.height ?? null,
-          caption: spec.caption ?? null,
-          blurHash: spec.blurHash ?? null,
-          uploadTimestamp: BigInt(Date.now()),
-          clientUuid: null,
-          thumbnail: null,
-          incrementalMac: null,
-          chunkSize: null,
-          audioDurationSeconds: spec.durationSeconds ?? null,
-        };
-      };
+      const pointerOf = (plaintext, spec) => this.#pointerOf(plaintext, spec);
       const pointers = [];
       let body = text ?? null;
       if (text !== undefined && Buffer.byteLength(text) > MAX_INLINE_BODY_BYTES) {
@@ -3858,7 +4002,14 @@ class Harness {
      * bytes), callId (a number, or a decimal string for ids above 2^53), timestamp?, type
      * (`audio`, `video`, `group`, `adHoc`, or the wire number), direction (`incoming`,
      * `outgoing`), event (`accepted`, `notAccepted`, `delete`, `observed`)}`: what the phone
-     * syncs about a call; `awaitDelivery?`, `timeout?`. Result: `{timestamp, to}`.
+     * syncs about a call; `attachmentBackfillResponse` `{conversation, author (ACI), timestamp
+     * (the message's sent time), error? ("messageNotFound" or a number) | attachments? [Entry],
+     * longText? Entry | empty? (true: neither)}`, the phone's answer to a request for lost
+     * files, where an Entry is `{status: "pending" | "terminalError" | <number>}`, `{data
+     * (base64), ...}` (uploaded now, the spec of `#pointerOf`: `clientUuid?`, `forge?`, ...),
+     * `{pointer}` (a JSON pointer sent as it is) or `{empty: true}` (an AttachmentData with
+     * neither field); `awaitDelivery?`, `timeout?`. Result: `{timestamp, to}`, and for a
+     * backfill answer `pointers` too (the pointers it put in, in entry order, long text last).
      */
     sendSync: async (args) => {
       const { sender, target } = await this.#syncPair(args);
@@ -3991,8 +4142,81 @@ class Harness {
             },
           },
         };
+      } else if (args.attachmentBackfillResponse != null) {
+        const spec = args.attachmentBackfillResponse;
+        const name = 'attachmentBackfillResponse';
+        const pick = (table, value, what) => {
+          if (Number.isSafeInteger(value)) {
+            return value;
+          }
+          if (!(value in table)) {
+            throw badRequest(`"${what}" must be one of ${Object.keys(table).join(', ')} or a number`);
+          }
+          return table[value];
+        };
+        const entry = async (item, what) => {
+          if (typeof item !== 'object' || item === null) {
+            throw badRequest(`"${what}" must be an object`);
+          }
+          if (item.empty === true) {
+            return { data: null };
+          }
+          if (item.status != null) {
+            return { data: { status: pick(BACKFILL_STATUS, item.status, `${what}.status`) } };
+          }
+          if (item.pointer != null) {
+            const pointer = pointerFromJson(item.pointer, `${what}.pointer`);
+            uploaded.push(pointer);
+            return { data: { attachment: pointer } };
+          }
+          if (typeof item.data === 'string') {
+            const pointer = await this.#pointerOf(Buffer.from(item.data, 'base64'), item);
+            uploaded.push(pointer);
+            return { data: { attachment: pointer } };
+          }
+          throw badRequest(`"${what}" needs one of status, pointer, data or empty`);
+        };
+        if (typeof spec.author !== 'string') {
+          throw badRequest(`"${name}.author" must be an ACI`);
+        }
+        const hasList = spec.attachments != null || spec.longText != null;
+        if (spec.error != null && hasList) {
+          throw badRequest(`"${name}" takes "error" or "attachments"/"longText", not both`);
+        }
+        const uploaded = [];
+        let data = null;
+        if (spec.error != null) {
+          data = { error: pick(BACKFILL_ERROR, spec.error, `${name}.error`) };
+        } else if (hasList) {
+          const attachments = [];
+          for (const [i, item] of optArray(spec, 'attachments').entries()) {
+            attachments.push(await entry(item, `${name}.attachments[${i}]`));
+          }
+          const longText = spec.longText == null ? null : await entry(spec.longText, `${name}.longText`);
+          data = { attachments: { attachments, longText } };
+        } else if (spec.empty !== true) {
+          throw badRequest(`"${name}" needs "error", "attachments", "longText" or "empty"`);
+        }
+        fields = {
+          content: {
+            attachmentBackfillResponse: {
+              targetMessage: addressed(spec, name),
+              targetConversation: thread(spec.conversation, `${name}.conversation`),
+              data,
+            },
+          },
+        };
+        const sent = await this.#sendContent(sender, target, syncContent(fields), {
+          timestamp,
+          sealed: false,
+          awaitDelivery: optBool(args, 'awaitDelivery', false),
+          timeout: timeoutArg(args),
+        });
+        return { ...sent, pointers: jsonSafe(uploaded) };
       } else {
-        throw badRequest('one of "deleteForMe", "viewOnceOpen", "viewed", "read" or "callEvent" is required');
+        throw badRequest(
+          'one of "deleteForMe", "viewOnceOpen", "viewed", "read", "callEvent" or "attachmentBackfillResponse" is required',
+        );
       }
       return this.#sendContent(sender, target, syncContent(fields), {
         timestamp,
@@ -4145,6 +4369,28 @@ class Harness {
       return {};
     },
 
+    /**
+     * Makes every linked device's Storage Service manifest request fail with 500 (`fail?`
+     * true) or work again (`fail: false`): the device's Storage Service sync fails and retries
+     * while everything else works. Result: `{refused}` (requests refused so far).
+     */
+    failStorageManifest: async (args) => {
+      this.server.failingManifest = optBool(args, 'fail', true);
+      return { refused: this.server.refusedManifests };
+    },
+
+    /**
+     * Rate-limits every profile fetch: `GET /v1/profile/...` answers 429 with `Retry-After:
+     * <retryAfter?>` (seconds, default 60) until `stop: true`. Result: `{refused}` (profile
+     * requests refused so far).
+     */
+    limitProfileFetches: async (args) => {
+      profileLimit.retryAfter = optBool(args, 'stop', false)
+        ? null
+        : optInt(args, 'retryAfter', 60, { min: 0 });
+      return { refused: profileLimit.refused };
+    },
+
     /** Sets one remote-config entry served by `/v2/config`. Args: `key`, `enabled?`, `value?`. */
     setRemoteConfig: async (args) => {
       const key = reqString(args, 'key');
@@ -4249,6 +4495,7 @@ class Harness {
       }
       return {
         single: Object.fromEntries(sends.single),
+        urgency: Object.fromEntries(sends.urgency),
         multi: sends.multi,
         multiRecipients: [...sends.multiRecipients],
         refusedTokens: sends.refusedTokens,
@@ -4256,6 +4503,9 @@ class Harness {
         groupFetches,
         uploads: this.server.cdn3Uploads,
         sendRequests: [...sends.single.values()].reduce((sum, n) => sum + n, 0) + sends.multiRequests,
+        // `PUT /v1/devices/link` requests served: one per device a client linked (or tried).
+        linkRequests: sends.linkRequests.length,
+        certificateRequests: [...sends.certificateRequests],
       };
     },
 

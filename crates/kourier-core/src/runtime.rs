@@ -35,7 +35,7 @@ use crate::supervisor::{
     Control, FAILPOINT_AFTER_PENDING_COMMAND, Hint, Plan, RestartPolicy, Supervisor, Timeouts,
 };
 use crate::vault::{AccountVault, VaultError};
-use crate::{calls, expiry, local, modify, outbox, query};
+use crate::{calls, expiry, local, modify, outbox, query, restore};
 
 /// Everything the core needs from the composition root.
 pub struct CoreConfig {
@@ -131,11 +131,28 @@ pub(crate) struct Shared {
     pub playback: Playback,
     /// At most this many thumbnail jobs decode at the same time.
     pub derive_permits: Arc<Semaphore>,
+    /// Accounts being removed in this run (link feedback L4, `buttons.md` F6): their background
+    /// work (the thumbnails of downloaded attachments) stops instead of reading files that are
+    /// being deleted and writing rows of an account that is gone. Account ids are never reused
+    /// (`AUTOINCREMENT`), so an id stays here for the rest of the run.
+    pub removing: Mutex<std::collections::BTreeSet<AccountId>>,
+    /// The `LogoutOutcome`s told before the front-end said `UiReady` (`Some` until then): a
+    /// removal or unlink that a quit cut off is finished while the core starts, before any
+    /// front-end listens, and the user must still be told what became of the device. They are
+    /// sent again at `UiReady` (same `seq`) and the list is dropped. Bounded.
+    pub logout_outcomes: Mutex<Option<Vec<UiEvent>>>,
+    /// The `seq` of the next `LogoutOutcome`.
+    pub outcome_seq: std::sync::atomic::AtomicU64,
     /// Wakes the disappearing-message sweeper ([`expiry`]) after a write that started a timer.
     pub expiry_wake: tokio::sync::Notify,
     /// Wakes the deadline task of ringing call lines ([`calls`]) after a write that stored
     /// one, and after a resume.
     pub calls_wake: tokio::sync::Notify,
+    /// Wakes the task of the waits for the other device's answer (`crate::restore`).
+    pub restore_wake: tokio::sync::Notify,
+    /// Which accounts' due waits may be judged: not before their backend replayed its outbox
+    /// ([`restore::Gate`]).
+    pub restore_gate: Mutex<restore::Gate>,
     /// Who may be told of a missed call at once, and the missed calls that wait for a
     /// catch-up summary ([`calls::Watch`]).
     pub calls_watch: Mutex<calls::Watch>,
@@ -166,6 +183,69 @@ pub(crate) struct Shared {
 
 /// Thumbnail jobs that decode at the same time.
 const DERIVE_PARALLEL: usize = 2;
+/// [`DERIVE_PARALLEL`] as the semaphore counts it: holding this many permits means no
+/// thumbnail is being computed.
+pub(crate) const DERIVE_PARALLEL_PERMITS: u32 = DERIVE_PARALLEL as u32;
+
+/// How many outcomes wait for the front-end ([`Shared::logout_outcomes`]).
+const LOGOUT_OUTCOMES_KEPT: usize = 32;
+
+impl Shared {
+    /// Tells the front-ends what became of an account's device ([`UiEvent::LogoutOutcome`]),
+    /// once now, and again at `UiReady` when nobody was ready yet.
+    pub(crate) fn emit_logout_outcome(
+        &self,
+        account: AccountId,
+        removed: bool,
+        report: kourier_model::LogoutReport,
+        who: crate::facade::AccountLabel,
+    ) {
+        // The number is taken and the event sent under the lock, so outcomes reach every
+        // receiver in the order of their numbers, also against a replay at `UiReady`.
+        let mut kept = self
+            .logout_outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let seq = self
+            .outcome_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let event = UiEvent::LogoutOutcome {
+            seq,
+            account,
+            removed,
+            report,
+            who,
+        };
+        if let Some(list) = kept.as_mut() {
+            if list.len() >= LOGOUT_OUTCOMES_KEPT {
+                list.remove(0);
+            }
+            list.push(event.clone());
+        }
+        self.emit(event);
+    }
+
+    /// The front-end is ready: what was told before it is told again.
+    fn replay_logout_outcomes(&self) {
+        // Sent under the lock: a new outcome cannot overtake the ones told again.
+        let mut kept = self
+            .logout_outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for event in kept.take().into_iter().flatten() {
+            self.emit(event);
+        }
+    }
+
+    /// Whether `account` is being removed in this run ([`Shared::removing`]).
+    pub(crate) fn is_removing(&self, account: AccountId) -> bool {
+        self.removing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&account)
+    }
+}
 
 impl Shared {
     pub(crate) fn emit(&self, e: UiEvent) {
@@ -268,6 +348,9 @@ impl Shared {
         blob_dir: &Path,
         ch: Changes,
     ) {
+        // Counted before the UI events: a reader that saw them sees the jobs until their
+        // results are published (`MediaHandles::deriving`).
+        let hold = self.media.reserve(ch.derive.len());
         emit_changes(self, &ch);
         if !ch.unlink.is_empty() {
             let (dir, paths) = (blob_dir.to_owned(), ch.unlink.clone());
@@ -275,7 +358,7 @@ impl Shared {
         }
         if !ch.derive.is_empty() {
             let scope = self.scope_of(account).await;
-            derive::spawn(self, account, scope, blob_dir.to_owned(), ch.derive);
+            derive::spawn(self, account, scope, blob_dir.to_owned(), ch.derive, hold);
         }
     }
 
@@ -333,6 +416,8 @@ pub struct Core {
     sweeper: Option<JoinHandle<()>>,
     /// The deadline task of ringing call lines.
     calls: Option<JoinHandle<()>>,
+    /// The deadline task of the waits for the other device's answer ([`restore`]).
+    restores: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
 }
 
@@ -357,6 +442,10 @@ impl Core {
     /// them when `core.db` was deleted — is recreated as an `Active` account started with
     /// `StartMode::Rebuild` when its secret still opens it, and removed when it does not.
     pub async fn start(cfg: CoreConfig) -> Result<Self> {
+        crate::ingest::restore::tune_waits(
+            cfg.timeouts.restore_answer,
+            cfg.timeouts.restore_pending,
+        );
         let (path, key) = (cfg.core_db.clone(), cfg.core_key.clone());
         let media_dir = cfg.media_cache.clone();
         let (store, fresh, playback) = tokio::task::spawn_blocking(move || {
@@ -398,8 +487,13 @@ impl Core {
             media: MediaHandles::new(tx.clone()),
             playback,
             derive_permits: Arc::new(Semaphore::new(DERIVE_PARALLEL)),
+            removing: Mutex::new(std::collections::BTreeSet::new()),
+            logout_outcomes: Mutex::new(Some(Vec::new())),
+            outcome_seq: std::sync::atomic::AtomicU64::new(0),
             expiry_wake: tokio::sync::Notify::new(),
             calls_wake: tokio::sync::Notify::new(),
+            restore_wake: tokio::sync::Notify::new(),
+            restore_gate: Mutex::new(restore::Gate::default()),
             calls_watch: Mutex::new(calls::Watch::default()),
             clock_wrong: Mutex::new(clock_wrong),
             clock_unverified: Mutex::new(std::collections::BTreeSet::new()),
@@ -418,6 +512,17 @@ impl Core {
                 (matches!(plan, Plan::Run(_)) && shared.networks.get(*network).is_some())
                     .then_some(*id)
             }));
+        // The accounts that will get an actor are "starting" for the waits for the other
+        // device's answer (`restore::Gate`) from here on, before the task that judges them is
+        // spawned: its first look comes at once, and a wait that ran out while Kourier was
+        // closed must not end before the account's actor was registered and its backend
+        // replayed the answer it kept (the supervisor first unwraps the key, reads the
+        // preferences and spawns the network; its own mark replaces this one).
+        for (id, _, network, plan) in &plans {
+            if matches!(plan, Plan::Run(_)) && shared.networks.get(*network).is_some() {
+                shared.restore_actor_started(*id);
+            }
+        }
         // And before any query is served: what came due while Kourier was not running is
         // hidden from the first read on, where the user chose that.
         let (hold, now) = (shared.expiry_hold(), shared.now());
@@ -427,8 +532,11 @@ impl Core {
                 expiry::settle_at_start(c, now, &hold)
             })
             .await?;
-        for (id, uuid, network, _) in &plans {
-            startup_files(&shared, *id, *uuid, *network).await;
+        for (id, uuid, network, plan) in &plans {
+            // A removed account's files are going: no work is started for them.
+            if !matches!(plan, Plan::Remove) {
+                startup_files(&shared, *id, *uuid, *network).await;
+            }
         }
         let handle = CoreHandle {
             commands: tx,
@@ -449,11 +557,13 @@ impl Core {
         let task = tokio::spawn(run_core(shared.clone(), rx, slots));
         let sweeper = tokio::spawn(expiry::run(shared.clone()));
         let calls = tokio::spawn(calls::run(shared.clone()));
+        let restores = tokio::spawn(restore::run(shared.clone()));
         Ok(Self {
             handle,
             task: Some(task),
             sweeper: Some(sweeper),
             calls: Some(calls),
+            restores: Some(restores),
             shared,
         })
     }
@@ -473,7 +583,7 @@ impl Core {
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
-        for t in [self.sweeper.take(), self.calls.take()]
+        for t in [self.sweeper.take(), self.calls.take(), self.restores.take()]
             .into_iter()
             .flatten()
         {
@@ -490,7 +600,7 @@ impl Drop for Core {
         if self.task.is_some() {
             self.shared.cancel.cancel();
         }
-        for t in [self.sweeper.take(), self.calls.take()]
+        for t in [self.sweeper.take(), self.calls.take(), self.restores.take()]
             .into_iter()
             .flatten()
         {
@@ -529,6 +639,18 @@ async fn reconcile(
     for row in rows {
         known.insert(row.uuid);
         match row.state {
+            // A removal that a quit cut off: its supervisor tries the logout once, then
+            // finishes it (link feedback L4: the phone must not keep listing the device).
+            AccountState::Removing if sh.networks.get(row.network).is_some() => {
+                tracing::info!(account = row.id.0, "finishing an unfinished removal");
+                plans.push((row.id, row.uuid, row.network, Plan::Remove));
+            }
+            // An unlink that a quit cut off: one more logout attempt, then logged out with the
+            // chats kept.
+            AccountState::Unlinking => {
+                tracing::info!(account = row.id.0, "finishing an unfinished unlink");
+                plans.push((row.id, row.uuid, row.network, Plan::Unlink));
+            }
             AccountState::Linking | AccountState::Removing => {
                 tracing::info!(
                     account = row.id.0,
@@ -946,6 +1068,7 @@ async fn ui_command(
     match cmd {
         UiCommand::UiReady => {
             sh.ui_ready.send_replace(true);
+            sh.replay_logout_outcomes();
         }
         UiCommand::AddAccount { network, flow } => match add_account(sh, network).await {
             Ok((id, uuid, net)) => {
@@ -980,6 +1103,11 @@ async fn ui_command(
         UiCommand::RemoveAccount { account } => {
             if let Err(e) = control(slots, account, Control::Remove) {
                 fail(Some(account), "RemoveAccount", e);
+            }
+        }
+        UiCommand::Unlink { account } => {
+            if let Err(e) = control(slots, account, Control::Unlink) {
+                fail(Some(account), "Unlink", e);
             }
         }
         UiCommand::RestartAccount { account } => {
@@ -1262,6 +1390,7 @@ async fn ui_command(
             // synced meanwhile comes with the reconnect.
             sh.calls_resumed();
             sh.calls_wake.notify_one();
+            sh.restore_wake.notify_one();
             for s in slots.values() {
                 let _ = s.control.send(Control::Hint(Hint::Resumed));
             }
@@ -1414,12 +1543,16 @@ struct SendFiles {
 
 /// Invalidations for a core-local write (the supervisor publishes ingest's own).
 pub(crate) fn emit_changes(sh: &Shared, ch: &Changes) {
+    sh.media.check_reserved(ch.derive.len());
     sh.forget_media(ch);
     if ch.expiring {
         sh.expiry_wake.notify_one();
     }
     if ch.ringing {
         sh.calls_wake.notify_one();
+    }
+    if ch.restoring {
+        sh.restore_wake.notify_one();
     }
     if !ch.removed.is_empty() {
         sh.emit(UiEvent::ConversationsRemoved {
@@ -1885,7 +2018,8 @@ async fn startup_files(
         .map_or(kourier_model::MsgIdScope::AccountAuthor, |n| {
             n.descriptor().msg_id_scope
         });
-    derive::spawn(sh, account, scope, dir.clone(), derives);
+    let hold = sh.media.reserve(derives.len());
+    derive::spawn(sh, account, scope, dir.clone(), derives, hold);
     // Thumbnails are written without fsync: what a power loss took is made again, off the
     // startup path.
     derive::repair_thumbs(sh, account, scope, dir);
@@ -2211,11 +2345,17 @@ async fn download_attachment(
         .await
         .map_err(|e| (Some(account), e))?;
     let jobs = std::mem::take(&mut ch.downloads);
+    let commands = std::mem::take(&mut ch.commands);
     emit_changes(sh, &ch);
-    if !jobs.is_empty()
-        && let Some(tx) = senders.get(&account)
-    {
-        let _ = tx.send(Control::Downloads(jobs));
+    if let Some(tx) = senders.get(&account) {
+        // A request to the other device (a click on a file the network lost): its row is
+        // stored, the account's next start resends it if this one is lost.
+        if !commands.is_empty() {
+            let _ = tx.send(Control::Durable(commands));
+        }
+        if !jobs.is_empty() {
+            let _ = tx.send(Control::Downloads(jobs));
+        }
     }
     Ok(())
 }

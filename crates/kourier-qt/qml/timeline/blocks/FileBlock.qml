@@ -22,6 +22,10 @@ RowLayout {
     readonly property string mediaState: root.block.state
     readonly property bool available: root.mediaState === "local"
     readonly property bool busy: root.mediaState === "downloading"
+    // Gone here, and Download asks the user's phone to upload it again (the core decides it).
+    readonly property bool ask: root.block.ask === true
+    // What a click fetches: a download, a retry, or the question to the phone.
+    readonly property bool downloadable: root.mediaState === "remote" || root.mediaState === "failed" || root.ask
     // Voice playback: the player exists once asked for (and stays while the row lives).
     property bool playRequested: false
     readonly property var player: playerLoader.item
@@ -33,7 +37,7 @@ RowLayout {
             return "";
         }
         if (!root.available) {
-            return root.mediaState === "remote" || root.mediaState === "failed" ? "download" : "";
+            return root.downloadable ? "download" : "";
         }
         if (root.voice) {
             return root.player && root.player.playing ? "pause" : "play";
@@ -53,7 +57,7 @@ RowLayout {
             return;
         }
         if (!root.available) {
-            if (root.mediaState === "remote" || root.mediaState === "failed") {
+            if (root.downloadable) {
                 App.downloadAttachment(root.attachment);
             }
         } else if (root.voice) {
@@ -71,19 +75,35 @@ RowLayout {
         id: action
         implicitWidth: Kirigami.Units.gridUnit * 2.2
         implicitHeight: implicitWidth
-        enabled: root.mediaState !== "expired" && root.attachment > 0
-        hoverEnabled: true
+        // A quiet disc stays enabled, because Kirigami.Icon draws the glyph of a disabled item
+        // dimmed and that would undo its contrast; it takes no focus and no hover, says it is
+        // not a button, and a click does nothing (`act()` looks at what can be fetched).
+        enabled: root.attachment > 0
+        hoverEnabled: !action.quiet
+        focusPolicy: action.quiet ? Qt.NoFocus : Qt.StrongFocus
+        Accessible.role: action.quiet ? Accessible.StaticText : Accessible.Button
         text: {
             if (root.busy) {
                 return L10n.i18nc("@info:tooltip", "Downloading");
             }
+            if (root.ask) {
+                return L10n.i18nc("@action:button", "Download");
+            }
             switch (root.mediaState) {
             case "remote":
                 return L10n.i18nc("@action:button", "Download");
+            case "asking":
+                return L10n.i18nc("@info", "Asking your phone…");
+            case "noanswer":
+            case "nomessage":
+            case "nofile":
+                return MediaActions.askNote(root.mediaState);
             case "failed":
                 return L10n.i18nc("@action:button", "Retry Download");
             case "expired":
                 return L10n.i18nc("@info", "No longer available");
+            case "unavailable":
+                return L10n.i18nc("@info", "Not available on this device");
             default:
                 return root.voice ? L10n.i18nc("@action:button", "Play") : L10n.i18nc("@action:button", "Open");
             }
@@ -96,19 +116,32 @@ RowLayout {
         // A downloaded file shows its type's (colored) icon on a plain disc; actions are glyphs
         // on the accent, in the theme's selection text color, adjusted until they can be read.
         readonly property bool typeIcon: root.available && !root.voice
+        // Nothing to click: waiting for the phone, or a file that cannot be had ("Not on your
+        // phone", "No answer from your phone", "No longer available"). Such a disc is a plain
+        // one like the downloaded file's, framed, with a quiet glyph that can be read on it:
+        // the accent at half opacity under the accent's text colour all but vanished in the
+        // dark theme.
+        readonly property bool quiet: root.attachment > 0 && !root.available && !root.busy && !root.downloadable
         readonly property color fill: {
-            if (action.typeIcon) {
+            if (action.typeIcon || action.quiet) {
                 return Kirigami.Theme.backgroundColor;
             }
             return action.hovered ? Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.highlightColor, Kirigami.Theme.textColor, 0.12) : Kirigami.Theme.highlightColor;
         }
         // On the accent fill: the theme's own text colour for its highlight (white on Breeze's
         // blue; user decision, 2026-10-08: the theme's pairing, not a computed contrast).
-        readonly property color glyph: action.typeIcon ? Kirigami.Theme.textColor : Kirigami.Theme.highlightedTextColor
+        readonly property color glyph: {
+            if (action.typeIcon) {
+                return Kirigami.Theme.textColor;
+            }
+            return action.quiet ? Style.secondary(Kirigami.Theme.textColor, action.fill) : Kirigami.Theme.highlightedTextColor;
+        }
 
         background: Rectangle {
             radius: width / 2
             color: action.fill
+            border.width: action.quiet ? 1 : 0
+            border.color: Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
             opacity: action.enabled ? 1 : 0.5
         }
         contentItem: Item {
@@ -118,12 +151,22 @@ RowLayout {
                 width: Kirigami.Units.iconSizes.smallMedium
                 height: width
                 source: {
+                    if (root.ask) {
+                        return "download";
+                    }
                     switch (root.mediaState) {
                     case "remote":
                         return "download";
+                    case "asking":
+                        return "appointment-soon";
+                    case "noanswer":
+                    case "nomessage":
+                    case "nofile":
+                        return "dialog-cancel";
                     case "failed":
                         return "view-refresh";
                     case "expired":
+                    case "unavailable":
                         return "dialog-cancel";
                     default:
                         if (root.voice) {
@@ -200,11 +243,26 @@ RowLayout {
                 if (root.mediaState === "expired") {
                     return L10n.i18nc("@info", "No longer available");
                 }
+                if (root.mediaState === "unavailable") {
+                    return L10n.i18nc("@info", "Not available on this device");
+                }
+                if (root.mediaState === "asking") {
+                    return L10n.i18nc("@info", "Asking your phone…");
+                }
+                const note = MediaActions.askNote(root.mediaState);
+                if (note !== "") {
+                    return note;
+                }
                 return root.block.detail;
             }
             color: root.subtleInk
             font: Kirigami.Theme.smallFont
             textFormat: Text.PlainText
+            // A note carries the way on ("Open Signal on your phone and try again."): it
+            // wraps inside the bubble at every width, as long as the name above it.
+            wrapMode: Text.Wrap
+            Layout.fillWidth: true
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 14
         }
     }
 

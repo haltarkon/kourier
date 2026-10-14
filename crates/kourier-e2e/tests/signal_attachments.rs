@@ -327,9 +327,13 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     });
     // The UI hears about the upload: shares of the blob below 1, then 1 once it is uploaded.
     let mut shares = Vec::new();
+    let mut steps = Vec::new();
     app.event("the upload's progress", |e| match e {
-        UiEvent::Progress(Progress::Transmit { progress, .. }) => {
+        UiEvent::Progress(Progress::Transmit {
+            progress, phase, ..
+        }) => {
             shares.push(*progress);
+            steps.push(*phase);
             (*progress >= 1.0).then_some(())
         }
         _ => None,
@@ -339,6 +343,17 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
         shares.is_sorted() && shares.iter().rev().skip(1).all(|p| *p < 1.0),
         "{shares:?}"
     );
+    // The line under the message says "Uploading files" while the blobs go up and no longer
+    // once they are up: a 1:1 send reports no step after this one, so the end of the uploads
+    // must clear the last (link feedback L6).
+    let (done, uploading) = steps.split_last().expect("a report");
+    assert!(
+        uploading
+            .iter()
+            .all(|s| *s == Some(kourier_model::SendPhase::Uploading)),
+        "{steps:?}"
+    );
+    assert_eq!(*done, None, "the uploads are over: no step ({steps:?})");
     let message = alice_receives(&world, &me).await;
     assert_eq!(message["body"], "the report");
     let pointers = pointers_in(&message);
@@ -528,7 +543,8 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     world.shutdown().await;
 }
 
-/// The attachment of the row captioned `caption`, once its download failed.
+/// The attachment of the row captioned `caption`, once its download failed or the backend
+/// said at receipt that it can never be fetched (`Unavailable`).
 async fn wait_failed(app: &App, conv: ConversationId, caption: &str) -> Attachment {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -543,7 +559,10 @@ async fn wait_failed(app: &App, conv: ConversationId, caption: &str) -> Attachme
                 AttachmentState::Local,
                 "{caption}: a hostile attachment was accepted"
             );
-            if matches!(attachment.state, AttachmentState::Failed { .. }) {
+            if matches!(
+                attachment.state,
+                AttachmentState::Failed { .. } | AttachmentState::Unavailable
+            ) {
                 return attachment.clone();
             }
         }
@@ -583,13 +602,19 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
         forge: Some(forge),
         ..OutgoingFile::new(&bait, "image/png")
     };
-    for (caption, forge) in [
+    // A pointer that fails only when its download is checked ends Failed for good; one the
+    // backend can tell at receipt it can never fetch (a CDN this build has no address for, a
+    // CDN key that is not a safe token) is "not available on this device" at once, with no
+    // request and no dead "Retry Download".
+    let failed = AttachmentState::Failed { retryable: false };
+    for (caption, forge, expected) in [
         (
             "a wrong digest",
             ForgedPointer {
                 digest: true,
                 ..ForgedPointer::default()
             },
+            failed,
         ),
         (
             // 100 bytes may take 592 on the CDN; the blob has over 50 000.
@@ -598,6 +623,7 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
                 size: Some(100),
                 ..ForgedPointer::default()
             },
+            failed,
         ),
         (
             "a CDN that does not exist",
@@ -605,6 +631,7 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
                 cdn_number: Some(77),
                 ..ForgedPointer::default()
             },
+            AttachmentState::Unavailable,
         ),
         (
             "a path as the CDN key",
@@ -612,6 +639,7 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
                 cdn_key: Some("../../v1/config".to_owned()),
                 ..ForgedPointer::default()
             },
+            AttachmentState::Unavailable,
         ),
     ] {
         world
@@ -620,11 +648,7 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
             .await
             .expect(caption);
         let attachment = wait_failed(&app, conv, caption).await;
-        assert_eq!(
-            attachment.state,
-            AttachmentState::Failed { retryable: false },
-            "{caption}: no retry can help"
-        );
+        assert_eq!(attachment.state, expected, "{caption}: no retry can help");
         assert!(attachment.local.is_none(), "{caption}");
     }
 

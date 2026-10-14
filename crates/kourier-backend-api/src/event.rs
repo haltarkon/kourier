@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use kourier_model::ids::validate_local;
 use kourier_model::{
-    AccountCaps, AccountSettingsPatch, AttachmentId, AttachmentMeta, BackendBlob, BackendError,
-    Body, CmdId, ContactPatch, ConvKey, ConversationPatch, DownloadId, Expiry, HistoryTransfer,
-    IdError, LocalMsgId, LoginStep, MsgTarget, NetMsgId, Origin, OutgoingState, PersistError,
-    ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
+    AccountCaps, AccountProgress, AccountSettingsPatch, AttachmentId, AttachmentMeta, BackendBlob,
+    BackendError, Body, CmdId, ContactPatch, ConvKey, ConversationPatch, DownloadId, Expiry,
+    HistoryTransfer, IdError, LocalMsgId, LoginStep, LogoutReport, MsgTarget, NetMsgId, Origin,
+    OutgoingState, PersistError, ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -121,12 +121,37 @@ pub enum BackendEvent {
     AttachmentDeleted {
         /// The message.
         target: MsgTarget,
-        /// Names of the attachment: the first attachment of the message one of whose
-        /// `Attachment::net_ids` is in this list goes (Signal: client UUID, digest). They
-        /// name content, hence redacted in `Debug`.
+        /// Names of the attachment, in order of priority (Signal: client UUID, digest,
+        /// plaintext hash): the first name that any attachment of the message has in its
+        /// `Attachment::net_ids` decides, and that attachment goes (the order over ALL
+        /// attachments, so a name two attachments share, like a plaintext hash, never beats a
+        /// name only one has). They name content, hence redacted in `Debug`.
         net_ids: Redacted<Vec<String>>,
         /// When (ms).
         at: i64,
+    },
+    /// News about a request for the files of one message that the network lost
+    /// (`Command::RequestAttachments`; Signal: attachment backfill): our request went out or
+    /// could not be sent, or the account's other device answered. An answer comes also for
+    /// a request another device of the account made (the phone answers all of them), and
+    /// several answers come for one request (a first one at once, more as the other device
+    /// uploads). The backend reports an answer only from the device that can give one
+    /// (Signal: the primary, device 1) and only for a message it could name; the core
+    /// applies it only to a message it has and never adds an attachment.
+    AttachmentRestore {
+        /// The message (its original id).
+        target: MsgTarget,
+        /// What happened.
+        update: RestoreUpdate,
+        /// When (ms).
+        at: i64,
+        /// The command the news is about: `Some` for [`RestoreUpdate::Sent`] and
+        /// [`RestoreUpdate::NotSent`] (the `cmd` of `Command::RequestAttachments`), which the
+        /// core applies only to the request that command made, never to a newer wait for the
+        /// same message; `None` for an answer, which names no command on any network (the
+        /// other device answers about the message). Old stored events lack it.
+        #[serde(default)]
+        cmd: Option<CmdId>,
     },
     /// A live message.
     ///
@@ -367,12 +392,19 @@ pub enum BackendEvent {
         /// What was written, or why not.
         result: Result<AttachmentMeta, BackendError>,
     },
-    /// Ephemeral: transmit progress of an own message.
+    /// Ephemeral: transmit progress of an own message. The backend reports it while an
+    /// attempt runs, at most a few times a second; a restart starts the attempt over.
     TransmitProgress {
         /// The message row.
         local: LocalMsgId,
-        /// 0.0 … 1.0.
+        /// The upload share of its attachments, 0.0 … 1.0 (0.0 for a message without
+        /// attachments).
         progress: f32,
+        /// What the send is doing now (`None`: no step, only the upload share is known; it
+        /// ends the step shown, so the uploads' end reports `None`). The UI keeps the last
+        /// one until the next report or until the row's state changes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<kourier_model::SendPhase>,
     },
     /// A banner for the user.
     Notice(BackendNotice),
@@ -389,6 +421,18 @@ pub enum BackendEvent {
     /// from what is on disk). While the state is not over the backend delivers no message;
     /// `Command::SkipHistoryTransfer` ends a wait or a download.
     HistoryTransfer(HistoryTransfer),
+    /// Ephemeral: how far the work of a newly linked account is that the user waits for
+    /// while the chats are already usable: the delivery of an imported history (messages
+    /// delivered and in all), then the profiles and the groups the link still fetches. Sent
+    /// while that work runs, when the numbers change, and once more with `finished` set when
+    /// nothing is left. Never stored: after a restart the backend reports again if work is
+    /// left. A backend that has no such work never sends it.
+    AccountProgress(AccountProgress),
+    /// Ephemeral: what became of this device on the network after `Command::Logout` (removed,
+    /// none to remove, the network not reached) and the name it was linked with. Sent once,
+    /// right before the actor exits `LoggedOut` for that command; the core tells the user,
+    /// once, whether the phone still lists the device. Never sent for an unlink by the phone.
+    Logout(LogoutReport),
 }
 
 impl BackendEvent {
@@ -406,6 +450,7 @@ impl BackendEvent {
             Self::ConversationRemoved { .. } => "ConversationRemoved",
             Self::ConversationCleared { .. } => "ConversationCleared",
             Self::AttachmentDeleted { .. } => "AttachmentDeleted",
+            Self::AttachmentRestore { .. } => "AttachmentRestore",
             Self::Message(_) => "Message",
             Self::HistoryBatch { .. } => "HistoryBatch",
             Self::Edited { .. } => "Edited",
@@ -422,6 +467,8 @@ impl BackendEvent {
             Self::TransmitProgress { .. } => "TransmitProgress",
             Self::Notice(_) => "Notice",
             Self::HistoryTransfer(_) => "HistoryTransfer",
+            Self::AccountProgress(_) => "AccountProgress",
+            Self::Logout(_) => "Logout",
         }
     }
 
@@ -436,6 +483,8 @@ impl BackendEvent {
                 | Self::DownloadProgress { .. }
                 | Self::TransmitProgress { .. }
                 | Self::HistoryTransfer(_)
+                | Self::AccountProgress(_)
+                | Self::Logout(_)
         )
     }
 
@@ -463,6 +512,7 @@ impl BackendEvent {
             Self::Deleted { target: t, .. }
             | Self::Reaction { target: t, .. }
             | Self::AttachmentDeleted { target: t, .. }
+            | Self::AttachmentRestore { target: t, .. }
             | Self::OwnSendState { target: t, .. } => target(t),
             Self::ConversationCleared { conv, up_to, .. } => {
                 conv.validate()?;
@@ -487,9 +537,56 @@ impl BackendEvent {
             | Self::AttachmentDone { .. }
             | Self::TransmitProgress { .. }
             | Self::HistoryTransfer(_)
+            | Self::AccountProgress(_)
+            | Self::Logout(_)
             | Self::Notice(_) => Ok(()),
         }
     }
+}
+
+/// What [`BackendEvent::AttachmentRestore`] reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreUpdate {
+    /// This device's request went out: the wait for an answer starts now.
+    Sent,
+    /// This device's request was not sent and will not be (it was given up): the wait ends
+    /// as if the other device had not answered.
+    NotSent,
+    /// The other device's answer: one slot per file of the message in the other device's
+    /// order (the files a network can restore: no quote thumbnail, link preview picture or
+    /// contact avatar; Signal puts a sticker's image first), and the rest of a long text in
+    /// a slot of its own.
+    Answer {
+        /// The files, in the other device's order.
+        attachments: Vec<RestoreSlot>,
+        /// The rest of the message's long text, when the answer has a slot for it.
+        long_text: Option<RestoreSlot>,
+    },
+    /// The other device does not have the message (or no file of it).
+    MessageNotFound,
+}
+
+/// One file of a [`RestoreUpdate::Answer`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreSlot {
+    /// The file was uploaded again: its new pointer.
+    File {
+        /// The new network pointer (becomes `Attachment::remote`).
+        remote: BackendBlob,
+        /// The names the pointer gives the file (Signal: `uuid:` of its client UUID, the new
+        /// `digest:`), in order of priority. The core matches a slot to an attachment by
+        /// these first and adds the ones the attachment lacks. Redacted in `Debug`.
+        net_ids: Redacted<Vec<String>>,
+        /// The plaintext size the pointer states.
+        size: u64,
+    },
+    /// The other device is still working on it (uploading): wait for a later answer.
+    Pending,
+    /// The other device does not have this file.
+    Gone,
+    /// Nothing usable (a pointer this build cannot fetch, an empty slot): the slot keeps
+    /// its place and changes nothing.
+    Skip,
 }
 
 /// Checks a message reference: its conversation key, `local` and alternates.

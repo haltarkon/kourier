@@ -7,11 +7,11 @@
 use std::collections::HashMap;
 
 use kourier_model::{
-    Attachment, AttachmentId, AttachmentKind, AttachmentState, Body, CannotSend, Message,
-    MessageId, OutgoingState, UserId,
+    AskFailure, Attachment, AttachmentId, AttachmentKind, AttachmentState, Body, CannotSend,
+    Message, MessageId, OutgoingState, SendPhase, UserId,
 };
 
-use crate::i18n::{trc, trnc};
+use crate::i18n::{trc, trfc, trnc, trnfc};
 use crate::media::{self, MediaVariant};
 use crate::names::{Names, single_line};
 use crate::preview::{self, NoticeTone, Summary};
@@ -121,8 +121,18 @@ pub enum MediaState {
     Local,
     /// Download failed.
     Failed,
-    /// No longer available.
+    /// No longer available (the network said so).
     Expired,
+    /// Not available on this device (known without asking).
+    Unavailable,
+    /// The user's phone is being asked to upload it again ("Asking your phone…").
+    Asking,
+    /// The phone did not answer in time; a click asks again.
+    NoAnswer,
+    /// The phone no longer has the message.
+    NoMessage,
+    /// The phone does not have this file either.
+    NoFile,
 }
 
 impl MediaState {
@@ -140,6 +150,16 @@ impl MediaState {
             AttachmentState::Local => (Self::Local, 1.0),
             AttachmentState::Failed { .. } => (Self::Failed, 0.0),
             AttachmentState::Expired => (Self::Expired, 0.0),
+            AttachmentState::Unavailable => (Self::Unavailable, 0.0),
+            AttachmentState::Asking => (Self::Asking, 0.0),
+            AttachmentState::AskFailed { why } => (
+                match why {
+                    AskFailure::NoAnswer => Self::NoAnswer,
+                    AskFailure::NoMessage => Self::NoMessage,
+                    AskFailure::NoFile => Self::NoFile,
+                },
+                0.0,
+            ),
         }
     }
 
@@ -151,6 +171,11 @@ impl MediaState {
             Self::Local => "local",
             Self::Failed => "failed",
             Self::Expired => "expired",
+            Self::Unavailable => "unavailable",
+            Self::Asking => "asking",
+            Self::NoAnswer => "noanswer",
+            Self::NoMessage => "nomessage",
+            Self::NoFile => "nofile",
         }
     }
 }
@@ -189,6 +214,10 @@ pub struct ImageBlock {
     pub label: String,
     /// Sticker (no bubble).
     pub sticker: bool,
+    /// It is gone here, and a click asks the user's phone to upload it again: the core lists
+    /// this attachment among the ones its Download asks for
+    /// (`MessageActions::ask_attachments`); no rule of the viewmodel's.
+    pub ask: bool,
 }
 
 crate::safe_debug!(ImageBlock {
@@ -200,7 +229,8 @@ crate::safe_debug!(ImageBlock {
     height,
     state,
     progress,
-    sticker
+    sticker,
+    ask
 });
 
 /// A file, audio file or voice note.
@@ -224,6 +254,9 @@ pub struct FileBlock {
     pub progress: f32,
     /// Voice note.
     pub voice: bool,
+    /// It is gone here, and a click asks the user's phone to upload it again (as
+    /// [`ImageBlock::ask`]).
+    pub ask: bool,
 }
 
 crate::safe_debug!(FileBlock {
@@ -233,7 +266,8 @@ crate::safe_debug!(FileBlock {
     icon,
     state,
     progress,
-    voice
+    voice,
+    ask
 });
 
 /// Whether the message a quote points at is (still) here.
@@ -373,6 +407,9 @@ pub struct RowActions {
     pub take_back: bool,
     /// Its send failed for some or all recipients: it can be sent again.
     pub retry: bool,
+    /// Download on one of its gone attachments asks the user's phone to upload it again
+    /// (the core's `MessageActions::ask_attachments` is not empty; the blocks carry it as `ask`).
+    pub ask_attachments: bool,
 }
 
 impl RowActions {
@@ -398,6 +435,223 @@ pub struct Reaction {
     pub emoji: String,
     /// When (ms).
     pub at: i64,
+}
+
+/// An own message on its way is explained under the bubble only once it has taken this long
+/// since it was sent (link feedback L6, "after a few seconds"): normal sends stay clean.
+pub const WAIT_SHOWN_AFTER_MS: i64 = 3_000;
+
+/// Why an own message that is still on its way waits (link feedback L6): a hold names the
+/// REAL one, in the terms of the banner of the account that says the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    /// Queued or being sent, nothing more known ("Sending… 0:42").
+    Sending,
+    /// The account is not connected (offline, connecting).
+    Connection,
+    /// The network asks for a check that a person is sending (banner "Verify…").
+    Challenge,
+    /// The conversation waits for the user to confirm a changed safety number.
+    SafetyNumber,
+    /// The computer's clock is off.
+    Clock,
+    /// The device is no longer linked.
+    LoggedOut,
+    /// The network restricted the account.
+    Restricted,
+    /// This version of Kourier is too old for the network.
+    UpdateApp,
+    /// Another session took over the connection.
+    Reconnect,
+    /// The attempt is at this step (the backend's ephemeral `SendPhase`).
+    Phase(SendPhase),
+}
+
+impl WaitReason {
+    /// The message waits for something other than its own send: no countdown to a next try
+    /// means anything then.
+    pub fn is_hold(self) -> bool {
+        !matches!(self, Self::Sending | Self::Phase(_))
+    }
+}
+
+/// What the line under an own message on its way is built from: the reason, the stored
+/// `sent_at` the timer counts up from (it survives a restart) and the outbox's stored next
+/// try (`next_attempt_at`) while it waits to retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendWait {
+    /// Why it waits.
+    pub reason: WaitReason,
+    /// The message's `sent_at` (ms).
+    pub since: i64,
+    /// When the next attempt starts (ms), while it waits to retry after a failed attempt.
+    pub retry_at: Option<i64>,
+}
+
+/// The line under an own message on its way, in the two labels the UI draws: the reason may be
+/// cut short when the bubble is narrow, the timer never is (link feedback L6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WaitLine {
+    /// Why it waits ("Setting up encryption with 12 members"); empty for a countdown.
+    pub reason: String,
+    /// The time: "· 0:42" after a reason, "0:42" after "Sending…", "Next try in 0:30" alone.
+    pub timer: String,
+}
+
+impl WaitLine {
+    /// Nothing to show.
+    pub fn is_empty(&self) -> bool {
+        self.reason.is_empty() && self.timer.is_empty()
+    }
+
+    /// Both labels as one text, as a plain reader would say them.
+    pub fn text(&self) -> String {
+        match (self.reason.is_empty(), self.timer.is_empty()) {
+            (_, true) => self.reason.clone(),
+            (true, _) => self.timer.clone(),
+            _ => format!("{} {}", self.reason, self.timer),
+        }
+    }
+}
+
+/// The line under an own message on its way at `now` (ms): "Sending… 0:42",
+/// "Waiting for the connection · 1:05", "Setting up encryption with 12 members · 0:42",
+/// "Sending to 20 members · 0:05", "Sent to 8 of 20 members · 0:42", "Next try in 0:30".
+/// Empty before [`WAIT_SHOWN_AFTER_MS`].
+pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
+    let elapsed = now.saturating_sub(wait.since);
+    if elapsed < WAIT_SHOWN_AFTER_MS {
+        return WaitLine::default();
+    }
+    let clock = |ms: i64| time::duration(u32::try_from(ms.max(0)).unwrap_or(u32::MAX));
+    // While the message waits for something else the countdown means nothing: the try waits
+    // for that (a connection, the user).
+    if !wait.reason.is_hold()
+        && let Some(at) = wait.retry_at.filter(|at| *at > now)
+    {
+        // Rounded up: "0:01" until the instant, never "0:00" before it.
+        let left = (at - now).saturating_add(999) / 1000 * 1000;
+        return WaitLine {
+            reason: String::new(),
+            timer: trfc(
+                "@info:status under a message not sent yet, %1 time left (m:ss)",
+                "Next try in %1",
+                &[&clock(left)],
+            ),
+        };
+    }
+    let since = clock(elapsed);
+    let why = match wait.reason {
+        WaitReason::Sending | WaitReason::Phase(SendPhase::Sending { of: 0..=1, .. }) => {
+            return WaitLine {
+                reason: trc("@info:status under a message being sent", "Sending…").into_owned(),
+                timer: since,
+            };
+        }
+        WaitReason::Connection => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for the connection",
+        )
+        .into_owned(),
+        // The words of the banners above the chat ("Verify…", the safety number notice, the
+        // clock, "no longer linked", "restricted").
+        WaitReason::Challenge => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for you to verify",
+        )
+        .into_owned(),
+        WaitReason::SafetyNumber => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for you to confirm the new safety number",
+        )
+        .into_owned(),
+        WaitReason::Clock => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for the computer's clock to be set",
+        )
+        .into_owned(),
+        WaitReason::LoggedOut => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for this device to be linked again",
+        )
+        .into_owned(),
+        WaitReason::Restricted => trc(
+            "@info:status under a message not sent yet",
+            "Waiting: the network restricted this account",
+        )
+        .into_owned(),
+        WaitReason::UpdateApp => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for Kourier to be updated",
+        )
+        .into_owned(),
+        WaitReason::Reconnect => trc(
+            "@info:status under a message not sent yet",
+            "Waiting for you to reconnect",
+        )
+        .into_owned(),
+        WaitReason::Phase(SendPhase::Uploading) => {
+            trc("@info:status under a message being sent", "Uploading files").into_owned()
+        }
+        WaitReason::Phase(SendPhase::RefreshingGroup) => trc(
+            "@info:status under a message being sent",
+            "Checking the group",
+        )
+        .into_owned(),
+        WaitReason::Phase(SendPhase::SettingUpKeys { of, .. }) => trnc(
+            "@info:status under a message being sent, %1 how many members",
+            "Setting up encryption with %1 member",
+            "Setting up encryption with %1 members",
+            u64::from(of),
+        ),
+        WaitReason::Phase(SendPhase::RepairingDevices) => trc(
+            "@info:status under a message being sent",
+            "Updating the members' devices",
+        )
+        .into_owned(),
+        // Nothing has reached anybody yet (the one request to the network is out): "Sent to 0
+        // of 20 members" would read like a failure.
+        WaitReason::Phase(SendPhase::Sending { done: 0, of }) => trnc(
+            "@info:status under a message being sent, %1 how many members",
+            "Sending to %1 member",
+            "Sending to %1 members",
+            u64::from(of),
+        ),
+        // The count of a plural is `%1`, which KI18n fills in itself: so `%1` is all members
+        // and `%2` those it went to (with `%1` for these the KDE translator said "Sent to 20
+        // of 20 members").
+        WaitReason::Phase(SendPhase::Sending { done, of }) => {
+            let count = |n: u32| crate::i18n::number(u64::from(n)).unwrap_or_else(|| n.to_string());
+            trnfc(
+                "@info:status under a message being sent, %1 all members, %2 members it went to",
+                "Sent to %2 of %1 member",
+                "Sent to %2 of %1 members",
+                u64::from(of),
+                &[&count(of), &count(done)],
+            )
+        }
+        WaitReason::Phase(SendPhase::SyncingOwnDevices) => trc(
+            "@info:status under a message being sent",
+            "Sending to your other devices",
+        )
+        .into_owned(),
+    };
+    WaitLine {
+        reason: why,
+        timer: trfc(
+            "@info:status after the reason under a message on its way, %1 time since it was sent (m:ss)",
+            "· %1",
+            &[&since],
+        ),
+    }
+}
+
+/// The line of a row: only an own message that is still pending has one.
+pub(crate) fn row_wait_line(receipt: Receipt, wait: Option<SendWait>, now: i64) -> WaitLine {
+    match wait {
+        Some(w) if receipt == Receipt::Pending => wait_line(&w, now),
+        _ => WaitLine::default(),
+    }
 }
 
 crate::safe_debug!(Reaction { user, at });
@@ -450,6 +704,11 @@ pub struct MessageRow {
     /// The message disappears: what the timer mark says ("Disappears 1 week after it is
     /// read"); empty for messages that stay.
     pub expiry: String,
+    /// The reason in the line under an own message on its way ([`wait_line`]); empty for
+    /// every other row, before [`WAIT_SHOWN_AFTER_MS`] and for a countdown.
+    pub wait: String,
+    /// The timer of that line: never cut short, it has a label of its own.
+    pub wait_timer: String,
 }
 
 crate::safe_debug!(MessageRow {
@@ -494,6 +753,8 @@ impl MessageRow {
             actions: RowActions::default(),
             tone: NoticeTone::Plain,
             expiry: String::new(),
+            wait: String::new(),
+            wait_timer: String::new(),
         }
     }
 
@@ -572,6 +833,28 @@ pub fn first_unread(messages: &[Message]) -> Option<MessageId> {
         })
         .last()
         .map(|m| m.id)
+}
+
+/// How many pictures, videos and files of `blocks` are downloading.
+pub fn blocks_downloading(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Image(image) => usize::from(image.state == MediaState::Downloading),
+            Block::Album(tiles) => tiles
+                .iter()
+                .filter(|t| t.state == MediaState::Downloading)
+                .count(),
+            Block::File(file) => usize::from(file.state == MediaState::Downloading),
+            Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => 0,
+        })
+        .sum()
+}
+
+/// How many pictures, videos and files of the `rows` shown are downloading (a `--screenshot`
+/// waits for none: their state, and with it their URLs, changes when the download ends).
+pub fn downloading(rows: &[MessageRow]) -> usize {
+    rows.iter().map(|r| blocks_downloading(&r.blocks)).sum()
 }
 
 /// Aggregates reactions into chips, most frequent first (ties: first reacted first).
@@ -710,6 +993,7 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
                 progress,
                 label,
                 sticker,
+                ask: false,
             })
         }
         AttachmentKind::Voice => Block::File(FileBlock {
@@ -722,6 +1006,7 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
             state,
             progress,
             voice: true,
+            ask: false,
         }),
         AttachmentKind::Audio | AttachmentKind::File => {
             let name = att
@@ -746,7 +1031,28 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
                 state,
                 progress,
                 voice: false,
+                ask: false,
             })
+        }
+    }
+}
+
+/// Marks the blocks of the attachments whose Download asks the user's phone to upload them
+/// again: the ones the core listed ([`Item::ask`]), copied as they are. Which attachments those
+/// are is the core's rule (the click's own check, [`RowActions::ask_attachments`]), not the
+/// viewmodel's.
+fn mark_askable(blocks: &mut [Block], ask: &[AttachmentId]) {
+    let asks = |id: Option<AttachmentId>| id.is_some_and(|id| ask.contains(&id));
+    for block in blocks {
+        match block {
+            Block::Image(i) => i.ask = asks(i.attachment),
+            Block::Album(items) => {
+                for i in items {
+                    i.ask = asks(i.attachment);
+                }
+            }
+            Block::File(f) => f.ask = asks(f.attachment),
+            Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => {}
         }
     }
 }
@@ -920,8 +1226,14 @@ pub(crate) struct Item<'a> {
     pub reactions: Vec<ReactionChip>,
     /// What the user may do with it (`retry` is derived here from the send state).
     pub actions: RowActions,
+    /// The attachments whose Download asks the user's phone to upload them again (the core's
+    /// per-attachment answer, copied to the blocks as `ask`).
+    pub ask: &'a [AttachmentId],
     /// Its disappearing timer.
     pub expiry: Option<&'a kourier_model::Expiry>,
+    /// What the line under it says while it is on its way (own messages; `None`: nothing
+    /// known, e.g. the fixture).
+    pub wait: Option<SendWait>,
 }
 
 /// The common part of every timeline: date headers, the unread marker, system rows, bubbles
@@ -1003,12 +1315,16 @@ pub(crate) fn build_rows<'a>(
         } else {
             blocks.extend(msg.quote);
             blocks.extend(content_blocks(msg.id, msg.body, names, read_more));
+            if !msg.ask.is_empty() {
+                mark_askable(&mut blocks, msg.ask);
+            }
         }
         let receipt = if msg.own && !deleted {
             Receipt::from_state(msg.out_state)
         } else {
             Receipt::None
         };
+        let wait = row_wait_line(receipt, msg.wait, time.now_ms);
         rows.push(MessageRow {
             key: RowKey::Message(msg.id),
             kind: RowKind::Message,
@@ -1039,6 +1355,8 @@ pub(crate) fn build_rows<'a>(
             } else {
                 msg.expiry.map(preview::expiry_text).unwrap_or_default()
             },
+            wait: wait.reason,
+            wait_timer: wait.timer,
         });
     }
     read_more.end();
@@ -1103,6 +1421,7 @@ fn model_actions(msg: &Message) -> RowActions {
             && matches!(&msg.body, Body::Media { attachments, .. } if attachments.iter().any(|a| !a.long_text)),
         take_back: false,
         retry: false,
+        ask_attachments: false,
     }
 }
 
@@ -1207,7 +1526,9 @@ pub fn build_timeline(
         },
         reactions: reaction_chips(input.reactions.get(&msg.id).unwrap_or(&empty), names),
         actions: model_actions(msg),
+        ask: &[],
         expiry: msg.expiry.as_ref(),
+        wait: None,
     });
     build_rows(
         items,
@@ -1253,6 +1574,21 @@ pub fn cannot_send_text(reason: &CannotSend) -> String {
             "Start this chat on your phone first.",
         )
         .into_owned(),
+        CannotSend::StillLoading => trc(
+            "@info:status why the composer is off",
+            "This group is still loading.",
+        )
+        .into_owned(),
+        CannotSend::InvitationPending => trc(
+            "@info:status why the composer is off",
+            "Accept the invitation on your phone to join this group.",
+        )
+        .into_owned(),
+        CannotSend::JoinRequestPending => trc(
+            "@info:status why the composer is off",
+            "Your request to join this group is waiting for an admin.",
+        )
+        .into_owned(),
         CannotSend::Other(s) => single_line(s),
     }
 }
@@ -1266,6 +1602,31 @@ mod tests {
     use kourier_model::{ConversationId, NetMsgId, Origin, ReadState, SystemEvent};
 
     const TZ: FixedOffset = FixedOffset(3 * 3600);
+
+    #[test]
+    fn only_blocks_in_state_downloading_count_as_downloading() {
+        let tile = |state| ImageBlock {
+            state,
+            ..ImageBlock::default()
+        };
+        let blocks = vec![
+            Block::Image(tile(MediaState::Downloading)),
+            Block::Image(tile(MediaState::Local)),
+            Block::Album(vec![
+                tile(MediaState::Downloading),
+                tile(MediaState::Local),
+                tile(MediaState::Downloading),
+                tile(MediaState::Remote),
+            ]),
+            Block::File(FileBlock {
+                state: MediaState::Downloading,
+                ..FileBlock::default()
+            }),
+            Block::File(FileBlock::default()),
+        ];
+        assert_eq!(blocks_downloading(&blocks), 4);
+        assert_eq!(blocks_downloading(&[]), 0);
+    }
 
     fn at(day: u32, h: u32, m: u32) -> i64 {
         local_instant(
@@ -1315,6 +1676,268 @@ mod tests {
 
     fn kinds(rows: &[MessageRow]) -> Vec<&'static str> {
         rows.iter().map(|r| r.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn the_line_under_a_message_on_its_way_says_why_and_how_long() {
+        const T0: i64 = 1_760_000_000_000;
+        let w = |reason, retry_at| SendWait {
+            reason,
+            since: T0,
+            retry_at,
+        };
+        // Both labels as one text, and each label by itself where it matters.
+        let text = |wait: &SendWait, now: i64| wait_line(wait, now).text();
+        let sending = w(WaitReason::Sending, None);
+        // A normal send stays clean: nothing before three seconds.
+        assert!(wait_line(&sending, T0).is_empty());
+        assert!(wait_line(&sending, T0 + WAIT_SHOWN_AFTER_MS - 1).is_empty());
+        assert_eq!(text(&sending, T0 + WAIT_SHOWN_AFTER_MS), "Sending… 0:03");
+        // It counts up from the stored `sent_at`.
+        assert_eq!(text(&sending, T0 + 42_900), "Sending… 0:42");
+        assert_eq!(
+            text(&w(WaitReason::Connection, None), T0 + 65_000),
+            "Waiting for the connection · 1:05"
+        );
+        // The timer is a label of its own, so a narrow bubble can cut the reason and never it.
+        let line = wait_line(&w(WaitReason::Connection, None), T0 + 65_000);
+        assert_eq!(
+            (line.reason.as_str(), line.timer.as_str()),
+            ("Waiting for the connection", "· 1:05")
+        );
+        let line = wait_line(&sending, T0 + 42_900);
+        assert_eq!(
+            (line.reason.as_str(), line.timer.as_str()),
+            ("Sending…", "0:42")
+        );
+        let keys = SendPhase::SettingUpKeys { done: 3, of: 12 };
+        assert_eq!(
+            text(&w(WaitReason::Phase(keys), None), T0 + 42_000),
+            "Setting up encryption with 12 members · 0:42"
+        );
+        let sent = SendPhase::Sending { done: 8, of: 20 };
+        assert_eq!(
+            text(&w(WaitReason::Phase(sent), None), T0 + 42_000),
+            "Sent to 8 of 20 members · 0:42"
+        );
+        // Nothing has reached anybody yet: never "Sent to 0 of 20 members".
+        let none = SendPhase::Sending { done: 0, of: 20 };
+        assert_eq!(
+            text(&w(WaitReason::Phase(none), None), T0 + 5_000),
+            "Sending to 20 members · 0:05"
+        );
+        // Waiting to retry: the countdown to the outbox's next try, rounded up, alone in its
+        // label.
+        let retry = w(WaitReason::Sending, Some(T0 + 90_000));
+        assert_eq!(text(&retry, T0 + 60_001), "Next try in 0:30");
+        assert_eq!(text(&retry, T0 + 89_999), "Next try in 0:01");
+        let line = wait_line(&retry, T0 + 60_001);
+        assert_eq!(
+            (line.reason.as_str(), line.timer.as_str()),
+            ("", "Next try in 0:30")
+        );
+        // Its instant passed (the row is not read again yet): it is being sent.
+        assert_eq!(text(&retry, T0 + 90_000), "Sending… 1:30");
+        // Offline, the countdown means nothing: the try waits for the connection.
+        assert_eq!(
+            text(&w(WaitReason::Connection, Some(T0 + 90_000)), T0 + 60_000),
+            "Waiting for the connection · 1:00"
+        );
+        // Not even a countdown before three seconds.
+        assert!(wait_line(&w(WaitReason::Sending, Some(T0 + 30_000)), T0 + 1_000).is_empty());
+    }
+
+    /// A message held by something other than its own send says what holds it, in the words
+    /// of the banner that says the same, and a countdown to a next try does not hide that.
+    #[test]
+    fn the_line_names_what_really_holds_the_message() {
+        const T0: i64 = 1_760_000_000_000;
+        let holds = [
+            (WaitReason::Challenge, "Waiting for you to verify · 0:12"),
+            (
+                WaitReason::SafetyNumber,
+                "Waiting for you to confirm the new safety number · 0:12",
+            ),
+            (
+                WaitReason::Clock,
+                "Waiting for the computer's clock to be set · 0:12",
+            ),
+            (
+                WaitReason::LoggedOut,
+                "Waiting for this device to be linked again · 0:12",
+            ),
+            (
+                WaitReason::Restricted,
+                "Waiting: the network restricted this account · 0:12",
+            ),
+            (
+                WaitReason::UpdateApp,
+                "Waiting for Kourier to be updated · 0:12",
+            ),
+            (WaitReason::Reconnect, "Waiting for you to reconnect · 0:12"),
+        ];
+        for (reason, want) in holds {
+            let wait = SendWait {
+                reason,
+                since: T0,
+                retry_at: Some(T0 + 60_000),
+            };
+            assert_eq!(wait_line(&wait, T0 + 12_000).text(), want, "{reason:?}");
+        }
+    }
+
+    /// KI18n fills a plural's `%1` with its count before this crate fills the rest
+    /// (`Translator::translate_plural`): the members line must still name both numbers
+    /// (link feedback L6: the KDE translator showed "Sent to 20 of 20 members").
+    #[test]
+    fn the_members_line_survives_a_translator_that_fills_the_count() {
+        struct LikeKi18n;
+        impl crate::i18n::Translator for LikeKi18n {
+            fn translate(&self, _context: &str, msgid: &str) -> String {
+                msgid.to_owned()
+            }
+            fn translate_plural(&self, _c: &str, one: &str, many: &str, n: u64) -> String {
+                let form = if n == 1 { one } else { many };
+                form.replace("%1", &n.to_string())
+            }
+        }
+        const T0: i64 = 1_760_000_000_000;
+        let wait = SendWait {
+            reason: WaitReason::Phase(SendPhase::Sending { done: 8, of: 20 }),
+            since: T0,
+            retry_at: None,
+        };
+        let none = SendWait {
+            reason: WaitReason::Phase(SendPhase::Sending { done: 0, of: 20 }),
+            ..wait
+        };
+        crate::i18n::with_translator(LikeKi18n, || {
+            assert_eq!(
+                wait_line(&wait, T0 + 42_000).text(),
+                "Sent to 8 of 20 members · 0:42"
+            );
+            assert_eq!(
+                wait_line(&none, T0 + 5_000).text(),
+                "Sending to 20 members · 0:05"
+            );
+        });
+    }
+
+    /// The two ways an attachment cannot be had are two states for QML, and so two texts:
+    /// "No longer available" after the network said so, "Not available on this device" when
+    /// the backend knew it without asking (user decision, 2026-10-10: "Two texts").
+    #[test]
+    fn gone_and_not_on_this_device_are_two_states() {
+        assert_eq!(
+            MediaState::from_attachment(AttachmentState::Expired)
+                .0
+                .as_str(),
+            "expired"
+        );
+        assert_eq!(
+            MediaState::from_attachment(AttachmentState::Unavailable)
+                .0
+                .as_str(),
+            "unavailable"
+        );
+        assert_ne!(
+            crate::media::revision(&kourier_model::Attachment {
+                state: AttachmentState::Expired,
+                ..Default::default()
+            }),
+            crate::media::revision(&kourier_model::Attachment {
+                state: AttachmentState::Unavailable,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// The phone's part (S6): asking and its three endings are their own states (their own
+    /// notes, a new picture revision each). Which attachments offer Download is the core's
+    /// answer, copied block by block: no rule of the viewmodel's, so a message with a file the
+    /// core does not list (too large, being asked) shows its note and no button.
+    #[test]
+    fn the_blocks_ask_where_the_core_lists_them() {
+        let states = [
+            (AttachmentState::Asking, "asking"),
+            (
+                AttachmentState::AskFailed {
+                    why: AskFailure::NoAnswer,
+                },
+                "noanswer",
+            ),
+            (
+                AttachmentState::AskFailed {
+                    why: AskFailure::NoMessage,
+                },
+                "nomessage",
+            ),
+            (
+                AttachmentState::AskFailed {
+                    why: AskFailure::NoFile,
+                },
+                "nofile",
+            ),
+            (AttachmentState::Expired, "expired"),
+            (AttachmentState::Unavailable, "unavailable"),
+            (AttachmentState::Remote, "remote"),
+        ];
+        let mut revisions = std::collections::HashSet::new();
+        let ask = |b: &Block| match b {
+            Block::Image(i) => i.ask,
+            Block::File(f) => f.ask,
+            _ => panic!("not a media block"),
+        };
+        for (state, name) in states {
+            assert_eq!(MediaState::from_attachment(state).0.as_str(), name);
+            assert!(
+                revisions.insert(crate::media::revision(&Attachment {
+                    state,
+                    ..Default::default()
+                })),
+                "{name} has its own revision"
+            );
+            for kind in [AttachmentKind::Image, AttachmentKind::File] {
+                let att = Attachment {
+                    id: Some(AttachmentId(3)),
+                    kind,
+                    state,
+                    ..Attachment::default()
+                };
+                let mut blocks = vec![attachment_block(&att, false)];
+                assert!(!ask(&blocks[0]), "{name}: not by itself");
+                // Whatever its state, the core's list decides.
+                mark_askable(&mut blocks, &[AttachmentId(3)]);
+                assert!(ask(&blocks[0]), "{name} {kind:?}: listed");
+                mark_askable(&mut blocks, &[AttachmentId(4)]);
+                assert!(
+                    !ask(&blocks[0]),
+                    "{name} {kind:?}: another attachment listed"
+                );
+            }
+        }
+        // An album: only the listed tile asks.
+        let tile = |id| {
+            let att = Attachment {
+                id: Some(AttachmentId(id)),
+                kind: AttachmentKind::Image,
+                state: AttachmentState::Unavailable,
+                ..Attachment::default()
+            };
+            match attachment_block(&att, false) {
+                Block::Image(i) => i,
+                _ => panic!("not an image"),
+            }
+        };
+        let mut album = vec![Block::Album(vec![tile(1), tile(2)])];
+        mark_askable(&mut album, &[AttachmentId(2)]);
+        let Block::Album(items) = &album[0] else {
+            panic!("album")
+        };
+        assert_eq!(
+            items.iter().map(|i| i.ask).collect::<Vec<_>>(),
+            [false, true]
+        );
     }
 
     #[test]
@@ -1873,5 +2496,50 @@ mod tests {
         }
         assert_eq!(mime_icon("application/PDF"), "application-pdf");
         assert_eq!(mime_icon("weird/thing"), "application-octet-stream");
+    }
+
+    /// Every reason the composer is off says its own thing: the invitation to accept on the
+    /// phone, the request that waits for an admin and the group that is still loading are
+    /// three different states with three different remedies, and none reads as "not a member".
+    #[test]
+    fn each_reason_the_composer_is_off_has_its_own_text() {
+        let reasons = [
+            (
+                CannotSend::NotMember,
+                "You are no longer a member of this group.",
+            ),
+            (CannotSend::AdminsOnly, "Only admins can send messages."),
+            (CannotSend::Blocked, "You blocked this contact."),
+            (
+                CannotSend::RequestPending,
+                "Accept the message request on your phone to reply.",
+            ),
+            (
+                CannotSend::Unregistered,
+                "This person is no longer using Signal.",
+            ),
+            (
+                CannotSend::NotAccepted,
+                "Start this chat on your phone first.",
+            ),
+            (CannotSend::StillLoading, "This group is still loading."),
+            (
+                CannotSend::InvitationPending,
+                "Accept the invitation on your phone to join this group.",
+            ),
+            (
+                CannotSend::JoinRequestPending,
+                "Your request to join this group is waiting for an admin.",
+            ),
+            (CannotSend::Other("Some\nreason".to_owned()), "Some reason"),
+        ];
+        for (reason, text) in &reasons {
+            assert_eq!(&cannot_send_text(reason), text, "{reason:?}");
+        }
+        let distinct: std::collections::BTreeSet<_> = reasons
+            .iter()
+            .map(|(reason, _)| cannot_send_text(reason))
+            .collect();
+        assert_eq!(distinct.len(), reasons.len(), "two reasons share a text");
     }
 }

@@ -14,7 +14,9 @@ use kourier_backend_api::{
     TransmitOutcome,
 };
 use kourier_db::ZoneDb;
-use kourier_model::{BackendError, ConnState, LoginStep, LoginStepKind};
+use kourier_model::{
+    BackendError, ConnState, DeviceLogout, LoginStep, LoginStepKind, LogoutReport,
+};
 use libsignal_protocol::PublicKey;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle, spawn_local};
@@ -104,6 +106,9 @@ pub(crate) struct Shared<T: SignalTransport> {
     /// The history transfer of a fresh link: its directory, whether it holds receiving back,
     /// the user's skip (`transfer.rs`).
     pub(crate) transfer: crate::transfer::TransferShared,
+    /// Whether the work of a new link is reported to the core, and what was reported
+    /// (`progress.rs`, `BackendEvent::AccountProgress`).
+    pub(crate) settling: crate::progress::Settling,
     /// Test hook: a blocking delay per stage-1 batch (a slow decrypt).
     #[cfg(test)]
     pub(crate) stage1_delay: Cell<Duration>,
@@ -196,6 +201,7 @@ impl<T: SignalTransport> Shared<T> {
             unauth: UnauthSocket::default(),
             blob_dir,
             transfer,
+            settling: crate::progress::Settling::default(),
             #[cfg(test)]
             stage1_delay: Cell::new(Duration::ZERO),
             challenge: RefCell::new(None),
@@ -567,6 +573,9 @@ impl<T: SignalTransport> Actor<T> {
             } else {
                 // Features this version computes differently (S11 group send, S12 files).
                 db.zone(|tx| -> Result<()> {
+                    // What the account can do, for the core, at every start
+                    // (`append_account_caps`; a rebuild states it with `AccountReady`).
+                    maintenance::append_account_caps(tx, now, &wake)?;
                     let events = crate::features::refresh_features(tx, account, now)?;
                     if !events.is_empty() {
                         outbox::append_events(tx, &events, now, &wake)?;
@@ -625,6 +634,18 @@ impl<T: SignalTransport> Actor<T> {
         if transfer_active {
             actor.start_transfer();
         }
+        // A link's tail cut off by a quit: its groups still load, and the UI shows how many.
+        // Only within a day of the link: an old account's stranded group is no news.
+        let now = actor.shared.now();
+        match actor
+            .shared
+            .db
+            .read(|conn| crate::progress::groups_loading(conn, now))
+        {
+            Ok(true) => actor.shared.settling.begin(),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "reading the groups still loading failed"),
+        }
         Ok(actor)
     }
 
@@ -637,6 +658,7 @@ impl<T: SignalTransport> Actor<T> {
         let stop = self.cancel.child_token();
         let task = spawn_local(crate::transfer::run(self.shared.clone(), stop.clone()));
         self.transfer = Some(Transfer { stop, task });
+        self.shared.settling.begin();
     }
 
     /// Stops the history transfer where it is (the stored state stays) and waits for its
@@ -741,7 +763,11 @@ impl<T: SignalTransport> Actor<T> {
             Command::NetworkChanged => self.hint(Nudge::NetworkChanged),
             Command::Resumed => self.hint(Nudge::Resumed),
             Command::Disconnect => self.disconnect().await,
-            Command::StartLogin { flow, relink } => self.start_login(&flow, relink).await,
+            Command::StartLogin {
+                flow,
+                relink,
+                taken,
+            } => self.start_login(&flow, relink, taken).await,
             Command::SubmitLoginInput { txn, values } => match &self.login {
                 Some(login) => {
                     let _ = login.inputs.send(LoginInput { txn, values });
@@ -813,13 +839,17 @@ impl<T: SignalTransport> Actor<T> {
                 request,
                 remote,
                 dest,
+                net_ids,
             } => {
+                // The names check a backfilled pointer without a digest by the plaintext
+                // hash the attachment's names state (`Pointer::from_blob_named`).
                 spawn_local(crate::attachment::run_command(
                     self.shared.clone(),
                     attachment,
                     request,
                     remote,
                     dest,
+                    net_ids.into_inner(),
                 ));
             }
             Command::RefreshContact { user } => {
@@ -876,6 +906,11 @@ impl<T: SignalTransport> Actor<T> {
                     wake,
                 )
             }),
+            Command::RequestAttachments { cmd, conv, target } => {
+                self.durable(cmd, |tx, account, now, wake| {
+                    crate::backfill::persist(tx, account, cmd, &conv, &target, now, wake)
+                });
+            }
             other @ Command::FetchHistory { .. } => {
                 tracing::debug!(command = other.name(), "command not handled yet");
             }
@@ -1024,10 +1059,41 @@ impl<T: SignalTransport> Actor<T> {
                 None
             }
         };
-        match device.or_else(|| self.shared.account()) {
+        // Read before the device goes: the wipe that follows takes the row with it. A device
+        // that was never stored (a login stopped at its answer) has no name here.
+        let device_name = self
+            .shared
+            .db
+            .read(|c| -> Result<Option<String>> {
+                use kourier_db::rusqlite::OptionalExtension as _;
+                Ok(
+                    c.query_row("SELECT device_name FROM account WHERE id = 1", [], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })
+                    .optional()?
+                    .flatten(),
+                )
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "logout: the device name could not be read");
+                None
+            });
+        let outcome = match device.or_else(|| self.shared.account()) {
             Some(account) => self.remove_device(&account, deadline).await,
-            None => tracing::info!("logout before a device was linked: nothing to remove"),
-        }
+            None => {
+                tracing::info!("logout before a device was linked: nothing to remove");
+                DeviceLogout::NoDevice
+            }
+        };
+        // The core tells the user, once, whether the phone still lists the device. A core
+        // that is gone has nobody to tell.
+        let _ = self
+            .shared
+            .emit(BackendEvent::Logout(LogoutReport {
+                outcome,
+                device_name,
+            }))
+            .await;
         self.unlinked("logged out on request".to_owned(), SHUTDOWN_DRAIN)
             .await
     }
@@ -1061,7 +1127,11 @@ impl<T: SignalTransport> Actor<T> {
     /// one opened for this request. A link that finished a moment ago has no socket yet, an
     /// account that is offline or held has none either, and a device that stays linked with
     /// nobody behind it can only be removed on the phone.
-    async fn remove_device(&mut self, account: &Account, deadline: tokio::time::Instant) {
+    async fn remove_device(
+        &mut self,
+        account: &Account,
+        deadline: tokio::time::Instant,
+    ) -> DeviceLogout {
         let open = self.shared.socket.borrow().clone();
         // `own` is the event stream of a socket opened here: kept until the request is
         // answered, and the sign that the socket is ours to close.
@@ -1087,7 +1157,7 @@ impl<T: SignalTransport> Actor<T> {
                             reason = %e,
                             "the server no longer knows this device: nothing to remove"
                         );
-                        return;
+                        return DeviceLogout::Removed;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -1095,14 +1165,14 @@ impl<T: SignalTransport> Actor<T> {
                             "logout: the server could not be reached to remove this device; \
                              unlink it on the phone"
                         );
-                        return;
+                        return DeviceLogout::NotReached;
                     }
                     Err(_) => {
                         tracing::warn!(
                             "logout: no connection in time to remove this device; unlink it \
                              on the phone"
                         );
-                        return;
+                        return DeviceLogout::NotReached;
                     }
                 }
             }
@@ -1115,23 +1185,35 @@ impl<T: SignalTransport> Actor<T> {
             Ok(request) => self.shared.net.request(&socket, request).await,
             Err(e) => Err(e),
         };
-        match answer {
-            Ok(response) if response.status.is_success() => {
-                tracing::info!("this device was removed from the account");
+        let outcome = match answer {
+            Ok(response) => {
+                let outcome = device_logout_of(response.status);
+                if outcome == DeviceLogout::Removed {
+                    tracing::info!(
+                        status = response.status.as_u16(),
+                        "this device was removed from the account"
+                    );
+                } else {
+                    tracing::warn!(
+                        status = response.status.as_u16(),
+                        "logout: the server did not remove this device; unlink it on the phone"
+                    );
+                }
+                outcome
             }
-            Ok(response) => tracing::warn!(
-                status = response.status.as_u16(),
-                "logout: the server did not remove this device; unlink it on the phone"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "logout: the server could not be told to remove this device; unlink it on the \
-                 phone"
-            ),
-        }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "logout: the server could not be told to remove this device; unlink it on \
+                     the phone"
+                );
+                DeviceLogout::NotReached
+            }
+        };
         if own.is_some() {
             self.shared.net.disconnect(&socket).await;
         }
+        outcome
     }
 
     /// The unlink procedure (§4.3 step 5; Signal obligation 8): this device's credentials are
@@ -1191,7 +1273,12 @@ impl<T: SignalTransport> Actor<T> {
     /// `Command::StartLogin`. A login that was cancelled a moment ago may still be ending
     /// (`CancelLogin` only asks it to stop): it is brought to its end first, as the loop would
     /// do, so that the new login is not taken for a second one and lost.
-    async fn start_login(&mut self, flow: &str, relink: Option<kourier_backend_api::Relink>) {
+    async fn start_login(
+        &mut self,
+        flow: &str,
+        relink: Option<kourier_backend_api::Relink>,
+        taken: Vec<kourier_backend_api::TakenIdentity>,
+    ) {
         if self
             .login
             .as_ref()
@@ -1220,9 +1307,18 @@ impl<T: SignalTransport> Actor<T> {
             self.login_failed(error).await;
             return;
         }
+        // A new link: an import this run remembers belongs to an earlier one, and this link's
+        // `Done` waits for the Storage Service sync unless its own transfer ends `done`.
+        self.shared.transfer.forget_import();
         let (inputs, rx) = mpsc::unbounded_channel();
         let stop = CancellationToken::new();
-        let task = spawn_local(link::link(self.shared.clone(), relink, rx, stop.clone()));
+        let task = spawn_local(link::link(
+            self.shared.clone(),
+            relink,
+            taken,
+            rx,
+            stop.clone(),
+        ));
         self.login = Some(Login { inputs, task, stop });
     }
 
@@ -1243,6 +1339,7 @@ impl<T: SignalTransport> Actor<T> {
                 *self.shared.account.borrow_mut() = Some(account);
                 self.shared.lanes.wake();
                 self.shared.login_pending.set(true);
+                self.shared.settling.begin();
                 // The link stored a history transfer (the phone sent its key): it runs
                 // from here, and receiving waits for its end (`transfer.rs`).
                 if self.shared.transfer.holds() {
@@ -1374,6 +1471,19 @@ impl<T: SignalTransport> Actor<T> {
     }
 }
 
+/// What the server's answer to `DELETE /v1/devices/<id>` means for the user (link feedback L4):
+/// a success, or an answer that says the server no longer knows this device or its credentials
+/// (401, 403, 404: the phone removed it already, or a second instance raced), leaves nothing
+/// to remove on the phone; anything else (a server error, 429 or 413 for a request that was
+/// refused, any other refusal) did not remove it. (A timeout or a transport error has no
+/// answer and is `NotReached` where the request is made.)
+fn device_logout_of(status: http::StatusCode) -> DeviceLogout {
+    match status.as_u16() {
+        200..=299 | 401 | 403 | 404 => DeviceLogout::Removed,
+        _ => DeviceLogout::NotReached,
+    }
+}
+
 /// Test support: a [`Shared`] without a network, for driving stage 1, stage 2 and the
 /// forwarder by hand.
 #[cfg(test)]
@@ -1500,6 +1610,93 @@ pub(crate) mod testing {
             core,
             acked: acked_tx,
             conn,
+        }
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    /// A login that starts is a new link: what an earlier transfer of this actor imported
+    /// (`TransferShared::imported`, which lets a link's `Done` skip the Storage Service sync)
+    /// is forgotten, so a later link on the same actor waits for the sync again (link
+    /// feedback L2). A login that is refused (the account is linked already) forgets
+    /// nothing: the link that is complete keeps what its transfer said.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_login_that_starts_forgets_an_earlier_import() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = testing::shared(fixture.db.clone(), fixture.account.clone(), Vec::new());
+                let shared = Rc::new(test.shared);
+                let (_commands_tx, commands) = mpsc::channel(8);
+                let mut actor = Actor {
+                    shared: shared.clone(),
+                    commands,
+                    cancel: CancellationToken::new(),
+                    login: None,
+                    connection: None,
+                    held: false,
+                    transfer: None,
+                    scrub_owed: false,
+                    forwarder: spawn_local(async {}),
+                    forwarder_stop: CancellationToken::new(),
+                    stage2: spawn_local(async {}),
+                    stage2_stop: CancellationToken::new(),
+                };
+
+                // Linked, its transfer imported the archive; a second login is refused.
+                shared.transfer.mark_imported();
+                actor.start_login("qr", None, Vec::new()).await;
+                assert!(actor.login.is_none(), "the account is linked already");
+                assert!(
+                    shared.transfer.imported(),
+                    "a refused login forgets nothing"
+                );
+
+                // No account (it went before the next link): the login starts and forgets.
+                *shared.account.borrow_mut() = None;
+                actor.start_login("qr", None, Vec::new()).await;
+                assert!(actor.login.is_some(), "the login started");
+                assert!(
+                    !shared.transfer.imported(),
+                    "a new link must not inherit the earlier import"
+                );
+
+                let login = actor.login.take().expect("login");
+                login.stop.cancel();
+                let _ = login.task.await;
+            })
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+
+    fn of(status: u16) -> DeviceLogout {
+        device_logout_of(http::StatusCode::from_u16(status).expect("a status"))
+    }
+
+    /// Link feedback L4: the answer of the server to the device's removal. What says the
+    /// device is gone (or never was) leaves nothing to remove on the phone; a server that
+    /// failed, was busy or refused the request did not remove it, and the user is told to.
+    #[test]
+    fn the_servers_answer_to_the_removal_says_whether_the_device_is_gone() {
+        // Removed.
+        for status in [200, 204] {
+            assert_eq!(of(status), DeviceLogout::Removed, "{status}");
+        }
+        // The server no longer knows this device or its credentials (the phone removed the
+        // device while the socket was still up).
+        for status in [401, 403, 404] {
+            assert_eq!(of(status), DeviceLogout::Removed, "{status}");
+        }
+        // The server could not be asked, or refused: still listed on the phone, maybe.
+        for status in [400, 409, 413, 422, 423, 429, 500, 502, 503, 504] {
+            assert_eq!(of(status), DeviceLogout::NotReached, "{status}");
         }
     }
 }

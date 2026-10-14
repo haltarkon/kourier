@@ -1,0 +1,71 @@
+# cargo-nextest configuration (https://nexte.st), used by `cargo xtask ci` and
+# `cargo xtask ci --quick`. Install: `cargo install cargo-nextest --locked`. Without it xtask
+# says so and falls back to `cargo test` (one test binary after another, about three times
+# slower). `cargo nextest run` by hand reads this file too.
+#
+# nextest runs EVERY test in a process of its own, with up to `test-threads` (the number of
+# cores) at a time, across all test binaries. What cannot run side by side is held back by a
+# test group below. Doc tests are not run by nextest: `cargo test --doc` is a step of its own.
+# Ignored tests (measurements run by hand) stay ignored.
+
+nextest-version = "0.9.100"
+
+[test-groups]
+# Every integration test of the Signal backend and of the end-to-end crate starts the Node
+# mock harness (`tests/mock-harness`: Signal's mock server with real timers) and several
+# actors, and most of them wait on real timers. Before nextest the rule was `-- --test-threads
+# 2` per binary, one binary after the other. Measured on this 6-core machine (2026-10-13, all
+# non-Qt tests, 1,962 tests, KOURIER_REQUIRE_MOCK_HARNESS=1, one core taken by another
+# session's hashcat, no test failed in any run): 2 at a time 654 s, 4 at a time 360 s and
+# 362 s, 6 at a time 283 s. These tests are the critical path of the whole run (about 1,130 s
+# of test time in 216 tests), so this number is the lever. 6 is the number of cores, which is
+# also the number of tests nextest runs at all; raise it only while repeated runs stay green.
+mock-harness = { max-threads = 6 }
+# The two tests that round-trip the session's REAL Secret Service (they skip when it is
+# absent or locked and delete what they create): one at a time.
+secret-service = { max-threads = 1 }
+# The Qt UI tests (harness = false: one test is one binary that starts the app, a window on
+# the offscreen platform and often child processes of its own). xtask runs kourier-qt in a
+# run of its own with QT_QPA_PLATFORM=offscreen; the other packages get no such variable.
+# Measured (the 54 tests of kourier-qt, same day and machine): 3 at a time 103 s and 104 s,
+# 4 at a time 87 s; plain `cargo test` 233 s. They are UI tests that wait on real timers and
+# can fail under load (`actions_ui` did once at 3); raise this only while repeated runs
+# stay green.
+qt-ui = { max-threads = 4 }
+
+[profile.default]
+# Run every test and list all failures, not only the first one.
+fail-fast = false
+# A failure shows its output where it happens and again in the summary at the end; a pass
+# shows a line only.
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "pass"
+final-status-level = "slow"
+# A test that runs for a minute is marked SLOW; one that hangs is killed after five.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = "kind(test) & (package(kourier-signal) | package(kourier-e2e))"
+test-group = "mock-harness"
+
+[[profile.default.overrides]]
+filter = "binary_id(kourier-desktop::secret_service) | binary_id(kourier-app::secret_service_keys)"
+test-group = "secret-service"
+
+[[profile.default.overrides]]
+filter = "package(kourier-qt) & kind(test)"
+test-group = "qt-ui"
+# These start the whole app and, some of them, several child processes one after another.
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# The longest tests start first, so none of them is left to run alone at the end (they are
+# mostly kill loops and real timers; names from the junit file of the 2026-10-13 runs). A
+# renamed test just loses the head start. Measured with the group at 4: 332 s against 360 s.
+[[profile.default.overrides]]
+filter = "test(=kill_at_every_point_gives_the_uncrashed_state) | test(=kills_anywhere_in_the_attachment_pipeline_give_the_uncrashed_state) | test(=one_to_one_calls_are_reported_and_never_answered) | test(=a_dropped_socket_is_reopened_with_growing_delays_and_at_once_on_a_network_change) | test(=review_unread_history_rows_converge_in_any_order) | test(=group_calls_are_reported_and_never_answered) | test(=the_core_gets_nothing_before_the_last_byte_of_the_archive_was_checked) | test(=a_timer_set_from_either_side_expires_messages_on_time) | test(=attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext) | test(=the_wait_for_the_phone_ends_at_its_deadline)"
+priority = 50
+
+# Per-test times of the last run (target/nextest/default/junit.xml): where the minutes go.
+[profile.default.junit]
+path = "junit.xml"

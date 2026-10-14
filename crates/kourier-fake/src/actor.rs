@@ -18,9 +18,10 @@ use kourier_db::{
     Batch, Forwarder, ForwarderConfig, Migrations, Refusal, ZoneDb, failpoint, migration, outbox,
 };
 use kourier_model::{
-    AccountUuid, BackendError, ConnState, ConvKey, ConversationChange, ConversationPatch,
-    ErrorKind, HistoryTransfer, HistoryTransferFailure, InputField, InputKind, LocalMsgId,
-    LoginStep, LoginStepKind, Member, OwnDevice, Patch, RecipientState, Redacted, UserId,
+    AccountProgress, AccountUuid, BackendError, ConnState, ConvKey, ConversationChange,
+    ConversationPatch, DeviceLogout, ErrorKind, HistoryTransfer, HistoryTransferFailure,
+    InputField, InputKind, LocalMsgId, LoginStep, LoginStepKind, LogoutReport, Member, OwnDevice,
+    Patch, RecipientState, Redacted, UserId,
 };
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -394,6 +395,55 @@ impl Actor {
             self.control.persisted(self.uuid, command);
         }
         Ok(())
+    }
+
+    /// Reports a request for lost files sent and commits the phone's scripted answer
+    /// ([`crate::script::BackfillScript`]).
+    fn answer_backfill(
+        &self,
+        target: kourier_model::MsgTarget,
+        request: kourier_model::CmdId,
+    ) -> Result<(), BackendError> {
+        use crate::script::BackfillScript;
+        use kourier_backend_api::{RestoreSlot, RestoreUpdate};
+        let at = self.now();
+        let mut events = vec![BackendEvent::AttachmentRestore {
+            target: target.clone(),
+            update: RestoreUpdate::Sent,
+            at,
+            cmd: Some(request),
+        }];
+        let answer = match &self.script.backfill {
+            None | Some(BackfillScript::Silent) => None,
+            Some(BackfillScript::NotFound) => Some(RestoreUpdate::MessageNotFound),
+            Some(BackfillScript::Files(slots)) => Some(RestoreUpdate::Answer {
+                attachments: slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, slot)| match slot {
+                        Some(p) => RestoreSlot::File {
+                            remote: p.to_blob(),
+                            // A pointer the phone re-uploaded states the digest of its blob:
+                            // the core takes no pointer it could not check at the download.
+                            net_ids: Redacted::new(vec![format!("digest:fake-{i}")]),
+                            size: p
+                                .plaintext()
+                                .and_then(Result::ok)
+                                .map_or(0, |b| b.len() as u64),
+                        },
+                        None => RestoreSlot::Gone,
+                    })
+                    .collect(),
+                long_text: None,
+            }),
+        };
+        events.extend(answer.map(|update| BackendEvent::AttachmentRestore {
+            target,
+            update,
+            at,
+            cmd: None,
+        }));
+        self.commit_events(&events, |_| Ok(()))
     }
 
     /// Increments a durable counter and returns the new value.
@@ -850,13 +900,39 @@ impl Actor {
                 }
                 Command::Shutdown => return Stop::Now(Exit::Shutdown),
                 Command::Logout => {
-                    // A real backend tells its server to forget the device, if it has one.
-                    if self.linked().unwrap_or(false) {
-                        self.control.device(self.uuid, false);
+                    // A real backend tells its server to forget the device, if it has one,
+                    // and says what became of it right before its exit.
+                    if let Some(delay) = self.script.logout_delay {
+                        self.clock.sleep(delay).await;
                     }
-                    return Stop::Drain(Exit::LoggedOut {
+                    let outcome = if !self.linked().unwrap_or(false) {
+                        DeviceLogout::NoDevice
+                    } else if self.script.logout_unreachable {
+                        DeviceLogout::NotReached
+                    } else {
+                        self.control.device(self.uuid, false);
+                        DeviceLogout::Removed
+                    };
+                    for _ in 0..self.script.logout_backlog.min(6) {
+                        self.send_ephemeral(BackendEvent::AccountProgress(
+                            kourier_model::AccountProgress::finished(),
+                        ))
+                        .await;
+                    }
+                    self.send_ephemeral(BackendEvent::Logout(LogoutReport {
+                        outcome,
+                        device_name: self.script.device_name.clone(),
+                    }))
+                    .await;
+                    let exit = Exit::LoggedOut {
                         reason: "logged out".into(),
-                    });
+                    };
+                    return if self.script.logout_backlog > 0 {
+                        // The exit is ready while the report is still queued.
+                        Stop::Now(exit)
+                    } else {
+                        Stop::Drain(exit)
+                    };
                 }
                 Command::NetworkChanged
                 | Command::Resumed
@@ -882,14 +958,45 @@ impl Actor {
                         .script
                         .reply_delays
                         .iter()
-                        .find(|(c, _)| *c == req.conv);
-                    let late = delay.map(|(_, d)| self.clock.sleep(*d));
+                        .find(|(c, _)| *c == req.conv)
+                        .map(|(_, d)| *d)
+                        .or(self.script.slow_sends.map(|(_, d)| d));
+                    // A slow send reports its phase now and again every second while it
+                    // lasts, as a real backend does (the first report can come before the
+                    // UI has the row).
+                    let phase = self
+                        .script
+                        .slow_sends
+                        .and_then(|(p, _)| p)
+                        .filter(|_| delay.is_some())
+                        .map(|p| BackendEvent::TransmitProgress {
+                            local,
+                            progress: 0.0,
+                            phase: Some(p),
+                        });
+                    if let Some(e) = &phase {
+                        self.send_ephemeral(e.clone()).await;
+                    }
+                    let late = delay.map(|d| self.clock.sleep(d));
                     self.record_transmit(local, *req, &outcome);
                     match late {
                         // A late answer: the server has the request, the core hears later.
                         Some(sleep) => {
+                            let events = self.events.clone();
                             tokio::spawn(async move {
-                                sleep.await;
+                                let again = async {
+                                    let Some(e) = phase else {
+                                        return std::future::pending().await;
+                                    };
+                                    loop {
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                        let _ = events.send(Envelope::ephemeral(e.clone())).await;
+                                    }
+                                };
+                                tokio::select! {
+                                    () = sleep => {}
+                                    () = again => {}
+                                }
                                 let _ = reply.send(outcome);
                             });
                         }
@@ -960,11 +1067,26 @@ impl Actor {
                         return Stop::Now(Exit::Failed(e));
                     }
                 }
+                Command::RequestAttachments { cmd, conv, target } => {
+                    // The request is kept like any durable command, reported sent, and the
+                    // phone answers as the script's backfill knob says (none: never).
+                    let command = DurableCommand::RequestAttachments {
+                        conv,
+                        target: target.clone(),
+                    };
+                    if let Err(e) = self.persist_command(cmd, "restore", command, true) {
+                        return Stop::Now(Exit::Failed(e));
+                    }
+                    if let Err(e) = self.answer_backfill(target, cmd) {
+                        return Stop::Now(Exit::Failed(e));
+                    }
+                }
                 Command::DownloadAttachment {
                     attachment,
                     request,
                     remote,
                     dest,
+                    ..
                 } => {
                     // Progress is ephemeral; the result is durable and committed only after the
                     // file is complete (rename + fsync in the blob writer).
@@ -1449,10 +1571,26 @@ impl Actor {
                 break HistoryTransfer::Skipped;
             }
             self.set_transfer(*state, Some(stage)).await?;
+            let counted = transfer
+                .import
+                .filter(|_| *state == HistoryTransfer::Reading);
             let held = async {
-                match hold {
-                    Some(d) => self.clock.sleep(*d).await,
-                    None => std::future::pending().await,
+                match (hold, counted) {
+                    (Some(d), Some(total)) => {
+                        // The delivery's numbers, a quarter at a time.
+                        for k in 0..4 {
+                            self.report_import(total * k / 4, total).await;
+                            self.clock.sleep(*d / 4).await;
+                        }
+                    }
+                    (Some(d), None) => self.clock.sleep(*d).await,
+                    (None, counted) => {
+                        if let Some(total) = counted {
+                            let share = total * TransferScript::HELD_SHARE / 1000;
+                            self.report_import(share, total).await;
+                        }
+                        std::future::pending().await
+                    }
                 }
             };
             tokio::pin!(held);
@@ -1478,7 +1616,22 @@ impl Actor {
         } else {
             HistoryTransfer::Skipped
         };
-        self.set_transfer(end, None).await
+        self.set_transfer(end, None).await?;
+        if transfer.import.is_some() {
+            self.send_ephemeral(BackendEvent::AccountProgress(AccountProgress::finished()))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Says how many of the history's `total` messages are delivered.
+    async fn report_import(&self, done: u64, total: u64) {
+        self.send_ephemeral(BackendEvent::AccountProgress(AccountProgress {
+            messages_done: done,
+            messages_total: total,
+            ..AccountProgress::default()
+        }))
+        .await;
     }
 
     /// `Command::SkipHistoryTransfer`: ends a wait or a download as skipped; nothing happens
