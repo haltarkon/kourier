@@ -20,6 +20,11 @@ int grabWindowToFile(QObject* window, const QString& path);
 // AnimatedImage, BorderImage) with status Loading. -1 when the object is not a window.
 int imagesLoading(QObject* window);
 
+// What `imagesLoading` counted, in words: one entry per loading image (its name, its parent's,
+// visible or hidden, its size, `source` and `sourceSize`), joined by "; ". Empty when none loads
+// or the object is not a window. For the line `shot: unsettled images N [...]`.
+QString loadingImages(QObject* window);
+
 // How many visible images of `window` (a QQuickWindow) draw an attachment: a QQuickImageBase
 // whose source is `image://kourier/thumb/…` or `image://kourier/att/…`, whatever its status.
 // What `--screenshot` asks before it waits for the core's thumbnail derive: a window that shows
@@ -42,7 +47,13 @@ void parkCursor();
 
 // Recolors every link in a TextEdit's document (`textDocument`, a QQuickTextDocument): links
 // in own bubbles take the bubble's ink instead of the palette's link color.
-void colorLinks(QObject* textDocument, const QColor& color);
+// A mention (the link `kourier:mention/<i>`) is not a link to look at: it keeps the look of the
+// text (`ink`, bold from its markup), without the underline an anchor gets.
+void colorLinks(QObject* textDocument, const QColor& color, const QColor& ink);
+
+// How the links of `html` look after `colorLinks`, one line per link ("href fg underline bold"):
+// what the tests of the mention's look read.
+QString richTextLinkLooks(const QString& html, const QColor& color, const QColor& ink);
 
 // Installs a Qt message handler that hands every message to `sink(level, category, text)`
 // (level: 0 debug, 1 warning, 2 critical, 3 fatal, 4 info). Messages are UTF-8; the file and

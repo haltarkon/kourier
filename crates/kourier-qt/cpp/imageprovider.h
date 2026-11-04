@@ -36,6 +36,17 @@ void logImageRequests(bool on);
 // The logged requests, in the order they came; empties the log.
 rust::Vec<rust::String> takeImageRequestLog();
 
+// Test probe of the order in which a response's `finished` reaches Qt's pixmap reader, which
+// connects to it only after `requestImageResponse` returned. `how` 0: off. 1: a request returns
+// only once its worker is done, so a worker that emitted `finished` itself did so before anyone
+// connected (Qt's reader catches that: the response's own flag, set by a slot Qt connects first,
+// is checked after it connects). 2: the same, and an emission of `finished` on a thread other than
+// the response's is held after Qt took its receivers and before that flag is set, until the
+// response's thread is back in its event loop (connected and checked by then): such a `finished`
+// reaches nobody and the Image stays in Loading for ever. 2 uses Qt's signal spy hook, looked up at
+// run time; false when it is not there (nothing is changed then).
+bool raceImageFinishes(int32_t how);
+
 // Decodes what `reader` returned for one request at `requested` (an empty size keeps the
 // natural size): encoded images are decoded by the payload's codec alone (never by detecting
 // the format, which would let any installed image plugin read bytes from the network), scaled

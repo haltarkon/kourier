@@ -5,11 +5,11 @@ the maintainer, 2026-10-08: "At first we should publish only in archives on gith
 Flathub, distribution packages and the rest come after it.
 
 **Nothing in this repository pushes, uploads or publishes by itself.** `cargo xtask dist` writes
-three files on this machine's disk and stops. Every command below that leaves the machine
+five files on this machine's disk and stops. Every command below that leaves the machine
 (`git push`, `gh release create`) is typed by the maintainer, in a session of his own, when he
 decides to. A tool or an agent that is not told to do it does not run them.
 
-**Nothing signs the archives.** Neither the two archives nor `SHA256SUMS` carry a signature; the
+**Nothing signs the archives.** None of the archives (binary, source, names) nor the two sums files carry a signature; the
 only signature in the process is the one on the git tag (step 4). `SHA256SUMS` tells a download
 from the file that was uploaded, not who made it. A detached signature (`gpg --detach-sign`) is
 the maintainer's decision; the tool makes none.
@@ -31,11 +31,27 @@ by `.gitattributes` (`export-ignore`).
 The notices of those libraries, and of the C libraries and the Rust standard library inside the
 binary, are in `THIRD-PARTY.html` in the binary archive.
 
+**The binary carries no symbol table.** `cargo xtask dist` builds the release binary with its
+function names (the profile keeps `strip = "debuginfo"`, so every other build keeps them), then
+splits them off: `objcopy --only-keep-debug` writes the names file
+`kourier-<build-id>.debug`, and `objcopy --strip-all --add-gnu-debuglink` writes the file that
+is packed (about 51 MiB instead of 77). The names file goes into its own archive,
+`kourier-<version>-linux-<arch>-names[-suffix].tar.gz`, with its own `SHA256SUMS.names`. The
+build cannot be repeated (see above), so a names file that is lost after the binary was
+published can never be made again: step 3 keeps a copy outside `target/`. A crash report that
+shows absolute addresses, or a `RUST_BACKTRACE` stack, is read with the names file of that
+release (the commands are in the archive's `README.txt`; a names file of another release gives
+wrong names silently in a backtrace, which is why its name carries the build-id).
+Packagers: a Flatpak built from source strips and writes its `.Debug` extension itself, from the
+unstripped profile build (never set `strip = "symbols"` in the profile); an AppImage recipe uses
+`names::split` (or `NO_STRIP=1` after the split) because linuxdeploy strips every ELF with a
+`strip` older than RELR; distro packagers' debuginfo tools work on the unstripped build as usual.
+
 ## What you need
 
 `cargo`, `git`, `tar`, `gzip`, `sha256sum`, `objdump` (binutils), `msgfmt` (gettext),
-`cargo-about` (`cargo install cargo-about --locked`), `desktop-file-validate`
-(`desktop-file-utils`), `appstreamcli` (`appstream`), `reuse`, `pkg-config` (the KDE Frameworks
+`objcopy`, `readelf` and `nm` (binutils, the names split and its checks), `cargo-about`
+(`cargo install cargo-about --locked`), `desktop-file-validate` (`desktop-file-utils`), `appstreamcli` (`appstream`), `reuse`, `pkg-config` (the KDE Frameworks
 version) and `zstd` (the search of the compressed Qt resources; without it the tool says they
 were not searched), the toolchain's documentation component (the Rust standard library's
 licence files), and for the last two steps `gh` (GitHub's command line tool) and a signing key
@@ -95,14 +111,18 @@ tree.
    ```
 
    Its first act is to remove what an earlier run left in `target/dist/` (every
-   `kourier-*.tar.gz`, `SHA256SUMS`, `NOT-READY.txt` and the stage directory, nothing else),
+   `kourier-*.tar.gz`, `SHA256SUMS`, `SHA256SUMS.names`, `NOT-READY.txt` and the stage directory, nothing else),
    so an old archive never stands beside a refusal. Then it refuses a tree with changes,
    writes `NOT-READY.txt` and stops while a finding is left, and builds the release binary
    into `target/dist-build` with every absolute path of this machine mapped away and with
-   `--no-default-features --features signal` (the Signal backend, no test network: the binary
+   `--no-default-features --features signal,whatsapp` (the Signal backend and the WhatsApp
+   backend, which a release build compiles in and does not register; no test network: the binary
    has no `--fixture`). When the build is done it reads the commit and `git status` again and
    fails if either moved, and writes a stamp beside the binary (commit, dirty flag, features,
-   Qt, KDE Frameworks and rustc versions, checksum of the binary). It searches the binary,
+   Qt, KDE Frameworks and rustc versions, checksum of the binary). It prints `objcopy
+   --version`, splits the binary (a build with debug information is refused: a policy of the
+   release profile, not a size need), and from here on every check reads the shipped file, the
+   split's output, not the build output. It searches the binary,
    and the decompressed zstd frames of its Qt resources, for the home directory, the user
    name, `/media/`, the host name, git's `user.name` and `user.email` and the project's former
    name, stages the installed tree (the desktop file claims no `sgnl://` or
@@ -110,14 +130,18 @@ tree.
    result, in `target/dist/`:
 
    ```
-   kourier-<version>-linux-<arch>.tar.gz    the installed tree, README.txt, licences
-   kourier-<version>-source.tar.gz          git archive of the commit
-   SHA256SUMS                               over both
+   kourier-<version>-linux-<arch>.tar.gz        the installed tree (binary without its symbol
+                                                table), README.txt, licences
+   kourier-<version>-linux-<arch>-names.tar.gz  bin/.debug/kourier-<build-id>.debug
+   kourier-<version>-source.tar.gz              git archive of the commit
+   SHA256SUMS                                   over the binary and the source archive
+   SHA256SUMS.names                             over the names archive
    ```
 
    Only a `--release` run that found nothing writes these bare names. Every other run
    writes `…-unreleased.tar.gz` (a tree with changes: `…-dirty.tar.gz`), and the top
-   directory inside each archive ends the same way.
+   directory inside each archive ends the same way; the grade goes last in the names
+   archive's name (`…-names-unreleased.tar.gz`).
 
    The command prints the requirements it read from the binary (shared libraries, glibc,
    libstdc++, the Qt minor version and why, QML modules, what is needed at run time) and the
@@ -125,13 +149,33 @@ tree.
    unpacked as a user would:
 
    ```bash
-   mkdir -p /tmp/kourier-try && tar -xzf target/dist/kourier-*-linux-*.tar.gz -C /tmp/kourier-try
+   mkdir -p /tmp/kourier-try && tar -xzf target/dist/kourier-*-linux-x86_64.tar.gz -C /tmp/kourier-try
    /tmp/kourier-try/kourier-*/bin/kourier --version
-   (cd target/dist && sha256sum -c SHA256SUMS)
+   (cd target/dist && sha256sum -c SHA256SUMS && sha256sum -c SHA256SUMS.names)
    ```
+
+   The pattern `kourier-*-linux-x86_64.tar.gz` names the binary archive exactly (a looser
+   `kourier-*-linux-*.tar.gz` also matches the names archive, and tar then takes it for a
+   member name and exits 2); for an unreleased run use `…-linux-x86_64-unreleased.tar.gz`.
 
    Put the repository address into the About data first (`homepage` in
    `crates/kourier-app/src/about.rs`) or the run stops at the finding about it.
+
+   **Keep the names file.** `target/dist/` is emptied by the next `dist` run (an agent's check
+   is enough) and `target/` can be lost, and the build cannot be repeated, so copy the names
+   archive and `SHA256SUMS.names` to a backed-up directory outside `target/` and outside every
+   repository, one directory per version, whatever is published. When the build ran on another
+   machine, copy `target/dist` back to this one first.
+
+   ```bash
+   mkdir -p <releases>/0.1.0
+   cp target/dist/kourier-0.1.0-linux-x86_64-names.tar.gz target/dist/SHA256SUMS.names \
+      <releases>/0.1.0/
+   (cd <releases>/0.1.0 && sha256sum -c SHA256SUMS.names)
+   ```
+
+   Whether the names archive is also published beside the binary (like Flatpak's `.Debug`) or
+   kept only there is the maintainer's call at the first release (step 5).
 
 4. **A signed tag on the commit the archives were made from.**
 
@@ -152,7 +196,14 @@ tree.
        target/dist/kourier-0.1.0-linux-x86_64.tar.gz \
        target/dist/kourier-0.1.0-source.tar.gz \
        target/dist/SHA256SUMS
+   # only if the names archive is published too (the maintainer's call, see below):
+   #   add target/dist/kourier-0.1.0-linux-x86_64-names.tar.gz target/dist/SHA256SUMS.names
    ```
+
+   Publishing the names archive or not changes nothing in the archives: the README inside the
+   binary archive says the names file "is attached to the release when the maintainer publishes
+   it; otherwise ask for it" and holds for both answers. Keep the file in the directory of step 3
+   either way.
 
    `--draft` keeps the release invisible. Open it on GitHub, read the notes and the file list,
    and press "Publish release" by hand. GitHub adds its own "Source code" archives to every
@@ -160,8 +211,9 @@ tree.
    modes and a top directory named for the version, which is why it is attached as well. It
    is not signed (see the top of this file): the tag is.
 
-6. **After publishing**, from a clean directory: download the three files, run
-   `sha256sum -c SHA256SUMS`, unpack the archive and run `bin/kourier --version`.
+6. **After publishing**, from a clean directory: download the files that were
+   attached (three, or five with the names archive and `SHA256SUMS.names`), run
+   `sha256sum -c SHA256SUMS` (and `sha256sum -c SHA256SUMS.names` beside the names archive), unpack the archive and run `bin/kourier --version`.
 
 ## What `cargo xtask dist` checks, and what it does not
 
@@ -169,8 +221,9 @@ tree.
 
 - the names are the bare ones, and they are the commit's: the tree had no changes, the commit
   and `git status` were the same at the end of the build as at its start, the binary's stamp
-  names that commit, a clean tree, the feature set `--no-default-features --features signal`
-  and the checksum of the binary that was packed, and the source archive is
+  names that commit, a clean tree, the feature set `--no-default-features --features signal,whatsapp`
+  and the checksum of the build output (the packed binary is that output without its symbol
+  table: the same build-id, and the CRC of the names file in its debuglink), and the source archive is
   `git archive <that commit hash>` (not `HEAD`) with modes 0644 and 0755 (it carries the commit
   in its header, which the tool compares);
 - no finding of `NOT-READY.txt` is left: no maintainer blank, no placeholder application id, no
@@ -178,6 +231,12 @@ tree.
 - the binary is no measuring build (never `perf` or `dumpable`) and has no test network:
   `bin/kourier --version` prints `Kourier <version>`, `--fixture` is refused, and no code of
   the test network crate is in it;
+- the binary does not offer WhatsApp or Threema: `bin/kourier --print-networks`, run on a temporary
+  profile whose `kourier.toml` has `networks-on = ["whatsapp", "threema"]`, names neither of them among
+  the networks it would register nor among those it would list as off, and names both in `on=`
+  (a release build offers them in neither list until the user lifts that rule; the only proof of the
+  release arm on the packed binary, since the tests are debug builds; Threema is not in the archive's
+  features at all, so it is safe by construction and the check guards the day it joins);
 - the home directory, the user name, a rooted `/media/`, the host name, git's `user.name` and
   `user.email` and the project's former name are in neither the binary (also inside its zstd
   frames, when `zstd` is installed) nor any packed file;
@@ -189,8 +248,14 @@ tree.
   "BoringSSL" in it;
 - `README.txt` names the Qt it was built with and why only that minor version runs it, the KDE
   Frameworks version, the glibc and libstdc++ versions the binary needs (a weak symbol sets
-  none), what is needed at run time that the binary cannot show, and the repository address;
-- the checksums match.
+  none; the release binary's packed relative relocations, `crates/kourier/build.rs`, need
+  glibc 2.36 or newer, and its `GLIBC_ABI_DT_RELR` version need counts as 2.36), what is needed at run time that the binary cannot show, and the repository address;
+- the names file is the one that belongs to the packed binary: the build output, the unpacked
+  `bin/kourier` and the unpacked names file carry the same GNU build-id, the debuglink stores
+  `kourier-<build-id>.debug` and the names file's CRC, the packed binary has no `.symtab`, and
+  its dynamic symbols are the build output's; the names archive holds exactly that one file and
+  is searched for private names like every packed file;
+- the checksums match, in `SHA256SUMS` and in `SHA256SUMS.names`.
 
 `--no-build` and `--allow-dirty` also check the stamp (a binary built from another commit or
 tree state, with other features, or replaced since, is refused); they never write the bare

@@ -24,6 +24,7 @@ pub(crate) mod media;
 pub(crate) mod outgoing;
 pub(crate) mod sealed;
 pub(crate) mod sender_key;
+pub(crate) mod stop;
 pub(crate) mod unauth;
 
 use std::cell::RefCell;
@@ -342,12 +343,15 @@ pub(crate) async fn transmit<T: SignalTransport>(
     match transmit_message(ctx, req, uploader).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            tracing::warn!(
-                kind = error.kind.name(),
-                request = req.kind.name(),
-                error = %error.detail,
-                "transmit failed"
-            );
+            // A stop the user asked for is not a failure worth a warning (the actor logs it).
+            if !uploader.stop.is_requested() {
+                tracing::warn!(
+                    kind = error.kind.name(),
+                    request = req.kind.name(),
+                    error = %error.detail,
+                    "transmit failed"
+                );
+            }
             TransmitOutcome::Failed(error)
         }
     }
@@ -417,6 +421,8 @@ async fn transmit_message<T: SignalTransport>(
         group: None,
     };
     let built = outgoing::build(ctx.db, uploader, &chat, req, ctx.now()).await?;
+    // The point of no return: from the first request to a recipient on, an abort is too late.
+    uploader.pass_point_of_no_return()?;
     let mut statuses = Vec::new();
     if !note_to_self {
         let mut outgoing = built.wire.content();
@@ -453,9 +459,28 @@ async fn transmit_message<T: SignalTransport>(
         .await
         .map_err(backend)?;
     let sealed = statuses.first().is_some_and(|s| s.sealed);
+    bring_back_after_send(ctx, req).map_err(backend)?;
     Ok(TransmitOutcome::Sent {
         server_at: None,
         per_recipient: vec![(user.clone(), RecipientState::Sent { sealed })],
+    })
+}
+
+/// A new message of ours that went out brings an archived chat back to the inbox (A1, BQ5): the
+/// upsert goes to the core's outbox and the chat's base moves in one zone of its own, run after
+/// the server accepted the message (an attempt that is tried again finds the base moved and
+/// writes nothing, so a crash between the acceptance and this zone loses nothing). An edit, a
+/// delete, a reaction and the follow-up to new members are no new message.
+pub(crate) fn bring_back_after_send<T: SignalTransport>(
+    ctx: &SendContext<'_, T>,
+    req: &OutgoingRequest,
+) -> Result<()> {
+    if !matches!(req.kind, OutgoingKind::Message { .. }) || req.is_recipient_update {
+        return Ok(());
+    }
+    let now = ctx.now();
+    ctx.db.zone(|tx| {
+        crate::receive::unarchive::after_own_send(tx, ctx.account, now, &req.conv, ctx.outbox_wake)
     })
 }
 
@@ -671,8 +696,17 @@ async fn send_payload<T: SignalTransport>(
             return Err(Error::Internal("no session with any recipient device"));
         }
         let now = ctx.now();
-        let messages = ctx.db.zone(|tx| {
-            encrypt_for(
+        // P5 B1 (critic F1): a session whose remote key is not the trusted stored one (a key
+        // learned from an incoming message, a prekey bundle or a profile fetch replaces the
+        // row, not device 1's session; a Storage record with another key only queues that
+        // fetch) fails here with `UntrustedIdentity` at every attempt, also after the user
+        // confirmed or marked the new key. As Desktop (`OutgoingMessage.preload.ts`
+        // `archiveAllSessions` on an encrypt-time `UntrustedIdentity`), every session with them
+        // is archived, so the attempt after the release fetches a bundle and builds a session
+        // with the stored key. The archive is written INSIDE the zone, which must commit: the
+        // error is carried out as `Ok(Err(e))` and returned after the commit.
+        let encrypted = ctx.db.zone(|tx| -> Result<std::result::Result<_, Error>> {
+            match encrypt_for(
                 tx,
                 ctx.account,
                 &their,
@@ -682,8 +716,25 @@ async fn send_payload<T: SignalTransport>(
                 seal.as_ref(),
                 delivery.hint,
                 group.and_then(|g| g.content_group()),
-            )
+            ) {
+                Err(e @ Error::Protocol(SignalProtocolError::UntrustedIdentity(_))) if !own => {
+                    archive_all_sessions(tx, &their, now)?;
+                    Ok(Err(e))
+                }
+                other => other.map(Ok),
+            }
         })?;
+        let messages = match encrypted {
+            Ok(messages) => messages,
+            Err(e) => {
+                tracing::info!(
+                    recipient = ?log_safe(destination),
+                    "the recipient's key is not trusted; their sessions are archived and the \
+                     send waits for the user"
+                );
+                return Err(e);
+            }
+        };
         kourier_db::failpoint::hit(FAILPOINT_AFTER_ENCRYPT_COMMIT);
         if let Some(point) = delivery.failpoint {
             kourier_db::failpoint::hit(point);
@@ -1497,7 +1548,10 @@ mod tests {
                         .into_iter()
                         .filter(|e| {
                             matches!(e, kourier_backend_api::BackendEvent::ContactUpsert(p)
-                                if p.trust == Some(kourier_model::TrustLevel::Unverified))
+                            if matches!(p.trust, Some(
+                                kourier_model::TrustLevel::Unverified
+                                    | kourier_model::TrustLevel::Changed
+                            )))
                         })
                         .count()
                 };
@@ -1553,9 +1607,18 @@ mod tests {
                             Err(Error::Protocol(SignalProtocolError::UntrustedIdentity(_)))
                         ));
                         assert_eq!(identity_changes(), round);
+                        let bob_user = crate::service_id::aci_user_id(bob.aci).unwrap();
+                        let shown = kourier_model::IdentityFingerprint(
+                            bob.identity.identity_key().serialize().to_vec(),
+                        );
+                        let wake = shared.wake.clone();
                         shared
                             .db
-                            .zone(|tx| crate::commands::confirm_identity(tx, bob.aci))
+                            .zone(|tx| {
+                                crate::commands::confirm_identity(
+                                    tx, &account, &bob_user, &shown, 1, 1, &wake,
+                                )
+                            })
                             .unwrap();
                     }
                     let retry = async {
@@ -1612,7 +1675,821 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(stored, own_key, "our identity is untouched");
-                assert_eq!(identity_changes(), 2, "nothing reported");
+                // Two key changes and the confirm of round 2 (it states the trust Unverified once,
+                // P5a): the impostor's key reported nothing.
+                assert_eq!(identity_changes(), 3, "nothing reported");
+            })
+            .await;
+    }
+
+    /// P5 B1 (critic F1): a new key learned by a profile fetch replaces the stored row but not
+    /// device 1's session, which still has the old key. The send fails `UntrustedIdentity`
+    /// at encrypt time and ARCHIVES every session with the contact in a zone that commits
+    /// (the archived row is there after the failure), so the next send fetches a bundle and
+    /// builds a session with the stored key. What happens then depends on the state (the
+    /// lead's R1, TOFU): a contact in state 2 (verified, then the key changed) is refused AGAIN
+    /// at that bundle and nothing goes out until the release (Mark or Clear of the new key); a
+    /// DEFAULT contact is trusted at that next attempt, as Desktop's "send anyway" dialog is a
+    /// stop and not a guarantee (the core pauses the first send; whoever retries, it goes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirm_after_a_profile_key_change_sends() {
+        LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = crate::actor::testing::shared(
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = test.shared;
+                let (socket, remote, _events) =
+                    crate::net::libsignal::fake_chat(tokio::runtime::Handle::current());
+                let socket = Arc::new(socket);
+                let account = fixture.account.clone();
+                let ctx = shared.send_context(&account, &socket);
+                let content = content::receipt(content::ReceiptType::Read, &[1]);
+                let out = Outgoing {
+                    content: &content,
+                    timestamp: 1800,
+                    delivery: Delivery::MESSAGE,
+                    local: None,
+                    group: None,
+                };
+                for (round, verified) in [(1_u128, true), (2, false)] {
+                    let mut bob = Contact::new(0xb1b0 + round);
+                    let sid = bob.sid();
+                    let user = crate::service_id::aci_user_id(bob.aci).unwrap();
+                    shared
+                        .db
+                        .zone(|tx| {
+                            peers::set_sealed_state(tx, &sid, SealedSenderState::Disabled, 1)
+                        })
+                        .unwrap();
+                    let all_keys = format!("/v2/keys/{sid}/*");
+                    let messages = format!("/v1/messages/{sid}");
+                    // A session with his first key.
+                    let first = async {
+                        answer(&remote, "GET", &all_keys, 200, &bob.keys(&[(1, 7)])).await;
+                        answer(&remote, "PUT", &messages, 200, b"{}").await;
+                    };
+                    let (sent, ()) = tokio::join!(send_to(&ctx, bob.aci.into(), &out), first);
+                    sent.unwrap();
+                    if verified {
+                        shared
+                            .db
+                            .zone(|tx| -> Result<()> {
+                                tx.execute(
+                                    "UPDATE identities SET verified = 1 WHERE service_id = ?1",
+                                    [&sid],
+                                )?;
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    // His profile brings a new key, saved through device 1 as `profile.rs` does.
+                    bob.identity = libsignal_protocol::IdentityKeyPair::generate(&mut rand::rng());
+                    let new_key = *bob.identity.identity_key();
+                    shared
+                        .db
+                        .zone(|tx| -> Result<()> {
+                            let mut stores = Stores::new(
+                                tx,
+                                IdentityKind::Aci,
+                                account.aci_identity,
+                                account.aci_registration_id,
+                                1,
+                            );
+                            let address =
+                                ProtocolAddress::new(sid.clone(), DeviceId::new(1).unwrap());
+                            ready(stores.identity.save_identity(&address, &new_key))??;
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert!(
+                        !shared
+                            .db
+                            .read(|c| usable_devices(c, &sid, None, true))
+                            .unwrap()
+                            .is_empty(),
+                        "round {round}: device 1's session with the old key is still current"
+                    );
+                    // The send fails at encrypt time (no request) and archives the session.
+                    let sent = send_to(&ctx, bob.aci.into(), &out).await;
+                    assert!(
+                        matches!(
+                            sent,
+                            Err(Error::Protocol(SignalProtocolError::UntrustedIdentity(_)))
+                        ),
+                        "round {round}: the old session's key is not trusted"
+                    );
+                    let rows: i64 = shared
+                        .db
+                        .read(|c| -> Result<i64> {
+                            Ok(c.query_row(
+                                "SELECT count(*) FROM sessions WHERE their_service_id = ?1",
+                                [&sid],
+                                |r| r.get(0),
+                            )?)
+                        })
+                        .unwrap();
+                    assert_eq!(rows, 1, "round {round}: the session row is kept (archived)");
+                    assert!(
+                        shared
+                            .db
+                            .read(|c| usable_devices(c, &sid, None, false))
+                            .unwrap()
+                            .is_empty(),
+                        "round {round}: the failed send must leave the old session archived \
+                         (a rolled-back archive fails the same way after the release)"
+                    );
+                    if verified {
+                        // State 2: the retry right after the archive fetches his bundle (the
+                        // new key, which is the stored one) and libsignal refuses it again
+                        // for the state alone; nothing but that fetch is asked and nothing
+                        // goes out until the release. A bounded wait: a send that went on to
+                        // the message would wait for an answer that never comes.
+                        let keys = bob.keys(&[(1, 8)]);
+                        let (sent, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                            tokio::join!(send_to(&ctx, bob.aci.into(), &out), async {
+                                answer(&remote, "GET", &all_keys, 200, &keys).await;
+                            })
+                        })
+                        .await
+                        .expect("a send to a state 2 contact stops at the key fetch");
+                        assert!(
+                            matches!(
+                                sent,
+                                Err(Error::Protocol(SignalProtocolError::UntrustedIdentity(_)))
+                            ),
+                            "round {round}: state 2 is refused again until the release"
+                        );
+                        // The release (Mark or Clear of the new key).
+                        let wake = shared.wake.clone();
+                        let shown =
+                            kourier_model::IdentityFingerprint(new_key.serialize().to_vec());
+                        let outcome = shared
+                            .db
+                            .zone(|tx| {
+                                crate::safety::set_verified(
+                                    tx, &account, &user, false, &shown, 1, 1, &wake,
+                                )
+                            })
+                            .unwrap();
+                        assert!(outcome == crate::safety::SetOutcome::Done, "round {round}");
+                    }
+                    // A DEFAULT contact needs no release at the backend (TOFU, R1): the next
+                    // send fetches his keys and goes out with a new session; so does the one
+                    // after a state 2 contact's release.
+                    let retry = async {
+                        answer(&remote, "GET", &all_keys, 200, &bob.keys(&[(1, 8)])).await;
+                        answer(&remote, "PUT", &messages, 200, b"{}").await
+                    };
+                    let (sent, body) = tokio::join!(send_to(&ctx, bob.aci.into(), &out), retry);
+                    sent.unwrap();
+                    assert_eq!(sent_to(&body), [(1, 8, 3)], "round {round}: a new session");
+                }
+            })
+            .await;
+    }
+
+    /// A fake server that answers every request at once and writes down which ones came:
+    /// `GET /v2/keys/<sid>/*` with `keys`, `PUT /v1/messages/<sid>` with `{}`, anything else 500.
+    /// What the tests count is the entries of the log that start with `GET /v2/keys/` and
+    /// `PUT /v1/messages/`.
+    fn serve(
+        remote: libsignal_net::chat::fake::FakeChatRemote,
+        sid: String,
+        keys: Vec<u8>,
+    ) -> Rc<RefCell<Vec<String>>> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let seen = log.clone();
+        spawn_local(async move {
+            while let Ok(Some(request)) = remote.receive_request().await {
+                let verb = request.verb.clone().unwrap_or_default();
+                let path = request.path.clone().unwrap_or_default();
+                seen.borrow_mut().push(format!("{verb} {path}"));
+                let (status, body) = if verb == "GET" && path == format!("/v2/keys/{sid}/*") {
+                    (200, keys.clone())
+                } else if verb == "PUT" && path == format!("/v1/messages/{sid}") {
+                    (200, b"{}".to_vec())
+                } else {
+                    (500, Vec::new())
+                };
+                remote
+                    .send_response(libsignal_net::chat::ResponseProto {
+                        id: request.id,
+                        status: Some(status),
+                        message: Some(String::new()),
+                        headers: vec!["Content-Type: application/json".to_owned()],
+                        body: Some(bytes::Bytes::from(body)),
+                    })
+                    .unwrap();
+            }
+        });
+        log
+    }
+
+    /// How many requests of the log start with `prefix`.
+    fn requests(log: &Rc<RefCell<Vec<String>>>, prefix: &str) -> usize {
+        log.borrow()
+            .iter()
+            .filter(|r| r.starts_with(prefix))
+            .count()
+    }
+
+    /// Bob in stored state 2 (verified, then his key changed; the key on the server is the stored
+    /// one, so only the state refuses a send), his sessions gone, and a fake server that writes
+    /// down what it is asked.
+    struct ChangedBob {
+        fixture: crate::receive::tests::Fixture,
+        shared: Rc<crate::actor::Shared<crate::actor::testing::NoTransport>>,
+        socket: Arc<crate::net::libsignal::LibsignalSocket>,
+        bob: Contact,
+        log: Rc<RefCell<Vec<String>>>,
+        /// The far ends of the actor's lanes and the socket's events, kept open.
+        _lanes: Box<dyn std::any::Any>,
+    }
+
+    fn changed_bob() -> ChangedBob {
+        let fixture = crate::receive::tests::fixture();
+        let test =
+            crate::actor::testing::shared(fixture.db.clone(), fixture.account.clone(), Vec::new());
+        let (socket, remote, events) =
+            crate::net::libsignal::fake_chat(tokio::runtime::Handle::current());
+        let bob = Contact::new(0xb0b4);
+        let sid = bob.sid();
+        let log = serve(remote, sid.clone(), bob.keys(&[(1, 7)]));
+        let crate::actor::testing::TestShared {
+            shared,
+            core,
+            acked,
+            conn,
+        } = test;
+        shared
+            .db
+            .zone(|tx| -> Result<()> {
+                peers::set_sealed_state(tx, &sid, SealedSenderState::Disabled, 1)?;
+                tx.execute(
+                    "INSERT INTO identities(service_id, identity_key, verified, updated_at)
+                     VALUES (?1, ?2, ?3, 0)",
+                    (
+                        &sid,
+                        &bob.identity.identity_key().serialize()[..],
+                        crate::store::IDENTITY_UNVERIFIED,
+                    ),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        ChangedBob {
+            fixture,
+            shared: Rc::new(shared),
+            socket: Arc::new(socket),
+            bob,
+            log,
+            _lanes: Box::new((core, acked, conn, events)),
+        }
+    }
+
+    /// P5a R4 (storage review MEDIUM-1): a delivery receipt owed to a contact in state 2 made a
+    /// prekey request on EVERY incoming message (each one pulls the job forward) that libsignal
+    /// refused again. Now the job looks at the stored state first: it waits, with no request and
+    /// no attempt counted, however many messages come; the release makes it due and it sends once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receipt_owed_to_a_changed_contact_waits_without_a_request() {
+        LocalSet::new()
+            .run_until(async {
+                let w = changed_bob();
+                let shared = &w.shared;
+                let sid = w.bob.sid();
+                let now = || shared.now();
+                for (round, timestamp) in [1_000_u64, 1_001, 1_002].into_iter().enumerate() {
+                    // An incoming message from Bob: a receipt is owed, due 500 ms later.
+                    shared
+                        .db
+                        .zone(|tx| crate::commands::queue_delivery_receipt(tx, &sid, timestamp, now()))
+                        .unwrap();
+                    let job = shared
+                        .db
+                        .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                        .unwrap()
+                        .expect("the receipt job is due");
+                    assert_eq!(job.kind, JobKind::DeliveryReceipts);
+                    let done = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        crate::maintenance::run_job(shared, &w.socket, &job),
+                    )
+                    .await
+                    .expect("the job asks for nothing")
+                    .unwrap_or_else(|e| panic!("round {round}: the job failed: {e}"));
+                    assert_eq!(done, jobs::Done::WaitUntrusted, "round {round}");
+                    shared
+                        .db
+                        .zone(|tx| jobs::finish(tx, &job, done, now()))
+                        .unwrap();
+                    assert!(
+                        shared
+                            .db
+                            .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                            .unwrap()
+                            .is_none(),
+                        "round {round}: the job sleeps until a release or its next look"
+                    );
+                }
+                assert_eq!(requests(&w.log, "GET /v2/keys/"), 0, "no prekey request");
+                assert_eq!(requests(&w.log, "PUT /v1/messages/"), 0, "nothing sent");
+                let (attempts, error, owed): (i64, Option<String>, i64) = shared
+                    .db
+                    .read(|c| -> Result<_> {
+                        let (attempts, error) = c.query_row(
+                            "SELECT attempts, last_error FROM jobs WHERE kind = 'delivery_receipts'",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )?;
+                        let owed =
+                            c.query_row("SELECT count(*) FROM delivery_receipts", [], |r| r.get(0))?;
+                        Ok((attempts, error, owed))
+                    })
+                    .unwrap();
+                assert_eq!(attempts, 0, "waiting counts no attempt");
+                assert_eq!(error.as_deref(), Some(jobs::UNTRUSTED_ERROR));
+                assert_eq!(owed, 3, "every receipt is kept");
+
+                // The release (the user confirms Bob's new number): the job is due, goes out once.
+                let wake = shared.wake.clone();
+                let user = crate::service_id::aci_user_id(w.bob.aci).unwrap();
+                let shown = kourier_model::IdentityFingerprint(
+                    w.bob.identity.identity_key().serialize().to_vec(),
+                );
+                shared
+                    .db
+                    .zone(|tx| {
+                        crate::commands::confirm_identity(
+                            tx,
+                            &w.fixture.account,
+                            &user,
+                            &shown,
+                            now(),
+                            1,
+                            &wake,
+                        )
+                    })
+                    .unwrap();
+                // (The Verified sync to our own devices is another job, not this test's.)
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        tx.execute("DELETE FROM jobs WHERE kind = 'verified_sync'", [])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let job = shared
+                    .db
+                    .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                    .unwrap()
+                    .expect("the release made the job due");
+                assert_eq!(job.kind, JobKind::DeliveryReceipts);
+                let done = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    crate::maintenance::run_job(shared, &w.socket, &job),
+                )
+                .await
+                .expect("the answers come")
+                .unwrap_or_else(|e| panic!("the send failed: {e}"));
+                assert_eq!(done, jobs::Done::Finished);
+                shared
+                    .db
+                    .zone(|tx| jobs::finish(tx, &job, done, now()))
+                    .unwrap();
+                assert_eq!(requests(&w.log, "GET /v2/keys/"), 1, "one bundle fetch");
+                assert_eq!(requests(&w.log, "PUT /v1/messages/"), 1, "one message, all three receipts");
+                let owed: i64 = shared
+                    .db
+                    .read(|c| -> Result<i64> {
+                        Ok(c.query_row("SELECT count(*) FROM delivery_receipts", [], |r| r.get(0))?)
+                    })
+                    .unwrap();
+                assert_eq!(owed, 0);
+            })
+            .await;
+    }
+
+    /// P5a R4: the other jobs that send to a contact in state 2 wait the same way, without a
+    /// request and without an attempt: a timer update and a retry request's answer (the runner's
+    /// check by [`JobKind::recipient`]) and a read receipt batch (checked per author).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_other_jobs_to_a_changed_contact_wait_without_a_request() {
+        LocalSet::new()
+            .run_until(async {
+                let w = changed_bob();
+                let shared = &w.shared;
+                let sid = w.bob.sid();
+                let now = || shared.now();
+                let timer = serde_json::to_vec(
+                    &serde_json::json!({"peer": sid, "timestamp": 5, "timer": 60, "version": 1}),
+                )
+                .unwrap();
+                let receipts = serde_json::to_vec(&serde_json::json!({
+                    "kind": "read",
+                    "recipients": [{"peer": sid, "timestamps": [7]}],
+                }))
+                .unwrap();
+                let day = Some(Duration::from_secs(24 * 3600));
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        jobs::enqueue_payload(
+                            tx,
+                            JobKind::TimerUpdate,
+                            &format!("{sid}:5"),
+                            &timer,
+                            now(),
+                            day,
+                        )?;
+                        jobs::enqueue_payload(
+                            tx,
+                            JobKind::Resend,
+                            &format!("{sid}.1:6"),
+                            b"{}",
+                            now(),
+                            day,
+                        )?;
+                        jobs::enqueue_command(tx, JobKind::Receipts, 1, &receipts, now())?;
+                        Ok(())
+                    })
+                    .unwrap();
+                for _ in 0..3 {
+                    let job = shared
+                        .db
+                        .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                        .unwrap()
+                        .expect("a job is due");
+                    let kind = job.kind;
+                    let done = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        crate::maintenance::run_job(shared, &w.socket, &job),
+                    )
+                    .await
+                    .expect("the job asks for nothing")
+                    .unwrap_or_else(|e| panic!("{}: the job failed: {e}", kind.as_str()));
+                    assert_eq!(done, jobs::Done::WaitUntrusted, "{}", kind.as_str());
+                    shared
+                        .db
+                        .zone(|tx| jobs::finish(tx, &job, done, now()))
+                        .unwrap();
+                }
+                assert!(
+                    shared
+                        .db
+                        .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                        .unwrap()
+                        .is_none(),
+                    "all three sleep"
+                );
+                assert_eq!(requests(&w.log, "GET "), 0, "no request of any kind");
+                assert_eq!(requests(&w.log, "PUT "), 0);
+                let waiting: i64 = shared
+                    .db
+                    .read(|c| -> Result<i64> {
+                        Ok(c.query_row(
+                            "SELECT count(*) FROM jobs WHERE attempts = 0 AND last_error = ?1",
+                            [jobs::UNTRUSTED_ERROR],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    waiting, 3,
+                    "no attempt counted, all marked as waiting for the key"
+                );
+                // The read receipt batch is still in the job, for the release.
+                let payload: Vec<u8> = shared
+                    .db
+                    .read(|c| -> Result<Vec<u8>> {
+                        Ok(c.query_row(
+                            "SELECT payload FROM jobs WHERE kind = 'receipts'",
+                            [],
+                            |r| r.get(0),
+                        )?)
+                    })
+                    .unwrap();
+                let kept: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(kept["recipients"].as_array().map(Vec::len), Some(1));
+                assert_eq!(kept["recipients"][0]["timestamps"], serde_json::json!([7]));
+            })
+            .await;
+    }
+
+    /// The lead's RC3: a retry request carries nothing of ours (the decryption error of THEIR
+    /// message, as plaintext; Desktop sends it whatever the trust), so it goes out to a contact in
+    /// state 2 that has a session with us: one PUT, no wait, no prekey request. The answers to
+    /// THEIR retry requests (`Resend`, our content) still wait: the test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_request_to_a_changed_contact_goes_out() {
+        LocalSet::new()
+            .run_until(async {
+                let w = changed_bob();
+                let shared = &w.shared;
+                let sid = w.bob.sid();
+                let now = || shared.now();
+                let set_state = |state: i64| {
+                    shared
+                        .db
+                        .zone(|tx| -> Result<()> {
+                            tx.execute(
+                                "UPDATE identities SET verified = ?2 WHERE service_id = ?1",
+                                (&sid, state),
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                };
+                // A session with Bob, built while his key was still trusted; then state 2 again.
+                set_state(0);
+                let ctx = shared.send_context(&w.fixture.account, &w.socket);
+                let content = content::receipt(content::ReceiptType::Read, &[1]);
+                let out = Outgoing {
+                    content: &content,
+                    timestamp: 1800,
+                    delivery: Delivery::MESSAGE,
+                    local: None,
+                    group: None,
+                };
+                send_to(&ctx, w.bob.aci.into(), &out).await.unwrap();
+                assert_eq!(
+                    (requests(&w.log, "GET "), requests(&w.log, "PUT ")),
+                    (1, 1),
+                    "the session is built"
+                );
+                set_state(2);
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        tx.execute(
+                            "INSERT INTO remote_config(name, value) VALUES (?1, 'true')",
+                            [crate::retry::RETRY_FLAG],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                // (A sender-key message: `for_original` parses the bytes of the other types.)
+                let request = libsignal_protocol::DecryptionErrorMessage::for_original(
+                    b"the envelope that did not decrypt",
+                    libsignal_protocol::CiphertextMessageType::SenderKey,
+                    libsignal_protocol::Timestamp::from_epoch_millis(77),
+                    1,
+                )
+                .unwrap();
+                shared
+                    .db
+                    .zone(|tx| {
+                        jobs::enqueue_payload(
+                            tx,
+                            JobKind::RetryRequest,
+                            &format!("{sid}.1:77"),
+                            request.serialized(),
+                            now(),
+                            Some(Duration::from_secs(24 * 3600)),
+                        )
+                    })
+                    .unwrap();
+                let job = shared
+                    .db
+                    .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                    .unwrap()
+                    .expect("the retry request is due");
+                assert_eq!(job.kind, JobKind::RetryRequest);
+                let done = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    crate::maintenance::run_job(shared, &w.socket, &job),
+                )
+                .await
+                .expect("the request is answered")
+                .expect("the retry request is sent");
+                assert_eq!(
+                    done,
+                    jobs::Done::Finished,
+                    "a retry request does not wait for the contact's new key"
+                );
+                assert_eq!(requests(&w.log, "PUT "), 2, "the request went to Bob");
+                assert_eq!(requests(&w.log, "GET "), 1, "no prekey request");
+            })
+            .await;
+    }
+
+    /// The lead's RC7: the same retry request when Bob's sessions were ARCHIVED (no open
+    /// session for his device) waits for the user: no prekey request, nothing sent, no attempt
+    /// counted (`Done::WaitUntrusted`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_request_to_a_changed_contact_without_a_session_waits() {
+        LocalSet::new()
+            .run_until(async {
+                let w = changed_bob();
+                let shared = &w.shared;
+                let sid = w.bob.sid();
+                let now = || shared.now();
+                let set_state = |state: i64| {
+                    shared
+                        .db
+                        .zone(|tx| -> Result<()> {
+                            tx.execute(
+                                "UPDATE identities SET verified = ?2 WHERE service_id = ?1",
+                                (&sid, state),
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                };
+                // A session with Bob, built while his key was still trusted; then state 2 again.
+                set_state(0);
+                let ctx = shared.send_context(&w.fixture.account, &w.socket);
+                let content = content::receipt(content::ReceiptType::Read, &[1]);
+                let out = Outgoing {
+                    content: &content,
+                    timestamp: 1800,
+                    delivery: Delivery::MESSAGE,
+                    local: None,
+                    group: None,
+                };
+                send_to(&ctx, w.bob.aci.into(), &out).await.unwrap();
+                assert_eq!(
+                    (requests(&w.log, "GET "), requests(&w.log, "PUT ")),
+                    (1, 1),
+                    "the session is built"
+                );
+                set_state(2);
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        crate::store::archive_all_sessions(tx, &sid, now())?;
+                        Ok(())
+                    })
+                    .unwrap();
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        tx.execute(
+                            "INSERT INTO remote_config(name, value) VALUES (?1, 'true')",
+                            [crate::retry::RETRY_FLAG],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                // (A sender-key message: `for_original` parses the bytes of the other types.)
+                let request = libsignal_protocol::DecryptionErrorMessage::for_original(
+                    b"the envelope that did not decrypt",
+                    libsignal_protocol::CiphertextMessageType::SenderKey,
+                    libsignal_protocol::Timestamp::from_epoch_millis(77),
+                    1,
+                )
+                .unwrap();
+                shared
+                    .db
+                    .zone(|tx| {
+                        jobs::enqueue_payload(
+                            tx,
+                            JobKind::RetryRequest,
+                            &format!("{sid}.1:77"),
+                            request.serialized(),
+                            now(),
+                            Some(Duration::from_secs(24 * 3600)),
+                        )
+                    })
+                    .unwrap();
+                let job = shared
+                    .db
+                    .read(|c| jobs::next_due(c, now() + 1_000, true, false))
+                    .unwrap()
+                    .expect("the retry request is due");
+                assert_eq!(job.kind, JobKind::RetryRequest);
+                let done = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    crate::maintenance::run_job(shared, &w.socket, &job),
+                )
+                .await
+                .expect("the job returns at once")
+                .expect("the job runs");
+                assert_eq!(
+                    done,
+                    jobs::Done::WaitUntrusted,
+                    "no open session: the request waits for the user"
+                );
+                assert_eq!(requests(&w.log, "GET "), 1, "no prekey request");
+                assert_eq!(requests(&w.log, "PUT "), 1, "nothing sent to Bob");
+            })
+            .await;
+    }
+
+    /// The backend's own guard of §6.7 (M1 rule: Kourier cannot turn profile sharing on, a Storage
+    /// Service write), the one place that refuses a first message into a 1:1 chat the phone has
+    /// not accepted when the core let the send through (NULL features, the window between a
+    /// phone-side "un-accept" and the features event): a person with neither profile sharing nor
+    /// a system contact is refused `Unsupported` with the words that send the user to the phone,
+    /// before the message is built and before ANY request reaches the server (no key fetch, no
+    /// frame to him, no transcript); once the phone accepts the chat (profile sharing) the very
+    /// same request goes out. The control proves the fake server would have taken the message,
+    /// so "nothing went out" in the first half is the guard's doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_message_into_a_chat_not_accepted_on_the_phone_is_refused_and_nothing_goes_out()
+    {
+        use kourier_model::{Body, MessageId, Text};
+
+        LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = crate::actor::testing::shared(
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let (socket, remote, events) =
+                    crate::net::libsignal::fake_chat(tokio::runtime::Handle::current());
+                let alice = Contact::new(0xa11c);
+                let sid = alice.sid();
+                let log = serve(remote, sid.clone(), alice.keys(&[(1, 7)]));
+                let crate::actor::testing::TestShared {
+                    shared,
+                    core,
+                    acked,
+                    conn,
+                } = test;
+                // The far ends of the actor's lanes and the socket's events stay open.
+                let _lanes = (core, acked, conn, events);
+                let socket = Arc::new(socket);
+                let shared = Rc::new(shared);
+                // A known person who is neither shared with nor in the address book. The
+                // sealed-sender state is set only so that the control below goes out the plain way.
+                shared
+                    .db
+                    .zone(|tx| -> Result<()> {
+                        peers::set_sealed_state(tx, &sid, SealedSenderState::Disabled, 1)?;
+                        let peer = peers::load(tx, &sid)?;
+                        assert!(
+                            !peer.profile_sharing && !peer.system_contact && !peer.accepted(),
+                            "the chat starts not accepted"
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                let account = fixture.account.clone();
+                let req = OutgoingRequest {
+                    conv: ConvKey::Direct(crate::service_id::aci_user_id(alice.aci).unwrap()),
+                    local: "1800000000001".into(),
+                    sent_at: 1_800_000_000_001,
+                    kind: OutgoingKind::Message {
+                        body: Body::Text(Text::plain("first words")),
+                        reply_to: None,
+                        expiry: None,
+                    },
+                    only: None,
+                    is_recipient_update: false,
+                };
+                let attempt = || async {
+                    let stop = stop::Stop::open();
+                    let uploader = media::Uploader {
+                        shared: &shared,
+                        socket: &socket,
+                        local: MessageId(5),
+                        net_local: &req.local,
+                        stop: &stop,
+                    };
+                    let ctx = shared.send_context(&account, &socket);
+                    tokio::time::timeout(Duration::from_secs(20), transmit(&ctx, &req, &uploader))
+                        .await
+                        .expect("the attempt ends")
+                };
+
+                // Not accepted: refused with the words for the user, and no request at all.
+                let TransmitOutcome::Failed(error) = attempt().await else {
+                    panic!("a chat the phone has not accepted takes no first message");
+                };
+                assert_eq!(error.kind, ErrorKind::Unsupported, "{}", error.detail);
+                assert_eq!(error.detail, "chat not accepted on the phone");
+                assert_eq!(
+                    error.user_message.as_deref(),
+                    Some("Start this chat on your phone first.")
+                );
+                assert_eq!(
+                    *log.borrow(),
+                    Vec::<String>::new(),
+                    "no key fetch, no frame, no transcript"
+                );
+
+                // Control: accepted on the phone (profile sharing), the same request goes out.
+                shared
+                    .db
+                    .zone(|tx| peers::set_profile_sharing(tx, &sid, true, 2))
+                    .unwrap();
+                let outcome = attempt().await;
+                assert!(
+                    matches!(outcome, TransmitOutcome::Sent { .. }),
+                    "an accepted chat takes the message: {outcome:?}"
+                );
+                assert_eq!(
+                    requests(&log, &format!("PUT /v1/messages/{sid}")),
+                    1,
+                    "one frame to him"
+                );
             })
             .await;
     }

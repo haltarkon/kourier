@@ -192,7 +192,7 @@ pub(crate) async fn submit<T: SignalTransport>(
             "Nothing is waiting for a verification.",
         ));
     };
-    let socket = shared.socket.borrow().clone();
+    let socket = shared.work_socket();
     let Some(socket) = socket else {
         return Err(BackendError::transient("not connected")
             .with_user_message("Kourier is offline. Verify again once it is connected."));

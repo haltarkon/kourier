@@ -10,19 +10,24 @@
 //! - the wait for a safety number to be confirmed ends with each row's budget, like the wait
 //!   for a challenge answer;
 //! - when the sweeper deletes the head of a conversation's queue, the rows behind it start
-//!   at once.
+//!   at once;
+//! - the budget is the network's (K-B1 B6, `NetworkDescriptor::outbox`): the WhatsApp-like
+//!   fake gives up a send after six hours where the Signal-like one keeps trying for a day,
+//!   and the time a hold stood is given back with the budget of the account's own network.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, BackendNotice, Clock};
 use kourier_core::facade::{UiCommand, UiEvent};
 use kourier_fake::scripts::T0;
-use kourier_fake::{Flavor, Script, Step, TransmitRecord, TransmitRule, challenge_error_after};
+use kourier_fake::{
+    Flavor, Script, Step, TransmitRecord, TransmitRule, WHATSAPP_LIKE_BUDGET, challenge_error_after,
+};
 use kourier_model::{
-    AccountId, AccountUuid, ConnState, ConvKey, ConversationId, ConversationPatch, FailReason,
-    MessageId, OutgoingState, Patch, Text, UserAction,
+    AccountHold, AccountId, AccountUuid, ConnState, ConvKey, ConversationId, ConversationPatch,
+    FailReason, HoldReason, MessageId, OutgoingState, Patch, Text, UserAction,
 };
 use support::send::*;
 use support::{Env, WAIT, add_linked, eventually};
@@ -32,7 +37,11 @@ const T0U: u64 = T0 as u64;
 const URL: &str = "https://example.invalid/challenge";
 
 async fn linked(script: Script) -> (Env, AccountId, AccountUuid) {
-    let mut env = Env::new(Flavor::SignalLike, script).await;
+    linked_on(Flavor::SignalLike, script).await
+}
+
+async fn linked_on(flavor: Flavor, script: Script) -> (Env, AccountId, AccountUuid) {
+    let mut env = Env::new(flavor, script).await;
     env.handle.send(UiCommand::UiReady).expect("send");
     let account = add_linked(&mut env).await;
     let uuid = env.account(account).await.expect("account").uuid;
@@ -374,11 +383,29 @@ async fn a_timed_challenge_ends_at_its_time_after_a_restart() {
 }
 
 /// A clock as the machine has it around a suspend: the wall clock jumps ahead, and a timer
-/// that was armed before does not fire for it. A sleep armed after the jump sees the new
-/// time.
+/// that was armed before does not fire for it (a tokio timer counts running time). A sleep
+/// armed after the jump sees the new time. Whether a sleep sleeps through the jump is
+/// decided when it is ARMED (`sleep_until`), as with a real timer, not when it is first
+/// polled: the core arms the challenge's end and then shows the challenge, and on a busy
+/// machine its first poll of that sleep can come after the test has jumped the clock (it then
+/// ended at once and the send got its late attempt before the resume: 1 of 36 runs beside
+/// four busy loops, 2026-10-16).
 #[derive(Clone)]
 struct SuspendClock {
     now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The deadlines of the sleeps that were armed while the clock was before them.
+    armed: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl SuspendClock {
+    /// Waits until a sleep for `deadline` is armed: only then may the clock jump.
+    async fn armed(&self, what: &str, deadline: u64) {
+        eventually(what, WAIT, || {
+            let armed = self.armed.clone();
+            async move { armed.lock().expect("armed").contains(&deadline) }
+        })
+        .await;
+    }
 }
 
 impl Clock for SuspendClock {
@@ -387,9 +414,13 @@ impl Clock for SuspendClock {
     }
 
     fn sleep_until(&self, deadline_ms: u64) -> kourier_backend_api::Sleep {
-        let now = self.now.clone();
+        // Decided when the timer is armed, not when it is first polled.
+        let asleep = self.now.load(std::sync::atomic::Ordering::SeqCst) < deadline_ms;
+        if asleep {
+            self.armed.lock().expect("armed").push(deadline_ms);
+        }
         Box::pin(async move {
-            if now.load(std::sync::atomic::Ordering::SeqCst) < deadline_ms {
+            if asleep {
                 std::future::pending::<()>().await;
             }
         })
@@ -409,6 +440,7 @@ async fn a_challenge_that_ended_during_a_suspend_does_not_use_up_the_budget() {
     ));
     let clock = SuspendClock {
         now: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(T0U)),
+        armed: std::sync::Arc::default(),
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = kourier_fake::FakeNetwork::new(Flavor::SignalLike, s);
@@ -443,6 +475,9 @@ async fn a_challenge_that_ended_during_a_suspend_does_not_use_up_the_budget() {
     let held = queued(&env, a, 1).await;
     challenge_on_show(&env, account).await;
     assert_eq!(send_row(&env, held.id).as_deref(), Some("Queued"));
+    // The challenge's end (an hour from now) is armed: a timer the core makes after the jump
+    // would see the new time and end at once, which is no suspend.
+    clock.armed("the challenge's end", T0U + HOUR).await;
 
     // The machine sleeps for 25 hours. Nothing fires by itself afterwards.
     clock
@@ -589,6 +624,7 @@ async fn the_wait_for_a_safety_number_ends_with_the_retry_budget() {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: alice(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     settle().await;
@@ -659,4 +695,156 @@ async fn rows_behind_a_head_the_sweeper_deleted_start_at_once() {
         "the first message expired"
     );
     assert_eq!(send_row(&env, first.id), None);
+}
+
+// ---------- the budget is the network's ----------
+
+fn failed(state: Option<&OutgoingState>) -> bool {
+    matches!(state, Some(OutgoingState::Failed { .. }))
+}
+
+/// The newest state of the first own message of `conv`.
+fn state_of(env: &Env, conv: ConversationId) -> Option<OutgoingState> {
+    own_messages(&env.core_db(), conv)
+        .first()
+        .and_then(|m| m.out_state.clone())
+}
+
+/// Moves the fake clock on by `step` at a time, `n` times, giving the core a moment after each
+/// to run what that step made due.
+async fn run_clock(env: &Env, step: Duration, n: u32) {
+    for _ in 0..n {
+        env.clock.advance(step);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// A message to a network that answers every attempt with a temporary failure is given up
+/// when ITS budget ends (K-B1 B6): the WhatsApp-like fake states six hours and fails the send
+/// then, within the longest back-off of the end (15 minutes); the Signal-like one states
+/// nothing, has Signal's day, and is still trying at the same time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_gives_up_at_its_networks_budget() {
+    let min = Duration::from_secs(60);
+    let hour = 60 * min;
+    assert_eq!(WHATSAPP_LIKE_BUDGET, 6 * hour, "the test value of the fake");
+    let never =
+        || script("network-budget").fail_transmit(TransmitRule::attempts(transient(), u32::MAX));
+
+    // WhatsApp-like: still trying an hour before the end, failed (retryable) soon after it.
+    let (mut env, _account, _uuid) = linked_on(Flavor::WhatsAppLike, never()).await;
+    let a = conv(&env, &d_alice()).await;
+    send(&env, a, "never answered");
+    queued(&env, a, 1).await;
+    run_clock(&env, 10 * min, 30).await; // 5 h
+    assert!(!failed(state_of(&env, a).as_ref()), "5 h: inside its 6 h");
+    let mut late = Duration::ZERO;
+    while !failed(state_of(&env, a).as_ref()) {
+        assert!(
+            late <= 2 * hour,
+            "not given up 7 h after the send: the budget is not the network's"
+        );
+        run_clock(&env, 5 * min, 1).await;
+        late += 5 * min;
+    }
+    assert!(
+        matches!(
+            state_of(&env, a),
+            Some(OutgoingState::Failed {
+                retryable: true,
+                ..
+            })
+        ),
+        "given up after its budget, to be retried by the user"
+    );
+    env.stop().await;
+
+    // Signal-like: the same send, 7 hours in, is still queued (its budget is a day).
+    let (mut env, _account, _uuid) = linked_on(Flavor::SignalLike, never()).await;
+    let a = conv(&env, &d_alice()).await;
+    send(&env, a, "never answered");
+    queued(&env, a, 1).await;
+    run_clock(&env, 10 * min, 42).await; // 7 h
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !failed(state_of(&env, a).as_ref()),
+        "Signal's budget is a day, not six hours"
+    );
+    env.stop().await;
+}
+
+async fn holding(env: &Env, account: AccountId) -> bool {
+    env.account(account).await.is_some_and(|a| a.hold.is_some())
+}
+
+/// The time a hold stood is given back with the budget of the account's network. A WhatsApp-like
+/// message typed three hours into a hold has six hours from its typing; the backend lifts the
+/// hold ten hours in: the message has its whole budget again, from the lift. With Signal's day
+/// in the computation the row would take for its start the start of the hold, and be given the
+/// three hours before it was typed too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_gives_back_time_with_its_networks_budget() {
+    let hour = Duration::from_secs(3600);
+    let held = HoldReason::ReachOutLocked;
+    let s = script("hold-budget-6h")
+        .step(Step::Conn(ConnState::Online { detail: None }))
+        .step(Step::Sleep(Duration::from_secs(5)))
+        .step(Step::Ephemeral(Box::new(BackendEvent::AccountHold(Some(
+            AccountHold {
+                until_ms: None,
+                reason: held,
+            },
+        )))))
+        .step(Step::Sleep(10 * hour))
+        .step(Step::Ephemeral(Box::new(BackendEvent::AccountHold(None))))
+        // Every attempt fails, so the row is still there to be read after the lift.
+        .fail_transmit(TransmitRule::attempts(transient(), u32::MAX));
+    let (mut env, account, uuid) = linked_on(Flavor::WhatsAppLike, s).await;
+    let a = conv(&env, &d_alice()).await;
+    let clock = env.clock.clone();
+    eventually("the hold is stated", WAIT, || {
+        clock.advance(Duration::from_secs(1));
+        holding(&env, account)
+    })
+    .await;
+    // Three hours into the hold the user types a message: its deadline is six hours on.
+    run_clock(&env, hour, 3).await;
+    send(&env, a, "typed during the hold");
+    let first = queued(&env, a, 1).await;
+    let deadline = || -> Option<i64> {
+        core_db(&env.core_db(), |c| {
+            c.query_row(
+                "SELECT deadline_at FROM outbox WHERE message_id = ?1 AND kind = 'Message'",
+                [first.id.0],
+                |r| r.get(0),
+            )
+            .ok()
+        })
+    };
+    let first_deadline = deadline().expect("its outbox row");
+    assert_eq!(
+        first_deadline - first.sent_at,
+        i64::try_from(WHATSAPP_LIKE_BUDGET.as_millis()).expect("ms"),
+        "the deadline is the network's six hours"
+    );
+    assert!(env.control.transmits(uuid).is_empty(), "held");
+    // The hold stands for ten hours (from its statement) and is lifted.
+    while holding(&env, account).await {
+        run_clock(&env, hour, 1).await;
+    }
+    let lifted = env.clock.now_ms() as i64;
+    eventually("the time of the hold is given back", WAIT, || async {
+        deadline().is_some_and(|d| d != first_deadline)
+    })
+    .await;
+    let moved = deadline().expect("its outbox row");
+    // The right start is the message's own typing: its budget is whole again from the lift
+    // (lift + 6 h at the latest; the clock was moved by whole hours, so the lift can be up to
+    // an hour before `lifted`). Signal's day would add the three hours before the typing.
+    let six = i64::try_from(WHATSAPP_LIKE_BUDGET.as_millis()).expect("ms");
+    assert!(
+        moved <= lifted + six && moved > lifted - 3_600_000 + six,
+        "the deadline {moved} is not six hours from the lift ({lifted})"
+    );
+    env.stop().await;
 }

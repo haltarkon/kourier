@@ -20,7 +20,7 @@ use kourier_model::{
 use proptest::prelude::*;
 
 use super::*;
-use crate::login::network_choices;
+use crate::login::{NetworkEntry, network_choices};
 use crate::time::FixedOffset;
 use crate::timeline::{RowKey, RowKind};
 
@@ -28,18 +28,29 @@ pub(super) const NOW: i64 = 1_760_000_000_000;
 
 pub(super) type Sent = Rc<RefCell<Vec<UiCommand>>>;
 
+/// The welcome page's rows of a run with Signal and the test network (which offers the history
+/// transfer), as the front-end builds them.
+pub(super) fn test_networks() -> Vec<NetworkChoice> {
+    network_choices(
+        &[
+            NetworkEntry::plain(NetworkKind::Signal),
+            NetworkEntry {
+                history_transfer: true,
+                ..NetworkEntry::plain(NetworkKind::Fake)
+            },
+        ],
+        false,
+    )
+}
+
 pub(super) fn source() -> (CoreSource, Sent) {
+    source_with(test_networks())
+}
+
+/// A source whose welcome page offers `networks`.
+pub(super) fn source_with(networks: Vec<NetworkChoice>) -> (CoreSource, Sent) {
     let sent: Sent = Rc::default();
     let s2 = sent.clone();
-    let mut networks = network_choices();
-    networks.push(NetworkChoice {
-        kind: NetworkKind::Fake,
-        name: "Test network".into(),
-        description: String::new(),
-        icon: "fake".into(),
-        available: true,
-        history_on_link: true,
-    });
     let src = CoreSource::new(
         Box::new(move |c: UiCommand| {
             s2.borrow_mut().push(c);
@@ -72,6 +83,9 @@ pub(super) fn account() -> CoreAccount {
         avatar: None,
         number: None,
         linked_at: 0,
+        hold: None,
+        roaming_writes: None,
+        pin_limit: None,
     }
 }
 
@@ -91,7 +105,7 @@ pub(super) fn conv_row(id: i64, title: &str, last: i64) -> CoreConversation {
             body_kind: "Text".into(),
             text: Some(format!("last of {title}")),
             sent_at: NOW - 60_000,
-            deleted: false,
+            deleted: None,
             out_state: None,
             attachment: None,
             attachments: 0,
@@ -112,6 +126,9 @@ pub(super) fn conv_row(id: i64, title: &str, last: i64) -> CoreConversation {
         features_hash: 0,
         has_draft: false,
         hidden: false,
+        can_send: true,
+        roaming: kourier_core::facade::Roaming::Hidden,
+        protected: false,
     }
 }
 
@@ -164,6 +181,18 @@ pub(super) struct Store {
     /// The detail's features, timer and the list rows' previews, when a test sets them.
     pub(super) features: ConversationFeatures,
     pub(super) timer: Option<Duration>,
+    /// The member rows the detail of every conversation has.
+    pub(super) members: Vec<kourier_model::Member>,
+    /// The accounts the core answers with; empty = the one account of [`account`].
+    pub(super) accounts: Vec<CoreAccount>,
+    /// The gallery of every conversation (people pages P4), newest message first, as the core's
+    /// `Query::ChatMedia` would list it before it picks a kind.
+    pub(super) media: Vec<kourier_core::facade::ChatMediaItem>,
+    /// The most attachments the simulated core answers in one page, whatever the query asks
+    /// (the real one clamps to `MAX_MEDIA_PAGE`).
+    pub(super) media_cap: Option<u32>,
+    /// The chats the core's rows state as protected (S-P).
+    pub(super) protected: Vec<i64>,
 }
 
 impl Store {
@@ -180,21 +209,80 @@ impl Store {
         format!("c{id} v{}", self.version)
     }
 
+    /// What the core's gallery statement answers from `self.media`: the kind's attachments after
+    /// the cursor, at most `limit`, and whether more follow or the other kind has any.
+    fn media_page(
+        &self,
+        q: &kourier_core::facade::ChatMediaQuery,
+    ) -> kourier_core::facade::ChatMediaPage {
+        use kourier_core::facade::MediaKind;
+        use kourier_model::AttachmentKind as K;
+        let of = |kind: MediaKind, it: &kourier_core::facade::ChatMediaItem| match kind {
+            MediaKind::Visual => matches!(it.attachment.kind, K::Image | K::Video | K::Gif),
+            MediaKind::Files => matches!(it.attachment.kind, K::File | K::Audio),
+        };
+        let other = match q.kind {
+            MediaKind::Visual => MediaKind::Files,
+            MediaKind::Files => MediaKind::Visual,
+        };
+        let after = |it: &kourier_core::facade::ChatMediaItem| match q.before {
+            None => true,
+            Some(c) => {
+                (
+                    std::cmp::Reverse(it.sort_key),
+                    std::cmp::Reverse(it.message.0),
+                    i64::from(it.idx),
+                ) > (
+                    std::cmp::Reverse(c.sort_key),
+                    std::cmp::Reverse(c.message.0),
+                    c.idx.map_or(-1, i64::from),
+                )
+            }
+        };
+        let mine: Vec<_> = self
+            .media
+            .iter()
+            .filter(|it| of(q.kind, it) && after(it))
+            .cloned()
+            .collect();
+        let limit = q.limit.min(self.media_cap.unwrap_or(u32::MAX)) as usize;
+        kourier_core::facade::ChatMediaPage {
+            conv: q.conv,
+            kind: q.kind,
+            more: mine.len() > limit,
+            other: q.before.is_none() && self.media.iter().any(|it| of(other, it)),
+            items: mine.into_iter().take(limit).collect(),
+        }
+    }
+
     pub(super) fn answer(&self, q: &Query) -> QueryData {
         match q {
-            Query::Accounts => QueryData::Accounts(vec![account()]),
+            Query::Accounts => QueryData::Accounts(if self.accounts.is_empty() {
+                vec![account()]
+            } else {
+                self.accounts.clone()
+            }),
             Query::Conversations(_) => QueryData::Conversations(ConversationPage {
                 rows: self
                     .convs
                     .iter()
-                    .map(|(id, m)| conv_row(*id, &self.title(*id), m.len() as i64))
+                    .map(|(id, m)| CoreConversation {
+                        protected: self.protected.contains(id),
+                        ..conv_row(*id, &self.title(*id), m.len() as i64)
+                    })
                     .collect(),
                 next: None,
             }),
+            Query::Person { .. } => QueryData::Person(None),
+            Query::Group(_) => QueryData::Group(None),
+            Query::ChatMedia(q) => QueryData::ChatMedia(self.media_page(q)),
             Query::Conversation(id) => {
                 QueryData::Conversation(Some(Box::new(ConversationDetail {
-                    row: conv_row(id.0, &self.title(id.0), 0),
-                    members: Vec::new(),
+                    row: CoreConversation {
+                        protected: self.protected.contains(&id.0),
+                        ..conv_row(id.0, &self.title(id.0), 0)
+                    },
+                    members: self.members.clone(),
                     features: self.features.clone(),
                     timer: self.timer,
                     draft: None,
@@ -253,8 +341,14 @@ impl Store {
                 })
             }
             Query::Attachment(_) => QueryData::Attachment(None),
+            Query::SaveFacts(_) => QueryData::SaveFacts(None),
             Query::FilePlan(_) | Query::Revisions(_) => QueryData::Revisions(None),
             Query::ExpiryPolicy => QueryData::ExpiryPolicy(Default::default()),
+            Query::QuietNotices => QueryData::QuietNotices(false),
+            Query::SafetyNumber { .. } => QueryData::SafetyNumber {
+                answer: Err(kourier_core::facade::model::SafetyUnavailable::Unsupported),
+                waits: false,
+            },
         }
     }
 }
@@ -704,12 +798,471 @@ proptest! {
     }
 }
 
+/// An experimental network that is off at this start is listed, but no login of it starts: its
+/// row opens the warning page, which turns it on and restarts. Nothing reaches the core (it
+/// would refuse an unknown network anyway), and once it is on, the login starts as any other.
+#[test]
+fn an_experimental_network_that_is_off_starts_no_login() {
+    let entry = |on| NetworkEntry {
+        kind: NetworkKind::WhatsApp,
+        flows: vec![
+            ("qr".into(), "QR code".into()),
+            ("pair-code".into(), "Phone number".into()),
+        ],
+        experimental: true,
+        risk_notice: Some(("t".into(), "b".into())),
+        history_transfer: false,
+        history: kourier_model::HistorySource::PushedOnLink,
+        on,
+        receipts_always_sent: false,
+        missing: None,
+    };
+    let list = |on| {
+        network_choices(
+            &[NetworkEntry::plain(NetworkKind::Signal), entry(on)],
+            false,
+        )
+    };
+    let (mut off, sent) = source_with(list(false));
+    assert!(off.networks()[1].available, "the row can be chosen");
+    assert!(matches!(
+        off.start_login(NetworkKind::WhatsApp),
+        Err(SourceError::Unavailable)
+    ));
+    assert!(
+        take_queries(&sent).is_empty()
+            && !sent
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, UiCommand::AddAccount { .. })),
+        "no AddAccount"
+    );
+    let (mut on, sent) = source_with(list(true));
+    on.start_login(NetworkKind::WhatsApp).expect("starts");
+    assert!(matches!(
+        sent.borrow().last(),
+        Some(UiCommand::AddAccount { network: NetworkKind::WhatsApp, flow }) if flow == "qr"
+    ));
+}
+
+// ---------- K-A: the link page's flows ----------
+
+fn whatsapp_entry(flows: &[(&str, &str)]) -> NetworkEntry {
+    NetworkEntry {
+        kind: NetworkKind::WhatsApp,
+        flows: flows
+            .iter()
+            .map(|(id, label)| ((*id).into(), (*label).into()))
+            .collect(),
+        experimental: true,
+        risk_notice: Some(("t".into(), "b".into())),
+        history_transfer: false,
+        history: kourier_model::HistorySource::PushedOnLink,
+        on: true,
+        receipts_always_sent: false,
+        missing: None,
+    }
+}
+
+/// A source whose welcome page offers WhatsApp (on) with both ways of linking.
+fn whatsapp_source() -> (CoreSource, Sent) {
+    source_with(network_choices(
+        &[
+            NetworkEntry::plain(NetworkKind::Signal),
+            whatsapp_entry(&[("qr", "QR code"), ("pair-code", "Phone number")]),
+        ],
+        false,
+    ))
+}
+
+fn login_step(account: AccountId, step_id: &str, txn: u64, kind: LoginStepKind) -> UiEvent {
+    UiEvent::LoginStep {
+        account,
+        step: LoginStep {
+            step_id: step_id.into(),
+            txn,
+            kind,
+        },
+    }
+}
+
+fn qr_step(account: AccountId) -> UiEvent {
+    login_step(
+        account,
+        "qr",
+        1,
+        LoginStepKind::ShowQr {
+            data: Redacted::new("qr-payload".into()),
+            valid_for: None,
+        },
+    )
+}
+
+fn phone_step(account: AccountId) -> UiEvent {
+    login_step(
+        account,
+        "phone",
+        2,
+        LoginStepKind::Input {
+            fields: vec![InputField {
+                id: "phone".into(),
+                label: "Phone number".into(),
+                kind: InputKind::Phone,
+                default: None,
+                required: true,
+                note: None,
+                code: None,
+            }],
+        },
+    )
+}
+
+fn failed_step(account: AccountId, step_id: &str, kind: kourier_model::ErrorKind) -> UiEvent {
+    login_step(
+        account,
+        step_id,
+        3,
+        LoginStepKind::Failed {
+            error: kourier_model::BackendError::new(kind, "refused"),
+        },
+    )
+}
+
+/// The login commands the source sent so far, one short line each: `add <network> <flow>`,
+/// `relink <account> <flow>`, `cancel <account>`, `submit <account>` (what was typed is not in it).
+fn login_commands(sent: &Sent) -> Vec<String> {
+    sent.borrow()
+        .iter()
+        .filter_map(|c| match c {
+            UiCommand::AddAccount { network, flow } => Some(format!("add {network:?} {flow}")),
+            UiCommand::Relink { account, flow } => Some(format!("relink {} {flow}", account.0)),
+            UiCommand::CancelLogin { account } => Some(format!("cancel {}", account.0)),
+            UiCommand::SubmitLoginInput { account, .. } => Some(format!("submit {}", account.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every login view says which flow runs and, where switching is a way on, the other flow with
+/// the label of its button: on the QR code "Link with Phone Number Instead", on the number and
+/// the code "Scan a QR Code Instead". A network with one flow offers none.
+#[test]
+fn the_link_page_offers_the_other_flow_where_switching_is_a_way_on() {
+    let (mut src, _) = whatsapp_source();
+    let view = src.start_login(NetworkKind::WhatsApp).expect("start");
+    assert_eq!(
+        (view.kind, view.flow.as_str()),
+        (LoginViewKind::Waiting, "qr")
+    );
+    assert!(
+        view.other_flow.is_empty(),
+        "no switch before the first step"
+    );
+    let wa = AccountId(7);
+    src.on_event(&UiEvent::AccountAdded { account: wa });
+    src.on_event(&qr_step(wa));
+    let v = src.login_view().expect("view");
+    assert_eq!(v.kind, LoginViewKind::Qr);
+    assert_eq!(
+        (
+            v.flow.as_str(),
+            v.other_flow.as_str(),
+            v.other_flow_label.as_str()
+        ),
+        ("qr", "pair-code", "Link with Phone Number Instead")
+    );
+    // The other flow's pages offer the way back.
+    let (mut pc, _) = whatsapp_source();
+    pc.start_login(NetworkKind::WhatsApp).expect("start");
+    pc.on_event(&UiEvent::AccountAdded { account: wa });
+    pc.login.as_mut().expect("login").flow = "pair-code".into();
+    pc.on_event(&phone_step(wa));
+    let v = pc.login_view().expect("view");
+    assert_eq!(v.kind, LoginViewKind::Input);
+    assert_eq!(
+        (
+            v.flow.as_str(),
+            v.other_flow.as_str(),
+            v.other_flow_label.as_str()
+        ),
+        ("pair-code", "qr", "Scan a QR Code Instead")
+    );
+    pc.on_event(&login_step(
+        wa,
+        "code",
+        3,
+        LoginStepKind::ShowCode {
+            code: Redacted::new("ABCD1234".into()),
+        },
+    ));
+    assert_eq!(pc.login_view().expect("view").other_flow, "qr");
+    // In the middle of the link (the phone has the code, Kourier waits) there is no switch.
+    pc.on_event(&login_step(
+        wa,
+        "linking",
+        4,
+        LoginStepKind::Progress {
+            label: "Linking".into(),
+            fraction: None,
+        },
+    ));
+    assert!(pc.login_view().expect("view").other_flow.is_empty());
+
+    // One flow, no button; a flow the viewmodel has no words for keeps the descriptor's label.
+    let (mut one, _) = source();
+    one.start_login(NetworkKind::Fake).expect("start");
+    one.on_event(&UiEvent::AccountAdded { account: wa });
+    one.on_event(&qr_step(wa));
+    assert!(one.login_view().expect("view").other_flow.is_empty());
+    let (mut odd, _) = source_with(network_choices(
+        &[
+            NetworkEntry::plain(NetworkKind::Signal),
+            whatsapp_entry(&[("qr", "QR code"), ("passkey", "Use a passkey")]),
+        ],
+        false,
+    ));
+    odd.start_login(NetworkKind::WhatsApp).expect("start");
+    odd.on_event(&UiEvent::AccountAdded { account: wa });
+    odd.on_event(&qr_step(wa));
+    let v = odd.login_view().expect("view");
+    assert_eq!(
+        (v.other_flow.as_str(), v.other_flow_label.as_str()),
+        ("passkey", "Use a passkey")
+    );
+}
+
+/// A switch stops the login that runs, starts the other flow of the same network and keeps the
+/// link page: `CancelLogin` of the old account, then `AddAccount` with the new flow, no question,
+/// and the old login's late steps change nothing.
+#[test]
+fn switching_the_flow_restarts_the_login_with_the_other_flow() {
+    let (mut src, sent) = whatsapp_source();
+    src.start_login(NetworkKind::WhatsApp).expect("start");
+    let (old, new) = (AccountId(7), AccountId(8));
+    src.on_event(&UiEvent::AccountAdded { account: old });
+    src.on_event(&qr_step(old));
+    sent.borrow_mut().clear();
+
+    let view = src.switch_login_flow("pair-code").expect("switch");
+    assert_eq!(
+        (view.kind, view.flow.as_str()),
+        (LoginViewKind::Waiting, "pair-code")
+    );
+    assert_eq!(
+        login_commands(&sent),
+        ["cancel 7", "add WhatsApp pair-code"]
+    );
+    // The page stays up and shows the new login; the old account's late QR code does not.
+    assert_eq!(src.login_network(), Some(NetworkKind::WhatsApp));
+    src.on_event(&qr_step(old));
+    assert_eq!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Waiting),
+        "the old login's step is ignored while the new account is not announced"
+    );
+    src.on_event(&UiEvent::AccountAdded { account: new });
+    src.on_event(&qr_step(old));
+    assert_eq!(
+        src.login_view().map(|v| v.kind),
+        Some(LoginViewKind::Waiting),
+        "and after it"
+    );
+    src.on_event(&phone_step(new));
+    let v = src.login_view().expect("view");
+    assert_eq!(
+        (v.kind, v.flow.as_str()),
+        (LoginViewKind::Input, "pair-code")
+    );
+}
+
+/// A double click (or a held key) on the button is one restart, and a switch where the page
+/// offers none, or to a flow the network does not have, sends nothing.
+#[test]
+fn a_double_switch_is_one_login_and_a_switch_out_of_place_sends_nothing() {
+    let (mut src, sent) = whatsapp_source();
+    src.start_login(NetworkKind::WhatsApp).expect("start");
+    let wa = AccountId(7);
+    src.on_event(&UiEvent::AccountAdded { account: wa });
+    // Before the first step: nothing to switch, and the click is not an error.
+    sent.borrow_mut().clear();
+    assert!(src.switch_login_flow("pair-code").is_ok());
+    assert!(
+        login_commands(&sent).is_empty(),
+        "the login has shown no step"
+    );
+    src.on_event(&qr_step(wa));
+    assert!(
+        src.switch_login_flow("passkey").is_err(),
+        "not a flow of the network"
+    );
+    assert!(src.switch_login_flow("qr").is_err(), "the flow that runs");
+    assert!(login_commands(&sent).is_empty());
+
+    src.switch_login_flow("pair-code").expect("first click");
+    let again = src.switch_login_flow("pair-code").expect("second click");
+    assert_eq!(again.kind, LoginViewKind::Waiting);
+    assert!(
+        src.switch_login_flow("qr").is_ok(),
+        "even the way back: ignored"
+    );
+    assert_eq!(
+        login_commands(&sent),
+        ["cancel 7", "add WhatsApp pair-code"],
+        "one restart, one login"
+    );
+
+    // No login at all, and a network with one flow.
+    let (mut none, _) = whatsapp_source();
+    assert!(none.switch_login_flow("pair-code").is_err());
+    let (mut one, sent) = source();
+    one.start_login(NetworkKind::Fake).expect("start");
+    one.on_event(&UiEvent::AccountAdded { account: wa });
+    one.on_event(&qr_step(wa));
+    sent.borrow_mut().clear();
+    assert!(one.switch_login_flow("pair-code").is_err());
+    assert!(login_commands(&sent).is_empty());
+}
+
+/// Linking an existing account again switches as a relink: the same account, the other flow.
+#[test]
+fn switching_the_flow_of_a_link_again_relinks_the_same_account() {
+    let (mut src, sent) = whatsapp_source();
+    let mut row = account();
+    row.network = NetworkKind::WhatsApp;
+    src.accounts = vec![row];
+    src.relink(AccountId(1)).expect("relink");
+    src.on_event(&qr_step(AccountId(1)));
+    sent.borrow_mut().clear();
+    src.switch_login_flow("pair-code").expect("switch");
+    assert_eq!(login_commands(&sent), ["cancel 1", "relink 1 pair-code"]);
+    // Its steps are followed from the first one, as for any relink.
+    src.on_event(&phone_step(AccountId(1)));
+    assert_eq!(src.login_view().map(|v| v.kind), Some(LoginViewKind::Input));
+}
+
+/// A refused number: "Try Again" starts the SAME flow with the number still in the field; an
+/// unavailable way ends in the other flow's button, not a retry; a code that ran out asks for a
+/// new one the same way.
+#[test]
+fn try_again_keeps_the_flow_and_the_typed_number() {
+    let (mut src, sent) = whatsapp_source();
+    src.start_login(NetworkKind::WhatsApp).expect("start");
+    let (first, second) = (AccountId(7), AccountId(8));
+    src.on_event(&UiEvent::AccountAdded { account: first });
+    src.on_event(&qr_step(first));
+    src.switch_login_flow("pair-code").expect("switch");
+    src.on_event(&UiEvent::AccountAdded { account: second });
+    src.on_event(&phone_step(second));
+    src.submit_login(vec![("phone".into(), "+380671234567".into())])
+        .expect("submit");
+    src.on_event(&failed_step(
+        second,
+        "phone",
+        kourier_model::ErrorKind::InvalidInput,
+    ));
+    let v = src.login_view().expect("view");
+    assert_eq!(v.kind, LoginViewKind::Failed);
+    assert!(v.error.starts_with("Check the phone number"), "{}", v.error);
+    assert!(v.retry);
+    assert_eq!(
+        (v.other_flow.as_str(), v.other_flow_label.as_str()),
+        ("qr", "Scan a QR Code Instead"),
+        "the way out of a refused number"
+    );
+
+    sent.borrow_mut().clear();
+    src.start_login(NetworkKind::WhatsApp).expect("try again");
+    assert_eq!(login_commands(&sent), ["add WhatsApp pair-code"]);
+    let third = AccountId(9);
+    src.on_event(&UiEvent::AccountAdded { account: third });
+    src.on_event(&phone_step(third));
+    let v = src.login_view().expect("view");
+    assert_eq!(v.fields[0].value, "+380671234567", "the number is kept");
+    // Only for the step it answered.
+    src.on_event(&login_step(
+        third,
+        "other",
+        5,
+        LoginStepKind::Input {
+            fields: vec![InputField {
+                id: "phone".into(),
+                label: "x".into(),
+                kind: InputKind::Phone,
+                default: None,
+                required: true,
+                note: None,
+                code: None,
+            }],
+        },
+    ));
+    assert!(src.login_view().expect("view").fields[0].value.is_empty());
+
+    // A code that ran out: the same flow again.
+    let mut again = whatsapp_source().0;
+    again.start_login(NetworkKind::WhatsApp).expect("start");
+    again.login.as_mut().expect("login").flow = "pair-code".into();
+    again.on_event(&UiEvent::AccountAdded { account: first });
+    again.on_event(&failed_step(
+        first,
+        "code",
+        kourier_model::ErrorKind::Expired,
+    ));
+    let v = again.login_view().expect("view");
+    assert!(v.retry && v.error.starts_with("The code expired"), "{v:?}");
+    let sent2 = {
+        let (mut a, s) = whatsapp_source();
+        a.start_login(NetworkKind::WhatsApp).expect("start");
+        a.login.as_mut().expect("login").flow = "pair-code".into();
+        a.on_event(&UiEvent::AccountAdded { account: first });
+        a.on_event(&failed_step(
+            first,
+            "code",
+            kourier_model::ErrorKind::Expired,
+        ));
+        s.borrow_mut().clear();
+        a.start_login(NetworkKind::WhatsApp).expect("try again");
+        s
+    };
+    assert_eq!(login_commands(&sent2), ["add WhatsApp pair-code"]);
+}
+
+/// A number the network does not take for this account ends in the other way, not in a retry
+/// that would fail the same; a link the user left forgets the number.
+#[test]
+fn an_unsupported_number_offers_the_qr_code_and_leaving_forgets_the_number() {
+    let (mut src, _) = whatsapp_source();
+    src.start_login(NetworkKind::WhatsApp).expect("start");
+    src.login.as_mut().expect("login").flow = "pair-code".into();
+    let wa = AccountId(7);
+    src.on_event(&UiEvent::AccountAdded { account: wa });
+    src.on_event(&phone_step(wa));
+    src.submit_login(vec![("phone".into(), "+380671234567".into())])
+        .expect("submit");
+    src.on_event(&failed_step(
+        wa,
+        "phone",
+        kourier_model::ErrorKind::Unsupported,
+    ));
+    let v = src.login_view().expect("view");
+    assert!(!v.retry, "asking again would fail the same");
+    assert!(v.error.contains("Scan a QR code instead"), "{}", v.error);
+    assert_eq!(v.other_flow, "qr");
+    // The number prints nowhere: not in the login's Debug.
+    let shown = format!("{:?}", src.login.as_ref().expect("login"));
+    assert!(!shown.contains("380671234567"), "{shown}");
+    // Left: the next link starts clean.
+    src.cancel_login();
+    src.start_login(NetworkKind::WhatsApp).expect("again");
+    assert!(src.login.as_ref().expect("login").typed.is_none());
+    assert_eq!(src.login.as_ref().expect("login").flow, "qr");
+}
+
 #[test]
 fn login_walks_input_qr_and_done() {
     let (mut src, sent) = source();
     assert!(
         src.start_login(NetworkKind::Threema).is_err(),
-        "not available"
+        "a network that is not in the build has no row"
     );
     let view = src.start_login(NetworkKind::Fake).expect("start");
     assert_eq!(view.kind, LoginViewKind::Waiting);
@@ -735,6 +1288,8 @@ fn login_walks_input_qr_and_done() {
                 kind: InputKind::Text,
                 default: Some("kourier".into()),
                 required: true,
+                note: None,
+                code: None,
             }],
         },
         1,
@@ -860,7 +1415,7 @@ fn not_implemented_send_shows_a_notice() {
     let ch = src.on_action_failed(
         "SendText",
         &CoreError::NotImplemented("SendText"),
-        &ActionSubject::None,
+        &ActionSubject::Conversation(ConversationId(1)),
     );
     assert!(ch.notice);
     assert!(ch.draft, "the refused text comes back");
@@ -1516,7 +2071,14 @@ fn send_files_takes_the_composer_text_as_caption_and_gives_it_back_on_failure() 
     src.save_draft(ConversationId(1), "draft");
     sent.borrow_mut().clear();
     assert_eq!(
-        src.send_files(ConversationId(1), Vec::new(), Vec::new(), "x", None),
+        src.send_files(
+            ConversationId(1),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "x",
+            None
+        ),
         Err(SourceError::Empty)
     );
     let paths = vec![std::path::PathBuf::from("/tmp/a.jpg")];
@@ -1526,6 +2088,7 @@ fn send_files_takes_the_composer_text_as_caption_and_gives_it_back_on_failure() 
             ConversationId(1),
             paths.clone(),
             vec![true],
+            Vec::new(),
             "Photos \n",
             Some(quoted),
         )
@@ -1562,6 +2125,7 @@ fn send_files_takes_the_composer_text_as_caption_and_gives_it_back_on_failure() 
             conv: ConversationId(1),
             request: kourier_core::facade::RequestId(request),
             as_file: vec![true],
+            with_location: Vec::new(),
             paths: paths.to_vec().into(),
             caption: files.2.clone(),
             reply_to: files.3,
@@ -1579,8 +2143,8 @@ fn send_files_takes_the_composer_text_as_caption_and_gives_it_back_on_failure() 
     assert_eq!(src.preparing_files(ConversationId(1)), 0);
     let back = src.take_refused_files().expect("the refused request");
     assert_eq!(
-        (back.conv, back.caption.as_str(), back.reply_to, back.resent),
-        (ConversationId(1), "Photos", Some(quoted), 0)
+        (back.conv, back.reply_to, back.resent),
+        (ConversationId(1), Some(quoted), 0)
     );
     // The file comes back with the choice that was made for it, and the request is named.
     assert_eq!(
@@ -1603,16 +2167,12 @@ fn send_files_takes_the_composer_text_as_caption_and_gives_it_back_on_failure() 
                 as_file: false,
                 reason: None,
             }],
-            caption: "private".into(),
             reply_to: None,
             resent: 0,
             resent_request: None,
         }
     );
-    assert!(
-        !debug.contains("secret") && !debug.contains("private"),
-        "{debug}"
-    );
+    assert!(!debug.contains("secret"), "{debug}");
     // A failure that names no request says so and hands nothing back.
     src.on_action_failed("SendFiles", &CoreError::Stopped, &ActionSubject::None);
     assert_eq!(src.notice(), "The files could not be sent.");
@@ -1636,6 +2196,7 @@ fn files_the_network_cannot_take_do_not_hold_the_others_back() {
             ConversationId(1),
             paths.clone(),
             Vec::new(),
+            Vec::new(),
             "Trip",
             Some(MessageId(100_002)),
         )
@@ -1651,6 +2212,7 @@ fn files_the_network_cannot_take_do_not_hold_the_others_back() {
             conv: ConversationId(1),
             request: kourier_core::facade::RequestId(request),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             paths: paths.to_vec().into(),
             caption: Some(Text::plain("Trip")),
             reply_to: Some(MessageId(100_002)),
@@ -1713,10 +2275,7 @@ fn files_the_network_cannot_take_do_not_hold_the_others_back() {
             returned(&paths[3], FileRefusal::NotAFile),
         ]
     );
-    assert_eq!(
-        (back.caption.as_str(), back.reply_to, back.resent),
-        ("", None, 2)
-    );
+    assert_eq!((back.reply_to, back.resent), (None, 2));
     assert_eq!(
         src.draft(ConversationId(1)),
         "",
@@ -1726,7 +2285,14 @@ fn files_the_network_cannot_take_do_not_hold_the_others_back() {
     sent.borrow_mut().clear();
     let one = vec![paths[3].clone()];
     let request = src
-        .send_files(ConversationId(1), one.clone(), Vec::new(), "Trip", None)
+        .send_files(
+            ConversationId(1),
+            one.clone(),
+            Vec::new(),
+            Vec::new(),
+            "Trip",
+            None,
+        )
         .expect("sent");
     sent.borrow_mut().clear();
     let ch = src.on_action_failed(
@@ -1754,7 +2320,11 @@ fn files_the_network_cannot_take_do_not_hold_the_others_back() {
     );
     let back = src.take_refused_files().expect("back");
     assert_eq!(back.files, vec![returned(&one[0], FileRefusal::NotAFile)]);
-    assert_eq!(back.caption, "Trip");
+    assert_eq!(
+        src.draft(ConversationId(1)),
+        "Trip",
+        "the caption is the draft again"
+    );
     assert_eq!(
         src.preparing_files(ConversationId(1)),
         2,
@@ -1954,7 +2524,7 @@ fn the_line_under_a_message_on_its_way_follows_the_connection_and_the_send() {
 }
 
 /// A pending own message (the third of conversation 1) with the given outbox row.
-fn make_pending(m: &mut CoreMessage, in_flight: bool, next: Option<i64>) {
+pub(super) fn make_pending(m: &mut CoreMessage, in_flight: bool, next: Option<i64>) {
     use kourier_core::facade::OutboxWait;
     m.origin = OriginKind::OwnThisDevice;
     m.author = None;
@@ -1967,6 +2537,52 @@ fn make_pending(m: &mut CoreMessage, in_flight: bool, next: Option<i64>) {
         next_attempt_at: next,
         last_error: None,
     });
+}
+
+/// K-A fix C3: while the account's network holds back what is sent, the chat header says why
+/// the disappearing-message timer cannot be changed (the core refuses the change), and it is
+/// silent again once the hold is lifted or its date has passed.
+#[test]
+fn the_timer_entry_says_why_it_is_off_while_the_account_is_held() {
+    use kourier_model::{AccountHold, HoldReason};
+    let (mut src, sent) = source();
+    let store = Store::new(&[(1, 3)]);
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    let reason = |src: &CoreSource| src.chat(ConversationId(1)).expect("header").timer_held;
+    assert_eq!(reason(&src), "");
+    let held = |hold| UiEvent::AccountHold {
+        account: AccountId(1),
+        hold,
+    };
+    src.on_event(&held(Some(AccountHold {
+        until_ms: None,
+        reason: HoldReason::ReachOutLocked,
+    })));
+    let text = reason(&src);
+    assert!(
+        text.starts_with("Disappearing messages cannot be changed while "),
+        "{text:?}"
+    );
+    src.on_event(&held(None));
+    assert_eq!(reason(&src), "");
+    // A hold with a date says it too, until the date: the reason is the same words, and it is
+    // gone once the date has passed.
+    let dated = |until: i64| {
+        held(Some(AccountHold {
+            until_ms: Some(u64::try_from(until).expect("a date")),
+            reason: HoldReason::ReachOutLocked,
+        }))
+    };
+    src.on_event(&dated(NOW + 3_600_000));
+    let text = reason(&src);
+    assert!(
+        text.starts_with("Disappearing messages cannot be changed while "),
+        "a dated hold gave no reason: {text:?}"
+    );
+    src.on_event(&dated(NOW - 1));
+    assert_eq!(reason(&src), "", "a hold whose date has passed");
 }
 
 /// The reason under a message that waits names the REAL hold, never "the connection" for
@@ -2018,6 +2634,8 @@ fn the_line_names_what_holds_the_account() {
         (
             ConnState::LoggedOut {
                 reason: "unlinked".into(),
+                cause: Default::default(),
+                note: Default::default(),
             },
             "Waiting for this device to be linked again · 0:42",
         ),
@@ -2033,8 +2651,10 @@ fn the_line_names_what_holds_the_account() {
             ConnState::Restricted {
                 until_ms: None,
                 reason: "later".into(),
+                kind: Default::default(),
+                note: Default::default(),
             },
-            "Waiting: the network restricted this account · 0:42",
+            "Waiting: Test network restricted this account",
         ),
         // Connected again (still catching up, then caught up): its own send.
         (ConnState::Syncing { fraction: None }, "Sending… 0:42"),
@@ -2110,6 +2730,80 @@ fn a_queue_that_waits_for_a_safety_number_says_so() {
     assert_eq!(r.wait, "Waiting for the connection");
 }
 
+/// U4: when the core names the person on every waiting row of the paused queue
+/// (`MessageActions::safety_number`), the paused head, although it shows as failed, says
+/// "Not sent: the safety number with <name> changed" at once, the rows behind it say what they
+/// wait for with the name, and each of them offers "Show <name>'s Safety Number" in its menu.
+/// A failed row the core did not name stays without a line.
+#[test]
+fn a_paused_head_and_the_rows_behind_it_name_the_person() {
+    use kourier_core::facade::OutboxWait;
+    use kourier_model::{FailReason, OutgoingState};
+    let (mut src, sent) = source();
+    let mut store = Store::new(&[(1, 4), (2, 3)]);
+    let who = user(7);
+    let msgs = store.convs.get_mut(&1).expect("conv");
+    make_pending(&mut msgs[2], false, None);
+    msgs[2].out_state = Some(OutgoingState::Failed {
+        reason: FailReason::UntrustedIdentity,
+        retryable: true,
+    });
+    msgs[2].outbox = Some(OutboxWait {
+        in_flight: false,
+        attempts: 1,
+        next_attempt_at: None,
+        last_error: Some("UntrustedIdentity".into()),
+    });
+    msgs[2].actions.safety_number = Some(who.clone());
+    make_pending(&mut msgs[3], false, None);
+    msgs[3].outbox = Some(OutboxWait {
+        in_flight: false,
+        attempts: 0,
+        next_attempt_at: None,
+        last_error: None,
+    });
+    msgs[3].actions.safety_number = Some(who.clone());
+    let (head, behind, other) = (msgs[2].id, msgs[3].id, msgs[1].id);
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    settle(&mut src, &sent, &store);
+    src.on_event(&UiEvent::ConnState {
+        account: AccountId(1),
+        state: ConnState::Online { detail: None },
+    });
+    let name = crate::names::single_line(&src.names.display_name(&who));
+    let rows = src.timeline(ConversationId(1));
+    let row = |id: MessageId| {
+        rows.iter()
+            .find(|r| r.key == RowKey::Message(id))
+            .expect("row")
+    };
+    let line = |id: MessageId| {
+        format!("{} {}", row(id).wait, row(id).wait_timer)
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        line(head),
+        format!("Not sent: the safety number with {name} changed"),
+        "the failed head names the person, with no timer"
+    );
+    assert_eq!(
+        line(behind),
+        format!("Waiting for you to confirm the new safety number with {name} · 0:42")
+    );
+    for id in [head, behind] {
+        let first = row(id).pages.first().expect("a page entry");
+        assert!(
+            first.safety && first.label == format!("Show {name}'s Safety Number"),
+            "{:?}: the menu names the number's page first",
+            row(id).key
+        );
+    }
+    assert_eq!(line(other), "", "a row the core did not name has no line");
+    assert!(row(other).pages.iter().all(|p| !p.safety));
+}
+
 /// The per-second tick brings up to date the lines under the messages that show one, row by
 /// row (`UiSource::wait_lines`), and never rebuilds the timeline (link feedback L6): what it
 /// hands out is what a rebuilt timeline would show.
@@ -2128,7 +2822,7 @@ fn the_tick_changes_only_the_wait_lines() {
         CoreSourceConfig {
             now: Box::new(move || c2.get()),
             calendar: Box::new(FixedOffset(0)),
-            networks: network_choices(),
+            networks: test_networks(),
             hostname: "workstation".into(),
             demo: None,
         },
@@ -2298,4 +2992,315 @@ fn a_logged_out_account_holds_its_queue_whatever_the_connection_says() {
         .find(|r| r.key == RowKey::Message(id))
         .expect("row");
     assert_eq!(r.wait, "Waiting for this device to be linked again");
+}
+
+// ---------- the archive (A1) ----------
+
+/// Answers the queries sent so far (and the follow-ups they cause) as the core answers the
+/// viewmodel's read of the WHOLE list: one query for the inbox and the archive together
+/// (`archived: None`; the simulated core returns `rows` whatever the query's view, as the real
+/// one does for `None`). The other queries get the empty store's answers. Every `Changes`
+/// merged.
+fn settle_listing(src: &mut CoreSource, sent: &Sent, rows: &[CoreConversation]) -> Changes {
+    let store = Store::default();
+    let mut changes = Changes::default();
+    for _ in 0..100 {
+        let queries = take_queries(sent);
+        if queries.is_empty() {
+            return changes;
+        }
+        for (token, query) in queries {
+            let data = match &query {
+                Query::Conversations(q) => {
+                    assert_eq!(
+                        q.archived, None,
+                        "the list is read as one: inbox and archive"
+                    );
+                    QueryData::Conversations(ConversationPage {
+                        rows: rows.to_vec(),
+                        next: None,
+                    })
+                }
+                other => store.answer(other),
+            };
+            changes.merge(src.on_event(&result(token, data)));
+        }
+    }
+    panic!("queries do not settle");
+}
+
+/// A source whose list is `rows`, and the queue its later reads go through.
+fn listing_source(rows: &[CoreConversation]) -> (CoreSource, Sent) {
+    let (mut src, sent) = source();
+    src.reload();
+    let first = settle_listing(&mut src, &sent, rows);
+    assert!(first.conversations, "the list was read");
+    (src, sent)
+}
+
+fn source_listing(rows: Vec<CoreConversation>) -> CoreSource {
+    listing_source(&rows).0
+}
+
+/// A conversation row of the archive tests: `unread` unread messages, in the archive or not.
+fn listed_row(id: i64, title: &str, last: i64, archived: bool, unread: u32) -> CoreConversation {
+    CoreConversation {
+        archived,
+        unread,
+        ..conv_row(id, title, last)
+    }
+}
+
+fn ids(rows: &[ConversationRow]) -> Vec<i64> {
+    rows.iter().map(|r| r.id.0).collect()
+}
+
+fn archive_view() -> ConversationFilter {
+    ConversationFilter {
+        archived: true,
+        ..ConversationFilter::default()
+    }
+}
+
+#[test]
+fn an_archived_chat_is_in_the_archive_not_in_the_inbox() {
+    let src = source_listing(vec![
+        listed_row(1, "Inbox one", 30, false, 0),
+        listed_row(2, "Archived one", 20, true, 0),
+        listed_row(3, "Inbox two", 10, false, 0),
+    ]);
+    let inbox = src.conversations(&ConversationFilter::default());
+    assert_eq!(ids(&inbox), [1, 3], "the inbox lacks the archived chat");
+    assert!(inbox.iter().all(|r| !r.archived));
+    let archive = src.conversations(&archive_view());
+    assert_eq!(ids(&archive), [2], "the archive view lists it");
+    assert!(archive[0].archived);
+    assert_eq!(src.archived_count(&ConversationFilter::default()), 1);
+    // The count follows the accounts of the filter: a hidden account's archived chats are not
+    // counted.
+    let other = ConversationFilter {
+        hidden: src.accounts().iter().map(|a| a.uuid).collect(),
+        ..ConversationFilter::default()
+    };
+    assert_eq!(src.archived_count(&other), 0);
+}
+
+#[test]
+fn a_search_lists_archived_chats_after_the_inbox_matches() {
+    // The archived chat is the NEWEST: order by activity alone would put it first.
+    let src = source_listing(vec![
+        listed_row(1, "Dogs club", 10, false, 0),
+        listed_row(2, "Dogs archive", 50, true, 0),
+        listed_row(3, "Cats", 40, false, 0),
+        listed_row(4, "Dogs walk", 5, false, 0),
+    ]);
+    let found = src.conversations(&ConversationFilter {
+        query: "dogs".into(),
+        ..ConversationFilter::default()
+    });
+    assert_eq!(
+        ids(&found),
+        [1, 4, 2],
+        "the inbox's matches in list order, then the archive's"
+    );
+    // The same search typed while the archive view is the filter's view still looks in both.
+    let from_archive = src.conversations(&ConversationFilter {
+        query: "dogs".into(),
+        ..archive_view()
+    });
+    assert_eq!(ids(&from_archive), [1, 4, 2]);
+}
+
+#[test]
+fn a_pinned_archived_chat_stays_in_the_inbox() {
+    let mut pinned = listed_row(1, "Pinned and archived", 10, true, 2);
+    pinned.pinned_order = Some(0);
+    let src = source_listing(vec![pinned, listed_row(2, "Inbox", 20, false, 0)]);
+    let inbox = src.conversations(&ConversationFilter::default());
+    assert_eq!(ids(&inbox), [1, 2], "the pinned chat leads the inbox");
+    assert!(
+        !inbox[0].archived,
+        "(Signal's merge: a pinned chat is never archived)"
+    );
+    assert!(src.conversations(&archive_view()).is_empty());
+    assert_eq!(src.archived_count(&ConversationFilter::default()), 0);
+    assert_eq!(
+        src.unread_total(),
+        2,
+        "its unread messages count: it is in the inbox"
+    );
+}
+
+#[test]
+fn an_archived_chat_counts_in_no_badge() {
+    let src = source_listing(vec![
+        listed_row(1, "Inbox", 20, false, 2),
+        listed_row(2, "Archived", 10, true, 3),
+    ]);
+    assert_eq!(
+        src.unread_total(),
+        2,
+        "only the inbox's 2: not the archive's 3"
+    );
+    let only_archived = source_listing(vec![listed_row(1, "Archived", 10, true, 3)]);
+    assert_eq!(only_archived.unread_total(), 0);
+}
+
+#[test]
+fn an_archived_chat_counts_in_no_account_number() {
+    let src = source_listing(vec![
+        listed_row(1, "Inbox", 20, false, 2),
+        listed_row(2, "Archived", 10, true, 3),
+    ]);
+    let accounts = src.accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(
+        accounts[0].unread, 2,
+        "the side panel counts the inbox only"
+    );
+}
+
+/// The core's list changed: `ConversationsChanged`, and the read it causes answered with `rows`.
+fn relist(src: &mut CoreSource, sent: &Sent, rows: &[CoreConversation]) -> Changes {
+    let mut changes = src.on_event(&UiEvent::ConversationsChanged { ids: Vec::new() });
+    changes.merge(settle_listing(src, sent, rows));
+    changes
+}
+
+#[test]
+fn the_open_chat_that_comes_back_reports_it() {
+    // Chat 1 is in the archive and open (picked from a search, or a notification).
+    let archived = [
+        listed_row(1, "Mine", 20, true, 0),
+        listed_row(2, "Other", 10, false, 0),
+    ];
+    let (mut src, sent) = listing_source(&archived);
+    src.open_conversation(Some(ConversationId(1)));
+    let opened = settle_listing(&mut src, &sent, &archived);
+    assert_eq!(opened.archive_move, None, "opening a chat moves nothing");
+    // The same list again: still nothing.
+    assert_eq!(relist(&mut src, &sent, &archived).archive_move, None);
+    // A message came: the chat is in the inbox.
+    let back = [
+        listed_row(1, "Mine", 30, false, 1),
+        listed_row(2, "Other", 10, false, 0),
+    ];
+    let ch = relist(&mut src, &sent, &back);
+    assert_eq!(
+        ch.archive_move,
+        Some(ArchiveMove::ToInbox),
+        "the list must go back to the inbox"
+    );
+    // Told once: the next read of the same list says nothing.
+    assert_eq!(relist(&mut src, &sent, &back).archive_move, None);
+    // Another chat leaving the archive is not the open chat's business (it is listed first:
+    // the open chat is looked for by its id, not by its place).
+    let both = [
+        listed_row(2, "Other", 10, true, 0),
+        listed_row(1, "Mine", 20, true, 0),
+    ];
+    let (mut src, sent) = listing_source(&both);
+    src.open_conversation(Some(ConversationId(1)));
+    settle_listing(&mut src, &sent, &both);
+    let other_back = [
+        listed_row(2, "Other", 40, false, 1),
+        listed_row(1, "Mine", 20, true, 0),
+    ];
+    assert_eq!(relist(&mut src, &sent, &other_back).archive_move, None);
+}
+
+#[test]
+fn the_open_chat_archived_elsewhere_reports_it() {
+    let inbox = [
+        listed_row(1, "Mine", 20, false, 0),
+        listed_row(2, "Other", 10, false, 0),
+    ];
+    let (mut src, sent) = listing_source(&inbox);
+    src.open_conversation(Some(ConversationId(1)));
+    settle_listing(&mut src, &sent, &inbox);
+    // The phone archives another chat (listed first): nothing for the open one.
+    let other = [
+        listed_row(2, "Other", 10, true, 0),
+        listed_row(1, "Mine", 20, false, 0),
+    ];
+    assert_eq!(relist(&mut src, &sent, &other).archive_move, None);
+    // The phone pins the open chat as well as archiving it: a pinned chat is in the inbox
+    // (the one rule), so it did not move.
+    let mut pinned = listed_row(1, "Mine", 20, true, 0);
+    pinned.pinned_order = Some(0);
+    assert_eq!(
+        relist(&mut src, &sent, &[other[0].clone(), pinned]).archive_move,
+        None
+    );
+    // The phone archives the open chat.
+    let gone = [
+        listed_row(1, "Mine", 20, true, 0),
+        listed_row(2, "Other", 10, true, 0),
+    ];
+    let ch = relist(&mut src, &sent, &gone);
+    assert_eq!(
+        ch.archive_move,
+        Some(ArchiveMove::ToArchive),
+        "the chat must close"
+    );
+    assert!(ch.any(), "the move counts as a change");
+}
+
+#[test]
+fn a_chat_opened_before_its_list_arrived_has_no_side_to_leave() {
+    let (mut src, sent) = source();
+    src.reload();
+    src.open_conversation(Some(ConversationId(1)));
+    let rows = [listed_row(1, "Mine", 20, true, 0)];
+    let ch = settle_listing(&mut src, &sent, &rows);
+    assert!(ch.conversations);
+    assert_eq!(
+        ch.archive_move, None,
+        "the first read of the list moves nothing"
+    );
+}
+
+/// S-P: a protected chat's list row shows "Protected chat" in place of its last message AND of
+/// a draft this session keeps (Threema Desktop's list), with no author, icon, receipt or time,
+/// whatever the core's row holds; a search finds it by its title, never by its text or by the
+/// placeholder. The chat next to it shows its last message as ever.
+#[test]
+fn a_protected_chat_s_row_shows_no_message_and_a_search_finds_only_its_title() {
+    let protected = CoreConversation {
+        protected: true,
+        ..conv_row(1, "Hiking", 20)
+    };
+    let mut src = source_listing(vec![protected, conv_row(2, "Cycling", 10)]);
+    src.save_draft(ConversationId(1), "my unsent secret");
+    let rows = src.conversations(&ConversationFilter::default());
+    let row = rows.iter().find(|r| r.id.0 == 1).expect("listed");
+    assert!(row.protected);
+    assert_eq!(row.preview, "Protected chat");
+    assert_eq!(
+        (
+            row.preview_author.as_str(),
+            row.preview_source,
+            row.preview_icon.as_str(),
+            row.time_label.as_str()
+        ),
+        ("", PreviewSource::None, "", "")
+    );
+    assert_eq!(row.receipt, Receipt::None);
+    let other = rows.iter().find(|r| r.id.0 == 2).expect("listed");
+    assert_eq!(other.preview, "last of Cycling");
+    assert!(!other.time_label.is_empty());
+    let search = |q: &str| {
+        ids(&src.conversations(&ConversationFilter {
+            query: q.into(),
+            ..ConversationFilter::default()
+        }))
+    };
+    assert_eq!(search("hiking"), [1], "by its title");
+    assert!(
+        search("last of hiking").is_empty(),
+        "never by its last message"
+    );
+    assert!(search("unsent secret").is_empty(), "never by its draft");
+    assert!(search("protected").is_empty(), "never by the placeholder");
+    assert_eq!(search("last of cycling"), [2], "the other chat by its text");
 }

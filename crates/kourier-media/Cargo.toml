@@ -8,5 +8,6 @@ publish.workspace = true
 
 [dependencies]
 blurhash.workspace = true
+flate2.workspace = true
 image.workspace = true
 thiserror.workspace = true

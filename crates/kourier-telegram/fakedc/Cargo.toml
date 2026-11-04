@@ -1,0 +1,34 @@
+# tg-fakedc: the lane's fake Telegram data centre for TDLib (TD-4a). TEST ONLY: never a member of Kourier's
+# workspace, never in a shipped binary. A workspace of its own with its own Cargo.lock; built and checked only by
+# `cargo xtask tdlib fakedc build` (never run cargo inside this directory: the target directory is
+# `target/tg-fakedc/` of the repository).
+[package]
+name = "tg-fakedc"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+grammers-crypto = "=0.11.0"
+# The TL types at layer 232: grammers-tl-types 0.11.0 (layer 230) with grammers' layer-232 api.tl, vendored
+# (vendor/grammers-tl-types/VENDORED.md). A path dependency inside this workspace is a member of it. `cargo xtask
+# tdlib fakedc build|env|record` refuse when its `// LAYER` line is not the pin's layer.
+grammers-tl-types = { version = "=0.11.0", path = "vendor/grammers-tl-types", features = ["deserializable-functions"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+sha1 = "0.11"
+sha2 = "0.11"
+aes = "0.8"
+ctr = "0.9"
+num-bigint = "0.4"
+rand = "0.8"
+
+# The key generation's Miller-Rabin and the handshake's modpow are slow unoptimised.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

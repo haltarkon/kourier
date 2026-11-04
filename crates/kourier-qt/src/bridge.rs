@@ -11,6 +11,9 @@ pub use crate::controllers::{ComposerRust, LoginRust, SettingsRust};
 pub use crate::models::accounts::AccountsRust;
 pub use crate::models::attachments::AttachmentsRust;
 pub use crate::models::conversations::ConversationsRust;
+pub use crate::models::media::MediaRust;
+pub use crate::models::members::MembersRust;
+pub use crate::models::share::ShareTargetsRust;
 pub use crate::models::timeline::TimelineRust;
 
 #[cxx_qt::bridge]
@@ -26,6 +29,9 @@ pub mod qobject {
         include!("cxx-qt-lib/qstring.h");
         /// Qt string.
         type QString = cxx_qt_lib::QString;
+        include!("cxx-qt-lib/qurl.h");
+        /// Qt URL (what Qt hands a URL handler).
+        type QUrl = cxx_qt_lib::QUrl;
         include!("cxx-qt-lib/qvariant.h");
         /// Qt variant.
         type QVariant = cxx_qt_lib::QVariant;
@@ -66,6 +72,16 @@ pub mod qobject {
         #[cxx_name = "imagesLoading"]
         unsafe fn images_loading(window: *mut QObject) -> i32;
 
+        /// The images of `window` that are loading, in words (name, parent, visible or hidden,
+        /// size, `source`, `sourceSize` of each, joined by "; "): what a render that did not
+        /// settle was waiting for.
+        ///
+        /// # Safety
+        ///
+        /// `window` must be null or a live `QObject`.
+        #[cxx_name = "loadingImages"]
+        unsafe fn loading_images(window: *mut QObject) -> QString;
+
         /// The visible images of `window` that draw an attachment (`image://kourier/thumb/…`
         /// or `…/att/…`), whatever their status (-1: not a window).
         ///
@@ -89,13 +105,19 @@ pub mod qobject {
         #[cxx_name = "parkCursor"]
         fn park_cursor();
 
-        /// Recolors the links of a `TextEdit.textDocument`.
+        /// Recolors the links of a `TextEdit.textDocument` with `color`; a mention (the link
+        /// `kourier:mention/<i>`) keeps the look of the text, `ink`, without an underline.
         ///
         /// # Safety
         ///
         /// `document` must be null or a live `QObject`.
         #[cxx_name = "colorLinks"]
-        unsafe fn color_links_of(document: *mut QObject, color: &QColor);
+        unsafe fn color_links_of(document: *mut QObject, color: &QColor, ink: &QColor);
+
+        /// How the links of `html` look after `colorLinks`, one line per link: the href, the
+        /// foreground as `#rrggbb`, `underline` and `bold` as 0 or 1 (tests).
+        #[cxx_name = "richTextLinkLooks"]
+        fn rich_text_link_looks(html: &QString, color: &QColor, ink: &QColor) -> QString;
 
         /// The plain text Qt's rich-text document makes of `html` (tests: displayed positions).
         #[cxx_name = "richTextPlain"]
@@ -144,6 +166,20 @@ pub mod qobject {
         /// Sets what [`session_ending`] says (tests: no session manager is there to ask).
         #[cxx_name = "setSessionEnding"]
         fn set_session_ending(ending: bool);
+
+        /// Makes every `QDesktopServices::openUrl` of the process with an http, https, mailto or
+        /// file URL (Kirigami's own components call `Qt.openUrlExternally`) go to the slot
+        /// `openExternalUrl(QUrl)` of `receiver` (the app).
+        ///
+        /// # Safety
+        ///
+        /// `receiver` must be a live `QObject` with that slot; Qt thread.
+        #[cxx_name = "registerUrlHandlers"]
+        unsafe fn register_url_handlers(receiver: *mut QObject);
+
+        /// `url` as the program that opens it takes it (`QUrl::FullyEncoded`).
+        #[cxx_name = "urlForTheOpener"]
+        fn url_for_the_opener(url: &QUrl) -> QString;
     }
 
     unsafe extern "C++" {
@@ -176,6 +212,14 @@ pub mod qobject {
         /// The requests logged since, in order; empties the log.
         #[cxx_name = "takeImageRequestLog"]
         fn take_image_request_log() -> Vec<String>;
+
+        /// Test probe of the order in which a response's `finished` reaches Qt's pixmap reader
+        /// (`raceImageFinishes` in `cpp/imageprovider.h`): 0 off; 1 a request returns only once
+        /// its worker is done; 2 the same, and a `finished` emitted on a thread other than the
+        /// response's is held inside Qt's emission until the reader has connected and checked
+        /// (the order that loses it). False when 2 cannot be armed.
+        #[cxx_name = "raceImageFinishes"]
+        fn race_image_finishes(how: i32) -> bool;
 
         /// A JPEG as stored (`width` x `height`, left half red, right half blue) with the EXIF
         /// orientation tag `orientation` (1 to 8: 6 = shown rotated by 90 degrees, 8 = by 270)
@@ -286,22 +330,45 @@ pub mod qobject {
         #[qproperty(bool, timers_active)]
         #[qproperty(i64, current_account)]
         #[qproperty(QString, current_title)]
+        #[qproperty(QString, current_title_short)]
+        #[qproperty(bool, blend)]
+        #[qproperty(bool, all_shown)]
+        #[qproperty(i32, shown_count)]
+        #[qproperty(i32, hidden_unread)]
+        #[qproperty(QVariant, banner_shown_transfer)]
         #[qproperty(bool, start_hidden, READ, CONSTANT)]
         #[qproperty(i32, release_delay_ms, READ, CONSTANT)]
         #[qproperty(bool, trace_frame)]
         #[qproperty(QString, perf_scenario, READ, CONSTANT)]
         #[qproperty(i32, tray_status)]
         #[qproperty(i32, unread_count)]
+        #[qproperty(bool, archive_shown)]
+        #[qproperty(i32, archived_count)]
         #[qproperty(QString, banner_kind)]
         #[qproperty(QString, banner_text)]
         #[qproperty(QString, banner_action)]
+        #[qproperty(QString, banner_explanation)]
+        #[qproperty(QString, banner_appeal_url)]
+        #[qproperty(QString, banner_appeal_label)]
         #[qproperty(i64, banner_account)]
         #[qproperty(QVariant, banner_transfer)]
         #[qproperty(QVariant, history_accounts)]
         #[qproperty(QVariant, account_actions)]
         #[qproperty(QVariant, revisions)]
+        #[qproperty(QVariant, person)]
+        #[qproperty(QVariant, group)]
+        #[qproperty(QVariant, safety)]
         #[qproperty(QVariant, networks, READ, CONSTANT)]
+        #[qproperty(QString, networks_note, READ, CONSTANT)]
+        #[qproperty(QString, privacy_note, READ, CONSTANT)]
         #[qproperty(*mut AccountListModel, accounts, READ, CONSTANT)]
+        #[qproperty(*mut MemberListModel, group_members, READ, CONSTANT)]
+        #[qproperty(*mut MemberListModel, group_preview, READ, CONSTANT)]
+        #[qproperty(*mut ShareTargetListModel, share_targets, READ, CONSTANT)]
+        #[qproperty(*mut MediaListModel, group_media, READ, CONSTANT)]
+        #[qproperty(*mut MediaListModel, person_media, READ, CONSTANT)]
+        #[qproperty(*mut MediaListModel, media_grid, READ, CONSTANT)]
+        #[qproperty(*mut MediaListModel, media_files, READ, CONSTANT)]
         #[qproperty(*mut ConversationListModel, conversations, READ, CONSTANT)]
         #[qproperty(*mut TimelineModel, timeline, READ, CONSTANT)]
         #[qproperty(*mut ComposerController, composer, READ, CONSTANT)]
@@ -309,9 +376,27 @@ pub mod qobject {
         #[qproperty(*mut SettingsController, settings, READ, CONSTANT)]
         type App = super::AppRust;
 
-        /// Shows one account's conversations (`-1` = all chats).
+        /// A click on an account: the list shows only its conversations (`-1` = all chats,
+        /// every account shown).
         #[qinvokable]
         fn select_account(self: Pin<&mut App>, account: i64);
+
+        /// Shift+click, Ctrl+click, Ctrl+Space, the box or the menu item: adds the account to
+        /// the accounts the list shows or takes it out (with `blend` off: as a click). Returns
+        /// false when nothing changed because the account is the last one shown ("At least
+        /// one account stays in the list").
+        #[qinvokable]
+        fn toggle_account(self: Pin<&mut App>, account: i64) -> bool;
+
+        /// Shows the archive (the archived chats of the accounts shown, under the title
+        /// "Archived Chats") or the chat list again. Showing the archive empties the search.
+        #[qinvokable]
+        fn show_archive(self: Pin<&mut App>, shown: bool);
+
+        /// A chat was picked from the list (or the quick switch): when it is an archived chat
+        /// that a search found, shows the archive with the chat in it.
+        #[qinvokable]
+        fn reveal_chat(self: Pin<&mut App>, conversation: i64);
 
         /// The first frame is on screen: backends may connect (§8.2 step 4).
         #[qinvokable]
@@ -384,6 +469,33 @@ pub mod qobject {
         #[qsignal]
         fn quit_requested(self: Pin<&mut App>);
 
+        /// Kourier was asked to start again ("Restart Now", "Turn On and Restart", the banner's
+        /// "Turn On"): the window quits, and the process starts anew once the core is down.
+        #[qsignal]
+        fn restart_requested(self: Pin<&mut App>);
+
+        /// The warning to show before a NEW account of `kind` is linked
+        /// (`title`, `paragraphs`, `confirm`, `accept`, `cancel`, `acceptHint`, `restartNote`);
+        /// an empty map for a network that asks nothing first.
+        #[qinvokable]
+        fn network_risk(self: &App, kind: &QString) -> QVariant;
+
+        /// Turns the experimental network `kind` on in the preferences (it takes effect at
+        /// the next start) and restarts Kourier; with `link` the link page of that network
+        /// opens right after the restart, once ("Turn On and Restart").
+        #[qinvokable]
+        fn turn_on_network_and_restart(self: Pin<&mut App>, kind: &QString, link: bool);
+
+        /// The network whose link page opens now (the one-shot request "Turn On and Restart"
+        /// left for this start), or empty; asking takes it: it counts once per start, also when
+        /// the window is made again.
+        #[qinvokable]
+        fn take_pending_link(self: Pin<&mut App>) -> QString;
+
+        /// Restarts Kourier ("Restart Now"): the window quits and the process starts anew.
+        #[qinvokable]
+        fn restart_now(self: Pin<&mut App>);
+
         /// Expires timed state (typing indicators); QML calls it while `timersActive`.
         #[qinvokable]
         fn tick(self: Pin<&mut App>);
@@ -421,6 +533,39 @@ pub mod qobject {
         #[qinvokable]
         fn open_externally(self: Pin<&mut App>, attachment: i64);
 
+        /// Asks the name `attachment` is offered under in the "Save As" dialog (F3b): answered
+        /// with `saveSuggested(attachment, url)`, or, when the file is gone, with a failed
+        /// `saveFinished`. `false`: nothing was asked.
+        #[qinvokable]
+        fn ask_save(self: Pin<&mut App>, attachment: i64) -> bool;
+
+        /// Saves `attachment` as the file `url` (the dialog's answer, which asked about replacing),
+        /// answered with `saveFinished`. Off the Qt thread: the core writes the copy.
+        #[qinvokable]
+        fn save_to(self: Pin<&mut App>, attachment: i64, url: &QString);
+
+        /// Saves the attachments `attachments` (their numbers, comma separated) into the folder
+        /// `folder` (a URL), each under the name it is offered with, never replacing a file;
+        /// ONE `saveFinished` when the last has ended.
+        #[qinvokable]
+        fn save_all(self: Pin<&mut App>, attachments: &QString, folder: &QString);
+
+        /// Asks the folder URL the folder dialog of "Save All…" starts in (the last folder a save
+        /// wrote into, else Downloads, else the home folder): answered with `saveFolderReady`.
+        /// The file system is looked at off the Qt thread.
+        #[qinvokable]
+        fn ask_save_folder(self: Pin<&mut App>);
+
+        /// The QML file that is the "Save As" dialog (a debug build can name another one in
+        /// `KOURIER_DEV_SAVE_DIALOG`; a release build always answers its own).
+        #[qinvokable]
+        fn save_dialog_source(self: &App) -> QString;
+
+        /// "Show in Folder": the file manager shows the saved file `url` selected, else its
+        /// folder opens.
+        #[qinvokable]
+        fn show_in_folder(self: &App, url: &QString);
+
         /// The full-size URL of the newest picture in the open timeline (`--page=viewer`).
         #[qinvokable]
         fn latest_image(self: &App) -> QString;
@@ -433,6 +578,11 @@ pub mod qobject {
         /// Deletes a message, for everyone or on this account only.
         #[qinvokable]
         fn delete_message(self: Pin<&mut App>, message: i64, for_everyone: bool);
+
+        /// The message the composer's notice offers "Delete for Everyone" for (the notice
+        /// "Already sent": the X came after the message went out); 0 for every other notice.
+        #[qinvokable]
+        fn notice_message(self: &App) -> i64;
 
         /// Sends a failed own message again.
         #[qinvokable]
@@ -448,6 +598,12 @@ pub mod qobject {
         /// by the core and shows as a notice.
         #[qinvokable]
         fn set_timer(self: Pin<&mut App>, seconds: i32);
+
+        /// Sets the disappearing-message timer of conversation `conversation` (`0` turns it
+        /// off), whichever chat is open: the details panel's pages name their own chat (a
+        /// member's 1:1 chat, the group). A value the chat does not take is refused by the core.
+        #[qinvokable]
+        fn set_timer_of(self: Pin<&mut App>, conversation: i64, seconds: i32);
 
         /// Deletes every message of the open conversation for this account (the chat stays in
         /// the list). The caller asked first.
@@ -472,10 +628,41 @@ pub mod qobject {
 
         /// What the picture viewer steps through for `message` of the open conversation, as
         /// the rows are now (see `models::timeline::viewer_items`): a list, empty when the
-        /// message has no pictures (any more); `undefined` when the message is not among the
-        /// loaded rows. The viewer asks again at `timelineRowsChanged`.
+        /// message has no pictures (any more) AND when it is not among the loaded rows (never
+        /// `undefined`: ask `viewerMessageLoaded` to tell the two apart). The viewer asks again
+        /// at `timelineRowsChanged`.
         #[qinvokable]
         fn viewer_items(self: &App, message: i64) -> QVariant;
+
+        /// Whether `message` is among the loaded rows of the open conversation (a viewer that
+        /// follows a message of the timeline stays as it is when the window moved on).
+        #[qinvokable]
+        fn viewer_message_loaded(self: &App, message: i64) -> bool;
+
+        /// What the picture viewer steps through for `message` as the gallery slot `slot` (`group`,
+        /// `person`, `media`) has its rows now: every picture of the message the slot holds, in the
+        /// shape of `viewerItems`; an empty list when the slot holds none of them (any more). A
+        /// viewer opened from a square follows the message through this, not through the open
+        /// timeline (the square may belong to another chat). It asks again at `galleryChanged`.
+        #[qinvokable]
+        fn gallery_viewer_items(self: &App, slot: &QString, message: i64) -> QVariant;
+
+        /// Whether the gallery slot `slot` has had its first answer since it was opened.
+        #[qinvokable]
+        fn gallery_loaded(self: &App, slot: &QString) -> bool;
+
+        /// Opens the picture viewer's own query (slot `viewer`) for the pictures of `message`, a
+        /// message among the rows of the slot `from` (`group`, `person`, `media`): the whole album
+        /// read AT the message, kept up to date as its chat changes; the viewer follows it through
+        /// `galleryViewerItems("viewer", message)` at `galleryChanged("viewer")`, and closes only
+        /// when the message has no picture left. Any earlier answer is dropped. `false` when `from`
+        /// holds no row of the message. `closeChatMedia("viewer")` ends it.
+        #[qinvokable]
+        fn show_gallery_viewer(self: Pin<&mut App>, from: &QString, message: i64) -> bool;
+
+        /// The rows of the gallery slot `slot` changed (an answer arrived; not when it was closed).
+        #[qsignal]
+        fn gallery_changed(self: Pin<&mut App>, slot: QString);
 
         /// The rows of the open conversation changed (an attachment finished downloading, a
         /// message went away, another conversation was opened).
@@ -500,6 +687,33 @@ pub mod qobject {
         /// Puts `text` on the clipboard ("Copy Text").
         #[qinvokable]
         fn copy_text(self: &App, text: &QString);
+
+        /// "Copy Link" of the person's page on screen (P5b): Rust copies the link it holds for
+        /// that page (the URL never passes through QML). `false` when there is none.
+        #[qinvokable]
+        fn copy_person_link(self: &App) -> bool;
+
+        /// "Share Contact…" of the person's page on screen (P5c): fills `shareTargets` with the
+        /// chats of that person's account a card may go to (the search emptied). `false` when no
+        /// person's page offers a card now.
+        #[qinvokable]
+        fn prepare_share(self: Pin<&mut App>) -> bool;
+
+        /// "Send" of the share picker (P5c): a contact card of the person on screen into the
+        /// listed chat `conversation`. Rust holds who; the core builds the card and checks it.
+        /// `false` when nothing was sent (no person, the chat is not listed, the core stopped).
+        #[qinvokable]
+        fn share_contact(self: Pin<&mut App>, conversation: i64) -> bool;
+
+        /// Opens `url` in the person's browser or in the application a file opens in, with the
+        /// environment the person gave Kourier. Whether a program was started. This is also the
+        /// slot Qt's URL handlers for http, https, mailto and file call (`registerUrlHandlers`),
+        /// so `Qt.openUrlExternally` anywhere in the process (Kirigami's About page too) ends
+        /// here: a program started by Qt's own services would inherit the variables Kourier sets
+        /// for Qt Multimedia. QML passes a string.
+        #[qinvokable]
+        #[cxx_name = "openExternalUrl"]
+        fn open_external_url(self: &App, url: &QUrl) -> bool;
 
         /// The banner's button was pressed: "Link Again" starts the login of the logged-out
         /// account (`relinkStarted`), "Verify…" asks to open the challenge in the browser
@@ -543,6 +757,108 @@ pub mod qobject {
         /// The edit history is no longer shown: it is not kept up to date any more.
         #[qinvokable]
         fn close_revisions(self: Pin<&mut App>);
+
+        /// Asks for the page of the other person of the open 1:1 chat (the user's own page in
+        /// Note to Self): `person` holds it when `personLoaded` comes. `false` when the open
+        /// chat has no person (a group, no chat open).
+        #[qinvokable]
+        fn show_person_of_chat(self: Pin<&mut App>) -> bool;
+
+        /// The page asked for with `showPersonOfChat` is in `person`. Comes again when the
+        /// contact, their chat or their groups change while the page is shown.
+        #[qsignal]
+        fn person_loaded(self: Pin<&mut App>);
+
+        /// The page can no longer be shown (the chat or the account is gone): the panel closes.
+        #[qsignal]
+        fn person_ended(self: Pin<&mut App>);
+
+        /// The person's page is no longer on screen: it is not kept up to date any more.
+        #[qinvokable]
+        fn close_person(self: Pin<&mut App>);
+
+        /// Asks for the page of `user` of `account` from the page of the open group (a member's
+        /// row, or "You"): `person` holds it when `personLoaded` comes. The open chat is the
+        /// page's origin (it ends with that chat). The map is empty until then. `false` when
+        /// the page cannot be asked for (no chat open).
+        #[qinvokable]
+        fn show_person(self: Pin<&mut App>, account: i64, user: &QString) -> bool;
+
+        /// The same for a person the OPEN CHAT names (a group's sender, a mention; the account is
+        /// the chat's): `person` holds the page when `personLoaded` comes, the open chat is its
+        /// origin. `false` when no chat is open or `user` is no id.
+        #[qinvokable]
+        fn show_person_in_chat(self: Pin<&mut App>, user: &QString) -> bool;
+
+        /// Asks for the page of the open group: `group` holds it when `groupLoaded` comes.
+        /// `false` when the open chat is not a group (a 1:1 chat, a channel, none open).
+        #[qinvokable]
+        fn show_group_of_chat(self: Pin<&mut App>) -> bool;
+
+        /// The page asked for with `showGroupOfChat` is in `group`. Comes again when the group,
+        /// a member's contact or the accounts change while the page is shown; an answer equal
+        /// to the one on screen is not announced.
+        #[qsignal]
+        fn group_loaded(self: Pin<&mut App>);
+
+        /// The page can no longer be shown (the group or its account is gone): the panel closes.
+        #[qsignal]
+        fn group_ended(self: Pin<&mut App>);
+
+        /// The group's page is no longer on screen: it is not kept up to date any more.
+        #[qinvokable]
+        fn close_group(self: Pin<&mut App>);
+
+        /// Asks for the safety number of `user` of `account` (P5a, the panel's "safety" level):
+        /// `safety` holds the level when `safetyLoaded` comes (empty until then), and again
+        /// whenever it changes while it is shown. `false` when `user` is no id.
+        #[qinvokable]
+        fn show_safety(self: Pin<&mut App>, account: i64, user: &QString) -> bool;
+
+        /// The level asked for with `showSafety` is in `safety`.
+        #[qsignal]
+        fn safety_loaded(self: Pin<&mut App>);
+
+        /// The safety-number level is no longer on screen: it is not kept up to date any more,
+        /// and its map is emptied.
+        #[qinvokable]
+        fn close_safety(self: Pin<&mut App>);
+
+        /// A button of the safety-number level was pressed (`action`: `mark`, `clear` or
+        /// `confirm`, as the level's `buttons` name them). It acts on the person and the KEY of
+        /// the number ON SCREEN, which Rust holds (QML passes nothing else); a button the level
+        /// on screen does not offer, or no level, does nothing. `false` when nothing was sent.
+        #[qinvokable]
+        fn safety_action(self: Pin<&mut App>, action: &QString) -> bool;
+
+        /// Whether a member row named `name` matches what was typed into the members search
+        /// (the viewmodel's rule: case does not matter, spaces at the ends of the typed text do
+        /// not count, nothing typed matches everyone).
+        #[qinvokable]
+        fn member_matches(self: &App, name: &QString, query: &QString) -> bool;
+
+        /// Shows the gallery of the chat `conversation` of `account` in the slot named `slot` (`group` and
+        /// `person`: the section of that page; `media` and `files`: the grid and the list of the
+        /// level of all media). The slot's model is emptied when it showed another chat, and fills
+        /// when the core answers; it follows the chat's messages until `closeMedia`. `false` when
+        /// the slot is unknown or the gallery cannot be asked for.
+        #[qinvokable]
+        fn show_chat_media(
+            self: Pin<&mut App>,
+            slot: &QString,
+            account: i64,
+            conversation: i64,
+        ) -> bool;
+
+        /// Asks for the next page of the slot `media` or `files` (after its last row). A section
+        /// never goes on.
+        #[qinvokable]
+        fn more_chat_media(self: Pin<&mut App>, slot: &QString);
+
+        /// The slot shows nothing any more (`all`: every slot): its model is emptied and it is
+        /// not kept up to date.
+        #[qinvokable]
+        fn close_chat_media(self: Pin<&mut App>, slot: &QString);
 
         /// The login of a logged-out account started: show the link page.
         #[qsignal]
@@ -645,9 +961,31 @@ pub mod qobject {
         #[qsignal]
         fn media_failed(self: Pin<&mut App>, token: i64);
 
-        /// The copy for `openExternally` is ready: hand `url` to `Qt.openUrlExternally`.
+        /// The copy for `openExternally` is ready: hand `url` to `openExternalUrl`.
         #[qsignal]
         fn external_ready(self: Pin<&mut App>, attachment: i64, url: QString);
+
+        /// The name `askSave(attachment)` asked for: the dialog starts at `url` (the start folder
+        /// and the offered name, built in Rust). Sent once both the name and the folder are known.
+        #[qsignal]
+        fn save_suggested(self: Pin<&mut App>, attachment: i64, url: QString);
+
+        /// The folder `askSaveFolder()` asked for: the folder dialog starts at `url`.
+        #[qsignal]
+        fn save_folder_ready(self: Pin<&mut App>, url: QString);
+
+        /// A save or a batch ended: `saved` files were written, `failed` were not; `name` is the
+        /// last file's name and `url` its `file:` URL; `reason` is the class of the last failure
+        /// ("nospace", "notwritable", "nofolder", "gone", "nothere", "other"), empty when none.
+        #[qsignal]
+        fn save_finished(
+            self: Pin<&mut App>,
+            saved: i32,
+            failed: i32,
+            name: QString,
+            url: QString,
+            reason: QString,
+        );
 
         /// Gives the links of a message text (`TextEdit.textDocument`) the color `color`.
         ///
@@ -655,7 +993,7 @@ pub mod qobject {
         ///
         /// `document` must be null or a live `QObject` (QML passes `textDocument`).
         #[qinvokable]
-        unsafe fn color_links(self: &App, document: *mut QObject, color: &QColor);
+        unsafe fn color_links(self: &App, document: *mut QObject, color: &QColor, ink: &QColor);
 
         /// The icon theme's name for the application's icon when the theme has one (an
         /// installed application), else an empty string: `Style.appIcon` then takes the
@@ -788,6 +1126,258 @@ pub mod qobject {
         #[qsignal]
         fn data_changed(
             self: Pin<&mut AccountListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
+    // ---- MemberListModel -----------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The member rows of the group's page (`App.groupMembers`, `App.groupPreview`).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(QString, filter, READ, WRITE = set_filter_text, NOTIFY = filter_changed)]
+        type MemberListModel = super::MembersRust;
+
+        #[cxx_override]
+        fn data(self: &MemberListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &MemberListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &MemberListModel) -> QHash_i32_QByteArray;
+
+        /// The text of the members search: only the members that match it are listed.
+        fn set_filter_text(self: Pin<&mut MemberListModel>, text: &QString);
+
+        /// The filter changed.
+        #[qsignal]
+        fn filter_changed(self: Pin<&mut MemberListModel>);
+
+        /// The user id of listed row `row` (empty when there is none).
+        #[qinvokable]
+        fn user_at(self: &MemberListModel, row: i32) -> QString;
+
+        /// The listed row of member `user` (-1 when the member is not listed).
+        #[qinvokable]
+        fn row_of(self: &MemberListModel, user: &QString) -> i32;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut MemberListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut MemberListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut MemberListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut MemberListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut MemberListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut MemberListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut MemberListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut MemberListModel>);
+        #[inherit]
+        fn index(
+            self: &MemberListModel,
+            row: i32,
+            column: i32,
+            parent: &QModelIndex,
+        ) -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut MemberListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
+    // ---- ShareTargetListModel -----------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The chats of the share picker (people pages P5c, `App.shareTargets`).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(QString, filter, READ, WRITE = set_filter_text, NOTIFY = filter_changed)]
+        type ShareTargetListModel = super::ShareTargetsRust;
+
+        #[cxx_override]
+        fn data(self: &ShareTargetListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &ShareTargetListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &ShareTargetListModel) -> QHash_i32_QByteArray;
+
+        /// The text of the picker's search: only the chats whose title contains it are listed.
+        fn set_filter_text(self: Pin<&mut ShareTargetListModel>, text: &QString);
+
+        /// The filter changed.
+        #[qsignal]
+        fn filter_changed(self: Pin<&mut ShareTargetListModel>);
+
+        /// The conversation id of listed row `row` (0 when there is none).
+        #[qinvokable]
+        fn conversation_at(self: &ShareTargetListModel, row: i32) -> i64;
+
+        /// The title of listed chat `conversation` (empty when it is not listed).
+        #[qinvokable]
+        fn title_of(self: &ShareTargetListModel, conversation: i64) -> QString;
+
+        /// Whether chat `conversation` is listed now.
+        #[qinvokable]
+        fn is_listed(self: &ShareTargetListModel, conversation: i64) -> bool;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut ShareTargetListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut ShareTargetListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut ShareTargetListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut ShareTargetListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut ShareTargetListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut ShareTargetListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut ShareTargetListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut ShareTargetListModel>);
+        #[inherit]
+        fn index(
+            self: &ShareTargetListModel,
+            row: i32,
+            column: i32,
+            parent: &QModelIndex,
+        ) -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut ShareTargetListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
+    // ---- MediaListModel -------------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The rows of a chat's gallery (`App.groupMedia`, `personMedia`, `mediaGrid`,
+        /// `mediaFiles`).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(bool, more)]
+        #[qproperty(bool, other)]
+        #[qproperty(bool, loaded)]
+        type MediaListModel = super::MediaRust;
+
+        #[cxx_override]
+        fn data(self: &MediaListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &MediaListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &MediaListModel) -> QHash_i32_QByteArray;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut MediaListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut MediaListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut MediaListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut MediaListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut MediaListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut MediaListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut MediaListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut MediaListModel>);
+        #[inherit]
+        fn index(self: &MediaListModel, row: i32, column: i32, parent: &QModelIndex)
+        -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut MediaListModel>,
             top_left: &QModelIndex,
             bottom_right: &QModelIndex,
             roles: &QVector_i32,
@@ -954,6 +1544,7 @@ pub mod qobject {
         #[qproperty(QString, subtitle)]
         #[qproperty(bool, typing)]
         #[qproperty(bool, is_group)]
+        #[qproperty(bool, has_details)]
         #[qproperty(bool, is_self)]
         #[qproperty(bool, muted)]
         #[qproperty(QString, avatar_url)]
@@ -967,6 +1558,7 @@ pub mod qobject {
         #[qproperty(i32, timer_custom_step)]
         #[qproperty(bool, deletes_sync)]
         #[qproperty(QString, still_filling)]
+        #[qproperty(QString, timer_held)]
         #[qproperty(bool, has_older)]
         #[qproperty(bool, has_newer)]
         #[qproperty(bool, loading)]
@@ -992,6 +1584,17 @@ pub mod qobject {
         /// `--screenshot` waits for 0).
         #[qinvokable]
         fn downloading_attachments(self: &TimelineModel) -> i32;
+
+        /// How many upload rings of the rows shown have a figure in them (the fixture pages of
+        /// upload progress wait for one before the picture is taken).
+        #[qinvokable]
+        fn uploads_reported(self: &TimelineModel) -> i32;
+
+        /// Whether the newest own message of the rows shown has left the outbox (the server
+        /// took it; not queued, not sending, not failed): the `media` fixture page sends from
+        /// the window and takes its picture only then, never with the clock icon.
+        #[qinvokable]
+        fn newest_own_left_the_outbox(self: &TimelineModel) -> bool;
     }
 
     #[auto_cxx_name]
@@ -1071,7 +1674,34 @@ pub mod qobject {
         #[qproperty(i32, preparing_done)]
         #[qproperty(QVariant, folder_question)]
         #[qproperty(bool, folder_asking)]
+        #[qproperty(bool, location_asking)]
+        #[qproperty(QVariant, location_question)]
         type ComposerController = super::ComposerRust;
+
+        /// Answers the question Send asked about files that would leave with where they
+        /// were taken (`locationAsking`, `locationQuestion`): `send` (Send with Location)
+        /// sends them with the others, `hold` (Don't Send) keeps them in the list and sends
+        /// the others with the text, or nothing when no file would go. A close without an
+        /// answer (Escape, the close button, a click outside) dismisses: the composer then
+        /// answers `dismiss`, which drops the question with nothing sent, held or remembered;
+        /// the next Send asks anew with its own text. "Remember my choice" is stored by the
+        /// dialog through `App.settings.locationFiles` AFTER an answer that applied (the one
+        /// owner of the setting).
+        /// Returns whether the answer applied: `false` when what the question was about moved
+        /// meanwhile (the answer is stale: nothing was sent or held and the question is asked
+        /// again), or for a dismissal. When files were sent, `sentFromQuestion` follows.
+        #[qinvokable]
+        fn answer_location(self: Pin<&mut ComposerController>, answer: &QString) -> bool;
+
+        /// The setting "Files with location data" changed: the list shows it at once (the
+        /// rows' notes, the counts), without waiting for its next change.
+        #[qinvokable]
+        fn refresh_location_pref(self: Pin<&mut ComposerController>);
+
+        /// An answer to the location question sent the files and the text of that Send: the
+        /// text area is cleared now (`send()` returned `false` when it asked).
+        #[qsignal]
+        fn sent_from_question(self: Pin<&mut ComposerController>);
 
         /// Answers the question about the folders that wait in the list (`folderAsking`,
         /// `folderQuestion`): `add` puts the files inside them into the list (asked about
@@ -1201,11 +1831,26 @@ pub mod qobject {
         #[qproperty(bool, retry)]
         #[qproperty(QString, leave)]
         #[qproperty(QVariant, fields)]
+        #[qproperty(QVariant, emoji)]
+        #[qproperty(bool, rotates)]
+        #[qproperty(QString, flow)]
+        #[qproperty(QString, other_flow)]
+        #[qproperty(QString, other_flow_label)]
+        #[qproperty(QStringList, steps)]
+        #[qproperty(QString, explain)]
+        #[qproperty(QString, icon)]
+        #[qproperty(QString, resend_label)]
+        #[qproperty(i32, resend_after_ms)]
         type LoginController = super::LoginRust;
 
         /// Starts linking an account on `network` ("Signal").
         #[qinvokable]
         fn start(self: Pin<&mut LoginController>, network: &QString);
+
+        /// Switches the page to the other way of linking the same network (`otherFlow`): the
+        /// running login stops and the other starts at once, with no question.
+        #[qinvokable]
+        fn switch_flow(self: Pin<&mut LoginController>);
 
         /// Sets the value of an input field of the current step.
         #[qinvokable]
@@ -1214,6 +1859,11 @@ pub mod qobject {
         /// Answers the current input step with the field values.
         #[qinvokable]
         fn submit(self: Pin<&mut LoginController>);
+
+        /// Asks the network for a new login code (the button `resendLabel` names): sends the
+        /// request alone, never the typed fields.
+        #[qinvokable]
+        fn resend(self: Pin<&mut LoginController>);
 
         /// Abandons the login.
         #[qinvokable]
@@ -1231,19 +1881,40 @@ pub mod qobject {
         #[qproperty(bool, autostart, READ, WRITE = set_autostart_pref, NOTIFY = changed)]
         #[qproperty(bool, start_hidden, READ, WRITE = set_start_hidden_pref, NOTIFY = changed)]
         #[qproperty(bool, compact, READ, WRITE = set_compact_pref, NOTIFY = changed)]
+        #[qproperty(bool, blend_accounts, READ, WRITE = set_blend_accounts_pref, NOTIFY = changed)]
         #[qproperty(bool, round_avatars, READ, WRITE = set_round_avatars_pref, NOTIFY = changed)]
         #[qproperty(f64, avatar_corner, READ, WRITE = set_avatar_corner_pref, NOTIFY = changed)]
         #[qproperty(i32, notification_content, READ, WRITE = set_notification_content_pref, NOTIFY = changed)]
+        #[qproperty(i32, location_files, READ, WRITE = set_location_files_pref, NOTIFY = changed)]
         #[qproperty(QString, expiry_policy, READ, WRITE = set_expiry_policy_pref, NOTIFY = changed)]
+        #[qproperty(QString, quiet_notices, READ, WRITE = set_quiet_notices_pref, NOTIFY = changed)]
+        #[qproperty(QStringList, networks_on, READ, NOTIFY = changed)]
         type SettingsController = super::SettingsRust;
 
-        /// The settings page is shown: reads what the core keeps (`expiryPolicy`).
+        /// Turns the experimental network `kind` on or off in the preferences. Nothing runs
+        /// differently until Kourier starts again (the core has no runtime switch).
+        #[qinvokable]
+        fn set_network_on(self: Pin<&mut SettingsController>, kind: &QString, on: bool);
+
+        /// How many accounts of the network `kind` exist now (the question before turning
+        /// the network off is asked only when it is not 0).
+        #[qinvokable]
+        fn accounts_of(self: &SettingsController, kind: &QString) -> i32;
+
+        /// The settings page is shown: reads what the core keeps (`expiryPolicy`,
+        /// `quietNotices`).
         #[qinvokable]
         fn load(self: Pin<&mut SettingsController>);
 
         /// What happens to disappearing messages whose time has come while this computer's
         /// clock is unconfirmed: `hide`, `keep` or `erase` (empty until the core has said).
         fn set_expiry_policy_pref(self: Pin<&mut SettingsController>, value: &QString);
+
+        /// Whether quiet notices (a safety number that changed, a refreshed session, a
+        /// changed number, an accepted request) count for the conversation list: `hide` (the
+        /// default: the list shows the last real message) or `show` (empty until the core
+        /// has said).
+        fn set_quiet_notices_pref(self: Pin<&mut SettingsController>, value: &QString);
 
         /// A preference changed.
         #[qsignal]
@@ -1261,6 +1932,11 @@ pub mod qobject {
         /// The compact conversation list.
         fn set_compact_pref(self: Pin<&mut SettingsController>, value: bool);
 
+        /// "Show chats of several accounts together": on, Shift/Ctrl+click adds an account to
+        /// the list; off, a click switches the account (turning it off with several shown
+        /// shows all chats).
+        fn set_blend_accounts_pref(self: Pin<&mut SettingsController>, value: bool);
+
         /// Avatars are circles; off, squares with the theme's corners.
         fn set_round_avatars_pref(self: Pin<&mut SettingsController>, value: bool);
 
@@ -1271,6 +1947,9 @@ pub mod qobject {
 
         /// Notification content: 0 name and message, 1 name only, 2 nothing.
         fn set_notification_content_pref(self: Pin<&mut SettingsController>, value: i32);
+
+        /// Files with location data: 0 ask each time, 1 always send, 2 never send.
+        fn set_location_files_pref(self: Pin<&mut SettingsController>, value: i32);
     }
 
     // Constructors used by `App` (and tests) to own its sub-objects.
@@ -1281,6 +1960,15 @@ pub mod qobject {
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
         fn new_account_list_model() -> UniquePtr<AccountListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_member_list_model() -> UniquePtr<MemberListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_share_target_list_model() -> UniquePtr<ShareTargetListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_media_list_model() -> UniquePtr<MediaListModel>;
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
         fn new_conversation_list_model() -> UniquePtr<ConversationListModel>;

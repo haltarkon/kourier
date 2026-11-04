@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use kourier_model::{
     AccountId, AccountSettingsPatch, AttachmentId, BackendBlob, BackendError, BlobKey, Body, CmdId,
-    ContactChange, ConvKey, ConversationChange, DownloadId, Identifier, LocalMsgId, MsgTarget,
-    NetMsgId, OwnDevice, ProfilePatch, ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
+    ContactChange, ConvKey, ConversationChange, DownloadId, Identifier, IdentityFingerprint,
+    LocalMsgId, MsgTarget, NetMsgId, OwnDevice, ProfilePatch, ReceiptKind, RecipientState,
+    Redacted, ReplyTo, SafetyAnswer, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -48,8 +49,9 @@ pub enum Command {
         flow: String,
         /// Set when relinking an existing account (§4.3 step 6).
         relink: Option<Relink>,
-        /// The primary own ids of the profile's OTHER accounts on this network (not the one
-        /// being relinked, none that is being removed). A backend that learns whose account
+        /// EVERY own id of the profile's OTHER accounts on this network, one entry per id (not
+        /// the accounts being relinked or removed): a WhatsApp account has its LID and its phone
+        /// number, and a login that is typed a number must see it. A backend that learns whose account
         /// the phone links BEFORE it registers a device refuses a link that brings one of
         /// them with `ErrorKind::AlreadyAdded`, so the phone never gets a second device of
         /// one account (L1, `buttons.md` F2). The core checks the same again when
@@ -68,6 +70,14 @@ pub enum Command {
     CancelLogin,
     /// One send attempt of an outbox item (§4.8); the backend's own repair (device mismatch,
     /// unsealed fallback) happens inside it.
+    ///
+    /// A transmit of an id the network already has (`req.local`, the network-local id the
+    /// core allocated: a resend after a kill between the attempt and its outcome, a retry
+    /// after a lost answer) makes no second message: the recipients see one, and the answer
+    /// is the message as it was sent (or the first attempt's failure), never a second send.
+    /// The core relies on it and resends with the same id after a restart (§4.8). A backend
+    /// whose library keeps its own send queue keeps a map from `req.local` to what it sent.
+    /// A retry that names only some recipients (`only`) sends to those and to nobody else.
     Transmit {
         /// The message row.
         local: LocalMsgId,
@@ -75,6 +85,23 @@ pub enum Command {
         req: Box<OutgoingRequest>,
         /// The outcome.
         reply: oneshot::Sender<TransmitOutcome>,
+    },
+    /// Stop the attempt of `local` before anything of it can reach anyone (the X on an upload;
+    /// not durable, no repeat). The backend answers at once, from its stop state, never by
+    /// waiting for the attempt:
+    /// - [`AbortAnswer::Stopping`]: nothing of the message can go out any more. The attempt
+    ///   ends and answers its `Transmit` with `Failed(..)`, having sent nothing to anyone.
+    /// - [`AbortAnswer::TooLate`]: the attempt is past the point of no return (a request is on
+    ///   its way, or it is over) or is not known. It goes on as it would have; the core keeps
+    ///   the message and the user is told that it was sent.
+    ///
+    /// A backend that sends `AttachmentProgress` MUST answer this (the UI draws an X from those
+    /// reports). A backend that drops the reply, or has no upload to stop, is read as `TooLate`.
+    AbortTransmit {
+        /// The message row of the attempt (`Transmit.local`).
+        local: LocalMsgId,
+        /// The answer.
+        reply: oneshot::Sender<AbortAnswer>,
     },
     /// Durable: send read or viewed receipts. The core never names a message of a history
     /// import here: its sender is not told that it was read on this device.
@@ -134,6 +161,23 @@ pub enum Command {
         /// nothing else another device could delete up to); a deleted conversation is sent
         /// also with both lists empty.
         remove: bool,
+        /// The newest `sent_at` (ms) among the messages the clear removed that a person sent
+        /// (not a notice, not a stand-in: the rows that can be anchors, so the time of
+        /// `newest[0]` unless a newer row was hidden), in the clock of the network's
+        /// `sent_at`; `None` when it removed none. A network whose clear names a time instead of
+        /// messages (WhatsApp: the range's `lastMessageTimestamp`, with `newest[0]` as its key)
+        /// sends this as that timestamp; Signal ignores it. At most the core's clock plus
+        /// [`CLEAR_CLOCK_TOLERANCE`] (a later time is read as that bound), so a message that
+        /// claims a later time never makes the range reach past it.
+        before_ms: Option<i64>,
+        /// The same for the rows that are NOT messages of a person (a group notice, a call
+        /// line, a stand-in for a message that could not be read): the newest `sent_at` among
+        /// the removed rows that are `System` or `Placeholder`, `None` when it removed none. A
+        /// network whose range keeps the two apart (WhatsApp: `lastSystemMessageTimestamp`
+        /// beside `lastMessageTimestamp`) sends it there; a network that has one time sends the
+        /// larger of the two. The cut the core keeps for refusing later history is the larger
+        /// of both.
+        system_before_ms: Option<i64>,
     },
     /// Durable: the user deleted one attachment of a message on this device (for this
     /// account only). The core has removed it already; the backend tells the account's other
@@ -236,6 +280,42 @@ pub enum Command {
         /// Accepted or not.
         reply: Reply<()>,
     },
+    /// Durable: a roaming conversation change the core makes on its own, with no click behind
+    /// it and no one waiting for an answer (today only the clearing of a "marked unread" flag
+    /// when the user reads the chat, `ConversationChange::SetMarkedUnread { marked_unread:
+    /// false }`). It is [`Command::ChangeConversation`] without a `reply`: the core stores it
+    /// in the transaction that reads the chat (`pending_commands`) and sends it again at every
+    /// start until the backend answers `CommandPersisted { cmd }`, so the backend answers it
+    /// after its OWN durable write (a zone of its `backend.db` that holds the intent and the
+    /// confirmation together), never through a oneshot. A backend that has nothing to write
+    /// for it (a network that states no roaming settings, an account whose roaming switch is
+    /// off) still answers `CommandPersisted` and drops it; one that never answers would be
+    /// sent the same row at every start for ever. The core queues it only for an account whose
+    /// caps state [`AccountCaps::roaming_writes`](kourier_model::AccountCaps::roaming_writes)
+    /// (`Some(_)`); a stale row of an account that no longer states it is dropped by the core,
+    /// not resent.
+    ///
+    /// A backend applies (or files) it in the order it receives it relative to
+    /// [`Command::ChangeConversation`] of the same chat: a later click on the same setting wins.
+    /// The core keeps its side of that order (a reading holds the chat's turn until the durable
+    /// command is queued, and a later click goes through the same channel behind it); a backend
+    /// that files the durable one as a job that runs later must not let a plain click that came
+    /// after it overtake it, or the user who reads a marked chat and marks it again at once ends
+    /// with the clear landing after the mark.
+    ///
+    /// `asked_at` is the core's clock (ms) at the moment the user read the chat: a backend that
+    /// keeps what another device wrote since compares it with the time it merged that (the
+    /// phone's newer mark stays and is stated back to the core).
+    ChangeConversationDurable {
+        /// The `pending_commands` row.
+        cmd: CmdId,
+        /// The conversation.
+        conv: ConvKey,
+        /// The change.
+        change: ConversationChange,
+        /// The core's clock (ms) when the change was asked.
+        asked_at: i64,
+    },
     /// Roaming contact change; confirmed by `ContactUpsert`.
     ChangeContact {
         /// The contact.
@@ -259,10 +339,63 @@ pub enum Command {
         /// Accepted or not.
         reply: Reply<()>,
     },
-    /// The user accepted a safety-number change; paused sends may continue.
+    /// The user turned the account's switch for WRITING roaming settings (settings the network
+    /// keeps for the account's other devices: archive, pin, mute, marked unread) on or off.
+    /// Not durable: the backend keeps the switch in its own store, answers `Ok` once it is
+    /// stored, and states the new value in [`AccountCaps::FLAG_ROAMING_WRITES`] with a
+    /// `BackendEvent::AccountCaps` (the core changes nothing before that event). A network that
+    /// cannot write roaming settings answers `ErrorKind::Unsupported` and states no flag.
+    /// Turning it off drops what the backend still had queued to write.
+    ///
+    /// [`AccountCaps::FLAG_ROAMING_WRITES`]: kourier_model::AccountCaps::FLAG_ROAMING_WRITES
+    SetRoamingWrites {
+        /// On (`true`) or off.
+        on: bool,
+        /// Done, or refused.
+        reply: Reply<()>,
+    },
+    /// The user accepted a safety-number change ("Confirm New Safety Number", BQ-2b: Desktop's
+    /// "Send anyway"); paused sends may continue. `key` is the key of the safety number the
+    /// user was SHOWN ([`SafetyNumber::key`](kourier_model::SafetyNumber), the lead's RC2),
+    /// as for [`Command::SetVerified`]: for a person whose key changed after it was verified
+    /// the backend refuses with `ErrorKind::InvalidInput` (nothing changes) when its stored key
+    /// is another one, so a key the user never saw is not approved; for any other person it is
+    /// an approval only and `key` is ignored. The core requeues the sends paused on `user`
+    /// only after `Ok` (the lead's RC6): a refusal leaves them paused.
     ConfirmIdentity {
         /// Whose identity.
         user: UserId,
+        /// The key the user was shown.
+        key: IdentityFingerprint,
+        /// Confirmed (or nothing to confirm), or refused.
+        reply: Reply<()>,
+    },
+    /// The safety number of a person (P5a), answered at once from the backend's own store:
+    /// computed from our identity key and the person's STORED key. A network without safety
+    /// numbers answers `SafetyUnavailable::Unsupported`.
+    SafetyNumber {
+        /// Whose.
+        user: UserId,
+        /// The number, or why there is none.
+        reply: Reply<SafetyAnswer>,
+    },
+    /// Mark (`verified`) or clear (`!verified`) the verification of a person's identity key
+    /// (P5a: "Mark as Verified" and "Clear Verification" ONLY; "Confirm New Safety Number" is
+    /// [`Command::ConfirmIdentity`], never a clear: a clear always queues a Verified sync,
+    /// BQ-2b). `key` is the key of the safety number the user was SHOWN
+    /// ([`SafetyNumber::key`](kourier_model::SafetyNumber)): the backend refuses with
+    /// `ErrorKind::InvalidInput` when its stored key is another one, so a state is never
+    /// applied to a key the user did not compare. The core releases the sends paused on
+    /// `user` after every `Ok` (P5a, critic F2), whatever the state was.
+    SetVerified {
+        /// Whose identity.
+        user: UserId,
+        /// Mark (`true`) or clear (`false`).
+        verified: bool,
+        /// The key the user was shown.
+        key: IdentityFingerprint,
+        /// Done, or refused.
+        reply: Reply<()>,
     },
     /// Fetch older history (only for `HistorySource::OnDemand`).
     FetchHistory {
@@ -332,6 +465,7 @@ impl Command {
             Self::SubmitLoginInput { .. } => "SubmitLoginInput",
             Self::CancelLogin => "CancelLogin",
             Self::Transmit { .. } => "Transmit",
+            Self::AbortTransmit { .. } => "AbortTransmit",
             Self::SendReceipts { .. } => "SendReceipts",
             Self::SyncReadMarker { .. } => "SyncReadMarker",
             Self::ClearConversation { .. } => "ClearConversation",
@@ -340,10 +474,14 @@ impl Command {
             Self::SetTyping { .. } => "SetTyping",
             Self::DownloadAttachment { .. } => "DownloadAttachment",
             Self::ChangeConversation { .. } => "ChangeConversation",
+            Self::ChangeConversationDurable { .. } => "ChangeConversationDurable",
             Self::ChangeContact { .. } => "ChangeContact",
             Self::ChangeAccountSettings { .. } => "ChangeAccountSettings",
             Self::ChangeProfile { .. } => "ChangeProfile",
+            Self::SetRoamingWrites { .. } => "SetRoamingWrites",
             Self::ConfirmIdentity { .. } => "ConfirmIdentity",
+            Self::SafetyNumber { .. } => "SafetyNumber",
+            Self::SetVerified { .. } => "SetVerified",
             Self::FetchHistory { .. } => "FetchHistory",
             Self::Resolve { .. } => "Resolve",
             Self::ListOwnDevices { .. } => "ListOwnDevices",
@@ -361,7 +499,8 @@ impl Command {
             | Self::SyncReadMarker { cmd, .. }
             | Self::ClearConversation { cmd, .. }
             | Self::DeleteAttachment { cmd, .. }
-            | Self::RequestAttachments { cmd, .. } => Some(*cmd),
+            | Self::RequestAttachments { cmd, .. }
+            | Self::ChangeConversationDurable { cmd, .. } => Some(*cmd),
             _ => None,
         }
     }
@@ -373,6 +512,17 @@ impl Command {
 /// (`SD/ts/sql/Server.node.ts` `getMostRecentAddressableMessages`, `limit = 5`), so more than
 /// one anchor makes the delete land although the devices' histories differ at the edge.
 pub const CLEAR_ANCHORS: usize = 5;
+
+/// How far after the core's clock a time of a clear by time may stand before the core reads it as
+/// that bound (one hour). A clear names the newest message of its range, and that is a time of the
+/// NETWORK's clock (the server's, the sender's): this computer's clock may run minutes behind it
+/// (no time sync, a resume before the sync), and the exact local "now" would then leave the last
+/// minutes before the clear in the chat. A time further ahead than this is a wrong clock or a
+/// hostile claim: it is read as `now + CLEAR_CLOCK_TOLERANCE`, because a cut only rises and one
+/// wrong time would delete live messages and refuse the chat's history for good. It applies to
+/// [`ConversationCleared::before_ms`](crate::BackendEvent::ConversationCleared) and to the times
+/// of [`Command::ClearConversation`] alike.
+pub const CLEAR_CLOCK_TOLERANCE: Duration = Duration::from_secs(60 * 60);
 
 /// The persisted form of a durable command (`pending_commands.command`, JSON). The core
 /// stores it in the transaction that does the command's local part (marks messages read,
@@ -412,6 +562,15 @@ pub enum DurableCommand {
         /// The conversation itself was deleted.
         #[serde(default)]
         remove: bool,
+        /// The newest `sent_at` (ms) among the removed rows that a person sent (not `System`,
+        /// not `Placeholder`: the filter of the anchors); `None` when it removed none (and for a
+        /// command stored before this field existed). See [`Command::ClearConversation`].
+        #[serde(default)]
+        before_ms: Option<i64>,
+        /// The newest `sent_at` (ms) among the other removed rows (`System`, `Placeholder`);
+        /// `None` when it removed none (and for a command stored before this field existed).
+        #[serde(default)]
+        system_before_ms: Option<i64>,
     },
     /// See [`Command::DeleteAttachment`].
     DeleteAttachment {
@@ -425,6 +584,15 @@ pub enum DurableCommand {
         /// The attachment's names.
         #[serde(default)]
         net_ids: Redacted<Vec<String>>,
+    },
+    /// See [`Command::ChangeConversationDurable`].
+    ChangeConversation {
+        /// The conversation.
+        conv: ConvKey,
+        /// The change.
+        change: ConversationChange,
+        /// The core's clock (ms) when the change was asked.
+        asked_at: i64,
     },
     /// See [`Command::RequestAttachments`].
     RequestAttachments {
@@ -460,12 +628,16 @@ impl DurableCommand {
                 newest,
                 newest_non_expiring,
                 remove,
+                before_ms,
+                system_before_ms,
             } => Command::ClearConversation {
                 cmd,
                 conv,
                 newest,
                 newest_non_expiring,
                 remove,
+                before_ms,
+                system_before_ms,
             },
             Self::DeleteAttachment {
                 conv,
@@ -479,6 +651,16 @@ impl DurableCommand {
                 index,
                 net_ids,
             },
+            Self::ChangeConversation {
+                conv,
+                change,
+                asked_at,
+            } => Command::ChangeConversationDurable {
+                cmd,
+                conv,
+                change,
+                asked_at,
+            },
             Self::RequestAttachments { conv, target } => {
                 Command::RequestAttachments { cmd, conv, target }
             }
@@ -486,11 +668,12 @@ impl DurableCommand {
     }
 }
 
-/// The primary own id of another account of the profile, and whether that account is logged
-/// out (`Command::StartLogin::taken`): the answer of a refused link says which.
+/// One own id of another account of the profile, and whether that account is logged out
+/// (`Command::StartLogin::taken`; an account with several ids has one entry for each): the
+/// answer of a refused link says which.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakenIdentity {
-    /// The account's primary own id (the first of its `own_ids`).
+    /// One of the account's own ids (all of them are listed, the primary first).
     pub user: UserId,
     /// That account is logged out: the user points it out with "Link Again".
     pub logged_out: bool,
@@ -568,7 +751,11 @@ pub enum OutgoingKind {
     },
     /// An edit of an own message.
     Edit {
-        /// The message (its latest revision).
+        /// The message: under [`EditTarget::LatestRevision`](kourier_model::EditTarget) its
+        /// latest revision that the recipients have, under
+        /// [`EditTarget::Original`](kourier_model::EditTarget) the message itself, never a
+        /// revision (the network says which in
+        /// [`NetworkDescriptor::edit_target`](kourier_model::NetworkDescriptor::edit_target)).
         target: MsgTarget,
         /// The new content: `Body::Text` for a text message; for a message with attachments
         /// `Body::Media` with every attachment of the message, unchanged and in order, and the
@@ -609,11 +796,72 @@ impl OutgoingKind {
     }
 }
 
+/// A backend's answer to [`Command::AbortTransmit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbortAnswer {
+    /// The attempt stops and nothing of it goes out to anyone; its `Transmit` answers `Failed`.
+    Stopping,
+    /// Too late, or no such attempt: it goes on as it would have.
+    TooLate,
+}
+
 /// The outcome of one [`Command::Transmit`] attempt (§4.8 step 3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TransmitOutcome {
     /// Accepted for every recipient.
     Sent {
+        /// Server timestamp.
+        #[serde(default)]
+        server_at: Option<i64>,
+        /// Per-recipient result.
+        #[serde(default)]
+        per_recipient: Vec<(UserId, RecipientState)>,
+    },
+    /// Accepted for every recipient, and the network's server gave the message an id and a
+    /// position of its own (KT-2: Telegram). Read as [`Sent`](Self::Sent) in every respect,
+    /// plus `assigned`: the core takes the message from its allocated id
+    /// ([`Network::allocate_message_id`](crate::Network::allocate_message_id)) to the assigned
+    /// one, and keeps the allocated id as another name for it. A network that answers so
+    /// promises:
+    ///
+    /// - Only a [`OutgoingKind::Message`] is answered so. An edit, a delete or a reaction
+    ///   targets a message that has its id already, and answers `Sent`; `SentAs` to one is a
+    ///   backend fault, which the core reads as `Sent` and says so in one warn line.
+    /// - A resend under the allocated id (the core keeps the id when it sends again) answers
+    ///   the SAME `assigned`, whether or not an earlier attempt reached the server: the
+    ///   network's own store holds the map from the allocated id, and holds it durably BEFORE
+    ///   the request leaves, or a kill between the send and the answer would lose it.
+    /// - The ids it allocates never equal an id its server gives (the fake: `k<hex>` against
+    ///   decimal numbers), so an allocated id never meets a message the server named.
+    /// - `assigned.local` is an id like any other (it passes the grammar every id of an
+    ///   envelope does, [`Envelope::validate`](crate::Envelope::validate), and the core never
+    ///   parses it) that no other message of the conversation has; `assigned.seq` is the
+    ///   position the echo of the message states as
+    ///   [`IncomingMessage::net_seq`](crate::IncomingMessage::net_seq), in
+    ///   `0..=`[`MAX_NET_SEQ`](crate::MAX_NET_SEQ). An own row of the conversation that is
+    ///   already under `assigned.local` is taken to be the echo of this message that knew no
+    ///   binding, and is merged into it, unless it has a send of its own queued. An id the core
+    ///   cannot take (it fails the grammar, or another message has it: a row of somebody else,
+    ///   a call line, a row of another conversation, an own message with its own send queued)
+    ///   is not an error: the send counts and the message keeps its allocated id. A position
+    ///   out of range is left out: the message takes the id, and its position comes with the
+    ///   echo.
+    /// - Behind an unsent message the core queues its edits, deletes and reactions, and they
+    ///   go out naming the assigned id once this answer is in and the allocated one before it:
+    ///   a request may name either, and the network resolves both to the same message. That
+    ///   includes a DELETE that names the allocated id of a message whose send was never
+    ///   answered (the attempt ended with no outcome: the server may hold the message), which
+    ///   the network maps through its own store.
+    /// - A QUOTE may name the allocated id of a message whose send FAILED, which has no
+    ///   assigned id and never will. A network that assigns ids sends such a reply WITHOUT the
+    ///   quote.
+    ///
+    /// The echo of the message
+    /// ([`IncomingMessage::allocated_as`](crate::IncomingMessage::allocated_as)) and this answer
+    /// state one `server_at`, so the order they arrive in changes nothing.
+    SentAs {
+        /// The id and the position the server gave the message.
+        assigned: AssignedId,
         /// Server timestamp.
         #[serde(default)]
         server_at: Option<i64>,
@@ -628,8 +876,22 @@ pub enum TransmitOutcome {
         /// Recipients that failed, and why.
         failed: Vec<(UserId, BackendError)>,
     },
-    /// Nothing was sent.
+    /// The attempt failed. After a transient failure (a timeout, a lost connection) the server
+    /// may have the message already: the core resends under the same id and the network makes
+    /// no second message. An attempt that answered [`AbortAnswer::Stopping`] to an
+    /// [`Command::AbortTransmit`] sent nothing to anyone.
     Failed(BackendError),
+}
+
+/// What the server called a message of ours, and where it put it ([`TransmitOutcome::SentAs`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AssignedId {
+    /// Network-local part of the id the server gave the message (the stored author of own
+    /// messages is always `None`).
+    pub local: Arc<str>,
+    /// The message's position in its conversation: the `net_seq` its echo states, in
+    /// `0..=`[`MAX_NET_SEQ`](crate::MAX_NET_SEQ).
+    pub seq: i64,
 }
 
 impl TransmitOutcome {
@@ -641,7 +903,7 @@ impl TransmitOutcome {
                 .filter(|(_, e)| e.is_retryable())
                 .map(|(u, _)| u.clone())
                 .collect(),
-            Self::Sent { .. } | Self::Failed(_) => Vec::new(),
+            Self::Sent { .. } | Self::SentAs { .. } | Self::Failed(_) => Vec::new(),
         }
     }
 
@@ -653,7 +915,7 @@ impl TransmitOutcome {
                 .filter(|(_, e)| !e.is_retryable())
                 .map(|(u, _)| u.clone())
                 .collect(),
-            Self::Sent { .. } | Self::Failed(_) => Vec::new(),
+            Self::Sent { .. } | Self::SentAs { .. } | Self::Failed(_) => Vec::new(),
         }
     }
 }

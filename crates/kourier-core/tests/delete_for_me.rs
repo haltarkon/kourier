@@ -6,7 +6,7 @@
 //! until it is used again, and does all of it idempotently. The fake plays the phone
 //! (`kourier_fake::scripts::delete_for_me`).
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::time::Duration;
@@ -229,6 +229,7 @@ async fn a_message_still_in_the_outbox_survives_the_clear() {
                 conv: d_alice(),
                 up_to: vec![target(Some(&d_alice()), Some(&alice()), &later.to_string())],
                 remove: true,
+                before_ms: None,
                 at: later + 1,
             },
         ]);
@@ -332,12 +333,14 @@ async fn a_delete_for_everyone_that_still_waits_survives_the_clear() {
                 conv: d_alice(),
                 up_to: vec![target(Some(&d_alice()), Some(&alice()), &later.to_string())],
                 remove: true,
+                before_ms: None,
                 at: later + 1,
             },
             BackendEvent::ConversationCleared {
                 conv: d_bob(),
                 up_to: Vec::new(),
                 remove: true,
+                before_ms: None,
                 at: later + 2,
             },
         ])
@@ -565,6 +568,7 @@ fn cleared(key: &ConvKey, up_to: &[i64], remove: bool) -> BackendEvent {
             .map(|n| target(Some(key), Some(&alice()), &at(*n)))
             .collect(),
         remove,
+        before_ms: None,
         at: T0 + 99_000,
     }
 }
@@ -944,6 +948,7 @@ fn a_clear_hands_the_files_of_its_messages_to_the_unlink() {
             conv: d_alice(),
             up_to: vec![target(Some(&d_alice()), None, &at(2))],
             remove: true,
+            before_ms: None,
             at: T0 + 3000,
         }])
         .expect("apply");
@@ -981,6 +986,7 @@ fn a_hidden_chat_that_takes_in_a_listed_one_is_listed() {
         conv: key.clone(),
         up_to: vec![target(Some(key), None, &at(n))],
         remove: true,
+        before_ms: None,
         at: T0 + 50_000,
     };
     let merge = || BackendEvent::IdentityMerged {
@@ -1380,6 +1386,7 @@ fn clear_command(
             newest,
             newest_non_expiring,
             remove,
+            ..
         } => (
             conv.clone(),
             newest.iter().map(|t| t.local.to_string()).collect(),

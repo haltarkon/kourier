@@ -15,16 +15,27 @@
 //! under the call sites, not a licence for them.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::format::{Format, Full, Writer};
+use tracing_subscriber::fmt::time::SystemTime;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
+use tracing_subscriber::layer::{Filter, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer as _};
+
+/// The records of whatsapp-rust and the crates under it and of libthreema: held to
+/// `kourier_whatsapp::logs`'s and `kourier_threema::logs`'s rules (the module doc of the file), each
+/// network's arm under its own feature. Only in a build that has one of the two backends.
+#[cfg(any(feature = "whatsapp", feature = "threema"))]
+mod upstream;
 
 /// The default log filter. libsignal-protocol logs full service ids and key fingerprints at
 /// INFO (e.g. "decrypted PreKey message from <uuid>.1"), which §9.1 forbids, so it is capped at
@@ -138,6 +149,19 @@ fn uuid_len(b: &[u8]) -> Option<usize> {
     (shaped && ends).then_some(LEN)
 }
 
+/// The shortest run of hex digits that [`redact`] cuts as a key (P5 H2): 32 digits, 16 bytes.
+/// libsignal writes a contact's identity key as 64 hex digits on every send it refuses
+/// (`session_management.rs` "Identity key {} is not trusted for remote address {}"); a key,
+/// a digest or a token of 16 bytes or more is never needed in a log whole. Kourier's own log
+/// fields print at most 8 bytes of a digest or id (`groups::log_id`, `jobs::command_key`).
+const HEX_RUN_MIN: usize = 32;
+
+/// Where a run of [`HEX_RUN_MIN`] or more hex digits at the start of `b` ends.
+fn hex_run_len(b: &[u8]) -> Option<usize> {
+    let n = b.iter().take_while(|c| c.is_ascii_hexdigit()).count();
+    (n >= HEX_RUN_MIN).then_some(n)
+}
+
 /// Where a phone number in E.164 form (`+` and 7 to 15 digits) at the start of `b` ends.
 fn e164_len(b: &[u8]) -> Option<usize> {
     if b.first() != Some(&b'+') {
@@ -167,9 +191,9 @@ fn secret_link_len(b: &[u8]) -> Option<(usize, &'static str)> {
 
 /// Takes out of one log line what §9.1 never allows in a log, whoever wrote the line: a whole
 /// UUID becomes `…` and its last four digits (service ids, group and account ids: the short
-/// form still tells two apart), a phone number becomes `+[number]`, a `sgnl://` or
-/// `signalcaptcha://` link keeps only its scheme. Text without any of these is returned as
-/// it is.
+/// form still tells two apart), a run of 32 or more hex digits (a key, a digest) becomes
+/// `[hex]`, a phone number becomes `+[number]`, a `sgnl://` or `signalcaptcha://` link keeps
+/// only its scheme. Text without any of these is returned as it is.
 pub fn redact(line: &str) -> Cow<'_, str> {
     let b = line.as_bytes();
     let mut out: Option<String> = None;
@@ -180,7 +204,9 @@ pub fn redact(line: &str) -> Cow<'_, str> {
         let before_ok = i == 0 || !b[i - 1].is_ascii_alphanumeric();
         let hit: Option<(usize, Cow<'static, str>)> = match b[i] {
             c if c.is_ascii_hexdigit() && (i == 0 || !b[i - 1].is_ascii_hexdigit()) => {
-                uuid_len(&b[i..]).map(|n| (n, Cow::Owned(format!("…{}", &line[i + n - 4..i + n]))))
+                uuid_len(&b[i..])
+                    .map(|n| (n, Cow::Owned(format!("…{}", &line[i + n - 4..i + n]))))
+                    .or_else(|| hex_run_len(&b[i..]).map(|n| (n, Cow::Borrowed("[hex]"))))
             }
             b'+' if before_ok => e164_len(&b[i..]).map(|n| (n, Cow::Borrowed("+[number]"))),
             b's' if before_ok => secret_link_len(&b[i..])
@@ -262,17 +288,70 @@ impl<'a> MakeWriter<'a> for RotatingFile {
     }
 }
 
+/// The filter of one layer: `KOURIER_LOG` (default [`DEFAULT_FILTER`]) behind, in a build with the
+/// WhatsApp or the Threema backend, the rule for upstream's records, which `KOURIER_LOG` cannot widen.
+fn layer_filter<S>() -> impl Filter<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    layer_filter_over(
+        EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER)),
+    )
+}
+
+/// [`layer_filter`] over the given `env` filter (a test hands the default one in). The combined
+/// filter keeps the level hint of `env`: the rule never widens it, so the subscriber's maximum level
+/// stays the user's (default INFO) and the `log` crate drops upstream's DEBUG and TRACE records at the
+/// macro, not one by one in the filters (`upstream::Rule::max_level_hint`).
+fn layer_filter_over<S>(env: EnvFilter) -> impl Filter<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    #[cfg(any(feature = "whatsapp", feature = "threema"))]
+    let env = tracing_subscriber::filter::FilterExt::and(upstream::Rule, env);
+    env
+}
+
+/// The event format of both layers: the default one, except that a record of whatsapp-rust and the
+/// crates under it, or of libthreema, is written as its message alone ([`upstream::format_upstream`]).
+struct EventFormat(Format<Full, SystemTime>);
+
+impl EventFormat {
+    fn new() -> Self {
+        Self(Format::default().with_thread_names(false))
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for EventFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        #[cfg(any(feature = "whatsapp", feature = "threema"))]
+        let mut writer = writer;
+        #[cfg(any(feature = "whatsapp", feature = "threema"))]
+        if let Some(written) = upstream::format_upstream(&mut writer, event) {
+            return written;
+        }
+        self.0.format_event(ctx, writer, event)
+    }
+}
+
 /// Installs the global subscriber: stderr, plus `log_dir/kourier.log` when given. Returns
 /// `false` when a subscriber was already installed (tests that start several apps) or the log
 /// file could not be opened (then stderr only, with a warning).
 pub fn init(log_dir: Option<&Path>) -> bool {
-    let filter =
-        || EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     let stderr = tracing_subscriber::fmt::layer()
         .with_writer(redacted_stderr)
         .with_ansi(io::stderr().is_terminal())
-        .with_thread_names(false)
-        .with_filter(filter());
+        .event_format(EventFormat::new())
+        .with_filter(layer_filter());
     let mut file_error = None;
     let file = log_dir.and_then(
         |dir| match RotatingFile::open(dir, MAX_FILE_BYTES, KEPT_FILES) {
@@ -287,8 +366,8 @@ pub fn init(log_dir: Option<&Path>) -> bool {
         tracing_subscriber::fmt::layer()
             .with_writer(f)
             .with_ansi(false)
-            .with_thread_names(false)
-            .with_filter(filter())
+            .event_format(EventFormat::new())
+            .with_filter(layer_filter())
     });
     let installed = tracing_subscriber::registry()
         .with(stderr)
@@ -340,6 +419,32 @@ mod tests {
         assert_eq!(redact("größe … +14155550101 ✓"), "größe … +[number] ✓");
     }
 
+    /// P5 H2: libsignal's line for a refused send, with its exact format string
+    /// (`rust/protocol/src/session_management.rs`, v0.104.0), loses the 64-digit identity key
+    /// (and the address's UUID, as before); a 32-digit digest goes too, 31 digits stay.
+    #[test]
+    fn a_libsignal_key_line_is_cut() {
+        let key = "3e5a9f1c0b7d4e2a8c6f0d1b3a5e7c9f2d4b6a8e0c1f3d5b7a9e2c4f6d8b0a1c";
+        let line = format!(
+            "WARN libsignal_protocol::session_management: Identity key {} is not trusted for remote address {}",
+            key, "9d0652a3-dcc3-4d11-975f-74d61598733f.1",
+        );
+        let cut = redact(&line);
+        assert!(
+            !cut.contains(&key[..HEX_RUN_MIN]) && !cut.contains(&key[HEX_RUN_MIN..]),
+            "the identity key reached the log line"
+        );
+        assert_eq!(
+            cut,
+            "WARN libsignal_protocol::session_management: Identity key [hex] is not trusted for remote address …733f.1"
+        );
+        assert_eq!(
+            redact("digest 9d0652a3dcc34d11975f74d61598733f."),
+            "digest [hex]."
+        );
+        assert_eq!(redact("0x00112233445566778899aabbccddeeff00"), "0x[hex]");
+    }
+
     /// Kourier's own log forms and ordinary numbers pass untouched (and unallocated).
     #[test]
     fn log_safe_text_is_not_touched() {
@@ -349,8 +454,8 @@ mod tests {
             "skew_ms=-3600000 retry_in_s=30 count=+5 size=1048576",
             // Too short or too long for a phone number, or glued to a word.
             "+123456 +1234567890123456 a+14155550101",
-            // Hex that is not a UUID.
-            "digest 9d0652a3dcc34d11975f74d61598733f 9d0652a3-dcc3-4d11",
+            // Hex that is not a UUID, shorter than 32 digits (an 8-byte digest, a group's log id).
+            "digest 9d0652a3dcc34d11975f74d61598733 9d0652a3-dcc3-4d11 key=0a1b2c3d4e5f6a7b",
             "9d0652a3-dcc3-4d11-975f-74d61598733f0",
             "a message about sgnl links, and signalcaptcha too",
             // The scheme alone, as a message names it, is no link.
@@ -360,6 +465,31 @@ mod tests {
         ] {
             assert!(matches!(redact(line), Cow::Borrowed(_)), "{line}");
         }
+    }
+
+    /// The rule for upstream's records keeps the level hint of the `EnvFilter` behind it (review F2):
+    /// `And` takes the lower hint of its two sides and a missing one wins, so a rule without a hint
+    /// left the subscriber with none, `LevelFilter::current()` at TRACE, and every `log::trace!` and
+    /// `debug!` of whatsapp-rust, ureq, rustls and libsignal reached the filters. Here the default
+    /// filter (INFO) is what the combined one reports, with and without the WhatsApp backend.
+    #[test]
+    fn the_combined_filter_keeps_the_level_hint_of_the_env_filter() {
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::Registry;
+
+        let hint = |filter: &dyn Filter<Registry>| filter.max_level_hint();
+        let env = EnvFilter::new(DEFAULT_FILTER);
+        let expected = hint(&env);
+        assert_eq!(
+            expected,
+            Some(LevelFilter::INFO),
+            "the default filter's hint"
+        );
+        let combined = layer_filter_over::<Registry>(EnvFilter::new(DEFAULT_FILTER));
+        assert_eq!(hint(&combined), expected);
+        // A filter that asks for more raises it, through the rule as well.
+        let wide = layer_filter_over::<Registry>(EnvFilter::new("debug"));
+        assert_eq!(hint(&wide), Some(LevelFilter::DEBUG));
     }
 
     #[test]

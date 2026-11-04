@@ -16,7 +16,7 @@
 //! - an actor that is still linking gets no download, no safety-number confirmation and no
 //!   challenge answer.
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -131,6 +131,22 @@ async fn waiting_for_retry(env: &Env, id: MessageId, attempts: i64) {
     .await;
 }
 
+/// Waits until the dispatcher sleeps on the (fake) clock until the time the send row of `id`
+/// waits for: the look at the outbox that follows a recorded outcome has run then. The row is
+/// read for that time, so this also fails if the row waits for nothing.
+async fn retry_timer_armed(env: &Env, id: MessageId) {
+    let db = env.core_db();
+    let at = core_db(&db, |c| {
+        c.query_row(
+            "SELECT next_attempt_at FROM outbox WHERE message_id = ?1 AND state = 'Queued'",
+            [id.0],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("the row waits for a retry")
+    });
+    sleeping_until(env, u64::try_from(at).expect("a time")).await;
+}
+
 async fn account_state(env: &Env, account: AccountId, what: &str, f: fn(&AccountState) -> bool) {
     let h = env.handle.clone();
     eventually(what, WAIT, || {
@@ -168,6 +184,7 @@ async fn handled_so_far(env: &Env, account: AccountId, uuid: AccountUuid) {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: alice(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     let control = env.control.clone();
@@ -1080,6 +1097,7 @@ async fn a_backend_that_is_still_linking_gets_no_download_confirmation_or_answer
         .send(UiCommand::ConfirmIdentity {
             account,
             user: alice(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     env.handle
@@ -1302,6 +1320,11 @@ async fn a_clock_set_back_does_not_stall_the_outbox() {
     transmits(&env, uuid, 5).await;
     let two = own_messages(&env.core_db(), b)[0].clone();
     waiting_for_retry(&env, two.id, 2).await;
+    // The row says "waiting" as soon as the outcome is recorded, but the dispatcher takes its
+    // look at the outbox (the one that arms the retry timer) after that. A look that falls
+    // behind the clock change below would be the "next look" and wake the outbox: wait for the
+    // timer, which only that look arms.
+    retry_timer_armed(&env, two.id).await;
     // An hour back: less than the budget, so the stored wait alone looks plausible.
     env.clock.set(t0 - 2 * DAY_MS - 3_600_000);
     settle().await;

@@ -37,7 +37,7 @@ use std::fmt::Write as _;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kourier_db::rusqlite::{Connection, OptionalExtension, Row as SqlRow};
-use kourier_model::ConvKey;
+use kourier_model::{ConvKey, Patch};
 use libsignal_core::Aci;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -177,6 +177,11 @@ pub(crate) struct SnapPending {
     pub(crate) admin: bool,
 }
 
+/// `AccessControl.AccessRequired.ADMINISTRATOR` (`protos/Groups.proto`: `UNKNOWN = 0; ANY = 1;
+/// MEMBER = 2; ADMINISTRATOR = 3; UNSATISFIABLE = 4`). The one level the page calls "only admins":
+/// `UNSATISFIABLE` means nobody and `UNKNOWN` that the group stated nothing, so neither is it.
+pub(crate) const ACCESS_ADMINISTRATOR: i32 = 3;
+
 /// Who may change what (`AccessControl.AccessRequired` values).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Access {
@@ -186,6 +191,18 @@ pub(crate) struct Access {
     pub(crate) members: i32,
     /// Joining by invite link.
     pub(crate) add_from_invite_link: i32,
+}
+
+impl Access {
+    /// Only administrators may change the title, avatar, timer and description.
+    pub(crate) fn attributes_admin_only(&self) -> bool {
+        self.attributes == ACCESS_ADMINISTRATOR
+    }
+
+    /// Only administrators may add members.
+    pub(crate) fn members_admin_only(&self) -> bool {
+        self.members == ACCESS_ADMINISTRATOR
+    }
 }
 
 /// The decrypted state of a group at one revision, as `groups.state` stores it (JSON). Personal
@@ -227,6 +244,11 @@ impl Snapshot {
     /// Whether `aci` is a full member.
     pub(crate) fn is_member(&self, aci: Aci) -> bool {
         self.member(aci).is_some()
+    }
+
+    /// The description as the patch that states it: set, or cleared when the group has none.
+    pub(crate) fn description_patch(&self) -> Patch<String> {
+        self.description.clone().map_or(Patch::Clear, Patch::Set)
     }
 
     /// Whether `service_id` (string form) is invited.
@@ -409,6 +431,44 @@ pub(crate) fn load_by_id(conn: &Connection, id: &[u8]) -> Result<Option<GroupRow
         Some((master, raw)) => finish_row(&master, raw),
         None => Ok(None),
     }
+}
+
+/// The archive state the phone last stated for the group with id `id` and its mute (ms, `i64::MAX`
+/// for ever), as two column reads: the receive path's unarchive rule asks it of every group
+/// message, so it must not load the snapshot (A1). `None` when no such group is stored.
+pub(crate) fn archive_state(conn: &Connection, id: &[u8]) -> Result<Option<(bool, Option<i64>)>> {
+    Ok(conn
+        .prepare_cached("SELECT archived, muted_until FROM groups WHERE group_id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?)
+}
+
+/// Writes the group's archived flag, which is also the base the Storage merge diffs the
+/// phone's next record against (A1: a new message brings the chat back and moves it, so a
+/// phone that archives the chat again is heard).
+pub(crate) fn set_archived(conn: &Connection, id: &[u8], archived: bool, now: i64) -> Result<()> {
+    conn.prepare_cached("UPDATE groups SET archived = ?2, updated_at = ?3 WHERE group_id = ?1")?
+        .execute((id, archived, now))?;
+    Ok(())
+}
+
+/// Writes the three chat flags the Storage Service keeps for a group, as the base the merge
+/// diffs the phone's next record against and as what the core was last told (A10: a change
+/// made here is stated to the core at once, so the mirror follows it).
+pub(crate) fn set_roaming(
+    conn: &Connection,
+    id: &[u8],
+    archived: bool,
+    marked_unread: bool,
+    muted_until: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE groups SET archived = ?2, marked_unread = ?3, muted_until = ?4, updated_at = ?5
+         WHERE group_id = ?1",
+    )?
+    .execute((id, archived, marked_unread, muted_until, now))?;
+    Ok(())
 }
 
 /// Whether our phone accepted the group with id `id` (the Storage Service record's

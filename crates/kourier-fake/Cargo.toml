@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+# The integration tests are one binary, tests/it.rs (T3); a new tests/<name>.rs is a `mod` there.
+autotests = false
 
 [dependencies]
 kourier-model.workspace = true
@@ -23,3 +25,7 @@ zeroize.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[[test]]
+name = "it"
+path = "tests/it.rs"

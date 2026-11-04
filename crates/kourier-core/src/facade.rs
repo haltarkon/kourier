@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kourier_backend_api::BackendNotice;
 use kourier_model::{
-    AccountId, AccountProgress, AccountState, AccountUuid, AttachmentId, AttachmentKind, BlobRef,
-    Body, ConnState, ConvKind, ConversationChange, ConversationFeatures, ConversationId, Deletion,
-    Expiry, HistoryTransfer, LoginStep, Member, MessageId, NetworkKind, OutgoingState,
-    QuoteSnapshot, ReadState, Redacted, SystemEvent, Text, UserId,
+    AccountHold, AccountId, AccountProgress, AccountState, AccountUuid, AttachmentId,
+    AttachmentKind, BlobRef, Body, ConnState, Contact, ConvKind, ConversationChange,
+    ConversationFeatures, ConversationId, Deletion, Expiry, HistoryTransfer, LoginStep, Member,
+    MemberRole, MessageId, NetworkKind, OutgoingState, QuoteSnapshot, ReadState, Redacted,
+    SystemEvent, Text, UserId,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -28,6 +28,17 @@ use crate::error::Result;
 pub use crate::error::{CoreError, Refusal};
 pub use crate::expiry::ExpiryPolicy;
 pub use crate::media::{MEDIA_HANDLES, MediaBlob, MediaEntry, MediaHandles, MediaVariant};
+/// What [`UiEvent::Notice`] carries, so a front-end can name the notice it shows (the quiet line
+/// for lost history, W4).
+pub use kourier_backend_api::BackendNotice;
+pub use kourier_blob::{SaveError, SaveMode};
+pub use kourier_media::{Look, LookFormat};
+/// Synthetic files that carry a made-up location (the Qt window tests and fixture pages of the
+/// location question; nothing of a user's).
+pub use kourier_media::{SampleLocated, sample_located};
+/// The file-name extension of a MIME type and back: what the name of a saved file is judged by
+/// (the viewmodel's `save_name`).
+pub use kourier_media::{extension_for_mime, mime_from_extension};
 pub use kourier_model as model;
 
 /// Capacity of the [`UiEvent`] broadcast. A lagging receiver gets `RecvError::Lagged` and must
@@ -52,13 +63,32 @@ pub struct QueryToken {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub u64);
 
+/// Where [`UiCommand::SaveAttachment`] puts a copy: a folder the user chose and a file name.
+/// Both are personal data: `Debug` shows neither (§9.1).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SaveTarget {
+    /// The folder the user chose (an absolute path).
+    pub dir: PathBuf,
+    /// The file name: ONE path component (the viewmodel cleans it, the writer refuses
+    /// anything else).
+    pub name: String,
+}
+
+impl std::fmt::Debug for SaveTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SaveTarget(<redacted>)")
+    }
+}
+
 /// What the UI asks the core to do.
 #[derive(Debug)]
 pub enum UiCommand {
     /// The first frame is shown: connect every active account (§4.3 step 3).
     UiReady,
     /// Start linking a new account of `network` with login flow `flow` (§4.3 step 1). Any risk
-    /// notice was accepted by the user before this.
+    /// notice was accepted by the user before this: the consent belongs to the front-end (a
+    /// page with a tick box, architecture §8.3); nothing below it checks that it was asked
+    /// (§8.10 R3).
     AddAccount {
         /// The network.
         network: NetworkKind,
@@ -187,7 +217,7 @@ pub enum UiCommand {
     ///
     /// A file the send cannot take is never dropped silently and never sent short: when any
     /// file is refused (unreadable, not a file, above the network's size limit, a kind
-    /// the chat does not take) nothing is queued and the failure hands the paths, the
+    /// the chat does not take, a location the user did not agree to send) nothing is queued and the failure hands the paths, the
     /// caption and the quote back and names every refused file with its reason
     /// ([`RefusedFiles::refused`]). The UI decides what happens to the rest: it puts all of it
     /// back into the composer with those files marked, or sends the command again without
@@ -208,10 +238,34 @@ pub enum UiCommand {
         /// apply to it. Missing entries are `false`, so an empty list sends every file as
         /// what it is; `true` for a file that is no picture or video changes nothing.
         as_file: Vec<bool>,
+        /// Per file, by position in `paths`: the user agreed that it leaves with where it was
+        /// taken (LOC; the composer's question or the "Always send" setting). A file that
+        /// would leave this PC with its location ([`leaves_with_location`], looked at again
+        /// when the send reads it) and whose entry is `false` is refused with
+        /// [`FileRefusal::Location`], like any other refusal. Missing entries are `false`.
+        with_location: Vec<bool>,
         /// Caption with formatting ranges (UTF-8 offsets); clears the draft when sent.
         caption: Option<Text>,
         /// The message this one replies to (as for [`SendText`](Self::SendText)).
         reply_to: Option<MessageId>,
+    },
+    /// Share a person's contact card in a chat (P5c, architecture §4.2): the CORE builds the card
+    /// from `user`'s contact row ([`PersonDetail::contact_card`]: their own profile name and the
+    /// number their page shows, nothing else) and queues it in `conv` like a
+    /// [`SendText`](Self::SendText) (same ordering; the chat's draft is left alone). Sent only
+    /// on the user's click and choice of chat. Refused (`ActionFailed { action: "SendContact",
+    /// subject: ActionSubject::Conversation(conv) }`) when `conv` belongs to another account than
+    /// `account` (a card never leaves through another account), when the network sends no
+    /// cards (`NetworkDescriptor::contact_cards`), when the person is the user (BQ-4), when
+    /// their page may show no number or they have no profile name ([`ShareState`]), and when
+    /// the chat cannot send.
+    SendContact {
+        /// Where the card goes.
+        conv: ConversationId,
+        /// The account of the person's page (it must be `conv`'s).
+        account: AccountId,
+        /// Whose card it is.
+        user: UserId,
     },
     /// Download an attachment the policy left for a click, or retry a failed download (§5.8).
     /// Answered with invalidations (`Downloading`, then `Local` or `Failed`) and
@@ -237,6 +291,30 @@ pub enum UiCommand {
         /// The attachment.
         attachment: kourier_model::AttachmentId,
     },
+    /// Save a plaintext copy of a downloaded attachment as the file `name` in the folder `dir`
+    /// (the user's choice in a file dialog): the core decrypts the blob straight into the
+    /// folder (`kourier_blob::save_copy`: an anonymous file that gets its name only once every
+    /// chunk authenticated, never an executable bit, a link of that name never followed) on a
+    /// worker, never on the UI's thread. The file is the sender's original with its metadata.
+    /// Answered with [`UiEvent::AttachmentSaved`], or with `ActionFailed { action:
+    /// "SaveAttachment", subject: ActionSubject::Attachment(..) }`:
+    /// `Refused(Gone)` for a message that is gone, deleted or hidden, `Refused(Deleted)` for a
+    /// tombstone, `Refused(WrongKind)` for a view-once message or the rest of a long text,
+    /// `InvalidInput` for a file that is not here, and `CoreError::Save(..)` for the writer's
+    /// own answers: [`kourier_blob::SaveError::Exists`] ([`SaveMode::NoReplace`] and the name
+    /// is taken), `BadName`, `NoFolder`, `NotWritable`, `NoSpace`, `Source`. The rule is the
+    /// one behind [`MessageActions::save_attachments`], looked at again at the command (the
+    /// row may have been deleted while the dialog was open). Saves are served in the order
+    /// they were sent, on a queue of their own: a long one never delays an open or a send.
+    SaveAttachment {
+        /// The attachment.
+        attachment: kourier_model::AttachmentId,
+        /// Where the copy goes.
+        target: SaveTarget,
+        /// Whether a file of that name is replaced (the dialog asked) or answered with
+        /// `Exists` (several files into one folder).
+        mode: SaveMode,
+    },
     /// Re-queue a failed (or paused) own message with its original network id, a fresh retry
     /// budget and only the recipients that do not have it yet (§4.8 step 5). It also lifts a
     /// challenge pause of the account's sends (the user solved it). Edits and reactions the
@@ -250,10 +328,21 @@ pub enum UiCommand {
         /// The failed message.
         message: MessageId,
     },
-    /// Delete a queued or failed own message that no recipient has yet, with its outbox row
-    /// (§4.8 step 5); refused while a transmit is in flight or once anyone has it.
+    /// "Cancel Sending" (§4.8 step 5): delete a queued or failed own message that no recipient
+    /// has yet, with its outbox row; refused once anyone has it.
+    ///
+    /// A message whose attempt is in flight is STOPPED, not deleted, and only while
+    /// [`MessageActions::cancel_sending`] says so: its first attempt, the backend reports an
+    /// upload of it and no recipient has it (the same rule decides the flag and this command).
+    /// The core writes the stop down durably and asks the backend; the answer decides. The row
+    /// stays, its X greyed out, until the answer is in: `Stopping` means nothing of the message
+    /// goes out any more and it is taken back (with its attachments' rows and files, also after
+    /// a quit or a crash before the attempt's end is recorded); `TooLate` means it was going out
+    /// anyway, the mark is cleared at once, the message ends sent and
+    /// [`UiEvent::CancelTooLate`] says so after it. Any other message in flight is refused
+    /// (`BeingSent`).
     CancelMessage {
-        /// The queued or failed message.
+        /// The queued, failed or uploading message.
         message: MessageId,
     },
     /// Edit the text of an own text message, or the caption of an own message with
@@ -392,13 +481,68 @@ pub enum UiCommand {
         /// Typing or stopped.
         on: bool,
     },
-    /// The user accepted `user`'s new safety number: the backend is told
-    /// (`Command::ConfirmIdentity`) and the conversations whose queue paused on it continue
-    /// (§4.8 `UntrustedIdentity`).
+    /// The user accepted `user`'s new safety number ("Confirm New Safety Number", also the
+    /// choice of a paused send): the backend is told (`Command::ConfirmIdentity`) and the
+    /// conversations whose queue paused on it continue (§4.8 `UntrustedIdentity`). BQ-2b
+    /// (Desktop's "Send anyway"): on a person whose key changed after it was verified the
+    /// backend sets DEFAULT, writes the quiet "not verified" notice and queues a Verified sync
+    /// DEFAULT; on any other person it only approves the new key (no state change, no sync, no
+    /// notice). `key` is the key of the safety number on screen ([`QueryData::SafetyNumber`],
+    /// the lead's RC2, as `SetVerified`): on a person whose key changed after it was verified
+    /// the backend refuses when its stored key is another one (the number changed meanwhile:
+    /// nothing is confirmed or written, [`UiEvent::ActionFailed`] with [`ActionSubject::Person`],
+    /// and the page shows the new number); on any other person it is ignored. The paused
+    /// conversations continue only after the backend's `Ok` (the lead's RC6: a refusal leaves
+    /// them paused); an account without a running actor keeps the confirmation for its next
+    /// start and lets them continue at once.
     ConfirmIdentity {
         /// The account.
         account: AccountId,
         /// Whose identity.
+        user: UserId,
+        /// The key the user was shown.
+        key: model::IdentityFingerprint,
+    },
+    /// Mark (`verified`) or clear the verification of `user`'s identity key (P5a: "Mark as
+    /// Verified" and "Clear Verification" ONLY; "Confirm New Safety Number" is
+    /// [`UiCommand::ConfirmIdentity`], never a clear: a clear always queues a Verified sync,
+    /// BQ-2b). `key` is the
+    /// key of the safety number on screen ([`QueryData::SafetyNumber`]); the backend refuses
+    /// another (the number changed meanwhile: [`UiEvent::ActionFailed`] with
+    /// [`ActionSubject::Person`]). Handed to the account in the order of the commands (a Mark
+    /// then a Clear reach the network in that order); after the backend's `Ok` the
+    /// conversations paused on `user` continue, whatever the state was (critic F2). Not durable:
+    /// an account that is not running answers a failure.
+    SetVerified {
+        /// The account.
+        account: AccountId,
+        /// Whose identity.
+        user: UserId,
+        /// Mark (`true`) or clear (`false`).
+        verified: bool,
+        /// The key the user was shown.
+        key: model::IdentityFingerprint,
+    },
+    /// Turn an account's switch for WRITING roaming settings (settings the network keeps for the
+    /// account's other devices: archive, pin, mute, marked unread) on or off. Handed to the
+    /// account in the order of the commands; the backend stores the switch, answers
+    /// (`Command::SetRoamingWrites`) and states the new value in the account's caps
+    /// (`AccountCaps::roaming_writes`), which is the only thing that changes what the UI is
+    /// offered. A refusal (a network that cannot write them, an account that is not running) comes
+    /// back as `ActionFailed { action: "SetRoamingWrites" }` with no subject.
+    SetRoamingWrites {
+        /// The account.
+        account: AccountId,
+        /// On (`true`) or off.
+        on: bool,
+    },
+    /// A person's page is open: ask the network for a fresh profile of `user` (the about
+    /// text), at most once a day per person (the backend decides; people pages P1). Not
+    /// durable, best effort, like a mark.
+    RefreshContact {
+        /// The account.
+        account: AccountId,
+        /// Whose profile.
         user: UserId,
     },
     /// The user solved the challenge an account waits on (Signal: the captcha behind a 428).
@@ -457,8 +601,9 @@ pub enum UiCommand {
     /// directions, in every account whose clock is unconfirmed right now: from "keep" to
     /// "hide", what is due by the local clock leaves the timeline, the list and the counters
     /// (`TimelineInvalidated`, `ConversationsChanged`); from "hide" to "keep" it shows again
-    /// as it was; to "erase" it is gone from every read at once and deleted for good a
-    /// moment later (the sweeper's next look, which the command wakes). The command is
+    /// as it was; to "erase" it is gone from every read at once and deleted for good before
+    /// the command returns (in the sweeper's batches): a change back right behind it finds
+    /// it erased, never only hidden. The command is
     /// applied before anything sent after it is looked at: a [`Query::ExpiryPolicy`] right
     /// behind it answers the new option, and a timeline read right behind it already
     /// follows it. There is no event of its own; a failure to store it comes as
@@ -468,6 +613,26 @@ pub enum UiCommand {
     SetExpiryPolicy {
         /// The option.
         policy: ExpiryPolicy,
+    },
+    /// Show or hide the QUIET notices in the conversation list (user decision, 2026-10-15; a
+    /// notice is quiet when [`kourier_model::SystemEvent::is_quiet`] says so: a safety number
+    /// that changed, a refreshed session, a changed number, an accepted message request).
+    /// Hidden is the default: such a notice is a row of its chat's timeline as any other, but
+    /// the list shows the chat's last real message, its time, and puts the chat where that
+    /// message puts it. Shown: the notice stands for its chat like any message.
+    ///
+    /// One setting for the whole core, stored in `core.db`. The command stores it and, in the
+    /// same transaction, gives every conversation the sort time its newest listed row says;
+    /// it is applied before anything sent after it is looked at (a [`Query::QuietNotices`] or
+    /// [`Query::Conversations`] right behind it answers the new state). The conversations
+    /// whose sort time changed come as `ConversationsChanged`; a PREVIEW can change without
+    /// that (two rows with one sort key, a pinned chat), so a front-end reads the whole list
+    /// again after this command. A failure to store it comes as `ActionFailed { account:
+    /// None, action: "SetQuietNotices", subject: ActionSubject::None }`: the option is then
+    /// what it was and the list is as it was.
+    SetQuietNotices {
+        /// `true`: quiet notices count for the list; `false`: they do not (the default).
+        shown: bool,
     },
     /// The UI needs nothing fast for a while (its window was released after it sat hidden
     /// in the tray, §8.2): the core gives back the memory it only keeps for speed, the
@@ -532,6 +697,15 @@ pub enum UiEvent {
         account: AccountId,
         /// The state.
         state: ConnState,
+    },
+    /// The account's send hold changed ([`AccountHold`]; `None`: no hold now): messages,
+    /// reactions, edits and deletes made in Kourier wait in the outbox while it stands. A
+    /// state, so a front-end treats it as idempotent; [`AccountRow::hold`] has the current one.
+    AccountHold {
+        /// The account.
+        account: AccountId,
+        /// The hold now.
+        hold: Option<AccountHold>,
     },
     /// A login step to show (§4.4).
     LoginStep {
@@ -677,6 +851,14 @@ pub enum UiEvent {
         /// The plaintext file (personal data, never logged).
         path: PathBuf,
     },
+    /// [`UiCommand::SaveAttachment`]: the copy is in the folder under the name asked for, and
+    /// on the disk.
+    AttachmentSaved {
+        /// The attachment.
+        attachment: kourier_model::AttachmentId,
+        /// The length of the copy in bytes.
+        bytes: u64,
+    },
     /// A banner from the backend.
     Notice {
         /// The account.
@@ -704,6 +886,31 @@ pub enum UiEvent {
         /// What the command was about.
         subject: ActionSubject,
     },
+    /// The user stopped a message that was uploading ([`UiCommand::CancelMessage`]) but the
+    /// backend had gone past the point of no return ("too late"), and the message was sent. Said
+    /// once, after the outcome was recorded as sent (or partly sent), so that the message's
+    /// delete-for-everyone, which the core refuses while a send is in flight, works at once.
+    /// Nothing is said when the attempt fails: the message then shows as failed and its menu
+    /// as usual.
+    CancelTooLate {
+        /// The account.
+        account: AccountId,
+        /// The conversation of the message.
+        conv: ConversationId,
+        /// The message.
+        message: MessageId,
+    },
+    /// The sends to `user` began or ended waiting for the user to confirm their changed safety
+    /// number (P5a BQ-3: a conversation's queue paused on them, or its last such pause ended:
+    /// confirmed, cancelled, given up). The rows come as `MessagesChanged` (the paused head
+    /// names the person, [`MessageActions::safety_number`]); this tells an open safety-number
+    /// page to ask again ([`QueryData::SafetyNumber`]'s `waits`).
+    SafetyWaitChanged {
+        /// The account.
+        account: AccountId,
+        /// Whose safety number.
+        user: UserId,
+    },
     /// The answer to [`UiCommand::Query`].
     QueryResult {
         /// The query's token.
@@ -727,6 +934,8 @@ pub enum ActionSubject {
     Attachment(AttachmentId),
     /// A refused `SendFiles`: the whole request, nothing of which was queued.
     Files(Arc<RefusedFiles>),
+    /// A person (`SetVerified`).
+    Person(UserId),
 }
 
 impl ActionSubject {
@@ -759,6 +968,8 @@ pub struct RefusedFiles {
     pub paths: Redacted<Vec<PathBuf>>,
     /// The command's `as_file`, as sent (by position in `paths`).
     pub as_file: Vec<bool>,
+    /// The command's `with_location`, as sent (by position in `paths`; missing = `false`).
+    pub with_location: Vec<bool>,
     /// The caption, as sent.
     pub caption: Option<Text>,
     /// The quoted message, as sent.
@@ -780,8 +991,9 @@ pub struct RefusedFile {
 }
 
 /// Why a file cannot be sent. None of these is a limit of Kourier's own making: the first
-/// two are about the file, the last two are what the network or its clients take. An empty
-/// file is no reason: it is sent like any other.
+/// two are about the file, the next two are what the network or its clients take, and
+/// `Location` is the user's own choice (LOC). An empty file is no reason: it is sent like any
+/// other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileRefusal {
     /// It could not be opened or read (gone, no permission, changed while it was read).
@@ -802,6 +1014,10 @@ pub enum FileRefusal {
         /// The kind, read from the file's content.
         kind: AttachmentKind,
     },
+    /// It holds where it was taken, would leave this PC with it, and the user did not agree
+    /// to that ([`UiCommand::SendFiles`] `with_location`). Also when it changed while it was
+    /// read and was not agreed to (critic F24).
+    Location,
 }
 
 /// [`Query::FilePlan`]: a pending selection of files, as the composer holds it.
@@ -845,6 +1061,73 @@ pub struct FilesPreview {
     /// messages" is `plan.message_count()`, which counts the texts of a caption that goes
     /// first (`plan.caption_messages`).
     pub plan: model::FilePlan,
+    /// By position: the file would leave this PC with where it was taken
+    /// ([`leaves_with_location`] for its look, kind, `as_file`, size and the network's
+    /// statement). `false` for a refused or unreadable file. The composer asks before it sends
+    /// a file marked here (LOC).
+    pub location: Vec<bool>,
+}
+
+/// Whether a file would leave this PC with where it was taken (LOC). The one decision of the
+/// plan and of the send (critic F13): the composer's question and the core's refusal follow
+/// it alike.
+///
+/// - The look found no location (`None`, and `Unreadable`, which does not ask): `false`.
+/// - Sent as the file it is (`as_file`): `true`, the bytes go unchanged.
+/// - A picture (`content` `Image`) whose format the LOOK read by its magic (never the MIME,
+///   which may come from the name: a TIFF named `x.jpg`, critic F10) is one the network
+///   states it cleans (`NetworkDescriptor::cleaned_pictures`), within its size bound:
+///   `false`.
+/// - M1 extends THIS function with its own clause (an ISO-BMFF video M1 cleans at import ->
+///   `false`), so that plan time and import time keep one answer; a clean that failed is
+///   remembered by the core, which then asks as if `cleaned` were `None` (critic F13).
+/// - Otherwise, and when the network states nothing (`cleaned` `None`): `true`.
+pub fn leaves_with_location(
+    look: &Look,
+    content: AttachmentKind,
+    as_file: bool,
+    size: u64,
+    cleaned: Option<&model::CleanedPictures>,
+) -> bool {
+    let Look::Found(evidence) = look else {
+        return false;
+    };
+    if as_file {
+        return true;
+    }
+    let Some(cleaned) = cleaned else {
+        return true;
+    };
+    !(content == AttachmentKind::Image && cleaned.cleans(look_mime(evidence.format), size))
+}
+
+/// The MIME type of a format the look recognised, as a network's statement names it.
+fn look_mime(format: LookFormat) -> &'static str {
+    match format {
+        LookFormat::Jpeg => "image/jpeg",
+        LookFormat::Png => "image/png",
+        LookFormat::WebP => "image/webp",
+        LookFormat::Tiff => "image/tiff",
+        LookFormat::Heif => "image/heic",
+        LookFormat::Jxl => "image/jxl",
+        LookFormat::Bmff => "video/mp4",
+    }
+}
+
+/// Looks at a file for where it was taken (blocking): from its start, whatever the file's
+/// position, at most 2 MiB read and 2 s spent (`kourier_media::look`). For a caller outside
+/// the core that packs files the core cannot see into (a folder sent as one .zip, critic F9):
+/// it reaches the look through the core, not through a crate edge of its own. The position
+/// afterwards is unspecified.
+pub fn look_file(f: &mut std::fs::File) -> Look {
+    use std::io::Seek;
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return Look::Unreadable;
+    };
+    if f.rewind().is_err() {
+        return Look::Unreadable;
+    }
+    crate::attachments::looks::look_noted(f, len)
 }
 
 /// The versions of a message ([`Query::Revisions`]), for an edit history.
@@ -890,12 +1173,15 @@ pub struct Notification {
 /// Progress events (ephemeral).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Progress {
-    /// Upload of attachment `index` of an own message.
+    /// Upload of one attachment of an own message while its attempt uploads (the backend's
+    /// `AttachmentProgress`, whose `index` the core turned into the attachment's row: the UI
+    /// knows blocks by attachment, as for downloads). `done` and `total` are plaintext bytes,
+    /// `total` final from the first report, `done == total` only once that upload is over.
     Upload {
         /// The message.
         message: MessageId,
-        /// Attachment index.
-        index: u16,
+        /// The attachment.
+        attachment: kourier_model::AttachmentId,
         /// Bytes done.
         done: u64,
         /// Total bytes.
@@ -957,6 +1243,13 @@ pub enum Query {
     /// The files of one attachment (media-handle misses, §8.6; runs on the third read
     /// connection).
     Attachment(kourier_model::AttachmentId),
+    /// What the name a saved file is offered under is made of ([`SaveFacts`]): who sent the
+    /// attachment's message and when, its place among the message's files, the stored name and
+    /// type, and what the first bytes of the plaintext say the file is (`kourier_media::sniff_mime`;
+    /// the stored MIME type is the sender's claim). Answered with [`QueryData::SaveFacts`];
+    /// `None` for an attachment that does not exist, or whose message is hidden. The decryption of
+    /// the first chunk runs on the blocking pool.
+    SaveFacts(kourier_model::AttachmentId),
     /// How a pending selection of files would be sent: the kind of each file, the files the
     /// send would refuse and the split into messages. For the composer, before
     /// [`UiCommand::SendFiles`]. The split is [`model::ConversationFeatures::plan`], the
@@ -966,9 +1259,36 @@ pub enum Query {
     /// The versions of a message with their times, for the edit history behind the "edited"
     /// mark.
     Revisions(MessageId),
+    /// One person for their page (people pages P1): the contact, the 1:1 chat with them, the
+    /// groups both are in. `user` may be an alias; the answer names the canonical id.
+    Person {
+        /// The account.
+        account: AccountId,
+        /// The person (an own id gives the user's own page).
+        user: UserId,
+    },
+    /// One group for its page (people pages P2): the description, the rules, the timer and
+    /// every member row with the name the core has for it. Answers for a conversation of kind
+    /// `Group` only: `None` for a 1:1 chat, a channel, a list or a conversation that is gone.
+    Group(ConversationId),
+    /// A page of the gallery of one chat, newest first (people pages P4, "Media and Files"):
+    /// the attachments of messages that are shown, of the kind asked for.
+    ChatMedia(ChatMediaQuery),
+    /// The safety number of a person (P5a), from the account's backend (the one query that
+    /// asks a backend; Signal computes it from its stored keys). An account that is not
+    /// running or not linked answers `SafetyUnavailable::NotRunning`.
+    SafetyNumber {
+        /// The account.
+        account: AccountId,
+        /// The person.
+        user: UserId,
+    },
     /// The option [`UiCommand::SetExpiryPolicy`] chose
     /// ([`ExpiryPolicy::HideUntilConfirmed`] until the user chooses another).
     ExpiryPolicy,
+    /// What [`UiCommand::SetQuietNotices`] chose: `true` when quiet notices are shown in the
+    /// list (`false` until the user chooses so).
+    QuietNotices,
 }
 
 /// The answer to a [`Query`].
@@ -984,12 +1304,33 @@ pub enum QueryData {
     Conversation(Option<Box<ConversationDetail>>),
     /// [`Query::Attachment`]; `None` when it does not exist.
     Attachment(Option<AttachmentFile>),
+    /// [`Query::SaveFacts`].
+    SaveFacts(Option<SaveFacts>),
     /// [`Query::FilePlan`].
     FilePlan(FilesPreview),
     /// [`Query::Revisions`]; `None` when the message does not exist.
     Revisions(Option<MessageRevisions>),
+    /// [`Query::Person`]; `None` when the account does not exist.
+    Person(Option<Box<PersonDetail>>),
+    /// [`Query::Group`]; `None` when the conversation does not exist or is not a group.
+    Group(Option<Box<GroupDetail>>),
+    /// [`Query::ChatMedia`].
+    ChatMedia(ChatMediaPage),
+    /// [`Query::SafetyNumber`]: the number, or why there is none. A failure of the backend
+    /// itself (its database) is the query's `Err`.
+    SafetyNumber {
+        /// The number, or why there is none.
+        answer: model::SafetyAnswer,
+        /// Sends to this person wait for the user to confirm their new safety number (a
+        /// conversation's queue paused on them, P5a BQ-3 / critic F2): the page offers
+        /// "Confirm New Safety Number" also for a person who was never verified. Read when
+        /// the backend's answer arrives; [`UiEvent::SafetyWaitChanged`] says when it changes.
+        waits: bool,
+    },
     /// [`Query::ExpiryPolicy`].
     ExpiryPolicy(ExpiryPolicy),
+    /// [`Query::QuietNotices`]: `true` when quiet notices are shown in the list.
+    QuietNotices(bool),
 }
 
 /// Where an attachment's encrypted files are.
@@ -1011,6 +1352,37 @@ pub struct AttachmentFile {
     pub file: Option<BlobRef>,
     /// The encrypted thumbnail.
     pub thumb: Option<BlobRef>,
+}
+
+/// What the name of a saved file is made of ([`Query::SaveFacts`]). Personal data: `Debug` shows
+/// none of it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SaveFacts {
+    /// The attachment's account.
+    pub account: AccountId,
+    /// The sender of its message; `None` for a message of our own.
+    pub author: Option<UserId>,
+    /// When the message was sent (ms since the Unix epoch).
+    pub sent_at: i64,
+    /// The file's place among ALL the files of its message, from 1 (whether or not the others
+    /// are on this PC).
+    pub position: u32,
+    /// The file name the sender gave, as stored.
+    pub file_name: Option<String>,
+    /// The MIME type the sender stated.
+    pub mime: Option<String>,
+    /// What the first bytes of the plaintext say it is; `None` for a file that is not here, a
+    /// type the sniffer does not know, or a blob that does not open.
+    pub sniffed: Option<String>,
+}
+
+impl std::fmt::Debug for SaveFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveFacts")
+            .field("account", &self.account)
+            .field("position", &self.position)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One account.
@@ -1049,9 +1421,28 @@ pub struct AccountRow {
     /// When this device was linked (ms since the epoch): the day the phone lists it under its
     /// linked devices. Moves to the time of a link that is accepted again (`Relink`).
     pub linked_at: i64,
+    /// The account's send hold while one stands (a network's temporary refusal of what the
+    /// user sends, with the connection up; [`AccountHold`]). Messages, reactions, edits and
+    /// deletes made in Kourier wait in the outbox until it ends; receiving, downloads, read
+    /// receipts and the missed-call summary go on.
+    pub hold: Option<AccountHold>,
+    /// Whether the account's network writes the settings it keeps for the account's other
+    /// devices (archive, pin, mute, marked unread: "roaming"; [`kourier_model::AccountCaps::roaming_writes`],
+    /// stated by the backend alone): `None` = the network cannot (nothing is offered), `Some(false)`
+    /// = it can and this account's switch is off ([`UiCommand::SetRoamingWrites`]), `Some(true)` =
+    /// on. Changes with `AccountsChanged`.
+    pub roaming_writes: Option<bool>,
+    /// How many chats this account may pin at most while it states [`Self::roaming_writes`]
+    /// (the limit the network states, [`kourier_model::AccountCaps::max_pinned_chats`]); `None` =
+    /// the network states NO limit (or does not state the flag at all): the core refuses no pin
+    /// for a count and a front-end disables Pin only at a stated limit. The count is the pinned
+    /// chats the core lists (a chat deleted here is not counted); the backend's gate is the real
+    /// limit. The core refuses a pin beyond a stated limit ([`Refusal::TooMany`]); a front-end
+    /// words the refusal with this number.
+    pub pin_limit: Option<u32>,
 }
 
-kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar, linked_at } redact { display_name, number });
+kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar, linked_at, hold, roaming_writes, pin_limit } redact { display_name, number });
 
 /// Who an account was, read before its row went: what a notice about its removal or unlink
 /// names it by (link feedback L4).
@@ -1079,8 +1470,11 @@ kourier_model::redacting_debug!(AccountLabel { network, own_device, linked_at, t
 pub struct ConversationListQuery {
     /// Only this account (`None` = all).
     pub account: Option<AccountId>,
-    /// Archived conversations instead of the inbox.
-    pub archived: bool,
+    /// Which view of the list: `Some(false)` the inbox (the default), `Some(true)` the archived
+    /// conversations instead, `None` both in one list order (the viewmodel reads the whole list
+    /// once and splits it by each row's flag, so a chat that moves between the two is in exactly
+    /// one of them in a snapshot; A1).
+    pub archived: Option<bool>,
     /// Page size.
     pub limit: u32,
     /// Continue after this row.
@@ -1091,7 +1485,7 @@ impl Default for ConversationListQuery {
     fn default() -> Self {
         Self {
             account: None,
-            archived: false,
+            archived: Some(false),
             limit: 200,
             after: None,
         }
@@ -1135,9 +1529,11 @@ pub struct ConversationRow {
     pub peer: Option<UserId>,
     /// Avatar file.
     pub avatar: Option<BlobRef>,
-    /// The newest visible message.
+    /// The newest LISTED message: a quiet notice (a safety number change, a refreshed session,
+    /// a changed number, an accepted request) only when the user asked to see them
+    /// ([`UiCommand::SetQuietNotices`]). Always `None` for a [`Self::protected`] chat.
     pub preview: Option<Preview>,
-    /// `sort_key` of the newest visible message (0 when empty).
+    /// `sort_key` of the newest LISTED message (0 when empty), the list's order.
     pub last_activity: i64,
     /// Unread messages: the conversation's unread rows, live and imported alike (a message
     /// of a history import that the other device had not read counts), plus the unread
@@ -1171,12 +1567,51 @@ pub struct ConversationRow {
     /// writes there. Only [`Query::Conversation`] returns such a row (a chat reached by id:
     /// from a contact, a link, a search).
     pub hidden: bool,
+    /// The user can send here: the conversation's features state no
+    /// [`kourier_model::CannotSend`] (not a member, admins only, blocked, a request pending,
+    /// ...). The share picker (P5c) lists only such chats; the outbox refuses the others.
+    pub can_send: bool,
+    /// What the chat offers of the settings its network keeps for the account's other devices
+    /// (archive, pin, mute, marked unread): the chat's OWN account's statement and whether the
+    /// network lists the chat ([`Roaming`]). In a list of several accounts one row can be
+    /// [`Roaming::Off`] and the next [`Roaming::On`]. A row is read again when its account's
+    /// statement changes (`ConversationsChanged` names the account's chats).
+    pub roaming: Roaming,
+    /// The user protects this chat on another device
+    /// ([`kourier_model::ConversationPatch::protected`]): its messages show nowhere outside the
+    /// open chat. The core gives such a row no [`Self::preview`]; a front-end shows a placeholder
+    /// in its place, no message text in a notification (the name and a count only), and a
+    /// search finds the chat by its title only. Its timeline reads as any other.
+    pub protected: bool,
+}
+
+/// What a chat offers of the settings its network keeps for the account's other devices
+/// ("roaming": archive, pin, mute, marked unread; architecture §8.3). Decided by the core from
+/// the chat's own account and the chat's own features, so a list that blends several accounts
+/// needs no rule of its own. The core refuses a change that is not [`Roaming::On`]
+/// ([`Refusal::NotAllowedHere`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Roaming {
+    /// The account's network states no such settings: the entries are not shown. Also the
+    /// state of every chat of an account whose stored caps this build cannot read; a click
+    /// there then fails (the core cannot read the account's statement) instead of being refused.
+    #[default]
+    Hidden,
+    /// The network can and the account's switch is off: the entries are shown disabled, with
+    /// the reason (how to turn the switch on).
+    Off,
+    /// The switch is on: the entries work.
+    On,
+    /// The account states the settings (the switch on or off) but the network does not list
+    /// THIS chat yet (a message request, a person known only by a number): the entries are not
+    /// shown until the network lists it.
+    NotListed,
 }
 
 kourier_model::redacting_debug!(ConversationRow {
     id, account, kind, is_self, peer, avatar, preview, last_activity, unread, mentions,
     marked_unread, muted_until, local_muted_until, archived, pinned_order, blocked,
-    request_pending, features_hash, has_draft, hidden
+    request_pending, features_hash, has_draft, hidden, can_send, roaming, protected
 } redact { title });
 
 impl ConversationRow {
@@ -1205,8 +1640,10 @@ pub struct Preview {
     pub text: Option<String>,
     /// Sent timestamp.
     pub sent_at: i64,
-    /// Deleted for everyone.
-    pub deleted: bool,
+    /// Deleted for everyone, and by whom when the network said (`None`: not deleted). The list
+    /// words it like the timeline's tombstone: a delete that names nobody
+    /// ([`Deletion::Unattributed`], KT-2) is not "You deleted this message".
+    pub deleted: Option<Deletion>,
     /// Own message state.
     pub out_state: Option<OutgoingState>,
     /// Kind of the first attachment of a `Media` or `Sticker` message (voice note, photo,
@@ -1244,6 +1681,374 @@ pub struct ConversationDetail {
     /// The composer draft (`UiCommand::SaveDraft`).
     pub draft: Option<Text>,
 }
+
+/// One person for their page (people pages P1; architecture §4.2). What the core keeps, not what
+/// the page shows: whether a number is shown, which name wins and how the groups are ordered is
+/// the front end's rule over these facts. `Debug` hides every name, text and number.
+#[derive(Clone)]
+pub struct PersonDetail {
+    /// The account.
+    pub account: AccountId,
+    /// The canonical id (an alias is resolved).
+    pub user: UserId,
+    /// One of the account's own ids: this is the user's own page.
+    pub is_self: bool,
+    /// The contact row; `None` when the core knows the id and nothing else.
+    pub contact: Option<Contact>,
+    /// The account's own profile name (`is_self` only; the contact row of the own id may lack it).
+    pub own_name: Option<String>,
+    /// The account's own number as the network shows it (`is_self` only).
+    pub own_number: Option<String>,
+    /// The 1:1 chat with them, when the core has one.
+    pub chat: Option<PersonChat>,
+    /// The groups both are full members of (never one we left or are only invited to), in the
+    /// order of their rows; archived ones included, deleted ones not.
+    pub groups: Vec<CommonGroup>,
+    /// The account's network has safety numbers (its descriptor's `safety_numbers`, P5a critic
+    /// F5): a page of another person offers "View Safety Number"; what the number is, or why
+    /// there is none, [`Query::SafetyNumber`] answers.
+    pub safety_numbers: bool,
+    /// Sends to this person wait for the user to confirm their changed safety number (the same
+    /// fact as [`QueryData::SafetyNumber`]'s `waits`, read from [`crate::runtime::Shared::paused`]
+    /// when the page is asked for; P5a U7): a person who was never verified still shows
+    /// "Safety number changed" under the row while that holds.
+    pub safety_waits: bool,
+    /// "Copy Link" (P5b): the link to this person, or why there is none. Filled by the runtime
+    /// from the network ([`kourier_backend_api::Network::contact_link`]) with a number only
+    /// when the page may show it.
+    pub link: LinkState,
+    /// "Share Contact…" (P5c): whether a card can be sent, or why not. Filled by the runtime
+    /// from the network's `contact_cards` ([`ShareState::of`]).
+    pub share: ShareState,
+}
+
+kourier_model::redacting_debug!(PersonDetail {
+    account, user, is_self, contact, chat, groups, safety_numbers, safety_waits, link, share
+} redact { own_name, own_number });
+
+impl PersonDetail {
+    /// THE NUMBER RULE of a person's page (P1; P5b's link and P5c's card): the number the page
+    /// may show, `+` first. The id itself when it is the number (it names them anyway);
+    /// otherwise the contact's phone identifier, and only when the network says the number is
+    /// shown (`number_shown == Some(true)`; `None`, never said, counts as not shown). Never the
+    /// user's own page's concern: callers handle `is_self` first.
+    pub fn shown_number(&self) -> Option<String> {
+        if self.user.is_phone_number() {
+            let v = self.user.value();
+            return Some(if v.starts_with('+') {
+                v.to_owned()
+            } else {
+                format!("+{v}")
+            });
+        }
+        let contact = self.contact.as_ref()?;
+        if contact.number_shown != Some(true) {
+            return None;
+        }
+        contact
+            .identifiers
+            .iter()
+            .find(|i| i.kind == kourier_model::IdentifierKind::Phone)
+            .map(|i| i.value.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Their own profile name as the network states it, trimmed; never the address-book name
+    /// or the user's nickname for them (his TASTE answer (4), the lead's SC1).
+    fn profile_name(&self) -> Option<&str> {
+        self.contact
+            .as_ref()
+            .and_then(|c| c.profile_name.as_deref())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    }
+
+    /// The contact card of this person (P5c, BQ-7, SC1, SC3): their PROFILE name and the ONE
+    /// number the page shows ([`Self::shown_number`]), nothing else (no picture, no other
+    /// field). `None` whenever [`ShareState::of`] is not `Ready` for a network that sends
+    /// cards. QML and the viewmodel never assemble a card: this is the one place.
+    pub fn contact_card(&self) -> Option<kourier_model::ContactCard> {
+        if ShareState::of(self, true) != ShareState::Ready {
+            return None;
+        }
+        let name = self.profile_name()?;
+        let number = self.shown_number()?;
+        Some(kourier_model::ContactCard {
+            name: Some(name.to_owned()),
+            identifiers: vec![kourier_model::Identifier {
+                kind: kourier_model::IdentifierKind::Phone,
+                value: number,
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+/// The largest profile name a card carries, in bytes: Kourier's own cap (architecture §13, the
+/// lead's SC3; no Signal client states one). A longer name gives no card.
+pub const MAX_CARD_NAME_BYTES: usize = 512;
+
+/// The "Share Contact…" of a person's page (P5c, architecture §4.2): whether the card can be
+/// sent, or why not. The number sentences are Copy Link's (call 1): a card carries only a
+/// number the page may show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareState {
+    /// The network sends no cards, or this is the user's own page (read-only, BQ-4): no
+    /// button.
+    #[default]
+    Hidden,
+    /// A card can be sent.
+    Ready,
+    /// The network states the number is not shown (as [`LinkState::NotShared`]).
+    NotShared,
+    /// No number the page may use (as [`LinkState::NoNumber`]).
+    NoNumber,
+    /// They have no profile name (SC1: never the address-book name or a nickname), or one
+    /// longer than [`MAX_CARD_NAME_BYTES`].
+    NoName,
+}
+
+impl ShareState {
+    /// The state of `detail`'s page on a network that sends cards (`cards`) or not.
+    pub fn of(detail: &PersonDetail, cards: bool) -> Self {
+        if !cards || detail.is_self {
+            return Self::Hidden;
+        }
+        // One number rule with the link (SD3): a shown number that is not E.164 (`+`, 7 to 15
+        // digits: what the receivers read as a number of their own region otherwise) is no
+        // number for the card, as `Network::contact_link` of Signal checks it for the link.
+        let Some(number) = detail.shown_number() else {
+            let not_shared = !detail.user.is_phone_number()
+                && detail.contact.as_ref().and_then(|c| c.number_shown) == Some(false);
+            return if not_shared {
+                Self::NotShared
+            } else {
+                Self::NoNumber
+            };
+        };
+        if !kourier_backend_api::is_e164(&number) {
+            return Self::NoNumber;
+        }
+        match detail.profile_name() {
+            Some(name) if name.len() <= MAX_CARD_NAME_BYTES => Self::Ready,
+            _ => Self::NoName,
+        }
+    }
+}
+
+/// The "Copy Link" of a person's page (P5b, architecture §4.2). The link holds a third
+/// party's phone number: it is made only from a number the page may show (`number_shown ==
+/// Some(true)`, or the id is the number), `Debug` hides it, and it never reaches a log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LinkState {
+    /// The network has no links to people, or this is the user's own page (read-only, BQ-4):
+    /// no button.
+    #[default]
+    Hidden,
+    /// The link (Signal: `https://signal.me/#p/<+E164>`).
+    Link(Redacted<String>),
+    /// The network states the number is not shown (`number_shown == Some(false)`: the person does
+    /// not share it, or Signal never fetched the profile and states `false` too, so the page's line
+    /// only says "not shown", Z1).
+    NotShared,
+    /// No number the page may use: never said (`number_shown == None`, a profile not fetched
+    /// yet: never "does not share", critic F20), shared but unknown, or not one a link takes.
+    NoNumber,
+}
+
+impl LinkState {
+    /// The state of `detail`'s page on a network with or without links. `link` makes the link
+    /// of a number that may be shown (the network's [`contact_link`]); it is called with no
+    /// other number.
+    ///
+    /// [`contact_link`]: kourier_backend_api::Network::contact_link
+    pub fn of(
+        detail: &PersonDetail,
+        links: bool,
+        link: impl FnOnce(&str) -> Option<String>,
+    ) -> Self {
+        if !links || detail.is_self {
+            return Self::Hidden;
+        }
+        // Known by the number alone: it names them anyway (the page shows it).
+        if !detail.user.is_phone_number()
+            && detail.contact.as_ref().and_then(|c| c.number_shown) == Some(false)
+        {
+            return Self::NotShared;
+        }
+        match detail.shown_number().as_deref().and_then(link) {
+            Some(l) => Self::Link(Redacted::new(l)),
+            None => Self::NoNumber,
+        }
+    }
+}
+
+/// The 1:1 chat of a [`PersonDetail`].
+#[derive(Clone, Debug)]
+pub struct PersonChat {
+    /// The chat.
+    pub id: ConversationId,
+    /// Disappearing timer.
+    pub timer: Option<Duration>,
+    /// Features (the timer options the page offers come from here).
+    pub features: ConversationFeatures,
+    /// Blocked in the chat's roaming state.
+    pub blocked: bool,
+    /// Deleted from the list (the state of a deleted chat: the row stays, nothing is shown). The
+    /// page offers no timer for it: a change would send a message and bring the chat back.
+    pub hidden: bool,
+}
+
+/// One group for its page (people pages P2; architecture §4.2). What the core keeps, not what the
+/// page shows: the order of the members, the counts, the texts and the rule lines are the front
+/// end's over these facts. `Debug` hides the name, the description and every member's name.
+#[derive(Clone)]
+pub struct GroupDetail {
+    /// The account the group belongs to.
+    pub account: AccountId,
+    /// The group's conversation.
+    pub id: ConversationId,
+    /// Its name (personal data); `None` when it has none.
+    pub title: Option<String>,
+    /// Its picture.
+    pub avatar: Option<BlobRef>,
+    /// Its description (personal data), whole as the network stated it.
+    pub description: Option<String>,
+    /// Disappearing timer.
+    pub timer: Option<Duration>,
+    /// Features: the rules (`group_info`), why we cannot send, the timer options.
+    pub features: ConversationFeatures,
+    /// Blocked in the chat's roaming state (`conversations.blocked`; no backend states
+    /// `CannotSend::Blocked`, so the page asks this fact for the links of the description).
+    pub blocked: bool,
+    /// Every member row, in no particular order: full members, admins, people invited and
+    /// people who asked to join. Our own row is among them while we are in the list.
+    pub members: Vec<GroupMember>,
+}
+
+kourier_model::redacting_debug!(GroupDetail {
+    account, id, avatar, timer, features, blocked, members
+} redact { title, description });
+
+/// Which attachments a gallery page lists ([`Query::ChatMedia`]). Voice notes and stickers are
+/// neither: a voice note is a message to listen to, a sticker is a picture the sender chose to
+/// say something with, not a file or a photo the chat shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    /// Pictures, videos and GIFs: the squares of "Media".
+    Visual,
+    /// Files and audio files: the rows of "Files" (a picture, GIF or video sent as a file is
+    /// a file: its kind is `File`).
+    Files,
+}
+
+/// Where a gallery page goes on: after this attachment, in the order of the gallery (newest
+/// message first, the attachments of one message in their order), or AT a message: a page that
+/// starts with that message's first attachment (what the picture viewer asks for, to read the
+/// whole album of the picture it shows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MediaCursor {
+    /// The message's `sort_key`.
+    pub sort_key: i64,
+    /// The message.
+    pub message: MessageId,
+    /// After the attachment at this place in its message (`Some`), or `None`: before all of the
+    /// message's attachments, so the page starts WITH the message's first one.
+    pub idx: Option<u32>,
+}
+
+/// [`Query::ChatMedia`]: a page of one chat's gallery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatMediaQuery {
+    /// The chat.
+    pub conv: ConversationId,
+    /// Which kind of attachment.
+    pub kind: MediaKind,
+    /// After this attachment (`None`: from the newest).
+    pub before: Option<MediaCursor>,
+    /// How many attachments at most (clamped to 1 ..= [`MAX_MEDIA_PAGE`]).
+    pub limit: u32,
+}
+
+/// The most attachments one gallery page holds.
+pub const MAX_MEDIA_PAGE: u32 = 1_000;
+
+/// One attachment of a chat's gallery. `Debug` shows no file name (the attachment redacts it).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChatMediaItem {
+    /// The message it belongs to.
+    pub message: MessageId,
+    /// That message's `sort_key` (with `message` and `idx`: the cursor).
+    pub sort_key: i64,
+    /// The attachment's place in its message.
+    pub idx: u32,
+    /// The attachment as the timeline shows one: id, kind, type, size, file name, dimensions,
+    /// duration, blurhash and download state; keys, files and network pointers are never here.
+    pub attachment: kourier_model::Attachment,
+    /// "Save As…" accepts it ([`crate::actions::may_save_file`]; the gallery lists only shown
+    /// messages, so the message half of the rule holds): the file is on this PC.
+    pub save: bool,
+}
+
+impl std::fmt::Debug for ChatMediaItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatMediaItem")
+            .field("message", &self.message)
+            .field("sort_key", &self.sort_key)
+            .field("idx", &self.idx)
+            .field("attachment", &self.attachment)
+            .field("save", &self.save)
+            .finish()
+    }
+}
+
+/// The answer to [`Query::ChatMedia`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatMediaPage {
+    /// The chat.
+    pub conv: ConversationId,
+    /// The kind asked for.
+    pub kind: MediaKind,
+    /// The attachments, newest message first.
+    pub items: Vec<ChatMediaItem>,
+    /// More of this kind lie after the last item.
+    pub more: bool,
+    /// The OTHER kind has at least one attachment in this chat (a section that has no pictures
+    /// still says there are files). Only asked for with the first page (`before` is `None`);
+    /// `false` on a later one.
+    pub other: bool,
+}
+
+/// A member of a [`GroupDetail`].
+#[derive(Clone)]
+pub struct GroupMember {
+    /// The member (as stored: the canonical id).
+    pub user: UserId,
+    /// Role: full member, admin, invited, asked to join.
+    pub role: MemberRole,
+    /// This is one of the account's own ids.
+    pub is_self: bool,
+    /// The core's name for them (nickname, address-book name, profile name); `None` without a
+    /// contact row or a name.
+    pub name: Option<String>,
+    /// Their picture.
+    pub avatar: Option<BlobRef>,
+}
+
+kourier_model::redacting_debug!(GroupMember { user, role, is_self, avatar } redact { name });
+
+/// A group two people share.
+#[derive(Clone, PartialEq)]
+pub struct CommonGroup {
+    /// The group's conversation.
+    pub id: ConversationId,
+    /// Its title (personal data).
+    pub title: Option<String>,
+    /// Its picture.
+    pub avatar: Option<BlobRef>,
+}
+
+kourier_model::redacting_debug!(CommonGroup { id, avatar } redact { title });
 
 /// A timeline page request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1440,6 +2245,13 @@ pub struct MessageActions {
     /// retry or whose send gave up on attempts without an answer: it may be with the server,
     /// so a delete for everyone of it is sent.
     pub take_back: bool,
+    /// "Cancel Sending" ([`UiCommand::CancelMessage`]) is accepted: `take_back` (nothing was
+    /// handed to the network yet, so the message is simply removed), or the message is in
+    /// flight and may be STOPPED: its attempt is the first, the backend reports an upload of
+    /// it, and no recipient has it ([`crate::actions::stoppable`]). The menu entry and the X
+    /// on a file's ring read it; `take_back` keeps its meaning ("Delete" alone is enough).
+    /// A delete command still refuses a message in flight.
+    pub cancel_sending: bool,
     /// The attachments of this row whose Download asks the account's other device (Signal: the
     /// phone) to upload them again: the very ones a click would ask for. The network lost the
     /// file ("Not available on this device", "No longer available", or an ask that ended
@@ -1450,9 +2262,54 @@ pub struct MessageActions {
     /// The note of each attachment says what is going on (`AttachmentState::Asking`,
     /// `AskFailed`).
     pub ask_attachments: Vec<AttachmentId>,
+    /// The attachments of this row that [`UiCommand::SaveAttachment`] accepts: the files that
+    /// are on this PC (`AttachmentState::Local`; one that is not here yet has Download, and
+    /// nothing is fetched for a save) of a message that is not deleted, not hidden because its
+    /// time has come on a clock nobody confirmed, and not view-once (a view-once message is
+    /// never saved, in any form). A message that disappears may be saved: the copy is the
+    /// user's own act and outlives the message. The rest of a long text is no file. A sticker
+    /// is one; a logged-out or paused account's files are the user's own and may be saved. One
+    /// function ([`crate::actions::save_attachments`]) answers the flag and the command.
+    pub save_attachments: Vec<AttachmentId>,
+    /// [`UiCommand::RetryMessage`] is accepted: the message's own send row is in the outbox
+    /// and not in flight, the network did not refuse it as a reach-out (WhatsApp's 463,
+    /// [`kourier_model::FailReason::ReachOutRefused`]: a second try is one more reach-out) and
+    /// the chat's features do not say we cannot send in it (it may have lost the right since
+    /// the message failed). The same function ([`crate::actions::retry`]) answers the flag and
+    /// the command. Whether "Send Again" is offered is the UI's own question on top of this:
+    /// only a message that shows as failed.
+    pub retry: bool,
+    /// "Show Sender's Page" is offered (people pages P3, the keyboard's and the screen reader's
+    /// way to what a click on the name or the picture opens): the message is another person's
+    /// and the chat is a group (a 1:1 chat has the one person it is with, the page of its
+    /// header). The UI opens `author` through the same path as the click.
+    pub show_sender: bool,
+    /// One "Show <name>'s Page" per DISTINCT person the message's text mentions, in the order of
+    /// their first mention; the user's own mention (any of his ids) is one entry with `own`
+    /// ("Show Your Page"). Left out: a message deleted, a mention that does not stand on its own
+    /// placeholder (an invalid range), and a mention under a spoiler (the spoiler hides who it
+    /// is; the core cannot know whether the user revealed it, so it never states one: a click on
+    /// the revealed mention still opens it).
+    pub show_people: Vec<ShownPerson>,
+    /// "Show <name>'s Safety Number" is offered (P5a BQ-3, U4): this is an own message of a
+    /// queue that waits for the user to confirm this person's changed safety number (the
+    /// dispatcher's identity pause, `UntrustedIdentity`): the paused head AND every row behind
+    /// it that still waits. The UI opens that person's safety-number page, which offers
+    /// "Confirm New Safety Number"; the line under these messages names the person. `None` on
+    /// every other row.
+    pub safety_number: Option<UserId>,
     /// When the first time-limited flag turns false (core clock, ms); `None`: no flag here
     /// depends on time.
     pub until: Option<i64>,
+}
+
+/// One person a message's menu offers a page of ([`MessageActions::show_people`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShownPerson {
+    /// Who (the id the message names; for the user's own mention, the one it named).
+    pub user: UserId,
+    /// The user himself: the entry says "Show Your Page" and opens his own page.
+    pub own: bool,
 }
 
 impl MessageRow {
@@ -1530,6 +2387,8 @@ pub struct CoreHandle {
     pub(crate) commands: mpsc::UnboundedSender<Internal>,
     pub(crate) events: broadcast::Sender<UiEvent>,
     pub(crate) media: MediaHandles,
+    /// The `MarkRead`s sent and not finished ([`Self::reads_in_flight`]); shared with the core.
+    pub(crate) reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for CoreHandle {
@@ -1554,9 +2413,25 @@ pub(crate) enum Internal {
 impl CoreHandle {
     /// Sends a command without blocking. Fails only when the core has stopped.
     pub fn send(&self, cmd: UiCommand) -> Result<()> {
-        self.commands
-            .send(Internal::Ui(cmd))
-            .map_err(|_| CoreError::Stopped)
+        use std::sync::atomic::Ordering;
+        // Counted before it leaves: the core's task counts it down once its events are sent.
+        let read = matches!(cmd, UiCommand::MarkRead { .. });
+        if read {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+        let sent = self.commands.send(Internal::Ui(cmd));
+        if sent.is_err() && read {
+            self.reads.fetch_sub(1, Ordering::SeqCst);
+        }
+        sent.map_err(|_| CoreError::Stopped)
+    }
+
+    /// How many `UiCommand::MarkRead`s were sent and are not finished: from the send until
+    /// the core has emitted what the reading changed (or found nothing to change, or failed).
+    /// After that the events are counted by [`Self::events_unseen`], so a screenshot that
+    /// waits for both never sees a chat between "read asked for" and "read shown".
+    pub fn reads_in_flight(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Subscribes to [`UiEvent`]s (from now on).

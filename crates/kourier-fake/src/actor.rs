@@ -2,33 +2,43 @@
 //! `backend.db` with `core_outbox`, stage 1 (inbox) and stage 2 (events) transactions, and the
 //! `kourier-db` forwarder (§5.6, §6.3) — the durability shape of a real backend.
 
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kourier_backend_api::{
-    AccountContext, BackendEvent, Clock, Command, DurableCommand, Envelope, Exit, OutgoingRequest,
-    Relink, StartMode, TransmitOutcome, decode_outbox_row, encode_outbox_row,
+    AbortAnswer, AccountContext, AssignedId, BackendEvent, Clock, Command, DurableCommand,
+    Envelope, Exit, OutgoingRequest, Relink, StartMode, TransmitOutcome, decode_outbox_row,
+    encode_outbox_row,
 };
 use kourier_db::rusqlite::OptionalExtension;
 use kourier_db::{
     Batch, Forwarder, ForwarderConfig, Migrations, Refusal, ZoneDb, failpoint, migration, outbox,
 };
 use kourier_model::{
-    AccountProgress, AccountUuid, BackendError, ConnState, ConvKey, ConversationChange,
-    ConversationPatch, DeviceLogout, ErrorKind, HistoryTransfer, HistoryTransferFailure,
-    InputField, InputKind, LocalMsgId, LoginStep, LoginStepKind, LogoutReport, Member, OwnDevice,
-    Patch, RecipientState, Redacted, UserId,
+    AccountCaps, AccountProgress, AccountUuid, BackendError, ConnState, ConvKey,
+    ConversationChange, ConversationPatch, DeviceLogout, ErrorKind, HistoryTransfer,
+    HistoryTransferFailure, InputField, InputKind, LocalMsgId, LoginStep, LoginStepKind,
+    LogoutReport, Member, NetworkKind, OwnDevice, Patch, RecipientState, Redacted, UserId,
 };
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::conformance;
 use crate::flavor::Flavor;
-use crate::network::{FakeControl, TransmitRecord};
-use crate::script::{LoginScript, Script, Step, TransferScript};
+use crate::network::{AbortRecord, FakeControl, TransmitRecord};
+use crate::rehearsal::{Injection, KnownChat, chats_of};
+use crate::script::{
+    FAKE_EMOJI, LoginScript, PIN_LIMIT, PairCodeScript, Script, Step, TransferScript,
+};
+use crate::upload;
+
+mod cue;
+mod phone;
 
 /// The fake's `backend.db` schema component.
 pub const MIGRATIONS: Migrations = Migrations::new(
@@ -37,6 +47,7 @@ pub const MIGRATIONS: Migrations = Migrations::new(
         migration!(1, "0001_fake"),
         migration!(2, "0002_fake_transmit"),
         migration!(3, "0003_fake_job_payload"),
+        migration!(4, "0004_fake_transmit_conv"),
     ],
 );
 
@@ -56,6 +67,9 @@ pub const FAILPOINT_AFTER_SERVER_ACCEPT: &str = "after_server_accept";
 pub struct ServerDelivery {
     /// The network-local id of the message.
     pub local: String,
+    /// The string form of the conversation the copy was sent in (`ConvKey::encode`); empty for
+    /// a copy an earlier build of the fake logged.
+    pub conv: String,
     /// Its `sent_at`.
     pub sent_at: i64,
     /// Who got it.
@@ -72,19 +86,23 @@ pub fn server_log(
     key: &kourier_db::DbKey,
 ) -> Result<Vec<ServerDelivery>, BackendError> {
     let conn = kourier_db::open_read_only(path, key).map_err(internal)?;
-    let rows: Vec<(String, i64, String, bool)> = conn
+    let rows: Vec<(String, String, i64, String, bool)> = conn
         .prepare(
-            "SELECT local, sent_at, recipient, recipient_update FROM fake_transmits ORDER BY id",
+            "SELECT local, conv, sent_at, recipient, recipient_update FROM fake_transmits
+             ORDER BY id",
         )
         .and_then(|mut s| {
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                .collect::<kourier_db::rusqlite::Result<Vec<_>>>()
+            s.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<kourier_db::rusqlite::Result<Vec<_>>>()
         })
         .map_err(internal)?;
     rows.into_iter()
-        .map(|(local, sent_at, recipient, recipient_update)| {
+        .map(|(local, conv, sent_at, recipient, recipient_update)| {
             Ok(ServerDelivery {
                 local,
+                conv,
                 sent_at,
                 recipient: UserId::parse(&recipient).map_err(internal)?,
                 recipient_update,
@@ -132,14 +150,31 @@ pub fn job_log(path: &Path, key: &kourier_db::DbKey) -> Result<Vec<Job>, Backend
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What the fake server did with the copies of a request (T2 F8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Copies {
+    /// At least one recipient got a new copy.
+    New,
+    /// Every recipient already held this id: a repeat the server drops (the resend after a kill, with its id).
+    Repeat,
+    /// Nothing was taken (a refusal, or no recipient).
+    Nothing,
+}
+
 enum Stop {
     Now(Exit),
     Drain(Exit),
 }
 
 enum LoginCmd {
-    Start(Option<Relink>),
-    Input(u64),
+    /// `StartLogin`: the flow id the core asked for and the relink, if it is one.
+    Start {
+        flow: String,
+        relink: Option<Relink>,
+    },
+    /// `SubmitLoginInput`: the step's `txn` and the typed values (also recorded for the test). A
+    /// scripted flow that looks at what was typed (the `phone` flow) reads them here.
+    Input(u64, Vec<(String, Redacted<String>)>),
     Cancel,
 }
 
@@ -155,6 +190,9 @@ type Downloaded = (
 
 /// The downloads in flight.
 type Downloads = tokio::task::JoinSet<Downloaded>;
+
+/// The upload phases in flight ([`upload`]).
+type Uploads = tokio::task::JoinSet<upload::Finished>;
 
 fn internal(e: impl std::fmt::Display) -> BackendError {
     BackendError::internal(format!("fake backend: {e}"))
@@ -181,6 +219,7 @@ pub(crate) fn run(
     pushed: bool,
     control: Arc<FakeControl>,
     flavor: Flavor,
+    kind: NetworkKind,
 ) -> Exit {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -191,7 +230,7 @@ pub(crate) fn run(
     };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        match Actor::open(ctx, script, pushed, control, flavor) {
+        match Actor::open(ctx, script, pushed, control, flavor, kind) {
             Ok((actor, commands)) => actor.run(commands).await,
             Err(e) => Exit::Failed(e),
         }
@@ -210,6 +249,9 @@ struct Actor {
     uuid: AccountUuid,
     start: StartMode,
     flavor: Flavor,
+    /// The network this fake plays (`NetworkKind::Fake` for none): a fake that plays Threema
+    /// shows the emoji step after the scan of a QR login.
+    kind: NetworkKind,
     /// A link is in progress and the core has not acked `AccountReady` yet: the conformance
     /// check applies the linking rule (§4.3).
     linking: Cell<bool>,
@@ -226,6 +268,17 @@ struct Actor {
     /// A history transfer is being walked ([`Actor::walk_transfer`]); otherwise a stored
     /// state that is not over just stands ([`Step::Transfer`]).
     walking: Cell<bool>,
+    /// The messages in their upload phase ([`Script::uploads`]): what an abort asks.
+    holds: RefCell<HashMap<LocalMsgId, Rc<upload::Hold>>>,
+    /// The tail of the number the link must find (`BackendConfig::expect_number_suffix`), honoured
+    /// only by a script that says so ([`Script::honour_number_tail`]).
+    number_tail: Option<Redacted<String>>,
+    /// The chats the script has delivered so far, with the member who writes into each: what
+    /// [`FakeControl::arrive`] picks from.
+    known: Arc<Mutex<Vec<KnownChat>>>,
+    /// The account's `AccountCaps` have been stated (by the script or by [`Actor::with_roaming_statement`]):
+    /// until then the next delivery carries the fake's statement of the roaming settings.
+    caps_stated: Cell<bool>,
 }
 
 impl Actor {
@@ -235,6 +288,7 @@ impl Actor {
         pushed: bool,
         control: Arc<FakeControl>,
         flavor: Flavor,
+        kind: NetworkKind,
     ) -> Result<(Self, mpsc::Receiver<Command>), BackendError> {
         if let Some(dir) = ctx.backend_db.parent() {
             std::fs::create_dir_all(dir).map_err(internal)?;
@@ -268,28 +322,49 @@ impl Actor {
             uuid: ctx.uuid,
             start: ctx.start,
             flavor,
+            kind,
             linking: Cell::new(ctx.start == StartMode::Fresh && !linked),
             blob_dir: ctx.blob_dir,
             pushed,
             skip_pending: Cell::new(false),
             skip: Notify::new(),
             walking: Cell::new(false),
+            holds: RefCell::new(HashMap::new()),
+            number_tail: ctx.config.expect_number_suffix,
+            known: Arc::new(Mutex::new(Vec::new())),
+            caps_stated: Cell::new(false),
         };
+        // A resumed account has stated them in an earlier run (they are in its mirror).
+        actor.caps_stated.set(actor.stated_caps()?.is_some());
         Ok((actor, ctx.commands))
     }
 
     async fn run(self, commands: mpsc::Receiver<Command>) -> Exit {
         tracing::debug!(uuid = %self.uuid.short(), flavor = ?self.flavor, script = %self.script.name, "fake actor running");
+        // The run tool's rehearsal plays WhatsApp: say what the real backend says when the one-start
+        // call switch is on, so the tool's proof of that switch is walked in the rehearsal too.
+        if self.plays_the_rehearsal() {
+            crate::rehearsal::say_call_builtin();
+        }
         if self.start == StartMode::Rebuild
             && let Err(e) = self.rebuild()
         {
             return Exit::Failed(e);
         }
         let (login_tx, login_rx) = mpsc::unbounded_channel();
+        // The door of a live account: `FakeControl::arrive` hands an arrival to this actor.
+        let (door_tx, door_rx) = mpsc::unbounded_channel();
+        let _door = match self.refresh_known() {
+            Ok(()) => self
+                .control
+                .open_door(self.uuid, door_tx, self.known.clone()),
+            Err(e) => return Exit::Failed(e),
+        };
         let stop = tokio::select! {
             s = self.forwarder() => s,
             s = self.runner(login_rx) => s,
             s = self.commands(commands, login_tx) => s,
+            s = self.arrivals(door_rx) => s,
         };
         match stop {
             Stop::Now(exit) => exit,
@@ -358,6 +433,55 @@ impl Actor {
         Ok(())
     }
 
+    /// Keeps the account's pin list: the pins `events` state, as `pin:<conversation>` keys
+    /// whose value is the place in the list (a `PinnedConversations` list replaces them all,
+    /// a patch with a `pinned_order` sets or clears one). It is what the network has told the core,
+    /// so [`pinned`](Self::pinned) is the list the core shows.
+    fn note_pins(tx: &kourier_db::Tx<'_>, events: &[BackendEvent]) -> kourier_db::Result<()> {
+        for e in events {
+            match e {
+                BackendEvent::ConversationUpsert(p) => match p.pinned_order {
+                    Patch::Set(place) => Self::set_in(tx, &pin_key(&p.key), i64::from(place))?,
+                    Patch::Clear => {
+                        tx.execute("DELETE FROM fake_state WHERE key = ?1", [pin_key(&p.key)])?;
+                    }
+                    Patch::Unchanged => {}
+                },
+                BackendEvent::PinnedConversations(keys) => {
+                    // (`PIN_PREFIX`)
+                    tx.execute("DELETE FROM fake_state WHERE key LIKE 'pin:%'", [])?;
+                    for (place, key) in keys.iter().enumerate() {
+                        let place = i64::try_from(place).unwrap_or(i64::MAX);
+                        Self::set_in(tx, &pin_key(key), place)?;
+                    }
+                }
+                BackendEvent::ConversationRemoved { conv } => {
+                    tx.execute("DELETE FROM fake_state WHERE key = ?1", [pin_key(conv)])?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The account's pinned chats in the order the network lists them.
+    fn pinned(&self) -> Result<Vec<ConvKey>, BackendError> {
+        let keys: Vec<String> = self
+            .db
+            .read(|c| -> kourier_db::Result<Vec<String>> {
+                // (`PIN_PREFIX`)
+                let mut stmt = c.prepare(
+                    "SELECT key FROM fake_state WHERE key LIKE 'pin:%' ORDER BY value, key",
+                )?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<kourier_db::rusqlite::Result<_>>()?)
+            })
+            .map_err(internal)?;
+        keys.iter()
+            .map(|k| ConvKey::parse(&k[PIN_PREFIX.len()..]).map_err(internal))
+            .collect()
+    }
+
     fn advance(&self, cursor: usize) -> Result<(), BackendError> {
         let next = i64::try_from(cursor + 1).unwrap_or(i64::MAX);
         self.db
@@ -377,13 +501,27 @@ impl Actor {
         command: DurableCommand,
         keep: bool,
     ) -> Result<(), BackendError> {
+        self.persist_command_with(cmd, kind, command, keep, Vec::new())
+    }
+
+    /// [`persist_command`](Self::persist_command) for a command whose effect the network states
+    /// with it: `effects` are committed in the same transaction, ahead of `CommandPersisted`.
+    fn persist_command_with(
+        &self,
+        cmd: kourier_model::CmdId,
+        kind: &str,
+        command: DurableCommand,
+        keep: bool,
+        mut effects: Vec<BackendEvent>,
+    ) -> Result<(), BackendError> {
         let payload = keep
             .then(|| serde_json::to_string(&command))
             .transpose()
             .map_err(internal)?;
         let now = self.now();
         let mut added = false;
-        self.commit_events(&[BackendEvent::CommandPersisted { cmd }], |tx| {
+        effects.push(BackendEvent::CommandPersisted { cmd });
+        self.commit_events(&effects, |tx| {
             added = tx.execute(
                 "INSERT OR IGNORE INTO jobs(cmd, kind, created_at, payload)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -486,6 +624,7 @@ impl Actor {
             .zone(|tx| -> kourier_db::Result<()> {
                 extra(tx)?;
                 Self::note_timer_versions(tx, events)?;
+                Self::note_pins(tx, events)?;
                 tx.outbox_append(&row, now)?;
                 for m in &mirrored {
                     tx.execute("INSERT INTO mirror(event) VALUES (?1)", [m])?;
@@ -655,7 +794,7 @@ impl Actor {
     /// One transmit attempt against the fake server: scripted rules decide failures (their
     /// counts are durable); accepted copies go to `fake_transmits`, which is also the send
     /// progress, so recipients that have the message are never sent it again.
-    fn transmit(&self, req: &OutgoingRequest) -> Result<TransmitOutcome, BackendError> {
+    fn transmit(&self, req: &OutgoingRequest) -> Result<(TransmitOutcome, Copies), BackendError> {
         // Like a real backend before its upload: every attachment's blob must read back whole.
         if let kourier_backend_api::OutgoingKind::Message {
             body: kourier_model::Body::Media { attachments, .. },
@@ -664,13 +803,13 @@ impl Actor {
         {
             for a in attachments {
                 if let Err(e) = crate::attachments::read_outgoing(&self.blob_dir, a) {
-                    return Ok(TransmitOutcome::Failed(e));
+                    return Ok((TransmitOutcome::Failed(e), Copies::Nothing));
                 }
             }
         }
         // Like a real backend, an edit, delete or reaction is checked before it is sent.
         if let Some(e) = invalid_change(&req.kind) {
-            return Ok(TransmitOutcome::Failed(e));
+            return Ok((TransmitOutcome::Failed(e), Copies::Nothing));
         }
         let recipients = match (&req.only, &req.kind) {
             (Some(only), _) => only.clone(),
@@ -686,9 +825,15 @@ impl Actor {
         };
         let rules = &self.script.transmit;
         let now = self.now();
+        // A Telegram-like server names the message and tells the account so (KT-2).
+        let assigned = self.assigned(req);
+        let echo = assigned
+            .as_ref()
+            .map(|a| self.echo_row(req, a, now))
+            .transpose()?;
         let outcome = self
             .db
-            .zone(|tx| -> kourier_db::Result<TransmitOutcome> {
+            .zone(|tx| -> kourier_db::Result<(TransmitOutcome, Copies)> {
                 let used = |tx: &kourier_db::Tx<'_>, i: usize| -> kourier_db::Result<u32> {
                     let v: Option<i64> = tx
                         .query_row(
@@ -725,14 +870,21 @@ impl Actor {
                     if r.member.is_none() && applies(r) && used(tx, i)? < r.times {
                         Self::set_in(tx, &format!("transmit-rule:{i}"), i64::from(used(tx, i)? + 1))?;
                         issue(tx, &r.error)?;
-                        return Ok(TransmitOutcome::Failed(r.error.clone()));
+                        return Ok((TransmitOutcome::Failed(r.error.clone()), Copies::Nothing));
                     }
                 }
                 let (mut delivered, mut failed) = (Vec::new(), Vec::new());
+                let (mut inserted, mut held_already) = (0usize, 0usize);
+                // The server's key of a copy is `(local, recipient, conversation)`: ids of a
+                // network with per-conversation ids may repeat in another chat of one
+                // person, and that copy is a new message (a row of an older build, with no
+                // conversation, counts for any chat).
+                let conv = req.conv.encode();
                 'recipients: for u in recipients {
                     let have: i64 = tx.query_row(
-                        "SELECT count(*) FROM fake_transmits WHERE local = ?1 AND recipient = ?2",
-                        (req.local.as_ref(), u.as_str()),
+                        "SELECT count(*) FROM fake_transmits
+                         WHERE local = ?1 AND recipient = ?2 AND conv IN (?3, '')",
+                        (req.local.as_ref(), u.as_str(), conv.as_str()),
                         |r| r.get(0),
                     )?;
                     if have == 0 {
@@ -745,25 +897,113 @@ impl Actor {
                             }
                         }
                         tx.execute(
-                            "INSERT INTO fake_transmits(local, sent_at, recipient, recipient_update, at)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            (req.local.as_ref(), req.sent_at, u.as_str(), req.is_recipient_update, now),
+                            "INSERT INTO fake_transmits(local, sent_at, recipient, recipient_update, at, conv)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            (
+                                req.local.as_ref(),
+                                req.sent_at,
+                                u.as_str(),
+                                req.is_recipient_update,
+                                now,
+                                conv.as_str(),
+                            ),
                         )?;
+                        inserted += 1;
+                    } else {
+                        held_already += 1;
                     }
                     delivered.push((u, RecipientState::Sent { sealed: true }));
                 }
-                Ok(if failed.is_empty() {
-                    TransmitOutcome::Sent {
+                let copies = if inserted > 0 {
+                    Copies::New
+                } else if held_already > 0 {
+                    Copies::Repeat
+                } else {
+                    Copies::Nothing
+                };
+                let outcome = if !failed.is_empty() {
+                    TransmitOutcome::Partial { delivered, failed }
+                } else if let Some(assigned) = &assigned {
+                    if let Some(row) = &echo
+                        && Self::first_echo(tx, req)?
+                    {
+                        tx.outbox_append(row, now)?;
+                    }
+                    TransmitOutcome::SentAs {
+                        assigned: assigned.clone(),
                         server_at: Some(now),
                         per_recipient: delivered,
                     }
                 } else {
-                    TransmitOutcome::Partial { delivered, failed }
-                })
+                    TransmitOutcome::Sent {
+                        server_at: Some(now),
+                        per_recipient: delivered,
+                    }
+                };
+                Ok((outcome, copies))
             })
             .map_err(internal)?;
         failpoint::hit(FAILPOINT_AFTER_SERVER_ACCEPT);
         Ok(outcome)
+    }
+
+    /// What the server of a Telegram-like account calls a new message (KT-2): its `sent_at` in
+    /// decimal, which is also its position. DERIVED from the request, so a resend under the
+    /// allocated id gets the same answer without the fake keeping a map, and strictly rising per
+    /// account because the core allocates its `sent_at` so (`outbox::allocate`). `None` for a
+    /// flavour whose server names nothing and for a request that is no message: an edit, a delete
+    /// and a reaction name a message that has its id, under the allocated or the assigned one (the
+    /// fake looks at neither) and are answered `Sent`.
+    fn assigned(&self, req: &OutgoingRequest) -> Option<AssignedId> {
+        (self.flavor == Flavor::TelegramLike
+            && matches!(req.kind, kourier_backend_api::OutgoingKind::Message { .. }))
+        .then(|| AssignedId {
+            local: req.sent_at.to_string().into(),
+            seq: req.sent_at,
+        })
+    }
+
+    /// The echo of an accepted message, as the `core_outbox` row it is committed in: what a
+    /// Telegram-like server tells the sender's account of the message it just took, one own row
+    /// under the assigned id with its position, the request's content and the id it was allocated
+    /// under (unless the script's echo knows no binding), and the `server_at` of the answer, so the
+    /// order the two arrive in changes nothing.
+    fn echo_row(
+        &self,
+        req: &OutgoingRequest,
+        assigned: &AssignedId,
+        server_at: i64,
+    ) -> Result<Vec<u8>, BackendError> {
+        let kourier_backend_api::OutgoingKind::Message { body, reply_to, .. } = &req.kind else {
+            return Err(internal("an echo of something that is no message"));
+        };
+        let mut echo = kourier_backend_api::IncomingMessage::new(
+            req.conv.clone(),
+            assigned.local.clone(),
+            kourier_model::Origin::OwnThisDevice,
+            body.clone(),
+            req.sent_at,
+            server_at,
+        );
+        echo.reply_to.clone_from(reply_to);
+        echo.server_at = Some(server_at);
+        echo.net_seq = Some(assigned.seq);
+        echo.allocated_as = (!self.script.echo_without_binding).then(|| req.local.clone());
+        encode_outbox_row(&[BackendEvent::Message(echo)]).map_err(internal)
+    }
+
+    /// Whether this is the first time the server takes `req`'s message: the echo is committed ONCE
+    /// per `(conversation, local)`, in the transaction of the accept like any backend's effects
+    /// (§4.1 principle 6). A resend, a follow-up to more recipients and the retry of a partial send
+    /// tell the core nothing more; a durable mark in `fake_state` holds that, as it holds the
+    /// counts of the transmit rules, and a chat with nobody else in it, which has no copy to
+    /// remember, still gets exactly one.
+    fn first_echo(tx: &kourier_db::Tx<'_>, req: &OutgoingRequest) -> kourier_db::Result<bool> {
+        let mark = format!("echo:{}:{}", req.conv.encode(), req.local);
+        Ok(tx.execute(
+            "INSERT OR IGNORE INTO fake_state(key, value) VALUES (?1, 1)",
+            [mark],
+        )? > 0)
     }
 
     fn record_transmit(
@@ -808,11 +1048,149 @@ impl Actor {
         login: mpsc::UnboundedSender<LoginCmd>,
     ) -> Stop {
         let mut downloads = Downloads::new();
-        let stop = self.serve(rx, login, &mut downloads).await;
+        // The upload phases end with the actor (their `Transmit` replies are dropped, as a
+        // backend that goes away drops them).
+        let mut uploads = Uploads::new();
+        let stop = self.serve(rx, login, &mut downloads, &mut uploads).await;
         // A file that is being written is finished before the actor goes: its target may
         // be asked for again by the next actor, and its directory may be removed.
         while downloads.join_next().await.is_some() {}
         stop
+    }
+
+    /// The fake server has taken (or refused) the request: records it and gives the core the
+    /// outcome, at once or, in a conversation with a late reply or a slow send, after the delay
+    /// (the server has the request, the core hears later).
+    ///
+    /// A message the server named (`SentAs`) has its echo committed with the accept
+    /// ([`Self::echo_row`]). By default the core has the echo, acked, BEFORE it hears the outcome
+    /// ("echo first"); a script that holds the forwarder back ([`Script::forward_delay`]) gets the
+    /// other order, the outcome at once and the echo behind it.
+    async fn answer(
+        &self,
+        local: LocalMsgId,
+        req: Box<OutgoingRequest>,
+        (outcome, copies): (TransmitOutcome, Copies),
+        reply: tokio::sync::oneshot::Sender<TransmitOutcome>,
+    ) -> Result<(), BackendError> {
+        if matches!(outcome, TransmitOutcome::SentAs { .. }) {
+            self.wake.notify_one();
+            if self.script.forward_delay.is_none() {
+                self.wait_acked().await?;
+            }
+        }
+        let delay = self
+            .script
+            .reply_delays
+            .iter()
+            .find(|(c, _)| *c == req.conv)
+            .map(|(_, d)| *d)
+            .or(self.script.slow_sends.map(|(_, d)| d));
+        // A slow send reports its phase now and again every second while it
+        // lasts, as a real backend does (the first report can come before the
+        // UI has the row).
+        let phase = self
+            .script
+            .slow_sends
+            .and_then(|(p, _)| p)
+            .filter(|_| delay.is_some())
+            .map(|p| BackendEvent::TransmitProgress {
+                local,
+                progress: 0.0,
+                phase: Some(p),
+            });
+        if let Some(e) = &phase {
+            self.send_ephemeral(e.clone()).await;
+        }
+        let late = delay.map(|d| self.clock.sleep(d));
+        // The run tool's rehearsal counts the two lines the real backend says at its write point (T2 F1).
+        let counted = self.plays_the_rehearsal();
+        let (outcome_word, outcome_code, outcome_again) =
+            crate::rehearsal::answered_words(&outcome);
+        if counted {
+            crate::rehearsal::say_frame_written(crate::rehearsal::frame_word(&req.kind));
+            if copies == Copies::Repeat {
+                crate::rehearsal::say_repeat_dropped();
+            }
+        }
+        // T2 F8: the rehearsal's resend text is taken by the server and its ack is held back for good, so the run tool
+        // kills the app before the ack and the next start's resend (the same id) is real.
+        let held =
+            counted && copies == Copies::New && crate::rehearsal::holds_the_ack_of(&req.kind);
+        self.record_transmit(local, *req, &outcome);
+        if held {
+            tokio::spawn(async move {
+                let _the_core_waits = reply;
+                std::future::pending::<()>().await;
+            });
+            return Ok(());
+        }
+        match late {
+            // A late answer: the server has the request, the core hears later.
+            Some(sleep) => {
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let again = async {
+                        let Some(e) = phase else {
+                            return std::future::pending().await;
+                        };
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let _ = events.send(Envelope::ephemeral(e.clone())).await;
+                        }
+                    };
+                    tokio::select! {
+                        () = sleep => {}
+                        () = again => {}
+                    }
+                    if counted {
+                        crate::rehearsal::say_frame_answered(
+                            outcome_word,
+                            outcome_code,
+                            &outcome_again,
+                        );
+                    }
+                    let _ = reply.send(outcome);
+                });
+            }
+            None => {
+                if counted {
+                    crate::rehearsal::say_frame_answered(
+                        outcome_word,
+                        outcome_code,
+                        &outcome_again,
+                    );
+                }
+                let _ = reply.send(outcome);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this fake plays WhatsApp for the run tool's rehearsal (the script honours the number tail and the
+    /// network is not Telegram): only then it says the two count lines of the real backend's write point.
+    fn plays_the_rehearsal(&self) -> bool {
+        self.script.honour_number_tail && self.kind != kourier_model::NetworkKind::Telegram
+    }
+
+    /// A message's upload phase ended: the fake server takes it (and the transmit is
+    /// recorded), or, when an abort stopped the phase, nothing reaches the server and the
+    /// attempt fails.
+    async fn finish_upload(
+        &self,
+        (local, req, reply, ended): upload::Finished,
+    ) -> Result<(), BackendError> {
+        self.holds.borrow_mut().remove(&local);
+        match ended {
+            upload::Ended::Stopped => {
+                let _ = reply.send(TransmitOutcome::Failed(upload::stopped()));
+            }
+            upload::Ended::Over => {
+                let outcome = self.transmit(&req)?;
+                self.answer(local, req, outcome, reply).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Commits the answers of finished downloads, as many as are ready, in one transaction.
@@ -861,6 +1239,7 @@ impl Actor {
         mut rx: mpsc::Receiver<Command>,
         login: mpsc::UnboundedSender<LoginCmd>,
         downloads: &mut Downloads,
+        uploads: &mut Uploads,
     ) -> Stop {
         loop {
             // Downloads run beside the command loop, a few at a time, like a real backend's:
@@ -880,6 +1259,13 @@ impl Actor {
                     })
                     .await;
                     if let Err(e) = self.finish_downloads(done, downloads) {
+                        return Stop::Now(Exit::Failed(e));
+                    }
+                    continue;
+                }
+                Some(done) = uploads.join_next(), if !uploads.is_empty() => {
+                    let Ok(done) = done else { continue };
+                    if let Err(e) = self.finish_upload(done).await {
                         return Stop::Now(Exit::Failed(e));
                     }
                     continue;
@@ -937,73 +1323,84 @@ impl Actor {
                 Command::NetworkChanged
                 | Command::Resumed
                 | Command::SetTyping { .. }
-                | Command::ConfirmIdentity { .. }
                 | Command::RefreshContact { .. }
                 | Command::FetchHistory { .. } => {}
-                Command::StartLogin { relink, .. } => {
-                    let _ = login.send(LoginCmd::Start(relink));
+                Command::StartLogin {
+                    flow,
+                    relink,
+                    taken,
+                } => {
+                    // The line the real login prints, for a script that honours the number tail
+                    // (the rehearsals'): the run tool says "scan now" only after it has read this
+                    // token (L2); `phone.rs` has the words.
+                    self.log_login_start();
+                    self.control.login(self.uuid, flow.clone(), taken);
+                    let _ = login.send(LoginCmd::Start { flow, relink });
                 }
-                Command::SubmitLoginInput { txn, .. } => {
-                    let _ = login.send(LoginCmd::Input(txn));
+                Command::SubmitLoginInput { txn, values } => {
+                    self.control.login_input(
+                        self.uuid,
+                        values
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.expose().clone()))
+                            .collect(),
+                    );
+                    let _ = login.send(LoginCmd::Input(txn, values));
                 }
                 Command::CancelLogin => {
                     let _ = login.send(LoginCmd::Cancel);
                 }
                 Command::Transmit { local, req, reply } => {
+                    // A message with files in a conversation whose script has an upload phase
+                    // is registered NOW (an abort right behind it must find it); the server
+                    // takes it when the phase is over.
+                    if let Some((files, script)) = upload::plan(&self.script.uploads, &req) {
+                        let hold = upload::Hold::new(&script);
+                        self.holds.borrow_mut().insert(local, hold.clone());
+                        uploads.spawn_local(upload::run(
+                            self.events.clone(),
+                            self.clock.clone(),
+                            local,
+                            files,
+                            script,
+                            hold,
+                            req,
+                            reply,
+                        ));
+                        continue;
+                    }
                     let outcome = match self.transmit(&req) {
                         Ok(o) => o,
                         Err(e) => return Stop::Now(Exit::Failed(e)),
                     };
-                    let delay = self
-                        .script
-                        .reply_delays
-                        .iter()
-                        .find(|(c, _)| *c == req.conv)
-                        .map(|(_, d)| *d)
-                        .or(self.script.slow_sends.map(|(_, d)| d));
-                    // A slow send reports its phase now and again every second while it
-                    // lasts, as a real backend does (the first report can come before the
-                    // UI has the row).
-                    let phase = self
-                        .script
-                        .slow_sends
-                        .and_then(|(p, _)| p)
-                        .filter(|_| delay.is_some())
-                        .map(|p| BackendEvent::TransmitProgress {
-                            local,
-                            progress: 0.0,
-                            phase: Some(p),
-                        });
-                    if let Some(e) = &phase {
-                        self.send_ephemeral(e.clone()).await;
+                    if let Err(e) = self.answer(local, req, outcome, reply).await {
+                        return Stop::Now(Exit::Failed(e));
                     }
-                    let late = delay.map(|d| self.clock.sleep(d));
-                    self.record_transmit(local, *req, &outcome);
-                    match late {
-                        // A late answer: the server has the request, the core hears later.
-                        Some(sleep) => {
-                            let events = self.events.clone();
-                            tokio::spawn(async move {
-                                let again = async {
-                                    let Some(e) = phase else {
-                                        return std::future::pending().await;
-                                    };
-                                    loop {
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
-                                        let _ = events.send(Envelope::ephemeral(e.clone())).await;
-                                    }
-                                };
-                                tokio::select! {
-                                    () = sleep => {}
-                                    () = again => {}
-                                }
-                                let _ = reply.send(outcome);
-                            });
-                        }
-                        None => {
-                            let _ = reply.send(outcome);
-                        }
+                }
+                // Answered at once from the message's stop state: only a message in its upload
+                // phase ([`Script::uploads`]) can be stopped.
+                Command::AbortTransmit { local, reply } => {
+                    let answer = self
+                        .holds
+                        .borrow()
+                        .get(&local)
+                        .map_or(AbortAnswer::TooLate, |hold| hold.abort());
+                    self.control.aborted(
+                        self.uuid,
+                        AbortRecord {
+                            message: local,
+                            answer,
+                        },
+                    );
+                    // A command loop that is inside an emit (see `Script::abort_backlog`): the
+                    // answer comes after the queue was read.
+                    for _ in 0..self.script.abort_backlog {
+                        self.send_ephemeral(BackendEvent::AccountProgress(
+                            kourier_model::AccountProgress::finished(),
+                        ))
+                        .await;
                     }
+                    let _ = reply.send(answer);
                 }
                 Command::SendReceipts {
                     cmd,
@@ -1039,12 +1436,16 @@ impl Actor {
                     newest,
                     newest_non_expiring,
                     remove,
+                    before_ms,
+                    system_before_ms,
                 } => {
                     let command = DurableCommand::ClearConversation {
                         conv,
                         newest,
                         newest_non_expiring,
                         remove,
+                        before_ms,
+                        system_before_ms,
                     };
                     if let Err(e) = self.persist_command(cmd, "clear", command, true) {
                         return Stop::Now(Exit::Failed(e));
@@ -1120,13 +1521,32 @@ impl Actor {
                     id,
                     reply,
                 } => {
+                    self.control.change(self.uuid, change.clone());
+                    // A timer set is a frame of the run tool's budget: the two count lines (T2 F1).
+                    let timer = self.plays_the_rehearsal()
+                        && matches!(change, ConversationChange::SetTimer { .. });
+                    if timer {
+                        crate::rehearsal::say_frame_written("timer");
+                    }
                     if self.script.reject_changes {
+                        if timer {
+                            // The core never sends a timer set again: the person asks again (T2 G1).
+                            crate::rehearsal::say_frame_answered("nacked", 0, "no");
+                        }
                         let _ = reply.send(Err(BackendError::new(
                             ErrorKind::InvalidInput,
                             "transaction rejected",
                         )));
                     } else {
                         let res = self.change_conversation(conv, &change, id);
+                        if timer {
+                            let (word, code) = if res.is_ok() {
+                                ("acked", 0)
+                            } else {
+                                ("nacked", 0)
+                            };
+                            crate::rehearsal::say_frame_answered(word, code, "no");
+                        }
                         let _ = reply.send(res);
                     }
                 }
@@ -1152,8 +1572,52 @@ impl Actor {
                 | Command::ChangeProfile { reply, .. } => {
                     let _ = reply.send(Err(BackendError::unsupported("not scripted")));
                 }
+                // The account's switch of the roaming settings: the fake re-states its caps with
+                // the flag as asked (a fake that states none refuses, like a network that cannot).
+                Command::SetRoamingWrites { on, reply } => {
+                    let _ = reply.send(self.set_roaming_writes(on));
+                }
+                // The core's own durable change of a chat (the clearing of a mark when it is
+                // read): kept as a job like the other durable commands and acknowledged. While the
+                // account's switch is on the network applies it, like the plain change, in the same
+                // transaction; with the switch off (or none) it is acknowledged and dropped. A
+                // command the core sends again is one job and applies once.
+                Command::ChangeConversationDurable {
+                    cmd,
+                    conv,
+                    change,
+                    asked_at,
+                } => {
+                    let effects = match self.durable_effects(cmd, &conv, &change) {
+                        Ok(effects) => effects,
+                        Err(e) => return Stop::Now(Exit::Failed(e)),
+                    };
+                    let command = DurableCommand::ChangeConversation {
+                        conv,
+                        change,
+                        asked_at,
+                    };
+                    if let Err(e) = self.persist_command_with(cmd, "change", command, true, effects)
+                    {
+                        return Stop::Now(Exit::Failed(e));
+                    }
+                }
                 Command::Resolve { reply, .. } => {
                     let _ = reply.send(Err(BackendError::unsupported("not scripted")));
+                }
+                Command::SafetyNumber { user, reply } => {
+                    let _ = reply.send(Ok(self.safety_number(&user)));
+                }
+                Command::ConfirmIdentity { user, key, reply } => {
+                    let _ = reply.send(self.confirm_identity(user, &key));
+                }
+                Command::SetVerified {
+                    user,
+                    verified,
+                    key,
+                    reply,
+                } => {
+                    let _ = reply.send(self.set_verified(user, verified, &key));
                 }
                 Command::ListOwnDevices { reply } => {
                     let _ = reply.send(Ok(vec![OwnDevice {
@@ -1180,6 +1644,202 @@ impl Actor {
         }
     }
 
+    // ---------- roaming settings ----------
+
+    /// The newest `AccountCaps` this account has stated (the script's or the fake's own), from the
+    /// mirror.
+    fn stated_caps(&self) -> Result<Option<AccountCaps>, BackendError> {
+        let row: Option<String> = self
+            .db
+            .read(|c| -> kourier_db::Result<Option<String>> {
+                Ok(c.query_row(
+                    "SELECT event FROM mirror WHERE event LIKE '{\"AccountCaps\":%'
+                     ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+            })
+            .map_err(internal)?;
+        row.map(|json| match serde_json::from_str(&json) {
+            Ok(BackendEvent::AccountCaps(caps)) => Ok(caps),
+            Ok(_) => Err(internal("a mirrored caps event is no caps")),
+            Err(e) => Err(internal(e)),
+        })
+        .transpose()
+    }
+
+    /// The account's switch is on: the stated flag is `Some(true)`.
+    fn roaming_on(&self) -> Result<bool, BackendError> {
+        Ok(self
+            .stated_caps()?
+            .and_then(|caps| caps.roaming_writes())
+            .unwrap_or(false))
+    }
+
+    /// What the fake states of the roaming settings ([`Script::roaming_writes`]) added to the
+    /// events of a delivery: a delivered `AccountCaps` that does not state the flag itself gets
+    /// the flag and the pin limit, and the first delivery of an account that has stated no caps yet
+    /// gets a statement of its own in front. The flag is the one the account has now (a switch
+    /// turned since stays turned), else the script's.
+    fn with_roaming_statement<'a>(
+        &self,
+        events: &'a [BackendEvent],
+    ) -> Result<Cow<'a, [BackendEvent]>, BackendError> {
+        let Some(default) = self.script.roaming_writes else {
+            return Ok(Cow::Borrowed(events));
+        };
+        let carries_caps = events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::AccountCaps(_)));
+        if !carries_caps && self.caps_stated.get() {
+            return Ok(Cow::Borrowed(events));
+        }
+        let on = self
+            .stated_caps()?
+            .and_then(|caps| caps.roaming_writes())
+            .unwrap_or(default);
+        let mut out = events.to_vec();
+        for e in &mut out {
+            if let BackendEvent::AccountCaps(caps) = e
+                && caps.roaming_writes().is_none()
+            {
+                state_roaming(caps, on);
+            }
+        }
+        if !carries_caps {
+            let mut caps = AccountCaps::default();
+            state_roaming(&mut caps, on);
+            out.insert(0, BackendEvent::AccountCaps(caps));
+        }
+        self.caps_stated.set(true);
+        Ok(Cow::Owned(out))
+    }
+
+    /// What the account states of the roaming settings again after a link that resumes a script
+    /// that was played (`played`: the events it delivered): the unlink wiped `backend.db`, and with
+    /// it the caps the account had stated, while the core keeps its stored statement and lets a click
+    /// through. It is the newest `AccountCaps` the script played, the flag and the pin limit added
+    /// as a delivery would have added them ([`with_roaming_statement`](Self::with_roaming_statement),
+    /// with the script's flag: a switch turned since is not remembered), or an `AccountCaps` of the
+    /// statement alone when the script played none. `None`: the script states nothing
+    /// ([`Script::roaming_writes`] is `None` and no played caps state the flag).
+    fn restated_roaming(&self, played: &[BackendEvent]) -> Option<AccountCaps> {
+        let newest = played.iter().rev().find_map(|e| match e {
+            BackendEvent::AccountCaps(caps) => Some(caps.clone()),
+            _ => None,
+        });
+        if let Some(caps) = newest
+            .as_ref()
+            .filter(|caps| caps.roaming_writes().is_some())
+        {
+            return Some(caps.clone());
+        }
+        let on = self.script.roaming_writes?;
+        let mut caps = newest.unwrap_or_default();
+        state_roaming(&mut caps, on);
+        Some(caps)
+    }
+
+    /// `Command::SetRoamingWrites`: the account's caps again, with the flag as asked.
+    fn set_roaming_writes(&self, on: bool) -> Result<(), BackendError> {
+        let Some(mut caps) = self
+            .stated_caps()?
+            .filter(|caps| caps.roaming_writes().is_some())
+        else {
+            return Err(BackendError::unsupported("not scripted"));
+        };
+        caps.flags
+            .insert(AccountCaps::FLAG_ROAMING_WRITES.to_owned(), on);
+        self.commit_events(&[BackendEvent::AccountCaps(caps)], |_| Ok(()))
+    }
+
+    /// The events a roaming change implies, as the network states them (§4.1 principle 4):
+    /// the patch of the change, and for the pin list what a network that keeps one does with it
+    /// (a new pin at its end). A pin goes to the END of the account's list (the whole list is
+    /// stated) and unarchives the chat; archiving takes the chat out of the list.
+    fn roaming_events(
+        &self,
+        conv: &ConvKey,
+        change: &ConversationChange,
+    ) -> Result<Vec<BackendEvent>, BackendError> {
+        match change {
+            ConversationChange::SetPinned { pinned: true } => {
+                let mut list = self.pinned()?;
+                if !list.contains(conv) {
+                    let full = self
+                        .stated_caps()?
+                        .and_then(|caps| caps.max_pinned_chats)
+                        .is_some_and(|limit| list.len() >= usize::try_from(limit).unwrap_or(0));
+                    if full {
+                        return Err(BackendError::new(
+                            ErrorKind::InvalidInput,
+                            "too many pinned chats",
+                        ));
+                    }
+                    list.push(conv.clone());
+                }
+                let mut unarchive = ConversationPatch::new(conv.clone());
+                unarchive.archived = Some(false);
+                Ok(vec![
+                    BackendEvent::PinnedConversations(list),
+                    BackendEvent::ConversationUpsert(unarchive),
+                ])
+            }
+            ConversationChange::SetPinned { pinned: false } => {
+                let mut list = self.pinned()?;
+                list.retain(|k| k != conv);
+                Ok(vec![BackendEvent::PinnedConversations(list)])
+            }
+            ConversationChange::SetArchived { archived: true } => {
+                let mut events = vec![BackendEvent::ConversationUpsert(patch_for(
+                    conv.clone(),
+                    change,
+                ))];
+                let mut list = self.pinned()?;
+                let before = list.len();
+                list.retain(|k| k != conv);
+                if list.len() != before {
+                    events.push(BackendEvent::PinnedConversations(list));
+                }
+                Ok(events)
+            }
+            _ => Ok(vec![BackendEvent::ConversationUpsert(patch_for(
+                conv.clone(),
+                change,
+            ))]),
+        }
+    }
+
+    /// What the network states when it applies a durable change the core sent: the change's
+    /// events while the account's switch is on and the command is new to the fake, none otherwise
+    /// (a change that cannot be made is acknowledged and dropped, never resent for ever).
+    fn durable_effects(
+        &self,
+        cmd: kourier_model::CmdId,
+        conv: &ConvKey,
+        change: &ConversationChange,
+    ) -> Result<Vec<BackendEvent>, BackendError> {
+        if !change.is_roaming() || !self.roaming_on()? {
+            return Ok(Vec::new());
+        }
+        let known: bool = self
+            .db
+            .read(|c| -> kourier_db::Result<bool> {
+                Ok(
+                    c.query_row("SELECT 1 FROM jobs WHERE cmd = ?1", [cmd.0], |_| Ok(()))
+                        .optional()?
+                        .is_some(),
+                )
+            })
+            .map_err(internal)?;
+        if known {
+            return Ok(Vec::new());
+        }
+        // (A change the network refuses, a pin over the limit, is dropped like the others.)
+        Ok(self.roaming_events(conv, change).unwrap_or_default())
+    }
+
     /// The confirmation of a roaming change (§4.1 principle 4): the patch, and for a timer
     /// change also its version (a durable counter per conversation, as Signal's
     /// `expireTimerVersion`) and the timeline row of our own change under the id the core
@@ -1190,9 +1850,17 @@ impl Actor {
         change: &ConversationChange,
         id: Option<kourier_backend_api::AllocatedId>,
     ) -> Result<(), BackendError> {
+        if change.is_roaming() && !self.roaming_on()? {
+            // The backend is the gate: the core checks the account's statement first, and a
+            // click that gets here anyway is refused.
+            return Err(BackendError::unsupported(
+                "this account does not write its chat settings to the network",
+            ));
+        }
         let mut patch = patch_for(conv.clone(), change);
         let ConversationChange::SetTimer { timer } = change else {
-            return self.commit_events(&[BackendEvent::ConversationUpsert(patch)], |_| Ok(()));
+            let events = self.roaming_events(&conv, change)?;
+            return self.commit_events(&events, |_| Ok(()));
         };
         let Some(id) = id else {
             return Err(BackendError::new(
@@ -1282,9 +1950,9 @@ impl Actor {
         &self,
         rx: &mut mpsc::UnboundedReceiver<LoginCmd>,
     ) -> Result<bool, BackendError> {
-        let relink = loop {
+        let (flow, relink) = loop {
             match rx.recv().await {
-                Some(LoginCmd::Start(r)) => break r,
+                Some(LoginCmd::Start { flow, relink }) => break (flow, relink),
                 Some(_) => continue,
                 None => return Ok(false),
             }
@@ -1297,6 +1965,24 @@ impl Actor {
             // The phone refused, or the codes ran out: the account stays logged out.
             let error = BackendError::new(ErrorKind::Unauthorized, "the relink was refused");
             self.step_login("failed", 98, LoginStepKind::Failed { error })
+                .await;
+            return Ok(false);
+        }
+        // The flows a script plays: the QR flow always, the pair-code flow when it has one. A
+        // flow the network does not have is refused like the network refuses it.
+        if flow == "pair-code"
+            && let Some(pair) = &self.script.pair_code
+        {
+            return self.pair_code(pair, relink.as_ref(), rx).await;
+        }
+        if flow == "phone"
+            && let Some(phone) = &self.script.phone_login
+        {
+            return self.phone_login(phone, relink.as_ref(), rx).await;
+        }
+        if flow != "qr" {
+            let error = BackendError::new(ErrorKind::Unsupported, "this login flow is not offered");
+            self.step_login("failed", 97, LoginStepKind::Failed { error })
                 .await;
             return Ok(false);
         }
@@ -1324,6 +2010,8 @@ impl Actor {
                         kind: InputKind::Text,
                         default: Some("kourier".into()),
                         required: true,
+                        note: None,
+                        code: None,
                     };
                     self.step_login(
                         "device-name",
@@ -1335,7 +2023,7 @@ impl Actor {
                     .await;
                     loop {
                         match rx.recv().await {
-                            Some(LoginCmd::Input(t)) if t == txn => break,
+                            Some(LoginCmd::Input(t, _)) if t == txn => break,
                             Some(LoginCmd::Cancel) | None => return Ok(false),
                             Some(_) => continue,
                         }
@@ -1345,12 +2033,17 @@ impl Actor {
                 for i in 0..*codes {
                     txn += 1;
                     let data = format!("fake-link://{}/{i}", self.uuid.short());
+                    // The first code may live longer than the others (`Script::first_qr_for`).
+                    let lives = match (i, self.script.first_qr_for) {
+                        (0, Some(first)) => first,
+                        _ => *valid_for,
+                    };
                     self.step_login(
                         "qr",
                         txn,
                         LoginStepKind::ShowQr {
                             data: Redacted::new(data),
-                            valid_for: Some(*valid_for),
+                            valid_for: Some(lives),
                         },
                     )
                     .await;
@@ -1359,7 +2052,7 @@ impl Actor {
                         break;
                     }
                     tokio::select! {
-                        _ = self.clock.sleep(*valid_for) => {}
+                        _ = self.clock.sleep(lives) => {}
                         c = rx.recv() => {
                             if matches!(c, Some(LoginCmd::Cancel) | None) {
                                 return Ok(false);
@@ -1373,12 +2066,130 @@ impl Actor {
                         .await;
                     return Ok(false);
                 }
+                if self.kind == NetworkKind::Threema {
+                    // Threema's link goes on from the scan to the emoji the phone shows too: the
+                    // person compares them and confirms on the phone (no button here), so the
+                    // fake waits for the phone's confirmation (`Script::emoji_for` of the
+                    // account clock) and only a cancel ends the wait early. Any other command
+                    // (a stray `SubmitLoginInput`, say) is ignored; the QR wait above ends its
+                    // rotation on one.
+                    txn += 1;
+                    let emoji = FAKE_EMOJI.iter().map(|glyph| (*glyph).to_owned()).collect();
+                    self.step_login("emoji", txn, LoginStepKind::ConfirmEmoji { emoji })
+                        .await;
+                    let mut confirmed = self.clock.sleep(self.script.emoji_for);
+                    loop {
+                        tokio::select! {
+                            _ = &mut confirmed => break,
+                            c = rx.recv() => {
+                                if matches!(c, Some(LoginCmd::Cancel) | None) {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                // TDLib asks the scanned-in account's two-step password right after the scan, and
+                // checks the number only after `Ready`: the password first (Telegram's order).
+                if let Some(password) = self.qr_password()
+                    && !self.password_steps(rx, &mut txn, password).await
+                {
+                    return Ok(false);
+                }
+                if self.number_refused() {
+                    // The real backend's wrong-phone refusal (W2c): the login ends at the QR
+                    // step, nothing is linked, no `AccountReady`, no device.
+                    let error = BackendError::new(
+                        ErrorKind::NotTheExpectedAccount,
+                        "the account is not the expected one",
+                    );
+                    self.step_login("qr", txn + 1, LoginStepKind::Failed { error })
+                        .await;
+                    return Ok(false);
+                }
                 let identity = linked_as
                     .clone()
                     .unwrap_or_else(|| self.script.own_ids.clone());
                 self.link(relink.as_ref(), &identity).await
             }
         }
+    }
+
+    /// The `pair-code` flow (WhatsApp's "link with phone number"): the phone number is asked
+    /// for, the network may refuse it, the code is shown, and the phone types it.
+    async fn pair_code(
+        &self,
+        pair: &PairCodeScript,
+        relink: Option<&Relink>,
+        rx: &mut mpsc::UnboundedReceiver<LoginCmd>,
+    ) -> Result<bool, BackendError> {
+        let attempt = self.control.pair_attempt();
+        let field = InputField {
+            id: "phone".into(),
+            label: "Phone number".into(),
+            kind: InputKind::Phone,
+            default: None,
+            required: true,
+            note: None,
+            code: None,
+        };
+        self.step_login(
+            "phone",
+            1,
+            LoginStepKind::Input {
+                fields: vec![field],
+            },
+        )
+        .await;
+        loop {
+            match rx.recv().await {
+                Some(LoginCmd::Input(1, _)) => break,
+                Some(LoginCmd::Cancel) | None => return Ok(false),
+                Some(_) => continue,
+            }
+        }
+        if let Some(error) = pair.refusals.get(attempt) {
+            // A failed step carries the step it failed at (the vocabulary of the link page).
+            self.step_login(
+                "phone",
+                2,
+                LoginStepKind::Failed {
+                    error: error.clone(),
+                },
+            )
+            .await;
+            return Ok(false);
+        }
+        self.step_login(
+            "code",
+            2,
+            LoginStepKind::ShowCode {
+                code: Redacted::new(pair.code.clone()),
+            },
+        )
+        .await;
+        let entered = match pair.entered_after {
+            Some(after) => after.min(pair.valid_for),
+            None => pair.valid_for,
+        };
+        tokio::select! {
+            _ = self.clock.sleep(entered) => {}
+            c = rx.recv() => {
+                if matches!(c, Some(LoginCmd::Cancel) | None) {
+                    return Ok(false);
+                }
+            }
+        }
+        if pair
+            .entered_after
+            .is_none_or(|after| after > pair.valid_for)
+        {
+            let error = BackendError::new(ErrorKind::Expired, "the pairing code expired");
+            self.step_login("code", 3, LoginStepKind::Failed { error })
+                .await;
+            return Ok(false);
+        }
+        self.link(relink, &self.script.own_ids).await
     }
 
     /// Finishes a link: refuses another identity on relink (before "linking", §4.3 step 6),
@@ -1456,6 +2267,15 @@ impl Actor {
                 .collect()
         });
         let cursor = resume.map(|at| i64::try_from(at).unwrap_or(i64::MAX));
+        // The statement of the roaming settings a resumed account makes again, as the fake's own
+        // memory (the mirror): no event goes to the core, which has the account's stored caps, and a
+        // rebuild of the core's database restates it with the rest of the mirror (F8).
+        let restated = played
+            .as_deref()
+            .and_then(|events| self.restated_roaming(events))
+            .map(|caps| serde_json::to_string(&BackendEvent::AccountCaps(caps)))
+            .transpose()
+            .map_err(internal)?;
         self.commit_events(&[ready], |tx| {
             tx.execute(
                 "INSERT OR REPLACE INTO fake_identity(id, own_ids, device, display_name)
@@ -1465,6 +2285,10 @@ impl Actor {
             if let (Some(cursor), Some(events)) = (cursor, &played) {
                 Self::set_in(tx, "cursor", cursor)?;
                 Self::note_timer_versions(tx, events)?;
+                Self::note_pins(tx, events)?;
+            }
+            if let Some(caps) = &restated {
+                tx.execute("INSERT INTO mirror(event) VALUES (?1)", [caps])?;
             }
             // The history transfer of a fresh link is stored with the account it belongs
             // to, at its first stage ("Link Again" has none).
@@ -1475,6 +2299,10 @@ impl Actor {
             }
             Self::set_in(tx, "linked", 1)
         })?;
+        if restated.is_some() {
+            // Stated now: no later delivery states the roaming settings in front of its events.
+            self.caps_stated.set(true);
+        }
         // No await since `AccountReady`: the forwarder finds these rows with it.
         for e in &self.script.with_ready {
             self.commit_events(std::slice::from_ref(e), |_| Ok(()))?;
@@ -1667,6 +2495,211 @@ impl Actor {
 
     // ---------- script ----------
 
+    /// Recomputes the chats the script has delivered (every `Deliver` step before the cursor):
+    /// at the start of an actor (a resumed account has them already), after a login (a relink
+    /// plays the cursor forward) and after each delivery.
+    fn refresh_known(&self) -> Result<(), BackendError> {
+        let cursor = self.cursor()?;
+        let delivered = self
+            .script
+            .steps
+            .iter()
+            .take(cursor)
+            .filter_map(|s| match s {
+                Step::Deliver(d) => Some(d.events.iter()),
+                _ => None,
+            })
+            .flatten();
+        let chats = chats_of(delivered, &self.script.own_ids);
+        *self
+            .known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = chats;
+        Ok(())
+    }
+
+    /// Adds the chats a delivery creates to the known ones (one delivery's events, not a rescan of
+    /// the script: a fixture's script has thousands of steps).
+    fn note_chats(&self, events: &[BackendEvent]) {
+        let fresh = chats_of(events, &self.script.own_ids);
+        let mut known = self
+            .known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for chat in fresh {
+            if !known.iter().any(|k| k.conv == chat.conv) {
+                known.push(chat);
+            }
+        }
+    }
+
+    /// Takes the arrivals [`FakeControl::arrive`] sends: one text from the other member into the
+    /// chat it chose, committed as a live message of the network (a new, unread row); and the
+    /// acts [`FakeControl::phone`] sends ([`Actor::cue`]), in the order they were sent.
+    async fn arrivals(&self, mut rx: mpsc::UnboundedReceiver<Injection>) -> Stop {
+        while let Some(arrival) = rx.recv().await {
+            let done = match arrival.act {
+                None => self.arrive(arrival),
+                Some(act) => self.cue(act, arrival).await,
+            };
+            if let Err(e) = done {
+                return Stop::Now(Exit::Failed(e));
+            }
+        }
+        std::future::pending().await
+    }
+
+    fn arrive(&self, arrival: Injection) -> Result<(), BackendError> {
+        let n = self.bump("arrivals")?;
+        let now = self.now();
+        // The fake playing Telegram gives its arrivals Telegram's id shape (a server id shifted
+        // by 20 bits, in decimal); every other fake keeps WhatsApp's stanza-id shape.
+        let local = if self.kind == NetworkKind::Telegram {
+            crate::telegram::arrival_id(n)
+        } else {
+            format!("{}{n:08}", crate::rehearsal::ARRIVAL_ID_PREFIX)
+        };
+        let conv = arrival.conv.clone();
+        let message = kourier_backend_api::IncomingMessage::new(
+            arrival.conv,
+            local.clone(),
+            kourier_model::Origin::Remote {
+                author: arrival.author,
+                device: Some(1),
+            },
+            kourier_model::Body::text(format!("{} {n}", crate::rehearsal::ARRIVAL_WORDS)),
+            now,
+            now,
+        );
+        self.commit_events(&[BackendEvent::Message(message)], |_| Ok(()))?;
+        self.note_arrived(&conv, local, n);
+        Ok(())
+    }
+
+    /// `Command::SafetyNumber` ([`crate::Script::safety`]): the held key's number. A script
+    /// without safety numbers is a network without them; one that has them but not for
+    /// `user` knows no key of that person.
+    fn safety_number(&self, user: &UserId) -> kourier_model::SafetyAnswer {
+        use kourier_model::SafetyUnavailable;
+        if self.script.safety.is_empty() {
+            return Err(SafetyUnavailable::Unsupported);
+        }
+        if self.script.own_ids.contains(user) {
+            return Err(SafetyUnavailable::OwnId);
+        }
+        self.control
+            .with_safety(self.uuid, &self.script, user, crate::safety::Held::ask)
+            .flatten()
+            .ok_or(SafetyUnavailable::NoKey)
+    }
+
+    /// `Command::SetVerified`: refused for a key the fake does not hold; else the state, the
+    /// contact's trust and key, the quiet notice in the 1:1 chat when the state changed (only
+    /// a chat the fake delivered: a notice opens no chat) and `IdentityTrusted` when it was
+    /// `Changed`, in one commit.
+    fn set_verified(
+        &self,
+        user: UserId,
+        verified: bool,
+        key: &kourier_model::IdentityFingerprint,
+    ) -> Result<(), BackendError> {
+        self.control
+            .note_verified(self.uuid, user.clone(), verified);
+        let Some(applied) = self
+            .control
+            .with_safety(self.uuid, &self.script, &user, |h| h.set(verified, key))
+        else {
+            return Err(BackendError::unsupported("not scripted"));
+        };
+        let Some(applied) = applied else {
+            return Err(BackendError::new(
+                kourier_model::ErrorKind::InvalidInput,
+                "the safety number changed",
+            ));
+        };
+        self.commit_applied(user, verified, &applied)
+    }
+
+    /// `Command::ConfirmIdentity` (BQ-2b, the lead's RC6): a scripted person in state Changed
+    /// gets the SHOWN key as Default (the same commit as a Clear of it) or, for another key,
+    /// a refusal (`InvalidInput`, nothing changes, so the core keeps the send paused); anyone
+    /// else (not scripted, or not Changed) is an approval only, answered `Ok`.
+    fn confirm_identity(
+        &self,
+        user: UserId,
+        key: &kourier_model::IdentityFingerprint,
+    ) -> Result<(), BackendError> {
+        use crate::safety::Confirm;
+        match self
+            .control
+            .with_safety(self.uuid, &self.script, &user, |h| h.confirm(key))
+        {
+            None | Some(Confirm::Approved) => Ok(()),
+            Some(Confirm::Refused) => Err(BackendError::new(
+                kourier_model::ErrorKind::InvalidInput,
+                "the safety number changed",
+            )),
+            Some(Confirm::Applied(applied)) => self.commit_applied(user, false, &applied),
+        }
+    }
+
+    /// The commit of a state the fake took (a Mark, a Clear or a Confirm): the contact's trust
+    /// and key, the quiet notice in a delivered 1:1 chat when the state changed, and
+    /// `IdentityTrusted` when it was `Changed`.
+    fn commit_applied(
+        &self,
+        user: UserId,
+        verified: bool,
+        applied: &crate::safety::Applied,
+    ) -> Result<(), BackendError> {
+        use kourier_model::{Body, ContactPatch, Patch, SystemEvent, VerifyState};
+        let mut patch = ContactPatch::new(user.clone());
+        patch.trust = Some(crate::safety::trust_of(applied.now));
+        patch.identity_fingerprint = Patch::Set(applied.key.clone());
+        let mut events = vec![BackendEvent::ContactUpsert(patch)];
+        let direct = ConvKey::Direct(user.clone());
+        let has_chat = self
+            .known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|k| k.conv == direct);
+        if applied.was != applied.now && has_chat {
+            let n = self.bump("verified")?;
+            let now = self.now();
+            let mut message = kourier_backend_api::IncomingMessage::new(
+                direct,
+                format!("verified:{n:08}"),
+                kourier_model::Origin::Remote {
+                    author: user.clone(),
+                    device: None,
+                },
+                Body::System(SystemEvent::VerifiedChanged {
+                    user: user.clone(),
+                    verified,
+                    other_device: false,
+                }),
+                now,
+                now,
+            );
+            message.silent = true;
+            events.push(BackendEvent::Message(message));
+        }
+        if applied.was == VerifyState::Changed {
+            events.push(BackendEvent::Notice(
+                kourier_backend_api::BackendNotice::IdentityTrusted { user },
+            ));
+        }
+        self.commit_events(&events, |_| Ok(()))
+    }
+
+    /// Whether the pairing of this QR login is refused for its number: the script honours the
+    /// expected tail, one is set, and the account's number does not end in it (an empty tail or
+    /// an account without a number fails closed, as the real backend's does).
+    fn number_refused(&self) -> bool {
+        self.tail_refuses(self.script.number.as_deref().unwrap_or_default())
+    }
+
     /// Stage 2 of every inbox row: the events go to `core_outbox` and the row is deleted, in one
     /// transaction (§5.6 invariant 2).
     fn flush_inbox(&self) -> Result<(), BackendError> {
@@ -1695,6 +2728,7 @@ impl Actor {
         self.db
             .zone(|tx| -> kourier_db::Result<()> {
                 Self::note_timer_versions(tx, &delivered)?;
+                Self::note_pins(tx, &delivered)?;
                 for (seq, bytes) in &rows {
                     tx.outbox_append(bytes, now)?;
                     tx.execute("DELETE FROM inbox WHERE seq = ?1", [seq])?;
@@ -1738,6 +2772,7 @@ impl Actor {
             if !self.login(login).await? {
                 return Ok(None);
             }
+            self.refresh_known()?;
         } else {
             // A start says where the history transfer stands, also one that is over.
             self.report_transfer().await;
@@ -1764,6 +2799,11 @@ impl Actor {
             }
             self.conn.send_replace(ConnState::Online { detail: None });
         }
+        // What the network states at every connect, once the connection is up.
+        for (delay, event) in &self.script.after_connect {
+            self.clock.sleep(*delay).await;
+            self.send_ephemeral(event.clone()).await;
+        }
         loop {
             let cursor = self.cursor()?;
             let Some(step) = self.script.steps.get(cursor) else {
@@ -1784,8 +2824,11 @@ impl Actor {
     async fn step(&self, cursor: usize, step: &Step) -> Result<Option<Stop>, BackendError> {
         match step {
             Step::Deliver(d) => {
-                // Stage 1: the delivery is durable in the inbox together with the cursor.
-                let row = encode_outbox_row(&d.events).map_err(internal)?;
+                // Stage 1: the delivery is durable in the inbox together with the cursor. (The
+                // script's `AccountCaps` and the first delivery carry what the fake states of
+                // the roaming settings.)
+                let events = self.with_roaming_statement(&d.events)?;
+                let row = encode_outbox_row(&events).map_err(internal)?;
                 let next = i64::try_from(cursor + 1).unwrap_or(i64::MAX);
                 let step_no = i64::try_from(cursor).unwrap_or(i64::MAX);
                 self.db
@@ -1798,6 +2841,7 @@ impl Actor {
                     })
                     .map_err(internal)?;
                 self.control.reached(self.uuid, cursor + 1);
+                self.note_chats(&d.events);
                 failpoint::hit(FAILPOINT_AFTER_INBOX_COMMIT);
                 // The server ack would leave here.
                 failpoint::hit(FAILPOINT_BEFORE_ACK);
@@ -1856,6 +2900,8 @@ impl Actor {
                 }
                 self.conn.send_replace(ConnState::LoggedOut {
                     reason: reason.clone(),
+                    cause: Default::default(),
+                    note: Default::default(),
                 });
                 self.control.device(self.uuid, false);
                 return Ok(Some(Stop::Drain(Exit::LoggedOut {
@@ -1921,6 +2967,14 @@ fn decode_transfer(kind: i64, done: i64, total: i64) -> Option<HistoryTransfer> 
     })
 }
 
+/// The `fake_state` keys of the pin list start with this; the value is the place in the list.
+const PIN_PREFIX: &str = "pin:";
+
+/// The `fake_state` key of a pinned conversation ([`Actor::note_pins`]).
+fn pin_key(conv: &ConvKey) -> String {
+    format!("{PIN_PREFIX}{}", conv.encode())
+}
+
 /// The `fake_state` key of a conversation's timer version (Signal's `expireTimerVersion`).
 fn timer_version_key(conv: &ConvKey) -> String {
     format!("timer-version:{}", conv.encode())
@@ -1976,14 +3030,20 @@ fn invalid_change(kind: &kourier_backend_api::OutgoingKind) -> Option<BackendErr
     }
 }
 
+/// States the roaming flag `on` in `caps`, and the pin limit unless it states one.
+fn state_roaming(caps: &mut AccountCaps, on: bool) {
+    caps.flags
+        .insert(AccountCaps::FLAG_ROAMING_WRITES.to_owned(), on);
+    caps.max_pinned_chats.get_or_insert(PIN_LIMIT);
+}
+
 /// The confirmation the network would send for a roaming change (§4.1 principle 4).
 fn patch_for(conv: ConvKey, change: &ConversationChange) -> ConversationPatch {
     let mut p = ConversationPatch::new(conv);
     match change {
         ConversationChange::SetArchived { archived } => p.archived = Some(*archived),
-        ConversationChange::SetPinned { pinned } => {
-            p.pinned_order = if *pinned { Patch::Set(0) } else { Patch::Clear };
-        }
+        // The pin list is the account's, not the chat's: `Actor::roaming_events` states it.
+        ConversationChange::SetPinned { .. } => {}
         ConversationChange::SetMuted { until } => {
             p.muted_until = until.map_or(Patch::Clear, Patch::Set);
         }

@@ -64,6 +64,7 @@ impl FileRefusal {
             Self::TooLarge { chat: false, .. } => "a file is larger than the network allows",
             Self::TooLarge { chat: true, .. } => "a file is larger than this chat allows",
             Self::KindNotAccepted { .. } => "this chat does not take this kind of file",
+            Self::Location => "a file holds its location and was not agreed to be sent with it",
         }
     }
 }
@@ -92,6 +93,31 @@ pub(crate) struct Inspected {
     pub mime: String,
     /// Size on disk.
     pub size: u64,
+    /// It is sent as the file it is (the query's or command's `as_file`).
+    pub as_file: bool,
+    /// Whether it carries where it was taken (LOC; [`super::looks`] keeps it by file).
+    pub look: kourier_media::Look,
+    /// A clean of it failed before (critic F13): the verdict asks.
+    pub clean_failed: bool,
+}
+
+impl Inspected {
+    /// Whether it would leave this PC with where it was taken, under the network's statement
+    /// `cleaned` ([`crate::facade::leaves_with_location`]; a failed clean counts as no
+    /// statement, critic F13).
+    pub(crate) fn leaves_with_location(
+        &self,
+        cleaned: Option<&kourier_model::CleanedPictures>,
+    ) -> bool {
+        let cleaned = if self.clean_failed { None } else { cleaned };
+        crate::facade::leaves_with_location(
+            &self.look,
+            self.content,
+            self.as_file,
+            self.size,
+            cleaned,
+        )
+    }
 }
 
 impl Inspected {
@@ -248,12 +274,14 @@ pub(crate) fn check_features(
 
 /// Opens the user's file and reads its kind and format from the first bytes (blocking). A
 /// FIFO, a directory or a device is refused before it is opened: opening a FIFO would block
-/// until a writer appears. `as_file`: it is sent as the file it is.
+/// until a writer appears. `as_file`: it is sent as the file it is. `fresh`: the look is made
+/// now, not answered from the cache (the import: [`super::looks::LookCache::look_fresh`]).
 fn open(
     path: &Path,
     max_bytes: Option<u64>,
     as_file: bool,
-) -> std::result::Result<(std::fs::File, Inspected), FileRefusal> {
+    fresh: bool,
+) -> std::result::Result<(std::fs::File, std::fs::Metadata, Inspected), FileRefusal> {
     let io = |_: std::io::Error| FileRefusal::Unreadable;
     let meta = std::fs::metadata(path).map_err(io)?;
     if !meta.is_file() {
@@ -262,12 +290,22 @@ fn open(
     let size = meta.len();
     check_size(size, max_bytes)?;
     let mut file = std::fs::File::open(path).map_err(io)?;
-    if !file.metadata().map_err(io)?.is_file() {
+    let opened = file.metadata().map_err(io)?;
+    if !opened.is_file() {
         // Replaced between the look and the open.
         return Err(FileRefusal::NotAFile);
     }
     let mut head = [0u8; 64];
     let n = read_up_to(&mut file, &mut head).map_err(io)?;
+    file.rewind().map_err(io)?;
+    // Where it was taken (LOC): looked at through the opened descriptor, kept by its identity
+    // and version (critic F26). The import looks anew (P6): the key cannot see a file written
+    // in place with the same size within its file system's time step.
+    let looked = if fresh {
+        super::looks::LOOKS.look_fresh(&mut file, &opened)
+    } else {
+        super::looks::LOOKS.look(&mut file, &opened)
+    };
     file.rewind().map_err(io)?;
     let ext_mime = path
         .extension()
@@ -285,11 +323,15 @@ fn open(
     };
     Ok((
         file,
+        opened,
         Inspected {
             kind,
             content,
             mime,
             size,
+            as_file,
+            look: looked.look,
+            clean_failed: looked.clean_failed,
         },
     ))
 }
@@ -301,13 +343,29 @@ pub(crate) fn inspect(
     max_bytes: Option<u64>,
     as_file: bool,
 ) -> std::result::Result<Inspected, FileRefusal> {
-    open(path, max_bytes, as_file).map(|(_, inspected)| inspected)
+    open(path, max_bytes, as_file, false).map(|(_, _, inspected)| inspected)
 }
 
 /// Whether the file at `index` is sent as the file it is (`as_file` may be shorter than the
 /// selection: missing entries are `false`).
 pub(crate) fn sent_as_file(as_file: &[bool], index: usize) -> bool {
-    as_file.get(index).copied().unwrap_or(false)
+    flagged(as_file, index)
+}
+
+/// The entry of a per-file flag list at `index` (`as_file`, `with_location`); a list shorter
+/// than the selection says `false` for the rest.
+pub(crate) fn flagged(flags: &[bool], index: usize) -> bool {
+    flags.get(index).copied().unwrap_or(false)
+}
+
+/// What the import holds a file's location against (LOC, BQ1): the user's agreement per
+/// position (`UiCommand::SendFiles` `with_location`) and what the network states it cleans.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocationRule<'a> {
+    /// Per file, by position: the user agreed it leaves with where it was taken.
+    pub agreed: &'a [bool],
+    /// The network's statement (`NetworkDescriptor::cleaned_pictures`).
+    pub cleaned: Option<&'a kourier_model::CleanedPictures>,
 }
 
 /// [`inspect`] for a whole selection, with the conversation's features applied: what was read
@@ -369,8 +427,10 @@ fn make_durable(blob_dir: &Path, imported: &[Imported]) -> std::io::Result<()> {
 /// Imports `paths` into the blob store at `blob_dir` (blocking), one after another. Any number
 /// of files: nothing here grows with the count but the list of what was written. Files larger
 /// than `max_bytes` (the network's send limit) and anything that is not a regular file are
-/// refused with their position. On any error, the blobs written so far are removed
-/// again. `as_file` says which files are sent as the files they are ([`sent_as_file`]).
+/// refused with their position, and so is a file that would leave with where it was taken
+/// although `location` has no agreement for it (looked at again through the opened file, and
+/// once more when it changed while it was copied: critic F24). On any error, the blobs written
+/// so far are removed again. `as_file` says which files are sent as the files they are ([`sent_as_file`]).
 /// `progress` hears how far the copy is: once before the first file, after every chunk read
 /// from a file, and after each file. Every file is durable when this returns
 /// ([`make_durable`], in batches while the copy runs).
@@ -378,6 +438,7 @@ pub(crate) fn import_files(
     blob_dir: &Path,
     paths: &[PathBuf],
     as_file: &[bool],
+    location: LocationRule<'_>,
     max_bytes: Option<u64>,
     progress: &mut dyn FnMut(ImportProgress),
 ) -> std::result::Result<Vec<Imported>, ImportError> {
@@ -399,13 +460,12 @@ pub(crate) fn import_files(
             at.bytes_done = before.saturating_add(n);
             progress(at);
         };
-        match import_one(
-            &store,
-            p,
-            max_bytes,
-            sent_as_file(as_file, index),
-            &mut read,
-        ) {
+        let file = OneFile {
+            as_file: sent_as_file(as_file, index),
+            agreed: flagged(location.agreed, index),
+            cleaned: location.cleaned,
+        };
+        match import_one(&store, p, max_bytes, file, &mut read) {
             Ok(i) => {
                 // What was read is what counts, also for a file that changed since the look.
                 at.bytes_done = before.saturating_add(i.file.size);
@@ -466,22 +526,64 @@ pub(crate) fn discard(blob_dir: &Path, imported: &[Imported]) {
     super::unlink(blob_dir, &paths);
 }
 
+/// How [`import_one`] takes one file of a selection.
+#[derive(Clone, Copy)]
+struct OneFile<'a> {
+    /// Sent as the file it is.
+    as_file: bool,
+    /// The user agreed it leaves with where it was taken.
+    agreed: bool,
+    /// The network's statement of what it cleans.
+    cleaned: Option<&'a kourier_model::CleanedPictures>,
+}
+
+/// Whether the file changed while it was copied: its size or modification time moved on the
+/// descriptor that was read (critic F24).
+fn changed(
+    file: &std::fs::File,
+    opened: &std::fs::Metadata,
+) -> std::result::Result<bool, FileRefusal> {
+    let now = file.metadata().map_err(|_| FileRefusal::Unreadable)?;
+    Ok(now.len() != opened.len() || now.modified().ok() != opened.modified().ok())
+}
+
+/// Whether what `r` holds (`len` bytes) would leave with where it was taken although the user
+/// did not agree, looked at anew (not through the cache: it is not what was looked at before).
+fn located_unagreed(
+    r: &mut dyn kourier_media::ReadSeek,
+    len: u64,
+    content: AttachmentKind,
+    one: OneFile<'_>,
+) -> bool {
+    if one.agreed {
+        return false;
+    }
+    let look = super::looks::look_noted(r, len);
+    crate::facade::leaves_with_location(&look, content, one.as_file, len, one.cleaned)
+}
+
 /// One file. A refusal carries position 0: [`import_files`] puts the real one in. `read`
 /// hears how many bytes of the file were read so far.
 fn import_one(
     store: &BlobStore,
     path: &Path,
     max_bytes: Option<u64>,
-    as_file: bool,
+    one: OneFile<'_>,
     read: &mut dyn FnMut(u64),
 ) -> std::result::Result<Imported, ImportError> {
     let blob = |e| ImportError::Other(CoreError::Blob(e));
-    let (file, looked) = open(path, max_bytes, as_file).map_err(refused)?;
+    // Looked at again through the descriptor that is read (LOC, BQ1): the file may have been
+    // swapped since `send_files` looked at it, so this look skips the cache (P6).
+    let (file, opened, looked) = open(path, max_bytes, one.as_file, true).map_err(refused)?;
+    if !one.agreed && looked.leaves_with_location(one.cleaned) {
+        return Err(refused(FileRefusal::Location));
+    }
     let Inspected {
         kind,
         content,
         mime,
         size,
+        ..
     } = looked;
     let mut file = Counting {
         inner: file,
@@ -499,6 +601,24 @@ fn import_one(
         let (id, key, len) = store.import_volatile(&mut file).map_err(blob)?;
         // The file may have changed since it was measured: the limits hold for what was read.
         if let Err(reason) = check_size(len, max_bytes) {
+            if let Err(e) = store.remove(&id) {
+                tracing::warn!(error = %e, "removing an imported file failed");
+            }
+            return Err(refused(reason));
+        }
+        // Changed while it was copied (critic F24): what was read may hold a location now.
+        // Looked at again through the same descriptor.
+        let located = match changed(&file.inner, &opened) {
+            Ok(false) => Ok(()),
+            Ok(true) if one.agreed => Ok(()),
+            Ok(true) => match file.inner.rewind() {
+                Ok(()) if !located_unagreed(&mut file.inner, len, content, one) => Ok(()),
+                Ok(()) => Err(FileRefusal::Location),
+                Err(_) => Err(FileRefusal::Unreadable),
+            },
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = located {
             if let Err(e) = store.remove(&id) {
                 tracing::warn!(error = %e, "removing an imported file failed");
             }
@@ -534,6 +654,13 @@ fn import_one(
         return Err(refused(FileRefusal::Unreadable));
     }
     check_size(read, max_bytes).map_err(refused)?;
+    // Changed while it was read (critic F24): the bytes in hand are what is sent, so they are
+    // looked at again.
+    if changed(&file.inner, &opened).map_err(refused)?
+        && located_unagreed(&mut std::io::Cursor::new(&bytes[..]), read, content, one)
+    {
+        return Err(refused(FileRefusal::Location));
+    }
     let (id, key, len) = store.import_volatile(&mut bytes.as_slice()).map_err(blob)?;
     let file_written = Written {
         path: core_path(&id),
@@ -599,7 +726,7 @@ fn read_up_to(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kourier_media::{SampleFormat, sample_image};
+    use kourier_media::{Look, SampleFormat, sample_image};
 
     #[test]
     fn pictures_get_metadata_and_a_thumbnail_files_stream_through() {
@@ -615,6 +742,7 @@ mod tests {
             &blobs,
             &[src.join("photo.png"), src.join("notes.txt")],
             &[],
+            LocationRule::default(),
             Some(10 << 20),
             &mut |_| {},
         )
@@ -680,14 +808,29 @@ mod tests {
             ),
         ] {
             let got = reason(
-                import_files(&blobs, &paths, &[], Some(50), &mut |_| {}).expect_err("refused"),
+                import_files(
+                    &blobs,
+                    &paths,
+                    &[],
+                    LocationRule::default(),
+                    Some(50),
+                    &mut |_| {},
+                )
+                .expect_err("refused"),
             );
             assert_eq!(got, (at, why));
             let store = crate::attachments::core_store(&blobs).expect("store");
             assert!(store.list().expect("list").is_empty(), "{why:?}");
         }
         assert!(matches!(
-            import_files(&blobs, &[], &[], Some(50), &mut |_| {}),
+            import_files(
+                &blobs,
+                &[],
+                &[],
+                LocationRule::default(),
+                Some(50),
+                &mut |_| {}
+            ),
             Err(ImportError::Other(CoreError::InvalidInput(
                 "no files to send"
             )))
@@ -699,8 +842,17 @@ mod tests {
             .status()
             .is_ok_and(|s| s.success())
         {
-            let got =
-                reason(import_files(&blobs, &[fifo], &[], None, &mut |_| {}).expect_err("fifo"));
+            let got = reason(
+                import_files(
+                    &blobs,
+                    &[fifo],
+                    &[],
+                    LocationRule::default(),
+                    None,
+                    &mut |_| {},
+                )
+                .expect_err("fifo"),
+            );
             assert_eq!(got, (0, FileRefusal::NotAFile));
         }
         // The reasons keep the texts the UI's notices were written for, and name no file.
@@ -717,8 +869,15 @@ mod tests {
             "invalid request: only files can be sent"
         );
         // An empty file is no reason to refuse a send: it is imported like any other.
-        let done =
-            import_files(&blobs, &[ok, empty], &[], Some(50), &mut |_| {}).expect("imported");
+        let done = import_files(
+            &blobs,
+            &[ok, empty],
+            &[],
+            LocationRule::default(),
+            Some(50),
+            &mut |_| {},
+        )
+        .expect("imported");
         assert_eq!(
             done.iter().map(|i| i.file.size).collect::<Vec<_>>(),
             [5, 0],
@@ -743,8 +902,15 @@ mod tests {
             })
             .collect();
         let mut heard = Vec::new();
-        let got = import_files(&blobs, &paths, &[], Some(1 << 20), &mut |p| heard.push(p))
-            .expect("import");
+        let got = import_files(
+            &blobs,
+            &paths,
+            &[],
+            LocationRule::default(),
+            Some(1 << 20),
+            &mut |p| heard.push(p),
+        )
+        .expect("import");
         assert_eq!(got.len(), 100);
         // The progress starts at nothing, never goes back and ends at everything.
         let total: u64 = got.iter().map(|f| f.file.size).sum();
@@ -916,6 +1082,7 @@ mod tests {
             &blobs,
             &[photo.clone(), photo],
             &[true],
+            LocationRule::default(),
             Some(10 << 20),
             &mut |_| {},
         )
@@ -945,5 +1112,173 @@ mod tests {
             picture.plan_file(),
             PlanFile::new(AttachmentKind::Image, "image/jpeg")
         );
+    }
+
+    fn location_of(got: std::result::Result<Vec<Imported>, ImportError>) -> Vec<RefusedFile> {
+        match got {
+            Err(ImportError::Refused(r)) => r,
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// LOC (BQ1): the import looks again at the file it opened, whatever the send looked at
+    /// before: a located file without the user's agreement for its position is refused with
+    /// `Location` and nothing stays in the store; with it, it is imported.
+    #[test]
+    fn the_import_looks_again_at_the_opened_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        let (doc, clip) = (dir.path().join("notes.txt"), dir.path().join("clip.mp4"));
+        std::fs::write(&doc, b"plain words").expect("write");
+        let located = kourier_media::sample_located(kourier_media::SampleLocated::Mp4);
+        std::fs::write(&clip, &located).expect("write");
+        let paths = [doc, clip];
+        let refused = location_of(import_files(
+            &blobs,
+            &paths,
+            &[],
+            LocationRule::default(),
+            None,
+            &mut |_| {},
+        ));
+        assert_eq!(
+            refused,
+            [RefusedFile {
+                index: 1,
+                reason: FileRefusal::Location,
+            }]
+        );
+        let store = crate::attachments::core_store(&blobs).expect("store");
+        assert!(store.list().expect("list").is_empty(), "nothing stays");
+        let agreed = LocationRule {
+            agreed: &[false, true],
+            cleaned: None,
+        };
+        let got = import_files(&blobs, &paths, &[], agreed, None, &mut |_| {}).expect("import");
+        assert_eq!(got.len(), 2);
+    }
+
+    /// Critic F24: a file that changes while it is copied is looked at again through the
+    /// descriptor that was read. Now located and not agreed to: refused with `Location`, the
+    /// blob removed. Grown but still without a location, or agreed to: imported as before.
+    #[test]
+    fn a_file_changed_while_it_is_copied_is_looked_at_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        let path = dir.path().join("log.txt");
+        let plain = vec![b'a'; 300 * 1024];
+        let located = kourier_media::sample_located(kourier_media::SampleLocated::Mp4);
+        let paths = [path.clone()];
+        let copy = |with: &[u8], rule: LocationRule<'_>| {
+            std::fs::write(&path, &plain).expect("write");
+            let mut changed = false;
+            import_files(&blobs, &paths, &[], rule, None, &mut |p| {
+                if p.bytes_done > 0 && !changed {
+                    changed = true;
+                    std::fs::write(&path, with).expect("rewrite");
+                }
+            })
+        };
+        let refused = location_of(copy(&located, LocationRule::default()));
+        assert_eq!(
+            refused,
+            [RefusedFile {
+                index: 0,
+                reason: FileRefusal::Location,
+            }]
+        );
+        let store = crate::attachments::core_store(&blobs).expect("store");
+        assert!(
+            store.list().expect("list").is_empty(),
+            "the blob is removed"
+        );
+        let mut grown = plain.clone();
+        grown.extend_from_slice(b"more lines");
+        assert_eq!(
+            copy(&grown, LocationRule::default()).expect("grown").len(),
+            1
+        );
+        let agreed = LocationRule {
+            agreed: &[true],
+            cleaned: None,
+        };
+        assert_eq!(copy(&located, agreed).expect("agreed").len(), 1);
+    }
+    /// LOC P6: the import judges the bytes it reads, not a kept look. A file rewritten in place
+    /// with the same size, on a file system whose times do not move (the kept key cannot tell),
+    /// would leave with its location from a kept `None`; the import looks at the descriptor
+    /// itself.
+    #[test]
+    fn the_import_does_not_trust_a_kept_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        let path = dir.path().join("export.mp4");
+        let located = kourier_media::sample_located(kourier_media::SampleLocated::Mp4);
+        // The file as the plan saw it: plain, same size. Then written in place with the
+        // location; the kept look is the plain one under the key the file now has.
+        std::fs::write(&path, vec![b'a'; located.len()]).expect("write");
+        std::fs::write(&path, &located).expect("rewrite");
+        let meta = std::fs::metadata(&path).expect("meta");
+        super::super::looks::LOOKS.plant(&meta, Look::None);
+        let seen = inspect(&path, None, false).expect("inspect");
+        assert_eq!(seen.look, Look::None, "the cache answers the stale look");
+        let paths = [path];
+        let refused = location_of(import_files(
+            &blobs,
+            &paths,
+            &[],
+            LocationRule::default(),
+            None,
+            &mut |_| {},
+        ));
+        assert_eq!(
+            refused,
+            [RefusedFile {
+                index: 0,
+                reason: FileRefusal::Location,
+            }]
+        );
+    }
+
+    /// LOC P6: when the import's own look is `Unreadable`, the kept look of the same key
+    /// decides; with none kept the file goes (BQ6).
+    #[test]
+    fn an_unreadable_fresh_look_defers_to_the_kept_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blobs = dir.path().join("blobs");
+        // A PNG signature, then a chunk that claims more than the file holds.
+        let mut cut = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        cut.extend([0x00, 0x10, 0x00, 0x00, b'I', b'D', b'A', b'T', 1, 2, 3]);
+        let found = Look::Found(kourier_media::Evidence {
+            format: kourier_media::LookFormat::Png,
+            kind: kourier_media::EvidenceKind::ExifGps,
+        });
+        let run = |name: &str, kept: Option<Look>| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &cut).expect("write");
+            let len = cut.len() as u64;
+            let mut f = std::fs::File::open(&path).expect("open");
+            assert_eq!(kourier_media::look(&mut f, len), Look::Unreadable);
+            if let Some(look) = kept {
+                let meta = std::fs::metadata(&path).expect("meta");
+                super::super::looks::LOOKS.plant(&meta, look);
+            }
+            // Sent as the file it is: nothing is decoded.
+            import_files(
+                &blobs,
+                &[path],
+                &[true],
+                LocationRule::default(),
+                None,
+                &mut |_| {},
+            )
+        };
+        let refused = location_of(run("kept-found.png", Some(found)));
+        assert_eq!(refused[0].reason, FileRefusal::Location);
+        assert_eq!(
+            run("kept-none.png", Some(Look::None)).expect("none").len(),
+            1
+        );
+        assert_eq!(run("nothing-kept.png", None).expect("unreadable").len(), 1);
     }
 }

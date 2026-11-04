@@ -1,0 +1,50 @@
+Kourier patch 0001: TDLib never starts its config recovery (the "config fallback").
+
+Applied by `cargo xtask tdlib build` to TDLib commit 0e88653dcbf4e44c73cb655a05b58cd749a91169 before
+the build (`git apply --check`, then `git apply`); listed in third_party/tdlib/tdlib.pin and part of
+the cache key and the manifest (the patch's sha256 is a key input: a change of these bytes is another
+cache entry).
+
+What it disables: td/telegram/ConfigManager.cpp, `ConfigRecoverer::loop`. Unpatched, TDLib starts the
+recovery when its connection state has stayed `Connecting` for `max_connecting_delay()` (5 s while
+`expect_blocking` holds, else 20 s). Two things then happen, and BOTH go past a proxy:
+  - The "simple config": TDLib asks third parties through a plain `Wget` that does not use the proxy
+    (Azure, Firebase, Google DNS, Mozilla DNS-over-HTTPS; ConfigManager.cpp `get_simple_config_*`).
+  - The "full config": `get_full_config` takes the data centres TDLib already knows (`dc_options_`: the
+    server's own stored config, `dc_options_update_`, plus whatever the simple config gave) and asks
+    them for the config through `ConnectionCreator::request_raw_connection_by_ip`, which prepares the
+    connection with an EMPTY proxy (`Proxy()`, ConnectionCreator.cpp). So the full config dials the
+    stored data-centre addresses DIRECTLY, even with no third party involved at all.
+Both conjunctions (`need_simple_config`, `need_full_config`) start with `has_connecting_problem`;
+setting it to false is the smallest change that turns both off and leaves no variable unused. The
+state `Connecting` is reached as soon as a SOCKS5 proxy accepted TDLib's login (Socks5.cpp
+`send_ip_address` -> `on_connected`), so a gate that holds or black-holes the CONNECT would
+otherwise let the fallback reach Telegram's addresses directly and the system resolver and those
+third parties (TG-1 plan critic H1). Proven by the trap test T-r1 (TG-1b), which also runs once
+against the unpatched build to show it can see the fallback (look there for a direct TCP connect to
+a data-centre address, not only for DNS and HTTPS to the four third parties).
+
+What it costs: TDLib can no longer find its way back when every data-centre address it knows is
+unreachable or blocked (new addresses from Azure/Firebase/Google/Mozilla, the config from another
+data centre directly). A normal data-centre move still works: `ConfigManager::request_config` asks
+`help.getConfig` through the main session, i.e. through the gate, and `updateDcOptions` from the
+server is applied as before. In a network that blocks Telegram the account stays "Connecting" for
+good instead of getting around the block, which is what the user chose ("No proxy", no fallback).
+
+The context lines are TDLib's (Boost Software License 1.0, LICENSES/BSL-1.0.txt); so is this file.
+
+--- a/td/telegram/ConfigManager.cpp
++++ b/td/telegram/ConfigManager.cpp
+@@ -733,8 +733,10 @@
+       return false;
+     };
+ 
+-    bool has_connecting_problem =
+-        is_connecting_ && check_timeout(Timestamp::at(connecting_since_ + max_connecting_delay()));
++    // Kourier: the config recovery never starts. Neither the simple config (HTTPS and DNS requests to
++    // third parties, outside the proxy) nor the full config from other data centres is asked for; the
++    // connection goes only through Kourier's gate.
++    bool has_connecting_problem = false;
+     bool is_valid_simple_config = !check_timeout(Timestamp::at(simple_config_expires_at_));
+     if (!is_valid_simple_config && !simple_config_.dc_options.empty()) {
+       simple_config_ = DcOptions();

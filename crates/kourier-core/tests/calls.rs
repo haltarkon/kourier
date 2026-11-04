@@ -5,24 +5,25 @@
 //! deleting a line without anything being sent, and one run through the runtime on the fake
 //! network.
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kourier_backend_api::{BackendEvent, Clock, DurableCommand};
+use kourier_backend_api::{BackendEvent, Clock, DurableCommand, IncomingMessage};
 use kourier_core::facade::{
-    ConversationListQuery, MessageRow, OriginKind, TimelineAnchor, TimelineQuery, UiCommand,
-    UiEvent,
+    ConversationListQuery, ConversationRow, MessageRow, OriginKind, TimelineAnchor, TimelineQuery,
+    UiCommand, UiEvent,
 };
 use kourier_core::testing::{DumpMode, IngestHarness};
 use kourier_fake::calls::{Call, RING_MS, cast, ring_end};
 use kourier_fake::scripts::{T0, remote, signal_features};
 use kourier_fake::{Flavor, Script, Step};
 use kourier_model::{
-    AccountSettingsPatch, CallDirection, CallLine, CallMedia, CallState, ConvKey, ConversationId,
-    ConversationPatch, MessageId, MsgIdScope, NetworkKind, Patch, ReadState, TargetAuthor,
+    AccountSettingsPatch, CallDirection, CallLine, CallMedia, CallState, CannotSend, ConvKey,
+    ConversationFeatures, ConversationId, ConversationPatch, HistorySource, MessageId, MsgIdScope,
+    NetworkKind, Origin, Patch, ReadState, TargetAuthor,
 };
 use support::send::core_db;
 use support::{Env, WAIT, add_linked, eventually};
@@ -1011,6 +1012,71 @@ fn conversation_scoped_ids_keep_one_line_per_chat() {
     assert_eq!(line(&h, &with_alice.conv).0.state, CallState::Missed);
 }
 
+/// T6b: on a network whose ids are unique per sender in a chat a call line and an own message
+/// still never share an id in a chat, whichever comes first: a signal whose id is an own
+/// message's makes no line and leaves the message as it is, and an own message whose id is a
+/// line's does not take its place. (Under `AccountAuthor` the same holds by the account-wide
+/// key; under `Conversation` the one key refuses the second row.) The id an own send is given
+/// is checked against the lines too: `outbox::tests`.
+#[test]
+fn a_call_signal_with_the_id_of_an_own_message_makes_no_line_under_per_sender_ids() {
+    let c = cast().expect("cast");
+    let per_sender = || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut h = IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([7; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::ConversationAuthor,
+            std::slice::from_ref(&c.me),
+        )
+        .expect("harness");
+        h.set_now(T0);
+        (dir, h)
+    };
+    let call = Call::direct(&c.alice, 7, CallMedia::Voice);
+    let key = call.conv.clone();
+    let hello = |h: &IngestHarness| -> usize {
+        rows(h, &key)
+            .iter()
+            .filter(|r| r.body.call_line().is_none())
+            .count()
+    };
+
+    // The message first: the signals find no line to change and make none.
+    let (_dir, mut h) = per_sender();
+    h.apply(vec![BackendEvent::Message(kourier_fake::scripts::own(
+        &key,
+        &call.local(),
+        ts(1),
+        "hello",
+    ))])
+    .expect("message");
+    h.apply(vec![call.ring(ts(2)), call.caller_gave_up(ts(9))])
+        .expect("signals");
+    let stored = rows(&h, &key);
+    assert_eq!(stored.len(), 1, "no line beside the message");
+    assert!(
+        stored[0].body.call_line().is_none(),
+        "the message is as it was"
+    );
+    assert_eq!(unread(&h, &key), 0, "and no missed call was counted");
+
+    // The line first: the message with its id does not replace it, and the line goes on.
+    let (_dir, mut h) = per_sender();
+    h.apply(vec![call.ring(ts(2))]).expect("ring");
+    h.apply(vec![BackendEvent::Message(kourier_fake::scripts::own(
+        &key,
+        &call.local(),
+        ts(3),
+        "hello",
+    ))])
+    .expect("message");
+    assert_eq!(hello(&h), 0, "the message is not stored over the line");
+    h.apply(vec![call.caller_gave_up(ts(9))]).expect("gave up");
+    assert_eq!(line(&h, &key).0.state, CallState::Missed);
+}
+
 // ---------- through the runtime, on the fake network ----------
 
 async fn linked(script: Script) -> (Env, kourier_model::AccountId) {
@@ -1486,4 +1552,117 @@ async fn the_calls_script_through_the_runtime() {
     assert!(env.control.transmits(uuid).is_empty());
     assert_eq!(env.control.durable_commands(uuid), Vec::new());
     env.stop().await;
+}
+
+/// W6a1 fix round, F11 (the interop review's INTEROP-6): the events the WhatsApp backend states for a call it
+/// learned from the phone's call log (`kourier-whatsapp` `calls/log.rs` `place`), fed to the real ingest by hand, put
+/// the chat in the conversation list with the line, quietly. His rule: "if there is no chat - it should be added".
+/// The statement (an upsert that carries the chat's features and `NotAccepted`: a call proves no start) comes first;
+/// the line is `Origin::OwnOtherDevice`, silent and read. Two forms:
+///
+/// - a call the chat's cut does not cover, or in a chat nobody deleted: a `HistoryBatch` row of the chat. A chat the
+///   core does not know yet is listed with it; nothing is announced, nothing is unread;
+/// - a call AFTER the cut of a deleted chat: a live `Message`, which brings the hidden chat back into the list with the
+///   line only (the history form of the same chat is dropped, so an old call a clear took away never returns).
+///
+/// Mutants (the core, none kept): the live arm of `message` dropping a hidden chat's row like the history arm; the
+/// call line's insert not unhiding its chat.
+#[test]
+fn the_call_logs_events_list_the_chat_with_the_line_quietly() {
+    let c = cast().expect("cast");
+    let (_dir, mut h) = harness();
+    let peer = ConvKey::Direct(c.bob.clone());
+    let now = h.now();
+    let statement = || {
+        let mut patch = ConversationPatch::new(peer.clone());
+        patch.features = Some(ConversationFeatures {
+            history: HistorySource::PushedOnLink,
+            cannot_send: Some(CannotSend::NotAccepted),
+            ..ConversationFeatures::default()
+        });
+        BackendEvent::ConversationUpsert(patch)
+    };
+    // The backend's own line: quiet, read, said by our other device, the caller named.
+    let log_line = |id: &str, at: i64| -> IncomingMessage {
+        let signal = CallLine::signal(CallDirection::Incoming, false, CallState::Missed, at)
+            .with_media(CallMedia::Voice, at)
+            .with_by(c.bob.clone(), at);
+        let mut m = IncomingMessage::call(
+            peer.clone(),
+            id,
+            Origin::OwnOtherDevice { device: None },
+            signal,
+            at,
+            now,
+        );
+        m.silent = true;
+        m.read = true;
+        m
+    };
+    let listed = |h: &IngestHarness| -> Option<ConversationRow> {
+        h.conversations(&ConversationListQuery::default())
+            .expect("list")
+            .rows
+            .into_iter()
+            .find(|r| r.peer.as_ref() == Some(&c.bob))
+    };
+    let quiet = |announced: &kourier_core::testing::Announced, what: &str| {
+        assert!(announced.notify.is_empty(), "{what}: a notification");
+        assert_eq!(announced.catch_up, 0, "{what}: a catch-up entry");
+    };
+    assert!(listed(&h).is_none(), "no chat with Bob yet");
+
+    // The history form, in a chat the core does not know: it is added, listed with the line.
+    let announced = h
+        .apply_announcing(vec![statement()])
+        .expect("the statement");
+    quiet(&announced, "the statement");
+    let announced = h
+        .apply_announcing(vec![BackendEvent::HistoryBatch {
+            conv: peer.clone(),
+            messages: vec![log_line("LOG-77310101", now - 300_000)],
+            has_more: false,
+            progress: None,
+        }])
+        .expect("the call log's line");
+    quiet(&announced, "the history line");
+    let row = listed(&h).expect("the chat is listed with its call");
+    assert!(!row.archived, "{row:?}");
+    assert_eq!(row.unread, 0, "a quiet, read line counts nothing");
+    assert!(row.preview.is_some(), "the line is the chat's preview");
+    let (call, message) = line(&h, &peer);
+    assert_eq!(call.state, CallState::Missed);
+    assert!(message.history, "the form is a history row");
+
+    // Deleted here: the chat leaves the list, and the log's history form of an older call finds it hidden and is dropped.
+    let id = conv(&h, &peer);
+    h.clear_conversation(id, true).expect("delete the chat");
+    assert!(listed(&h).is_none(), "a deleted chat is not listed");
+    let announced = h
+        .apply_announcing(vec![BackendEvent::HistoryBatch {
+            conv: peer.clone(),
+            messages: vec![log_line("LOG-77310102", now - 200_000)],
+            has_more: false,
+            progress: None,
+        }])
+        .expect("an old call after the delete");
+    quiet(&announced, "the dropped history line");
+    assert!(listed(&h).is_none(), "an old call does not bring it back");
+    assert!(rows(&h, &peer).is_empty(), "and leaves no row");
+
+    // The live form of a call AFTER the delete: the chat is back, with that one line, still quiet.
+    h.set_now(now + 60_000);
+    let announced = h
+        .apply_announcing(vec![BackendEvent::Message(log_line(
+            "LOG-77310103",
+            now + 30_000,
+        ))])
+        .expect("a call after the delete");
+    quiet(&announced, "the live line");
+    let row = listed(&h).expect("the deleted chat is listed again");
+    assert_eq!(row.unread, 0);
+    assert!(row.preview.is_some());
+    let (call, message) = line(&h, &peer);
+    assert_eq!(call.state, CallState::Missed);
+    assert!(!message.history, "the live form is a live row");
 }

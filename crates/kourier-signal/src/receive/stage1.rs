@@ -26,7 +26,7 @@ use kourier_db::rusqlite::{Connection, OptionalExtension};
 use kourier_db::{Tx, ZoneDb};
 use kourier_model::{
     Body, ContactPatch, ConvKey, Identifier, IdentifierKind, IdentityFingerprint, Origin, Patch,
-    SystemEvent, TrustLevel,
+    SystemEvent,
 };
 use libsignal_core::{Aci, DeviceId, Pni, ServiceId};
 use libsignal_protocol::{
@@ -230,7 +230,8 @@ pub(crate) fn identity_events(
             continue;
         };
         let mut patch = ContactPatch::new(user.clone());
-        patch.trust = Some(TrustLevel::Unverified);
+        // A verified contact's key change is `Changed` (state 2), else `Unverified` (F3).
+        patch.trust = Some(crate::store::trust_of(change.verified));
         patch.identity_fingerprint =
             Patch::Set(IdentityFingerprint(change.identity.serialize().into_vec()));
         events.push(BackendEvent::ContactUpsert(patch));
@@ -773,6 +774,16 @@ fn pni_signature(
     // Told once: a contact repeats the signature with every message until our receipt arrives.
     if let Some(event) = crate::links::learn(conn, account, pni, aci, now)? {
         facts.events.push(event);
+        // The core's merge does not carry the PNI's number verdict over (it was stated for
+        // another service id): the ACI gets a `peers` row, so that a profile key that arrives
+        // in stage 2 is a change of the rule's inputs, and its verdict is stated now (P1 F2b).
+        let aci_sid = ServiceId::from(aci).service_id_string();
+        crate::peers::ensure(conn, &aci_sid, now)?;
+        if let Ok(user) = aci_user_id(aci) {
+            let mut patch = ContactPatch::new(user);
+            patch.number_shown = Some(crate::peers::number_shown(conn, &aci_sid)?);
+            facts.events.push(BackendEvent::ContactUpsert(patch));
+        }
     }
     Ok(())
 }
@@ -818,6 +829,8 @@ fn sender_number(
         kind: IdentifierKind::Phone,
         value: e164.to_owned(),
     }]);
+    // The certificate tells the number; whether it may be SHOWN is the rule's word.
+    patch.number_shown = Some(crate::peers::number_shown(conn, &service_id)?);
     facts.events.push(BackendEvent::ContactUpsert(patch));
     Ok(())
 }

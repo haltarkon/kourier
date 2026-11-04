@@ -6,8 +6,9 @@
 //! the one dialog of the front-end shows all three with the same guard (`armDelay`, Cancel the
 //! default, never confirmed by Enter).
 
-use kourier_model::{AccountId, DeviceLogout, LogoutReport};
+use kourier_model::{AccountId, DeviceLogout, LogoutReport, NetworkKind};
 
+use crate::conversations::network_name;
 use crate::i18n::{trc, trfc};
 use crate::transfer::ReplaceQuestion;
 
@@ -74,6 +75,81 @@ pub fn remove_question(account: AccountId, about: String, linked: bool) -> Repla
             trc(
                 "@info question before an account is removed from this computer",
                 "To use this account here again, link it again with your phone.",
+            )
+            .into_owned(),
+        ],
+        confirm: trc(
+            "@action:button remove an account from this computer",
+            "Remove Account",
+        )
+        .into_owned(),
+        cancel: trc("@action:button", "Cancel").into_owned(),
+    }
+}
+
+/// The question before "Remove Account…" of an account whose network is turned off in this
+/// Kourier (`kind`: the network): nothing can reach the network, so it is not told. The
+/// account's data goes from this computer and the network keeps the device until the person
+/// removes it there (the notice that follows says so too). `missing`: this build cannot connect
+/// to the network at all (Telegram). Telegram has sessions, not a main phone that holds the list
+/// of linked devices, so for it, missing or only turned off, the words speak of a session and
+/// never of a phone (fix round F7, post-rebase fix a).
+pub fn remove_question_while_off(
+    account: AccountId,
+    about: String,
+    kind: NetworkKind,
+    missing: bool,
+) -> ReplaceQuestion {
+    let network = network_name(kind);
+    let sessions = missing || kind == NetworkKind::Telegram;
+    ReplaceQuestion {
+        account,
+        title: trc(
+            "@title:dialog question before an account is removed from this computer",
+            "Remove Account?",
+        )
+        .into_owned(),
+        about,
+        paragraphs: vec![
+            // Nothing can reach the network in any case; only the reason differs.
+            if missing {
+                // Only Telegram can be missing.
+                trfc(
+                    "@info question before an account of a network this build cannot connect to is removed from this computer, %1 the network",
+                    "This build of Kourier cannot connect to %1, so it cannot end this session. Kourier deletes this account's chats, messages and files from this computer.",
+                    &[network],
+                )
+            } else if sessions {
+                trfc(
+                    "@info question before an account of a network with sessions that is turned off is removed from this computer, %1 the network",
+                    "%1 is turned off, so Kourier cannot end this session. Kourier deletes this account's chats, messages and files from this computer.",
+                    &[network],
+                )
+            } else {
+                trfc(
+                    "@info question before an account of a network that is turned off is removed from this computer, %1 the network",
+                    "%1 is turned off, so Kourier cannot tell your phone. Kourier deletes this account's chats, messages and files from this computer.",
+                    &[network],
+                )
+            },
+            if sessions {
+                // The session is listed in every other app of the account until it is ended
+                // there (the menu path is not named: unverified until R1).
+                trfc(
+                    "@info question before an account of a network with sessions is removed from this computer without ending its session, %1 the network",
+                    "This session stays listed in your other %1 apps until you end it there.",
+                    &[network],
+                )
+            } else {
+                trc(
+                    "@info question before an account of a network that is turned off is removed from this computer",
+                    "This computer stays in the linked devices of your phone until you remove it there.",
+                )
+                .into_owned()
+            },
+            trc(
+                "@info question before an account is removed from this computer",
+                "Your account, and the messages on your phone and your other devices, stay as they are.",
             )
             .into_owned(),
         ],

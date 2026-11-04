@@ -121,6 +121,19 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes a directory and everything in it; a directory that is not there is fine.
+/// (`remove_dir_all` removes a symbolic link itself, never what it points to.)
+fn remove_tree_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The directory of a Telegram account's TDLib database (its session with Telegram's servers):
+/// credentials too, so an unlink wipes it with the backend's database (TG-2 S-4).
+const TDLIB_DIR: &str = "tdlib";
+
 impl AccountVault for AppVault {
     fn create(&self, uuid: AccountUuid, network: NetworkKind) -> VaultFuture<'_, DbKey> {
         Box::pin(async move {
@@ -199,6 +212,7 @@ impl AccountVault for AppVault {
             ] {
                 remove_if_exists(&dir.join(name))?;
             }
+            remove_tree_if_exists(&dir.join(TDLIB_DIR))?;
             Ok(())
         })
     }
@@ -270,9 +284,15 @@ mod tests {
         assert!(v.backend_db(uuid).starts_with(tmp.path()));
         std::fs::write(v.backend_db(uuid), b"x").expect("backend.db");
         std::fs::create_dir_all(v.blob_dir(uuid)).expect("blobs");
+        // A Telegram account's TDLib database (S-4).
+        let tdlib = v.dir(uuid).join("tdlib");
+        std::fs::create_dir_all(tdlib.join("db")).expect("tdlib dir");
+        std::fs::write(tdlib.join("td.binlog"), b"x").expect("binlog");
+        std::fs::write(tdlib.join("db").join("db.sqlite"), b"x").expect("tdlib db");
 
         v.wipe_credentials(uuid).await.expect("wipe");
         assert!(!v.backend_db(uuid).exists());
+        assert!(!tdlib.exists(), "TDLib's session goes with the credentials");
         assert!(v.blob_dir(uuid).exists(), "blobs stay after an unlink");
         assert!(v.list().await.expect("list").is_empty());
         assert!(matches!(v.unwrap(uuid).await, Err(VaultError::Missing)));

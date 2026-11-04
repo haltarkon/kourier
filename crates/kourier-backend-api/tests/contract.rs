@@ -125,6 +125,7 @@ fn all_events() -> Vec<BackendEvent> {
             conv: group(),
             up_to: vec![target(), MsgTarget::to_id(Some(group()), &NetMsgId::own("7"))],
             remove: true,
+            before_ms: None,
             at: 1_700_000_000_100,
         },
         AttachmentDeleted => BackendEvent::AttachmentDeleted {
@@ -151,6 +152,12 @@ fn all_events() -> Vec<BackendEvent> {
             cmd: None,
         },
         Message => BackendEvent::Message(message("2")),
+        Message => {
+            let mut cloud = message("3");
+            cloud.net_seq = Some(1_700_000_000_123);
+            cloud.allocated_as = Some("k0f".into());
+            BackendEvent::Message(cloud)
+        },
         HistoryBatch => BackendEvent::HistoryBatch {
             conv: group(),
             messages: vec![history],
@@ -180,6 +187,8 @@ fn all_events() -> Vec<BackendEvent> {
             at: 10,
         },
         ReadMarker => BackendEvent::ReadMarker { conv: None, up_to: target() },
+        ReadUpTo => BackendEvent::ReadUpTo { conv: group(), seq: 120 },
+        PeerReadUpTo => BackendEvent::PeerReadUpTo { conv: group(), seq: 119 },
         OwnSendState => BackendEvent::OwnSendState {
             local: Some(MessageId(4)),
             target: MsgTarget::to_id(Some(group()), &NetMsgId::own("6")),
@@ -212,6 +221,8 @@ fn all_events() -> Vec<BackendEvent> {
         HistoryTransfer => BackendEvent::HistoryTransfer(HistoryTransfer::Failed(HistoryTransferFailure::UpdateApp)),
         AccountProgress => BackendEvent::AccountProgress(kourier_model::AccountProgress { messages_done: 1, messages_total: 2, profiles_left: 3, groups_left: 4, finished: false }),
         AccountProgress => BackendEvent::AccountProgress(kourier_model::AccountProgress::finished()),
+        AccountHold => BackendEvent::AccountHold(Some(kourier_model::AccountHold { until_ms: Some(9), reason: kourier_model::HoldReason::ReachOutLocked })),
+        AccountHold => BackendEvent::AccountHold(None),
         Logout => BackendEvent::Logout(kourier_model::LogoutReport { outcome: kourier_model::DeviceLogout::Removed, device_name: Some("Kourier".into()) }),
         Logout => BackendEvent::Logout(kourier_model::LogoutReport::new(kourier_model::DeviceLogout::NotReached)),
     })
@@ -222,7 +233,9 @@ fn every_enum_roundtrips_by_name() {
     assert!(all_events().len() >= 24);
     roundtrip_all!(BackendNotice {
         IdentityChanged => BackendNotice::IdentityChanged { user: uid("aci:a") },
+        IdentityTrusted => BackendNotice::IdentityTrusted { user: uid("aci:a") },
         ChallengeRequired => BackendNotice::ChallengeRequired { url: "signalcaptcha://".into(), retry_after: Some(Duration::from_secs(60)) },
+        HistoryLost => BackendNotice::HistoryLost { count: 3 },
         Error => BackendNotice::Error(BackendError::unsupported("no").with_user_message("Not here")),
     });
     roundtrip_all!(OutgoingKind {
@@ -240,6 +253,11 @@ fn every_enum_roundtrips_by_name() {
             server_at: Some(1),
             per_recipient: vec![(uid("aci:a"), RecipientState::Sent { sealed: false })],
         },
+        SentAs => TransmitOutcome::SentAs {
+            assigned: AssignedId { local: "4821".into(), seq: 1_700_000_000_123 },
+            server_at: Some(1),
+            per_recipient: vec![(uid("aci:a"), RecipientState::Sent { sealed: false })],
+        },
         Partial => TransmitOutcome::Partial {
             delivered: vec![(uid("aci:a"), RecipientState::Sent { sealed: true })],
             failed: vec![(uid("aci:b"), BackendError::transient("timeout"))],
@@ -254,12 +272,19 @@ fn every_enum_roundtrips_by_name() {
             newest: vec![target(), target()],
             newest_non_expiring: vec![target()],
             remove: true,
+            before_ms: Some(1_700_000_000_000),
+            system_before_ms: Some(1_700_000_001_000),
         },
         DeleteAttachment => DurableCommand::DeleteAttachment {
             conv: group(),
             target: target(),
             index: 2,
             net_ids: vec!["uuid:00ff".to_owned()].into(),
+        },
+        ChangeConversation => DurableCommand::ChangeConversation {
+            conv: group(),
+            change: ConversationChange::SetMarkedUnread { marked_unread: false },
+            asked_at: 1_700_000_000_000,
         },
         RequestAttachments => DurableCommand::RequestAttachments { conv: group(), target: target() },
     });
@@ -317,7 +342,7 @@ fn outbox_codec_roundtrips_durable_events_only() {
     let events = all_events();
     let (ephemeral, durable): (Vec<_>, Vec<_>) =
         events.into_iter().partition(BackendEvent::is_ephemeral);
-    assert_eq!(ephemeral.len(), 12);
+    assert_eq!(ephemeral.len(), 14);
     // One row per event, and all durable events of a transaction in one row.
     for e in &durable {
         let row = encode_outbox_row(std::slice::from_ref(e)).expect("durable");
@@ -432,6 +457,22 @@ fn envelope_rules() {
         acked_typing.validate(),
         Err(ContractViolation::EphemeralWithAck("Typing"))
     );
+    // The account hold is a state the backend reports again at every connect: ephemeral, never
+    // stored, so an ack on it is a contract violation (the core would store a deadline row).
+    for hold in [
+        BackendEvent::AccountHold(None),
+        BackendEvent::AccountHold(Some(kourier_model::AccountHold {
+            until_ms: Some(1),
+            reason: kourier_model::HoldReason::ReachOutLocked,
+        })),
+    ] {
+        assert_eq!(Envelope::ephemeral(hold.clone()).validate(), Ok(()));
+        let (acked, _w) = Envelope::durable(vec![hold]);
+        assert_eq!(
+            acked.validate(),
+            Err(ContractViolation::EphemeralWithAck("AccountHold"))
+        );
+    }
     let (empty, _w) = Envelope::durable(vec![]);
     assert_eq!(empty.validate(), Err(ContractViolation::Empty));
     let big = BackendEvent::HistoryBatch {
@@ -795,9 +836,20 @@ impl EchoNetwork {
                 login_flows: vec![],
                 start_chat: vec![],
                 history: HistorySource::None,
+                history_read: kourier_model::HistoryReadState::Known,
                 msg_id_scope: MsgIdScope::AccountAuthor,
                 typing: TypingPolicy::default(),
                 risk_notice: None,
+                history_transfer: false,
+                experimental: false,
+                edit_target: EditTarget::default(),
+                outbox: OutboxPolicy::default(),
+                shutdown_grace: None,
+                safety_numbers: false,
+                contact_cards: false,
+                cleaned_pictures: None,
+                receipts_always_sent: false,
+                server: ServerRules::default(),
             },
         }
     }
@@ -989,6 +1041,23 @@ fn dropped_exit_sender_reads_as_panic() {
     ));
 }
 
+/// The abort of an upload is a plain command with an answer of its own: not durable (nothing is
+/// stored, nothing is replayed after a restart), named for the log, and its answers survive
+/// serde by name.
+#[test]
+fn an_abort_is_not_durable_and_its_answers_roundtrip() {
+    let (reply, _answer) = oneshot::channel();
+    let abort = Command::AbortTransmit {
+        local: MessageId(4),
+        reply,
+    };
+    assert_eq!((abort.name(), abort.durable_id()), ("AbortTransmit", None));
+    roundtrip_all!(AbortAnswer {
+        Stopping => AbortAnswer::Stopping,
+        TooLate => AbortAnswer::TooLate,
+    });
+}
+
 #[test]
 fn durable_commands_and_outcomes() {
     let d = DurableCommand::SyncReadMarker {
@@ -1009,6 +1078,8 @@ fn durable_commands_and_outcomes() {
         newest: vec![target()],
         newest_non_expiring: Vec::new(),
         remove: true,
+        before_ms: Some(1_700_000_000_000),
+        system_before_ms: Some(1_700_000_001_000),
     };
     match clear.clone().into_command(CmdId(10)) {
         Command::ClearConversation {
@@ -1017,8 +1088,12 @@ fn durable_commands_and_outcomes() {
             newest,
             newest_non_expiring,
             remove,
+            before_ms,
+            system_before_ms,
         } => {
             assert_eq!((cmd, conv, remove), (CmdId(10), group(), true));
+            assert_eq!(before_ms, Some(1_700_000_000_000));
+            assert_eq!(system_before_ms, Some(1_700_000_001_000));
             assert_eq!((newest, newest_non_expiring), (vec![target()], Vec::new()));
         }
         other => panic!("unexpected {}", other.name()),
@@ -1062,9 +1137,36 @@ fn durable_commands_and_outcomes() {
     .expect("an old row");
     assert!(matches!(
         old,
-        DurableCommand::ClearConversation { remove: false, ref newest, .. } if newest.is_empty()
+        DurableCommand::ClearConversation {
+            remove: false,
+            before_ms: None,
+            system_before_ms: None,
+            ref newest,
+            ..
+        } if newest.is_empty()
+    ));
+    // K-B1: a clear by time is new; an event or a stored command without it reads as none.
+    let old: BackendEvent = serde_json::from_str(&format!(
+        r#"{{"ConversationCleared":{{"conv":{},"at":5}}}}"#,
+        serde_json::to_string(&group()).expect("key")
+    ))
+    .expect("an old event");
+    assert!(matches!(
+        old,
+        BackendEvent::ConversationCleared {
+            before_ms: None,
+            remove: false,
+            at: 5,
+            ..
+        }
     ));
     assert_eq!(kourier_backend_api::CLEAR_ANCHORS, 5);
+    // A clear by time may name a time ahead of this computer's clock by up to an hour (the
+    // network's clock may run ahead; the core reads a later time as that bound).
+    assert_eq!(
+        kourier_backend_api::CLEAR_CLOCK_TOLERANCE,
+        std::time::Duration::from_secs(3600)
+    );
     let partial = TransmitOutcome::Partial {
         delivered: vec![(uid("aci:a"), RecipientState::Sent { sealed: true })],
         failed: vec![
@@ -1077,6 +1179,86 @@ fn durable_commands_and_outcomes() {
     };
     assert_eq!(partial.retryable_members(), vec![uid("aci:b")]);
     assert_eq!(partial.permanently_failed(), vec![uid("aci:c")]);
+}
+
+/// A10a: the core's own durable change of a chat is a command of its own. It carries a `cmd`
+/// and no `reply` (the backend answers `CommandPersisted` after its durable write), every field
+/// of the stored row reaches the command, and the stored row keeps its spelling.
+#[test]
+fn a_durable_conversation_change_is_a_command_without_a_reply() {
+    let stored = DurableCommand::ChangeConversation {
+        conv: group(),
+        change: ConversationChange::SetMarkedUnread {
+            marked_unread: false,
+        },
+        asked_at: 1_700_000_123_456,
+    };
+    match stored.clone().into_command(CmdId(21)) {
+        Command::ChangeConversationDurable {
+            cmd,
+            conv,
+            change,
+            asked_at,
+        } => {
+            assert_eq!(
+                (cmd, conv, asked_at),
+                (CmdId(21), group(), 1_700_000_123_456)
+            );
+            assert_eq!(
+                change,
+                ConversationChange::SetMarkedUnread {
+                    marked_unread: false
+                }
+            );
+        }
+        other => panic!("unexpected {}", other.name()),
+    }
+    let command = stored.clone().into_command(CmdId(21));
+    assert_eq!(
+        (command.name(), command.durable_id()),
+        ("ChangeConversationDurable", Some(CmdId(21)))
+    );
+    // The row `pending_commands.command` holds: the variant's name, the change as the model
+    // spells it, the time in ms. A rename here would strand the rows of a profile.
+    let json = serde_json::to_value(&stored).expect("serialize");
+    assert_eq!(
+        json,
+        serde_json::json!({"ChangeConversation": {
+            "conv": serde_json::to_value(group()).expect("key"),
+            "change": {"SetMarkedUnread": {"marked_unread": false}},
+            "asked_at": 1_700_000_123_456_i64,
+        }})
+    );
+    // Log-safe: the key's `Debug` is a hash, never the id.
+    let secret = "SECRET";
+    let quiet = DurableCommand::ChangeConversation {
+        conv: ConvKey::Group(format!("gv2:{secret}").into()),
+        change: ConversationChange::SetMuted { until: Some(5) },
+        asked_at: 7,
+    };
+    let text = format!("{quiet:?} {:?}", quiet.clone().into_command(CmdId(22)));
+    assert!(!text.contains(secret), "{text}");
+}
+
+/// A10a: `SetRoamingWrites` is a request command (a reply, not durable), and the caps flag it
+/// changes reads in three states.
+#[test]
+fn the_roaming_switch_is_a_request_and_its_flag_has_three_states() {
+    let (reply, _rx) = oneshot::channel();
+    let switch = Command::SetRoamingWrites { on: true, reply };
+    assert_eq!(
+        (switch.name(), switch.durable_id()),
+        ("SetRoamingWrites", None)
+    );
+    let mut caps = AccountCaps::default();
+    assert_eq!(caps.roaming_writes(), None, "absent: the network cannot");
+    caps.flags
+        .insert(AccountCaps::FLAG_ROAMING_WRITES.to_owned(), false);
+    assert_eq!(caps.roaming_writes(), Some(false), "off");
+    caps.flags
+        .insert(AccountCaps::FLAG_ROAMING_WRITES.to_owned(), true);
+    assert_eq!(caps.roaming_writes(), Some(true), "on");
+    assert_eq!(AccountCaps::FLAG_ROAMING_WRITES, "roaming_writes");
 }
 
 #[test]
@@ -1131,6 +1313,7 @@ fn debug_of_events_and_commands_is_log_safe() {
         }),
         BackendEvent::ConversationUpsert(ConversationPatch {
             title: Patch::Set(secret.into()),
+            description: Patch::Set(secret.into()),
             ..ConversationPatch::new(group())
         }),
         BackendEvent::Login(LoginStep {
@@ -1265,6 +1448,7 @@ fn clear_and_attachment_delete_targets_are_checked() {
                 conv: group(),
                 up_to: vec![target(), bad.clone()],
                 remove: false,
+                before_ms: None,
                 at: 1,
             },
         ),
@@ -1301,6 +1485,7 @@ fn clear_and_attachment_delete_targets_are_checked() {
         conv: group(),
         up_to: Vec::new(),
         remove: true,
+        before_ms: None,
         at: 1,
     }]);
     assert_eq!(env.validate(), Ok(()));
@@ -1333,4 +1518,282 @@ fn a_restore_report_names_its_command_and_an_old_event_has_none() {
         panic!("not an AttachmentRestore");
     };
     assert_eq!(cmd, None);
+}
+
+/// KT-2: `SentAs` is a send with an id and a position added. It round-trips by name, an answer
+/// without `server_at` and `per_recipient` reads as the empty ones (as `Sent`'s do), the seq is
+/// not optional, and the members it names are never retried or failed (it is `Sent` in this
+/// respect).
+#[test]
+fn a_sent_as_answer_roundtrips_and_leaves_no_member_to_retry() {
+    let answer = TransmitOutcome::SentAs {
+        assigned: AssignedId {
+            local: "4821".into(),
+            seq: 1_700_000_000_123,
+        },
+        server_at: Some(5),
+        per_recipient: vec![(uid("aci:a"), RecipientState::Sent { sealed: false })],
+    };
+    let json = serde_json::to_value(&answer).expect("serialize");
+    assert_eq!(json["SentAs"]["assigned"]["local"], "4821");
+    assert_eq!(json["SentAs"]["assigned"]["seq"], 1_700_000_000_123_i64);
+    assert_eq!(
+        serde_json::from_value::<TransmitOutcome>(json).expect("deserialize"),
+        answer
+    );
+    let bare: TransmitOutcome =
+        serde_json::from_str(r#"{"SentAs":{"assigned":{"local":"4821","seq":9}}}"#)
+            .expect("an answer that names no time and no recipient");
+    assert_eq!(
+        bare,
+        TransmitOutcome::SentAs {
+            assigned: AssignedId {
+                local: "4821".into(),
+                seq: 9
+            },
+            server_at: None,
+            per_recipient: Vec::new(),
+        }
+    );
+    assert!(
+        serde_json::from_str::<TransmitOutcome>(r#"{"SentAs":{"assigned":{"local":"4821"}}}"#)
+            .is_err(),
+        "a network that assigns an id always has its position"
+    );
+    assert!(answer.retryable_members().is_empty());
+    assert!(answer.permanently_failed().is_empty());
+}
+
+/// KT-2: the two read positions are durable events of their own (stored in `core_outbox` and
+/// replayed), tagged by name, and their conversation key is checked like every other.
+#[test]
+fn the_read_positions_are_durable_and_their_conversation_is_checked() {
+    let own = BackendEvent::ReadUpTo {
+        conv: group(),
+        seq: 120,
+    };
+    let peer = BackendEvent::PeerReadUpTo {
+        conv: group(),
+        seq: 119,
+    };
+    let no_scheme = ConvKey::Group("no-scheme".into());
+    for (event, name, seq, bad) in [
+        (
+            own,
+            "ReadUpTo",
+            120,
+            BackendEvent::ReadUpTo {
+                conv: no_scheme.clone(),
+                seq: 120,
+            },
+        ),
+        (
+            peer,
+            "PeerReadUpTo",
+            119,
+            BackendEvent::PeerReadUpTo {
+                conv: no_scheme,
+                seq: 119,
+            },
+        ),
+    ] {
+        assert_eq!(event.name(), name);
+        assert!(!event.is_ephemeral());
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(json[name]["seq"], seq, "{json}");
+        assert_eq!(
+            serde_json::from_value::<BackendEvent>(json).expect("deserialize"),
+            event
+        );
+        let row = encode_outbox_row(std::slice::from_ref(&event)).expect("durable");
+        assert_eq!(decode_outbox_row(&row).ok(), Some(vec![event.clone()]));
+        let (env, _w) = Envelope::durable(vec![event]);
+        assert_eq!(env.validate(), Ok(()));
+        // The position is any number: there need be no message at it.
+        for seq in [i64::MIN, -1, 0, i64::MAX] {
+            let json = format!(r#"{{"{name}":{{"conv":"group:gv2:AbC","seq":{seq}}}}}"#);
+            assert!(
+                serde_json::from_str::<BackendEvent>(&json).is_ok(),
+                "{json}"
+            );
+        }
+        let (env, _w) = Envelope::durable(vec![bad]);
+        assert!(
+            matches!(
+                env.validate(),
+                Err(ContractViolation::InvalidId { event, .. }) if event == name
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// KT-2: `net_seq`, `allocated_as` and `server_unread` / `server_mentions` are additive. A
+/// message or a chat that states none writes none of them, and a `core_outbox` row written before
+/// they existed (the backend replays such rows after an upgrade) still decodes, with `None`.
+#[test]
+fn rows_written_before_the_cloud_fields_still_decode() {
+    let mut stated = message("7");
+    stated.net_seq = Some(1_700_000_000_123);
+    stated.allocated_as = Some("k0f".into());
+    let json = serde_json::to_value(&stated).expect("serialize");
+    assert_eq!(json["net_seq"], 1_700_000_000_123_i64);
+    assert_eq!(json["allocated_as"], "k0f");
+    assert_eq!(
+        serde_json::from_value::<IncomingMessage>(json.clone()).expect("deserialize"),
+        stated
+    );
+    let mut older = json;
+    let fields = older.as_object_mut().expect("object");
+    fields.remove("net_seq");
+    fields.remove("allocated_as");
+    let back: IncomingMessage = serde_json::from_value(older).expect("an older message reads");
+    assert_eq!((back.net_seq, back.allocated_as.as_deref()), (None, None));
+    assert_eq!(back, message("7"));
+    let plain = serde_json::to_string(&message("7")).expect("serialize");
+    assert!(
+        !plain.contains("net_seq") && !plain.contains("allocated_as"),
+        "None is not written: {plain}"
+    );
+
+    let mut chat = ConversationPatch::new(group());
+    chat.server_unread = Some(7);
+    chat.server_mentions = Some(2);
+    let event = BackendEvent::ConversationUpsert(chat);
+    let mut json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["ConversationUpsert"]["server_unread"], 7);
+    assert_eq!(json["ConversationUpsert"]["server_mentions"], 2);
+    assert_eq!(
+        serde_json::from_value::<BackendEvent>(json.clone()).expect("deserialize"),
+        event
+    );
+    let fields = json["ConversationUpsert"].as_object_mut().expect("object");
+    fields.remove("server_unread");
+    fields.remove("server_mentions");
+    assert_eq!(
+        serde_json::from_value::<BackendEvent>(json).expect("an older chat reads"),
+        BackendEvent::ConversationUpsert(ConversationPatch::new(group()))
+    );
+    let plain = serde_json::to_string(&ConversationPatch::new(group())).expect("serialize");
+    assert!(!plain.contains("server_"), "None is not written: {plain}");
+
+    // The whole row, as an older backend wrote it: neither a message nor a chat names a new field.
+    let mut old = OUTBOX_FORMAT.to_le_bytes().to_vec();
+    old.extend_from_slice(
+        serde_json::to_string(&[
+            BackendEvent::Message(message("7")),
+            BackendEvent::ConversationUpsert(ConversationPatch::new(group())),
+        ])
+        .expect("serialize")
+        .as_bytes(),
+    );
+    let events = decode_outbox_row(&old).expect("an older row decodes");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            BackendEvent::Message(IncomingMessage {
+                net_seq: None,
+                allocated_as: None,
+                ..
+            }),
+            BackendEvent::ConversationUpsert(ConversationPatch {
+                server_unread: None,
+                server_mentions: None,
+                ..
+            }),
+        ]
+    ));
+}
+
+/// KT-2: the id an own message was allocated under is checked like every other id of an
+/// envelope, in a live message and in a history batch.
+#[test]
+fn a_bad_allocated_id_is_refused() {
+    let long = "9".repeat(kourier_backend_api::model::ids::MAX_ID_LEN + 1);
+    let mut good = message("1");
+    good.allocated_as = Some("k0f".into());
+    let (env, _w) = Envelope::durable(vec![BackendEvent::Message(good.clone())]);
+    assert_eq!(env.validate(), Ok(()));
+    for bad in ["", "x\u{0}y", long.as_str()] {
+        let mut m = good.clone();
+        m.allocated_as = Some(bad.into());
+        let (live, _w) = Envelope::durable(vec![BackendEvent::Message(m.clone())]);
+        assert!(
+            matches!(
+                live.validate(),
+                Err(ContractViolation::InvalidId {
+                    event: "Message",
+                    ..
+                })
+            ),
+            "{bad:?}"
+        );
+        let (batch, _w) = Envelope::durable(vec![BackendEvent::HistoryBatch {
+            conv: group(),
+            messages: vec![good.clone(), m],
+            has_more: false,
+            progress: None,
+        }]);
+        assert!(
+            matches!(
+                batch.validate(),
+                Err(ContractViolation::InvalidId {
+                    event: "HistoryBatch",
+                    ..
+                })
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+/// KT-2: a position is in `0..=MAX_NET_SEQ` wherever an envelope states one (a message, a message
+/// of a history batch, `ReadUpTo`, `PeerReadUpTo`): another is refused for good, because positions
+/// only rise and one bogus number would read a chat for good. Both ends of the range pass.
+/// Mutants: `is_net_seq` as `seq <= MAX_NET_SEQ` (the lower bound gone), as `0..MAX_NET_SEQ` (the
+/// upper bound open), and the `positions_in_range` check removed from `Envelope::validate`.
+#[test]
+fn a_position_out_of_range_is_refused_wherever_an_envelope_states_one() {
+    let at = |seq: i64| -> Vec<(&'static str, BackendEvent)> {
+        let mut stated = message("1");
+        stated.net_seq = Some(seq);
+        vec![
+            ("Message", BackendEvent::Message(stated.clone())),
+            (
+                "HistoryBatch",
+                BackendEvent::HistoryBatch {
+                    conv: group(),
+                    messages: vec![message("0"), stated],
+                    has_more: false,
+                    progress: None,
+                },
+            ),
+            ("ReadUpTo", BackendEvent::ReadUpTo { conv: group(), seq }),
+            (
+                "PeerReadUpTo",
+                BackendEvent::PeerReadUpTo { conv: group(), seq },
+            ),
+        ]
+    };
+    for seq in [-1, MAX_NET_SEQ + 1, i64::MIN, i64::MAX] {
+        for (name, event) in at(seq) {
+            let (env, _w) = Envelope::durable(vec![event]);
+            assert_eq!(
+                env.validate(),
+                Err(ContractViolation::PositionOutOfRange(name)),
+                "{name} at {seq}"
+            );
+        }
+    }
+    for seq in [0, 1, MAX_NET_SEQ] {
+        for (name, event) in at(seq) {
+            let (env, _w) = Envelope::durable(vec![event]);
+            assert_eq!(env.validate(), Ok(()), "{name} at {seq}");
+        }
+    }
+    assert!(is_net_seq(0) && is_net_seq(MAX_NET_SEQ));
+    assert!(!is_net_seq(-1) && !is_net_seq(MAX_NET_SEQ + 1));
+    // A message with no position states none.
+    let (env, _w) = Envelope::durable(vec![BackendEvent::Message(message("2"))]);
+    assert_eq!(env.validate(), Ok(()));
 }

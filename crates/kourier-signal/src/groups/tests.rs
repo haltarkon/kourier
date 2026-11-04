@@ -123,6 +123,119 @@ fn group_features_say_why_we_cannot_send() {
     );
 }
 
+/// P2: "only admins" is exactly the proto's `ADMINISTRATOR` (3): `UNKNOWN` (the group stated
+/// nothing), `ANY`, `MEMBER` and `UNSATISFIABLE` (nobody) are not, for the group's info and for
+/// adding members alike.
+#[test]
+fn only_the_administrator_access_level_is_admin_only() {
+    use super::Access;
+    use crate::proto::access_control::AccessRequired as Level;
+    assert_eq!(
+        super::ACCESS_ADMINISTRATOR,
+        Level::Administrator as i32,
+        "the constant is the proto's number"
+    );
+    for level in [
+        Level::Unknown,
+        Level::Any,
+        Level::Member,
+        Level::Unsatisfiable,
+    ] {
+        let access = Access {
+            attributes: level as i32,
+            members: level as i32,
+            add_from_invite_link: Level::Administrator as i32,
+        };
+        assert!(!access.attributes_admin_only(), "attributes {level:?}");
+        assert!(!access.members_admin_only(), "members {level:?}");
+    }
+    let admin = Level::Administrator as i32;
+    let member = Level::Member as i32;
+    let attributes = Access {
+        attributes: admin,
+        members: member,
+        add_from_invite_link: 0,
+    };
+    assert!(attributes.attributes_admin_only() && !attributes.members_admin_only());
+    let members = Access {
+        attributes: member,
+        members: admin,
+        add_from_invite_link: 0,
+    };
+    assert!(!members.attributes_admin_only() && members.members_admin_only());
+}
+
+/// P2: what the group page shows reaches the core with the group's fetch: the description (or its
+/// clearing) and the rules as the snapshot states them.
+#[test]
+fn a_fetch_states_the_description_and_the_rules_of_the_group() {
+    use super::Access;
+    use super::apply::{AvatarUpdate, Outcome};
+    use super::decode::DecodedState;
+    use kourier_model::{GroupInfo, Patch};
+    let fixture = crate::receive::tests::fixture();
+    let me = member(Uuid::from(fixture.account.aci).as_u128(), false);
+    let fetch = |snapshot: Snapshot| {
+        let outcome = Outcome::Current {
+            state: Box::new(DecodedState {
+                snapshot,
+                profile_keys: Vec::new(),
+            }),
+            changes: Vec::new(),
+            endorsements: None,
+            avatar: AvatarUpdate::Unchanged,
+        };
+        let (events, _) = answered(&fixture, "member", outcome);
+        the_upsert(&events).clone()
+    };
+
+    let strict = fetch(Snapshot {
+        description: Some("Meet at six.\nBring water.".to_owned()),
+        members: vec![me.clone()],
+        access: Access {
+            attributes: super::ACCESS_ADMINISTRATOR,
+            members: 2,
+            add_from_invite_link: 4,
+        },
+        announcements_only: true,
+        ..Snapshot::default()
+    });
+    assert_eq!(
+        strict.description,
+        Patch::Set("Meet at six.\nBring water.".into())
+    );
+    assert_eq!(
+        strict.features.as_ref().and_then(|f| f.group_info),
+        Some(GroupInfo {
+            attributes_admin_only: true,
+            members_admin_only: false,
+            announcements_only: true,
+            terminated: false,
+        })
+    );
+
+    let ended = fetch(Snapshot {
+        members: vec![me],
+        access: Access {
+            attributes: 2,
+            members: super::ACCESS_ADMINISTRATOR,
+            add_from_invite_link: 4,
+        },
+        terminated: true,
+        ..Snapshot::default()
+    });
+    assert_eq!(ended.description, Patch::Clear, "no description says so");
+    assert_eq!(
+        ended.features.as_ref().and_then(|f| f.group_info),
+        Some(GroupInfo {
+            attributes_admin_only: false,
+            members_admin_only: true,
+            announcements_only: false,
+            terminated: true,
+        })
+    );
+}
+
 /// Step S4b: a group the core has from a history import before its first fetch (no
 /// snapshot, membership unknown) is "still loading", a translatable reason; without a
 /// snapshot a group that is left or gone stays "not a member". An invitation and a request to

@@ -12,7 +12,7 @@
 //! (`support::fake_core`). Skips without Node ≥ 24 or the harness's `node_modules`
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
@@ -297,6 +297,100 @@ async fn group_reaches_the_core_with_title_members_and_avatar() {
     assert!(
         world.system_messages(&group).is_empty(),
         "no system messages on the first fetch"
+    );
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// P2 (the group's page): a group's description and rules reach the core with its first fetch. The
+/// first group is made the way Desktop makes one (everyone may change everything), the second with
+/// administrator-only access for the group's info and for adding members, in an announcement-only
+/// group with a description of two lines: the access numbers are the proto's (`MEMBER = 2`,
+/// `ADMINISTRATOR = 3`), encoded by the mock, not by this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_states_its_description_and_its_rules() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let open = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.phone.device_ref.clone(),
+            title: "Open club".to_owned(),
+            members: vec![world.ada.device_ref.clone()],
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("create the open group");
+    let strict = world
+        .harness
+        .create_group(&CreateGroup {
+            from: world.phone.device_ref.clone(),
+            title: "Strict club".to_owned(),
+            members: vec![world.ada.device_ref.clone()],
+            description: Some("Meet at six.\nBring water.".to_owned()),
+            announcements_only: Some(true),
+            attributes_access: Some("administrator".to_owned()),
+            members_access: Some("administrator".to_owned()),
+            ..CreateGroup::default()
+        })
+        .await
+        .expect("create the strict group");
+    let (mut core, _device) = world
+        .link(&StorageSpec {
+            primary: world.phone.device_ref.clone(),
+            groups: [&open, &strict]
+                .into_iter()
+                .map(|g| StorageGroup {
+                    id: g.id.clone(),
+                    ..StorageGroup::default()
+                })
+                .collect(),
+            ..StorageSpec::default()
+        })
+        .await;
+    core.wait_online().await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (open_fields, strict_fields) = loop {
+        let (a, b) = (world.upsert(&open), world.upsert(&strict));
+        if a.contains_key("features") && b.contains_key("features") {
+            break (a, b);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the groups never reached the core"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let info = &strict_fields["features"]["group_info"];
+    assert_eq!(info["attributes_admin_only"], true, "{info}");
+    assert_eq!(info["members_admin_only"], true, "{info}");
+    assert_eq!(info["announcements_only"], true, "{info}");
+    assert_eq!(info["terminated"], false, "{info}");
+    assert_eq!(
+        strict_fields["description"]["Set"], "Meet at six.\nBring water.",
+        "the description, with its line break"
+    );
+
+    let info = &open_fields["features"]["group_info"];
+    assert_eq!(
+        (
+            &info["attributes_admin_only"],
+            &info["members_admin_only"],
+            &info["announcements_only"]
+        ),
+        (
+            &Value::Bool(false),
+            &Value::Bool(false),
+            &Value::Bool(false)
+        ),
+        "a group made with member access is not admin-only: {info}"
+    );
+    assert_eq!(
+        open_fields["description"], "Clear",
+        "a group with no description says so"
     );
     assert_eq!(core.shutdown().await, Exit::Shutdown);
     world.harness.shutdown().await.expect("harness shutdown");
@@ -617,12 +711,8 @@ async fn a_removal_survives_a_kill_after_the_backend_commit() {
         kourier_signal::failpoints::AFTER_BACKEND_EFFECTS_COMMIT
     );
     let mut process = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "child_actor_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .arg(support::child_filter(module_path!(), "child_actor_process"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(&child).expect("spec"))
         .env("KOURIER_FAILPOINT", &failpoint)
         .stdin(Stdio::null())

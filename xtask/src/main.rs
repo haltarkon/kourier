@@ -1,4 +1,4 @@
-//! Developer tasks: `cargo xtask <ci|deps-check|symbols-check|shots|demo|smoke|perf|install|uninstall>`.
+//! Developer tasks: `cargo xtask <ci|deps-check|symbols-check|shots|demo|smoke|wa-run|tdlib|perf|install|uninstall>`.
 //!
 //! `ci` is the local CI: every step must pass before a commit. `ci --quick [--since <rev>]` is
 //! its tier for use while working: the unit tests of every package and the integration tests of
@@ -9,6 +9,9 @@
 //! compares the pictures with the stored ones ([`shots`]). `demo` runs the real app against Signal's mock server and photographs it ([`demo`]).
 //! `smoke` runs the real app step by step against a Signal server on a profile that keeps its
 //! login, and rehearses that against the mock ([`smoke`], `docs/smoke-run.md`).
+//! `wa-run` is its twin for the WhatsApp backend: the real run step by step on a profile that keeps
+//! its login, and a rehearsal against the fake playing WhatsApp ([`wa_run`], `docs/whatsapp-run.md`).
+//! `tdlib` builds, checks and locates the pinned, patched TDLib the Telegram helper opens ([`tdlib`]).
 //! `perf` measures the quality targets of §1.3 and prints them against their budgets
 //! ([`perf`]). `install` and `uninstall` put the release build under a prefix in the XDG
 //! layout and take it away again ([`install`]). `dist` makes the archives of a release on this
@@ -20,22 +23,49 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod cleaned;
 mod demo;
 mod dist;
+#[cfg(test)]
+mod filter_model;
+mod green;
 mod i18n;
 mod install;
+mod lock;
+mod manifest;
+mod names;
 mod perf;
+mod prune;
 mod quick;
 mod runner;
 mod seam;
 mod shots;
+mod slow;
 mod smoke;
+mod tdlib;
+mod tg_run;
+mod wa_run;
 mod workspace;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = real_main() {
+        // What `fn main() -> Result` prints; a run that did not wait for the test lock
+        // (`--no-wait`) ends with status 75 and its own sentence.
+        if err.downcast_ref::<lock::Busy>().is_some() {
+            eprintln!("{err}");
+        } else {
+            eprintln!("Error: {err:?}");
+        }
+        std::process::exit(lock::exit_code(&err));
+    }
+}
+
+fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("ci") => ci(&args[1..]),
+        Some("lock") => lock::command(&args[1..]),
+        Some("prune") => prune::command(&args[1..]),
         Some("deps-check") => deps_check(),
         Some("symbols-check") => symbols_check(args.get(1).map(PathBuf::from)),
         Some("shots") => shots::shots(&args[1..]),
@@ -56,13 +86,37 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some("wa-run") => {
+            // 0, 2 for the usage, or 1 when a step failed; a command that could not run is an error (1).
+            let status = wa_run::wa_run(&args[1..])?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
+        Some("tg-run") => {
+            // 0, 2 for the usage, or 1 when a check failed; a command that could not run is an error (1).
+            let status = tg_run::tg_run(&args[1..])?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
+        Some("tdlib") => {
+            // 0, 1 when a detached build still runs or a check failed, 2 for the usage.
+            let status = tdlib::tdlib(&args[1..])?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
         Some("i18n") => i18n::i18n(&args[1..]),
         Some("dist") => dist::dist(&args[1..]),
         Some("install") => install::install(&args[1..]),
         Some("uninstall") => install::uninstall(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <ci [--quick [--since <rev>]]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|i18n <extract|check|build [--out <dir>]>|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
+                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
             );
             std::process::exit(2);
         }
@@ -78,6 +132,10 @@ fn root() -> PathBuf {
 
 fn run(desc: &str, cmd: &mut Command) -> Result<()> {
     eprintln!("\n==> {desc}");
+    // `ci` prunes target/debug at its end by the graph of the cargo commands it ran.
+    prune::record(cmd);
+    // What runs under the test lock says so (a nested `cargo xtask` does not wait for it).
+    lock::mark_children(cmd);
     let status = cmd
         .current_dir(root())
         .status()
@@ -88,47 +146,224 @@ fn run(desc: &str, cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// The Telegram API pair `kourier-telegram` reads with `option_env!` (`api.rs`): no build, test or
+/// lint the xtask starts may compile one in from the caller's environment (TG-2 S-5). A release
+/// build that is meant to carry a pair must set it on its own command after `cargo()`; none does
+/// today.
+const TELEGRAM_API_VARS: [&str; 2] = ["KOURIER_TG_API_ID", "KOURIER_TG_API_HASH"];
+
 fn cargo() -> Command {
-    Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    lock::mark_children(&mut cmd);
+    for var in TELEGRAM_API_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// The colour scheme files the screenshots read (a part of the green-run digest, T5b).
+fn scheme_files() -> Vec<PathBuf> {
+    SHOT_THEMES
+        .iter()
+        .map(|(_, scheme, _)| color_scheme_file(scheme))
+        .collect()
+}
+
+/// What a `ci` run knows about the tree it stands on when it starts (T5b, [`green`]): the
+/// digest of the tree and its surroundings, and the records earlier green runs left.
+pub struct Start {
+    sys: Option<green::System>,
+    pub digest: Option<green::Digest>,
+    pub records: Vec<(green::Tier, green::Record)>,
+    /// `--force`: run although a record covers this run.
+    pub force: bool,
+}
+
+impl Start {
+    /// Takes the digest (after the test lock: the tree must not change under a run that waited).
+    /// A digest that cannot be taken is told and means no skip and no record, never a failure.
+    fn take(force: bool) -> Start {
+        let (sys, digest) = match green::System::query(&root(), &scheme_files()) {
+            Ok(sys) => match green::digest(&root(), &sys) {
+                Ok(digest) => (Some(sys), Some(digest)),
+                Err(e) => {
+                    eprintln!("ci: cannot take the digest of the tree ({e:#}): no skip, no record");
+                    (Some(sys), None)
+                }
+            },
+            Err(e) => {
+                eprintln!("ci: cannot ask the machine for the digest ({e:#}): no skip, no record");
+                (None, None)
+            }
+        };
+        Start {
+            sys,
+            digest,
+            records: green::load(&target_dir()),
+            force,
+        }
+    }
+
+    /// Whether a record of this very tree covers `want`; says so (the skip), or says which parts
+    /// of the tree moved since the last green run. `--force` never skips.
+    pub fn covered(&self, want: &green::Ran) -> bool {
+        let Some(digest) = &self.digest else {
+            return false;
+        };
+        if self.force {
+            eprintln!("\nci: --force: running although a green run may be on record");
+            return false;
+        }
+        match green::covering(&self.records, digest, want) {
+            Some(skip) => {
+                eprintln!("\n{}", green::skip_message(&skip));
+                true
+            }
+            None => {
+                if let Some(why) = green::why_not_same(&self.records, digest) {
+                    eprintln!("\n{why}");
+                }
+                false
+            }
+        }
+    }
+
+    /// Writes the record of a green run, unless the tree moved while it ran. Never fails the run.
+    fn record(&self, tier: green::Tier, ran: green::Ran, engine: runner::Engine) {
+        let (Some(before), Some(sys)) = (&self.digest, &self.sys) else {
+            return;
+        };
+        let Ok(after) = green::digest(&root(), sys) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        match green::record_green(
+            &target_dir(),
+            tier,
+            before,
+            &after,
+            runner::engine_name(engine),
+            ran,
+            now,
+        ) {
+            Ok(Some(_)) => eprintln!(
+                "ci: this tree is on record as green ({}, digest {}): a repeat on it ends at once",
+                tier.name(),
+                after.hex()
+            ),
+            Ok(None) => eprintln!("ci: the tree changed while the run went on: no record written"),
+            Err(e) => {
+                eprintln!("ci: could not write the record ({e:#}): the next run will not skip")
+            }
+        }
+    }
+}
+
+/// How a `ci` run that did not fail ended.
+pub enum Outcome {
+    /// A record of this very tree covered it (T5b): nothing ran.
+    Skipped,
+    /// It ran green: what it covered, for the record.
+    Ran {
+        tier: green::Tier,
+        ran: green::Ran,
+        engine: runner::Engine,
+    },
 }
 
 /// `ci`: everything, or with `--quick` the tier for use while working ([`quick`]).
 fn ci(args: &[String]) -> Result<()> {
     let args = quick::parse_args(args)?;
-    if args.quick {
-        quick::run(args.since.as_deref())
+    // One test run at a time on this PC, both checkouts: held to the end, the prune included.
+    lock::take(args.no_wait)?;
+    let start = Start::take(args.force);
+    let outcome = if args.quick {
+        quick::run(args.since.as_deref(), &start)
     } else {
-        ci_full()
+        ci_full(&start)
+    };
+    match outcome {
+        Err(err) => {
+            // The tree is no longer known green.
+            if let Some(digest) = &start.digest {
+                for tier in green::forget(&target_dir(), digest) {
+                    eprintln!("ci: the {} record of this tree is removed", tier.name());
+                }
+            }
+            Err(err)
+        }
+        // Nothing was built: nothing to prune.
+        Ok(Outcome::Skipped) => Ok(()),
+        Ok(Outcome::Ran { tier, ran, engine }) => {
+            start.record(tier, ran, engine);
+            // Only a green run gets here: a failed one may not have built the whole graph.
+            prune::after_ci(args.keep_target);
+            Ok(())
+        }
     }
 }
+
+/// The lint step's clippy run. The prune replays exactly this (`prune::canonical_queries`):
+/// clippy-driver tracks its lint arguments, so a replay with other ones would check the
+/// workspace crates again and leave them fingerprinted for its own lints.
+const CLIPPY_ARGS: [&str; 6] = [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings",
+];
 
 /// The steps both tiers start with: rustfmt, clippy and deps-check.
 fn lint_steps() -> Result<()> {
     run("rustfmt", cargo().args(["fmt", "--all", "--check"]))?;
-    run(
-        "clippy",
-        cargo().args([
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ]),
-    )?;
+    run("clippy", cargo().args(CLIPPY_ARGS))?;
     eprintln!("\n==> deps-check");
     deps_check()?;
     eprintln!("\n==> i18n check");
     i18n::i18n(&["check".to_owned()])
 }
 
-fn ci_full() -> Result<()> {
-    lint_steps()?;
-    runner::full(runner::engine())?;
-    qmllint()?;
+fn ci_full(start: &Start) -> Result<Outcome> {
+    prune::mark_full();
+    if start.covered(&green::Ran::everything()) {
+        return Ok(Outcome::Skipped);
+    }
+    let engine = runner::engine();
+    // After a green quick run on this very tree only what it did not cover runs (T5b).
+    let remainder = match (&start.digest, start.force) {
+        (Some(digest), false) => green::remainder(
+            &start.records,
+            digest,
+            runner::engine_name(engine),
+            &slow::integration_filter,
+        ),
+        _ => None,
+    };
+    match &remainder {
+        Some(rest) => {
+            eprintln!("\n{}", rest.message());
+            runner::full_remainder(rest)?;
+            if rest.qmllint {
+                qmllint()?;
+            }
+        }
+        None => {
+            lint_steps()?;
+            runner::full(engine)?;
+            qmllint()?;
+        }
+    }
     shots::ci_step()?;
     eprintln!("\nci: all steps passed");
-    Ok(())
+    Ok(Outcome::Ran {
+        tier: green::Tier::Full,
+        ran: green::Ran::everything(),
+        engine,
+    })
 }
 
 /// Allowed internal dependencies per crate (docs/architecture.md §2.2). Anything else is an error.
@@ -170,6 +405,35 @@ fn allowed_internal() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "kourier-media",
             ][..],
         ),
+        // The WhatsApp backend (architecture §7): from W5b (media send) the encrypted files and the pictures too.
+        (
+            "kourier-whatsapp",
+            &[
+                "kourier-model",
+                "kourier-backend-api",
+                "kourier-db",
+                "kourier-blob",
+                "kourier-media",
+            ][..],
+        ),
+        // The Telegram backend (architecture §7.5) and its TDLib helper. The helper crate stands
+        // alone (the frame protocol, the serve loop, the binary that dlopens libtdjson); only the
+        // Telegram backend uses it.
+        (
+            "kourier-telegram",
+            &[
+                "kourier-model",
+                "kourier-backend-api",
+                "kourier-db",
+                "kourier-tdlib",
+            ][..],
+        ),
+        ("kourier-tdlib", &[][..]),
+        // The Threema backend (architecture §7.4): the same edges as WhatsApp's.
+        (
+            "kourier-threema",
+            &["kourier-model", "kourier-backend-api", "kourier-db"][..],
+        ),
         ("kourier-desktop", &[][..]),
         (
             "kourier-app",
@@ -180,6 +444,12 @@ fn allowed_internal() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "kourier-desktop",
                 "kourier-blob",
                 "kourier-signal",
+                // Behind the cargo feature `whatsapp` (W2: the feature and the registration).
+                "kourier-whatsapp",
+                // Behind the cargo feature `telegram` (TG-1a: debug builds only, behind `networks-on`).
+                "kourier-telegram",
+                // Behind the cargo feature `threema` (TH1: debug builds only).
+                "kourier-threema",
                 "kourier-fake",
                 // `CoreConfig::core_key` is a `kourier_db::DbKey` (only the key type is used).
                 "kourier-db",
@@ -219,12 +489,25 @@ fn restricted_external() -> Vec<(&'static str, &'static [&'static str])> {
         ("libsignal", &["kourier-signal", "kourier-coexist"][..]),
         ("zkgroup", &["kourier-signal"][..]),
         ("signal-", &["kourier-signal"][..]),
+        // whatsapp-rust and its crates (one git revision, architecture §7): only the WhatsApp
+        // backend, and the test-only crate that runs real backends against local servers. The
+        // prefixes `wacore` and `waproto` also cover `wacore-binary`, `wacore-appstate` …;
+        // `buffa` is the protobuf runtime `waproto` uses (it must not leak into other crates).
+        ("whatsapp-rust", &["kourier-whatsapp", "kourier-e2e"][..]),
+        ("wacore", &["kourier-whatsapp", "kourier-e2e"][..]),
+        ("waproto", &["kourier-whatsapp", "kourier-e2e"][..]),
+        ("buffa", &["kourier-whatsapp", "kourier-e2e"][..]),
+        // libthreema, vendored (third_party/libthreema): only the Threema backend. The prefix also
+        // covers `libthreema-macros`, `libthreema-dependencies` and `libthreema-blake2`.
+        ("libthreema", &["kourier-threema"][..]),
         (
             "rusqlite",
             &[
                 "kourier-db",
                 "kourier-core",
                 "kourier-signal",
+                "kourier-whatsapp",
+                "kourier-telegram",
                 "kourier-fake",
             ][..],
         ),
@@ -237,6 +520,9 @@ fn restricted_external() -> Vec<(&'static str, &'static [&'static str])> {
                 "kourier-core",
                 "kourier-fake",
                 "kourier-signal",
+                "kourier-whatsapp",
+                "kourier-telegram",
+                "kourier-threema",
                 "kourier-desktop",
                 "kourier-app",
                 "kourier-db",
@@ -266,6 +552,7 @@ fn deps_check() -> Result<()> {
     let mut errors = errors;
     errors.extend(check_facade_only()?);
     errors.extend(seam::check(&root(), &workspace::Workspace::load(&root())?)?);
+    errors.extend(cleaned::check(&root())?);
     if errors.is_empty() {
         eprintln!("deps-check: layering OK");
         Ok(())
@@ -386,7 +673,7 @@ fn symbols_check(bin: Option<PathBuf>) -> Result<()> {
 
 /// Names in `nm -D --defined-only` output (`<address> <type> <name>[@[@]<version>]`) that start
 /// with an OpenSSL prefix.
-fn exported_openssl_symbols(nm_output: &str) -> Vec<String> {
+pub(crate) fn exported_openssl_symbols(nm_output: &str) -> Vec<String> {
     nm_output
         .lines()
         .filter_map(|line| line.split_whitespace().nth(2))
@@ -458,7 +745,7 @@ fn target_dir() -> PathBuf {
 /// network's linking walk) for the first three, `--fixture` (the fake account's demo data in
 /// `core.db`) for the rest. Every `--page` value is here (`PAGES` in `crates/kourier-qt/src/lib.rs`;
 /// a test compares the two).
-const SHOT_PAGES: [&str; 49] = [
+const SHOT_PAGES: [&str; 82] = [
     "welcome",
     "link",
     "qr",
@@ -508,6 +795,39 @@ const SHOT_PAGES: [&str; 49] = [
     "transferbanner",
     "transferfailed",
     "transferask",
+    "networks",
+    "warisk",
+    "waqr",
+    "waphone",
+    "wacode",
+    "thqr",
+    "themoji",
+    "tgwarn",
+    "tgqr",
+    "tgcode",
+    "tgpassword",
+    "wahistory",
+    "waban",
+    "walock",
+    "waoff",
+    "wafailed",
+    "walost",
+    "uploading",
+    "uploadfile",
+    "archive",
+    "person",
+    "group",
+    "chatmedia",
+    "safety",
+    "safetychanged",
+    "share",
+    "timerpending",
+    "save",
+    "location",
+    "locationmany",
+    "locationnever",
+    "accounts",
+    "accountsdrawer",
 ];
 
 /// Pages that look the same in both color schemes: the image viewer covers the window with a
@@ -650,6 +970,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Every cargo the xtask starts has the Telegram API pair removed from its environment, so a
+    /// pair in the caller's shell never reaches `option_env!` (S-5).
+    #[test]
+    fn cargo_never_passes_the_telegram_api_pair() {
+        let cmd = cargo();
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_owned())
+            .collect();
+        for var in ["KOURIER_TG_API_ID", "KOURIER_TG_API_HASH"] {
+            assert!(
+                removed.iter().any(|k| k == var),
+                "{var} is removed from cargo's environment"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_of_the_same_tree_ends_the_run_unless_it_is_forced() {
+        let record = green::Record {
+            digest: 7,
+            parts: BTreeMap::new(),
+            at: 100,
+            engine: "nextest".to_owned(),
+            ran: green::Ran::everything(),
+        };
+        let start = |force: bool, total: u64| Start {
+            sys: None,
+            digest: Some(green::Digest {
+                parts: BTreeMap::new(),
+                total,
+            }),
+            records: vec![(green::Tier::Full, record.clone())],
+            force,
+        };
+        let want = green::Ran::everything();
+        assert!(start(false, 7).covered(&want));
+        assert!(!start(true, 7).covered(&want), "--force runs anyway");
+        assert!(!start(false, 8).covered(&want), "another tree");
+        let blind = Start {
+            sys: None,
+            digest: None,
+            records: Vec::new(),
+            force: false,
+        };
+        assert!(!blind.covered(&want), "no digest, no skip");
+    }
+
     fn meta(edges: &[(&str, &str, &str)]) -> Value {
         let mut pkgs: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
         for name in allowed_internal().keys() {
@@ -700,6 +1069,233 @@ mod tests {
             ("kourier-model", "tokio", "normal"),
         ]);
         assert_eq!(check_metadata(&m).unwrap().len(), 2);
+    }
+
+    /// The WhatsApp backend's edges (architecture §2.2, §7): the contract crates, the database, the
+    /// encrypted files and the pictures (W5b), whatsapp-rust's crates and tokio; nothing else of Kourier, and nobody else gets its crates.
+    #[test]
+    fn whatsapp_may_use_the_contract_the_database_and_whatsapp_rust() {
+        let m = meta(&[
+            ("kourier-whatsapp", "kourier-model", "normal"),
+            ("kourier-whatsapp", "kourier-backend-api", "normal"),
+            ("kourier-whatsapp", "kourier-db", "normal"),
+            // W5b (media send).
+            ("kourier-whatsapp", "kourier-blob", "normal"),
+            ("kourier-whatsapp", "kourier-media", "normal"),
+            ("kourier-whatsapp", "whatsapp-rust", "normal"),
+            (
+                "kourier-whatsapp",
+                "whatsapp-rust-tokio-transport",
+                "normal",
+            ),
+            (
+                "kourier-whatsapp",
+                "whatsapp-rust-ureq-http-client",
+                "normal",
+            ),
+            ("kourier-whatsapp", "wacore", "normal"),
+            ("kourier-whatsapp", "wacore-binary", "normal"),
+            ("kourier-whatsapp", "waproto", "normal"),
+            ("kourier-whatsapp", "buffa", "normal"),
+            ("kourier-whatsapp", "tokio", "normal"),
+            ("kourier-whatsapp", "rusqlite", "dev"),
+            ("kourier-e2e", "wacore", "dev"),
+            ("kourier-app", "kourier-whatsapp", "normal"),
+        ]);
+        assert!(check_metadata(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn whatsapp_stays_below_the_core_and_alone_with_its_crates() {
+        // The WhatsApp backend does not reach into the core, the app or another backend.
+        for to in [
+            "kourier-core",
+            "kourier-app",
+            "kourier-signal",
+            "kourier-fake",
+        ] {
+            let m = meta(&[("kourier-whatsapp", to, "normal")]);
+            let errors = check_metadata(&m).unwrap();
+            assert_eq!(errors.len(), 1, "{to}: {errors:?}");
+            assert!(errors[0].contains(&format!("kourier-whatsapp -> {to}")));
+        }
+        // Nothing reaches into it but the app (behind a feature).
+        for from in [
+            "kourier-core",
+            "kourier-signal",
+            "kourier-viewmodel",
+            "kourier-qt",
+        ] {
+            let m = meta(&[(from, "kourier-whatsapp", "normal")]);
+            assert_eq!(check_metadata(&m).unwrap().len(), 1, "{from}");
+        }
+        // whatsapp-rust's crates belong to the WhatsApp backend (and the e2e crate's tests).
+        for from in [
+            "kourier-core",
+            "kourier-signal",
+            "kourier-app",
+            "kourier-model",
+        ] {
+            for dep in [
+                "whatsapp-rust",
+                // The real transport and HTTP client: the builder's slots are filled by the
+                // WhatsApp backend alone (W1 fix F1).
+                "whatsapp-rust-tokio-transport",
+                "whatsapp-rust-ureq-http-client",
+                "wacore",
+                "wacore-binary",
+                "wacore-appstate",
+                "waproto",
+                "buffa",
+            ] {
+                let m = meta(&[(from, dep, "normal")]);
+                let errors = check_metadata(&m).unwrap();
+                assert_eq!(errors.len(), 1, "{from} -> {dep}: {errors:?}");
+                assert!(errors[0].contains(&format!("{from} -> {dep}")));
+            }
+        }
+    }
+
+    /// The Telegram backend's edges (architecture §2.2, §7.5): the contract crates, the database and
+    /// the TDLib helper crate, tokio and rusqlite; nothing else of Kourier.
+    #[test]
+    fn telegram_may_use_the_contract_the_database_and_the_helper_crate() {
+        let m = meta(&[
+            ("kourier-telegram", "kourier-model", "normal"),
+            ("kourier-telegram", "kourier-backend-api", "normal"),
+            ("kourier-telegram", "kourier-db", "normal"),
+            ("kourier-telegram", "kourier-tdlib", "normal"),
+            ("kourier-telegram", "kourier-tdlib", "dev"),
+            ("kourier-telegram", "kourier-fake", "dev"),
+            ("kourier-telegram", "tokio", "normal"),
+            ("kourier-telegram", "rusqlite", "dev"),
+            ("kourier-tdlib", "libc", "normal"),
+            ("kourier-tdlib", "serde_json", "normal"),
+            ("kourier-tdlib", "kourier-tdlib", "dev"),
+            ("kourier-app", "kourier-telegram", "normal"),
+        ]);
+        assert!(check_metadata(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn telegram_stays_below_the_core_and_the_helper_crate_alone() {
+        // The Telegram backend does not reach into the core, the app or another backend.
+        for to in [
+            "kourier-core",
+            "kourier-app",
+            "kourier-signal",
+            "kourier-whatsapp",
+            "kourier-blob",
+        ] {
+            let m = meta(&[("kourier-telegram", to, "normal")]);
+            let errors = check_metadata(&m).unwrap();
+            assert_eq!(errors.len(), 1, "{to}: {errors:?}");
+            assert!(errors[0].contains(&format!("kourier-telegram -> {to}")));
+        }
+        // Nothing reaches into it but the app (behind a feature); the core never does.
+        for from in [
+            "kourier-core",
+            "kourier-signal",
+            "kourier-whatsapp",
+            "kourier-viewmodel",
+            "kourier-qt",
+        ] {
+            let m = meta(&[(from, "kourier-telegram", "normal")]);
+            assert_eq!(check_metadata(&m).unwrap().len(), 1, "{from}");
+        }
+        // The helper crate depends on no other Kourier crate, and only the Telegram backend uses
+        // it (the app reaches the helper through the backend's seam).
+        for to in ["kourier-model", "kourier-backend-api", "kourier-db"] {
+            let m = meta(&[("kourier-tdlib", to, "normal")]);
+            assert_eq!(
+                check_metadata(&m).unwrap().len(),
+                1,
+                "kourier-tdlib -> {to}"
+            );
+        }
+        for from in ["kourier-app", "kourier-core", "kourier-whatsapp", "kourier"] {
+            let m = meta(&[(from, "kourier-tdlib", "normal")]);
+            assert_eq!(
+                check_metadata(&m).unwrap().len(),
+                1,
+                "{from} -> kourier-tdlib"
+            );
+        }
+        // No tokio and no rusqlite in the helper: it is a small std program.
+        for dep in ["tokio", "rusqlite"] {
+            let m = meta(&[("kourier-tdlib", dep, "normal")]);
+            assert_eq!(
+                check_metadata(&m).unwrap().len(),
+                1,
+                "kourier-tdlib -> {dep}"
+            );
+        }
+    }
+
+    /// The Threema backend's edges (architecture §2.2, §7.4): the contract crates and the database,
+    /// libthreema and tokio; nothing else of Kourier, and nobody else gets libthreema.
+    #[test]
+    fn threema_may_use_the_contract_the_database_and_libthreema() {
+        let m = meta(&[
+            ("kourier-threema", "kourier-model", "normal"),
+            ("kourier-threema", "kourier-backend-api", "normal"),
+            ("kourier-threema", "kourier-db", "normal"),
+            ("kourier-threema", "libthreema", "normal"),
+            ("kourier-threema", "tokio", "normal"),
+            ("kourier-app", "kourier-threema", "normal"),
+        ]);
+        assert!(check_metadata(&m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn threema_stays_below_the_core_and_alone_with_its_crates() {
+        // The Threema backend does not reach into the core, the app or another backend.
+        for to in [
+            "kourier-core",
+            "kourier-app",
+            "kourier-signal",
+            "kourier-whatsapp",
+            "kourier-telegram",
+            "kourier-tdlib",
+            "kourier-fake",
+        ] {
+            let m = meta(&[("kourier-threema", to, "normal")]);
+            let errors = check_metadata(&m).unwrap();
+            assert_eq!(errors.len(), 1, "{to}: {errors:?}");
+            assert!(errors[0].contains(&format!("kourier-threema -> {to}")));
+        }
+        // Nothing reaches into it but the app (behind a feature).
+        for from in [
+            "kourier-core",
+            "kourier-signal",
+            "kourier-whatsapp",
+            "kourier-telegram",
+            "kourier-viewmodel",
+            "kourier-qt",
+        ] {
+            let m = meta(&[(from, "kourier-threema", "normal")]);
+            assert_eq!(check_metadata(&m).unwrap().len(), 1, "{from}");
+        }
+        // libthreema's crates belong to the Threema backend.
+        for from in [
+            "kourier-core",
+            "kourier-signal",
+            "kourier-whatsapp",
+            "kourier-app",
+            "kourier-model",
+        ] {
+            for dep in [
+                "libthreema",
+                "libthreema-macros",
+                "libthreema-dependencies",
+                "libthreema-blake2",
+            ] {
+                let m = meta(&[(from, dep, "normal")]);
+                let errors = check_metadata(&m).unwrap();
+                assert_eq!(errors.len(), 1, "{from} -> {dep}: {errors:?}");
+                assert!(errors[0].contains(&format!("{from} -> {dep}")));
+            }
+        }
     }
 
     #[test]

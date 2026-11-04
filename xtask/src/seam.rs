@@ -74,7 +74,7 @@ const R3_CRATES: [(&str, &str, &[Mark]); 2] = [
 /// Rust files of a front-end that name nothing of its toolkit and stay there on purpose
 /// (path from the workspace root, reason). Each is logic a second front-end would need as
 /// well; the debt is §8.10's "Known debts".
-pub const R3_LISTED: [(&str, &str); 4] = [
+pub const R3_LISTED: [(&str, &str); 6] = [
     (
         "crates/kourier-qt/src/pump.rs",
         "the hand-over queue of UiEvents from the runtime to the UI thread: scheduling \
@@ -95,6 +95,18 @@ pub const R3_LISTED: [(&str, &str); 4] = [
         "crates/kourier-qt/src/dev/protocol.rs",
         "the wire format of the development control channel, JSON lines that `cargo xtask \
          demo`, `smoke` and `perf` speak; shared by any front-end that implements it",
+    ),
+    (
+        "crates/kourier-qt/src/dev/facts.rs",
+        "`chat_facts` of the development control channel (T2): turns the core's own row of one \
+         chat, read through the facade off the UI thread, into the plain marks the run tool \
+         asserts; debug-only and part of the channel's contract, so it moves with protocol.rs",
+    ),
+    (
+        "crates/kourier-qt/src/dev/guard.rs",
+        "the checks of the development control channel's `send` and `act` guards (T2, C7): \
+         plain functions of ids that decide whether the named chat is the open one and the \
+         named message is the one to act on; debug-only, moves with protocol.rs",
     ),
 ];
 

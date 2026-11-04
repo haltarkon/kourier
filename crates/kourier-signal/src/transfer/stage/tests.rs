@@ -49,6 +49,7 @@ fn contact(i: u32) -> StagedContact {
         profile_name: Some(format!("Person {i}")),
         system_name: None,
         nickname: None,
+        system_nickname_only: false,
     }
 }
 
@@ -494,6 +495,31 @@ fn review_a_stage_of_another_format_is_refused() {
         let conn = kourier_db::open(&path_in(dir.path()), &key().0).unwrap();
         let changed = conn
             .execute("UPDATE meta SET v = ?1 WHERE k = 'format'", [FORMAT - 1])
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+    assert_eq!(
+        StageReader::open(dir.path(), &key()).err(),
+        Some(StageError::Unreadable)
+    );
+}
+
+/// Quiet notices (format 7): a stage the mapper of format 6 wrote lists a chat whose only
+/// rows are session refreshes as shown, and this mapper stages it unshown. Such a stage is
+/// refused whatever `FORMAT` becomes later (it is read again from the archive).
+#[test]
+fn a_stage_of_format_6_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = writer(dir.path(), 1, StageLimits::default());
+    writer
+        .item(0, 1, &message(0, 1, "of the mapper before quiet notices"))
+        .unwrap();
+    writer.commit(&[counters(0, 1, 1_001)], 4).unwrap();
+    assert!(StageReader::open(dir.path(), &key()).is_ok());
+    {
+        let conn = kourier_db::open(&path_in(dir.path()), &key().0).unwrap();
+        let changed = conn
+            .execute("UPDATE meta SET v = 6 WHERE k = 'format'", [])
             .unwrap();
         assert_eq!(changed, 1);
     }

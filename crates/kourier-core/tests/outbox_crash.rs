@@ -42,7 +42,7 @@
 //!
 //! Every failpoint is tried at every hit count until a run finishes without hitting it.
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -288,6 +288,7 @@ async fn child(home: PathBuf, mode: Mode) {
                         h.send(UiCommand::ConfirmIdentity {
                             account,
                             user: bob(),
+                            key: kourier_model::IdentityFingerprint(vec![5; 33]),
                         })
                         .expect("send");
                     }
@@ -361,6 +362,7 @@ async fn child(home: PathBuf, mode: Mode) {
                 h.send(UiCommand::SendFiles {
                     request: Default::default(),
                     as_file: Vec::new(),
+                    with_location: Vec::new(),
                     conv: g,
                     paths: paths.into(),
                     caption: Some(kourier_model::Text::plain("crash-safe files")),
@@ -410,6 +412,7 @@ async fn child(home: PathBuf, mode: Mode) {
                 h.send(UiCommand::SendFiles {
                     request: Default::default(),
                     as_file: Vec::new(),
+                    with_location: Vec::new(),
                     conv: a,
                     paths: paths.into(),
                     caption: None,
@@ -630,17 +633,14 @@ fn run_child(home: &Path, mode: Mode, failpoint: Option<&str>) -> ExitStatus {
     let exe = std::env::current_exe().expect("test binary");
     let log = home.join(format!("child-{}.log", failpoint.unwrap_or("clean")));
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "--exact",
-        "outbox_crash_child",
-        "--nocapture",
-        "--test-threads=1",
-    ])
-    .env(CHILD_HOME, home)
-    .env(CHILD_MODE, mode.name())
-    .env_remove(kourier_db::failpoint::ENV)
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(std::fs::File::create(log).expect("log file")));
+    cmd.arg("--exact")
+        .arg(support::child_filter(module_path!(), "outbox_crash_child"))
+        .args(["--nocapture", "--test-threads=1"])
+        .env(CHILD_HOME, home)
+        .env(CHILD_MODE, mode.name())
+        .env_remove(kourier_db::failpoint::ENV)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(log).expect("log file")));
     if let Some(fp) = failpoint {
         cmd.env(kourier_db::failpoint::ENV, fp);
     }
@@ -763,6 +763,7 @@ fn verify_clear(home: &Path, spec: &str) {
                 newest,
                 newest_non_expiring,
                 remove,
+                ..
             },
         ] => {
             assert_eq!(*conv, d_alice(), "{spec}");

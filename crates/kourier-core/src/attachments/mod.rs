@@ -23,6 +23,7 @@
 
 pub(crate) mod derive;
 pub(crate) mod import;
+pub(crate) mod looks;
 pub(crate) mod playback;
 pub(crate) mod policy;
 pub(crate) mod sweep;

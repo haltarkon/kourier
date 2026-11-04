@@ -968,6 +968,8 @@ fn the_storage_sync_is_not_due_while_a_transfer_holds_it() {
     );
     assert!(JobKind::StorageSync.waits_for_transfer());
     assert!(JobKind::ContactSyncWait.waits_for_transfer());
+    assert!(JobKind::ProfileRefresh.waits_for_transfer());
+    assert!(!JobKind::ProfileFetch.waits_for_transfer());
     assert!(!JobKind::SyncRequest.waits_for_transfer());
     assert!(!JobKind::RemoteConfig.waits_for_transfer());
 }

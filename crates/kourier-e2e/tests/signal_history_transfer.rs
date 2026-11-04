@@ -11,7 +11,7 @@
 //! `LoggedOut`, nothing of its backend stays on disk, nothing more is told, the app starts
 //! again as logged out, and "Link Again" works and receives.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

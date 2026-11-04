@@ -14,8 +14,10 @@ pub(crate) mod libsignal;
 mod runner;
 
 #[cfg(test)]
+pub(crate) use runner::REQUESTS_TARGET;
+#[cfg(test)]
 pub(crate) use runner::UPLOAD_TAIL_STALLS;
-pub(crate) use runner::{Net, json_request, parse_json, with_basic_auth};
+pub(crate) use runner::{AbortOnDrop, Net, json_request, parse_json, with_basic_auth};
 
 use std::fmt;
 use std::future::Future;

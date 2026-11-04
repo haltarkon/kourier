@@ -452,14 +452,20 @@ fn apply_current(
 
     // Member profile keys: a major source of contacts' keys (Desktop's `applyNewMembers`).
     let mut profile_fetches = false;
+    let mut number_events = Vec::new();
     for (aci, key) in &state.profile_keys {
         if *aci == account.aci {
             continue;
         }
         let sid = ServiceId::from(*aci).service_id_string();
+        let shown_before = peers::number_shown_before(tx, &sid)?;
         if peers::store_profile_key(tx, *aci, key, now)? {
             profile::request(tx, &sid, now)?;
             profile_fetches = true;
+            // The key is an input of the number rule: a person we had no key for may hide it now.
+            if let Ok(user) = crate::service_id::aci_user_id(*aci) {
+                number_events.extend(peers::number_shown_event(tx, &user, &sid, shown_before)?);
+            }
         } else if !profile::fetched(tx, &sid)? {
             profile_fetches |= profile::queue(tx, &sid, now)?;
         }
@@ -480,6 +486,7 @@ fn apply_current(
     } else {
         Patch::Set(snapshot.title.clone())
     };
+    patch.description = snapshot.description_patch();
     patch.avatar = avatar_patch;
     patch.members = Some(member_list(&snapshot));
     patch.timer = if snapshot.timer_secs > 0 {
@@ -501,7 +508,8 @@ fn apply_current(
     }
     tx.prepare_cached("UPDATE groups SET features_hash = ?2 WHERE master_key = ?1")?
         .execute((&keys.master[..], hash))?;
-    let mut events = vec![BackendEvent::ConversationUpsert(patch)];
+    let mut events = number_events;
+    events.push(BackendEvent::ConversationUpsert(patch));
     if !in_core {
         events.extend(storage::pins_with_new_group(tx, keys)?);
     }

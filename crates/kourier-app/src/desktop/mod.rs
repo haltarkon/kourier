@@ -340,6 +340,25 @@ impl DesktopHandle {
         let _ = self.shared.commands.send(Command::Prefs(prefs));
     }
 
+    /// Changes the preferences through `change`, which sees the stored ones: the read and the
+    /// write are one step under the lock, so two settings that change different fields at the
+    /// same moment do not undo each other. Saved and applied like [`Self::set_prefs`].
+    pub fn update_prefs(&self, change: impl FnOnce(&mut Prefs)) {
+        let mut current = self
+            .shared
+            .prefs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = current.clone();
+        change(&mut next);
+        if *current == next {
+            return;
+        }
+        *current = next.clone();
+        drop(current);
+        let _ = self.shared.commands.send(Command::Prefs(next));
+    }
+
     /// The UI is up: use its strings and pixels; the tray starts now (when enabled).
     pub fn attach(&self, presenter: Arc<dyn Presenter>) {
         let _ = self.shared.commands.send(Command::Attach(presenter));
@@ -772,5 +791,47 @@ mod tests {
             handled_uris(many).len(),
             kourier_desktop::instance::MAX_URIS
         );
+    }
+    /// A handle on its own, with a channel to look at what it sends the desktop task.
+    fn handle_with(prefs: Prefs) -> (DesktopHandle, mpsc::UnboundedReceiver<Command>) {
+        let (commands, rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            commands,
+            events: Mutex::new(None),
+            prefs: Mutex::new(prefs),
+            enabled: false,
+            background: false,
+        });
+        (DesktopHandle { shared }, rx)
+    }
+
+    /// `update_prefs` hands the closure the STORED preferences, so a change of one field keeps
+    /// the others (the experimental networks the settings page has no control for), saves what
+    /// changed once and sends nothing for a change that changes nothing.
+    #[test]
+    fn update_prefs_changes_one_field_on_top_of_the_stored_ones() {
+        let stored = Prefs {
+            compact: true,
+            networks_on: vec!["WhatsApp".to_owned()],
+            ..Prefs::default()
+        };
+        let (handle, mut rx) = handle_with(stored.clone());
+        handle.update_prefs(|p| p.tray = true);
+        let expected = Prefs {
+            tray: true,
+            ..stored.clone()
+        };
+        assert_eq!(handle.prefs(), expected);
+        match rx.try_recv() {
+            Ok(Command::Prefs(sent)) => assert_eq!(sent, expected),
+            _ => panic!("the changed preferences were not sent to the desktop task"),
+        }
+        // The same change again, and a closure that changes nothing: no command.
+        handle.update_prefs(|p| p.tray = true);
+        handle.update_prefs(|_| {});
+        assert!(rx.try_recv().is_err());
+        // A network turned on from the stored list, not from a copy a page kept.
+        handle.update_prefs(|p| p.set_network_on(kourier_model::NetworkKind::WhatsApp, false));
+        assert!(handle.prefs().networks_on.is_empty() && handle.prefs().tray);
     }
 }

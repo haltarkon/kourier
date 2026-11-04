@@ -1,6 +1,7 @@
 //! Image decoding, resizing, metadata stripping, blurhash and thumbnails (docs/architecture.md
 //! §5.8, §8.6). Pure Rust codecs (`image` with PNG, JPEG, GIF, WebP and BMP; `blurhash`); no Qt,
-//! no protocol types, no I/O: every function works on bytes in memory.
+//! no protocol types, no I/O of its own: every function works on bytes in memory, except that the
+//! look reads through a caller's `Read + Seek`.
 //!
 //! - [`decode`]: decode with EXIF orientation applied and decompression-bomb limits
 //!   ([`MAX_DIMENSION`], [`MAX_ALLOC`]); [`probe`] reads dimensions without decoding pixels.
@@ -9,26 +10,43 @@
 //! - [`scale_to_level`]: the per-network re-encode helper for backends, Signal Desktop's
 //!   `scaleImageToLevel` (max 1600 px, quality 0.7, ≤ 1 MiB at level one;
 //!   `SD/ts/util/scaleImageToLevel.preload.ts`). Re-encoding drops every metadata block.
+//! - [`clean_still`]: the one cleaning function of a picture a network sends (LOC): re-encoded,
+//!   else stripped, never returned with a location; [`CLEANED_TYPES`] is what it cleans.
 //! - [`strip_metadata`]: removes EXIF, XMP, IPTC and text chunks from JPEG and PNG without
 //!   re-encoding, unless an EXIF orientation must be applied first.
 //! - [`blurhash_rgba`]: placeholder pixels for the UI while a thumbnail decodes.
 //! - [`sniff_mime`], [`mime_from_extension`], [`extension_for_mime`]: content types.
-//! - [`sample_image`]: a deterministic synthetic picture for fakes, fixtures and tests.
+//! - [`look`]: does a file carry where it was taken? Found / None / Unreadable, bounded, without
+//!   decoding pixels or keeping a coordinate (LOC).
+//! - [`sample_image`]: a deterministic synthetic picture for fakes, fixtures and tests;
+//!   [`sample_located`]: synthetic files that carry a made-up location, for the LOC tests.
 //!
 //! Errors never quote input bytes, so they are log-safe (§9.1).
 
+mod bmff;
+mod chunks;
+mod clean;
 mod decode;
+mod heif;
+mod location;
 mod mime;
+mod movie;
 mod sample;
 mod scale;
 mod strip;
+mod tiff;
+mod xmp;
 
+pub use clean::{CLEANED_TYPES, NotCleaned, clean_still};
 pub use decode::{
     Decoded, Derived, ImageInfo, MAX_ALLOC, MAX_DIMENSION, THUMBNAIL_EDGE, blurhash_rgba, decode,
     derive, probe,
 };
+pub use location::{
+    Evidence, EvidenceKind, Look, LookFormat, ReadSeek, Unreadable, look, look_why,
+};
 pub use mime::{extension_for_mime, mime_from_extension, sniff_mime};
-pub use sample::{SampleFormat, sample_image};
+pub use sample::{SampleFormat, SampleLocated, sample_image, sample_located};
 pub use scale::{MIN_DIMENSIONS, SCALABLE_DIMENSIONS, ScaleLevel, scale_to_level};
 pub use strip::{Stripped, strip_metadata};
 

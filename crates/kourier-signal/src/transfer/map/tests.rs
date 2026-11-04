@@ -424,20 +424,34 @@ fn an_item_of_an_unknown_chat_or_author_is_skipped_and_counted() {
 
 #[test]
 fn a_chat_without_a_loud_row_is_not_staged_as_shown() {
-    // The rule itself: the four notices Signal Desktop does not surface a chat for.
+    // The rule itself: the four quiet notices (the live list keeps them out of a chat's
+    // preview and order too) and a member leaving, which Signal Desktop does not surface a
+    // chat for either.
     let u = user(0x21);
     for quiet in [
         SystemEvent::IdentityKeyChanged { user: u.clone() },
+        SystemEvent::SessionRefreshed { user: u.clone() },
         SystemEvent::NumberChanged { user: u.clone() },
         SystemEvent::MessageRequestAccepted,
         SystemEvent::MemberLeft { user: u.clone() },
     ] {
-        assert!(!is_loud(&Body::System(quiet)));
+        assert!(!is_loud(&Body::System(quiet.clone())), "{quiet:?}");
     }
     assert!(is_loud(&Body::text("a message")));
-    assert!(is_loud(&Body::System(SystemEvent::SessionRefreshed {
-        user: u.clone()
-    })));
+    // The other notices still make a chat show (a group change, a timer, joining).
+    for loud in [
+        SystemEvent::MembersAdded {
+            by: Some(u.clone()),
+            users: vec![u.clone()],
+        },
+        SystemEvent::TimerChanged {
+            by: None,
+            timer: None,
+        },
+        SystemEvent::Joined,
+    ] {
+        assert!(is_loud(&Body::System(loud.clone())), "{loud:?}");
+    }
     assert!(is_loud(&Body::Unsupported {
         kind_hint: "poll".into(),
         summary: None

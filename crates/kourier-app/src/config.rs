@@ -52,6 +52,15 @@ pub enum ConfigError {
     /// What a first link must find is not usable (log-safe: the value is not repeated).
     #[error("{0}")]
     Expectation(String),
+    /// The rehearsal switch (`KOURIER_DEV_REHEARSAL`) has a value other than `whatsapp` or
+    /// `telegram`, or is set in a debug build that has no rehearsal network (log-safe: the value is
+    /// not repeated). Only a debug build reads it.
+    #[error("{0}")]
+    Rehearsal(String),
+    /// Telegram's servers switch (`KOURIER_DEV_TELEGRAM_ENV`, `crate::telegram::servers`) asks for
+    /// what this build or profile does not allow (fixed words: the value is not repeated).
+    #[error("{0}")]
+    Telegram(&'static str),
 }
 
 /// The fields of the harness handshake Kourier needs. The harness writes them in camelCase

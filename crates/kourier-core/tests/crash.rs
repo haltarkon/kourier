@@ -4,7 +4,7 @@
 //! the resulting `core.db` must equal the uncrashed run's (every message exactly once, system
 //! messages, merges and read syncs included). Every failpoint is tried at every hit count.
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -154,7 +154,9 @@ async fn child(home: PathBuf) {
 fn run_child(home: &Path, failpoint: Option<&str>) -> ExitStatus {
     let exe = std::env::current_exe().expect("test binary");
     let mut cmd = Command::new(exe);
-    cmd.args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
+    cmd.arg("--exact")
+        .arg(support::child_filter(module_path!(), "crash_child"))
+        .args(["--nocapture", "--test-threads=1"])
         .env(CHILD_HOME, home)
         .env_remove(kourier_db::failpoint::ENV)
         .stdout(Stdio::null())

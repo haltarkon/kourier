@@ -237,6 +237,39 @@ pub fn schema_version(conn: &Connection, component: &str) -> Result<Option<i64>>
     read_version(conn, component)
 }
 
+/// Every component recorded in the file, in name order; empty for a file that was never migrated.
+/// Reads only.
+pub fn schema_components(conn: &Connection) -> Result<Vec<String>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT component FROM schema_version ORDER BY component")?;
+    let found = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(found)
+}
+
+/// Refuses a backend's `backend.db` that carries a schema component other than the shared
+/// `core_outbox` and the backend's own (`own`): an ALLOW-list, so the file of any other network, of
+/// the core or of a backend that does not exist yet is refused too. It only reads, and a backend
+/// calls it before its first migration, so a refused file is not written to (not even its
+/// `core_outbox` migrated, and a newer one of that is not reported as `TooNew` first). A file that
+/// was never migrated passes.
+pub fn check_backend_file(conn: &Connection, own: &Migrations) -> Result<()> {
+    for component in schema_components(conn)? {
+        if component != crate::outbox::MIGRATIONS.component && component != own.component {
+            return Err(Error::ForeignComponent { component });
+        }
+    }
+    Ok(())
+}
+
 fn read_version(conn: &Connection, component: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
@@ -479,5 +512,49 @@ mod tests {
                 Err(Error::InvalidMigrations { .. })
             ));
         }
+    }
+
+    /// A backend's file may carry `core_outbox` and its own component: an allow-list, read only.
+    #[test]
+    fn a_backend_file_may_carry_only_the_outbox_and_its_own_component() {
+        let own = Migrations::new("mine", V1);
+        // Never migrated: passes, and the check made no table.
+        let (dir, mut conn) = db();
+        check_backend_file(&conn, &own).unwrap();
+        assert!(schema_components(&conn).unwrap().is_empty());
+        // The outbox and its own component: passes.
+        migrate(&mut conn, &crate::outbox::MIGRATIONS).unwrap();
+        check_backend_file(&conn, &own).unwrap();
+        migrate(&mut conn, &own).unwrap();
+        check_backend_file(&conn, &own).unwrap();
+        assert_eq!(schema_components(&conn).unwrap(), ["core_outbox", "mine"]);
+        // Any other component is refused, whatever its name (no list of known names).
+        for other in ["signal", "whatsapp", "core", "threema", "anything"] {
+            conn.execute(
+                "INSERT INTO schema_version(component, version) VALUES (?1, 1)",
+                [other],
+            )
+            .unwrap();
+            let err = check_backend_file(&conn, &own).unwrap_err();
+            assert!(
+                matches!(&err, Error::ForeignComponent { component } if component == other),
+                "{other}: {err:?}"
+            );
+            conn.execute("DELETE FROM schema_version WHERE component = ?1", [other])
+                .unwrap();
+        }
+        // It reads only: a read-only connection can run it.
+        conn.execute(
+            "INSERT INTO schema_version(component, version) VALUES ('signal', 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let read_only =
+            crate::open_read_only(&dir.path().join("m.db"), &DbKey::from([5; 32])).unwrap();
+        assert!(matches!(
+            check_backend_file(&read_only, &own),
+            Err(Error::ForeignComponent { .. })
+        ));
     }
 }

@@ -82,9 +82,12 @@
 //!   hundreds of empty conversations. The one exception: a chat the phone PINNED is staged
 //!   at its chat frame and shown whatever it holds, as Android and Desktop list it.
 //! - **Quiet and loud.** A chat is shown only when one of its rows is loud: a message, a
-//!   placeholder, a call line, or a notice other than the four that Signal Desktop does not
-//!   surface a chat for ([`is_loud`]). A chat with rows but no loud one is staged and not
-//!   delivered, unless it is pinned.
+//!   placeholder, a call line, or a notice other than the quiet ones
+//!   ([`kourier_model::Body::is_quiet`]: a safety number, a refreshed session, a changed
+//!   number, an accepted request) and a member leaving, which Signal Desktop does not
+//!   surface a chat for either ([`is_loud`]). A chat with rows but no loud one is staged and
+//!   not delivered, unless it is pinned. The rule does not follow the setting that shows
+//!   quiet notices in the list: it decides which chats exist after a link.
 //! - **A 1:1 chat holds what its peer and we wrote**, nothing else: an incoming item whose
 //!   author is not the chat's contact is skipped. The same for the state of an own item:
 //!   only the send-status entries of the chat's contact count. A quote, a reaction and a
@@ -435,18 +438,13 @@ pub(crate) struct MapEnd {
 }
 
 /// Whether a row with this body makes its chat show in the list. Signal Desktop does not
-/// surface a chat for the notices named here (`ts/services/backups/import.preload.ts`,
-/// the items that do not "affect presence", cut down to the notices the contract has).
+/// surface a chat for the notices that do not "affect presence"
+/// (`ts/services/backups/import.preload.ts`), cut down to the notices the contract has: the
+/// quiet ones ([`Body::is_quiet`], which the live list keeps out of a chat's preview and
+/// order too) and a member leaving (a group change that still shows in the live list, but
+/// no reason to list a group nobody wrote in).
 pub(crate) fn is_loud(body: &Body) -> bool {
-    !matches!(
-        body,
-        Body::System(
-            SystemEvent::IdentityKeyChanged { .. }
-                | SystemEvent::NumberChanged { .. }
-                | SystemEvent::MessageRequestAccepted
-                | SystemEvent::MemberLeft { .. }
-        )
-    )
+    !body.is_quiet() && !matches!(body, Body::System(SystemEvent::MemberLeft { .. }))
 }
 
 /// A recipient of the archive, by what it can be to a chat or an item.
@@ -791,6 +789,8 @@ impl Mapper {
         };
         let system_name = name(&contact.system_given_name, &contact.system_family_name)
             .or_else(|| name(&contact.system_nickname, ""));
+        let system_nickname_only = system_name.is_some()
+            && name(&contact.system_given_name, &contact.system_family_name).is_none();
         let staged = StagedContact {
             user: user.clone(),
             aci: aci.map(uuid::Uuid::from),
@@ -815,6 +815,7 @@ impl Mapper {
                 contact.profile_family_name.as_deref().unwrap_or(""),
             ),
             system_name,
+            system_nickname_only,
             nickname: contact
                 .nickname
                 .as_ref()
@@ -2518,7 +2519,8 @@ fn named_users(msg: &IncomingMessage) -> Vec<&UserId> {
             SystemEvent::MemberLeft { user }
             | SystemEvent::IdentityKeyChanged { user }
             | SystemEvent::SessionRefreshed { user }
-            | SystemEvent::NumberChanged { user } => users.push(user),
+            | SystemEvent::NumberChanged { user }
+            | SystemEvent::VerifiedChanged { user, .. } => users.push(user),
             SystemEvent::TitleChanged { by, .. }
             | SystemEvent::AvatarChanged { by }
             | SystemEvent::DescriptionChanged { by }

@@ -43,18 +43,22 @@ fn default_jobs() -> usize {
 }
 
 /// Pages whose picture is random by design, so there is nothing to compare: the rotating QR code
-/// carries a fresh random payload in every render (thousands of pixels differ). Both sizes and
+/// carries a fresh random payload in every render (thousands of pixels differ; `waqr` is the
+/// same code on WhatsApp's link page, `thqr` on Threema's, `tgqr` on Telegram's: the fake's code
+/// names the account's random uuid). Both sizes and
 /// both color schemes are skipped; the checks of a render (clean exit, no QML warning, theme)
 /// still apply.
-const SHOT_PAGES_NOT_COMPARED: [&str; 1] = ["qr"];
+const SHOT_PAGES_NOT_COMPARED: [&str; 4] = ["qr", "waqr", "thqr", "tgqr"];
 
 /// Pages compared only in a run by hand, not in ci's screenshot step (rendered and checked in ci
-/// all the same). EMPTY: the eight pages that flapped before S1 (2026-10-13) are all compared in
-/// ci again, with ci's limits. A picture is now grabbed when it is final (`MainWindow.qml`
-/// `shotTimer`) and `shots --repeat` is the tool that finds a page that is not (see CLAUDE.md,
-/// "Stable screenshots"). The list and its handling stay for the next page that cannot be made
-/// stable.
-const SHOT_PAGES_COMPARED_BY_HAND: [&str; 0] = [];
+/// all the same; the user's rule, 2026-10-13: a picture that flaps is moved out of the regular
+/// run). The eight pages that flapped before S1 (2026-10-13) are compared in ci again: a picture is
+/// grabbed when it is final (`MainWindow.qml` `shotTimer`) and `shots --repeat` finds a page that
+/// is not (see `.claude/rules/screenshots.md`, "THE PICTURE IS TAKEN WHEN IT IS FINAL").
+/// - `history`: the wide light picture differed at the timeline's scroll-bar thumb (76 px) in two
+///   full ci runs under load (2026-10-14, 2026-10-15) and matched its baseline in every render
+///   alone: the thumb's length follows the estimated content height of rows not made yet.
+const SHOT_PAGES_COMPARED_BY_HAND: [&str; 1] = ["history"];
 
 /// Whether a render of `page` is compared with its baseline: not the random ones, and in ci not
 /// [`SHOT_PAGES_COMPARED_BY_HAND`].
@@ -80,7 +84,7 @@ const MAX_DIFFERING_PIXELS: usize = 24;
 /// these pages are compared with the looser [`PICTURE_PAGE_ONE_IN`]; a change of their text or
 /// layout smaller than that is not seen. (The lead decides, after three full runs without a
 /// re-render of a picture page, whether they get the strict limit: stable-screenshots.md step 8.)
-const SHOT_PAGES_WITH_PICTURES: [&str; 19] = [
+const SHOT_PAGES_WITH_PICTURES: [&str; 25] = [
     "media",
     "viewer",
     "files",
@@ -96,12 +100,20 @@ const SHOT_PAGES_WITH_PICTURES: [&str; 19] = [
     // run of 2026-10-08 flagged `edit` and `compose` for 48 and 68 pixels inside a photo.
     "compose",
     "folder",
+    "location",
+    "locationmany",
+    "locationnever",
     "quotes",
     "menu",
     "react",
     "edit",
     "reply",
     "delete",
+    // The upload pages draw pictures of their own (the album, held in its upload).
+    "uploading",
+    "uploadfile",
+    // The level of all media of a chat: a grid of its pictures (people pages P4).
+    "chatmedia",
 ];
 
 /// A page with pictures differs when more than one pixel in this many differs (0.15 %).
@@ -155,6 +167,9 @@ struct Args {
     /// `--repeat N`: render each picture N times and require every render to be the very same
     /// picture ([`run_repeat`]); no baseline is involved.
     repeat: Option<usize>,
+    /// `--no-wait`: when another test run holds the lock ([`crate::lock`]), end with status 75
+    /// instead of waiting for it.
+    no_wait: bool,
 }
 
 impl Default for Args {
@@ -172,6 +187,7 @@ impl Default for Args {
             variants: None,
             ci: false,
             repeat: None,
+            no_wait: false,
         }
     }
 }
@@ -184,7 +200,7 @@ impl Args {
 }
 
 /// Parses `[dir] [--page a,b,...] [--theme light|dark] [--size wide|narrow] [--jobs N]
-/// [--repeat N] [--no-build] [--accept] [--no-compare]`; a value follows its flag as
+/// [--repeat N] [--no-build] [--accept] [--no-compare] [--no-wait]`; a value follows its flag as
 /// `--page=a` or `--page a`.
 fn parse_args(args: &[String]) -> Result<Args> {
     let mut out = Args::default();
@@ -264,7 +280,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     bail!("--variant needs at least one variant");
                 }
             }
-            "--no-build" | "--accept" | "--no-compare" | "--matrix" => {
+            "--no-build" | "--accept" | "--no-compare" | "--matrix" | "--no-wait" => {
                 if inline.is_some() {
                     bail!("{flag} takes no value");
                 }
@@ -272,6 +288,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     "--no-build" => out.build = false,
                     "--accept" => out.accept = true,
                     "--matrix" => out.matrix = true,
+                    "--no-wait" => out.no_wait = true,
                     _ => out.compare = false,
                 }
             }
@@ -553,6 +570,10 @@ struct Outcome {
     settle_ms: Vec<u32>,
     /// Renders that ended `shot: unsettled` and were rendered again.
     unsettled_retries: usize,
+    /// What held each of those renders (the app's `shot: unsettled <what>`: the images still
+    /// loading, with their sources): the progress line names it, because the render that is
+    /// repeated and then settles leaves nothing else behind.
+    unsettled_what: Vec<String>,
     /// The render printed QML problems (they are in `failures`).
     qml_warnings: bool,
     verdict: Verdict,
@@ -567,8 +588,9 @@ impl Outcome {
         }
         if self.unsettled_retries > 0 {
             out.push_str(&format!(
-                " ({} unsettled render(s) repeated)",
-                self.unsettled_retries
+                " ({} unsettled render(s) repeated: {})",
+                self.unsettled_retries,
+                self.unsettled_what.join(" | ")
             ));
         }
         match &self.verdict {
@@ -834,7 +856,9 @@ fn process(ctx: &Ctx, job: &Job) -> Outcome {
     let mut settle_ms: Vec<u32> = last.settle_ms.into_iter().collect();
     // A picture that did not settle is rendered again; only the last render's failures count.
     let mut unsettled_retries = 0;
+    let mut unsettled_what = Vec::new();
     while last.unsettled.is_some() && unsettled_retries < RETRIES {
+        unsettled_what.extend(last.unsettled.clone());
         unsettled_retries += 1;
         last = render(
             ctx,
@@ -849,6 +873,7 @@ fn process(ctx: &Ctx, job: &Job) -> Outcome {
         luma: last.luma,
         settle_ms,
         unsettled_retries,
+        unsettled_what,
         verdict: Verdict::NotCompared,
     };
     if ctx.mode == Mode::Plain || !is_compared(ctx.ci, job.page) || !ctx.png(job).is_file() {
@@ -1233,7 +1258,10 @@ fn run_matrix(args: &Args) -> Result<()> {
 /// (the theme did not apply; see [`theme_problem`] for the pages this cannot be told from)
 /// and, in the default directory, on changed pictures.
 pub fn shots(args: &[String]) -> Result<()> {
-    run_shots(&parse_args(args)?)
+    let args = parse_args(args)?;
+    // One test run at a time on this PC (a `ci` that renders holds the lock already).
+    crate::lock::take(args.no_wait)?;
+    run_shots(&args)
 }
 
 /// The screenshot step of `cargo xtask ci`: the parallel render, unless nothing that draws
@@ -1595,9 +1623,17 @@ const DIGEST_ROOTS: [&str; 5] = [
     "xtask/src/shots.rs",
 ];
 
-/// Crates below `crates/` that cannot change a picture: the Signal backend (the render runs on
-/// the fake network) and the two test-only crates.
-const DIGEST_SKIPPED_CRATES: [&str; 3] = ["kourier-signal", "kourier-e2e", "kourier-coexist"];
+/// Crates below `crates/` that cannot change a picture: the Signal, WhatsApp, Telegram and
+/// Threema backends and the TDLib helper crate (the render runs on the fake network) and the two test-only crates.
+const DIGEST_SKIPPED_CRATES: [&str; 7] = [
+    "kourier-signal",
+    "kourier-whatsapp",
+    "kourier-telegram",
+    "kourier-tdlib",
+    "kourier-threema",
+    "kourier-e2e",
+    "kourier-coexist",
+];
 
 /// A hash of every file of [`DIGEST_ROOTS`] (path and content), except `tests/` directories,
 /// build output and [`DIGEST_SKIPPED_CRATES`].
@@ -1822,8 +1858,14 @@ mod tests {
             "2",
             "--no-build",
             "--no-compare",
+            "--no-wait",
         ])
         .unwrap();
+        assert!(
+            a.no_wait,
+            "--no-wait: end with status 75 when another test run holds the lock"
+        );
+        assert!(!args(&["--page", "chat"]).unwrap().no_wait);
         assert_eq!(
             a.pages.as_deref(),
             Some(&["chat".into(), "edit".into(), "reply".into()][..])
@@ -1893,7 +1935,15 @@ mod tests {
         for page in SHOT_PAGES_NOT_COMPARED {
             assert!(SHOT_PAGES.contains(&page), "{page}");
         }
-        assert!(SHOT_PAGES_NOT_COMPARED.contains(&"qr"));
+        // The rotating QR codes: the fake's code names the account's random uuid, on every network's
+        // link page (Telegram's `tgqr`, KT-1b).
+        for page in ["qr", "waqr", "thqr", "tgqr"] {
+            assert!(SHOT_PAGES_NOT_COMPARED.contains(&page), "{page}");
+        }
+        // And only those: `tgwarn`, `tgcode` and `tgpassword` have a fixed picture to compare.
+        for page in ["tgwarn", "tgcode", "tgpassword"] {
+            assert!(!SHOT_PAGES_NOT_COMPARED.contains(&page), "{page}");
+        }
         for page in SHOT_PAGES_COMPARED_BY_HAND {
             assert!(SHOT_PAGES.contains(&page), "{page}");
         }
@@ -2114,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_compares_every_page_but_the_random_one() {
+    fn ci_compares_every_page_but_the_random_one_and_those_compared_by_hand() {
         // The pages S1 kept out of ci while their pictures flapped (F10, 2026-10-14): ci compares
         // them again, with its own limits.
         for page in [
@@ -2132,8 +2182,15 @@ mod tests {
             assert!(is_compared(false, page), "{page} is compared by hand");
         }
         for page in SHOT_PAGES {
-            assert_eq!(is_compared(true, page), page != "qr", "{page}");
+            let by_hand = SHOT_PAGES_COMPARED_BY_HAND.contains(&page);
+            let random = SHOT_PAGES_NOT_COMPARED.contains(&page);
+            assert_eq!(is_compared(true, page), !random && !by_hand, "{page}");
+            assert_eq!(is_compared(false, page), !random, "{page} by hand");
         }
+        assert!(
+            !is_compared(true, "history"),
+            "history is compared by hand only"
+        );
     }
 
     /// The lines of every `[KDE]` group of a `kdeglobals` text (a color scheme file has one
@@ -2268,6 +2325,11 @@ mod tests {
             out.failures
         );
         assert!(out.describe().contains("unsettled"), "{}", out.describe());
+        assert!(
+            out.describe().contains("images 2, moving"),
+            "the line names what held the render: {}",
+            out.describe()
+        );
 
         // The same app without the line: no failure, no repeat, and it is the baseline.
         let fine = TempTree::new("settled");
@@ -2424,6 +2486,9 @@ mod tests {
         tree.write("crates/kourier-qt/tests/ui.rs", "// test");
         tree.write("crates/kourier-signal/src/lib.rs", "// signal");
         tree.write("crates/kourier-signal/tests/mock.rs", "// test");
+        tree.write("crates/kourier-whatsapp/src/lib.rs", "// whatsapp");
+        tree.write("crates/kourier-whatsapp/migrations/0001_init.sql", "-- sql");
+        tree.write("crates/kourier-threema/src/lib.rs", "// threema");
         tree.write("crates/kourier-e2e/src/lib.rs", "// e2e");
         tree.write("crates/kourier-coexist/src/lib.rs", "// coexist");
         tree.write("crates/kourier-core/tests/db.rs", "// test");
@@ -2478,6 +2543,14 @@ mod tests {
             ("crates/kourier-signal/src/lib.rs", "// signal 2"),
             ("crates/kourier-signal/src/new.rs", "// a new file"),
             ("crates/kourier-signal/tests/mock.rs", "// test 2"),
+            ("crates/kourier-whatsapp/src/lib.rs", "// whatsapp 2"),
+            ("crates/kourier-whatsapp/src/store/new.rs", "// a new file"),
+            (
+                "crates/kourier-whatsapp/migrations/0001_init.sql",
+                "-- sql 2",
+            ),
+            ("crates/kourier-threema/src/lib.rs", "// threema 2"),
+            ("crates/kourier-threema/src/store/new.rs", "// a new file"),
             ("crates/kourier-e2e/src/lib.rs", "// e2e 2"),
             ("crates/kourier-coexist/src/lib.rs", "// coexist 2"),
             ("crates/kourier-qt/tests/ui.rs", "// test 2"),

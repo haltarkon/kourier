@@ -6,7 +6,7 @@
 //! One test in a binary of its own: the warnings are collected by a `tracing` subscriber that is
 //! installed for the whole process.
 
-mod support;
+use crate::support;
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -112,6 +112,9 @@ fn derived(env: &Env) -> i64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_account_leaves_no_attachment_work_running() {
+    if support::in_own_process!() {
+        return;
+    }
     let log = Log::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(log.clone()))
         .expect("the only subscriber of this process");

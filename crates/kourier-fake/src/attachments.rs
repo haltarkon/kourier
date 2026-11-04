@@ -113,6 +113,21 @@ pub fn synthetic_image(width: u32, height: u32, seed: u64) -> Attachment {
     }
 }
 
+/// A picture whose sender claims `claim` (width, height) but whose file is `width` × `height`:
+/// a phone that ignores the EXIF rotation, or a size that is only a guess. The row is laid out
+/// by the claim until the download reports the real size, and then its height changes.
+pub fn synthetic_image_claiming(
+    claim: (u32, u32),
+    width: u32,
+    height: u32,
+    seed: u64,
+) -> Attachment {
+    Attachment {
+        dims: Some(claim),
+        ..synthetic_image(width, height, seed)
+    }
+}
+
 /// An incoming file attachment of `len` deterministic bytes.
 pub fn synthetic_file(name: &str, mime: &str, len: u64, seed: u64) -> Attachment {
     Attachment {
@@ -212,6 +227,24 @@ pub(crate) fn read_outgoing(blob_dir: &Path, a: &Attachment) -> Result<u64, Back
 mod tests {
     use super::*;
     use kourier_model::BlobKey;
+
+    #[test]
+    fn a_claim_that_differs_from_the_file_is_corrected_by_the_download() {
+        let a = synthetic_image_claiming((200, 90), 90, 200, 7);
+        assert_eq!(a.dims, Some((200, 90)), "the row is laid out by the claim");
+        let remote = a.remote.clone().expect("remote");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = BlobTarget {
+            path: dir.path().join("blob"),
+            key: BlobKey::new([3; 32]),
+        };
+        let meta = download(&remote, &dest).expect("download");
+        assert_eq!(
+            meta.dims,
+            Some((90, 200)),
+            "the download reports the real size"
+        );
+    }
 
     #[test]
     fn pointers_round_trip_and_download_into_the_target() {

@@ -1,14 +1,24 @@
 //! `Message` and `HistoryBatch` ingest (§4.9 rows 1-2), sort keys (§3.9), placeholders, echo
 //! dedup of own messages (§4.8 step 6) and the derived per-message state (revisions, aggregated
 //! outgoing state).
+//!
+//! A message is found by its network key, and the key depends on the network's
+//! [`MsgIdScope`] (§3.1): `(account, author, local)` for `AccountAuthor`, `(conversation, local)`
+//! for `Conversation` (Threema, and every call line), `(conversation, author, local)` for
+//! `ConversationAuthor` (WhatsApp, core.db schema 16: two members of a group may use one id). Each
+//! scope has its own unique index; `Apply::by_key` is the one place that picks the statement, and the
+//! other lookups by key (`existing`, the lookup before a conversation exists, `expiry::remembered`,
+//! `clear::was_removed`, the modifiers) each have an arm for every scope. The rows of a
+//! `HistoryBatch` at or below their conversation's cut (a clear by time, `clear.rs`) are dropped
+//! before they get here (`ingest/mod.rs`).
 
 use std::collections::BTreeMap;
 
 use kourier_backend_api::{HistoryEdit, IncomingMessage, MAX_HISTORY_EDITS};
 use kourier_db::rusqlite::{OptionalExtension, Row, params};
 use kourier_model::{
-    Body, ConvKind, ConversationId, DisappearKind, MessageId, MsgIdScope, Origin, OutgoingState,
-    Placeholder, ReceiptKind, RecipientState, UserId,
+    Body, ConvKind, ConversationId, DisappearKind, HistoryReadState, MessageId, MsgIdScope, Origin,
+    OutgoingState, Placeholder, ReceiptKind, RecipientState, UserId,
 };
 
 use super::{Apply, NotifyCandidate};
@@ -31,12 +41,14 @@ pub(crate) struct MsgRow {
     pub read_state: Option<String>,
     /// The server's time for the message, when the network gave one.
     pub server_at: Option<i64>,
+    /// Its position in the conversation, when the network numbers its messages (KT-2).
+    pub net_seq: Option<i64>,
 }
 
 impl MsgRow {
     pub(crate) const SELECT: &'static str = "SELECT m.id, m.conversation_id, c.conv_key,
         m.net_author, m.net_local, m.sent_at, m.sort_key, m.deleted, m.body_kind,
-        m.revision, m.read_state, m.server_at
+        m.revision, m.read_state, m.server_at, m.net_seq
         FROM messages m JOIN conversations c ON c.id = m.conversation_id";
 
     pub(crate) fn from_row(r: &Row<'_>) -> kourier_db::rusqlite::Result<Self> {
@@ -53,6 +65,7 @@ impl MsgRow {
             revision: u16::try_from(r.get::<_, i64>(9)?.max(0)).unwrap_or(u16::MAX),
             read_state: r.get(10)?,
             server_at: r.get(11)?,
+            net_seq: r.get(12)?,
         })
     }
 
@@ -77,6 +90,8 @@ pub(super) struct ConvState {
     muted_until: Option<i64>,
     local_muted_until: Option<i64>,
     read_sent_at: Option<i64>,
+    read_seq: Option<i64>,
+    peer_read_seq: Option<i64>,
 }
 
 /// Whether a body carries attachment rows.
@@ -134,6 +149,24 @@ fn history_sort_key(sent_at: i64, local: &str) -> i64 {
         .saturating_add(i64::try_from(h & 1023).unwrap_or(0))
 }
 
+/// The key of a message under [`MsgIdScope::AccountAuthor`]: the partial unique index
+/// `messages_key_account`.
+pub(crate) const BY_KEY_ACCOUNT: &str =
+    "SELECT id FROM messages WHERE account_id = ?1 AND net_author = ?2
+   AND net_local = ?3 AND net_scope = 0";
+
+/// The key of a message under [`MsgIdScope::Conversation`]: the partial unique index
+/// `messages_key_conv`.
+pub(crate) const BY_KEY_CONVERSATION: &str =
+    "SELECT id FROM messages WHERE conversation_id = ?1 AND net_local = ?2
+   AND net_scope = 1";
+
+/// The key of a message under [`MsgIdScope::ConversationAuthor`] (core.db schema 16): the
+/// partial unique index `messages_key_conv_author` serves it, and only a statement that says
+/// `net_scope = 2` can use that index (`tests::by_key_under_per_sender_ids_uses_its_key`).
+pub(crate) const BY_KEY_PER_SENDER: &str = "SELECT id FROM messages WHERE conversation_id = ?1
+   AND net_author = ?2 AND net_local = ?3 AND net_scope = 2";
+
 impl Apply<'_> {
     /// Loads one message.
     pub(crate) fn msg_row(&self, id: MessageId) -> Result<Option<MsgRow>> {
@@ -145,11 +178,31 @@ impl Apply<'_> {
             .optional()?)
     }
 
-    /// The message with key `(author, local)` under the network scope (§3.1). A call line is
-    /// keyed by its conversation on every network ([`super::call`]): under `AccountAuthor`
-    /// scope an own key that names no message names the call line of `conv` with that id,
-    /// when there is one.
+    /// The message with key `(author, local)`: [`Self::by_key_only`], and for an own key that
+    /// names nothing the row that had the id under an earlier name ([`Self::by_alias`], KT-2): a late
+    /// copy under an allocated id finds its row, and the allocator does not hand that id out again.
+    /// Only an own key looks: a message of somebody else with that id is a message of its own, and a
+    /// non-own key never pays for the arm.
     pub(crate) fn by_key(
+        &self,
+        conv: ConversationId,
+        author: &str,
+        local: &str,
+    ) -> Result<Option<MsgRow>> {
+        if let Some(row) = self.by_key_only(conv, author, local)? {
+            return Ok(Some(row));
+        }
+        if author.is_empty() {
+            return self.by_alias(conv, local);
+        }
+        Ok(None)
+    }
+
+    /// The row that holds the key `(author, local)` now, under the network scope (§3.1): what can
+    /// clash with a key, so an alias is not looked at. A call line is keyed by its conversation on
+    /// every network ([`super::call`]): under `AccountAuthor` and `ConversationAuthor` scope an own
+    /// key that names no message names the call line of `conv` with that id, when there is one.
+    pub(crate) fn by_key_only(
         &self,
         conv: ConversationId,
         author: &str,
@@ -159,10 +212,7 @@ impl Apply<'_> {
             MsgIdScope::AccountAuthor => {
                 let id: Option<i64> = self
                     .conn
-                    .prepare_cached(
-                        "SELECT id FROM messages WHERE account_id = ?1 AND net_author = ?2
-                           AND net_local = ?3 AND net_scope = 0",
-                    )?
+                    .prepare_cached(BY_KEY_ACCOUNT)?
                     .query_row((self.acc.id.0, author, local), |r| r.get(0))
                     .optional()?;
                 if id.is_none() && author.is_empty() {
@@ -170,14 +220,29 @@ impl Apply<'_> {
                 }
                 id
             }
+            // Ids unique per conversation (Threema): no author in the key, so a second author
+            // with the id is a collision ([`Self::existing`]).
             MsgIdScope::Conversation => self
                 .conn
-                .prepare_cached(
-                    "SELECT id FROM messages WHERE conversation_id = ?1 AND net_local = ?2
-                       AND net_scope = 1",
-                )?
+                .prepare_cached(BY_KEY_CONVERSATION)?
                 .query_row((conv.0, local), |r| r.get(0))
                 .optional()?,
+            // Ids unique per sender in a chat (WhatsApp): the author is part of the key, so two
+            // members may use one id. An own key that names no message names the call line
+            // of `conv` with that id, as under `AccountAuthor`: an own send is never given a
+            // call's id ([`crate::outbox::allocate`]) and a call signal never takes the id of
+            // an own message ([`super::call`]).
+            MsgIdScope::ConversationAuthor => {
+                let id: Option<i64> = self
+                    .conn
+                    .prepare_cached(BY_KEY_PER_SENDER)?
+                    .query_row((conv.0, author, local), |r| r.get(0))
+                    .optional()?;
+                if id.is_none() && author.is_empty() {
+                    return self.call_row(conv, local);
+                }
+                id
+            }
         };
         match id {
             Some(id) => self.msg_row(MessageId(id)),
@@ -189,7 +254,8 @@ impl Apply<'_> {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT kind, blocked, muted_until, local_muted_until, read_sent_at
+                "SELECT kind, blocked, muted_until, local_muted_until, read_sent_at, read_seq,
+                   peer_read_seq
                  FROM conversations WHERE id = ?1",
             )?
             .query_row([conv.0], |r| {
@@ -199,6 +265,8 @@ impl Apply<'_> {
                     muted_until: r.get(2)?,
                     local_muted_until: r.get(3)?,
                     read_sent_at: r.get(4)?,
+                    read_seq: r.get(5)?,
+                    peer_read_seq: r.get(6)?,
                 })
             })?)
     }
@@ -282,10 +350,54 @@ impl Apply<'_> {
             (None, MsgIdScope::AccountAuthor) => {
                 self.by_key(ConversationId(0), &author, &m.local)?
             }
-            (None, MsgIdScope::Conversation) => None,
+            (None, MsgIdScope::Conversation | MsgIdScope::ConversationAuthor) => None,
         };
         if let Some(existing) = found {
             return self.existing(existing, &author, m, history);
+        }
+        // The echo of an own send that names the id it was allocated under (KT-2): the row of that
+        // id is this message under the id the server gave it. The re-key's second part follows the
+        // ordinary path, which finishes the send ([`super::rekey`]: what waited must find a message
+        // that is sent). The row gone and its id remembered: a chat or message removed while the
+        // send was in flight does not come back through its echo. Only this device's echo binds:
+        // another device cannot know what this one allocated, so a copy from it that says so is
+        // a backend fault and re-keys nothing.
+        if matches!(origin, Origin::OwnThisDevice)
+            && let Some(allocated) = m.allocated_as.clone()
+        {
+            let row = match sql::conversation_id(self.conn, self.acc.id, &key)? {
+                Some(c) => self
+                    .by_key_only(c, "", &allocated)?
+                    .filter(|r| r.conv == c && r.is_own()),
+                None => None,
+            };
+            match row {
+                Some(row) => {
+                    if let Some(done) = self.rekey_own(row.id, &m.local, m.net_seq)? {
+                        if let Some(fresh) = self.msg_row(row.id)? {
+                            self.existing(fresh, &author, m, history)?;
+                        }
+                        return self.settle_rekey(done);
+                    }
+                }
+                None => {
+                    if crate::expiry::remembered(
+                        self.conn,
+                        self.acc.id,
+                        self.scope,
+                        &key.encode(),
+                        "",
+                        &allocated,
+                        self.now,
+                    )? {
+                        tracing::debug!(
+                            account = self.acc.id.0,
+                            "the echo of a removed message was dropped"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
         }
         // A copy of a message whose timer ran out here (its row is gone): it stays gone, and
         // leaves no empty chat behind.
@@ -304,14 +416,38 @@ impl Apply<'_> {
             );
             return Ok(());
         }
-        let conv = self.ensure_conversation(&key)?;
+        // A QUIET notice (a safety number that changed, a refreshed session, a changed number,
+        // an accepted request: `Body::is_quiet`) makes no chat and brings none back, whatever
+        // the user chose to see in the list (user decision, 2026-10-15; Signal Desktop's key
+        // change gives its chat no activity either). It is a row of a chat that is here, deleted
+        // or not: for a chat the core does not have it is dropped, for a chat deleted on another
+        // device it is stored and the chat stays deleted until a row that counts comes. The
+        // setting is never read here, so switching it later changes only what the list shows,
+        // and nothing that was dropped or stored depends on it ([`crate::notices`]).
+        let quiet = m.body.is_quiet();
+        let conv = if quiet {
+            let Some(conv) = sql::conversation_id(self.conn, self.acc.id, &key)? else {
+                tracing::debug!(
+                    account = self.acc.id.0,
+                    "a quiet notice for a chat the core does not have was dropped"
+                );
+                return Ok(());
+            };
+            conv
+        } else {
+            self.ensure_conversation(&key)?
+        };
 
         let cs = self.conv_state(conv)?;
         let sort_key = self.sort_key_of(conv, &m, history)?;
         let remote = matches!(origin, Origin::Remote { .. });
         // System notices (group updates, safety-number changes) are never unread.
         let read_state = if remote && !matches!(m.body, Body::System(_)) {
-            let read_elsewhere = cs.read_sent_at.is_some_and(|w| m.sent_at <= w);
+            // By its position when it has one, never by time ([`super::position`]).
+            let read_elsewhere = match m.net_seq {
+                Some(seq) => cs.read_seq.is_some_and(|w| seq <= w),
+                None => cs.read_sent_at.is_some_and(|w| m.sent_at <= w),
+            };
             Some(if m.read || read_elsewhere {
                 "Read"
             } else {
@@ -325,9 +461,19 @@ impl Apply<'_> {
         let floor = if remote || matches!(m.body, Body::System(_)) {
             None
         } else {
-            Some(m.initial_out_state.clone().unwrap_or(OutgoingState::Sent {
+            let stated = m.initial_out_state.clone().unwrap_or(OutgoingState::Sent {
                 server_at: m.server_at,
-            }))
+            });
+            // At or below what the other side has read: the marker came first.
+            let read = m
+                .net_seq
+                .zip(cs.peer_read_seq)
+                .is_some_and(|(seq, peer)| seq <= peer);
+            if read {
+                merge_out(Some(stated), Some(OutgoingState::Read))
+            } else {
+                Some(stated)
+            }
         };
         let linked: Option<i64> = match m.linked_local {
             Some(l) => self
@@ -383,9 +529,9 @@ impl Apply<'_> {
                    origin, device, linked_message_id, sort_key, sent_at, server_at, received_at,
                    arrival, body_kind, body, preview, reply_to, out_floor, out_state, read_state,
                    expiry_kind, expiry_timer_ms, expiry_started_at, expires_at, view_once, history,
-                   silent, mentions_me, meta, raw)
+                   silent, mentions_me, meta, raw, net_seq)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                   ?18, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                   ?18, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             )?
             .execute(params![
                 self.acc.id.0,
@@ -417,14 +563,18 @@ impl Apply<'_> {
                 m.mentions_me,
                 m.meta.as_ref().map(sql::blob_to_sql),
                 m.raw.as_ref().map(sql::blob_to_sql),
+                m.net_seq,
             ])?;
         let id = MessageId(self.conn.last_insert_rowid());
         if has_attachments(&m.body) {
             self.insert_attachments(id, &m.body)?;
             self.plan_downloads(id, conv, history)?;
         }
-        // A chat deleted on another device comes back with its next message.
-        self.unhide(conv)?;
+        // A chat deleted on another device comes back with its next message (a quiet notice
+        // is not one, see above).
+        if !quiet {
+            self.unhide(conv)?;
+        }
         self.ch.message(conv, id);
         if let Origin::Remote { author, device } = &origin {
             self.ch.incoming.push((conv, author.clone(), *device));
@@ -504,12 +654,23 @@ impl Apply<'_> {
     ) -> Result<()> {
         if self.scope == MsgIdScope::Conversation && ex.net_author != author {
             // Same (conversation, local) from another author: a backend bug or a collision.
+            // Only the per-conversation scope has this case: its ids are unique in the chat
+            // whoever sends them (Threema), and the first row keeps the key. Under
+            // `ConversationAuthor` the author is in the key and `by_key` cannot return a row
+            // of another author; under `AccountAuthor` it likewise. Such a copy is not this
+            // message, so it teaches the row no position either.
             tracing::warn!(
                 message = ex.id.0,
                 "message key collision with another author; ignored"
             );
             return Ok(());
         }
+        // A position it did not have, above everything else that can end here
+        // ([`super::position`]): a tombstone and a call line keep their place too.
+        let ex = match (ex.net_seq, m.net_seq) {
+            (None, Some(seq)) => self.position_learnt(ex, seq)?,
+            _ => ex,
+        };
         if ex.deleted.is_some() {
             return Ok(());
         }
@@ -614,8 +775,14 @@ impl Apply<'_> {
                 self.start_send_timer(ex.id)?;
             }
             self.recompute_out(ex.id)?;
-        } else if !ex.is_own() && m.read {
-            // A copy that says "already read elsewhere" (history imports).
+        } else if !ex.is_own()
+            && m.read
+            && !(history && self.history_read == HistoryReadState::Unknown)
+        {
+            // A copy that says "already read elsewhere" (history imports). Not from a network
+            // whose history cannot say it (W4 fix F1, WhatsApp: `read: true` there is only "not
+            // known"): a copy never lowers what the person has not seen, and the live message
+            // that arrived meanwhile is still unread here.
             self.raise_read_state(&ex, kourier_model::ReadState::Read)?;
         }
         for r in &m.reactions {
@@ -1026,6 +1193,55 @@ mod tests {
         assert_eq!(merge_out(sent, Some(failed.clone())), Some(failed));
         assert!(preview(&Body::text("  hi  ")).is_some_and(|p| p == "hi"));
         assert_eq!(preview(&Body::text("")), None);
+    }
+
+    /// The key of a message under per-sender ids is one lookup of the partial unique index,
+    /// whatever the size of the chat (T7): core.db has no planner statistics, so the plan is
+    /// pinned here. Without `net_scope = 2` in the statement the partial index cannot be
+    /// used and the plan walks the chat by `messages_timeline`.
+    #[test]
+    fn by_key_under_per_sender_ids_uses_its_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([3u8; 32]),
+            kourier_model::NetworkKind::Fake,
+            MsgIdScope::ConversationAuthor,
+            &[kourier_model::UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let plan = |sql: &str| -> Vec<String> {
+            h.connection()
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    sql.replace("?1", "1")
+                        .replace("?2", "'lid:alice'")
+                        .replace("?3", "'3EB0X1'")
+                ))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(3))
+                .expect("plan")
+                .collect::<kourier_db::rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let steps = plan(BY_KEY_PER_SENDER);
+        assert!(
+            steps.iter().any(|s| s.starts_with("SEARCH messages USING")
+                && s.contains("INDEX messages_key_conv_author")
+                && s.contains("conversation_id=?")
+                && s.contains("net_author=?")
+                && s.contains("net_local=?")),
+            "{steps:#?}"
+        );
+        // The same statement without the scope is the generic walk: this is what the plan
+        // test guards against.
+        let without = plan(&BY_KEY_PER_SENDER.replace("AND net_scope = 2", ""));
+        assert!(
+            without
+                .iter()
+                .all(|s| !s.contains("messages_key_conv_author")),
+            "{without:#?}"
+        );
     }
 
     /// Sender-claimed timestamps at the extremes saturate instead of overflowing.

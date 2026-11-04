@@ -12,6 +12,9 @@
 
 mod support;
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
 use cxx_qt_lib::{QByteArray, QGuiApplication, QQmlApplicationEngine, QUrl};
 use kourier_app::{App, FixtureOptions, Launch, StartOptions};
 use kourier_qt::{UiContext, UiOptions};
@@ -40,6 +43,7 @@ Window {
     property int waits: 0
     property int editsStarted: 0
     property int editsFinished: 0
+    property bool removed: false
 
     function fail(msg: string): void {
         console.error("FAIL [" + step + "]: " + msg);
@@ -273,6 +277,11 @@ Window {
                 // Files can be a reply too.
                 if (!App.composer.replyTo(QUOTES, test.photo)) return fail("replyTo for files");
                 if (!App.composer.addFile(SAMPLE)) return fail("the sample was not added: " + App.composer.notice);
+                test.step = "filelooked";
+                return;
+            case "filelooked":
+                // Send waits for the core's look at the file (its location verdict).
+                if (!App.composer.planned) return;
                 composerItem.setText("With a picture");
                 composerItem.send();
                 if (App.composer.attachmentCount !== 0 || composerItem.replying) return fail("strip and banner go with the send");
@@ -284,10 +293,31 @@ Window {
                 const q = test.quoteOf(r);
                 if (!q || q.target !== test.photo) return fail("files carry the quote");
                 if (!r.blocks.some(b => b.type === "image")) return fail("the picture of the reply");
-                // A send the core refuses (a file that is gone, sent before the core has
+                // A send the core refuses (a file that is gone at Send, after the core
                 // looked at it) comes back whole.
                 if (!App.composer.replyTo(QUOTES, test.photo)) return fail("replyTo before the refused send");
                 if (!App.composer.addFile(GONE)) return fail("the file was not added: " + App.composer.notice);
+                test.step = "gonelooked";
+                return;
+            }
+            case "gonelooked": {
+                if (!App.composer.planned) return;
+                if (App.composer.sendableCount !== 1 || fileRows.objectAt(0).reason !== "") return fail("the file can go while it is there: " + fileRows.objectAt(0).reason);
+                // The file is deleted after the core looked at it (the test's side does it).
+                const request = new XMLHttpRequest();
+                request.onreadystatechange = function() {
+                    if (request.readyState === XMLHttpRequest.DONE) {
+                        test.removed = request.status === 200;
+                    }
+                };
+                request.open("GET", "http://127.0.0.1:PORT/remove");
+                request.send();
+                test.step = "goneremoved";
+                return;
+            }
+            case "goneremoved": {
+                if (!test.removed) return;
+                if (App.composer.sendableCount !== 1) return fail("the plan changed before the send");
                 composerItem.setText("Not lost");
                 composerItem.send();
                 if (App.composer.attachmentCount !== 0 || composerItem.text !== "") return fail("the composer empties when it sends");
@@ -457,14 +487,37 @@ fn main() {
     let sample_url = kourier_qt::app::file_url(&sample_path);
 
     // Something the composer takes like any file and no network can carry: a file that was
-    // deleted after it was picked.
-    let gone_url = kourier_qt::app::file_url(&dir.join("Gone.pdf"));
+    // deleted after the core looked at it. The test owns it; a request to this port removes it.
+    let gone_path = dir.join("Gone.pdf");
+    std::fs::write(
+        &gone_path,
+        b"%PDF-1.4\n% a synthetic test document\n%%EOF\n",
+    )
+    .expect("write the document");
+    let gone_url = kourier_qt::app::file_url(&gone_path);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+    let port = listener.local_addr().expect("its address").port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0u8; 1024];
+            let n = stream.read(&mut request).unwrap_or(0);
+            let removed = String::from_utf8_lossy(&request[..n]).starts_with("GET /remove")
+                && std::fs::remove_file(&gone_path).is_ok();
+            let answer: &[u8] = if removed {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            } else {
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            let _ = stream.write_all(answer);
+        }
+    });
 
     let script = SCRIPT
         .replace("QUOTES", &quotes.0.to_string())
         .replace("TIMER", &timer.0.to_string())
         .replace("SAMPLE", &format!("{sample_url:?}"))
-        .replace("GONE", &format!("{gone_url:?}"));
+        .replace("GONE", &format!("{gone_url:?}"))
+        .replace("PORT", &port.to_string());
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
         kourier_qt::install_image_provider(engine.as_mut());

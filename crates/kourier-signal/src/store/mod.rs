@@ -22,7 +22,10 @@ use kourier_db::rusqlite::Connection;
 use libsignal_protocol::{IdentityKeyPair, ProtocolAddress, SignalProtocolError};
 
 pub(crate) use identity::{
-    IdentityChangeRecord, SqlIdentityStore, load_identity_key, save_own_identity,
+    DEFAULT as IDENTITY_DEFAULT, IdentityChangeRecord, SqlIdentityStore,
+    UNVERIFIED as IDENTITY_UNVERIFIED, VERIFIED as IDENTITY_VERIFIED,
+    is_changed as identity_is_changed, load_identity, load_identity_key, save_own_identity,
+    trust_of,
 };
 pub(crate) use prekeys::{
     SqlKyberPreKeyStore, SqlPreKeyStore, SqlSignedPreKeyStore, insert_kyber_prekey, insert_prekey,

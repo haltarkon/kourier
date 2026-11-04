@@ -490,6 +490,10 @@ pub struct HarnessOptions {
     /// Keep the server's state (CDN3 files) here; by default it goes to a temporary directory
     /// removed when the [`Harness`] is dropped, even if the process had to be killed.
     pub state_dir: Option<PathBuf>,
+    /// The first port the harness tries (`--first-port`, test-only; the kernel's pick by
+    /// default). The harness skips a port whose IPv6 twin `[::1]:P` another program holds, so
+    /// a test that holds it itself sees the handshake name another port.
+    pub first_port: Option<u16>,
 }
 
 impl Default for HarnessOptions {
@@ -500,6 +504,7 @@ impl Default for HarnessOptions {
             request_timeout: Duration::from_secs(90),
             api_timeout: None,
             state_dir: None,
+            first_port: None,
         }
     }
 }
@@ -545,6 +550,9 @@ impl Harness {
             .kill_on_drop(true);
         if let Some(api_timeout) = options.api_timeout {
             command.arg(format!("--api-timeout={}", millis(api_timeout)));
+        }
+        if let Some(first_port) = options.first_port {
+            command.arg(format!("--first-port={first_port}"));
         }
         let temp_state_dir = match &options.state_dir {
             Some(state_dir) => {
@@ -903,6 +911,47 @@ impl Harness {
         self.request_value("failAuth", args).await.map(drop)
     }
 
+    /// Holds the answer to the next `count` authenticated websocket upgrades under the name
+    /// `username` (`"<aci>.<deviceId>"`, a device that may not be linked yet) back by `ms`
+    /// (`holdUpgrade`): the server has the attempt and the client waits for it.
+    pub async fn hold_upgrade_named(
+        &self,
+        username: &str,
+        ms: u32,
+        count: u32,
+    ) -> Result<(), HarnessError> {
+        let args = json!({ "username": username, "ms": ms, "count": count });
+        self.request_value("holdUpgrade", args).await.map(drop)
+    }
+
+    /// The next `count` requests with `verb` and a path that starts with `path_prefix` close
+    /// the websocket they came on with `code` (4409: connected elsewhere) instead of being
+    /// answered (`closeOnRequest`).
+    pub async fn close_on_request(
+        &self,
+        verb: &str,
+        path_prefix: &str,
+        code: u16,
+        count: u32,
+    ) -> Result<(), HarnessError> {
+        let args = json!({ "verb": verb, "pathPrefix": path_prefix, "code": code, "count": count });
+        self.request_value("closeOnRequest", args).await.map(drop)
+    }
+
+    /// The next `count` requests with `verb` and a path that starts with `path_prefix` are
+    /// taken up by the server only after `ms` (`holdRequest`): the client's request timeout
+    /// comes first, and the same request asked again on a new connection is served at once.
+    pub async fn hold_request(
+        &self,
+        verb: &str,
+        path_prefix: &str,
+        ms: u32,
+        count: u32,
+    ) -> Result<(), HarnessError> {
+        let args = json!({ "verb": verb, "pathPrefix": path_prefix, "ms": ms, "count": count });
+        self.request_value("holdRequest", args).await.map(drop)
+    }
+
     /// The phone's user chooses "Transfer message history": `primary` puts this ephemeral
     /// backup key into the provisioning message of a link whose URL offers `backup5`.
     pub async fn set_ephemeral_backup_key(&self, primary: &str) -> Result<[u8; 32], HarnessError> {
@@ -1052,6 +1101,20 @@ impl Harness {
     pub async fn connection_stats(&self, device: &str) -> Result<ConnectionStats, HarnessError> {
         self.request("connectionStats", json!({ "device": device }))
             .await
+    }
+
+    /// The requests the clients sent over their websockets so far, in arrival order, only
+    /// those with `verb` and a path that starts with `path_prefix` when given (`requestLog`);
+    /// `clear` forgets the log first.
+    pub async fn request_log(
+        &self,
+        verb: Option<&str>,
+        path_prefix: Option<&str>,
+        clear: bool,
+    ) -> Result<Vec<LoggedRequest>, HarnessError> {
+        let args = json!({ "verb": verb, "pathPrefix": path_prefix, "clear": clear });
+        let log: RequestLog = self.request("requestLog", args).await?;
+        Ok(log.requests)
     }
 
     /// The one-time prekeys the server holds for `device` and its key uploads (`keyCounts`).
@@ -1407,12 +1470,124 @@ impl Harness {
         Ok(v["refused"].as_u64().unwrap_or(0))
     }
 
+    /// The safety number as `primary`'s phone computes it for `peer` (a primary ref; a linked
+    /// device shares its primary's ACI keys) with the harness's libsignal-client, and, given
+    /// `scannable` (the bytes of the other side's QR code), whether the two QR codes match
+    /// (`ScannableFingerprint.compare`). P5a's independent oracle (critic H4).
+    pub async fn safety_number(
+        &self,
+        primary: &str,
+        peer: &str,
+        scannable: Option<&[u8]>,
+    ) -> Result<PhoneSafetyNumber, HarnessError> {
+        use base64::Engine as _;
+        let mut args = json!({ "primary": primary, "peer": peer });
+        if let Some(bytes) = scannable {
+            args["scannable"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+        self.request("safetyNumber", args).await
+    }
+
+    /// A new install of `primary` as the server sees it (a new ACI identity key, its prekeys
+    /// signed with it; `Device.setKeys`): profile and prekey requests answer the new key, the
+    /// harness primary cannot decrypt messages encrypted to it (and asks for no retry), and
+    /// later `set_storage_state` records carry it. Returns the new key (33 bytes, base64).
+    pub async fn replace_identity_key(&self, primary: &str) -> Result<String, HarnessError> {
+        let v = self
+            .request_value("replaceIdentityKey", json!({ "primary": primary }))
+            .await?;
+        v["identityKey"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| HarnessError::Protocol("replaceIdentityKey without a key".into()))
+    }
+
     /// Replaces the phone's Storage Service state (a new manifest version).
     pub async fn set_storage_state(
         &self,
         spec: &StorageSpec,
     ) -> Result<StorageWritten, HarnessError> {
         self.request("setStorageState", to_args(spec)?).await
+    }
+
+    /// The phone's Storage Service state as the phone reads it (`storageState`): it decrypts
+    /// the manifest and every listed item, so it FAILS while an item cannot be read.
+    pub async fn storage_state(&self, primary: &str) -> Result<StorageView, HarnessError> {
+        self.request("storageState", json!({ "primary": primary }))
+            .await
+    }
+
+    /// The manifest alone (`storageIdentifiers`).
+    pub async fn storage_identifiers(
+        &self,
+        primary: &str,
+    ) -> Result<StorageIdentifiers, HarnessError> {
+        self.request("storageIdentifiers", json!({ "primary": primary }))
+            .await
+    }
+
+    /// One record's decrypted bytes, not re-encoded (`rawStorageRecord`).
+    pub async fn raw_storage_record(
+        &self,
+        primary: &str,
+        subject: StorageSubject<'_>,
+    ) -> Result<RawStorageRecord, HarnessError> {
+        let mut args = json!({ "primary": primary });
+        subject.put(&mut args);
+        self.request("rawStorageRecord", args).await
+    }
+
+    /// How many writes of the linked device the server applied, how many it answered 409 and how
+    /// many PUTs reached it and were refused. The phone's own writes are in none.
+    pub async fn storage_writes(&self) -> Result<StorageWrites, HarnessError> {
+        self.request("storageWrites", json!({})).await
+    }
+
+    /// A write of the LINKED device made by the harness itself over the real route
+    /// (`storagePut`): the manifest again under `version` (`None`: the server's version + 1)
+    /// with `orphans` items no identifier lists. For tests of the harness itself, where no
+    /// Kourier writes.
+    pub async fn storage_put(
+        &self,
+        primary: &str,
+        version: Option<u64>,
+        orphans: u64,
+    ) -> Result<StoragePut, HarnessError> {
+        let mut args = json!({ "primary": primary, "orphans": orphans });
+        if let Some(version) = version {
+            args["version"] = json!(version);
+        }
+        self.request("storagePut", args).await
+    }
+
+    /// The phone changes one record now, under a new identifier (`updateStorageRecord`).
+    /// Returns the new manifest version.
+    pub async fn update_storage_record(
+        &self,
+        primary: &str,
+        subject: StorageSubject<'_>,
+        change: &PhoneChange,
+    ) -> Result<u64, HarnessError> {
+        let v = self
+            .request_value("updateStorageRecord", change.args(primary, subject))
+            .await?;
+        v["version"]
+            .as_u64()
+            .ok_or_else(|| HarnessError::Protocol("updateStorageRecord without a version".into()))
+    }
+
+    /// Arms a phone change to be applied just before the linked device's NEXT write is looked
+    /// at: that write is answered 409 (`conflictNextStorageWrite`).
+    pub async fn conflict_next_storage_write(
+        &self,
+        primary: &str,
+        subject: StorageSubject<'_>,
+        change: &PhoneChange,
+    ) -> Result<(), HarnessError> {
+        let _: Value = self
+            .request_value("conflictNextStorageWrite", change.args(primary, subject))
+            .await?;
+        Ok(())
     }
 
     /// `SyncMessage.FetchLatest{type}` from the phone to its linked device `to` (`type`:
@@ -1636,6 +1811,13 @@ impl Harness {
         self.request("sendStats", json!({})).await
     }
 
+    /// Starts [`SendStats::in_flight_max`] anew: the maxima go back to what is open right now.
+    pub async fn reset_in_flight(&self) -> Result<(), HarnessError> {
+        self.request_value("resetInFlight", json!({}))
+            .await
+            .map(drop)
+    }
+
     /// `primary` forgets the sender keys it holds from `from`; returns how many.
     pub async fn break_sender_keys(&self, primary: &str, from: &str) -> Result<u64, HarnessError> {
         let value = self
@@ -1671,6 +1853,21 @@ pub struct ConnectionStats {
     pub open: bool,
     /// Keepalive requests the server got (from any socket).
     pub keepalives: u64,
+}
+
+/// One request a client sent over a websocket (`requestLog`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggedRequest {
+    /// `GET`, `PUT`, `DELETE` …
+    pub verb: String,
+    /// The path with its query string.
+    pub path: String,
+}
+
+/// The answer of `requestLog`.
+#[derive(Debug, Deserialize)]
+struct RequestLog {
+    requests: Vec<LoggedRequest>,
 }
 
 /// The server's prekeys of one device (`keyCounts`).
@@ -1801,6 +1998,23 @@ pub struct SendStats {
     /// clients fetched (the kind without the number asks `?includeE164=false`).
     #[serde(default)]
     pub certificate_requests: Vec<String>,
+    /// The most requests of each kind a client had open at once since the harness started or
+    /// [`Harness::reset_in_flight`].
+    #[serde(default)]
+    pub in_flight_max: InFlightMax,
+}
+
+/// The most requests of a kind a client had open at once (`SendStats::in_flight_max`): from
+/// their arrival at the server to their answer, the round trip of [`Harness::set_latency`]
+/// included. A test that says "these ran at once" judges this count, not the wall time.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InFlightMax {
+    /// `GET /v2/keys/<service id>/<device>`: the prekey fetches.
+    pub prekey_fetches: u64,
+    /// `PUT /v1/messages/<service id>`: the 1:1 sends (distribution messages among them), not
+    /// the multi-recipient route.
+    pub single_sends: u64,
 }
 
 /// One 1:1 send as the server saw its request (`SendStats::urgency`).
@@ -1823,12 +2037,35 @@ impl SendStats {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptFailure {
-    /// Ref of the sending device.
-    pub source: String,
+    /// Ref of the sending device (`None`: a sealed envelope to a replaced identity key, which
+    /// did not unseal).
+    pub source: Option<String>,
     /// The envelope timestamp.
     pub timestamp: u64,
     /// The inner envelope type (`SenderKey`, `CipherText`, `PreKey`, `Plaintext`).
     pub envelope_type: String,
+}
+
+/// Result of `safetyNumber`: one phone's side of a safety number. Its `Debug` hides the
+/// digits and bytes (a safety number never reaches a test's output).
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneSafetyNumber {
+    /// The 60 digits (no spaces).
+    pub digits: String,
+    /// The bytes this side's QR code carries (base64).
+    pub scannable: String,
+    /// `ScannableFingerprint.compare` against the given bytes (absent when none were given).
+    pub matches: Option<bool>,
+}
+
+impl std::fmt::Debug for PhoneSafetyNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhoneSafetyNumber")
+            .field("digits", &format_args!("[{} digits]", self.digits.len()))
+            .field("matches", &self.matches)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Milliseconds for a `timeout` argument (at least 1, the harness rejects 0).
@@ -1956,6 +2193,9 @@ pub struct CreatePrimary {
     /// Profile "about" emoji.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about_emoji: Option<String>,
+    /// The profile's `phoneNumberSharing` field (one byte, 1 = shares); `None`: no such field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone_number_sharing: Option<bool>,
 }
 
 impl CreatePrimary {
@@ -1989,6 +2229,10 @@ pub struct StorageSpec {
     /// `Some(false)`: legacy record keys (no `recordIkm` in the manifest).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_ikm: Option<bool>,
+    /// Records of kinds a linked device never merges, one each, by name:
+    /// `storyDistributionList`, `callLink`, `chatFolder`, `notificationProfile` (A10c, L8).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<String>,
 }
 
 /// One `ContactRecord` of [`StorageSpec`] (absent fields take the harness defaults).
@@ -2032,6 +2276,18 @@ pub struct StorageContact {
     /// The record carries the PNI beside the ACI (the phone joined the two).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub with_pni: bool,
+    /// The phone's verification of the record's identity key: `default` (the harness's
+    /// default), `verified` or `unverified` (verified, then the key changed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_state: Option<String>,
+    /// Raw protobuf fields (base64) the harness appends INSIDE the contact record's message
+    /// after writing it: a client that re-encodes the record loses them (A10c).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_fields: Option<String>,
+    /// The listed item's value on the server is no ciphertext: the phone's own
+    /// `getStorageState()` throws (`storage_identifiers` and `raw_storage_record` still work).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub undecryptable: bool,
 }
 
 impl StorageContact {
@@ -2068,6 +2324,12 @@ pub struct StorageGroup {
     /// Pinned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+    /// Raw protobuf fields (base64) appended inside the group record's message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_fields: Option<String>,
+    /// The listed item is no ciphertext (as [`StorageContact::undecryptable`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub undecryptable: bool,
 }
 
 /// Arguments of `createGroup`.
@@ -2096,6 +2358,13 @@ pub struct CreateGroup {
     /// Only administrators may send.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub announcements_only: Option<bool>,
+    /// Who may change the title, picture, timer and description: `member` (the default) or
+    /// `administrator`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes_access: Option<String>,
+    /// Who may add members: `member` (the default) or `administrator`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members_access: Option<String>,
 }
 
 /// Arguments of `modifyGroup`: one signed change.
@@ -2200,6 +2469,9 @@ pub struct StorageAccount {
     /// Note to Self marked unread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_to_self_marked_unread: Option<bool>,
+    /// Raw protobuf fields (base64) appended inside the account record's message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_fields: Option<String>,
 }
 
 /// The result of `setStorageState`.
@@ -2209,6 +2481,213 @@ pub struct StorageWritten {
     pub version: u64,
     /// Records in the manifest.
     pub records: u64,
+}
+
+/// The flags of one chat's record in the phone's Storage Service state (`storageState`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatFlags {
+    /// Archived (Note to Self: `noteToSelfArchived`).
+    #[serde(default)]
+    pub archived: bool,
+    /// Marked unread.
+    #[serde(default)]
+    pub marked_unread: bool,
+    /// Muted until, in ms, as a decimal string (`"0"` = not muted; "Always" is `i64::MAX`,
+    /// beyond a double); a Note to Self has none.
+    #[serde(default)]
+    pub muted_until: Option<String>,
+}
+
+impl ChatFlags {
+    /// The mute time in ms (0 = not muted).
+    pub fn muted_until_ms(&self) -> u64 {
+        self.muted_until
+            .as_deref()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// What the phone's Storage Service state says (`storageState`), decoded as the phone reads it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageView {
+    /// The manifest version (`None`: no manifest).
+    pub version: Option<u64>,
+    /// Records the manifest lists.
+    #[serde(default)]
+    pub records: u64,
+    /// Contact records by the contact's primary ref.
+    #[serde(default)]
+    pub contacts: BTreeMap<String, ChatFlags>,
+    /// A contact record's `identityState` by the contact's primary ref: `default`, `verified`
+    /// or `unverified` (P5a's safety number state).
+    #[serde(default)]
+    pub identity_states: BTreeMap<String, String>,
+    /// Group records by group id (base64).
+    #[serde(default)]
+    pub groups: BTreeMap<String, ChatFlags>,
+    /// The account record's pinned conversations in order: `contact:<ref>`, `group:<id>` or
+    /// `other`.
+    #[serde(default)]
+    pub pins: Vec<String>,
+    /// Note to Self's two flags (`muted_until` is absent).
+    #[serde(default)]
+    pub note_to_self: ChatFlags,
+    /// Items on the server that no identifier lists.
+    #[serde(default)]
+    pub orphans: u64,
+}
+
+impl StorageView {
+    /// The flags of `contact` (a primary ref); panics when the phone has no record of it.
+    pub fn contact(&self, contact: &str) -> &ChatFlags {
+        self.contacts
+            .get(contact)
+            .unwrap_or_else(|| panic!("the phone has no record of the contact {contact}"))
+    }
+
+    /// The flags of the group `id`.
+    pub fn group(&self, id: &str) -> &ChatFlags {
+        self.groups
+            .get(id)
+            .unwrap_or_else(|| panic!("the phone has no record of the group {id}"))
+    }
+}
+
+/// The manifest alone (`storageIdentifiers`): readable when `storageState` is not.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageIdentifiers {
+    /// The manifest version (`None`: no manifest).
+    pub version: Option<u64>,
+    /// Every identifier the manifest lists.
+    pub ids: Vec<StorageIdentifier>,
+    /// Items the server holds.
+    pub items: u64,
+    /// Items the server holds that no identifier lists.
+    pub orphans: u64,
+    /// Identifiers with no item on the server.
+    pub missing: u64,
+    /// Identifiers whose item does not open under the phone's keys.
+    pub unreadable: u64,
+}
+
+/// One identifier of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StorageIdentifier {
+    /// `ManifestRecord.Identifier.Type` (1 contact, 3 group, 4 account).
+    #[serde(rename = "type")]
+    pub kind: u32,
+    /// The identifier (16 bytes, base64).
+    pub id: String,
+}
+
+/// One record's decrypted bytes (`rawStorageRecord`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawStorageRecord {
+    /// Its identifier (base64).
+    pub id: String,
+    /// The `StorageRecord` bytes, not re-encoded (base64).
+    pub raw: String,
+    /// The flags the harness decoded from it.
+    pub flags: ChatFlags,
+}
+
+impl RawStorageRecord {
+    /// The bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        BASE64.decode(&self.raw).expect("the harness sends base64")
+    }
+}
+
+/// Which record `raw_storage_record` and the phone's changes name.
+#[derive(Debug, Clone, Copy)]
+pub enum StorageSubject<'a> {
+    /// A contact (a primary ref).
+    Contact(&'a str),
+    /// A group (its id).
+    Group(&'a str),
+    /// The account record (Note to Self, the pins).
+    Account,
+}
+
+impl StorageSubject<'_> {
+    fn put(self, args: &mut Value) {
+        match self {
+            Self::Contact(contact) => args["contact"] = json!(contact),
+            Self::Group(group) => args["group"] = json!(group),
+            Self::Account => args["account"] = json!(true),
+        }
+    }
+}
+
+/// A change the PHONE makes to one record (`updateStorageRecord`,
+/// `conflictNextStorageWrite`); absent fields stay as they are.
+#[derive(Debug, Clone, Default)]
+pub struct PhoneChange {
+    /// Archived (Note to Self: `noteToSelfArchived`).
+    pub archived: Option<bool>,
+    /// Marked unread.
+    pub marked_unread: Option<bool>,
+    /// Muted until, ms (0 = unmuted).
+    pub muted_until: Option<u64>,
+    /// Pinned (a contact or a group).
+    pub pinned: Option<bool>,
+}
+
+impl PhoneChange {
+    fn args(&self, primary: &str, subject: StorageSubject<'_>) -> Value {
+        let mut args = json!({ "primary": primary });
+        subject.put(&mut args);
+        let account = matches!(subject, StorageSubject::Account);
+        if let Some(archived) = self.archived {
+            let name = if account {
+                "noteToSelfArchived"
+            } else {
+                "archived"
+            };
+            args[name] = json!(archived);
+        }
+        if let Some(marked) = self.marked_unread {
+            let name = if account {
+                "noteToSelfMarkedUnread"
+            } else {
+                "markedUnread"
+            };
+            args[name] = json!(marked);
+        }
+        if let Some(until) = self.muted_until {
+            args["mutedUntil"] = json!(until.to_string());
+        }
+        if let Some(pinned) = self.pinned {
+            args["pinned"] = json!(pinned);
+        }
+        args
+    }
+}
+
+/// How many writes of the linked device the server applied or refused (`storageWrites`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct StorageWrites {
+    /// Applied (`PUT /v1/storage/` answered 200).
+    pub writes: u64,
+    /// Answered 409.
+    pub conflicts: u64,
+    /// PUTs that reached the server and were neither (answered 400, 403 or 500, or still being
+    /// handled): a switch-off oracle that counted only `writes` and `conflicts` could not see a
+    /// PUT the mock turned away (A10c fix round, V4).
+    pub refused: u64,
+}
+
+/// The answer of `storagePut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct StoragePut {
+    /// The status of the `PUT`: 200, or 409 (a newer manifest stood).
+    pub status: u16,
+    /// The version written (200) or the version of the manifest the server answered with (409).
+    pub version: u64,
 }
 
 /// A group to create in `createPrimary`.

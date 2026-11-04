@@ -52,7 +52,7 @@
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -186,6 +186,10 @@ pub struct Packed {
     /// Files that were there for the walk and could not be read when their turn came (gone,
     /// or an I/O error): they are not in the archive.
     pub missing: u64,
+    /// A file packed holds where it was taken (`kourier_core::facade::look_file`, BQ4): the
+    /// archive leaves this PC with it. The core cannot look inside the archive; the composer
+    /// asks about it as one file.
+    pub located: bool,
 }
 
 /// Why a walk or a packing ended without a result. Log-safe: no path, no name.
@@ -613,6 +617,19 @@ fn write_archive(
             before = before.saturating_add(entry.size);
             continue;
         };
+        // Through the same descriptor that is packed (the look rewinds it first; one located
+        // file is enough to know).
+        if !packed.located {
+            packed.located = matches!(
+                kourier_core::facade::look_file(&mut source),
+                kourier_core::facade::Look::Found(_)
+            );
+            if source.rewind().is_err() {
+                packed.missing += 1;
+                before = before.saturating_add(entry.size);
+                continue;
+            }
+        }
         zip.start_file(name, entry_options(entry)?)?;
         let mut read = 0u64;
         let complete = loop {
@@ -845,6 +862,62 @@ mod tests {
                     .into_owned()
             })
             .collect()
+    }
+
+    /// A little MP4 whose `moov/udta/©xyz` holds a made-up place (Android's `MediaMuxer`
+    /// writes it so): a file that leaves with where it was taken.
+    fn located_mp4() -> Vec<u8> {
+        fn bmff(typ: &[u8], payload: &[u8]) -> Vec<u8> {
+            let mut b = u32::try_from(payload.len() + 8)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            b.extend(typ);
+            b.extend(payload);
+            b
+        }
+        let place = b"+30.2096-040.1191/";
+        let mut xyz = u16::try_from(place.len()).unwrap().to_be_bytes().to_vec();
+        xyz.extend(0x15c7u16.to_be_bytes());
+        xyz.extend(place);
+        let mut mvhd = vec![0; 100];
+        mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        let mut out = bmff(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
+        let udta = bmff(b"udta", &bmff(&[0xa9, b'x', b'y', b'z'], &xyz));
+        out.extend(bmff(b"moov", &[bmff(b"mvhd", &mvhd), udta].concat()));
+        out.extend(bmff(b"mdat", &[0x5a; 256]));
+        out
+    }
+
+    #[test]
+    fn an_archive_with_a_located_file_inside_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ArchiveFiles::new(&dir.path().join("cache/outgoing"));
+        let plain = dir.path().join("Plain");
+        write(&plain.join("notes.txt"), b"wind 4 m/s");
+        write(&plain.join("deep/more.txt"), b"gusts");
+        let dest = store.reserve("Plain").unwrap();
+        let packed = pack(&plain, "Plain", &dest, &Cancel::new(), &mut |_, _| {}).unwrap();
+        assert!(!packed.located, "nothing inside holds a place");
+        assert_eq!(packed.files, 2);
+
+        // One located video among plain files, below the first one packed.
+        let trip = dir.path().join("Trip");
+        write(&trip.join("a.txt"), b"first");
+        write(&trip.join("clips/clip.mp4"), &located_mp4());
+        write(&trip.join("z.txt"), b"last");
+        let dest = store.reserve("Trip").unwrap();
+        let packed = pack(&trip, "Trip", &dest, &Cancel::new(), &mut |_, _| {}).unwrap();
+        assert!(packed.located, "the video holds where it was taken");
+        // Looking did not cost the file its bytes: every file is whole in the archive.
+        assert_eq!((packed.files, packed.missing), (3, 0));
+        let mut zip = zip::ZipArchive::new(fs::File::open(&dest).unwrap()).unwrap();
+        let mut clip = Vec::new();
+        zip.by_name("Trip/clips/clip.mp4")
+            .unwrap()
+            .read_to_end(&mut clip)
+            .unwrap();
+        assert_eq!(clip, located_mp4());
     }
 
     /// A folder with everything the walk has rules for.
@@ -1328,7 +1401,8 @@ mod tests {
                     special: 0,
                     unreadable: 0
                 },
-                missing: 0
+                missing: 0,
+                located: false
             }
         );
         assert_eq!(reports.last(), Some(&(total, total)), "the end is reported");

@@ -3,7 +3,7 @@
 //! files, `SendFiles` read back by the backend, ids that never repeat, and a plaintext scan of
 //! the whole profile after the flows.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 
@@ -466,6 +466,7 @@ async fn sent_files_are_imported_and_read_back_byte_identical_by_the_backend() {
     let cmd = UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![pjpeg.clone()].into(),
         caption: None,
@@ -478,6 +479,7 @@ async fn sent_files_are_imported_and_read_back_byte_identical_by_the_backend() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv,
             paths: vec![pdoc.clone()].into(),
             caption: None,
@@ -569,6 +571,7 @@ async fn sent_files_are_imported_and_read_back_byte_identical_by_the_backend() {
             .send(UiCommand::SendFiles {
                 request: Default::default(),
                 as_file: Vec::new(),
+                with_location: Vec::new(),
                 conv: to,
                 paths: paths.into(),
                 caption,
@@ -594,6 +597,7 @@ async fn sent_files_are_imported_and_read_back_byte_identical_by_the_backend() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: strict,
             paths: vec![tiny].into(),
             caption: text("hi"),
@@ -631,6 +635,7 @@ async fn sent_files_are_imported_and_read_back_byte_identical_by_the_backend() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv,
             paths: vec![pjpeg.clone(), pdoc.clone()].into(),
             caption: text("two files"),
@@ -798,6 +803,7 @@ async fn a_plaintext_scan_of_the_profile_finds_no_attachment_bytes() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv,
             paths: vec![src.path().join("a.jpg"), src.path().join("b.bin")].into(),
             caption: None,

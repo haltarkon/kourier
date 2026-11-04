@@ -103,9 +103,15 @@ pub(crate) struct Shared<T: SignalTransport> {
     pub(crate) unauth: UnauthSocket<T>,
     /// `accounts/<uuid>/blobs`: avatars go here through `kourier-blob` (§5.8).
     pub(crate) blob_dir: PathBuf,
+    /// `accounts/<uuid>/upload-tmp`: the re-encoded pictures of the sends under way wait here,
+    /// sealed (`send/media/tmp.rs`); emptied when this actor starts.
+    pub(crate) upload_tmp: PathBuf,
     /// The history transfer of a fresh link: its directory, whether it holds receiving back,
     /// the user's skip (`transfer.rs`).
     pub(crate) transfer: crate::transfer::TransferShared,
+    /// The `Transmit` attempts that are running, with the stop state an `AbortTransmit` is
+    /// answered from (`send/stop.rs`).
+    pub(crate) transmits: Rc<send::stop::Transmits>,
     /// Whether the work of a new link is reported to the core, and what was reported
     /// (`progress.rs`, `BackendEvent::AccountProgress`).
     pub(crate) settling: crate::progress::Settling,
@@ -125,6 +131,17 @@ pub(crate) struct Shared<T: SignalTransport> {
     /// This device is no longer linked: stage 2 and the jobs still running start no network
     /// work (§4.3 step 5).
     pub(crate) unlinking: Cell<bool>,
+    /// The device [`Actor::remove_device`] is asking the server to forget, while it asks (`ACI`
+    /// and device id; set by a guard that clears it, whatever way the request ends). The
+    /// connection task whose own device that is starts no post-connect work on the socket it
+    /// connects meanwhile ([`Self::is_removing`]), and nothing NEW rides on it either
+    /// ([`Self::work_socket`]: the history transfer's long poll, sends, the group lanes): the
+    /// removal rides on that socket and it should carry the `DELETE` and nothing new the
+    /// device is about to lose (one-time keys, sync requests to the phone). Work already under
+    /// way on a socket that stands (the job runner's requests, a long poll in flight) goes on
+    /// until `unlinked` stops the task; it fails or is lost with the device. Not
+    /// [`Self::unlinking`]: a removal also ends a refused link, whose actor goes on.
+    removing: Cell<Option<(libsignal_core::Aci, libsignal_core::DeviceId)>>,
     /// The server stated its time on the connection that stands and this computer's clock was
     /// within the tolerance (`connection`, `ChatEvent::ServerTimestamp`); `false` before
     /// any connection, from a statement the clock failed and from any state of the
@@ -133,6 +150,8 @@ pub(crate) struct Shared<T: SignalTransport> {
     pub(crate) clock_confirmed: Cell<bool>,
     /// The last timestamp [`Self::unique_timestamp`] handed out.
     last_timestamp: Cell<u64>,
+    /// The last safety number per person and what it was computed from (P5 critic F16).
+    pub(crate) safety_memo: crate::safety::Memo,
     /// Connection state for the core.
     conn: watch::Sender<ConnState>,
     /// Why this device counts as unlinked, set by whoever finds out outside the connection
@@ -155,6 +174,7 @@ pub(crate) struct SharedParts<T: SignalTransport> {
     pub(crate) tuning: Tuning,
     pub(crate) conn: watch::Sender<ConnState>,
     pub(crate) blob_dir: PathBuf,
+    pub(crate) upload_tmp: PathBuf,
     pub(crate) transfer: crate::transfer::TransferShared,
 }
 
@@ -175,6 +195,7 @@ impl<T: SignalTransport> Shared<T> {
             tuning,
             conn,
             blob_dir,
+            upload_tmp,
             transfer,
         } = parts;
         let zk_params = zkgroup::deserialize::<zkgroup::ServerPublicParams>(&zk_params).ok();
@@ -200,18 +221,57 @@ impl<T: SignalTransport> Shared<T> {
             send_locks: SendLocks::default(),
             unauth: UnauthSocket::default(),
             blob_dir,
+            upload_tmp,
             transfer,
+            transmits: Rc::default(),
             settling: crate::progress::Settling::default(),
             #[cfg(test)]
             stage1_delay: Cell::new(Duration::ZERO),
             challenge: RefCell::new(None),
             job_challenge: Cell::new(None),
+            safety_memo: crate::safety::Memo::default(),
             unlinking: Cell::new(false),
+            removing: Cell::new(None),
             clock_confirmed: Cell::new(false),
             last_timestamp: Cell::new(0),
             conn,
             unlinked: watch::Sender::new(None),
         }
+    }
+
+    /// Whether the server is being asked to forget the device of `account`
+    /// ([`Actor::remove_device`]); the connection task then starts no post-connect work on a
+    /// socket it connected meanwhile (see the field `removing`).
+    pub(crate) fn is_removing(&self, account: &Account) -> bool {
+        self.removing.get() == Some((account.aci, account.device_id))
+    }
+
+    /// The socket the work of this device rides on (the history transfer's long poll, sends,
+    /// the group lanes, a challenge's answer): the one that stands, but none while the device
+    /// is being removed ([`Self::is_removing`]), whose socket carries the `DELETE` and no new
+    /// work (what is already under way on it goes on until `unlinked` stops the task). The
+    /// callers wait for a socket, or fail as offline, as they do without one. The removal
+    /// itself reads the field `socket` ([`Actor::attempt_socket`]).
+    pub(crate) fn work_socket(&self) -> Option<Arc<T::Socket>> {
+        if self.winding_down() {
+            return None;
+        }
+        self.socket.borrow().clone()
+    }
+
+    /// This device is being removed from the account ([`Self::is_removing`] for its own
+    /// device) or is no longer linked ([`Self::unlinking`]; `logout` sets it the moment the
+    /// removal is over, before the actor tells the core and runs `unlinked`): no new work
+    /// rides on its socket. The removal's `Removing` guard goes with `remove_device`'s return,
+    /// and the transfer's long poll found the socket in the moments before `unlinked` stopped
+    /// it (R1, N2).
+    pub(crate) fn winding_down(&self) -> bool {
+        self.unlinking.get()
+            || self
+                .account
+                .borrow()
+                .as_ref()
+                .is_some_and(|account| self.is_removing(account))
     }
 
     /// Reports that this device is no longer linked (`reason` is log-safe); the connection
@@ -241,7 +301,7 @@ impl<T: SignalTransport> Shared<T> {
                     _ => None,
                 })
             }
-            TransmitOutcome::Sent { .. } => None,
+            TransmitOutcome::Sent { .. } | TransmitOutcome::SentAs { .. } => None,
         };
         if let Some(token) = token.filter(|token| !token.expose().is_empty()) {
             *self.challenge.borrow_mut() = Some(token.clone());
@@ -313,6 +373,19 @@ impl<T: SignalTransport> Shared<T> {
 
     /// Publishes a connection state (log-safe: only the variant name is logged).
     pub(crate) fn set_conn(&self, state: ConnState) {
+        // `LoggedOut` is final (R1, N6): `unlinked` writes it while the connection task is still
+        // running, and the task's last words (`Connecting` after a stale reconnect, `Offline` as
+        // it stops) must not take the banner's "logged out" back. Only another `LoggedOut`
+        // (the task's own reason, the actor's) replaces it.
+        if matches!(*self.conn.borrow(), ConnState::LoggedOut { .. })
+            && !matches!(state, ConnState::LoggedOut { .. })
+        {
+            tracing::debug!(
+                state = state.name(),
+                "connection state: not after logged out"
+            );
+            return;
+        }
         if *self.conn.borrow() != state {
             tracing::info!(state = state.name(), "connection state");
             if !matches!(state, ConnState::Syncing { .. } | ConnState::Online { .. }) {
@@ -414,6 +487,23 @@ struct Connection {
     task: JoinHandle<ConnectionEnd>,
     /// Hints for the task: connect now, check the socket.
     nudges: mpsc::UnboundedSender<Nudge>,
+}
+
+/// Keeps [`Shared::is_removing`] true for the device of one [`Actor::remove_device`], whatever
+/// way that ends (a return, a dropped future).
+struct Removing<T: SignalTransport>(Rc<Shared<T>>);
+
+impl<T: SignalTransport> Removing<T> {
+    fn new(shared: &Rc<Shared<T>>, account: &Account) -> Self {
+        shared.removing.set(Some((account.aci, account.device_id)));
+        Self(shared.clone())
+    }
+}
+
+impl<T: SignalTransport> Drop for Removing<T> {
+    fn drop(&mut self) {
+        self.0.removing.set(None);
+    }
 }
 
 /// The running history transfer of a fresh link (`transfer::run`).
@@ -554,6 +644,10 @@ impl<T: SignalTransport> Actor<T> {
             .is_some_and(|stored| stored.phase.is_over())
             && !crate::transfer::checkpoint(&db);
         crate::transfer::clean_at_start(&transfer_dir, stored_transfer.as_ref());
+        // A send that was running when a process died left re-encoded pictures here (sealed,
+        // their keys gone with the process): empty before any send of this actor can start.
+        let upload_tmp = crate::send::media::tmp::dir_beside(&backend_db);
+        crate::send::media::tmp::clean_at_start(&upload_tmp);
         let transfer_active = account.is_some()
             && stored_transfer
                 .as_ref()
@@ -576,6 +670,8 @@ impl<T: SignalTransport> Actor<T> {
                     // What the account can do, for the core, at every start
                     // (`append_account_caps`; a rebuild states it with `AccountReady`).
                     maintenance::append_account_caps(tx, now, &wake)?;
+                    // Once after the upgrade to backend.db 24: the number verdicts (P1 F7).
+                    maintenance::restate_number_verdicts(tx, now, &wake)?;
                     let events = crate::features::refresh_features(tx, account, now)?;
                     if !events.is_empty() {
                         outbox::append_events(tx, &events, now, &wake)?;
@@ -611,6 +707,7 @@ impl<T: SignalTransport> Actor<T> {
             tuning,
             conn,
             blob_dir,
+            upload_tmp,
             transfer: crate::transfer::TransferShared::new(transfer_dir, transfer_active),
         }));
         // Rows a previous run committed in stage 1 but did not finish (§5.6 "restart") are
@@ -784,6 +881,12 @@ impl<T: SignalTransport> Actor<T> {
                 }
             }
             Command::Transmit { local, req, reply } => self.transmit(local, *req, reply),
+            // Answered at once from the attempt's stop state (`send/stop.rs`): never by waiting
+            // for the attempt, and the attempt is never killed from here (its `Transmit` must
+            // still be answered).
+            Command::AbortTransmit { local, reply } => {
+                let _ = reply.send(self.shared.transmits.abort(local));
+            }
             Command::Logout => return Some(self.logout().await),
             Command::ChangeConversation {
                 conv,
@@ -793,13 +896,46 @@ impl<T: SignalTransport> Actor<T> {
             } => {
                 let _ = reply.send(self.set_timer(&conv, timer, id.as_ref()));
             }
+            // The four roaming settings of a chat (archive, pin, mute, marked unread;
+            // `ConversationChange::is_roaming`): one zone files the intent the `storage_write`
+            // job writes to the Storage Service, and the reply answers after its commit (A10c).
+            Command::ChangeConversation {
+                conv,
+                change,
+                reply,
+                ..
+            } if change.is_roaming() => {
+                let _ = reply.send(self.change_roaming(&conv, &change));
+            }
+            // What stays as it was: block, accept a request and leave need the group and message
+            // request protocols, contact, settings and profile changes are not written either.
             Command::ChangeConversation { reply, .. }
             | Command::ChangeContact { reply, .. }
             | Command::ChangeAccountSettings { reply, .. }
             | Command::ChangeProfile { reply, .. } => {
                 let _ = reply.send(Err(BackendError::unsupported(
-                    "Storage Service writes are not in M1",
+                    "this change is not written to the phone",
                 )));
+            }
+            // The account's switch "Sync chat changes with my phone" (A10c).
+            Command::SetRoamingWrites { on, reply } => {
+                let _ = reply.send(self.set_roaming_writes(on));
+            }
+            // The core's own durable change (the clearing of a mark when a chat is read): filed
+            // as an automatic intent and confirmed in ONE zone, so a kill between the two cannot
+            // lose the clear or leave the core resending it for ever. With the switch off it is
+            // confirmed and dropped (`storage::intents::file_durable`).
+            Command::ChangeConversationDurable {
+                cmd,
+                conv,
+                change,
+                asked_at,
+            } => {
+                self.durable(cmd, |tx, account, now, wake| {
+                    crate::storage::intents::file_durable(
+                        tx, account, cmd, &conv, &change, asked_at, now, wake,
+                    )
+                });
             }
             Command::Resolve { reply, .. } => {
                 let _ = reply.send(Err(BackendError::unsupported("resolve arrives later")));
@@ -823,16 +959,17 @@ impl<T: SignalTransport> Actor<T> {
             Command::SetTyping { conv, on } => {
                 spawn_local(commands::send_typing(self.shared.clone(), conv, on));
             }
-            Command::ConfirmIdentity { user } => {
-                if let Ok(crate::service_id::SignalUser::Aci(aci)) =
-                    crate::service_id::parse_user_id(&user)
-                    && let Err(e) = self
-                        .shared
-                        .db
-                        .zone(|tx| commands::confirm_identity(tx, aci))
-                {
-                    tracing::error!(error = %e, "confirming an identity failed");
-                }
+            Command::ConfirmIdentity { user, key, reply } => {
+                let _ = reply.send(self.confirm_identity(&user, &key));
+            }
+            Command::SafetyNumber { user, reply } => self.safety_number(&user, reply),
+            Command::SetVerified {
+                user,
+                verified,
+                key,
+                reply,
+            } => {
+                let _ = reply.send(self.set_verified(&user, verified, &key));
             }
             Command::DownloadAttachment {
                 attachment,
@@ -859,12 +996,16 @@ impl<T: SignalTransport> Actor<T> {
                 {
                     let sid = libsignal_core::ServiceId::from(aci).service_id_string();
                     let now = self.shared.now();
+                    // A person's page asks for this when it opens: never more than one fetch a
+                    // day per person (P1, `profile::request_throttled`); our own profile too.
+                    let own = self.shared.account().is_some_and(|a| a.aci == aci);
                     match self
                         .shared
                         .db
-                        .zone(|tx| crate::profile::request(tx, &sid, now))
+                        .zone(|tx| crate::profile::request_throttled(tx, &sid, own, now))
                     {
-                        Ok(_) => self.shared.jobs_wake.notify_one(),
+                        Ok(true) => self.shared.jobs_wake.notify_one(),
+                        Ok(false) => {}
                         Err(e) => tracing::error!(error = %e, "queueing a profile fetch failed"),
                     }
                 }
@@ -875,6 +1016,9 @@ impl<T: SignalTransport> Actor<T> {
                 newest,
                 newest_non_expiring,
                 remove,
+                // Signal's delete sync names messages, not a time (K-B1: WhatsApp's range).
+                before_ms: _,
+                system_before_ms: _,
             } => self.durable(cmd, |tx, account, now, wake| {
                 crate::delete_sync::persist_clear(
                     tx,
@@ -951,6 +1095,216 @@ impl<T: SignalTransport> Actor<T> {
                 }
             }
             Err(e) => tracing::error!(cmd = cmd.0, error = %e, "persisting a command failed"),
+        }
+    }
+
+    /// A roaming setting of a chat (`Command::ChangeConversation` of archive, pin, mute or
+    /// marked unread): [`crate::storage::intents::intend`] in ONE zone, then the job runner is
+    /// woken (the write is due a second later). A refusal stores nothing and is answered with
+    /// the kind the refusal names and no content (`Refused::to_backend_error`).
+    fn change_roaming(
+        &self,
+        conv: &kourier_model::ConvKey,
+        change: &kourier_model::ConversationChange,
+    ) -> std::result::Result<(), BackendError> {
+        let Some(account) = self.shared.account() else {
+            return Err(BackendError::new(
+                kourier_model::ErrorKind::LoggedOut,
+                "the account is not linked",
+            ));
+        };
+        let now = self.shared.now();
+        let wake = self.shared.wake.clone();
+        match self
+            .shared
+            .db
+            .zone(|tx| crate::storage::intents::intend(tx, &account, change, conv, now, &wake))
+        {
+            Ok(Ok(())) => {
+                self.shared.jobs_wake.notify_one();
+                Ok(())
+            }
+            Ok(Err(refused)) => {
+                tracing::debug!(?refused, "a chat change was refused");
+                Err(refused.to_backend_error())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "filing a chat change failed");
+                Err(e.to_backend_error())
+            }
+        }
+    }
+
+    /// `Command::SetRoamingWrites`: the account's switch, in ONE zone. The column changes; turning
+    /// it OFF also drops the queued changes (`intents::drop_all`: what a write in flight carries
+    /// stays, review Y6, and the phone's values of what was dropped are stated to the core); the
+    /// caps are stated again, with the roaming flag and the pin limit together
+    /// ([`maintenance::account_caps_of`]). The reply answers after the commit.
+    fn set_roaming_writes(&self, on: bool) -> std::result::Result<(), BackendError> {
+        let Some(account) = self.shared.account() else {
+            return Err(BackendError::new(
+                kourier_model::ErrorKind::LoggedOut,
+                "the account is not linked",
+            ));
+        };
+        let now = self.shared.now();
+        let wake = self.shared.wake.clone();
+        let outcome = self.shared.db.zone(|tx| -> Result<usize> {
+            tx.prepare_cached("UPDATE account SET roaming_writes = ?1 WHERE id = 1")?
+                .execute([on])?;
+            let dropped = if on {
+                0
+            } else {
+                crate::storage::intents::drop_all(tx, &account, now, &wake)?
+            };
+            let caps = maintenance::account_caps_of(tx)?;
+            outbox::append_events(tx, &[BackendEvent::AccountCaps(caps)], now, &wake)?;
+            Ok(dropped)
+        });
+        match outcome {
+            Ok(dropped) => {
+                tracing::info!(on, dropped, "the switch for chat changes was set");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "setting the switch for chat changes failed");
+                Err(e.to_backend_error())
+            }
+        }
+    }
+
+    /// `Command::SafetyNumber` (P5a): their stored key is read in a read zone here, the
+    /// number (10,400 SHA-512) is computed on a blocking thread: ~7 ms in the dev profile
+    /// (`safety::tests::our_pni_key_is_never_used` prints it), over the 5 ms an actor turn may
+    /// take (p5-refresh L6). Not linked = not running.
+    fn safety_number(
+        &self,
+        user: &kourier_model::UserId,
+        reply: kourier_backend_api::Reply<kourier_model::SafetyAnswer>,
+    ) {
+        let Some(account) = self.shared.account() else {
+            let _ = reply.send(Ok(Err(kourier_model::SafetyUnavailable::NotRunning)));
+            return;
+        };
+        let found = match self
+            .shared
+            .db
+            .read(|c| crate::safety::lookup(c, &account, user))
+        {
+            Ok(found) => found,
+            Err(e) => {
+                let _ = reply.send(Err(e.to_backend_error()));
+                return;
+            }
+        };
+        // F16: the same keys and state as last time answer from memory.
+        if let Some(number) = self.shared.safety_memo.hit(&account, &found) {
+            let _ = reply.send(Ok(Ok(number)));
+            return;
+        }
+        let shared = self.shared.clone();
+        spawn_local(async move {
+            let kept = found.clone();
+            let ours = account.clone();
+            let answer =
+                tokio::task::spawn_blocking(move || crate::safety::answer(&ours, found)).await;
+            let _ = reply.send(match answer {
+                Ok(Ok(answer)) => {
+                    if let Ok(number) = &answer {
+                        shared.safety_memo.remember(&account, &kept, number);
+                    }
+                    Ok(answer)
+                }
+                Ok(Err(e)) => Err(e.to_backend_error()),
+                Err(_) => Err(BackendError::internal("the safety number was not computed")),
+            });
+        });
+    }
+
+    /// `Command::SetVerified` (P5a): [`crate::safety::set_verified`] in one zone, in the order
+    /// the core hands the commands over (one actor loop: Mark then Clear stay in order); a
+    /// refusal is `InvalidInput` with its log-safe reason.
+    fn set_verified(
+        &self,
+        user: &kourier_model::UserId,
+        verified: bool,
+        key: &kourier_model::IdentityFingerprint,
+    ) -> std::result::Result<(), BackendError> {
+        let Some(account) = self.shared.account() else {
+            return Err(BackendError::new(
+                kourier_model::ErrorKind::LoggedOut,
+                "the account is not linked",
+            ));
+        };
+        let now = self.shared.now();
+        let stamp = self.shared.unique_timestamp();
+        let wake = self.shared.wake.clone();
+        let outcome = self.shared.db.zone(|tx| {
+            crate::safety::set_verified(tx, &account, user, verified, key, now, stamp, &wake)
+        });
+        match outcome {
+            Ok(crate::safety::SetOutcome::Done) => {
+                self.shared.jobs_wake.notify_one();
+                Ok(())
+            }
+            Ok(crate::safety::SetOutcome::Refused(why)) => {
+                tracing::info!(reason = why, "a safety number mark was refused");
+                Err(BackendError::new(
+                    kourier_model::ErrorKind::InvalidInput,
+                    why,
+                ))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "setting a verification state failed");
+                Err(e.to_backend_error())
+            }
+        }
+    }
+
+    /// `Command::ConfirmIdentity` (Confirm New Safety Number, BQ-2 / BQ-2b: Desktop's "Send
+    /// anyway", `verifyConversationsStoppingSend`): a person in state 2 (verified, then the key
+    /// changed) gets the key the user was SHOWN as DEFAULT through [`crate::safety::set_verified`]
+    /// (the quiet "not verified" notice, `IdentityTrusted`, ONE Verified sync DEFAULT); when the
+    /// stored key is another one nothing is confirmed (RC2); any other state is an approval only
+    /// (the paused jobs are released; no state change, no sync, no notice; `key` ignored). No
+    /// stored key: nothing to confirm. The answer (the lead's RC6): `Err(InvalidInput)` for the
+    /// refusal only, so the core leaves the paused send paused; `Ok` otherwise (the core then
+    /// requeues it and its next attempt meets this store's view).
+    fn confirm_identity(
+        &self,
+        user: &kourier_model::UserId,
+        key: &kourier_model::IdentityFingerprint,
+    ) -> std::result::Result<(), BackendError> {
+        let Some(account) = self.shared.account() else {
+            return Ok(());
+        };
+        let now = self.shared.now();
+        let stamp = self.shared.unique_timestamp();
+        let wake = self.shared.wake.clone();
+        match self
+            .shared
+            .db
+            .zone(|tx| commands::confirm_identity(tx, &account, user, key, now, stamp, &wake))
+        {
+            Ok(commands::Confirmed::Yes) => {
+                self.shared.jobs_wake.notify_one();
+                Ok(())
+            }
+            Ok(commands::Confirmed::Nothing) => {
+                tracing::debug!("nothing confirmed: no stored key");
+                Ok(())
+            }
+            Ok(commands::Confirmed::Refused(why)) => {
+                tracing::debug!(reason = why, "nothing confirmed: the number changed");
+                Err(BackendError::new(
+                    kourier_model::ErrorKind::InvalidInput,
+                    why,
+                ))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "confirming an identity failed");
+                Err(e.to_backend_error())
+            }
         }
     }
 
@@ -1085,6 +1439,10 @@ impl<T: SignalTransport> Actor<T> {
                 DeviceLogout::NoDevice
             }
         };
+        // The device is gone for this actor whatever the server said: from here to `unlinked`
+        // (which tells the core first, an await) nothing new rides on its socket. No await
+        // between the removal's return, which drops its `Removing` guard, and this line.
+        self.shared.unlinking.set(true);
         // The core tells the user, once, whether the phone still lists the device. A core
         // that is gone has nobody to tell.
         let _ = self
@@ -1123,97 +1481,215 @@ impl<T: SignalTransport> Actor<T> {
     }
 
     /// Tells the server to forget the device of `account` (`DELETE /v1/devices/<id>`), best
-    /// effort and done by `deadline`: on the authenticated socket when one is open, else on
-    /// one opened for this request. A link that finished a moment ago has no socket yet, an
-    /// account that is offline or held has none either, and a device that stays linked with
-    /// nobody behind it can only be removed on the phone.
+    /// effort and done by `deadline`. Over which socket:
+    /// - the one that stands, when the connection is up;
+    /// - the one of the connection task's attempt that is under way (a link that finished a
+    ///   moment ago has none yet): waited for, see [`Self::attempt_socket`]. That attempt is
+    ///   never given up for a second one: a connect cannot be taken back once its upgrade is
+    ///   at the server. It runs in Kourier's network runtime (`Net::run` spawns it; dropping
+    ///   the `JoinHandle` detaches the task, so a dropped connect future used to leave the
+    ///   connect running and it opened its socket all the same; `Net::run_aborting` aborts it
+    ///   now, which cannot recall an upgrade the server has already got), and the server
+    ///   closes the older of two sockets of a device with 4409 (the `DELETE` then rode on the
+    ///   closed one: the account was gone here and its device stayed on the phone's list);
+    /// - else one opened for this request (an account that is offline or held has none).
+    ///
+    /// A socket that is closed under the request (4409: another client took the credentials,
+    /// 4401, or just gone) or that does not answer it in time (a dead socket nobody noticed
+    /// yet) is not the end: the request is asked once more, again on the connection task's
+    /// socket when the task reconnects (the one that failed is skipped), else on a connection
+    /// of its own. No connect is started once `deadline` has passed. A
+    /// device that stays linked with nobody behind it can only be removed on the phone.
+    ///
+    /// While it runs, [`Shared::is_removing`] is true for the device: the connection task
+    /// whose socket the request rides on starts no post-connect work on it.
     async fn remove_device(
         &mut self,
         account: &Account,
         deadline: tokio::time::Instant,
     ) -> DeviceLogout {
-        let open = self.shared.socket.borrow().clone();
-        // `own` is the event stream of a socket opened here: kept until the request is
-        // answered, and the sign that the socket is ours to close.
-        let (socket, own) = match open {
-            Some(socket) => (socket, None),
-            None => {
-                // The connection task may be between two attempts, or in one: it must not
-                // open a second socket for this device beside ours (4409).
-                if let Some(connection) = self.connection.take() {
-                    connection.stop.cancel();
-                    let _ = connection.task.await;
-                }
-                let connecting = self.shared.net.connect_auth(account.credentials());
-                match tokio::time::timeout_at(deadline, connecting).await {
-                    Ok(Ok(Connected { socket, events })) => (Arc::new(socket), Some(events)),
-                    Ok(Err(
-                        e @ (TransportError::DeviceDeregistered
-                        | TransportError::Rejected { status: 401 | 403 }),
-                    )) => {
-                        // What the connection task takes as "unlinked" (`connection::run`):
-                        // the phone removed this device while it was away.
-                        tracing::info!(
-                            reason = %e,
-                            "the server no longer knows this device: nothing to remove"
-                        );
-                        return DeviceLogout::Removed;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            "logout: the server could not be reached to remove this device; \
-                             unlink it on the phone"
-                        );
-                        return DeviceLogout::NotReached;
-                    }
-                    Err(_) => {
+        let _removing = Removing::new(&self.shared, account);
+        // Whether the first try failed on a socket that closed under it, and which socket
+        // that was: the second try rides on the connection task's socket again when the task
+        // has reconnected meanwhile (or still does), but not on the one that failed.
+        let mut second_try = false;
+        let mut failed: Option<Arc<T::Socket>> = None;
+        loop {
+            let open = self.attempt_socket(deadline, failed.as_ref()).await;
+            // `own` is the event stream of a socket opened here: kept until the request is
+            // answered, and the sign that the socket is ours to close.
+            let (socket, own) = match open {
+                Some(socket) => (socket, None),
+                None => {
+                    // Not before the time is up: a connect started now would reach the
+                    // server after this removal gave up (and the keys are wiped), and it
+                    // takes the connection from the task's own attempt, if there is one
+                    // (4409). The task is stopped and awaited before this returns, though
+                    // (R1, N1): `Removing` goes with the return, and an upgrade the server
+                    // answered later, while `unlinked` was still writing, would have started
+                    // the post-connect work (one-time keys, sync requests to the phone) of a
+                    // device that is still linked and whose keys are being wiped.
+                    if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(
                             "logout: no connection in time to remove this device; unlink it \
                              on the phone"
                         );
+                        self.stop_connection().await;
                         return DeviceLogout::NotReached;
                     }
+                    // Between two attempts (or none): the task is stopped, it must not open a
+                    // second socket for this device beside ours (4409).
+                    self.stop_connection().await;
+                    let connecting = self.shared.net.connect_auth(account.credentials());
+                    match tokio::time::timeout_at(deadline, connecting).await {
+                        Ok(Ok(Connected { socket, events })) => (Arc::new(socket), Some(events)),
+                        Ok(Err(
+                            e @ (TransportError::DeviceDeregistered
+                            | TransportError::Rejected { status: 401 | 403 }),
+                        )) => {
+                            // What the connection task takes as "unlinked" (`connection::run`):
+                            // the phone removed this device while it was away.
+                            tracing::info!(
+                                reason = %e,
+                                "the server no longer knows this device: nothing to remove"
+                            );
+                            return DeviceLogout::Removed;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                error = %e,
+                                "logout: the server could not be reached to remove this \
+                                 device; unlink it on the phone"
+                            );
+                            return DeviceLogout::NotReached;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "logout: no connection in time to remove this device; unlink \
+                                 it on the phone"
+                            );
+                            return DeviceLogout::NotReached;
+                        }
+                    }
                 }
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let path = format!("/v1/devices/{}", u32::from(account.device_id));
+            let request = crate::net::ChatRequest::new(http::Method::DELETE, &path)
+                .map(|request| request.with_timeout(left.min(LOGOUT_REQUEST)));
+            let answer = match request {
+                Ok(request) => self.shared.net.request(&socket, request).await,
+                Err(e) => Err(e),
+            };
+            if own.is_some() {
+                self.shared.net.disconnect(&socket).await;
             }
-        };
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let path = format!("/v1/devices/{}", u32::from(account.device_id));
-        let request = crate::net::ChatRequest::new(http::Method::DELETE, &path)
-            .map(|request| request.with_timeout(left.min(LOGOUT_REQUEST)));
-        let answer = match request {
-            Ok(request) => self.shared.net.request(&socket, request).await,
-            Err(e) => Err(e),
-        };
-        let outcome = match answer {
-            Ok(response) => {
-                let outcome = device_logout_of(response.status);
-                if outcome == DeviceLogout::Removed {
+            match answer {
+                Ok(response) => {
+                    let outcome = device_logout_of(response.status);
+                    if outcome == DeviceLogout::Removed {
+                        tracing::info!(
+                            status = response.status.as_u16(),
+                            "this device was removed from the account"
+                        );
+                    } else {
+                        tracing::warn!(
+                            status = response.status.as_u16(),
+                            "logout: the server did not remove this device; unlink it on the \
+                             phone"
+                        );
+                    }
+                    return outcome;
+                }
+                Err(
+                    e @ (TransportError::ConnectedElsewhere
+                    | TransportError::ConnectionInvalidated
+                    | TransportError::Disconnected
+                    | TransportError::Timeout),
+                ) if !second_try => {
+                    // `Timeout`: a socket that is dead but not noticed yet (the seconds after
+                    // a resume behind a NAT that dropped the mapping) swallows the request
+                    // for its whole timeout (R1, N3). A request the server did serve is safe
+                    // to ask again: the new connection is refused at the door with 401 or
+                    // 403, which counts as `Removed`.
                     tracing::info!(
-                        status = response.status.as_u16(),
-                        "this device was removed from the account"
+                        error = %e,
+                        "logout: the socket closed or did not answer; asking again on a new \
+                         connection"
                     );
-                } else {
-                    tracing::warn!(
-                        status = response.status.as_u16(),
-                        "logout: the server did not remove this device; unlink it on the phone"
-                    );
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!("logout: no time left to ask again; unlink it on the phone");
+                        // Like the early return above (R1, N1): the task has just lost its
+                        // socket and is held or backing off, and a connect it makes next must
+                        // not publish a socket after `Removing` went with this return, while
+                        // `unlinked` still writes. Stopped and awaited here, not left to it.
+                        self.stop_connection().await;
+                        return DeviceLogout::NotReached;
+                    }
+                    second_try = true;
+                    failed = Some(socket);
                 }
-                outcome
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "logout: the server could not be told to remove this device; unlink it \
+                         on the phone"
+                    );
+                    return DeviceLogout::NotReached;
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "logout: the server could not be told to remove this device; unlink it on \
-                     the phone"
-                );
-                DeviceLogout::NotReached
-            }
-        };
-        if own.is_some() {
-            self.shared.net.disconnect(&socket).await;
         }
-        outcome
+    }
+
+    /// Stops the connection task, if there is one, and waits for its end: its attempt that is
+    /// under way is aborted with it (`Net::run_aborting`), and nothing of it is left to
+    /// publish a socket afterwards.
+    async fn stop_connection(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.stop.cancel();
+            let _ = connection.task.await;
+        }
+    }
+
+    /// The socket of the connection task: the one that stands, else the one of its attempt
+    /// that is under way (`ConnState::Connecting`), once it has come about; `None` when
+    /// there is no such attempt, it ended without a socket (it failed and the task waits to
+    /// try again, or the task is gone), the task is not connecting (it holds a socket that
+    /// is not usable, or none) or `deadline` came. A standing socket that is `skip` (the one
+    /// that just failed under a request) does not count. Nothing is cancelled here: the task
+    /// goes on with its socket, and the caller's request rides on it.
+    async fn attempt_socket(
+        &mut self,
+        deadline: tokio::time::Instant,
+        skip: Option<&Arc<T::Socket>>,
+    ) -> Option<Arc<T::Socket>> {
+        let mut state = self.shared.conn_watch();
+        loop {
+            let standing = self.shared.socket.borrow().clone();
+            if let Some(socket) = standing
+                && !skip.is_some_and(|failed| Arc::ptr_eq(failed, &socket))
+            {
+                return Some(socket);
+            }
+            let connection = self.connection.as_mut()?;
+            if !matches!(*state.borrow_and_update(), ConnState::Connecting) {
+                return None;
+            }
+            tokio::select! {
+                changed = state.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                // The task ended while we waited: its end is taken here, so it is not awaited
+                // twice.
+                _ = &mut connection.task => {
+                    self.connection = None;
+                    return None;
+                }
+                () = tokio::time::sleep_until(deadline) => return None,
+            }
+        }
     }
 
     /// The unlink procedure (§4.3 step 5; Signal obligation 8): this device's credentials are
@@ -1227,6 +1703,8 @@ impl<T: SignalTransport> Actor<T> {
         self.shared.unlinking.set(true);
         self.shared.set_conn(ConnState::LoggedOut {
             reason: reason.clone(),
+            cause: Default::default(),
+            note: Default::default(),
         });
         // A history transfer ends with the login it belonged to. Its key and the archive's
         // place leave the database files here, not only with the core's wipe of them (the
@@ -1399,9 +1877,18 @@ impl<T: SignalTransport> Actor<T> {
         reply: tokio::sync::oneshot::Sender<TransmitOutcome>,
     ) {
         let shared = self.shared.clone();
+        // Registered here, not in the task: an `AbortTransmit` right behind this command must
+        // find the attempt. Only a new message has an upload phase to stop; an edit, a delete or
+        // a reaction may have reached someone already.
+        let stop = match &req.kind {
+            kourier_backend_api::OutgoingKind::Message { .. } => send::stop::Stop::open(),
+            _ => send::stop::Stop::closed(),
+        };
+        let attempt = shared.transmits.register(local, stop);
         spawn_local(async move {
+            let started = std::time::Instant::now();
             // Clone out of the cells first: no `RefCell` borrow may live across an await.
-            let socket = shared.socket.borrow().clone();
+            let socket = shared.work_socket();
             let outcome = match (shared.account(), socket) {
                 (Some(account), Some(socket)) => {
                     let uploader = send::media::Uploader {
@@ -1409,6 +1896,7 @@ impl<T: SignalTransport> Actor<T> {
                         socket: &socket,
                         local,
                         net_local: &req.local,
+                        stop: attempt.stop(),
                     };
                     match &req.conv {
                         kourier_model::ConvKey::Group(_) => {
@@ -1425,8 +1913,23 @@ impl<T: SignalTransport> Actor<T> {
                     TransmitOutcome::Failed(BackendError::transient("not connected"))
                 }
             };
+            if attempt.stop().is_requested() {
+                // `Stopping` was answered, so nothing may have gone out: the attempt ends
+                // `Failed`. A `Sent` here would be a backend bug (the core records it as sent).
+                match &outcome {
+                    TransmitOutcome::Failed(_) => tracing::info!(
+                        ms = started.elapsed().as_millis() as u64,
+                        "transmit stopped before anything was sent"
+                    ),
+                    _ => tracing::error!(
+                        "an attempt that answered an abort with Stopping went out anyway"
+                    ),
+                }
+            }
             // A challenge is answered with its token (`Command::SubmitChallenge`).
             shared.note_challenge(&outcome);
+            // Forgotten before the answer: an abort that comes after it is too late.
+            drop(attempt);
             // The core may have stopped waiting; the send is on the wire either way (§4.7).
             let _ = reply.send(outcome);
         });
@@ -1563,9 +2066,9 @@ pub(crate) mod testing {
     }
 
     /// A [`Shared`] (not yet in an `Rc`, so a test can still swap its lanes) and its far ends.
-    pub(crate) struct TestShared {
+    pub(crate) struct TestShared<T: SignalTransport = NoTransport> {
         /// The shared state.
-        pub(crate) shared: Shared<NoTransport>,
+        pub(crate) shared: Shared<T>,
         /// What the actor sends to the core.
         pub(crate) core: mpsc::Receiver<Envelope>,
         /// The forwarder's end of `Shared::acked`.
@@ -1580,17 +2083,36 @@ pub(crate) mod testing {
         account: Account,
         trust_roots: Vec<PublicKey>,
     ) -> TestShared {
+        shared_over(Arc::new(NoTransport::default()), db, account, trust_roots)
+    }
+
+    /// [`shared`] over a transport of the test's own.
+    pub(crate) fn shared_over<T: SignalTransport>(
+        transport: Arc<T>,
+        db: Rc<ZoneDb>,
+        account: Account,
+        trust_roots: Vec<PublicKey>,
+    ) -> TestShared<T> {
+        shared_over_clock(transport, db, account, trust_roots, Arc::new(SystemClock))
+    }
+
+    /// [`shared_over`] with the clock the account context would hand the actor (a test's
+    /// `FakeClock`).
+    pub(crate) fn shared_over_clock<T: SignalTransport>(
+        transport: Arc<T>,
+        db: Rc<ZoneDb>,
+        account: Account,
+        trust_roots: Vec<PublicKey>,
+        clock: Arc<dyn kourier_backend_api::Clock>,
+    ) -> TestShared<T> {
         let (events, core) = mpsc::channel(64);
         let (acked_tx, acked) = watch::channel(0);
         let (conn_tx, conn) = watch::channel(ConnState::Offline { retry_at_ms: None });
         let shared = Shared::new(SharedParts {
-            net: Net::new(
-                Arc::new(NoTransport::default()),
-                tokio::runtime::Handle::current(),
-            ),
+            net: Net::new(transport, tokio::runtime::Handle::current()),
             db,
             events,
-            clock: Arc::new(SystemClock),
+            clock,
             config: BackendConfig::default(),
             trust_roots,
             zk_params: Vec::new(),
@@ -1600,6 +2122,7 @@ pub(crate) mod testing {
             tuning: Tuning::default(),
             conn: conn_tx,
             blob_dir: std::env::temp_dir().join("kourier-signal-test-blobs-unused"),
+            upload_tmp: std::env::temp_dir().join("kourier-signal-test-upload-tmp-unused"),
             transfer: crate::transfer::TransferShared::new(
                 std::env::temp_dir().join("kourier-signal-test-transfer-unused"),
                 false,
@@ -1617,6 +2140,146 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod login_tests {
     use super::*;
+
+    /// The temporary files of a send a dead process left (sealed pictures waiting for their
+    /// upload; their keys died with it) are removed when the account's actor starts, before any
+    /// send of it can run (upload progress, R-Q1). `Actor::start` stands for the process that
+    /// starts again: a kill runs no destructor, so the files of the attempt are simply there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_empties_the_upload_files_a_dead_process_left() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let backend_db = dir.path().join("backend.db");
+                let tmp = send::media::tmp::dir_beside(&backend_db);
+                let dead = send::media::tmp::TempFiles::new(tmp.clone());
+                let (left, ..) = dead.write(&[3; 4096]).expect("a file of the dead attempt");
+                std::mem::forget(dead);
+                assert!(left.exists());
+                let (ctx, _core) =
+                    kourier_backend_api::AccountContext::new(kourier_backend_api::ContextParams {
+                        account: kourier_model::AccountId(1),
+                        uuid: kourier_model::AccountUuid::new_random(),
+                        start: kourier_backend_api::StartMode::Fresh,
+                        backend_db,
+                        db_key: kourier_backend_api::DbKey::new([5; 32]),
+                        blob_dir: dir.path().join("blobs"),
+                        net_rt: tokio::runtime::Handle::current(),
+                        cancel: CancellationToken::new(),
+                        clock: Arc::new(kourier_backend_api::SystemClock),
+                        config: kourier_backend_api::BackendConfig::default(),
+                        ui: Default::default(),
+                        local_prefs: Default::default(),
+                    });
+                let actor = Actor::start(
+                    ctx,
+                    Arc::new(testing::NoTransport::default()),
+                    Vec::new(),
+                    Vec::new(),
+                    Tuning::default(),
+                )
+                .expect("the actor starts");
+                assert!(!left.exists(), "the dead process's file is gone");
+                assert!(!tmp.exists(), "the directory is emptied at the start");
+                assert_eq!(actor.shared.upload_tmp, tmp, "the sends use that directory");
+            })
+            .await;
+    }
+
+    /// P1 F7/N1 (wiring): the start of a linked account states the number verdict of every
+    /// person once (`maintenance::restate_number_verdicts`); a second start states nothing. The
+    /// pass has its own unit test; this one fails when `Actor::start` stops calling it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_states_the_number_verdicts_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let aci = |n: u128| libsignal_core::Aci::from(uuid::Uuid::from_u128(n));
+                let sid = |n: u128| libsignal_core::ServiceId::from(aci(n)).service_id_string();
+                fixture
+                    .db
+                    .zone(|tx| -> crate::error::Result<()> {
+                        // Two people with no `e164` (the number lives in the core only): 2 holds
+                        // a profile key and does not share.
+                        for n in [1u128, 2] {
+                            crate::peers::ensure(tx, &sid(n), 5)?;
+                        }
+                        tx.execute(
+                            "UPDATE peers SET profile_key = x'0101010101010101010101010101010101010101010101010101010101010101' WHERE service_id = ?1",
+                            [sid(2)],
+                        )?;
+                        // The state of a file that was of schema 23: nothing stated yet.
+                        tx.execute("UPDATE account SET number_verdicts_stated = 0", [])?;
+                        tx.execute("DELETE FROM core_outbox", [])?;
+                        // Linked to the environment the test's default config names.
+                        tx.execute("UPDATE account SET env = 'production'", [])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                let verdicts = |actor: &Actor<testing::NoTransport>| -> Vec<(String, Option<bool>)> {
+                    actor
+                        .shared
+                        .db
+                        .read(|c| -> crate::error::Result<Vec<BackendEvent>> {
+                            let mut stmt = c.prepare("SELECT envelope FROM core_outbox ORDER BY seq")?;
+                            let rows: Vec<Vec<u8>> = stmt
+                                .query_map([], |r| r.get(0))?
+                                .collect::<kourier_db::rusqlite::Result<_>>()?;
+                            let mut events = Vec::new();
+                            for row in rows {
+                                events.extend(kourier_backend_api::decode_outbox_row(&row)?);
+                            }
+                            Ok(events)
+                        })
+                        .unwrap()
+                        .into_iter()
+                        .filter_map(|e| match e {
+                            BackendEvent::ContactUpsert(p) if p.number_shown.is_some() => {
+                                Some((p.user.as_str().to_owned(), p.number_shown))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let start = || {
+                    let (ctx, core) = kourier_backend_api::AccountContext::new(
+                        kourier_backend_api::ContextParams {
+                            account: kourier_model::AccountId(1),
+                            uuid: kourier_model::AccountUuid::new_random(),
+                            start: kourier_backend_api::StartMode::Resume,
+                            backend_db: fixture.backend_path(),
+                            db_key: kourier_backend_api::DbKey::new([5; 32]),
+                            blob_dir: fixture.backend_path().with_file_name("blobs"),
+                            net_rt: tokio::runtime::Handle::current(),
+                            cancel: CancellationToken::new(),
+                            clock: Arc::new(kourier_backend_api::SystemClock),
+                            config: kourier_backend_api::BackendConfig::default(),
+                            ui: Default::default(),
+                            local_prefs: Default::default(),
+                        },
+                    );
+                    let actor = Actor::start(
+                        ctx,
+                        Arc::new(testing::NoTransport::default()),
+                        Vec::new(),
+                        Vec::new(),
+                        Tuning::default(),
+                    )
+                    .expect("the actor starts");
+                    (actor, core)
+                };
+                let user = |n: u128| format!("aci:{}", uuid::Uuid::from_u128(n));
+                let (first, _core) = start();
+                assert_eq!(
+                    verdicts(&first),
+                    [(user(1), Some(true)), (user(2), Some(false))],
+                    "the first start states every person's verdict"
+                );
+                let (second, _core2) = start();
+                assert_eq!(verdicts(&second).len(), 2, "a second start states nothing more");
+            })
+            .await;
+    }
 
     /// A login that starts is a new link: what an earlier transfer of this actor imported
     /// (`TransferShared::imported`, which lets a link's `Done` skip the Storage Service sync)
@@ -1667,6 +2330,535 @@ mod login_tests {
                 let login = actor.login.take().expect("login");
                 login.stop.cancel();
                 let _ = login.task.await;
+            })
+            .await;
+    }
+}
+
+/// The second try of [`Actor::remove_device`] (F1 fix round, P1): a socket that closed under the
+/// first `DELETE` while the connection task is connecting again. No end-to-end run reaches it:
+/// the task disconnects a stale socket only after the request in flight is answered (libsignal
+/// lets it finish), and a socket the server closes (4409, 4401) leaves the task held or waiting
+/// for its backoff, never connecting. So the state is set by hand, over a transport that
+/// counts the connects of the removal itself.
+#[cfg(test)]
+mod abort_tests;
+
+/// A10c (C1): the switch `Command::SetRoamingWrites`, the route of the four roaming changes to the
+/// Storage Service write engine, the durable clear, and P5a's identity intent, through the real
+/// command path of an actor.
+#[cfg(test)]
+mod roaming_tests;
+
+#[cfg(test)]
+mod removal_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kourier_model::UserAction;
+
+    use super::*;
+    use crate::net::{
+        ChatEvent, ChatRequest, ChatResponse, ChatSocket, HttpsRequest, HttpsResponse,
+        MultiRecipientOutcome, MultiRecipientSend, ProvisioningEvent, UploadForm, UploadTooLarge,
+    };
+
+    /// A socket that either closes under every request or answers 204 to it.
+    struct StubSocket {
+        closes_under_requests: bool,
+        /// How long a request takes before it closes or is answered.
+        delay: Duration,
+        requests: AtomicUsize,
+        /// Told when a request of this socket has failed.
+        failed: Arc<Notify>,
+    }
+
+    impl StubSocket {
+        fn new(closes_under_requests: bool, failed: &Arc<Notify>) -> Arc<Self> {
+            Arc::new(Self {
+                closes_under_requests,
+                delay: Duration::ZERO,
+                requests: AtomicUsize::new(0),
+                failed: failed.clone(),
+            })
+        }
+
+        /// A socket that closes under a request only after `delay`.
+        fn closing_after(delay: Duration, failed: &Arc<Notify>) -> Arc<Self> {
+            Arc::new(Self {
+                closes_under_requests: true,
+                delay,
+                requests: AtomicUsize::new(0),
+                failed: failed.clone(),
+            })
+        }
+    }
+
+    impl ChatSocket for StubSocket {
+        async fn request(
+            &self,
+            _request: ChatRequest,
+        ) -> std::result::Result<ChatResponse, TransportError> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.closes_under_requests {
+                self.failed.notify_one();
+                return Err(TransportError::Disconnected);
+            }
+            Ok(ChatResponse {
+                status: http::StatusCode::NO_CONTENT,
+                message: None,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::new(),
+            })
+        }
+
+        async fn send_multi_recipient(
+            &self,
+            _send: MultiRecipientSend,
+        ) -> std::result::Result<MultiRecipientOutcome, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn get_upload_form(
+            &self,
+            _upload_length: u64,
+        ) -> std::result::Result<std::result::Result<UploadForm, UploadTooLarge>, TransportError>
+        {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn disconnect(&self) {}
+    }
+
+    /// A transport that counts the `connect_auth` calls (the removal's own connects) and
+    /// fails them.
+    #[derive(Default)]
+    struct CountingTransport {
+        auth_connects: AtomicUsize,
+    }
+
+    impl SignalTransport for CountingTransport {
+        type Socket = StubSocket;
+
+        async fn connect_auth(
+            &self,
+            _credentials: &crate::net::AuthCredentials,
+        ) -> std::result::Result<Connected<StubSocket, ChatEvent>, TransportError> {
+            self.auth_connects.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::Disconnected)
+        }
+
+        async fn connect_unauth(
+            &self,
+        ) -> std::result::Result<Connected<StubSocket, ChatEvent>, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn connect_provisioning(
+            &self,
+        ) -> std::result::Result<Connected<StubSocket, ProvisioningEvent>, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn https(
+            &self,
+            _request: HttpsRequest,
+        ) -> std::result::Result<HttpsResponse, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn https_download(
+            &self,
+            _request: HttpsRequest,
+            _sink: crate::net::DownloadSink,
+        ) -> std::result::Result<http::StatusCode, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        async fn https_upload(
+            &self,
+            _request: crate::net::UploadRequest,
+        ) -> std::result::Result<HttpsResponse, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        fn network_changed(&self) {}
+    }
+
+    /// R1, N2: the moment the removal returns, its `Removing` guard is gone, and `logout` still
+    /// has to tell the core (an await that waits while the core's channel is full) before
+    /// `unlinked` stops the history transfer and the task. In that time nothing new rides on
+    /// the socket of the device: `logout` sets `unlinking` right behind the removal.
+    #[tokio::test]
+    async fn nothing_new_rides_on_the_socket_while_logout_tells_the_core() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = testing::shared_over(
+                    Arc::new(CountingTransport::default()),
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = Rc::new(test.shared);
+                let _core = test.core;
+                let failed = Arc::new(Notify::new());
+                let socket = StubSocket::new(false, &failed);
+                *shared.socket.borrow_mut() = Some(socket.clone());
+                shared.set_conn(ConnState::Syncing { fraction: None });
+                // The core takes nothing: its channel is full.
+                let filler = || {
+                    Envelope::ephemeral(BackendEvent::Logout(LogoutReport {
+                        outcome: DeviceLogout::NoDevice,
+                        device_name: None,
+                    }))
+                };
+                while shared.events.try_send(filler()).is_ok() {}
+                let (_commands_tx, commands) = mpsc::channel(8);
+                let mut actor = Actor {
+                    shared: shared.clone(),
+                    commands,
+                    cancel: CancellationToken::new(),
+                    login: None,
+                    connection: None,
+                    held: false,
+                    transfer: None,
+                    scrub_owed: false,
+                    forwarder: spawn_local(async {}),
+                    forwarder_stop: CancellationToken::new(),
+                    stage2: spawn_local(async {}),
+                    stage2_stop: CancellationToken::new(),
+                };
+
+                let logout = tokio::time::timeout(Duration::from_millis(300), actor.logout());
+                assert!(logout.await.is_err(), "telling the core waits for the core");
+
+                assert_eq!(
+                    socket.requests.load(Ordering::SeqCst),
+                    1,
+                    "the DELETE went out"
+                );
+                assert!(!shared.is_removing(&fixture.account), "the removal is over");
+                assert!(shared.socket.borrow().is_some(), "the socket stands");
+                assert!(
+                    shared.work_socket().is_none(),
+                    "but nothing new rides on it before `unlinked` runs"
+                );
+            })
+            .await;
+    }
+
+    /// R1, N6: `LoggedOut` is the last state of a `Shared`; only another `LoggedOut` replaces it.
+    #[tokio::test]
+    async fn logged_out_is_final_for_the_connection_state() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = testing::shared_over(
+                    Arc::new(CountingTransport::default()),
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = test.shared;
+                shared.set_conn(ConnState::Syncing { fraction: None });
+                shared.set_conn(ConnState::LoggedOut {
+                    reason: "first".to_owned(),
+                    cause: Default::default(),
+                    note: Default::default(),
+                });
+                for later in [
+                    ConnState::Connecting,
+                    ConnState::Syncing { fraction: None },
+                    ConnState::Online { detail: None },
+                    ConnState::Offline { retry_at_ms: None },
+                    ConnState::NeedsUserAction(UserAction::Reconnect),
+                ] {
+                    let name = later.name();
+                    shared.set_conn(later);
+                    assert_eq!(
+                        *shared.conn_watch().borrow(),
+                        ConnState::LoggedOut {
+                            reason: "first".to_owned(),
+                            cause: Default::default(),
+                            note: Default::default(),
+                        },
+                        "{name} after logged out"
+                    );
+                }
+                shared.set_conn(ConnState::LoggedOut {
+                    reason: "second".to_owned(),
+                    cause: Default::default(),
+                    note: Default::default(),
+                });
+                assert_eq!(
+                    *shared.conn_watch().borrow(),
+                    ConnState::LoggedOut {
+                        reason: "second".to_owned(),
+                        cause: Default::default(),
+                        note: Default::default(),
+                    }
+                );
+            })
+            .await;
+    }
+
+    /// R1, N1: the removal that gives up at its deadline with the connection task's attempt still
+    /// under way stops the task and waits for it before it returns, and does not leave it to
+    /// `unlinked`. `Removing` goes with the return; an upgrade the server answers in the
+    /// moments before `unlinked` cancels the task would publish a socket for which
+    /// `is_removing` is false, and its post-connect work (one-time keys, sync requests to the
+    /// phone) would start for a device that is still linked and whose keys are being wiped.
+    #[tokio::test]
+    async fn a_removal_that_runs_out_of_time_stops_the_connection_task_before_it_returns() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let transport = Arc::new(CountingTransport::default());
+                let test = testing::shared_over(
+                    transport.clone(),
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = Rc::new(test.shared);
+                // The task's attempt is on its way and the server does not answer in time.
+                shared.set_conn(ConnState::Connecting);
+                let stop = CancellationToken::new();
+                let (nudges, _nudged) = mpsc::unbounded_channel();
+                let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let task = {
+                    let (stop, ended) = (stop.clone(), ended.clone());
+                    spawn_local(async move {
+                        stop.cancelled().await;
+                        ended.store(true, Ordering::SeqCst);
+                        ConnectionEnd::Stopped
+                    })
+                };
+                let (_commands_tx, commands) = mpsc::channel(8);
+                let mut actor = Actor {
+                    shared: shared.clone(),
+                    commands,
+                    cancel: CancellationToken::new(),
+                    login: None,
+                    connection: Some(Connection {
+                        stop: stop.clone(),
+                        task,
+                        nudges,
+                    }),
+                    held: false,
+                    transfer: None,
+                    scrub_owed: false,
+                    forwarder: spawn_local(async {}),
+                    forwarder_stop: CancellationToken::new(),
+                    stage2: spawn_local(async {}),
+                    stage2_stop: CancellationToken::new(),
+                };
+
+                let outcome = actor
+                    .remove_device(
+                        &fixture.account,
+                        tokio::time::Instant::now() + Duration::from_millis(100),
+                    )
+                    .await;
+
+                assert_eq!(outcome, DeviceLogout::NotReached);
+                assert!(stop.is_cancelled(), "the task was told to stop");
+                assert!(
+                    ended.load(Ordering::SeqCst),
+                    "the task had ended when the removal returned"
+                );
+                assert!(actor.connection.is_none(), "and nobody awaits it again");
+                assert_eq!(
+                    transport.auth_connects.load(Ordering::SeqCst),
+                    0,
+                    "the removal opened no connect of its own"
+                );
+                assert!(
+                    !shared.is_removing(&fixture.account),
+                    "the device is no longer under removal"
+                );
+            })
+            .await;
+    }
+
+    /// R1 fix (N1 on the other early return): the first `DELETE` fails with the deadline gone by
+    /// ("no time left to ask again") while the connection task still runs; the removal stops
+    /// the task and waits for it before it returns, as it does at the other early return. The
+    /// task has just lost its socket and a connect it makes next must not publish one after
+    /// `Removing` went with the return.
+    #[tokio::test]
+    async fn a_removal_with_no_time_left_to_ask_again_stops_the_connection_task_before_it_returns()
+    {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let transport = Arc::new(CountingTransport::default());
+                let test = testing::shared_over(
+                    transport.clone(),
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = Rc::new(test.shared);
+                // The socket that stands closes under the request, but only after the
+                // deadline has gone by.
+                let failed = Arc::new(Notify::new());
+                let socket = StubSocket::closing_after(Duration::from_millis(250), &failed);
+                *shared.socket.borrow_mut() = Some(socket.clone());
+                shared.set_conn(ConnState::Online { detail: None });
+                let stop = CancellationToken::new();
+                let (nudges, _nudged) = mpsc::unbounded_channel();
+                let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let task = {
+                    let (stop, ended) = (stop.clone(), ended.clone());
+                    spawn_local(async move {
+                        stop.cancelled().await;
+                        ended.store(true, Ordering::SeqCst);
+                        ConnectionEnd::Stopped
+                    })
+                };
+                let (_commands_tx, commands) = mpsc::channel(8);
+                let mut actor = Actor {
+                    shared: shared.clone(),
+                    commands,
+                    cancel: CancellationToken::new(),
+                    login: None,
+                    connection: Some(Connection {
+                        stop: stop.clone(),
+                        task,
+                        nudges,
+                    }),
+                    held: false,
+                    transfer: None,
+                    scrub_owed: false,
+                    forwarder: spawn_local(async {}),
+                    forwarder_stop: CancellationToken::new(),
+                    stage2: spawn_local(async {}),
+                    stage2_stop: CancellationToken::new(),
+                };
+
+                let outcome = actor
+                    .remove_device(
+                        &fixture.account,
+                        tokio::time::Instant::now() + Duration::from_millis(100),
+                    )
+                    .await;
+
+                assert_eq!(outcome, DeviceLogout::NotReached);
+                assert_eq!(socket.requests.load(Ordering::SeqCst), 1, "one try only");
+                assert!(stop.is_cancelled(), "the task was told to stop");
+                assert!(
+                    ended.load(Ordering::SeqCst),
+                    "the task had ended when the removal returned"
+                );
+                assert!(actor.connection.is_none(), "and nobody awaits it again");
+                assert_eq!(
+                    transport.auth_connects.load(Ordering::SeqCst),
+                    0,
+                    "the removal opened no connect of its own"
+                );
+                assert!(
+                    !shared.is_removing(&fixture.account),
+                    "the device is no longer under removal"
+                );
+            })
+            .await;
+    }
+
+    /// The socket of the first try closes under its `DELETE` while the connection task is
+    /// connecting again; the task's new socket comes about a moment later. The second try
+    /// rides on THAT socket: the removal opens no connect of its own and does not cancel the
+    /// task (a connect of its own would take the connection from the task's attempt with a
+    /// 4409 whenever the attempt's upgrade is at the server already: F1 review, F-1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_second_try_of_a_removal_rides_on_the_socket_of_the_task_that_is_connecting() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let transport = Arc::new(CountingTransport::default());
+                let test = testing::shared_over(
+                    transport.clone(),
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let shared = Rc::new(test.shared);
+                let failed = Arc::new(Notify::new());
+                let (first, second) = (
+                    StubSocket::new(true, &failed),
+                    StubSocket::new(false, &failed),
+                );
+                *shared.socket.borrow_mut() = Some(first.clone());
+                // The task's state when the request fails: connecting, with no socket yet.
+                shared.set_conn(ConnState::Connecting);
+                // The task: stops when told to; its new socket comes after the first failed.
+                let stop = CancellationToken::new();
+                let (nudges, _nudged) = mpsc::unbounded_channel();
+                let task = {
+                    let (stop, shared, second, failed) =
+                        (stop.clone(), shared.clone(), second.clone(), failed.clone());
+                    spawn_local(async move {
+                        tokio::select! {
+                            () = stop.cancelled() => ConnectionEnd::Stopped,
+                            () = async {
+                                failed.notified().await;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                *shared.socket.borrow_mut() = Some(second);
+                                shared.set_conn(ConnState::Syncing { fraction: None });
+                                std::future::pending::<()>().await;
+                            } => ConnectionEnd::Held,
+                        }
+                    })
+                };
+                let (commands_tx, commands) = mpsc::channel(8);
+                let mut actor = Actor {
+                    shared: shared.clone(),
+                    commands,
+                    cancel: CancellationToken::new(),
+                    login: None,
+                    connection: Some(Connection {
+                        stop: stop.clone(),
+                        task,
+                        nudges,
+                    }),
+                    held: false,
+                    transfer: None,
+                    scrub_owed: false,
+                    forwarder: spawn_local(async {}),
+                    forwarder_stop: CancellationToken::new(),
+                    stage2: spawn_local(async {}),
+                    stage2_stop: CancellationToken::new(),
+                };
+
+                let outcome = actor
+                    .remove_device(
+                        &fixture.account,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await;
+
+                assert_eq!(outcome, DeviceLogout::Removed);
+                assert_eq!(first.requests.load(Ordering::SeqCst), 1, "the first try");
+                assert_eq!(
+                    second.requests.load(Ordering::SeqCst),
+                    1,
+                    "the second try rode on the task's new socket"
+                );
+                assert_eq!(
+                    transport.auth_connects.load(Ordering::SeqCst),
+                    0,
+                    "the removal opened no connect of its own"
+                );
+                assert!(!stop.is_cancelled(), "the task was left alone");
+                assert!(actor.connection.is_some());
+                drop(commands_tx);
+                stop.cancel();
+                if let Some(connection) = actor.connection.take() {
+                    let _ = connection.task.await;
+                }
             })
             .await;
     }

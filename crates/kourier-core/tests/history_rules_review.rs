@@ -650,8 +650,23 @@ fn review_the_echo_starts_the_timer_of_a_pending_row_also_after_a_receipt() {
 /// the live copy of one row and a live message end in the same counts and read states
 /// whatever order the six deliveries come in (the `history` flag and the sort key of the row
 /// that has a live copy depend on which copy came first, by design: they are left out).
+///
+/// The regular run (`ci --quick` too) takes a fixed SAMPLE of the 720 orders: every 7th, the
+/// identity and the reverse (104 orders, ~1.6 s). The whole run is
+/// [`review_unread_history_rows_converge_in_any_order_exhaustive`] (~11 s quiet), in the slow
+/// set that only the full `ci` runs (T5d).
 #[test]
 fn review_unread_history_rows_converge_in_any_order() {
+    converge_in_any_order(false);
+}
+
+/// Every one of the 720 orders (see [`review_unread_history_rows_converge_in_any_order`]).
+#[test]
+fn review_unread_history_rows_converge_in_any_order_exhaustive() {
+    converge_in_any_order(true);
+}
+
+fn converge_in_any_order(exhaustive: bool) {
     let a = d_alice();
     let deliveries = || -> Vec<Vec<BackendEvent>> {
         let mut edited = incoming(&a, &alice(), 250, false);
@@ -711,7 +726,14 @@ fn review_unread_history_rows_converge_in_any_order() {
         (counts(h, &a), states)
     };
     let mut first = None;
-    for order in orders(6) {
+    let mut ran = 0usize;
+    for (n, order) in orders(6).into_iter().enumerate() {
+        let identity = order.windows(2).all(|w| w[0] < w[1]);
+        let reverse = order.windows(2).all(|w| w[0] > w[1]);
+        if !exhaustive && n % 7 != 0 && !identity && !reverse {
+            continue;
+        }
+        ran += 1;
         let dir = tempfile::tempdir().expect("tempdir");
         let mut h = harness_in(dir.path());
         let all = deliveries();
@@ -725,6 +747,8 @@ fn review_unread_history_rows_converge_in_any_order() {
             Some(expected) => assert_eq!(&got, expected, "order {order:?}"),
         }
     }
+    // 103 orders of every 7th (the first, n = 0, is the reverse) and the identity (the last).
+    assert_eq!(ran, if exhaustive { 720 } else { 104 });
     let (count, states) = first.expect("some order");
     // 100, 150 and 200 are under the marker, 300 is read by its second copy; 250 and the
     // live 400 are unread.

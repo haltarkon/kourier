@@ -82,6 +82,7 @@ mod proto;
 mod provisioning;
 mod receive;
 mod retry;
+mod safety;
 mod send;
 mod service_id;
 mod storage;
@@ -98,8 +99,8 @@ use kourier_backend_api::{
     AccountContext, AccountHandle, AllocatedId, Network, spawn_account_thread,
 };
 use kourier_model::{
-    BackendError, ConvKey, HistorySource, LoginFlow, MsgIdScope, NetworkDescriptor, NetworkKind,
-    TypingPolicy, UserId,
+    BackendError, CleanedPictures, ConvKey, EditTarget, HistoryReadState, HistorySource, LoginFlow,
+    MsgIdScope, NetworkDescriptor, NetworkKind, OutboxPolicy, ServerRules, TypingPolicy, UserId,
 };
 
 pub use net::{LocalTestEnv, SignalEnvironment};
@@ -565,6 +566,16 @@ pub mod failpoints {
     /// After one Storage Service merge zone committed, before the next one (§6.9).
     pub const AFTER_STORAGE_MERGE_COMMIT: &str =
         crate::storage::FAILPOINT_AFTER_STORAGE_MERGE_COMMIT;
+    /// A Storage Service write: its in-flight row is committed, the PUT has not gone out.
+    pub const BEFORE_STORAGE_WRITE_PUT: &str =
+        crate::storage::write::FAILPOINT_BEFORE_STORAGE_WRITE_PUT;
+    /// A Storage Service write: the server answered 200, the zone of the 200 has not run.
+    pub const AFTER_STORAGE_WRITE_PUT: &str =
+        crate::storage::write::FAILPOINT_AFTER_STORAGE_WRITE_PUT;
+    /// A Storage Service write: the zone of the 200 committed (records, version, intents closed,
+    /// the fetch-latest job queued).
+    pub const AFTER_STORAGE_WRITE_COMMIT: &str =
+        crate::storage::write::FAILPOINT_AFTER_STORAGE_WRITE_COMMIT;
     /// History import: a read of the archive is about to begin. A stage that no commit
     /// recorded is removed, the read's start is not counted yet.
     pub const BEFORE_HISTORY_IMPORT_READ: &str = crate::transfer::FAILPOINT_BEFORE_IMPORT_READ;
@@ -694,12 +705,30 @@ impl SignalNetwork {
                 // Phone-number and username lookup (CDSI, usernames) arrive after S2.
                 start_chat: Vec::new(),
                 history: HistorySource::None,
+                history_read: HistoryReadState::Known,
                 msg_id_scope: MsgIdScope::AccountAuthor,
                 typing: TypingPolicy {
                     refresh: Duration::from_secs(10),
                     stop_after: Duration::from_secs(3),
                 },
                 risk_notice: None,
+                history_transfer: false,
+                experimental: false,
+                // Desktop names the revision it edited last, and its send budget is the
+                // 24 h the other Signal clients' receive windows are built on.
+                edit_target: EditTarget::LatestRevision,
+                outbox: OutboxPolicy::SIGNAL,
+                // The core's default (5 s): a Signal actor stops in well under that.
+                shutdown_grace: None,
+                safety_numbers: true,
+                contact_cards: true,
+                // Every picture of these types leaves through `kourier_media::clean_still`
+                // (`send/media.rs` `encode_still`), which never returns located bytes (LOC, F14).
+                cleaned_pictures: Some(CleanedPictures::stills(kourier_media::CLEANED_TYPES)),
+                // Signal's read receipts and typing indicators are the account's settings.
+                receipts_always_sent: false,
+                // The clients count what is unread and check the deletes (KT-2).
+                server: ServerRules::default(),
             },
             tuning: Tuning::default(),
         }
@@ -784,8 +813,9 @@ impl SignalNetwork {
     /// the transfer switches it on.
     ///
     /// The descriptor follows the switch: with the offer on it says that linking brings the
-    /// account's history (`HistorySource::PushedOnLink`), which is what makes a UI offer
-    /// "Transfer History from Phone…" for an account that is linked already.
+    /// account's history (`HistorySource::PushedOnLink`) as one archive
+    /// (`NetworkDescriptor::history_transfer`, the flag a UI keys "Transfer History from
+    /// Phone…" on for an account that is linked already).
     #[must_use]
     pub fn with_history_transfer_offer(mut self, offer: bool) -> Self {
         self.tuning.transfer_offer = offer;
@@ -794,6 +824,7 @@ impl SignalNetwork {
         } else {
             HistorySource::None
         };
+        self.descriptor.history_transfer = offer;
         self
     }
 
@@ -911,6 +942,11 @@ impl std::fmt::Debug for SignalNetwork {
     }
 }
 
+/// Signal's link to a person by an E.164 number; `None` for anything else.
+fn contact_link(number: &str) -> Option<String> {
+    kourier_backend_api::is_e164(number).then(|| format!("https://signal.me/#p/{number}"))
+}
+
 impl Network for SignalNetwork {
     fn kind(&self) -> NetworkKind {
         NetworkKind::Signal
@@ -934,6 +970,18 @@ impl Network for SignalNetwork {
     /// known before the upload.
     fn attachment_net_ids(&self, local: &str, index: usize) -> Vec<String> {
         send::media::attachment_net_ids(local, index)
+    }
+
+    /// Signal links a person by number: `https://signal.me/#p/<+E164>` (Desktop
+    /// `ts/util/signalRoutes.std.ts`). The other form, `#eu/` (an encrypted username link),
+    /// needs the entropy and handle only the username's OWNER has, so Kourier can make it for
+    /// nobody else (P5b, refresh §3.2).
+    fn contact_links(&self) -> bool {
+        true
+    }
+
+    fn contact_link(&self, _user: &UserId, number: &str) -> Option<String> {
+        contact_link(number)
     }
 
     fn spawn(&self, ctx: AccountContext) -> Result<AccountHandle, BackendError> {
@@ -964,6 +1012,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contact_link_is_the_number_form_for_e164_only() {
+        let network = SignalNetwork::new();
+        let ada = UserId::parse("aci:9d0652a3-dcc3-4d11-975f-74d61598733f").unwrap();
+        assert!(network.contact_links());
+        assert_eq!(
+            network.contact_link(&ada, "+15551234567").as_deref(),
+            Some("https://signal.me/#p/+15551234567")
+        );
+        // Z2: a number of 7 digits is E.164 too (Niue and Tokelau: +683 and +690 with 4 digits); the
+        // lower bound is the log scrubber's, 7 (the page shows such a number, so it must link).
+        assert_eq!(
+            network.contact_link(&ada, "+6834002").as_deref(),
+            Some("https://signal.me/#p/+6834002")
+        );
+        for bad in [
+            "15551234567",
+            "+1555",
+            "+683400",
+            "+1234567890123456",
+            "+0555123456",
+            "+1555 123 4567",
+            "+1555-1234567",
+            "",
+            "+",
+        ] {
+            assert_eq!(network.contact_link(&ada, bad), None, "case {}", bad.len());
+        }
+    }
+
+    #[test]
     fn message_ids_are_the_sent_timestamp() {
         let network = SignalNetwork::new();
         let conv =
@@ -974,17 +1052,26 @@ mod tests {
         assert_eq!(network.kind(), NetworkKind::Signal);
         assert_eq!(network.descriptor().login_flows[0].id, "qr");
         assert_eq!(network.descriptor().msg_id_scope, MsgIdScope::AccountAuthor);
+        // K-B1: Signal's edits name the latest revision and its outbox keeps Desktop's numbers.
+        assert_eq!(network.descriptor().edit_target, EditTarget::LatestRevision);
+        assert_eq!(network.descriptor().outbox, OutboxPolicy::default());
         // Linking brings no history unless the offer is switched on, and the descriptor
         // says what the linking URL will offer: a UI shows "Transfer History from Phone…"
         // by it.
         assert_eq!(network.descriptor().history, HistorySource::None);
+        assert!(!network.descriptor().history_transfer);
         assert!(!network.tuning.transfer_offer);
         let offering = SignalNetwork::new().with_history_transfer_offer(true);
         assert_eq!(offering.descriptor().history, HistorySource::PushedOnLink);
+        // The flag the screens key on ("Transfer History from Phone…"), not `history`.
+        assert!(offering.descriptor().history_transfer);
         assert!(offering.tuning.transfer_offer);
         let off_again = offering.with_history_transfer_offer(false);
         assert_eq!(off_again.descriptor().history, HistorySource::None);
+        assert!(!off_again.descriptor().history_transfer);
         assert!(!off_again.tuning.transfer_offer);
+        // Signal is not an experimental network.
+        assert!(!network.descriptor().experimental);
         // Own attachments have a name before they are sent: stable, one per position.
         let names = network.attachment_net_ids(&id.local, 0);
         assert_eq!(names.len(), 1);

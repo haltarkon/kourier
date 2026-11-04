@@ -469,60 +469,28 @@ impl NotificationClient {
         Ok(self.proxy.close_notification(id).await?)
     }
 
-    /// Subscribes to the server's signals. The forwarding task ends when the receiver is
-    /// dropped or the connection closes. Must run inside the tokio runtime.
+    /// Subscribes to the server's signals, handed on in the order the server sent them (the
+    /// `ActivationToken` before the `ActionInvoked` it belongs to). The forwarding task ends
+    /// when the receiver is dropped or the connection closes. Must run inside the tokio runtime.
     pub async fn subscribe(
         &self,
     ) -> Result<mpsc::UnboundedReceiver<NotificationEvent>, DesktopError> {
-        type Events = std::pin::Pin<Box<dyn futures_util::Stream<Item = NotificationEvent> + Send>>;
-        let closed: Events = Box::pin(self.proxy.receive_notification_closed().await?.filter_map(
-            |s| async move {
-                let a = s.args().ok()?;
-                Some(NotificationEvent::Closed {
-                    id: a.id,
-                    reason: CloseReason::from_code(a.reason),
-                })
-            },
-        ));
-        let action: Events = Box::pin(self.proxy.receive_action_invoked().await?.filter_map(
-            |s| async move {
-                let a = s.args().ok()?;
-                Some(NotificationEvent::Action {
-                    id: a.id,
-                    key: a.action_key,
-                })
-            },
-        ));
-        let token: Events = Box::pin(self.proxy.receive_activation_token().await?.filter_map(
-            |s| async move {
-                let a = s.args().ok()?;
-                Some(NotificationEvent::ActivationToken {
-                    id: a.id,
-                    token: a.activation_token,
-                })
-            },
-        ));
-        let replied: Events = Box::pin(
-            self.proxy
-                .receive_notification_replied()
-                .await?
-                .filter_map(|s| async move {
-                    let a = s.args().ok()?;
-                    Some(NotificationEvent::Replied {
-                        id: a.id,
-                        text: a.text,
-                    })
-                }),
-        );
-        let mut events = futures_util::stream::select_all([closed, action, token, replied]);
+        // ONE stream for every signal of the interface, in the order of the bus. Four streams,
+        // one per signal, merged with `select_all`, lost the order between them: a burst of
+        // token, action, reply came out as reply, token, action (tests/dbus.rs
+        // `notification_signals_in_order`), and the `notifications` case once got the action
+        // before its token.
+        let mut signals = self.proxy.inner().receive_all_signals().await?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tx.closed() => break,
-                    e = events.next() => match e {
-                        Some(e) => {
-                            if tx.send(e).is_err() {
+                    m = signals.next() => match m {
+                        Some(m) => {
+                            if let Some(e) = event_of(m)
+                                && tx.send(e).is_err()
+                            {
                                 break;
                             }
                         }
@@ -533,6 +501,38 @@ impl NotificationClient {
         });
         Ok(rx)
     }
+}
+
+/// The event a signal of the notification interface stands for (`None` for any other signal
+/// or arguments that do not parse).
+fn event_of(m: zbus::Message) -> Option<NotificationEvent> {
+    if let Some(s) = NotificationClosed::from_message(m.clone()) {
+        let a = s.args().ok()?;
+        return Some(NotificationEvent::Closed {
+            id: a.id,
+            reason: CloseReason::from_code(a.reason),
+        });
+    }
+    if let Some(s) = ActionInvoked::from_message(m.clone()) {
+        let a = s.args().ok()?;
+        return Some(NotificationEvent::Action {
+            id: a.id,
+            key: a.action_key,
+        });
+    }
+    if let Some(s) = ActivationToken::from_message(m.clone()) {
+        let a = s.args().ok()?;
+        return Some(NotificationEvent::ActivationToken {
+            id: a.id,
+            token: a.activation_token,
+        });
+    }
+    let s = NotificationReplied::from_message(m)?;
+    let a = s.args().ok()?;
+    Some(NotificationEvent::Replied {
+        id: a.id,
+        text: a.text,
+    })
 }
 
 /// The unique name that owns the notification service now.

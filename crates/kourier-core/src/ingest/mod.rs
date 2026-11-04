@@ -7,9 +7,10 @@
 //! state: modifiers that arrive before their target wait in `pending_modifiers`; reactions are
 //! last-writer-wins by `at` with tombstones; receipts keep the earliest `at`; per-recipient send
 //! states and read states only move forward; unread counters and the aggregated outgoing state
-//! are recomputed from rows; read markers from other devices are a `sent_at` watermark; the
-//! signals of a call join into one line ([`call`]). Only the `sort_key` of live messages depends
-//! on arrival order, by design (§3.9).
+//! are recomputed from rows; read markers from other devices are a `sent_at` watermark, or a
+//! position where the network numbers its messages ([`position`]); the signals of a call join into
+//! one line ([`call`]). Only the `sort_key` of live messages depends on arrival order, by design
+//! (§3.9).
 
 mod attachment;
 mod call;
@@ -17,6 +18,8 @@ mod clear;
 mod merge;
 mod message;
 mod modifier;
+mod position;
+mod rekey;
 pub(crate) mod restore;
 mod roaming;
 
@@ -27,7 +30,8 @@ use kourier_backend_api::{BackendEvent, BackendNotice};
 use kourier_db::failpoint;
 use kourier_db::rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use kourier_model::{
-    AccountId, AttachmentId, CmdId, ConvKey, ConversationId, MessageId, MsgIdScope, UserId,
+    AccountId, AttachmentId, CmdId, ConvKey, ConversationId, HistoryReadState, MessageId,
+    MsgIdScope, ServerRules, UserId,
 };
 
 pub(crate) use attachment::{forget_orphans, newest_download, pending_derives, resume_downloads};
@@ -35,11 +39,17 @@ pub(crate) use call::{DEAD_ORIGIN, is_call_line};
 pub(crate) use clear::{
     LocalDelete, attachment_account, body_reads, clear_conversation, delete_attachment,
 };
-pub(crate) use message::{MsgRow, preview};
-pub(crate) use modifier::{MAX_EMOJI_BYTES, receipt_retry_decodes};
-pub(crate) use roaming::other_identities;
+pub(crate) use message::{BY_KEY_ACCOUNT, BY_KEY_CONVERSATION, BY_KEY_PER_SENDER, MsgRow, preview};
+pub(crate) use modifier::{
+    MAX_EMOJI_BYTES, MESSAGES_WITH_LOCAL, RESOLVE_BY_AUTHOR, RESOLVE_BY_LOCAL,
+    receipt_retry_decodes,
+};
+pub(crate) use position::{NEWEST_AT_POSITION, PEER_READ_RANGE, READ_BY_POSITION};
+pub(crate) use rekey::BY_ALIAS;
+pub(crate) use roaming::{other_identities, same_identity};
 
 use crate::error::{CoreError, Result};
+use crate::rules::NetRules;
 use crate::sql::{self, AccountInfo};
 
 /// Kill point inside the ingest transaction, before `COMMIT` (§10.4): the envelope rolls back.
@@ -168,11 +178,15 @@ pub(crate) struct NotifyCandidate {
 }
 
 /// Applies `events` of `account` in one `BEGIN IMMEDIATE` transaction. `scope` is the network's
-/// message-id scope (§3.1); `now` is the core clock (pending-modifier expiry, bookkeeping).
+/// message-id scope (§3.1); `history_read` is what the network says of the `read` flag of its
+/// history rows (W4 fix F1); `server` is what its server owns (KT-2); `now` is the core clock
+/// (pending-modifier expiry, bookkeeping).
 pub(crate) fn apply_events(
     conn: &mut Connection,
     account: AccountId,
     scope: MsgIdScope,
+    history_read: HistoryReadState,
+    server: ServerRules,
     now: i64,
     events: Vec<BackendEvent>,
 ) -> Result<Changes> {
@@ -182,6 +196,8 @@ pub(crate) fn apply_events(
         conn: &tx,
         acc,
         scope,
+        history_read,
+        server,
         now,
         ch: Changes::default(),
     };
@@ -201,6 +217,17 @@ pub(crate) struct Apply<'c> {
     pub(crate) conn: &'c Connection,
     pub(crate) acc: AccountInfo,
     pub(crate) scope: MsgIdScope,
+    /// What the `read` flag of a history row means for this network: where it is unknown a
+    /// history copy never raises an existing row (W4 fix F1). The core-local paths that
+    /// begin an `Apply` ingest no history, so they leave it at `Known`.
+    pub(crate) history_read: HistoryReadState,
+    /// What the network's server owns (KT-2). THE RULE: whoever has the network's [`NetRules`] in
+    /// hand begins with [`Apply::under_rules`], and the ingest entry is handed it, because what
+    /// waited for a message is applied by the path that finds the message: an own send or the
+    /// outcome of one can apply a delete that waited, and under the default that delete is judged
+    /// by the old rule and consumed. A path with no network's rules in hand leaves it off: it
+    /// applies nothing that waited and takes no stated count, so neither flag can reach it.
+    pub(crate) server: ServerRules,
     pub(crate) now: i64,
     pub(crate) ch: Changes,
 }
@@ -219,9 +246,23 @@ impl<'c> Apply<'c> {
             conn,
             acc,
             scope,
+            history_read: HistoryReadState::Known,
+            server: ServerRules::default(),
             now,
             ch: Changes::default(),
         })
+    }
+
+    /// [`Self::begin`] where the network's `rules` are in hand (the rule on [`Self::server`]).
+    pub(crate) fn under_rules(
+        conn: &'c Connection,
+        account: AccountId,
+        rules: NetRules,
+        now: i64,
+    ) -> Result<Self> {
+        let mut apply = Self::begin(conn, account, rules.scope, now)?;
+        apply.server = rules.server;
+        Ok(apply)
     }
 }
 
@@ -236,6 +277,7 @@ impl Apply<'_> {
             | BackendEvent::TransmitProgress { .. }
             | BackendEvent::HistoryTransfer(_)
             | BackendEvent::AccountProgress(_)
+            | BackendEvent::AccountHold(_)
             | BackendEvent::Logout(_) => Ok(()),
             BackendEvent::AttachmentRestore {
                 target,
@@ -265,8 +307,9 @@ impl Apply<'_> {
                 conv,
                 up_to,
                 remove,
+                before_ms,
                 ..
-            } => self.conversation_cleared(&conv, &up_to, remove),
+            } => self.conversation_cleared(&conv, &up_to, remove, before_ms),
             BackendEvent::Message(m) => self.message(m, false),
             BackendEvent::HistoryBatch {
                 conv,
@@ -274,10 +317,37 @@ impl Apply<'_> {
                 has_more,
                 progress,
             } => {
+                let key = self.canon_conv(&conv)?;
+                // The cut of a cleared chat (`ingest/clear.rs`), looked up ONCE for the batch,
+                // which names one conversation: a history row at or below it is what the clear
+                // removed (or would have), and it is dropped. Never a live or catch-up row.
+                let cut = if messages.is_empty() {
+                    None
+                } else {
+                    self.cut_of(&key.encode())?
+                };
                 for m in messages {
+                    // A row that names another conversation than its batch (a backend fault)
+                    // is judged by its own conversation's cut, one lookup for that row.
+                    let cut = if m.conv == conv {
+                        cut
+                    } else {
+                        let own = self.canon_conv(&m.conv)?;
+                        self.cut_of(&own.encode())?
+                    };
+                    if cut.is_some_and(|c| m.sent_at <= c) {
+                        // Its key is remembered like that of a removed row: whether the history
+                        // or the clear came first must not decide if a later copy shows.
+                        self.remember_refused(&m)?;
+                        // (No conversation key in the line: a WhatsApp key is a number.)
+                        tracing::debug!(
+                            account = self.acc.id.0,
+                            "an imported message at or below the cut of a cleared chat was dropped"
+                        );
+                        continue;
+                    }
                     self.message(m, true)?;
                 }
-                let key = self.canon_conv(&conv)?;
                 if let Some(id) = sql::conversation_id(self.conn, self.acc.id, &key)? {
                     self.ch.history.push((id, progress, has_more));
                 }
@@ -305,6 +375,8 @@ impl Apply<'_> {
             | BackendEvent::AttachmentDeleted { .. }
             | BackendEvent::ReadMarker { .. }
             | BackendEvent::OwnSendState { .. }) => self.modifier(e),
+            BackendEvent::ReadUpTo { conv, seq } => self.read_up_to(&conv, seq),
+            BackendEvent::PeerReadUpTo { conv, seq } => self.peer_read_up_to(&conv, seq),
             BackendEvent::CommandPersisted { cmd } => {
                 self.conn
                     .prepare_cached(
@@ -424,18 +496,23 @@ impl Apply<'_> {
     }
 }
 
-/// The statement of [`recount`].
-const RECOUNT: &str = "UPDATE conversations SET
-           unread = unread_hint + (SELECT count(*) FROM messages
+/// The statement of [`recount`]. `last_activity` is the sort key of the newest LISTED row
+/// ([`crate::notices::newest_listed`]): a quiet notice does not give a conversation its time or its
+/// place in the list unless the user asked to see them. A count the server stated stands instead of
+/// the rows' (KT-2), and the rows are then not counted at all.
+pub(crate) const RECOUNT: &str = concat!(
+    "UPDATE conversations SET
+           unread = coalesce(unread_server, unread_hint + (SELECT count(*) FROM messages
              WHERE conversation_id = ?1 AND read_state = 'Unread'
-               AND deleted IS NULL AND expiry_hidden = 0),
-           mentions = (SELECT count(*) FROM messages
+               AND deleted IS NULL AND expiry_hidden = 0)),
+           mentions = coalesce(mentions_server, (SELECT count(*) FROM messages
              WHERE conversation_id = ?1 AND read_state = 'Unread'
-               AND deleted IS NULL AND mentions_me = 1 AND expiry_hidden = 0),
-           last_activity = (SELECT max(sort_key) FROM messages
-             WHERE conversation_id = ?1 AND (deleted IS NULL OR deleted <> 'ForMe')
-               AND expiry_hidden = 0)
-         WHERE id = ?1";
+               AND deleted IS NULL AND mentions_me = 1 AND expiry_hidden = 0)),
+           last_activity = ",
+    crate::notices::newest_listed!("?1"),
+    "
+         WHERE id = ?1"
+);
 
 /// Marks every unread message of a conversation (`?1`) whose `sent_at` is at or before a
 /// watermark (`?2`) read, and returns their ids: a read marker of another device
@@ -444,9 +521,12 @@ const RECOUNT: &str = "UPDATE conversations SET
 /// delete would end differently in the two orders), so the partial index of the unread
 /// rows, `read_state = 'Unread'` alone, is the one that serves it: a statement that also
 /// asked for `deleted IS NULL` (as the first form of that index did) walked the whole
-/// conversation for every marker. The plan is held by `ingest::tests`.
+/// conversation for every marker. The plan is held by `ingest::tests`. A row with a position
+/// (KT-2) never follows this rule, from any path: two messages of one second must not share a read
+/// state ([`position`]).
 pub(crate) const READ_UP_TO: &str = "UPDATE messages SET read_state = 'Read'
            WHERE conversation_id = ?1 AND read_state = 'Unread' AND sent_at <= ?2
+             AND net_seq IS NULL
            RETURNING id";
 
 /// `unread`, `mentions` and `last_activity` of `conv` from its rows (§3.3 step 3).
@@ -456,7 +536,9 @@ pub(crate) const READ_UP_TO: &str = "UPDATE messages SET read_state = 'Read'
 /// history row only when it KNOWS the message is unread). `unread_hint` adds the unread
 /// messages a backend has no rows for, and nothing else. So reading the chat here, a read
 /// marker of another device, a delete and a timer that runs out all lower the count by the
-/// row they touch, and a row that is delivered twice counts once.
+/// row they touch, and a row that is delivered twice counts once. The one exception is a network
+/// whose server owns the count (KT-2): once it stated one, that is the count, a live row does not
+/// move it and the network states every change; until its first statement the rows count.
 ///
 /// A message hidden because its time has come on an unconfirmed clock (`expiry_hidden`,
 /// [`crate::expiry`]) counts for none of them: the list shows the conversation as if the
@@ -473,7 +555,37 @@ pub(crate) fn hex64(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kourier_model::{MsgIdScope, NetworkKind, UserId};
+    use kourier_model::{MsgIdScope, NetworkKind, ServerRules, UserId};
+
+    /// KT-2: `Apply::begin` knows no network, so nothing is the server's; `under_rules` takes
+    /// what the network's rules say.
+    #[test]
+    fn an_apply_under_a_networks_rules_knows_what_its_server_owns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([3u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::Conversation,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let server = ServerRules {
+            owns_unread: true,
+            validates_deletes: true,
+        };
+        let rules = crate::rules::NetRules {
+            server,
+            ..crate::rules::NetRules::signal(MsgIdScope::Conversation)
+        };
+        let plain = super::Apply::begin(h.connection(), h.account(), MsgIdScope::Conversation, 1)
+            .expect("begin");
+        assert_eq!(plain.server, ServerRules::default());
+        let under =
+            super::Apply::under_rules(h.connection(), h.account(), rules, 1).expect("begin");
+        assert_eq!(under.server, server);
+        assert_eq!(under.scope, MsgIdScope::Conversation);
+    }
 
     /// `core.db` has no planner statistics. What every ingest transaction, every read marker
     /// of another device and every read of a chat count or mark the unread rows with must go

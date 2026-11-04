@@ -57,6 +57,9 @@ pub(crate) struct Service {
     session: Option<Bus>,
     /// A notification server connection in progress.
     connecting: Option<JoinHandle<Result<Connected, DesktopError>>>,
+    /// The server got a new owner while `connecting` was out: that attempt may have tried before
+    /// the server existed, so a failure of it connects again instead of giving up.
+    appeared_while_connecting: bool,
     /// Catch-up summaries that arrived while connecting.
     queued_summaries: Vec<(AccountId, u32, u32)>,
     book: NotificationBook,
@@ -92,7 +95,10 @@ async fn join_opt<T>(task: &mut Option<JoinHandle<T>>) -> Result<T, JoinError> {
 
 /// Connects to the notification server and subscribes to its signals.
 async fn connect_server(bus: Bus) -> Result<Connected, DesktopError> {
-    let client = NotificationClient::connect(&bus).await?;
+    let client = NotificationClient::connect(&bus).await;
+    #[cfg(test)]
+    connect_gate::pass().await;
+    let client = client?;
     let events = match client.subscribe().await {
         Ok(rx) => Some(rx),
         Err(e) => {
@@ -129,6 +135,7 @@ impl Service {
             client: None,
             session: None,
             connecting: None,
+            appeared_while_connecting: false,
             queued_summaries: Vec::new(),
             book: NotificationBook::default(),
             accounts: Vec::new(),
@@ -192,6 +199,9 @@ impl Service {
                     if let Some(rx) = self.on_connected(c).await {
                         notification_rx = Some(rx);
                     }
+                    if std::mem::take(&mut self.appeared_while_connecting) && self.client.is_none() {
+                        self.connect_notifications();
+                    }
                 }
                 s = recv_opt(&mut server_rx) => match s {
                     Some(owner) => self.on_server_appeared(&owner),
@@ -214,6 +224,26 @@ impl Service {
                         self.pace.shown(conv, tokio::time::Instant::now());
                     }
                 }
+            }
+        }
+        // Preferences asked for just before the quit are saved (K-A fix C5): "Turn On and
+        // Restart" changes the preferences and quits at once, and when the stop and the
+        // queued command are both ready `select!` picks one at random, so the restart would
+        // come up on the old file. Only the newest is saved, and the autostart entry follows
+        // it; the tray is not started for a task that is ending.
+        let mut last = None;
+        while let Ok(c) = commands.try_recv() {
+            if let Command::Prefs(prefs) = c {
+                last = Some(prefs);
+            }
+        }
+        if let Some(prefs) = last {
+            let old = std::mem::replace(&mut self.prefs, prefs.clone());
+            if let Err(e) = super::save_prefs(self.files.prefs.clone(), prefs.clone()).await {
+                tracing::warn!(error = %e, "preferences not saved");
+            }
+            if old.autostart != prefs.autostart || old.start_hidden != prefs.start_hidden {
+                self.sync_autostart().await;
             }
         }
         // Quit: our notifications and the tray icon go with us.
@@ -282,6 +312,9 @@ impl Service {
             let forgotten = self.book.close_all().len();
             tracing::info!(forgotten, "the notification server changed");
             self.client = None;
+        }
+        if self.connecting.is_some() {
+            self.appeared_while_connecting = true;
         }
         self.connect_notifications();
     }
@@ -471,7 +504,7 @@ impl Service {
                     self.close_ids(vec![id]).await;
                 }
             }
-            NotificationEvent::Closed { id, .. } => self.book.on_closed(id),
+            NotificationEvent::Closed { id, reason } => self.book.on_closed(id, reason),
         }
     }
 
@@ -514,12 +547,19 @@ impl Service {
             } => self.show_summary(account, messages, conversations).await,
             UiEvent::ConversationsChanged { ids } => {
                 for conv in ids {
-                    if self.book.is_tracked(conv) {
-                        self.check_read(conv).await;
+                    // (A chat with no notification on screen is looked at only when one of its
+                    // notifications that showed text expired in this run: it may sit in the
+                    // server's history.)
+                    if self.book.is_tracked(conv) || self.book.has_expired_text(conv) {
+                        let detail = self.check_read(conv).await;
+                        self.keep_text_off(conv, detail).await;
                     }
                 }
             }
             UiEvent::ConversationsRemoved { ids } => {
+                for conv in &ids {
+                    self.book.forget_expired_text(*conv);
+                }
                 let closed: Vec<u32> = ids
                     .into_iter()
                     .filter_map(|c| self.book.close_conversation(c))
@@ -634,9 +674,13 @@ impl Service {
         if msg.deleted.is_some() || policy::call_moved_on(&msg) {
             return;
         }
-        let mode = self.prefs.notification_content;
-        let title = self.presenter.conversation_title(&detail);
-        let line = self.presenter.message_line(&detail, &msg);
+        let mode = policy::content_mode(self.prefs.notification_content, &detail.row);
+        // (No message line is made where the mode shows none: a protected chat's text is never
+        // even assembled.)
+        let line = match mode {
+            NotificationContent::NameAndMessage => self.presenter.message_line(&detail, &msg),
+            NotificationContent::NameOnly | NotificationContent::Hidden => String::new(),
+        };
         let shown = self.book.messages(n.conv);
         let new = burst
             .earlier
@@ -645,24 +689,7 @@ impl Service {
             .filter(|m| !shown.iter().any(|(s, _)| s == *m))
             .count();
         let count = shown.len() + new;
-        let count_line = (count > 1).then(|| self.presenter.new_messages(count));
-        let origin = self.origin(n.account);
-        let avatar = match mode {
-            NotificationContent::Hidden => None,
-            _ => self.presenter.avatar(&title, &detail),
-        };
-        let can_reply = !detail.row.blocked && !detail.row.request_pending;
-        let content = policy::message_notification(MessageContent {
-            mode,
-            title: &title,
-            line: &line,
-            count_line: count_line.as_deref(),
-            origin: origin.as_deref(),
-            avatar,
-            can_reply,
-            replaces_id: self.book.replaces_for(n.conv),
-            texts: &self.texts,
-        });
+        let content = self.message_notification(&detail, mode, &line, count);
         let Some(client) = &self.client else {
             return;
         };
@@ -672,13 +699,44 @@ impl Service {
                 tracing::debug!(conv = n.conv.0, id, count, "notified");
                 // Earlier messages of the burst were new (revision 0) when they arrived.
                 for earlier in burst.earlier {
-                    self.book.shown_message(n.conv, n.account, earlier, 0, id);
+                    self.book
+                        .shown_message(n.conv, n.account, earlier, 0, id, mode);
                 }
                 self.book
-                    .shown_message(n.conv, n.account, n.message, msg.revision, id);
+                    .shown_message(n.conv, n.account, n.message, msg.revision, id, mode);
             }
             Err(e) => tracing::warn!(error = %e, "notification failed"),
         }
+    }
+
+    /// The notification of the chat `detail` describes, announcing `count` messages in `mode`
+    /// (`line` is the newest one's text, shown in `NameAndMessage` only); it replaces the one
+    /// the book has for the chat.
+    fn message_notification(
+        &self,
+        detail: &ConversationDetail,
+        mode: NotificationContent,
+        line: &str,
+        count: usize,
+    ) -> notifications::Notification {
+        let title = self.presenter.conversation_title(detail);
+        let count_line = (count > 1).then(|| self.presenter.new_messages(count));
+        let origin = self.origin(detail.row.account);
+        let avatar = match mode {
+            NotificationContent::Hidden => None,
+            _ => self.presenter.avatar(&title, detail),
+        };
+        policy::message_notification(MessageContent {
+            mode,
+            title: &title,
+            line,
+            count_line: count_line.as_deref(),
+            origin: origin.as_deref(),
+            avatar,
+            can_reply: policy::can_reply(&detail.row),
+            replaces_id: self.book.replaces_for(detail.row.id),
+            texts: &self.texts,
+        })
     }
 
     async fn show_summary(&mut self, account: AccountId, messages: u32, conversations: u32) {
@@ -709,15 +767,73 @@ impl Service {
         }
     }
 
-    /// Closes `conv`'s notification once it is read (here or on another device) or gone.
-    async fn check_read(&mut self, conv: ConversationId) {
-        let read = match self.conversation(conv).await {
+    /// Closes `conv`'s notification once it is read (here or on another device) or gone;
+    /// returns the chat as it was read (`None` = gone).
+    async fn check_read(&mut self, conv: ConversationId) -> Option<ConversationDetail> {
+        let detail = self.conversation(conv).await;
+        let read = match &detail {
             None => true,
             Some(d) => policy::read_now(&d.row),
         };
         if read && let Some(id) = self.book.close_conversation(conv) {
             tracing::debug!(conv = conv.0, "read: notification closed");
             self.close_ids(vec![id]).await;
+        }
+        detail
+    }
+
+    /// A chat that became protected must not keep a message's text where it was shown before
+    /// (S-P, architecture §8.7): the notification on screen is shown again WITHOUT the text,
+    /// under the same id, so the server updates it in place (its name and "New message" or "N
+    /// new messages"); the notifications of this run that expired with the text, which the
+    /// server may keep in its history, are revoked. `detail` is the chat as `check_read` read
+    /// it (`None` = gone or not readable: nothing is done, see below).
+    async fn keep_text_off(&mut self, conv: ConversationId, detail: Option<ConversationDetail>) {
+        // (`None` is a gone chat or a failed query: nothing to judge. A gone chat's ids are
+        // forgotten by `ConversationsRemoved`; after a failed query the chat may still exist,
+        // so its expired ids stay for the next change.)
+        let Some(detail) = detail else {
+            return;
+        };
+        if !detail.row.protected {
+            return;
+        }
+        let expired = self.book.take_expired_text(conv);
+        if !expired.is_empty() {
+            tracing::debug!(
+                conv = conv.0,
+                count = expired.len(),
+                "protected: expired notifications revoked"
+            );
+            self.close_ids(expired).await;
+        }
+        let Some(mode) = self
+            .book
+            .shown_in(conv)
+            .and_then(|shown| policy::text_to_withdraw(shown, &detail.row))
+        else {
+            return;
+        };
+        let content = self.message_notification(&detail, mode, "", self.book.count(conv));
+        let Some(client) = &self.client else {
+            return;
+        };
+        match client.notify(&content).await {
+            Ok(id) => {
+                tracing::debug!(
+                    conv = conv.0,
+                    id,
+                    "protected: notification shown without its text"
+                );
+                self.book.reshown(conv, id, mode);
+            }
+            Err(e) => {
+                // (The text must not stay: close it.)
+                tracing::warn!(error = %e, "notification not renewed");
+                if let Some(id) = self.book.close_conversation(conv) {
+                    self.close_ids(vec![id]).await;
+                }
+            }
         }
     }
 
@@ -751,11 +867,55 @@ impl Service {
     }
 
     async fn recheck_all(&mut self) {
-        for conv in self.book.conversations() {
-            self.check_read(conv).await;
+        // The chats with a notification on screen, and those whose notification expired with a
+        // text: a protect patch among the lost events must still take the text off.
+        let mut convs = self.book.conversations();
+        for conv in self.book.expired_chats() {
+            if !convs.contains(&conv) {
+                convs.push(conv);
+            }
+        }
+        for conv in convs {
+            let detail = self.check_read(conv).await;
+            self.keep_text_off(conv, detail).await;
             if self.book.is_tracked(conv) {
                 self.check_messages(conv).await;
             }
+        }
+    }
+}
+
+/// Test-only: holds ONE connection attempt after its try, so a test can make the server appear
+/// while an attempt that missed it is still out (`e2e`: the race of a late server).
+#[cfg(test)]
+pub(super) mod connect_gate {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    struct Gate {
+        held: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+
+    /// Arms the gate for the next attempt: `held` is notified once it has tried, and it goes on
+    /// when `release` is notified. (nextest runs each test in a process of its own.)
+    pub(in crate::desktop) fn arm() -> (Arc<Notify>, Arc<Notify>) {
+        let (held, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Gate {
+            held: held.clone(),
+            release: release.clone(),
+        });
+        (held, release)
+    }
+
+    pub(super) async fn pass() {
+        let gate = GATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(gate) = gate {
+            gate.held.notify_one();
+            gate.release.notified().await;
         }
     }
 }

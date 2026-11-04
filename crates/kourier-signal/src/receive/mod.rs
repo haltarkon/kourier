@@ -10,6 +10,8 @@
 //!   the events are in `core_outbox` exactly when the rows are gone. Content failures count
 //!   towards the poison limit; network failures park the lane and never count.
 //! - [`dispatch`]: the content mapping of §6.13 (`Content` → core events and backend effects).
+//! - [`unarchive`]: a new message brings an archived chat back (Signal's rule, A1), in the zone
+//!   of the row that holds the message.
 //! - [`calls`]: call messages, group rings, group-call updates and the phone's call-event syncs
 //!   as call lines. Kourier shows calls and never sends anything for one.
 
@@ -19,6 +21,7 @@ mod group_dispatch;
 pub(crate) mod media;
 pub(crate) mod stage1;
 pub(crate) mod stage2;
+pub(crate) mod unarchive;
 
 use std::fmt::Write as _;
 

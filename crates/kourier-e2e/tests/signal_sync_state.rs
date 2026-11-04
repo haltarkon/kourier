@@ -27,17 +27,25 @@
 //!   three at once, and a read sync that waits out a rate limit of its own is not sent any
 //!   earlier for it.
 //!
+//! - [`a_chat_the_phone_archived_comes_back_with_a_message_and_goes_again_with_the_phone`] and
+//!   [`a_chat_muted_on_this_computer_comes_back_all_the_same`] (A1, archived chats): the
+//!   phone archives a contact's chat (its Storage Service record), the contact writes and the
+//!   chat is in the inbox (a message brings it back, the real core), the phone archives it
+//!   AGAIN (a new record that says what the one before it said) and it is in the archive
+//!   again; the second test mutes the chat on this computer first (the core's own
+//!   `local_muted_until`, which the backend never sees): it comes back all the same.
+//!
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
 use kourier_core::facade::{ConversationListQuery, Query, QueryData, UiCommand};
 use kourier_model::{AccountId, Body, CannotSend, ConnState, ConversationId, Redacted, UserAction};
 use serde_json::json;
-use support::harness::{DeviceInfo, OutgoingFile, SendAttachments};
+use support::harness::{DeviceInfo, OutgoingFile, SendAttachments, StorageContact, StorageSpec};
 use support::{App, WAIT, World};
 
 /// How long nothing must happen.
@@ -98,7 +106,7 @@ async fn listed(app: &App, account: AccountId, conv: ConversationId) -> bool {
     for archived in [false, true] {
         let query = ConversationListQuery {
             account: Some(account),
-            archived,
+            archived: Some(archived),
             limit: 100,
             ..ConversationListQuery::default()
         };
@@ -202,6 +210,7 @@ async fn deletes_made_here_reach_the_phone_and_the_phone_deletes_what_kourier_se
         request: Default::default(),
         paths: paths.into(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         caption: None,
         reply_to: None,
     });
@@ -935,4 +944,118 @@ async fn one_challenge_is_one_refusal_and_its_answer_leaves_a_rate_limit_alone()
 
     app.stop().await;
     world.shutdown().await;
+}
+
+/// Whether the list holds `conv` in the archive (`true`) or in the inbox (`false`).
+async fn in_list(app: &App, account: AccountId, conv: ConversationId, archived: bool) -> bool {
+    let query = ConversationListQuery {
+        account: Some(account),
+        archived: Some(archived),
+        limit: 100,
+        ..ConversationListQuery::default()
+    };
+    match app
+        .handle
+        .query(Query::Conversations(query))
+        .await
+        .expect("conversations")
+    {
+        QueryData::Conversations(page) => page.rows.iter().any(|row| row.id == conv),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+async fn wait_in(app: &App, account: AccountId, conv: ConversationId, archived: bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !in_list(app, account, conv, archived).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the chat never reached the {}",
+            if archived { "archive" } else { "inbox" }
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The phone's Storage Service state, with Alice's chat archived or not and nothing else, and
+/// the nudge that makes our device fetch it. Every write is a new version with new record ids,
+/// as the phone makes them when it archives, unarchives and archives again.
+async fn phone_stores_alice(world: &World, device: &DeviceInfo, archived: bool) {
+    world
+        .harness
+        .set_storage_state(&StorageSpec {
+            primary: world.phone.device_ref.clone(),
+            contacts: vec![StorageContact {
+                archived: Some(archived),
+                ..StorageContact::of(&world.alice.device_ref)
+            }],
+            ..StorageSpec::default()
+        })
+        .await
+        .expect("storage state");
+    world
+        .harness
+        .send_fetch_latest(
+            &world.phone.device_ref,
+            &device.device_ref,
+            "storageManifest",
+        )
+        .await
+        .expect("fetch latest");
+}
+
+/// Mutes the chat on this computer, the way the core keeps it (a column the backend never
+/// reads; nothing in the UI sets it yet).
+fn mute_here(dir: &std::path::Path, conv: ConversationId) {
+    let conn = kourier_db::open(
+        &dir.join("data").join("core.db"),
+        &kourier_db::DbKey::from(support::CORE_KEY),
+    )
+    .expect("open core.db");
+    conn.execute(
+        "UPDATE conversations SET local_muted_until = ?2 WHERE id = ?1",
+        (conv.0, 4_102_444_800_000i64),
+    )
+    .expect("mute here");
+}
+
+/// The round of A1's B1, through the real core and the mock phone: archived on the phone, a
+/// message brings the chat back, archived AGAIN on the phone (its record says what the one
+/// before said), and one more message brings it back.
+async fn archive_round(mute_on_this_computer: bool) {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let mut app = App::start(world.tmp.path(), &world.env).await;
+    let (account, device) = app.link(&world).await;
+    world.alice_says(&device, "hello").await;
+    let conv = app.accept(&world, account, &device, &world.alice).await;
+    assert!(in_list(&app, account, conv, false).await, "in the inbox");
+
+    phone_stores_alice(&world, &device, true).await;
+    wait_in(&app, account, conv, true).await;
+    if mute_on_this_computer {
+        mute_here(world.tmp.path(), conv);
+    }
+
+    world.alice_says(&device, "are you there").await;
+    wait_in(&app, account, conv, false).await;
+
+    phone_stores_alice(&world, &device, true).await;
+    wait_in(&app, account, conv, true).await;
+
+    world.alice_says(&device, "and again").await;
+    wait_in(&app, account, conv, false).await;
+    app.stop().await;
+    world.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_the_phone_archived_comes_back_with_a_message_and_goes_again_with_the_phone() {
+    archive_round(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_muted_on_this_computer_comes_back_all_the_same() {
+    archive_round(true).await;
 }

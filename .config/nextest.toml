@@ -45,12 +45,16 @@ final-status-level = "slow"
 # A test that runs for a minute is marked SLOW; one that hangs is killed after five.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Only the mock tests: each `tests/<file>.rs` of the two crates is a module of the crate's
+# `it` binary (`<file>::<test>`). The two kinds of test that start no mock server and only hold
+# a slot are left out: `every_test_file_is_declared` (a top-level test of `it.rs`) and the
+# `support::tests::` of the shared helpers (T3 review F4).
 [[profile.default.overrides]]
-filter = "kind(test) & (package(kourier-signal) | package(kourier-e2e))"
+filter = "kind(test) & (package(kourier-signal) | package(kourier-e2e)) & !test(=every_test_file_is_declared) & !test(/^support::tests::/)"
 test-group = "mock-harness"
 
 [[profile.default.overrides]]
-filter = "binary_id(kourier-desktop::secret_service) | binary_id(kourier-app::secret_service_keys)"
+filter = "binary_id(kourier-desktop::secret_service) | (package(kourier-app) & kind(test) & test(/^secret_service_keys::/))"
 test-group = "secret-service"
 
 [[profile.default.overrides]]
@@ -60,10 +64,12 @@ test-group = "qt-ui"
 slow-timeout = { period = "120s", terminate-after = 5 }
 
 # The longest tests start first, so none of them is left to run alone at the end (they are
-# mostly kill loops and real timers; names from the junit file of the 2026-10-13 runs). A
-# renamed test just loses the head start. Measured with the group at 4: 332 s against 360 s.
+# mostly kill loops and real timers; names from the junit file of the 2026-10-13 runs, as
+# `<module>::<test>` since the integration tests of a crate are one binary (T3). A renamed or
+# moved test just loses the head start; scripts/nextest-check.py says when a name matches
+# nothing. Measured with the group at 4: 332 s against 360 s.
 [[profile.default.overrides]]
-filter = "test(=kill_at_every_point_gives_the_uncrashed_state) | test(=kills_anywhere_in_the_attachment_pipeline_give_the_uncrashed_state) | test(=one_to_one_calls_are_reported_and_never_answered) | test(=a_dropped_socket_is_reopened_with_growing_delays_and_at_once_on_a_network_change) | test(=review_unread_history_rows_converge_in_any_order) | test(=group_calls_are_reported_and_never_answered) | test(=the_core_gets_nothing_before_the_last_byte_of_the_archive_was_checked) | test(=a_timer_set_from_either_side_expires_messages_on_time) | test(=attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext) | test(=the_wait_for_the_phone_ends_at_its_deadline)"
+filter = "test(=crash::kill_at_every_point_gives_the_uncrashed_state) | test(=attachments_crash::kills_anywhere_in_the_attachment_pipeline_give_the_uncrashed_state) | test(=calls::one_to_one_calls_are_reported_and_never_answered) | test(=robustness::a_dropped_socket_is_reopened_with_growing_delays_and_at_once_on_a_network_change) | test(=history_rules_review::review_unread_history_rows_converge_in_any_order) | test(=calls::group_calls_are_reported_and_never_answered) | test(=history_import::the_core_gets_nothing_before_the_last_byte_of_the_archive_was_checked) | test(=signal_modifiers::a_timer_set_from_either_side_expires_messages_on_time) | test(=signal_attachments::attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext) | test(=history_transfer::the_wait_for_the_phone_ends_at_its_deadline)"
 priority = 50
 
 # Per-test times of the last run (target/nextest/default/junit.xml): where the minutes go.

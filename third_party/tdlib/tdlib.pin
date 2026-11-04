@@ -1,0 +1,35 @@
+# The pinned TDLib that `cargo xtask tdlib build` fetches, patches, builds and checks (TG-1 plan §3,
+# decisions D3 H1/L5). One `key = value` per line; strings in double quotes, lists in brackets on one
+# line. Every field is required. Bumped only together with kourier_telegram::PIN (a test compares).
+repo = "https://github.com/tdlib/td.git"
+commit = "0e88653dcbf4e44c73cb655a05b58cd749a91169"
+version = "1.8.69"
+layer = 232
+# git's tree id of the commit and a sha256 over `git ls-tree -r HEAD` (content ids of every file):
+# no git or tar version changes either.
+tree = "1b92bea33f6615b4457d7d7f17b36cc1362edaff"
+ls_tree_sha256 = "b761bab923ea0ee72472fca2945f78de7a30bcf9b5cf783f1c7edc172b9303f0"
+# The licence files of the tree, as `<path> <sha256>`; copied to the cache's notices/.
+licenses = ["LICENSE_1_0.txt c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566", "sqlite/sqlite/LICENSE 92a681e777538e3cc012d5886505fec7704fb9c1957ef6b67807d771985d457e"]
+# Applied in this order from third_party/tdlib/patches/ (`git apply --check` first).
+patches = ["0001-no-config-fallback.patch", "0002-no-incoming-calls.patch"]
+build_type = "MinSizeRel"
+openssl = "system"
+gperf = "3.1"
+# The sha256 of the gperf .deb that `--fetch-gperf` downloads (apt-get download gperf, fetched
+# 2026-10-25 and recorded in the first manifest); a different package is refused, on purpose.
+gperf_deb_sha256 = "f6701027304592fe819d219a5ee00d8b56ba4b2a05a7623dd923f1884d595042"
+soname = "libtdjson.so.1.8.69"
+# Exactly these dynamic symbols (set equality, not "at least").
+exports = ["td_create_client_id", "td_send", "td_receive", "td_execute", "td_set_log_message_callback", "td_json_client_create", "td_json_client_destroy", "td_json_client_send", "td_json_client_receive", "td_json_client_execute", "td_set_log_file_path", "td_set_log_max_file_size", "td_set_log_verbosity_level", "td_set_log_fatal_error_callback"]
+# Exactly these NEEDED entries; no RPATH or RUNPATH. As the server's build (gcc 13.3, MinSizeRel, Unix
+# Makefiles) links it, 2026-10-25: the dynamic loader instead of the spike's libgcc_s.so.1.
+needed = ["libssl.so.3", "libcrypto.so.3", "libz.so.1", "libstdc++.so.6", "libm.so.6", "libc.so.6", "ld-linux-x86-64.so.2"]
+# The stripped library's size, in MiB, inclusive (23.66 MiB measured by the spike at -Os).
+size_mib = [20, 28]
+# The sha256 of TDLib's two compiled handshake keys, BEGIN line to END line as the library holds them
+# (`td/telegram/net/PublicRsaKeySharedMain.cpp` of the commit; computed 2026-10-27 from the source and
+# found once each in the 0001+0002 library). `check`/`path` require both exactly once and the commit
+# exactly once (the genuine-keys row); the test-only library of `tdlib fakedc lib` replaces them.
+rsa_test_pem_sha256 = "cbf044e9578af52b8ffb4326e94058a42c7cc396fc4ce97a7c864f6b5ed27f19"
+rsa_main_pem_sha256 = "fc618f78aa55f526052c6869d47626788e68daba454269271cfadc316ed854b6"

@@ -19,6 +19,17 @@
 //!   `App.screenshotHolds` is never empty, though the core's derive count is 0 long before.
 //!   And what it waits for in the first place (F5): the derive only while a picture of an
 //!   attachment is on screen.
+//! - Held row (the whole-picture step): the chat is read a little above its newest message
+//!   (the view does not follow and holds on to the row at the top of the viewport), and the
+//!   picture below it downloads with a size that differs from the sender's claim
+//!   (`synthetic_image_claiming`: the row is laid out by 200 x 90 and becomes 90 x 200 tall).
+//!   Every frame from the click until the picture is on screen from its file: the row at the
+//!   top of the viewport stays where it is (within a pixel) and the view does not start
+//!   following the newest message.
+//! - Followed newest row (the whole-picture step, decision 6): the view follows the newest
+//!   message and the row at the newest end grows (its picture's shape changes, the way a
+//!   download corrects a claimed size). Every frame from the change until the row is taller:
+//!   the viewport stays at the newest end (within a pixel) and the view keeps following.
 //! - F3: pixels are held only for the SAME attachment. In the block: another attachment's URL
 //!   loading right after a picture shows no held pixels (an album's tiles are reused by
 //!   index), and neither does a URL after a failed one (`paintedWidth` keeps its old value
@@ -47,13 +58,14 @@ import QtQml
 import QtQuick.Controls as QQC2
 import app.kourier
 
-// The app's own main window is the root (narrow: one page at a time), tall enough for every
-// row of the chat to have its delegate.
+// The app's own main window is the root (narrow: one page at a time), low enough for the chat
+// to be taller than its viewport: the newest row, the picture, is on screen at the bottom, and
+// the view can be moved up from it.
 MainWindow {
     id: win
 
     width: 520
-    height: 1400
+    height: 560
     visible: true
 
     property string step: "start"
@@ -72,6 +84,23 @@ MainWindow {
     // said nothing held the picture.
     property var holes: []
     property var seenHolds: ({})
+    // The held row: where the row at the top of the viewport was when the picture below it was
+    // clicked, the picture's height then, and the largest distance a frame showed the row from
+    // there until the picture was on screen from its file.
+    property bool holding: false
+    property real heldAt0: 0
+    property real blockBefore: 0
+    property real worst: 0
+    property int heldFrames: 0
+    // The followed newest row: the largest distance of the viewport from the newest end that
+    // a frame showed while the newest row grew, the frames judged, whether the view ever
+    // stopped following, and the row's height before.
+    property bool followWatch: false
+    property real followWorst: 0
+    property int followFrames: 0
+    property bool followLost: false
+    property real followBefore: 0
+    property real followBase: 0
 
     // The pictures that nobody has drawn yet (their ids), for the viewer and the guards.
     readonly property var spare: [SPARE]
@@ -169,6 +198,43 @@ MainWindow {
         }
     }
 
+    // Where the row the timeline holds on to is in the viewport now (`NaN`: none).
+    function heldAtNow(): real {
+        const list = win.view.rowList;
+        return list.held === null ? NaN : list.held.y - list.contentY;
+    }
+
+    // One frame of the held row.
+    Connections {
+        target: win
+        function onFrameSwapped(): void {
+            if (!win.holding) {
+                return;
+            }
+            win.heldFrames += 1;
+            const at = win.heldAtNow();
+            if (isNaN(at)) {
+                return win.fail("frame " + win.heldFrames + ": the view lost the row it holds on to");
+            }
+            win.worst = Math.max(win.worst, Math.abs(at - win.heldAt0));
+        }
+    }
+
+    // One frame of the followed newest row.
+    Connections {
+        target: win
+        function onFrameSwapped(): void {
+            if (!win.followWatch) {
+                return;
+            }
+            win.followFrames += 1;
+            win.followWorst = Math.max(win.followWorst, Math.abs(win.view.rowList.below() - win.followBase));
+            if (!win.view.followNewest) {
+                win.followLost = true;
+            }
+        }
+    }
+
     // One frame of the watch: the block of the picture is the one that was there and holds
     // pixels.
     Connections {
@@ -230,7 +296,24 @@ MainWindow {
             const all = win.blocks().filter(b => b.mediaState === "remote" && b.mediaAction === "download" && b.tile === false && b.sticker === false);
             if (all.length === 0) return win.later("the picture that downloads on a click");
             win.pic = all[0].attachment;
-            if (!win.click(all[0])) return win.fail("the window took no mouse event");
+            // The view is moved up from the newest message by a little (the reader's move): it
+            // stops following and holds on to the row at the top of the viewport.
+            const list = win.view.rowList;
+            if (list.contentHeight < list.height + 400) return win.fail("precondition: the chat is not taller than its viewport (" + list.contentHeight + " in " + list.height + ")");
+            list.contentY -= 40;
+            return win.next("held");
+        }
+        case "held": {
+            const list = win.view.rowList;
+            if (win.view.followNewest || list.held === null) return win.later("the view holding on to a row");
+            const b = win.block(win.pic);
+            if (b === null) return win.fail("the picture left the screen");
+            const centre = b.mapToItem(list, b.width / 2, b.height / 2);
+            if (centre.y < 0 || centre.y > list.height) return win.fail("precondition: the centre of the picture is outside the viewport (" + centre.y + " of " + list.height + ")");
+            win.heldAt0 = win.heldAtNow();
+            win.blockBefore = b.height;
+            win.holding = true;
+            if (!win.click(b)) return win.fail("the window took no mouse event");
             return win.next("downloading");
         }
         case "downloading": {
@@ -239,6 +322,17 @@ MainWindow {
             if (b === null || b.mediaState !== "local") return win.later("the picture local");
             const p = win.pictureOf(b);
             if (p === null || p.status !== Image.Ready || !b.pictureHeld || b.block.url.indexOf("image://kourier/thumb/") !== 0) return win.later("the picture drawn");
+            // The download corrected the picture's size: the row is taller than the claim made
+            // it, and the row at the top of the viewport has not moved.
+            win.holding = false;
+            // (The content's height is no measure: the list estimates the rows it has not made.)
+            const grown = b.height - win.blockBefore;
+            if (grown < 50) return win.fail("precondition: the download did not change the picture's height (" + win.blockBefore + " -> " + b.height + ")");
+            if (win.view.followNewest) return win.fail("the view followed the newest message while a row below the reader's grew");
+            const at = win.heldAtNow();
+            if (isNaN(at) || Math.abs(at - win.heldAt0) > 1) return win.fail("the row at the top of the viewport moved from " + win.heldAt0 + " to " + at + " when the row below it grew by " + grown);
+            if (win.worst > 1) return win.fail("a frame showed the row at the top of the viewport " + win.worst + " px from where it was (" + win.heldFrames + " frames)");
+            console.log("held row: the picture grew by " + grown + " px, worst distance " + win.worst + " px over " + win.heldFrames + " frames");
             win.blk = b;
             win.urlA = b.block.url;
             win.urls = [b.block.url];
@@ -262,9 +356,13 @@ MainWindow {
             win.holdsNow(b);
             const p = win.pictureOf(b);
             if (b.block.url === win.urlA || p.status !== Image.Ready) return win.later("the new URL drawn");
+            // The list of URLs is filled by the frames (onFrameSwapped), not by this tick: a tick
+            // that reads the new URL before the frame that draws it has run finds one URL in the
+            // list although the URL did change (6 copies side by side: 2 of 18 runs). Wait for the
+            // frame; a URL that no frame ever shows fails as "never happened".
+            if (win.urls.length < 2) return win.later("a frame that draws the new URL: " + JSON.stringify(win.urls));
             if (win.frames < 3) return win.later("three frames");
             win.watching = false;
-            if (win.urls.length < 2) return win.fail("the URL never changed: " + JSON.stringify(win.urls));
             win.done();
             // (For a look at what held it, with --no-capture.)
             console.log("screenshotHolds seen after the release, in samples: " + JSON.stringify(win.seenHolds));
@@ -272,6 +370,41 @@ MainWindow {
             // (the pump was slowed down) and the reads of the models held the screenshot.
             if (win.holes.length > 0) return win.fail("a screenshot would have been taken with the old picture on screen (frames " + JSON.stringify(win.holes) + "; holds seen " + JSON.stringify(win.seenHolds) + ")");
             if (!win.seenHolds["events"] || !win.seenHolds["queries"]) return win.fail("the slowed-down pump never showed as events and queries: " + JSON.stringify(win.seenHolds));
+            return win.next("follow");
+        }
+        case "follow": {
+            // The reader goes back to the newest message: the view follows it again.
+            win.view.rowList.positionViewAtBeginning();
+            return win.next("follow-set");
+        }
+        case "follow-set": {
+            const list = win.view.rowList;
+            const b = win.blk;
+            if (!win.view.followNewest || !list.atNewest()) return win.later("the view following the newest message (follows " + win.view.followNewest + ", " + list.below() + " px from the newest end)");
+            // The picture is the newest row: its bottom edge is the viewport's (minus the margin).
+            const bottom = b.mapToItem(list, 0, b.height).y;
+            if (Math.abs(list.height - list.bottomMargin - bottom) > 40) return win.fail("precondition: the picture is not the newest row at the bottom of the viewport (its bottom is at " + bottom + " of " + list.height + ")");
+            win.followBefore = b.height;
+            win.followBase = list.below();
+            win.followWatch = true;
+            // The row grows by a lot: the shape of its picture changes (as a download that
+            // corrects a claimed size does).
+            b.block = Object.assign({}, b.block, {
+                "width": 90,
+                "height": 300
+            });
+            return win.next("follow-grown");
+        }
+        case "follow-grown": {
+            const list = win.view.rowList;
+            const b = win.blk;
+            const grown = b.height - win.followBefore;
+            if (grown < 50 || win.followFrames < 2) return win.later("the newest row taller (" + win.followBefore + " -> " + b.height + ", " + win.followFrames + " frames)");
+            win.followWatch = false;
+            if (win.followLost || !win.view.followNewest) return win.fail("the view stopped following the newest message while its row grew");
+            if (win.followWorst > 1) return win.fail("a frame showed the viewport " + win.followWorst + " px from the newest end while the newest row grew by " + grown + " (" + win.followFrames + " frames)");
+            if (Math.abs(list.below() - win.followBase) > 1) return win.fail("the view is " + (list.below() - win.followBase) + " px from where it was at the newest end after the newest row grew by " + grown);
+            console.log("followed newest row: it grew by " + grown + " px, worst distance " + win.followWorst + " px over " + win.followFrames + " frames (at the newest end: " + win.followBase + ")");
             return win.next("other");
         }
         case "other": {

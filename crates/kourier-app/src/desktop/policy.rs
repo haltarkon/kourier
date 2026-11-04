@@ -9,10 +9,10 @@
 //! read (here or on another device), deleted, or one of its shown messages is deleted or
 //! edited, or was a missed call that turned out answered or declined.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use kourier_core::facade::{ConversationRow, MessageRow, Notification as CoreNotification};
-use kourier_desktop::notifications::{ImageData, InlineReply, Notification, Urgency};
+use kourier_desktop::notifications::{CloseReason, ImageData, InlineReply, Notification, Urgency};
 use kourier_model::{AccountId, ConversationId, MessageId};
 
 use crate::prefs::NotificationContent;
@@ -55,11 +55,18 @@ struct Shown {
     account: AccountId,
     /// The messages this notification announced, with the revision shown.
     messages: Vec<(MessageId, u16)>,
+    /// The content mode it is shown in now: `NameAndMessage` means the text of a message is on
+    /// screen (a chat that becomes protected takes it off again).
+    mode: NotificationContent,
 }
 
 /// Most messages remembered per conversation notification (older ones cannot be told apart
 /// from the newest anyway).
 const MAX_TRACKED: usize = 32;
+
+/// Most ids of expired notifications that showed text, all chats together, remembered for this
+/// run (the oldest go first).
+const MAX_EXPIRED_TEXT: usize = 64;
 
 /// Which notifications are on screen and what they stand for.
 #[derive(Debug, Default)]
@@ -68,6 +75,11 @@ pub struct NotificationBook {
     summaries: HashMap<AccountId, u32>,
     targets: HashMap<u32, Target>,
     tokens: HashMap<u32, String>,
+    /// Notifications that EXPIRED while they showed a message's text, as (chat, id), oldest
+    /// first: a server may keep such a notification in its history (Plasma does), and a chat
+    /// that becomes protected has them revoked. This run only: ids mean nothing to a restarted
+    /// server (nor to a later run of Kourier; architecture §8.7).
+    expired_text: VecDeque<(ConversationId, u32)>,
 }
 
 impl NotificationBook {
@@ -81,7 +93,8 @@ impl NotificationBook {
         self.convs.get(&conv).map_or(0, |s| s.messages.len())
     }
 
-    /// Records that `id` now shows `message` (revision `revision`) of `conv`.
+    /// Records that `id` now shows `message` (revision `revision`) of `conv`, in the content
+    /// mode `mode`.
     pub fn shown_message(
         &mut self,
         conv: ConversationId,
@@ -89,12 +102,15 @@ impl NotificationBook {
         message: MessageId,
         revision: u16,
         id: u32,
+        mode: NotificationContent,
     ) {
         let entry = self.convs.entry(conv).or_insert_with(|| Shown {
             id,
             account,
             messages: Vec::new(),
+            mode,
         });
+        entry.mode = mode;
         if entry.id != id {
             // The server gave a new id (the old one was closed meanwhile).
             self.targets.remove(&entry.id);
@@ -108,6 +124,55 @@ impl NotificationBook {
             }
         }
         self.targets.insert(id, Target::Conversation(conv));
+    }
+
+    /// The content mode the notification of `conv` is shown in (`None` = none shown).
+    pub fn shown_in(&self, conv: ConversationId) -> Option<NotificationContent> {
+        self.convs.get(&conv).map(|s| s.mode)
+    }
+
+    /// Records that the notification of `conv` was shown again, in `mode`, as `id` (its own id
+    /// when the server replaced it in place, else the new one the server gave).
+    pub fn reshown(&mut self, conv: ConversationId, id: u32, mode: NotificationContent) {
+        let Some(entry) = self.convs.get_mut(&conv) else {
+            return;
+        };
+        entry.mode = mode;
+        if entry.id != id {
+            self.targets.remove(&entry.id);
+            self.tokens.remove(&entry.id);
+            entry.id = id;
+        }
+        self.targets.insert(id, Target::Conversation(conv));
+    }
+
+    /// Whether a notification of `conv` that showed text expired in this run (and was not
+    /// revoked yet).
+    pub fn has_expired_text(&self, conv: ConversationId) -> bool {
+        self.expired_text.iter().any(|(c, _)| *c == conv)
+    }
+
+    /// The chats with a remembered expired notification that showed text (each once).
+    pub fn expired_chats(&self) -> Vec<ConversationId> {
+        let mut chats: Vec<ConversationId> = Vec::new();
+        for (c, _) in &self.expired_text {
+            if !chats.contains(c) {
+                chats.push(*c);
+            }
+        }
+        chats
+    }
+
+    /// Takes the ids of `conv`'s expired notifications that showed text: they are to be revoked.
+    pub fn take_expired_text(&mut self, conv: ConversationId) -> Vec<u32> {
+        let ids = self
+            .expired_text
+            .iter()
+            .filter(|(c, _)| *c == conv)
+            .map(|(_, id)| *id)
+            .collect();
+        self.expired_text.retain(|(c, _)| *c != conv);
+        ids
     }
 
     /// The id the summary of `account` replaces (0 = none shown).
@@ -157,6 +222,11 @@ impl NotificationBook {
         }
     }
 
+    /// Forgets the ids of `conv`'s expired notifications (the chat is gone: `ConversationsRemoved`).
+    pub fn forget_expired_text(&mut self, conv: ConversationId) {
+        self.expired_text.retain(|(c, _)| *c != conv);
+    }
+
     /// Forgets `conv`'s notification; returns the id to close.
     pub fn close_conversation(&mut self, conv: ConversationId) -> Option<u32> {
         let shown = self.convs.remove(&conv)?;
@@ -202,11 +272,22 @@ impl NotificationBook {
         ids
     }
 
-    /// The server closed `id` (expired, dismissed or by us).
-    pub fn on_closed(&mut self, id: u32) {
+    /// The server closed `id` (expired, dismissed or by us). A conversation notification that
+    /// EXPIRED while it showed text is remembered ([`Self::take_expired_text`]): the server may
+    /// keep it in its history, and only an expired one is kept there (Plasma's history drops one
+    /// the user dismissed or the client closed).
+    pub fn on_closed(&mut self, id: u32, reason: CloseReason) {
         match self.targets.remove(&id) {
             Some(Target::Conversation(c)) if self.convs.get(&c).is_some_and(|s| s.id == id) => {
-                self.convs.remove(&c);
+                let shown = self.convs.remove(&c);
+                if reason == CloseReason::Expired
+                    && shown.is_some_and(|s| s.mode == NotificationContent::NameAndMessage)
+                {
+                    self.expired_text.push_back((c, id));
+                    if self.expired_text.len() > MAX_EXPIRED_TEXT {
+                        self.expired_text.pop_front();
+                    }
+                }
             }
             Some(Target::Summary(a)) if self.summaries.get(&a) == Some(&id) => {
                 self.summaries.remove(&a);
@@ -331,6 +412,14 @@ pub fn read_now(row: &ConversationRow) -> bool {
     row.unread == 0 && !row.marked_unread
 }
 
+/// Whether a notification of this conversation offers an inline reply: the chat takes a new
+/// message (the core refuses a send into a chat whose features state a reason it cannot, and
+/// the inline reply never looks at the answer, so a reply typed there would be lost), is not
+/// blocked and has no message request pending.
+pub fn can_reply(row: &ConversationRow) -> bool {
+    row.can_send && !row.blocked && !row.request_pending
+}
+
 /// Whether a shown message is gone, deleted or edited since it was shown (`shown` revision),
 /// or is a call line that moved on ([`call_moved_on`]).
 pub fn changed_since_shown(shown: u16, row: Option<&MessageRow>) -> bool {
@@ -409,6 +498,32 @@ impl Default for Texts {
             tray_quit: "Quit".into(),
         }
     }
+}
+
+/// The content mode a conversation's notification is shown in: the user's choice, except that
+/// a protected chat ([`ConversationRow::protected`]) never shows the text of a message: its
+/// `NameAndMessage` is `NameOnly` (the title and "New message" or "3 new messages"; Threema
+/// Desktop empties the body of such a chat's notification and keeps the names in the title,
+/// `common/notification.ts` 382-385, `common/dom/ui/notification.ts` 205-237). `Hidden` stays
+/// `Hidden`. The inline reply stays where [`can_reply`] offers it: it shows no text (its field
+/// has the fixed placeholder, and a reply quotes nothing).
+pub fn content_mode(chosen: NotificationContent, row: &ConversationRow) -> NotificationContent {
+    match chosen {
+        NotificationContent::NameAndMessage if row.protected => NotificationContent::NameOnly,
+        other => other,
+    }
+}
+
+/// The mode a notification that is on screen in `shown` must be shown again in, because its
+/// chat became protected after the text was shown (`None` = it may stay as it is): the same
+/// rule as [`content_mode`], applied to what is already shown. The notification is shown again
+/// under its own id, so the server updates it in place.
+pub fn text_to_withdraw(
+    shown: NotificationContent,
+    row: &ConversationRow,
+) -> Option<NotificationContent> {
+    let now = content_mode(shown, row);
+    (now != shown).then_some(now)
 }
 
 /// What one message notification is built from.
@@ -516,26 +631,28 @@ mod tests {
     const C2: ConversationId = ConversationId(2);
     const A1: AccountId = AccountId(1);
     const A2: AccountId = AccountId(2);
+    /// The mode of a notification that shows the text.
+    const TEXT: NotificationContent = NotificationContent::NameAndMessage;
 
     #[test]
     fn one_notification_per_conversation() {
         let mut b = NotificationBook::default();
         assert_eq!(b.replaces_for(C1), 0);
-        b.shown_message(C1, A1, MessageId(10), 0, 100);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
         assert_eq!(b.replaces_for(C1), 100);
-        b.shown_message(C1, A1, MessageId(11), 0, 100);
+        b.shown_message(C1, A1, MessageId(11), 0, 100, TEXT);
         assert_eq!(b.count(C1), 2);
         assert_eq!(b.replaces_for(C2), 0, "other conversations get their own");
-        b.shown_message(C2, A1, MessageId(20), 0, 101);
+        b.shown_message(C2, A1, MessageId(20), 0, 101, TEXT);
         assert_eq!(b.messages(C1), vec![(MessageId(10), 0), (MessageId(11), 0)]);
         // The same message twice (a repeated Notify) is counted once.
-        b.shown_message(C1, A1, MessageId(11), 0, 100);
+        b.shown_message(C1, A1, MessageId(11), 0, 100, TEXT);
         assert_eq!(b.count(C1), 2);
         // The server closed it (dismissed): the next message starts a new one.
-        b.on_closed(100);
+        b.on_closed(100, CloseReason::Dismissed);
         assert!(!b.is_tracked(C1));
         assert_eq!(b.replaces_for(C1), 0);
-        b.shown_message(C1, A1, MessageId(12), 0, 102);
+        b.shown_message(C1, A1, MessageId(12), 0, 102, TEXT);
         assert_eq!(b.count(C1), 1);
         assert_eq!(b.on_reply(100), None, "the old id means nothing now");
         assert_eq!(b.on_reply(102), Some(C1));
@@ -544,19 +661,19 @@ mod tests {
     #[test]
     fn a_new_server_id_replaces_the_old_target() {
         let mut b = NotificationBook::default();
-        b.shown_message(C1, A1, MessageId(10), 0, 100);
-        b.shown_message(C1, A1, MessageId(11), 0, 105);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
+        b.shown_message(C1, A1, MessageId(11), 0, 105, TEXT);
         assert_eq!(b.replaces_for(C1), 105);
         assert_eq!(b.on_reply(100), None);
         // A late close of the old id leaves the new one alone.
-        b.on_closed(100);
+        b.on_closed(100, CloseReason::Dismissed);
         assert!(b.is_tracked(C1));
     }
 
     #[test]
     fn clicks_carry_the_token_and_the_target() {
         let mut b = NotificationBook::default();
-        b.shown_message(C1, A1, MessageId(10), 0, 100);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
         b.on_token(100, "tok".into());
         b.on_token(999, "stray".into());
         let a = b.on_action(100, "default").expect("activation");
@@ -591,8 +708,8 @@ mod tests {
     #[test]
     fn closing_by_conversation_and_account() {
         let mut b = NotificationBook::default();
-        b.shown_message(C1, A1, MessageId(10), 0, 100);
-        b.shown_message(C2, A2, MessageId(20), 0, 101);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
+        b.shown_message(C2, A2, MessageId(20), 0, 101, TEXT);
         b.shown_summary(A2, 102);
         assert_eq!(b.close_conversation(C1), Some(100));
         assert_eq!(b.close_conversation(C1), None);
@@ -600,7 +717,7 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![101, 102]);
         assert!(b.conversations().is_empty());
-        b.shown_message(C1, A1, MessageId(10), 0, 103);
+        b.shown_message(C1, A1, MessageId(10), 0, 103, TEXT);
         assert_eq!(b.close_all(), vec![103]);
     }
 
@@ -627,6 +744,9 @@ mod tests {
             features_hash: 0,
             has_draft: false,
             hidden: false,
+            can_send: true,
+            roaming: kourier_core::facade::Roaming::Hidden,
+            protected: false,
         }
     }
 
@@ -698,6 +818,41 @@ mod tests {
         assert!(read_now(&row(0, false)));
         assert!(!read_now(&row(2, false)));
         assert!(!read_now(&row(0, true)), "marked unread keeps it");
+    }
+
+    #[test]
+    fn a_reply_is_offered_only_where_the_chat_takes_a_message() {
+        assert!(can_reply(&row(1, false)));
+        let mut cannot = row(1, false);
+        cannot.can_send = false;
+        assert!(!can_reply(&cannot), "the core would refuse the send");
+        let mut blocked = row(1, false);
+        blocked.blocked = true;
+        assert!(!can_reply(&blocked));
+        let mut pending = row(1, false);
+        pending.request_pending = true;
+        assert!(!can_reply(&pending));
+        // The notification carries it: no field to type into where it is not offered.
+        let texts = Texts::default();
+        let notification = |can_reply: bool| {
+            message_notification(MessageContent {
+                mode: NotificationContent::NameAndMessage,
+                title: "Olena",
+                line: "see you at 8",
+                count_line: None,
+                origin: None,
+                avatar: None,
+                can_reply,
+                replaces_id: 0,
+                texts: &texts,
+            })
+        };
+        assert!(
+            notification(can_reply(&row(1, false)))
+                .inline_reply
+                .is_some()
+        );
+        assert!(notification(can_reply(&cannot)).inline_reply.is_none());
     }
 
     fn msg(revision: u16, deleted: bool) -> MessageRow {
@@ -791,8 +946,8 @@ mod tests {
         // The book: a line that is forgotten leaves the notification and its other messages.
         let mut book = NotificationBook::default();
         let conv = ConversationId(3);
-        book.shown_message(conv, AccountId(1), MessageId(10), 0, 77);
-        book.shown_message(conv, AccountId(1), MessageId(11), 0, 77);
+        book.shown_message(conv, AccountId(1), MessageId(10), 0, 77, TEXT);
+        book.shown_message(conv, AccountId(1), MessageId(11), 0, 77, TEXT);
         assert!(!book.forget_message(conv, MessageId(10)));
         assert_eq!(book.messages(conv), vec![(MessageId(11), 0)]);
         assert!(book.is_tracked(conv));
@@ -812,6 +967,174 @@ mod tests {
             replaces_id: 5,
             texts,
         })
+    }
+
+    /// A protected chat's notification shows no text of the message in any mode: the choice
+    /// "name and message" becomes "name only" for it alone; the title, the count line, the
+    /// account and the reply field (which shows no text) stay.
+    #[test]
+    fn a_protected_chat_s_notification_shows_no_text_in_any_mode() {
+        let texts = Texts::default();
+        let mut protected = row(1, false);
+        protected.protected = true;
+        let open = row(1, false);
+        for chosen in [
+            NotificationContent::NameAndMessage,
+            NotificationContent::NameOnly,
+            NotificationContent::Hidden,
+        ] {
+            let mode = content_mode(chosen, &protected);
+            assert_ne!(mode, NotificationContent::NameAndMessage, "{chosen:?}");
+            for count_line in [None, Some("2 new messages")] {
+                let n = message_notification(MessageContent {
+                    mode,
+                    title: "Olena",
+                    line: "the secret plan",
+                    count_line,
+                    origin: Some("Work"),
+                    avatar: None,
+                    can_reply: can_reply(&protected),
+                    replaces_id: 0,
+                    texts: &texts,
+                });
+                let reply = n.inline_reply.as_ref().map(|r| r.placeholder.as_str());
+                for field in [
+                    n.summary.as_str(),
+                    n.body.as_str(),
+                    n.app_name.as_str(),
+                    n.origin_name.as_deref().unwrap_or(""),
+                    reply.unwrap_or(""),
+                ] {
+                    assert!(!field.contains("secret"), "{chosen:?}: {field}");
+                }
+                if chosen != NotificationContent::Hidden {
+                    assert_eq!(n.summary, "Olena", "the name stays");
+                    assert_eq!(n.body, count_line.unwrap_or("New message"));
+                    assert_eq!(reply, Some("Reply…"), "the reply field stays, without text");
+                }
+            }
+        }
+        // Not protected: the choice as it is.
+        for chosen in [
+            NotificationContent::NameAndMessage,
+            NotificationContent::NameOnly,
+            NotificationContent::Hidden,
+        ] {
+            assert_eq!(content_mode(chosen, &open), chosen);
+        }
+    }
+
+    /// A chat that becomes protected after its text was shown: the book knows the mode each
+    /// notification is shown in, the rule says which mode the one on screen is shown again in,
+    /// and the re-show keeps (or renews) the id.
+    #[test]
+    fn a_notification_that_showed_text_is_shown_again_once_its_chat_is_protected() {
+        let mut protected = row(1, false);
+        protected.protected = true;
+        let open = row(1, false);
+        assert_eq!(
+            text_to_withdraw(TEXT, &protected),
+            Some(NotificationContent::NameOnly)
+        );
+        assert_eq!(
+            text_to_withdraw(TEXT, &open),
+            None,
+            "not protected: as it is"
+        );
+        for shown in [NotificationContent::NameOnly, NotificationContent::Hidden] {
+            assert_eq!(
+                text_to_withdraw(shown, &protected),
+                None,
+                "{shown:?} has no text"
+            );
+        }
+        let mut b = NotificationBook::default();
+        assert_eq!(b.shown_in(C1), None);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
+        assert_eq!(b.shown_in(C1), Some(TEXT));
+        assert_eq!(b.shown_in(C2), None, "another chat has none");
+        // Shown again without the text, in place.
+        b.reshown(C1, 100, NotificationContent::NameOnly);
+        assert_eq!(b.shown_in(C1), Some(NotificationContent::NameOnly));
+        assert_eq!((b.replaces_for(C1), b.count(C1)), (100, 1));
+        // The server gave a new id (the old one was gone meanwhile): the book follows it.
+        b.reshown(C1, 101, NotificationContent::NameOnly);
+        assert_eq!(b.replaces_for(C1), 101);
+        b.on_closed(100, CloseReason::Expired);
+        assert!(b.is_tracked(C1), "the old id means nothing any more");
+        // A later message in text mode (the chat was lifted again) is remembered as such.
+        b.shown_message(C1, A1, MessageId(11), 0, 101, TEXT);
+        assert_eq!(b.shown_in(C1), Some(TEXT));
+        // A chat the book does not track is not shown again.
+        b.reshown(C2, 200, NotificationContent::NameOnly);
+        assert!(!b.is_tracked(C2) && b.on_reply(200).is_none());
+    }
+
+    /// The server's history keeps what EXPIRED (Plasma drops a notification the user
+    /// dismissed or the client closed): only an expired notification that showed text is
+    /// remembered, per chat, for revoking when the chat becomes protected; the memory is
+    /// bounded and ends with the server.
+    #[test]
+    fn only_an_expired_notification_that_showed_text_is_remembered_for_revoking() {
+        use CloseReason::{Closed, Dismissed, Expired, Other};
+        use NotificationContent::{Hidden, NameOnly};
+        for (mode, reason, remembered) in [
+            (TEXT, Expired, true),
+            (TEXT, Dismissed, false),
+            (TEXT, Closed, false),
+            (TEXT, Other, false),
+            (NameOnly, Expired, false),
+            (Hidden, Expired, false),
+        ] {
+            let mut b = NotificationBook::default();
+            b.shown_message(C1, A1, MessageId(10), 0, 100, mode);
+            b.shown_message(C2, A1, MessageId(20), 0, 101, TEXT);
+            b.on_closed(100, reason);
+            assert!(!b.is_tracked(C1), "{mode:?} {reason:?}");
+            assert_eq!(b.has_expired_text(C1), remembered, "{mode:?} {reason:?}");
+            assert!(!b.has_expired_text(C2), "another chat's is not touched");
+            let expected: Vec<u32> = if remembered { vec![100] } else { Vec::new() };
+            assert_eq!(b.take_expired_text(C1), expected, "{mode:?} {reason:?}");
+            assert!(!b.has_expired_text(C1), "taken once");
+        }
+        // An id the book replaced meanwhile (a new id after a re-show) is not remembered.
+        let mut b = NotificationBook::default();
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
+        b.shown_message(C1, A1, MessageId(11), 0, 105, TEXT);
+        b.on_closed(100, CloseReason::Expired);
+        assert!(
+            !b.has_expired_text(C1),
+            "100 is no longer the chat's notification"
+        );
+        // Several ids of one chat come out together, oldest first; a gone chat forgets them.
+        let mut b = NotificationBook::default();
+        for (m, id) in [(1, 300u32), (2, 301), (3, 302)] {
+            b.shown_message(C1, A1, MessageId(m), 0, id, TEXT);
+            b.on_closed(id, CloseReason::Expired);
+        }
+        assert_eq!(b.expired_chats(), vec![C1], "each chat once");
+        assert_eq!(b.take_expired_text(C1), vec![300, 301, 302]);
+        assert!(b.expired_chats().is_empty());
+        b.shown_message(C2, A1, MessageId(9), 0, 400, TEXT);
+        b.on_closed(400, CloseReason::Expired);
+        assert_eq!(b.expired_chats(), vec![C2]);
+        b.forget_expired_text(C2);
+        assert!(!b.has_expired_text(C2));
+        assert!(b.expired_chats().is_empty());
+        // Bounded: the oldest ids go first.
+        let mut b = NotificationBook::default();
+        for id in 1..=(MAX_EXPIRED_TEXT as u32 + 3) {
+            b.shown_message(C1, A1, MessageId(i64::from(id)), 0, id, TEXT);
+            b.on_closed(id, CloseReason::Expired);
+        }
+        let kept = b.take_expired_text(C1);
+        assert_eq!(kept.len(), MAX_EXPIRED_TEXT);
+        assert_eq!(kept.first(), Some(&4), "the first three are gone");
+        // The server changed (or Kourier quits): everything is forgotten.
+        b.shown_message(C1, A1, MessageId(1), 0, 900, TEXT);
+        b.on_closed(900, CloseReason::Expired);
+        b.close_all();
+        assert!(!b.has_expired_text(C1));
     }
 
     #[test]

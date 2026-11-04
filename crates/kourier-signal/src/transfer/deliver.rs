@@ -935,7 +935,8 @@ fn contact_event(tx: &Tx<'_>, contact: &StagedContact, now: i64) -> Result<Backe
         if contact.profile_sharing {
             peers::set_profile_sharing(tx, sid, true, now)?;
         }
-        if contact.system_name.is_some() {
+        // Only a given or family name makes a system contact, never a nickname alone (F5).
+        if contact.system_name.is_some() && !contact.system_nickname_only {
             peers::set_system_contact(tx, sid, true, now)?;
         }
         if contact.blocked {
@@ -946,7 +947,13 @@ fn contact_event(tx: &Tx<'_>, contact: &StagedContact, now: i64) -> Result<Backe
         }
         fetched = profile::fetched(tx, sid)?;
     }
-    Ok(BackendEvent::ContactUpsert(contact_patch(contact, fetched)))
+    let mut patch = contact_patch(contact, fetched);
+    // A number from the archive is shown by the same rule as every other (no row, no key: shown).
+    patch.number_shown = Some(match &sid {
+        Some(sid) => peers::number_shown(tx, sid)?,
+        None => peers::number_shown_for_number(tx, contact.e164.as_deref())?,
+    });
+    Ok(BackendEvent::ContactUpsert(patch))
 }
 
 /// The features of the chat of a person known only by a number: nothing can be sent there
@@ -1230,13 +1237,29 @@ fn events_of<T: SignalTransport>(
                 if let ConvKey::Direct(user) = &chat.conv
                     && let Some(peer) = features::direct_service_id(&account, user)
                 {
+                    let sid = peer.service_id_string();
                     peers::set_expire_timer_unless_older(
                         tx,
-                        &peer.service_id_string(),
+                        &sid,
                         chat.op.frame.timer_secs.unwrap_or(0),
                         chat.op.frame.timer_version.max(1),
                         now,
                     )?;
+                    // What the chat's upsert states of the archive is what the core was told
+                    // (A1): the base of the Storage diff and of the unarchive rule, with the
+                    // mute the same frame states. A chat the frame does not archive states
+                    // nothing, so it writes no base (`chat_event`).
+                    if chat.op.frame.archived {
+                        peers::set_roaming(
+                            tx,
+                            &sid,
+                            peers::Roaming {
+                                archived: true,
+                                muted_until: chat.op.frame.muted_until,
+                            },
+                            now,
+                        )?;
+                    }
                 }
             }
             // Chat by chat, each with its features right in front of it: the core makes a

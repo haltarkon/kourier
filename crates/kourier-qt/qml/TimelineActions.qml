@@ -44,6 +44,11 @@ QtObject {
     signal attachmentDeleteRequested(var row)
     // Show one step more of the long text of `message` ("Read more").
     signal readMoreRequested(real message)
+    // Open the page of the person `user` (a user id): the sender of a row, or someone a message mentions.
+    signal personRequested(string user)
+    // Open the person `user`'s page and the level of their safety number on it (P5a: the entry a paused send's
+    // message menu offers, BQ-3).
+    signal safetyRequested(string user)
 
     function menu(anchor: Item, row: var, x: real, y: real): void {
         actions.menuRequested(anchor, row, x, y);
@@ -79,6 +84,14 @@ QtObject {
 
     function readMore(message: real): void {
         actions.readMoreRequested(message);
+    }
+
+    function person(user: string): void {
+        actions.personRequested(user);
+    }
+
+    function safety(user: string): void {
+        actions.safetyRequested(user);
     }
 
     function flash(message: real): void {

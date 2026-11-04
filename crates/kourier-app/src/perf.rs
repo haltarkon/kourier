@@ -117,6 +117,17 @@ const SEED: u64 = 16;
 /// must not need gigabytes.
 const PICTURES: [(u32, u32); 5] = [(320, 240), (240, 320), (480, 360), (360, 480), (640, 480)];
 
+/// Phone screenshots (width, height), a fifth of a 1080 x 2340 and of a 1080 x 1920 screen: tall
+/// and narrow, the shape a layout that crops would have cut and that shown whole is the tallest
+/// row of a chat. Only the image-heavy conversation has them.
+const SCREENSHOTS: [(u32, u32); 2] = [(216, 468), (225, 400)];
+/// Share of the pictures of the image-heavy conversation that are phone screenshots, in percent.
+const SCREENSHOT_PERCENT: usize = 12;
+/// Share of the picture messages of the image-heavy conversation that are albums, in percent.
+const ALBUM_PERCENT: usize = 20;
+/// The fewest and the most pictures of an album (a message with 2 to 6 attachments).
+const ALBUM_PICTURES: std::ops::RangeInclusive<usize> = 2..=6;
+
 /// The fixed passphrase: a perf profile is throwaway test data.
 const PASSPHRASE: &[u8] = b"kourier perf profile";
 /// The keyring's settings file, below the profile's config directory.
@@ -220,6 +231,9 @@ fn with_bulk_media(mut script: Script, spec: &PerfSpec) -> Script {
         .cloned();
     let per_conv = spec.messages_per_conversation;
     let mut rng = Rng::new(SEED ^ 0x006d_6564_6961);
+    // The image-heavy conversation draws its screenshots and albums from a stream of its own:
+    // the other conversations keep the pictures they always had.
+    let mut heavy_rng = Rng::new(SEED ^ 0x0068_6561_7679);
     let mut current: Option<ConvKey> = None;
     let mut index = 0usize;
     let mut serial = 0u64;
@@ -247,6 +261,17 @@ fn with_bulk_media(mut script: Script, spec: &PerfSpec) -> Script {
             let kind = rng.below(100);
             let caption = rng.below(100);
             let size = rng.below(PICTURES.len());
+            let is_heavy = heavy.as_ref() == Some(&m.conv);
+            // Three more draws per message of the image-heavy conversation, whatever happens.
+            let (screenshot, album, album_len) = if is_heavy {
+                (
+                    heavy_rng.below(100),
+                    heavy_rng.below(100),
+                    heavy_rng.below(ALBUM_PICTURES.end() - ALBUM_PICTURES.start() + 1),
+                )
+            } else {
+                (100, 100, 0)
+            };
             if roll >= percent || position + KEEP_NEWEST_TEXTS >= per_conv {
                 continue;
             }
@@ -255,7 +280,7 @@ fn with_bulk_media(mut script: Script, spec: &PerfSpec) -> Script {
             };
             let text: Text = text.clone();
             serial += 1;
-            let attachment = if kind < FILE_PERCENT && heavy.as_ref() != Some(&m.conv) {
+            let attachment = if kind < FILE_PERCENT && !is_heavy {
                 let len = 4 * 1024 + u64::try_from(size).unwrap_or(0) * 12 * 1024;
                 synthetic_file(
                     &format!("document-{serial}.pdf"),
@@ -264,11 +289,32 @@ fn with_bulk_media(mut script: Script, spec: &PerfSpec) -> Script {
                     SEED ^ serial,
                 )
             } else {
-                let (w, h) = PICTURES.get(size).copied().unwrap_or((320, 240));
+                let shot = SCREENSHOTS
+                    .get(screenshot % SCREENSHOTS.len())
+                    .filter(|_| screenshot < SCREENSHOT_PERCENT);
+                let (w, h) = shot
+                    .or_else(|| PICTURES.get(size))
+                    .copied()
+                    .unwrap_or((320, 240));
                 synthetic_image(w, h, SEED ^ serial)
             };
+            let mut attachments = vec![attachment];
+            if album < ALBUM_PERCENT {
+                // An album: 2 to 6 pictures of mixed shapes (the first one is the single
+                // picture above), the rest drawn from a stream of the message's own.
+                let mut shapes = Rng::new(SEED ^ serial ^ 0x0061_6c62);
+                let all: Vec<(u32, u32)> = PICTURES.iter().chain(&SCREENSHOTS).copied().collect();
+                for i in 1..ALBUM_PICTURES.start() + album_len {
+                    let (w, h) = all
+                        .get(shapes.below(all.len()))
+                        .copied()
+                        .unwrap_or((320, 240));
+                    let seed = SEED ^ (1 << 40) ^ (serial << 8) ^ u64::try_from(i).unwrap_or(0);
+                    attachments.push(synthetic_image(w, h, seed));
+                }
+            }
             m.body = Body::Media {
-                attachments: vec![attachment],
+                attachments,
                 caption: (caption < CAPTION_PERCENT).then_some(text),
             };
         }
@@ -619,13 +665,15 @@ mod tests {
         for e in script.deliveries().iter().flatten() {
             if let BackendEvent::Message(m) = e {
                 match &m.body {
+                    // (An album is one message of pictures.)
                     Body::Media { attachments, .. } => {
-                        for a in attachments {
-                            if a.kind == kourier_model::AttachmentKind::Image {
-                                pictures += 1;
-                            } else {
-                                files += 1;
-                            }
+                        if attachments
+                            .iter()
+                            .all(|a| a.kind == kourier_model::AttachmentKind::Image)
+                        {
+                            pictures += 1;
+                        } else {
+                            files += 1;
                         }
                     }
                     _ => texts += 1,
@@ -702,6 +750,58 @@ mod tests {
             matches!(last, ConvKey::Group(_)),
             "the last conversation is a group"
         );
+    }
+
+    #[test]
+    fn the_image_heavy_chat_has_albums_and_phone_screenshots_and_the_others_have_neither() {
+        let spec = PerfSpec {
+            messages_per_conversation: 200,
+            ..small()
+        };
+        let script = reference_script(&spec, NOW).expect("script");
+        let messages: Vec<&kourier_backend_api::IncomingMessage> = script
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Deliver(d) => Some(d.events.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| match e {
+                BackendEvent::Message(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        let heavy = messages.last().expect("messages").conv.clone();
+        let (mut albums, mut mixed, mut screenshots) = (0, 0, 0);
+        let mut lengths = std::collections::BTreeSet::new();
+        for m in messages {
+            let Body::Media { attachments, .. } = &m.body else {
+                continue;
+            };
+            let dims: Vec<(u32, u32)> = attachments.iter().filter_map(|a| a.dims).collect();
+            let shots = dims.iter().filter(|d| SCREENSHOTS.contains(d)).count();
+            if m.conv != heavy {
+                assert_eq!(attachments.len(), 1, "no albums outside the heavy chat");
+                assert_eq!(shots, 0, "no screenshots outside the heavy chat");
+                continue;
+            }
+            screenshots += shots;
+            if attachments.len() > 1 {
+                albums += 1;
+                lengths.insert(attachments.len());
+                assert!(ALBUM_PICTURES.contains(&attachments.len()), "{dims:?}");
+                assert!(attachments.iter().all(|a| a.dims.is_some()));
+                mixed += usize::from(dims.iter().any(|d| *d != dims[0]));
+            }
+        }
+        assert!(albums >= 5, "{albums} albums");
+        assert!(
+            mixed * 2 >= albums,
+            "{mixed} of {albums} albums have mixed shapes"
+        );
+        assert!(lengths.len() >= 3, "album sizes {lengths:?}");
+        assert!(screenshots >= 5, "{screenshots} phone screenshots");
     }
 
     #[test]

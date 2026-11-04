@@ -36,26 +36,35 @@
 //! without a definite answer, so a delete for everyone of such a message is sent and an edit
 //! of it is a revision ([`crate::actions::sending_of`]).
 //!
-//! The retry budget ([`BUDGET`]) is kept although it is Signal Desktop's number and no server
-//! asks for it: the receive windows of the other clients are built on it (an edit is taken up
-//! to 48 h after its original and may be sent for 24 h, a delete up to a day after its send
-//! window, `SD/ts/util/canDeleteForEveryone.preload.ts` `MESSAGE_SEND_GRACE_PERIOD`), so a
-//! change that left later would be dropped by its receivers, and a message that went out days
-//! after the user saw it fail would surprise them. Nothing is refused by it: the row stays
+//! The numbers of the outbox are a network's ([`OutboxPolicy`], `NetworkDescriptor::outbox`,
+//! carried as [`NetRules::outbox`]): the retry budget, the longest back-off and how long a
+//! stored challenge can still be answered. Signal's are Signal Desktop's (one day, 15 minutes,
+//! one day: [`BUDGET`], [`MAX_BACKOFF`], the default policy), and no server asks for them: the
+//! receive windows of the other Signal clients are built on them (an edit is taken up to 48 h
+//! after its original and may be sent for 24 h, a delete up to a day after its send window,
+//! `SD/ts/util/canDeleteForEveryone.preload.ts` `MESSAGE_SEND_GRACE_PERIOD`), so a change that
+//! left later would be dropped by its receivers, and a message that went out days after the
+//! user saw it fail would surprise them. The curve of the back-off (0, 190 ms, ×1.9) is the
+//! core's for every network; only its cap is the network's ([`backoff_capped`]). Every site
+//! reads the policy of the account's network, none the constants; a network that has not said
+//! otherwise has Signal's. Nothing is refused by the budget: the row stays
 //! for "Retry", which starts a new budget with the same id. The waits for the user count
 //! against it, the one for a challenge answer and the one for a safety number to be
 //! confirmed ([`give_up_overdue`]); waiting offline or logged out does not, and a row whose
 //! budget ended that way still gets one late attempt when the account is back, also when a
 //! wait for the user stands in front of it then. That attempt is its last: answered with a
 //! challenge or a safety number, the row fails instead of waiting on
-//! ([`record_outcome`]). An edit names its target when it is sent, not when it was typed: the
-//! revision right before its own that is still there (Signal Desktop's
+//! ([`record_outcome`]). Where a network names the latest revision in an edit
+//! (`EditTarget::LatestRevision`, Signal), the edit names its target when it is sent, not when
+//! it was typed: the revision right before its own that is still there (Signal Desktop's
 //! `getTargetOfThisEditTimestamp`), so an edit queued behind one the network refused (and the
-//! core rolled back) targets what the recipients have.
+//! core rolled back) targets what the recipients have. Where it names the original
+//! (`EditTarget::Original`, WhatsApp and Threema) the request holds the message's own key from
+//! the start and [`take_due`] leaves it alone.
 //!
 //! Clock changes (§9.6): a wait is stored as a wall-clock time. After the clock was set back, a
-//! row would wait for the old time; a wait longer than any wait can be ([`BUDGET`]) is read as
-//! due, and the dispatcher clears the waits of its account when it sees the clock go back.
+//! row would wait for the old time; a wait longer than any wait can be (the network's budget)
+//! is read as due, and the dispatcher clears the waits of its account when it sees the clock go back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -66,15 +75,16 @@ use kourier_backend_api::{
 use kourier_db::failpoint;
 use kourier_db::rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use kourier_model::{
-    AccountId, AccountState, BackendError, BlobKey, BlobRef, Body, ConvKey, ConversationFeatures,
-    ConversationId, DisappearKind, ErrorKind, Expiry, FailReason, MessageId, MsgIdScope, MsgTarget,
-    NetMsgId, NetworkKind, Origin, OutgoingState, QuoteSnapshot, RecipientState, Redacted, ReplyTo,
-    Text, UserId,
+    AccountHold, AccountId, AccountState, AttachmentId, BackendError, BlobKey, BlobRef, Body,
+    ConvKey, ConversationFeatures, ConversationId, DisappearKind, EditTarget, ErrorKind, Expiry,
+    FailReason, MessageId, MsgIdScope, MsgTarget, NetMsgId, NetworkKind, Origin, OutboxPolicy,
+    OutgoingState, QuoteSnapshot, RecipientState, Redacted, ReplyTo, Text, UserId,
 };
 
 use crate::actions::{self, Facts, Sending};
 use crate::error::{CoreError, Refusal, Result};
 use crate::ingest::{Apply, Changes};
+use crate::rules::NetRules;
 use crate::sql;
 
 /// Kill point after an attempt was recorded (`Transmitting`), before `Transmit` is sent (§10.4).
@@ -87,6 +97,18 @@ pub const FAILPOINT_BEFORE_OUTCOME_COMMIT: &str = "outbox_before_outcome_commit"
 /// and with it a challenge the account waits on from then; the restart finds both.
 pub const FAILPOINT_AFTER_OUTCOME: &str = "outbox_after_outcome_commit";
 
+/// Kill point right after the answer to a stop (`Stopping`: the durable mark
+/// [`CANCEL_STOPPING`]; `TooLate`: the mark cleared) was committed, before the attempt's outcome
+/// is recorded. After `Stopping` the stopped attempt reached nobody and the restart takes the
+/// message back; after `TooLate` the restart sends it as it would have (upload progress, critic
+/// B2).
+pub const FAILPOINT_AFTER_CANCEL_ANSWER: &str = "outbox_after_cancel_answer";
+
+/// Kill point right after the X's mark ([`CANCEL_ASKED`]) was committed, before the backend was
+/// asked (upload progress, fix K4). Nothing was promised: the restart clears the mark and the
+/// message goes out as it would have.
+pub const FAILPOINT_AFTER_CANCEL_ASKED: &str = "outbox_after_cancel_asked";
+
 /// Kill point inside the enqueue transaction, after each message of the send and its outbox
 /// row were written, before the commit (§10.4): the kill leaves none of them.
 pub const FAILPOINT_IN_ENQUEUE: &str = "outbox_in_enqueue";
@@ -94,10 +116,12 @@ pub const FAILPOINT_IN_ENQUEUE: &str = "outbox_in_enqueue";
 /// it (§10.4): every message of the send exists and the restart sends each once.
 pub const FAILPOINT_AFTER_ENQUEUE: &str = "outbox_after_enqueue_commit";
 
-/// Retry budget of one message, from enqueue (Signal: one day).
-pub const BUDGET: Duration = Duration::from_secs(24 * 3600);
-/// Longest wait between two attempts.
-pub const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+/// Retry budget of one message, from enqueue: Signal's one day, the default policy's value
+/// ([`OutboxPolicy::SIGNAL`]). A network states its own in its descriptor ([`NetRules::outbox`]);
+/// every site of the outbox reads the account's policy, not this constant.
+pub const BUDGET: Duration = OutboxPolicy::SIGNAL.budget;
+/// Longest wait between two attempts: Signal's, the default policy's value.
+pub const MAX_BACKOFF: Duration = OutboxPolicy::SIGNAL.max_backoff;
 
 pub(crate) const QUEUED: &str = "Queued";
 pub(crate) const TRANSMITTING: &str = "Transmitting";
@@ -109,11 +133,27 @@ pub(crate) const STAGED: &str = "Staged";
 /// ([`crate::modify`]).
 pub(crate) const MESSAGE: &str = "Message";
 
+/// `outbox.cancel_state` (core.db 17): no stop was asked.
+pub(crate) const CANCEL_NONE: i64 = 0;
+/// The X was pressed; the backend's answer is not recorded yet. Nothing was promised: an
+/// outcome, a lost reply and a restart clear it and the message goes on as it was.
+pub(crate) const CANCEL_ASKED: i64 = 1;
+/// The backend said `Stopping`: nothing of the message goes out any more. Only this mark takes
+/// the message back when the attempt ends `Failed` or without a reply, and at the next start.
+pub(crate) const CANCEL_STOPPING: i64 = 2;
+
 /// The wait before the next attempt after `failures` failed attempts: 0 ms, 190 ms, then ×1.9,
 /// capped at [`MAX_BACKOFF`] (Signal's `exponentialBackoffSleepTime`,
-/// `SD/ts/util/exponentialBackoff.std.ts`).
+/// `SD/ts/util/exponentialBackoff.std.ts`). The core's sites use [`backoff_capped`] with the
+/// account's cap ([`OutboxPolicy::max_backoff`]); this is the curve with Signal's cap.
 pub fn backoff(failures: u32) -> Duration {
-    let max = MAX_BACKOFF.as_millis() as f64;
+    backoff_capped(failures, MAX_BACKOFF)
+}
+
+/// [`backoff`] with the cap of a network's policy ([`OutboxPolicy::max_backoff`]). The curve's
+/// shape (0, 190 ms, ×1.9) is the core's for every network; only its cap is the network's.
+pub fn backoff_capped(failures: u32, cap: Duration) -> Duration {
+    let max = cap.as_millis() as f64;
     let ms = match failures {
         0 | 1 => 0.0,
         n => (190.0 * 1.9f64.powi(i32::try_from(n - 2).unwrap_or(i32::MAX))).min(max),
@@ -126,7 +166,8 @@ pub(crate) fn ms(d: Duration) -> i64 {
 }
 
 /// A new transaction with the [`Apply`] state of `account` (ingest's helpers: send-state
-/// aggregation, counters, invalidations).
+/// aggregation, counters, invalidations), for the paths that know only the scope: they apply
+/// nothing that waited. A path that has the network's [`NetRules`] uses [`Apply::under_rules`].
 fn apply_for<'c>(
     tx: &'c Connection,
     account: AccountId,
@@ -192,7 +233,7 @@ const MAX_ALLOC_TRIES: u32 = 1000;
 /// Allocates the network id of a new own send in `conv` (a message, or an edit, delete or
 /// reaction, which are network messages of their own): strictly increasing per account (the
 /// watermark survives restarts and clock jumps), and never the key of an existing own message or
-/// revision.
+/// revision, or an id a message had before the server named it ([`Apply::by_key`]).
 pub(crate) fn allocate(
     apply: &Apply<'_>,
     network: &dyn Network,
@@ -310,6 +351,7 @@ fn reply_to(
     let body: Body = sql::from_json(&body)?;
     actions::reply(&Facts {
         active: apply.acc.state == AccountState::Active,
+        registered: true,
         blocked,
         features,
         admin: false,
@@ -344,6 +386,14 @@ fn reply_to(
                 .find(|(_, a)| !a.long_text),
         ),
         Body::Sticker(a) => (None, Some((0, *a))),
+        // A card is quoted as Signal Android quotes it (`Contact.quoteText`): "👤 " and the
+        // card's name; never the number (SD5).
+        Body::Contact(card) => (
+            card.name
+                .as_deref()
+                .map(|name| Text::plain(format!("\u{1F464} {name}"))),
+            None,
+        ),
         _ => (None, None),
     };
     let thumb = match &first {
@@ -389,7 +439,9 @@ fn reply_to(
 
 /// §4.8 step 1: one transaction inserts the message row (`Queued`, own, no author), allocates
 /// its network id with [`Network::allocate_message_id`] and inserts the outbox row with the
-/// request. Clears the conversation's draft.
+/// request. Clears the conversation's draft. A conversation that cannot take messages
+/// (`ConversationFeatures::cannot_send`) is refused before anything is stored, the draft
+/// stays ([`Target::read`] is the gate of every new send).
 ///
 /// A text longer than one message of the conversation carries
 /// (`ConversationFeatures::max_text_bytes`: on Signal the size of a long-text attachment,
@@ -404,7 +456,7 @@ pub(crate) fn enqueue_text(
     reply: Option<MessageId>,
     now: i64,
 ) -> Result<Written> {
-    let stored = enqueue(conn, network, conv, reply, now, |features| {
+    let stored = enqueue(conn, network, conv, reply, now, true, |features| {
         let max = features
             .and_then(|f| f.max_text_bytes)
             .and_then(|max| usize::try_from(max).ok());
@@ -421,6 +473,28 @@ pub(crate) fn enqueue_text(
                 files: Vec::new(),
             })
             .collect())
+    })?;
+    Ok(stored.written)
+}
+
+/// §4.8 step 1 for a contact card (P5c, `UiCommand::SendContact`): ONE message whose body is
+/// `card` (built by the core from the contact row, [`crate::facade::PersonDetail::contact_card`]),
+/// queued through the conversation's FIFO like a text. The chat's draft is NOT cleared (the
+/// card was not typed there), and a chat that cannot send refuses it (the gate of
+/// [`Target::read`], as for a text: the composer is not there to stop it).
+pub(crate) fn enqueue_contact(
+    conn: &mut Connection,
+    network: &dyn Network,
+    conv: ConversationId,
+    card: kourier_model::ContactCard,
+    now: i64,
+) -> Result<Written> {
+    let stored = enqueue(conn, network, conv, None, now, false, |_| {
+        Ok(vec![Outgoing {
+            body: Body::Contact(card),
+            quotes: false,
+            files: Vec::new(),
+        }])
     })?;
     Ok(stored.written)
 }
@@ -507,7 +581,11 @@ pub(crate) enum FilesStep {
 /// caption longer than one message of the conversation carries
 /// (`ConversationFeatures::max_text_bytes`): it goes first as the texts it is split into
 /// ([`Text::split`]), the quote on the first of them, and the files follow without a
-/// caption. The draft is cleared only when a caption was sent.
+/// caption. The draft is cleared only when a caption was sent. A conversation that cannot
+/// take messages (`ConversationFeatures::cannot_send`) is refused with
+/// [`Refusal::CannotSend`] before the files are checked against its features and before
+/// anything is stored: this first part is the gate of the whole send; the parts after it are
+/// not gated again.
 ///
 /// All of them or none, also across a kill. A send of up to [`ENQUEUE_CHUNK`] messages is
 /// one transaction. A larger one is written in parts so the writer thread is free in
@@ -543,7 +621,7 @@ pub(crate) fn enqueue_files(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(CoreError::from)?;
     let stored = (|| {
-        let mut target = Target::read(&tx, network, conv, now)?;
+        let mut target = Target::read(&tx, network, conv, Part::First, now)?;
         let features = target.features.as_ref();
         // The kinds are those of what was imported: the content decides, at import time.
         for (index, f) in files.iter().enumerate() {
@@ -612,7 +690,10 @@ pub(crate) fn enqueue_files(
 /// and the draft is cleared, in the same transaction.
 ///
 /// The part is written where the parts before it are now: when their conversation was
-/// merged into another one meanwhile, that is the conversation that stayed.
+/// merged into another one meanwhile, that is the conversation that stayed. It is not
+/// refused for `cannot_send`: the first part passed the gate, and a conversation that lost
+/// the right since still gets the rest (the send is all of it or none; the network fails
+/// what it will not take, message by message).
 pub(crate) fn enqueue_files_more(
     conn: &mut Connection,
     network: &dyn Network,
@@ -631,7 +712,8 @@ pub(crate) fn enqueue_files_more(
         send.conv = ConversationId(now_in);
     }
     let conv = send.conv;
-    let mut target = Target::read(&tx, network, conv, now)?;
+    // Not the first part: a send the chat took is finished even if it lost the right since.
+    let mut target = Target::read(&tx, network, conv, Part::Next, now)?;
     let files = send.files.clone();
     let was_hidden = is_hidden(&tx, conv)?;
     // The quote went with the first part.
@@ -652,14 +734,23 @@ pub(crate) fn enqueue_files_more(
     if done {
         // Its own rows, by message (`outbox_by_message`): another send that is being
         // stored in this conversation after a merge keeps its rows `Staged`.
-        let mut queue = tx.prepare_cached(
-            "UPDATE outbox SET state = ?2 WHERE message_id = ?1 AND kind = 'Message'
-               AND state = ?3",
-        )?;
-        for message in &send.messages {
-            queue.execute((message.0, QUEUED, STAGED))?;
+        // A network that refused one of this send's own messages as a first contact while the
+        // send was being stored (a 463 landed between two parts: `fail_waiting_of` failed the
+        // rows already stored) has refused the rest too: those parts were typed before, and
+        // each is one more reach-out. They fail without an attempt instead of turning due
+        // (K-A fix 2). A refusal of an earlier message of the chat does not count: this send
+        // was begun after it, and a message typed afterwards is the user's own new act.
+        if reach_out_refused_in(&tx, &send.messages)? {
+            fail_staged_of(&tx, &mut target.apply, conv, &send.messages)?;
+        } else {
+            let mut queue = tx.prepare_cached(
+                "UPDATE outbox SET state = ?2 WHERE message_id = ?1 AND kind = 'Message'
+                   AND state = ?3",
+            )?;
+            for message in &send.messages {
+                queue.execute((message.0, QUEUED, STAGED))?;
+            }
         }
-        drop(queue);
         if send.clear_draft {
             tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
                 .execute([conv.0])?;
@@ -876,18 +967,39 @@ struct Outgoing {
 /// its messages are stored through.
 struct Target<'c> {
     apply: Apply<'c>,
+    /// The network's rules: the retry budget a stored row gets ([`Target::store`]).
+    rules: NetRules,
     account: AccountId,
     key: ConvKey,
     features: Option<ConversationFeatures>,
     timer: Option<Duration>,
 }
 
+/// Which part of a send a transaction stores: [`Target::read`] gates only the first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// The first transaction of a NEW send (a text, a card, the first messages of some
+    /// files): the chat must take messages (`ConversationFeatures::cannot_send`).
+    First,
+    /// A further part of a send that was accepted ([`enqueue_files_more`]): never refused for
+    /// the right to send. The send is "all of it or none" (core.md): a chat that lost the right
+    /// between two parts must not leave a half of a send behind, and the parts are one act of
+    /// the user, whose first part the chat did take.
+    Next,
+}
+
 impl<'c> Target<'c> {
-    /// Reads `conv` and checks that its account is linked and it is not blocked.
+    /// Reads `conv` and checks that its account is linked and it is not blocked; for the
+    /// [`Part::First`] of a send it also checks that the chat lets us send. THE GATE of every
+    /// new send (G4): the features are read in the same transaction that stores the messages
+    /// and clears the draft, so a refusal stores nothing and keeps the draft, and a chat that
+    /// lost the right a moment after the composer was shown (a stale UI, a second front-end, a
+    /// race) never gets a message the network would only fail.
     fn read(
         tx: &'c Connection,
         network: &dyn Network,
         conv: ConversationId,
+        part: Part,
         now: i64,
     ) -> Result<Self> {
         // (account, key, blocked, timer, features)
@@ -904,8 +1016,8 @@ impl<'c> Target<'c> {
         let (account, key, blocked, timer, features) =
             row.ok_or(CoreError::UnknownConversation(conv))?;
         let account = AccountId(account);
-        let scope = network.descriptor().msg_id_scope;
-        let apply = apply_for(tx, account, scope, now)?;
+        let rules = NetRules::of(network.descriptor());
+        let apply = Apply::under_rules(tx, account, rules, now)?;
         if apply.acc.state != AccountState::Active {
             return Err(CoreError::InvalidState("the account is not linked"));
         }
@@ -915,11 +1027,20 @@ impl<'c> Target<'c> {
                 "the conversation is blocked",
             ));
         }
+        let features: Option<ConversationFeatures> = sql::from_json_opt(features)?;
+        // NULL features are "sendable", as `ConversationRow.can_send` says (core.md).
+        if part == Part::First && features.as_ref().is_some_and(|f| f.cannot_send.is_some()) {
+            return Err(CoreError::refused(
+                Refusal::CannotSend,
+                "the conversation does not take messages",
+            ));
+        }
         Ok(Self {
             apply,
+            rules,
             account,
             key: sql::conv_key(&key)?,
-            features: sql::from_json_opt(features)?,
+            features,
             timer: timer
                 .filter(|s| *s > 0)
                 .map(|s| Duration::from_secs(u64::try_from(s).unwrap_or(0))),
@@ -1050,7 +1171,7 @@ impl<'c> Target<'c> {
                 conv.0,
                 sql::to_json(&request)?,
                 state,
-                now.saturating_add(ms(BUDGET)),
+                now.saturating_add(ms(self.rules.outbox.budget)),
             ))?;
             self.apply.ch.message(conv, message);
             messages.push(message);
@@ -1119,10 +1240,11 @@ fn enqueue(
     conv: ConversationId,
     reply: Option<MessageId>,
     now: i64,
+    clear_draft: bool,
     plan: impl FnOnce(Option<&ConversationFeatures>) -> Result<Vec<Outgoing>>,
 ) -> Result<Enqueued> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut target = Target::read(&tx, network, conv, now)?;
+    let mut target = Target::read(&tx, network, conv, Part::First, now)?;
     let mut items: std::collections::VecDeque<Outgoing> = plan(target.features.as_ref())?.into();
     let mut quote = target.quote(conv, reply)?;
     target.store(
@@ -1134,8 +1256,10 @@ fn enqueue(
         QUEUED,
         &[],
     )?;
-    tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
-        .execute([conv.0])?;
+    if clear_draft {
+        tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
+            .execute([conv.0])?;
+    }
     let (account, changes) = target.finish()?;
     tx.commit()?;
     failpoint::hit(FAILPOINT_AFTER_ENQUEUE);
@@ -1253,6 +1377,17 @@ fn set_floor(
     apply.recompute_out(message)
 }
 
+/// The stored features of `conv`; `None` while the network has stated none (NULL: sendable).
+pub(crate) fn features_of(
+    conn: &Connection,
+    conv: ConversationId,
+) -> Result<Option<ConversationFeatures>> {
+    let features: Option<String> = conn
+        .prepare_cached("SELECT features FROM conversations WHERE id = ?1")?
+        .query_row([conv.0], |r| r.get(0))?;
+    sql::from_json_opt(features)
+}
+
 /// The current floor of a message.
 pub(crate) fn floor(conn: &Connection, message: MessageId) -> Result<Option<OutgoingState>> {
     let f: Option<Option<String>> = conn
@@ -1275,6 +1410,13 @@ pub(crate) struct Attempt {
     pub message: MessageId,
     /// What to send.
     pub req: OutgoingRequest,
+    /// The attachment rows of `req`'s `Body::Media.attachments`, by position: what the
+    /// backend's `AttachmentProgress.index` names. Mapped once, here, with the join
+    /// [`prune_gone_files`] uses (the request's blob path to the row that owns the file), after
+    /// that function took files out of the request: the position is the request's, not the
+    /// row's `idx`. `None` for an attachment the request holds no file of. Empty for anything
+    /// but a message with files.
+    pub attachments: Vec<Option<AttachmentId>>,
     /// Which attempt of the row this is (1 = the first), for the log.
     pub number: i64,
     /// When it started (ms), for the log's `took_ms`.
@@ -1365,7 +1507,20 @@ fn unsent_for_everyone(conn: &Connection, message: MessageId) -> Result<bool> {
 /// before its own, as the revisions are now. The request was written when the user typed the
 /// edit and names the revision that was the latest then; if that one was an edit the network
 /// refused, it is gone (rolled back) and the recipients never had it.
-fn retarget_edit(conn: &Connection, message: MessageId, req: &mut OutgoingRequest) -> Result<()> {
+///
+/// Only where the network names the latest revision ([`EditTarget::LatestRevision`], Signal).
+/// Where it names the original ([`EditTarget::Original`]: WhatsApp, Threema) every edit of a
+/// message names that one message, which `modify` wrote into the request when the user typed
+/// it and which no rolled-back edit can change: there is nothing to move.
+fn retarget_edit(
+    conn: &Connection,
+    edit_target: EditTarget,
+    message: MessageId,
+    req: &mut OutgoingRequest,
+) -> Result<()> {
+    if edit_target == EditTarget::Original {
+        return Ok(());
+    }
     let local = req.local.clone();
     let OutgoingKind::Edit { target, .. } = &mut req.kind else {
         return Ok(());
@@ -1397,13 +1552,13 @@ fn retarget_edit(conn: &Connection, message: MessageId, req: &mut OutgoingReques
 pub(crate) fn take_due(
     conn: &mut Connection,
     account: AccountId,
-    scope: MsgIdScope,
+    rules: NetRules,
     now: i64,
     skip: &Skip,
     max: usize,
 ) -> Result<Due> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut apply = apply_for(&tx, account, scope, now)?;
+    let mut apply = Apply::under_rules(&tx, account, rules, now)?;
     let heads = heads_of(&tx, account)?;
     let mut due = Due::default();
     for (outbox, conv, message, state, next, kind) in heads {
@@ -1425,7 +1580,8 @@ pub(crate) fn take_due(
             continue;
         }
         // No wait is longer than the budget: one that is was set before the clock went back.
-        let wait_until = next.filter(|at| *at > now && *at <= now.saturating_add(ms(BUDGET)));
+        let wait_until =
+            next.filter(|at| *at > now && *at <= now.saturating_add(ms(rules.outbox.budget)));
         if let Some(at) = wait_until {
             due.next_wake = Some(due.next_wake.map_or(at, |w| w.min(at)));
             continue;
@@ -1454,18 +1610,25 @@ pub(crate) fn take_due(
         if kind != MESSAGE {
             // An edit, delete or reaction: its own `only` (the members a partial attempt
             // missed); `send_state` belongs to the target's own send.
-            retarget_edit(&tx, message, &mut req)?;
+            retarget_edit(&tx, rules.edit_target, message, &mut req)?;
+            // No stop mark outlives the attempt it was written for: a stale one is cleared
+            // here too, so it can never be read as this attempt's (belt and braces to
+            // `release` and `record_outcome`, which clear it with the attempt's end).
             let number: i64 = tx
                 .prepare_cached(
                     "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
-                       request = ?3 WHERE id = ?1 RETURNING attempts",
+                       request = ?3, cancel_state = ?4 WHERE id = ?1 RETURNING attempts",
                 )?
-                .query_row((outbox, TRANSMITTING, sql::to_json(&req)?), |r| r.get(0))?;
+                .query_row(
+                    (outbox, TRANSMITTING, sql::to_json(&req)?, CANCEL_NONE),
+                    |r| r.get(0),
+                )?;
             due.attempts.push(Attempt {
                 outbox,
                 conv,
                 message,
                 req,
+                attachments: Vec::new(),
                 number,
                 started_at: now,
             });
@@ -1478,12 +1641,16 @@ pub(crate) fn take_due(
             finish_attempt(&mut apply, outbox, conv, message, None, &req)?;
             continue;
         }
+        // See above: a stale stop mark does not start with the attempt.
         let number: i64 = tx
             .prepare_cached(
                 "UPDATE outbox SET state = ?2, attempts = attempts + 1, next_attempt_at = NULL,
-                   request = ?3 WHERE id = ?1 RETURNING attempts",
+                   request = ?3, cancel_state = ?4 WHERE id = ?1 RETURNING attempts",
             )?
-            .query_row((outbox, TRANSMITTING, sql::to_json(&req)?), |r| r.get(0))?;
+            .query_row(
+                (outbox, TRANSMITTING, sql::to_json(&req)?, CANCEL_NONE),
+                |r| r.get(0),
+            )?;
         let f = floor(&tx, message)?;
         if f.as_ref().is_none_or(|f| f.rank().is_none_or(|r| r < 1)) {
             set_floor(
@@ -1493,11 +1660,13 @@ pub(crate) fn take_due(
                 &OutgoingState::Sending { progress: None },
             )?;
         }
+        let attachments = attachment_ids(&tx, message, &req)?;
         due.attempts.push(Attempt {
             outbox,
             conv,
             message,
             req,
+            attachments,
             number,
             started_at: now,
         });
@@ -1573,6 +1742,46 @@ fn heads_of(conn: &Connection, account: AccountId) -> Result<Vec<Head>> {
     Ok(heads)
 }
 
+/// The attachment rows of `message` that hold a file, by the file's blob path (relative to the
+/// account's blob directory, as a request names it).
+fn files_of(conn: &Connection, message: MessageId) -> Result<BTreeMap<String, AttachmentId>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT f.path, a.id FROM attachments a JOIN files f ON f.id = a.file_id
+             WHERE a.message_id = ?1",
+        )?
+        .query_map([message.0], |r| Ok((r.get(0)?, AttachmentId(r.get(1)?))))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?)
+}
+
+/// The attachment row of each attachment of `req`'s `Body::Media`, by position
+/// ([`Attempt::attachments`]). Empty for a request that is not a message with files.
+fn attachment_ids(
+    conn: &Connection,
+    message: MessageId,
+    req: &OutgoingRequest,
+) -> Result<Vec<Option<AttachmentId>>> {
+    let OutgoingKind::Message {
+        body: Body::Media { attachments, .. },
+        ..
+    } = &req.kind
+    else {
+        return Ok(Vec::new());
+    };
+    if attachments.iter().all(|a| a.local.is_none()) {
+        return Ok(Vec::new());
+    }
+    let here = files_of(conn, message)?;
+    Ok(attachments
+        .iter()
+        .map(|a| {
+            a.local
+                .as_ref()
+                .and_then(|blob| here.get(blob.path.to_string_lossy().as_ref()).copied())
+        })
+        .collect())
+}
+
 /// Takes out of an own send's request the files that are no longer files of `message`: a
 /// request names the blobs the backend reads, and an attachment deleted meanwhile (from
 /// another own device, `AttachmentDeleted`) took its blob with it. Returns whether anything
@@ -1591,18 +1800,12 @@ fn prune_gone_files(
     if attachments.iter().all(|a| a.local.is_none()) {
         return Ok(false);
     }
-    let here: BTreeSet<String> = conn
-        .prepare_cached(
-            "SELECT f.path FROM attachments a JOIN files f ON f.id = a.file_id
-             WHERE a.message_id = ?1",
-        )?
-        .query_map([message.0], |r| r.get(0))?
-        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let here = files_of(conn, message)?;
     let before = attachments.len();
     attachments.retain(|a| {
         a.local
             .as_ref()
-            .is_none_or(|blob| here.contains(blob.path.to_string_lossy().as_ref()))
+            .is_none_or(|blob| here.contains_key(blob.path.to_string_lossy().as_ref()))
     });
     if attachments.len() == before {
         return Ok(false);
@@ -1669,25 +1872,74 @@ fn mark_sent(
     Ok(())
 }
 
-/// Rows left `Transmitting` by an earlier actor or process go back to `Queued` (§4.8 step 4).
+/// Rows left `Transmitting` by an earlier actor or process go back to `Queued` (§4.8 step 4),
+/// except a message whose stop the backend had accepted (`cancel_state` [`CANCEL_STOPPING`]):
+/// that attempt reached nobody and the user asked for it to go, so it is TAKEN BACK here, with
+/// its attachments' rows (the files go with the returned changes). A mark that was only asked
+/// ([`CANCEL_ASKED`]) is cleared: the message may have gone, and it is sent as before.
 /// Rows of tombstones other than deletes go: nothing in flight can answer them any more, and
 /// a `Failed` one that an earlier build left behind would stay for good.
-pub(crate) fn reset_transmitting(conn: &Connection, account: AccountId) -> Result<usize> {
-    let reset = conn
+pub(crate) fn reset_transmitting(
+    conn: &mut Connection,
+    account: AccountId,
+    scope: MsgIdScope,
+    now: i64,
+) -> Result<(usize, Changes)> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stopped: Vec<(i64, i64)> = tx
         .prepare_cached(
-            "UPDATE outbox SET state = ?2 WHERE state = ?3 AND conversation_id IN
+            "SELECT message_id, conversation_id FROM outbox
+             WHERE state = ?1 AND kind = ?2 AND cancel_state = ?3 AND conversation_id IN
+               (SELECT id FROM conversations WHERE account_id = ?4)",
+        )?
+        .query_map((TRANSMITTING, MESSAGE, CANCEL_STOPPING, account.0), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let mut apply = apply_for(&tx, account, scope, now)?;
+    for (message, conv) in &stopped {
+        take_back(&tx, &mut apply, MessageId(*message), ConversationId(*conv))?;
+    }
+    let reset = tx
+        .prepare_cached(
+            "UPDATE outbox SET state = ?2, cancel_state = ?4 WHERE state = ?3 AND conversation_id IN
                (SELECT id FROM conversations WHERE account_id = ?1)",
         )?
-        .execute((account.0, QUEUED, TRANSMITTING))?;
+        .execute((account.0, QUEUED, TRANSMITTING, CANCEL_NONE))?;
     // Per outbox row (few) one lookup of its message by id: the other way round, every message
     // of the account would be read at each actor start.
-    conn.prepare_cached(
+    tx.prepare_cached(
         "DELETE FROM outbox WHERE kind <> 'Delete' AND EXISTS
            (SELECT 1 FROM messages m WHERE m.id = outbox.message_id AND m.account_id = ?1
               AND m.deleted IS NOT NULL)",
     )?
     .execute([account.0])?;
-    Ok(reset)
+    let changes = std::mem::take(&mut apply.ch);
+    drop(apply);
+    tx.commit()?;
+    Ok((reset + stopped.len(), changes))
+}
+
+/// What the backend answered to a stop the user asked for ([`CANCEL_ASKED`]), written by the
+/// dispatcher right after the answer and before it records anything else: `stopping` is the
+/// durable `Stopping` mark, otherwise the mark goes (`TooLate`, no answer). `false` when no
+/// row was asked any more (its outcome was recorded meanwhile, which cleared the mark).
+pub(crate) fn answer_cancel(conn: &Connection, message: MessageId, stopping: bool) -> Result<bool> {
+    let mark = if stopping {
+        CANCEL_STOPPING
+    } else {
+        CANCEL_NONE
+    };
+    let changed = conn
+        .prepare_cached(
+            "UPDATE outbox SET cancel_state = ?2
+             WHERE message_id = ?1 AND kind = ?3 AND state = ?4 AND cancel_state = ?5",
+        )?
+        .execute((message.0, mark, MESSAGE, TRANSMITTING, CANCEL_ASKED))?;
+    if changed > 0 {
+        failpoint::hit(FAILPOINT_AFTER_CANCEL_ANSWER);
+    }
+    Ok(changed > 0)
 }
 
 /// The clock went back (§9.6): every wait of `account`'s queued rows was set on the old clock
@@ -1703,25 +1955,82 @@ pub(crate) fn clear_waits(conn: &Connection, account: AccountId) -> Result<usize
         .execute((account.0, QUEUED))?)
 }
 
+/// What [`release`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Released {
+    /// The row was in flight and is queued again (or its message was taken back).
+    pub released: bool,
+    /// What a take-back changed (the dispatcher publishes it; its files go with it).
+    pub changes: Changes,
+}
+
 /// The outcome of an attempt could not be recorded (a `core.db` error): the row goes back to
 /// `Queued` after a backoff instead of holding its conversation's FIFO as `Transmitting` until
 /// the next actor start. The resend keeps the stored id and `only`; the backend's send progress
-/// keeps it from reaching a recipient twice (§4.8 step 4). `false` when the row is not in flight.
-pub(crate) fn release(conn: &Connection, outbox: i64, now: i64) -> Result<bool> {
-    let attempts: Option<i64> = conn
-        .prepare_cached("SELECT attempts FROM outbox WHERE id = ?1 AND state = ?2")?
-        .query_row((outbox, TRANSMITTING), |r| r.get(0))
+/// keeps it from reaching a recipient twice (§4.8 step 4). `released` is `false` when the row is
+/// not in flight. The wait follows the account's back-off cap (`rules.outbox`).
+///
+/// A stop mark never outlives the attempt it was written for, so `release` follows
+/// [`reset_transmitting`]'s rule in the same write: a message whose stop the backend had
+/// ACCEPTED ([`CANCEL_STOPPING`]: the attempt reached nobody) is TAKEN BACK here, with its
+/// attachments' rows (the files go with the returned changes), and a mark that was only asked
+/// ([`CANCEL_ASKED`]) becomes [`CANCEL_NONE`]. Left on the row, the mark would be read by the
+/// NEXT attempt, which was never asked to stop: a message the user stopped would go out, or a
+/// message that may have reached its recipients would be taken back.
+pub(crate) fn release(
+    conn: &mut Connection,
+    account: AccountId,
+    rules: NetRules,
+    outbox: i64,
+    now: i64,
+) -> Result<Released> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(i64, i64, i64, i64, String)> = tx
+        .prepare_cached(
+            "SELECT attempts, cancel_state, message_id, conversation_id, kind FROM outbox
+             WHERE id = ?1 AND state = ?2",
+        )?
+        .query_row((outbox, TRANSMITTING), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .optional()?;
-    let Some(attempts) = attempts else {
-        return Ok(false);
+    let Some((attempts, cancel_state, message, conv, kind)) = row else {
+        return Ok(Released::default());
     };
-    let wait = backoff(sql::u32_of(attempts).saturating_add(1)).max(Duration::from_secs(1));
-    conn.prepare_cached(
-        "UPDATE outbox SET state = ?2, next_attempt_at = ?3, last_error = 'Internal'
+    if kind == MESSAGE && cancel_state == CANCEL_STOPPING {
+        let mut apply = Apply::under_rules(&tx, account, rules, now)?;
+        take_back(&tx, &mut apply, MessageId(message), ConversationId(conv))?;
+        apply.finish()?;
+        let changes = std::mem::take(&mut apply.ch);
+        drop(apply);
+        tx.commit()?;
+        return Ok(Released {
+            released: true,
+            changes,
+        });
+    }
+    let wait = backoff_capped(
+        sql::u32_of(attempts).saturating_add(1),
+        rules.outbox.max_backoff,
+    )
+    .max(Duration::from_secs(1));
+    tx.prepare_cached(
+        "UPDATE outbox SET state = ?2, next_attempt_at = ?3, last_error = 'Internal',
+           cancel_state = ?5
          WHERE id = ?1 AND state = ?4",
     )?
-    .execute((outbox, QUEUED, now.saturating_add(ms(wait)), TRANSMITTING))?;
-    Ok(true)
+    .execute((
+        outbox,
+        QUEUED,
+        now.saturating_add(ms(wait)),
+        TRANSMITTING,
+        CANCEL_NONE,
+    ))?;
+    tx.commit()?;
+    Ok(Released {
+        released: true,
+        changes: Changes::default(),
+    })
 }
 
 // ---------- outcomes ----------
@@ -1780,27 +2089,61 @@ pub(crate) struct StoredChallenge {
 }
 
 impl StoredChallenge {
-    /// Whether a challenge stored at `since` still counts at `now`: Signal Desktop drops one
+    /// Whether a challenge stored at `since` still counts at `now`: for as long as the
+    /// network's policy says ([`OutboxPolicy::challenge_lifetime`]). Signal Desktop drops one
     /// after a day (`DEFAULT_EXPIRE_AFTER`), which is also the budget of every send it could
     /// hold. One dated in the future was stored on a clock that has been set back since (§9.6).
-    pub(crate) fn is_fresh(&self, now: i64) -> bool {
-        self.since <= now && now.saturating_sub(self.since) <= ms(BUDGET)
+    pub(crate) fn is_fresh(&self, now: i64, policy: OutboxPolicy) -> bool {
+        self.since <= now && now.saturating_sub(self.since) <= ms(policy.challenge_lifetime)
     }
 }
 
 const CHALLENGE_KEY: &str = "challenge";
+const HOLD_KEY: &str = "hold";
+
+/// The value of the account's `settings` row `key`, if it is there and this build can read it.
+fn stored_setting<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    account: AccountId,
+    key: &str,
+) -> Result<Option<T>> {
+    let json: Option<String> = conn
+        .prepare_cached("SELECT value FROM settings WHERE scope = ?1 AND key = ?2")?
+        .query_row((alloc_scope(account), key), |r| r.get(0))
+        .optional()?;
+    // A value this build cannot read is none: the next send finds out.
+    Ok(json.and_then(|j| sql::from_json(&j).ok()))
+}
+
+/// Stores the account's `settings` row `key`, or forgets it (`None`).
+fn store_setting<T: serde::Serialize>(
+    conn: &Connection,
+    account: AccountId,
+    key: &str,
+    value: Option<&T>,
+) -> Result<()> {
+    match value {
+        Some(v) => {
+            conn.prepare_cached(
+                "INSERT INTO settings(scope, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
+            )?
+            .execute((alloc_scope(account), key, sql::to_json(v)?))?;
+        }
+        None => {
+            conn.prepare_cached("DELETE FROM settings WHERE scope = ?1 AND key = ?2")?
+                .execute((alloc_scope(account), key))?;
+        }
+    }
+    Ok(())
+}
 
 /// The challenge stored for `account`, if any.
 pub(crate) fn stored_challenge(
     conn: &Connection,
     account: AccountId,
 ) -> Result<Option<StoredChallenge>> {
-    let json: Option<String> = conn
-        .prepare_cached("SELECT value FROM settings WHERE scope = ?1 AND key = ?2")?
-        .query_row((alloc_scope(account), CHALLENGE_KEY), |r| r.get(0))
-        .optional()?;
-    // A value this build cannot read is no challenge: the next send finds out.
-    Ok(json.and_then(|j| sql::from_json(&j).ok()))
+    stored_setting(conn, account, CHALLENGE_KEY)
 }
 
 /// Stores the challenge `account` waits on, or forgets it (`None`).
@@ -1809,20 +2152,73 @@ pub(crate) fn store_challenge(
     account: AccountId,
     challenge: Option<&StoredChallenge>,
 ) -> Result<()> {
-    match challenge {
-        Some(c) => {
-            conn.prepare_cached(
-                "INSERT INTO settings(scope, key, value) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
-            )?
-            .execute((alloc_scope(account), CHALLENGE_KEY, sql::to_json(c)?))?;
-        }
-        None => {
-            conn.prepare_cached("DELETE FROM settings WHERE scope = ?1 AND key = ?2")?
-                .execute((alloc_scope(account), CHALLENGE_KEY))?;
-        }
-    }
-    Ok(())
+    store_setting(conn, account, CHALLENGE_KEY, challenge)
+}
+
+/// The send hold as `core.db` keeps it: what the backend stated, and when this core began to
+/// hold (ms on the core's clock), so the time held can be given back to the rows' retry
+/// budgets at the lift ([`give_back_held_time`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredHold {
+    #[serde(flatten)]
+    pub hold: AccountHold,
+    /// When the hold began; none in a row an older build wrote (no time to give back).
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+/// The send hold stored for `account` (`{until_ms, reason, since_ms}`), if any. The row is the
+/// hold as the backend last stated it: it is restored into the dispatcher at the first start of
+/// a run, so a restart (a crash, a reboot, "Restart Now") does not send into a lock the backend
+/// has not yet restated.
+pub(crate) fn stored_hold(conn: &Connection, account: AccountId) -> Result<Option<StoredHold>> {
+    stored_setting(conn, account, HOLD_KEY)
+}
+
+/// Stores the send hold of `account`, or forgets it (`None`: lifted, or ended by its time).
+pub(crate) fn store_hold(
+    conn: &Connection,
+    account: AccountId,
+    hold: Option<&StoredHold>,
+) -> Result<()> {
+    store_setting(conn, account, HOLD_KEY, hold)
+}
+
+/// The hold `held` ended at `now`: the time it stood does not count against a message's budget
+/// (K-A fix C4), so every row of `account` that waited through it gets its deadline moved on
+/// by that time. A row's budget began at its enqueue, which is its deadline minus the
+/// account's budget (`policy`; every earlier hold moved the deadline by time that had passed
+/// since, so that start is never after the hold's own for a row that is older than the hold):
+/// a row made during the hold is given only the time since it was made. Returns the rows
+/// changed.
+///
+/// Risk (K-B1, B6): a start is computed from the budget of the policy that is in force NOW. A
+/// build that CHANGES a network's budget while rows wait in a hold computes their start from
+/// the new number, so the time given back moves once, by the difference of the two budgets
+/// (the deadlines themselves are stored and do not move). No network changes its budget in
+/// K-B1; the step that gives WhatsApp its own numbers (W5) does it before any real send.
+pub(crate) fn give_back_held_time(
+    conn: &Connection,
+    account: AccountId,
+    held: &StoredHold,
+    now: i64,
+    policy: OutboxPolicy,
+) -> Result<usize> {
+    let Some(since) = held.since_ms else {
+        return Ok(0);
+    };
+    // The hold ended by its own time at `until`, however late the core looked.
+    let end = held
+        .hold
+        .until_ms
+        .map_or(now, |u| now.min(i64::try_from(u).unwrap_or(i64::MAX)));
+    Ok(conn
+        .prepare_cached(
+            "UPDATE outbox SET deadline_at = deadline_at + (?2 - max(?3, deadline_at - ?4))
+               WHERE state IN (?5, ?6) AND ?2 > max(?3, deadline_at - ?4)
+                 AND conversation_id IN (SELECT id FROM conversations WHERE account_id = ?1)",
+        )?
+        .execute((account.0, end, since, ms(policy.budget), QUEUED, STAGED))?)
 }
 
 impl Challenge {
@@ -1916,10 +2312,20 @@ pub(crate) fn late_pause(n: &Next) -> bool {
     )
 }
 
-pub(crate) fn classify(e: &BackendError, conv: ConversationId, outbox: i64, failures: u32) -> Next {
+/// How a failed attempt continues; a retryable error waits [`backoff_capped`] with the
+/// account's cap (`policy`).
+pub(crate) fn classify(
+    e: &BackendError,
+    conv: ConversationId,
+    outbox: i64,
+    failures: u32,
+    policy: OutboxPolicy,
+) -> Next {
     match &e.kind {
         ErrorKind::Transient { retry_after } | ErrorKind::RateLimited { retry_after } => {
-            Next::Retry(backoff(failures).max(retry_after.unwrap_or_default()))
+            Next::Retry(
+                backoff_capped(failures, policy.max_backoff).max(retry_after.unwrap_or_default()),
+            )
         }
         ErrorKind::Challenge {
             url,
@@ -1952,18 +2358,18 @@ pub(crate) fn classify(e: &BackendError, conv: ConversationId, outbox: i64, fail
 pub(crate) fn record_outcome(
     conn: &mut Connection,
     account: AccountId,
-    scope: MsgIdScope,
+    rules: NetRules,
     now: i64,
     attempt: &Attempt,
     outcome: Option<TransmitOutcome>,
 ) -> Result<Recorded> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut apply = apply_for(&tx, account, scope, now)?;
+    let mut apply = Apply::under_rules(&tx, account, rules, now)?;
     let outbox = attempt.outbox;
     // What was sent decides how the answer is read, not what the row says now: the answer to
     // an edit, delete or reaction whose row is gone says nothing about its target's own send.
     if !matches!(attempt.req.kind, OutgoingKind::Message { .. }) {
-        let recorded = crate::modify::record_outcome(&mut apply, attempt, outcome)?;
+        let recorded = crate::modify::record_outcome(&mut apply, rules.outbox, attempt, outcome)?;
         if let Some(Pause::Account {
             challenge: Some(c), ..
         }) = &recorded.pause
@@ -1985,16 +2391,18 @@ pub(crate) fn record_outcome(
     // of two conversations may have moved it and its message meanwhile (§3.3): the answer is
     // recorded where they are now. Without the row (an echo from another device finished it)
     // the per-recipient outcome still counts for the message.
-    let row: Option<(i64, u32, i64)> = tx
+    let row: Option<(i64, u32, i64, i64)> = tx
         .prepare_cached(
-            "SELECT message_id, attempts, deadline_at FROM outbox WHERE id = ?1 AND state = ?2",
+            "SELECT message_id, attempts, deadline_at, cancel_state FROM outbox
+             WHERE id = ?1 AND state = ?2",
         )?
         .query_row((outbox, TRANSMITTING), |r| {
-            Ok((r.get(0)?, sql::u32_of(r.get(1)?), r.get(2)?))
+            Ok((r.get(0)?, sql::u32_of(r.get(1)?), r.get(2)?, r.get(3)?))
         })
         .optional()?;
-    let message = row.map_or(attempt.message, |(m, _, _)| MessageId(m));
-    let row = row.map(|(_, attempts, deadline)| (attempts, deadline));
+    let message = row.map_or(attempt.message, |(m, _, _, _)| MessageId(m));
+    let cancel_state = row.map_or(CANCEL_NONE, |(_, _, _, c)| c);
+    let row = row.map(|(_, attempts, deadline, _)| (attempts, deadline));
     let conv: Option<i64> = tx
         .prepare_cached("SELECT conversation_id FROM messages WHERE id = ?1")?
         .query_row([message.0], |r| r.get(0))
@@ -2004,6 +2412,39 @@ pub(crate) fn record_outcome(
         // removed): nothing is left to record.
         return Ok(Recorded::default());
     };
+    // The backend said `Stopping` ([`CANCEL_STOPPING`]): nothing of this attempt went out, so
+    // whatever it ends with other than a send that went out anyway (a backend bug, below) the
+    // message the user stopped is taken back. A mark that was only asked is no promise: the
+    // outcome is read as it comes and the mark goes with the row's next state.
+    if cancel_state == CANCEL_STOPPING {
+        let went = matches!(
+            &outcome,
+            Some(
+                TransmitOutcome::Sent { .. }
+                    | TransmitOutcome::SentAs { .. }
+                    | TransmitOutcome::Partial { .. }
+            )
+        );
+        if went {
+            tracing::error!(
+                account = account.0,
+                msg = message.0,
+                "an attempt that was stopped reported a send: recorded as sent"
+            );
+        } else {
+            take_back(&tx, &mut apply, message, conv)?;
+            apply.finish()?;
+            let changes = std::mem::take(&mut apply.ch);
+            drop(apply);
+            failpoint::hit(FAILPOINT_BEFORE_OUTCOME_COMMIT);
+            tx.commit()?;
+            failpoint::hit(FAILPOINT_AFTER_OUTCOME);
+            return Ok(Recorded {
+                changes,
+                ..Recorded::default()
+            });
+        }
+    }
     let outcome = outcome.unwrap_or_else(|| {
         TransmitOutcome::Failed(BackendError::new(
             ErrorKind::Transient { retry_after: None },
@@ -2017,17 +2458,31 @@ pub(crate) fn record_outcome(
     let mut next: Option<(Next, OutgoingRequest, &'static str)> = None;
     // Somebody has it now: a disappearing timer starts (once).
     let reached = match &outcome {
-        TransmitOutcome::Sent { .. } => true,
+        TransmitOutcome::Sent { .. } | TransmitOutcome::SentAs { .. } => true,
         TransmitOutcome::Partial { delivered, .. } => !delivered.is_empty(),
         TransmitOutcome::Failed(_) => false,
     };
     if reached {
         apply.start_send_timer(message)?;
     }
+    // The server gave the message an id of its own (KT-2, [`crate::ingest::Apply::rekey_own`]):
+    // its keys and what the queue names move before the send is finished. Also when the row is
+    // gone (an echo finished it) and for a tombstone: a delete queued behind it must name that id.
+    let rekeyed = match &outcome {
+        TransmitOutcome::SentAs { assigned, .. } => {
+            apply.rekey_own(message, &assigned.local, Some(assigned.seq))?
+        }
+        _ => None,
+    };
     match outcome {
         TransmitOutcome::Sent {
             server_at,
             per_recipient,
+        }
+        | TransmitOutcome::SentAs {
+            server_at,
+            per_recipient,
+            ..
         } => {
             for (u, s) in &per_recipient {
                 set_recipient(&mut apply, message, u, *s, None)?;
@@ -2103,7 +2558,7 @@ pub(crate) fn record_outcome(
                         .map(|(_, e)| e.kind.retry_after().unwrap_or_default())
                         .max()
                         .unwrap_or_default()
-                        .max(backoff(attempts));
+                        .max(backoff_capped(attempts, rules.outbox.max_backoff));
                     let n = if now.saturating_add(ms(wait)) > deadline {
                         Next::Fail {
                             reason: FailReason::from(&first.kind),
@@ -2133,7 +2588,7 @@ pub(crate) fn record_outcome(
         }
         TransmitOutcome::Failed(e) => {
             if let Some((attempts, deadline)) = row {
-                let n = match classify(&e, conv, outbox, attempts) {
+                let n = match classify(&e, conv, outbox, attempts, rules.outbox) {
                     Next::Retry(wait) if now.saturating_add(ms(wait)) > deadline => Next::Fail {
                         reason: FailReason::from(&e.kind),
                         retryable: true,
@@ -2209,6 +2664,9 @@ pub(crate) fn record_outcome(
                         set_recipient(&mut apply, message, &u, failed, None)?;
                     }
                 }
+                if reason == FailReason::ReachOutRefused {
+                    fail_waiting_of(&tx, &mut apply, conv, message, &reason)?;
+                }
                 set_floor(
                     &mut apply,
                     message,
@@ -2217,6 +2675,13 @@ pub(crate) fn record_outcome(
                 )?;
             }
         }
+    }
+    // A stop that was asked but did not stop this attempt (the backend said `TooLate`, said
+    // nothing, or the attempt ended on its own first) is over with the attempt: the row goes on
+    // without the mark, so the next attempt is never taken for a stopped one.
+    if cancel_state != CANCEL_NONE {
+        tx.prepare_cached("UPDATE outbox SET cancel_state = ?2 WHERE id = ?1")?
+            .execute((outbox, CANCEL_NONE))?;
     }
     // The message was deleted (here, from another device, by its author) while this attempt
     // was in flight: nothing more of it is sent, and no row of it is kept for a retry.
@@ -2238,6 +2703,10 @@ pub(crate) fn record_outcome(
     apply.retry_receipts_of(message)?;
     apply.ch.message(conv, message);
     apply.recompute_out(message)?;
+    // Last: what waited under the server's id may remove the message.
+    if let Some(done) = rekeyed {
+        apply.settle_rekey(done)?;
+    }
     apply.finish()?;
     let changes = std::mem::take(&mut apply.ch);
     drop(apply);
@@ -2250,6 +2719,112 @@ pub(crate) fn record_outcome(
         retry_in,
         failed: None,
     })
+}
+
+/// A network refused `message` as a first contact ([`FailReason::ReachOutRefused`]): the
+/// conversation's other messages that still wait for their first attempt fail the same way,
+/// without one. Each of them is one more reach-out to the same person, and every reach-out
+/// counts against the account (research §5.5: after a 463 stop, explain, never retry). A
+/// message in flight already has its own answer coming, and the rows of a large send that is
+/// still being stored (`Staged`) are messages that wait for their first attempt too (K-A fix
+/// C6: they would turn `Queued` a moment later and be one more reach-out); edits, reactions and deletes are not
+/// messages to a new person and keep waiting for their target. There is no account-wide hold
+/// (K-A decision 5): a message typed afterwards is the user's own new act.
+fn fail_waiting_of(
+    tx: &Connection,
+    apply: &mut Apply<'_>,
+    conv: ConversationId,
+    except: MessageId,
+    reason: &FailReason,
+) -> Result<()> {
+    let waiting: Vec<(i64, i64)> = tx
+        .prepare_cached(
+            "SELECT id, message_id FROM outbox
+             WHERE conversation_id = ?1 AND kind = ?2 AND state IN (?3, ?5) AND message_id <> ?4
+             ORDER BY id",
+        )?
+        .query_map((conv.0, MESSAGE, QUEUED, except.0, STAGED), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    for (outbox, message) in waiting {
+        fail_unattempted(tx, apply, conv, outbox, MessageId(message), reason)?;
+    }
+    Ok(())
+}
+
+/// One row that waited for its first attempt fails as a first contact the network refused
+/// ([`fail_waiting_of`]): no attempt, not retryable, shown as the floor.
+fn fail_unattempted(
+    tx: &Connection,
+    apply: &mut Apply<'_>,
+    conv: ConversationId,
+    outbox: i64,
+    message: MessageId,
+    reason: &FailReason,
+) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE outbox SET state = ?2, next_attempt_at = NULL, last_error = ?3
+         WHERE id = ?1",
+    )?
+    .execute((outbox, FAILED, ErrorKind::ReachOutRefused.name()))?;
+    for (u, s) in send_states(tx, message)? {
+        if matches!(s, RecipientState::Pending) {
+            let failed = RecipientState::Failed { retryable: false };
+            set_recipient(apply, message, &sql::user(&u)?, failed, None)?;
+        }
+    }
+    let shown = OutgoingState::Failed {
+        reason: reason.clone(),
+        retryable: false,
+    };
+    set_floor(apply, message, conv, &shown)
+}
+
+/// Whether one of `messages` (the messages of a send) has the floor "refused as a first
+/// contact": the network answered a 463 while the send was stored in parts.
+fn reach_out_refused_in(tx: &Connection, messages: &[MessageId]) -> Result<bool> {
+    for message in messages {
+        if matches!(
+            floor(tx, *message)?,
+            Some(OutgoingState::Failed {
+                reason: FailReason::ReachOutRefused,
+                ..
+            })
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The `Staged` rows of `messages` (a send whose last part was just stored) fail as a first
+/// contact the network refused, like the rows [`fail_waiting_of`] met.
+fn fail_staged_of(
+    tx: &Connection,
+    apply: &mut Apply<'_>,
+    conv: ConversationId,
+    messages: &[MessageId],
+) -> Result<()> {
+    for message in messages {
+        let row: Option<i64> = tx
+            .prepare_cached(
+                "SELECT id FROM outbox WHERE message_id = ?1 AND kind = ?2 AND state = ?3",
+            )?
+            .query_row((message.0, MESSAGE, STAGED), |r| r.get(0))
+            .optional()?;
+        if let Some(outbox) = row {
+            fail_unattempted(
+                tx,
+                apply,
+                conv,
+                outbox,
+                *message,
+                &FailReason::ReachOutRefused,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// What [`give_up_overdue`] did.
@@ -2461,13 +3036,13 @@ fn own_message(conn: &Connection, message: MessageId) -> Result<(AccountId, Conv
 /// a fresh budget, and `only` = the recipients that do not have it yet.
 pub(crate) fn retry(
     conn: &mut Connection,
-    scope: MsgIdScope,
+    rules: NetRules,
     message: MessageId,
     now: i64,
 ) -> Result<Written> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (account, conv) = own_message(&tx, message)?;
-    let mut apply = apply_for(&tx, account, scope, now)?;
+    let mut apply = Apply::under_rules(&tx, account, rules, now)?;
     let (outbox, state, request) =
         row_of(&tx, message)?.ok_or(CoreError::InvalidInput("the message has nothing to retry"))?;
     if state == TRANSMITTING {
@@ -2476,6 +3051,13 @@ pub(crate) fn retry(
             "the message is being sent",
         ));
     }
+    // The same rule the flag `MessageActions::retry` answers: a message the network refused as
+    // a reach-out is not sent again, and neither is one into a chat that lost the right to
+    // send since it failed (a left group, an un-accepted chat).
+    crate::actions::retry(
+        floor(&tx, message)?.as_ref(),
+        features_of(&tx, conv)?.as_ref(),
+    )?;
     let mut req: OutgoingRequest = sql::from_json(&request)?;
     // A retry does not forget what an earlier attempt may have left with the server: a row
     // that waited for its next attempt, or gave up on attempts without a definite answer,
@@ -2483,7 +3065,7 @@ pub(crate) fn retry(
     // still not "ours to take back" (`actions::sending_of`): a delete for everyone of it is
     // sent and an edit is a revision. A row the network refused for good starts from nothing.
     let maybe_out = matches!(
-        crate::actions::sending_of(&tx, message)?,
+        crate::actions::sending_of(&tx, message, false)?,
         crate::actions::Sending::Unsent { attempted: true }
     );
     let states = send_states(&tx, message)?;
@@ -2510,7 +3092,7 @@ pub(crate) fn retry(
     .execute((
         outbox,
         QUEUED,
-        now.saturating_add(ms(BUDGET)),
+        now.saturating_add(ms(rules.outbox.budget)),
         sql::to_json(&req)?,
         i64::from(maybe_out),
     ))?;
@@ -2520,7 +3102,11 @@ pub(crate) fn retry(
         "UPDATE outbox SET deadline_at = ?2, next_attempt_at = NULL
          WHERE message_id = ?1 AND kind IN ('Edit', 'React') AND state = ?3",
     )?
-    .execute((message.0, now.saturating_add(ms(BUDGET)), QUEUED))?;
+    .execute((
+        message.0,
+        now.saturating_add(ms(rules.outbox.budget)),
+        QUEUED,
+    ))?;
     set_floor(&mut apply, message, conv, &OutgoingState::Queued)?;
     apply.finish()?;
     let changes = std::mem::take(&mut apply.ch);
@@ -2533,30 +3119,16 @@ pub(crate) fn retry(
     })
 }
 
-/// §4.8 step 5: a queued or failed message that no recipient has is deleted with its outbox
-/// row. A message in flight, or one some recipient has, cannot be taken back here.
-pub(crate) fn cancel(
-    conn: &mut Connection,
-    scope: MsgIdScope,
+/// Removes `message` of `conv` with its outbox row, its attachments' rows and (after the
+/// commit, by the changes) their files; the conversation's counts follow. The one body of a
+/// take-back: the user's cancel of a message that waits ([`cancel`]) and a stopped attempt
+/// ([`record_outcome`], [`reset_transmitting`]).
+fn take_back(
+    tx: &Connection,
+    apply: &mut Apply<'_>,
     message: MessageId,
-    now: i64,
-) -> Result<Written> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (account, conv) = own_message(&tx, message)?;
-    let (_, state, _) =
-        row_of(&tx, message)?.ok_or(CoreError::InvalidInput("the message is not queued"))?;
-    if state == TRANSMITTING {
-        return Err(CoreError::refused(
-            Refusal::BeingSent,
-            "the message is being sent",
-        ));
-    }
-    if send_states(&tx, message)?.values().any(|s| !s.needs_send()) {
-        return Err(CoreError::InvalidInput(
-            "the message reached some recipients already",
-        ));
-    }
-    let mut apply = apply_for(&tx, account, scope, now)?;
+    conv: ConversationId,
+) -> Result<()> {
     // Its imported files go with it (unlinked after the commit).
     apply.delete_attachments(message)?;
     tx.prepare_cached("DELETE FROM messages WHERE id = ?1")?
@@ -2564,15 +3136,133 @@ pub(crate) fn cancel(
     apply.recount(conv)?;
     apply.ch.conversations.insert(conv);
     apply.ch.timelines.insert(conv);
+    Ok(())
+}
+
+/// What [`cancel`] did.
+#[derive(Debug)]
+pub(crate) enum Cancelled {
+    /// The message was taken back (it was waiting).
+    TakenBack(Written),
+    /// The message is in flight and uploading: the stop is ASKED ([`CANCEL_ASKED`] is written);
+    /// the dispatcher now asks the backend, and its answer decides ([`answer_cancel`]).
+    Asked(Written),
+}
+
+/// §4.8 step 5: a queued or failed message that no recipient has and that no attempt may have
+/// reached the server for ([`actions::sending_of`], the rule of the flag `take_back`) is deleted
+/// with its outbox row. A message in flight is taken back here only as far as the user's wish goes: when it is
+/// [`actions::stoppable`] (the backend reports an upload of its first attempt and nobody has
+/// it) the stop is written down ([`CANCEL_ASKED`], durable) and the message stays until the
+/// backend has answered; any other message in flight is refused. `uploading`: the core's set of
+/// reported uploads holds the message; the caller reads it INSIDE the write, so the rule is
+/// judged on the state the row has here.
+pub(crate) fn cancel(
+    conn: &mut Connection,
+    scope: MsgIdScope,
+    message: MessageId,
+    now: i64,
+    uploading: bool,
+) -> Result<Cancelled> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (account, conv) = own_message(&tx, message)?;
+    let (_, state, _) =
+        row_of(&tx, message)?.ok_or(CoreError::InvalidInput("the message is not queued"))?;
+    if state == TRANSMITTING {
+        let (attempts, cancel_state): (i64, i64) = tx
+            .prepare_cached(
+                "SELECT attempts, cancel_state FROM outbox WHERE message_id = ?1 AND kind = ?2",
+            )?
+            .query_row((message.0, MESSAGE), |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let stoppable = actions::stoppable(actions::StopFacts {
+            transmitting: true,
+            uploading,
+            attempts,
+            reached: uploading
+                && attempts == 1
+                && send_states(&tx, message)?.values().any(|s| !s.needs_send()),
+            asked: cancel_state != CANCEL_NONE,
+        });
+        if !stoppable {
+            return Err(CoreError::refused(
+                Refusal::BeingSent,
+                "the message is being sent",
+            ));
+        }
+        tx.prepare_cached(
+            "UPDATE outbox SET cancel_state = ?2 WHERE message_id = ?1 AND kind = ?3",
+        )?
+        .execute((message.0, CANCEL_ASKED, MESSAGE))?;
+        // The row's flags are read again: the X greys out.
+        let mut changes = Changes::default();
+        changes.message(conv, message);
+        tx.commit()?;
+        failpoint::hit(FAILPOINT_AFTER_CANCEL_ASKED);
+        return Ok(Cancelled::Asked(Written {
+            account,
+            conv,
+            changes,
+        }));
+    }
+    // The flag's own rule ([`actions::cancel_sending`]: a take-back is offered for a message
+    // nothing was handed to the network for), judged here on the state the row has INSIDE this
+    // write: a retry wait after an attempt that may have reached the server (a dropped reply, a
+    // temporary failure) is refused like a message in flight, whatever the X on screen said.
+    match actions::sending_of(&tx, message, false)? {
+        Sending::Unsent { attempted: false } => {}
+        Sending::Unsent { attempted: true } => {
+            return Err(CoreError::refused(
+                Refusal::BeingSent,
+                "an attempt to send the message may have reached the server",
+            ));
+        }
+        _ => {
+            return Err(CoreError::InvalidInput(
+                "the message reached some recipients already",
+            ));
+        }
+    }
+    let mut apply = apply_for(&tx, account, scope, now)?;
+    take_back(&tx, &mut apply, message, conv)?;
     let changes = std::mem::take(&mut apply.ch);
     drop(apply);
     tx.commit()?;
-    Ok(Written {
+    Ok(Cancelled::TakenBack(Written {
         account,
         conv,
         changes,
-    })
+    }))
 }
+
+/// Of the paused conversations `convs`, the GROUPS of `account` that `user` is a member of
+/// (critic M4/F19): a confirm of one member resumes a group paused on another, whose head
+/// then retries (it pauses again on a member the backend still refuses: a Signal member in
+/// state 2; a member who was never verified is trusted at the retry, the lead's R1). One lookup per paused
+/// conversation (a handful), each by primary keys ([`PAUSED_GROUP_MEMBER`], plan test).
+pub(crate) fn groups_with_member(
+    conn: &Connection,
+    account: AccountId,
+    convs: &[ConversationId],
+    user: &UserId,
+) -> Result<Vec<ConversationId>> {
+    let group = sql::enum_name(&kourier_model::ConvKind::Group)?;
+    let mut stmt = conn.prepare_cached(PAUSED_GROUP_MEMBER)?;
+    let mut out = Vec::new();
+    for conv in convs {
+        let is: bool = stmt.query_row((conv.0, user.as_str(), account.0, &group), |r| r.get(0))?;
+        if is {
+            out.push(*conv);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether conversation ?1 is a group of account ?3 (kind ?4) with member ?2: the
+/// conversation by its rowid, the member by the primary key `(conversation_id, user_id)`,
+/// never `members_by_user` (a user is in many groups).
+pub(crate) const PAUSED_GROUP_MEMBER: &str = "SELECT EXISTS(SELECT 1 FROM conversations c
+   WHERE c.id = ?1 AND c.account_id = ?3 AND c.kind = ?4
+     AND EXISTS(SELECT 1 FROM members m WHERE m.conversation_id = c.id AND m.user_id = ?2))";
 
 /// After `ConfirmIdentity`: the paused heads show `Queued` again until their next attempt.
 pub(crate) fn requeue(
@@ -2631,6 +3321,42 @@ pub(crate) fn save_draft(
 mod tests {
     use super::*;
 
+    /// The lookup of a confirm's groups goes by primary keys: no scan, and not the index of
+    /// every membership of the user (core.db has no planner statistics, `core.md`).
+    #[test]
+    fn the_paused_group_lookup_goes_by_primary_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = kourier_db::DbKey::from([7u8; 32]);
+        let mut conn = kourier_db::open(&dir.path().join("core.db"), &key).unwrap();
+        kourier_db::migrate(&mut conn, &crate::store::MIGRATIONS).unwrap();
+        let steps: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {PAUSED_GROUP_MEMBER}"))
+            .unwrap()
+            .query_map((1_i64, "aci:x", 1_i64, "Group"), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            steps
+                .iter()
+                .all(|s| (s == "SCAN CONSTANT ROW" || !s.starts_with("SCAN"))
+                    && !s.contains("members_by_user")),
+            "{steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("members") && s.contains("conversation_id=? AND user_id=?")),
+            "{steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.starts_with("SEARCH c USING INTEGER PRIMARY KEY")),
+            "{steps:#?}"
+        );
+    }
+
     /// An unrecordable outcome hands the row back to the queue after a backoff; a row that is
     /// not in flight is left alone.
     #[test]
@@ -2647,7 +3373,13 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(release(&conn, 1, 1_000).unwrap());
+        let signal = NetRules::signal(MsgIdScope::AccountAuthor);
+        let released = |conn: &mut Connection, rules: NetRules, row: i64| {
+            release(conn, AccountId(1), rules, row, 1_000)
+                .unwrap()
+                .released
+        };
+        assert!(released(&mut conn, signal, 1));
         let (state, next): (String, i64) = conn
             .query_row(
                 "SELECT state, next_attempt_at FROM outbox WHERE id = 1",
@@ -2658,9 +3390,9 @@ mod tests {
         assert_eq!(state, QUEUED);
         // backoff(4) = 685 ms, raised to the 1 s floor.
         assert_eq!(next, 1_000 + 1_000);
-        assert!(!release(&conn, 2, 1_000).unwrap(), "not in flight");
-        assert!(!release(&conn, 1, 1_000).unwrap(), "already released");
-        assert!(!release(&conn, 9, 1_000).unwrap(), "gone");
+        assert!(!released(&mut conn, signal, 2), "not in flight");
+        assert!(!released(&mut conn, signal, 1), "already released");
+        assert!(!released(&mut conn, signal, 9), "gone");
     }
 
     /// The dispatcher's look at the outbox reads one head per conversation along the index
@@ -2854,6 +3586,96 @@ mod tests {
         assert!(!prune_gone_files(&conn, MessageId(7), &mut req).unwrap());
     }
 
+    /// The backend's `AttachmentProgress.index` is a position in the attempt's request, which
+    /// lost a file meanwhile: `take_due` maps each position to the attachment row that owns the
+    /// file (a position, not the row's `idx`).
+    #[test]
+    fn an_attempt_names_the_attachment_rows_of_its_requests_files() {
+        use crate::attachments::import::{Imported, Written};
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::scripts::{remote, signal_features};
+        use kourier_model::{AttachmentKind, ConversationPatch};
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let mut patch = ConversationPatch::new(key.clone());
+        patch.features = Some(signal_features(false));
+        h.apply(vec![
+            BackendEvent::ConversationUpsert(patch),
+            BackendEvent::Message(remote(&key, &alice, "100", 100, "hello")),
+        ])
+        .unwrap();
+        let account = h.account();
+        let conn = h.connection_mut();
+        let conv = ConversationId(id_of(conn, "SELECT id FROM conversations"));
+        let net = kourier_fake::FakeNetwork::new(
+            kourier_fake::Flavor::SignalLike,
+            kourier_fake::Script::new("ids", vec![UserId::parse(ME).unwrap()]),
+        );
+        let picture = |i: usize| Imported {
+            kind: AttachmentKind::Image,
+            content: AttachmentKind::Image,
+            file_name: None,
+            dims: Some((40, 30)),
+            blurhash: None,
+            file: Written {
+                path: format!("core/aa/{i:032x}").into(),
+                key: kourier_blob::FileKey::from_bytes([1; 32]),
+                size: 10,
+                mime: "image/png".into(),
+            },
+            thumb: None,
+        };
+        let files: std::sync::Arc<[Imported]> = (0..3).map(picture).collect();
+        match enqueue_files(conn, &net, conv, files, None, None, 1_000) {
+            Ok(FilesStep::Done(..)) => {}
+            other => panic!("not stored whole: {other:?}"),
+        }
+        let rules = NetRules::signal(MsgIdScope::AccountAuthor);
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM attachments ORDER BY idx")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids.len(), 3, "one album of three pictures");
+
+        // Whole: the positions are the rows in order.
+        let due = take_due(conn, account, rules, 2_000, &Skip::default(), 4).unwrap();
+        let [attempt] = &due.attempts[..] else {
+            panic!("{due:?}")
+        };
+        assert_eq!(
+            attempt.attachments,
+            ids.iter()
+                .map(|id| Some(AttachmentId(*id)))
+                .collect::<Vec<_>>()
+        );
+
+        // The second picture is deleted from another own device before the next attempt
+        // (the attempt failed and waits again): the request loses it, and position 1 is now
+        // the THIRD picture's row, not the row with `idx` 1.
+        conn.execute(
+            "UPDATE outbox SET state = 'Queued', next_attempt_at = NULL",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM attachments WHERE id = ?1", [ids[1]])
+            .unwrap();
+        let due = take_due(conn, account, rules, 3_000, &Skip::default(), 4).unwrap();
+        let [attempt] = &due.attempts[..] else {
+            panic!("{due:?}")
+        };
+        assert_eq!(
+            attempt.attachments,
+            [Some(AttachmentId(ids[0])), Some(AttachmentId(ids[2]))],
+            "the positions of the request that goes out, not the rows' idx"
+        );
+    }
+
     /// A send of more messages than one transaction writes is stored in parts whose rows
     /// the dispatcher does not see; the last part makes all of them due at once and clears
     /// the draft. A send that fails between two parts is dropped whole, with the rows of
@@ -2928,7 +3750,7 @@ mod tests {
         let due = take_due(
             conn,
             account,
-            MsgIdScope::AccountAuthor,
+            NetRules::signal(MsgIdScope::AccountAuthor),
             2_000,
             &Skip::default(),
             4,
@@ -3014,7 +3836,7 @@ mod tests {
         let due = take_due(
             conn,
             account,
-            MsgIdScope::AccountAuthor,
+            NetRules::signal(MsgIdScope::AccountAuthor),
             5_000,
             &Skip::default(),
             4,
@@ -3286,6 +4108,316 @@ mod tests {
         (h, net, first, conv)
     }
 
+    /// K-A fix C6: a refusal as a first contact also fails the rows of the chat that are still
+    /// being stored (`Staged`), not only the `Queued` ones: they would be due a moment later.
+    #[test]
+    fn a_reach_out_refusal_also_fails_the_rows_still_being_staged() {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::scripts::remote;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        h.apply(vec![BackendEvent::Message(remote(
+            &key, &alice, "100", 100, "hello",
+        ))])
+        .unwrap();
+        let net = kourier_fake::FakeNetwork::new(
+            kourier_fake::Flavor::SignalLike,
+            kourier_fake::Script::new("staged-463", vec![UserId::parse(ME).unwrap()]),
+        );
+        let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
+        for (i, text) in ["refused", "queued", "staging"].into_iter().enumerate() {
+            enqueue_text(
+                h.connection_mut(),
+                &net,
+                conv,
+                Text::plain(text),
+                None,
+                1_000 + i64::try_from(i).unwrap(),
+            )
+            .unwrap();
+        }
+        // The third is the first part of a send that is still being written.
+        h.connection()
+            .execute(
+                "UPDATE outbox SET state = ?1 WHERE id = (SELECT max(id) FROM outbox)",
+                [STAGED],
+            )
+            .unwrap();
+        let first = MessageId(id_of(
+            h.connection(),
+            "SELECT message_id FROM outbox ORDER BY id LIMIT 1",
+        ));
+        let account = h.account();
+        {
+            let conn = h.connection_mut();
+            let tx = conn.transaction().unwrap();
+            let mut apply = apply_for(&tx, account, MsgIdScope::AccountAuthor, 2_000).unwrap();
+            fail_waiting_of(&tx, &mut apply, conv, first, &FailReason::ReachOutRefused).unwrap();
+            apply.finish().unwrap();
+            drop(apply);
+            tx.commit().unwrap();
+        }
+        let states: Vec<String> = h
+            .connection()
+            .prepare("SELECT state FROM outbox ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            [QUEUED, FAILED, FAILED],
+            "the refused row is the caller's; the queued and the staged one fail"
+        );
+    }
+
+    /// `n` small files as the import step hands them to a send.
+    fn files_of(n: usize) -> std::sync::Arc<[crate::attachments::import::Imported]> {
+        use crate::attachments::import::{Imported, Written};
+        use kourier_model::AttachmentKind;
+        (0..n)
+            .map(|i| Imported {
+                kind: AttachmentKind::File,
+                content: AttachmentKind::File,
+                file_name: Some(format!("doc-{i:03}.txt")),
+                dims: None,
+                blurhash: None,
+                file: Written {
+                    path: format!("core/aa/{i:032x}").into(),
+                    key: kourier_blob::FileKey::from_bytes([1; 32]),
+                    size: 10,
+                    mime: "text/plain".into(),
+                },
+                thumb: None,
+            })
+            .collect()
+    }
+
+    /// Stores a send of `n` files in parts until its last part makes its rows due (or fails
+    /// them); `between` runs after the first part.
+    fn store_in_parts(
+        h: &mut crate::testing::IngestHarness,
+        net: &kourier_fake::FakeNetwork,
+        conv: ConversationId,
+        n: usize,
+        now: i64,
+        between: impl FnOnce(&mut crate::testing::IngestHarness),
+    ) -> Vec<MessageId> {
+        let mut between = Some(between);
+        let mut step = enqueue_files(h.connection_mut(), net, conv, files_of(n), None, None, now)
+            .map_err(|e| format!("{e:?}"))
+            .unwrap();
+        loop {
+            match step {
+                FilesStep::Done(_, messages) => return messages,
+                FilesStep::More(send) => {
+                    if let Some(f) = between.take() {
+                        f(h);
+                    }
+                    step = enqueue_files_more(h.connection_mut(), net, send, now).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The states of the outbox rows of `messages`, in order.
+    fn row_states(conn: &Connection, messages: &[MessageId]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|m| {
+                conn.query_row(
+                    "SELECT state FROM outbox WHERE message_id = ?1 AND kind = 'Message'",
+                    [m.0],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// K-A fix 2 (C6, gap b): the parts of a large send that are stored after a 463 landed
+    /// fail with the rest of the send; they do not turn due at its end. A send begun after the
+    /// refusal is the user's own new act and goes out, though the chat has a refused message
+    /// behind it.
+    #[test]
+    fn a_reach_out_refusal_between_the_parts_of_a_large_send_fails_the_parts_that_follow() {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::scripts::remote;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        h.apply(vec![BackendEvent::Message(remote(
+            &key, &alice, "100", 100, "hello",
+        ))])
+        .unwrap();
+        let net = kourier_fake::FakeNetwork::new(
+            kourier_fake::Flavor::SignalLike,
+            kourier_fake::Script::new("parts-463", vec![UserId::parse(ME).unwrap()]),
+        );
+        let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
+        // The message the network refuses (its answer lands while the send is stored).
+        enqueue_text(
+            h.connection_mut(),
+            &net,
+            conv,
+            Text::plain("refused"),
+            None,
+            900,
+        )
+        .unwrap();
+        let refused = MessageId(id_of(h.connection(), "SELECT message_id FROM outbox"));
+        let account = h.account();
+        let n = 2 * ENQUEUE_CHUNK + 22;
+        let send = store_in_parts(&mut h, &net, conv, n, 1_000, |h| {
+            let conn = h.connection_mut();
+            let tx = conn.transaction().unwrap();
+            let mut apply = apply_for(&tx, account, MsgIdScope::AccountAuthor, 1_500).unwrap();
+            fail_waiting_of(&tx, &mut apply, conv, refused, &FailReason::ReachOutRefused).unwrap();
+            apply.finish().unwrap();
+            drop(apply);
+            tx.commit().unwrap();
+        });
+        assert_eq!(send.len(), n);
+        let states = row_states(h.connection(), &send);
+        assert!(
+            states.iter().all(|s| s == FAILED),
+            "the part stored before the refusal and every part after it fail: {states:?}"
+        );
+        for m in [send[0], send[n - 1]] {
+            assert_eq!(
+                floor(h.connection(), m).unwrap(),
+                Some(OutgoingState::Failed {
+                    reason: FailReason::ReachOutRefused,
+                    retryable: false
+                }),
+                "shown as the 463 line"
+            );
+        }
+        // Only the row the refusal was answered for waits for its own answer.
+        let due = take_due(
+            h.connection_mut(),
+            account,
+            NetRules::signal(MsgIdScope::AccountAuthor),
+            3_000,
+            &Skip::default(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            due.attempts.iter().map(|a| a.message).collect::<Vec<_>>(),
+            [refused],
+            "no part of the refused send is attempted"
+        );
+
+        // A send begun afterwards: the chat's newest floors are the refusal, and it is queued.
+        let later = store_in_parts(&mut h, &net, conv, ENQUEUE_CHUNK + 3, 5_000, |_| {});
+        let states = row_states(h.connection(), &later);
+        assert!(
+            states.iter().all(|s| s == QUEUED),
+            "a send begun after the refusal is due: {states:?}"
+        );
+    }
+
+    /// K-A fix 2 (C4): what a hold's time is given back to. Rows that waited through the whole
+    /// hold get all of it, a row made during the hold only the time since it was made, and a
+    /// row that is not waiting (failed) nothing; a hold without a start (a row an older build
+    /// wrote) gives nothing back.
+    #[test]
+    fn the_time_a_hold_stood_is_given_back_to_the_rows_that_waited_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        h.apply(vec![kourier_backend_api::BackendEvent::Message(
+            kourier_fake::scripts::remote(&key, &alice, "100", 100, "hello"),
+        )])
+        .unwrap();
+        let net = kourier_fake::FakeNetwork::new(
+            kourier_fake::Flavor::SignalLike,
+            kourier_fake::Script::new("give-back", vec![UserId::parse(ME).unwrap()]),
+        );
+        let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
+        let hour = 3_600_000_i64;
+        let day = ms(BUDGET);
+        // Made before the hold (t = 0), made during it (t = 3 h), and one that already failed.
+        for (text, at) in [("before", 0), ("during", 3 * hour), ("failed", 0)] {
+            enqueue_text(h.connection_mut(), &net, conv, Text::plain(text), None, at).unwrap();
+        }
+        h.connection()
+            .execute(
+                "UPDATE outbox SET state = ?1 WHERE id = (SELECT max(id) FROM outbox)",
+                [FAILED],
+            )
+            .unwrap();
+        let deadlines = |h: &crate::testing::IngestHarness| -> Vec<i64> {
+            h.connection()
+                .prepare("SELECT deadline_at FROM outbox ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(deadlines(&h), [day, 3 * hour + day, day]);
+        let account = h.account();
+        let hold = |since_ms, until_ms| StoredHold {
+            hold: AccountHold {
+                until_ms,
+                reason: kourier_model::HoldReason::ReachOutLocked,
+            },
+            since_ms,
+        };
+        // No start: nothing to give back.
+        assert_eq!(
+            give_back_held_time(
+                h.connection(),
+                account,
+                &hold(None, None),
+                30 * hour,
+                OutboxPolicy::SIGNAL
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(deadlines(&h), [day, 3 * hour + day, day]);
+        // The hold began at 1 h and the backend lifted it at 30 h.
+        let rows = give_back_held_time(
+            h.connection(),
+            account,
+            &hold(Some(hour), None),
+            30 * hour,
+            OutboxPolicy::SIGNAL,
+        )
+        .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            deadlines(&h),
+            [day + 29 * hour, 3 * hour + day + 27 * hour, day],
+            "the whole hold for the first row, the time since it was made for the second, none for the failed one"
+        );
+        // A second hold, from 31 h, ran out at its date (33 h) and the core looked at 40 h:
+        // it is given back up to its date.
+        let before = deadlines(&h);
+        give_back_held_time(
+            h.connection(),
+            account,
+            &hold(Some(31 * hour), Some(u64::try_from(33 * hour).unwrap())),
+            40 * hour,
+            OutboxPolicy::SIGNAL,
+        )
+        .unwrap();
+        let after = deadlines(&h);
+        assert_eq!(after[0] - before[0], 2 * hour, "until 33 h, not 40 h");
+        assert_eq!(after[1] - before[1], 2 * hour);
+        assert_eq!(after[2], before[2]);
+    }
+
     /// A send that is stored in parts goes on where its messages are after a merge of two
     /// chats: the parts that follow are written into the chat that stayed, and the last one
     /// makes the rows of this send due, not the `Staged` rows of another send that is being
@@ -3348,7 +4480,7 @@ mod tests {
         let due = take_due(
             conn,
             account,
-            MsgIdScope::AccountAuthor,
+            NetRules::signal(MsgIdScope::AccountAuthor),
             3_000,
             &Skip::default(),
             4,
@@ -3498,7 +4630,7 @@ mod tests {
         let recorded = record_outcome(
             conn,
             account,
-            MsgIdScope::AccountAuthor,
+            NetRules::signal(MsgIdScope::AccountAuthor),
             1_000,
             &a,
             Some(refused),
@@ -3518,13 +4650,14 @@ mod tests {
                 since: 1_000,
             }
         );
-        assert!(stored.is_fresh(1_000) && stored.is_fresh(1_000 + ms(BUDGET)));
+        let policy = OutboxPolicy::SIGNAL;
+        assert!(stored.is_fresh(1_000, policy) && stored.is_fresh(1_000 + ms(BUDGET), policy));
         assert!(
-            !stored.is_fresh(1_001 + ms(BUDGET)),
+            !stored.is_fresh(1_001 + ms(BUDGET), policy),
             "a day later it is over"
         );
         assert!(
-            !stored.is_fresh(999),
+            !stored.is_fresh(999, policy),
             "from a clock that was set back since"
         );
         assert_eq!(
@@ -3562,6 +4695,56 @@ mod tests {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
+    /// T6b, the second half: on a network whose ids are unique per sender in a chat a call
+    /// line holds its id in its chat like an own message does, so an own send is never given
+    /// it (the line is a row under the per-conversation key, which the per-sender key does
+    /// not see: `Apply::by_key` answers an own key with the line of the chat).
+    #[test]
+    fn an_own_send_is_never_given_the_id_of_a_call_line_under_per_sender_ids() {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::calls::Call;
+        use kourier_model::CallMedia;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let at: i64 = 1_700_000_000_000;
+        let flavor = kourier_fake::Flavor::WhatsAppLike;
+        // The id the allocator tries first at `at`; a line of the chat has it.
+        let first = flavor.allocate(u64::try_from(at).unwrap()).local;
+        let BackendEvent::Message(mut ring) = Call::direct(&alice, 7, CallMedia::Voice).ring(at)
+        else {
+            panic!("a ring is a message");
+        };
+        ring.local = first.clone();
+        let mut h = harness(&dir, MsgIdScope::ConversationAuthor);
+        h.set_now(at);
+        h.apply(vec![BackendEvent::Message(ring)]).unwrap();
+        assert_eq!(
+            id_of(
+                h.connection(),
+                "SELECT count(*) FROM messages WHERE net_scope = 1"
+            ),
+            1,
+            "the line is there under the id"
+        );
+        let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
+        let account = h.account();
+        let net = kourier_fake::FakeNetwork::new(
+            flavor,
+            kourier_fake::Script::new("alloc", vec![UserId::parse(ME).unwrap()]),
+        );
+        let conn = h.connection_mut();
+        let tx = conn.transaction().unwrap();
+        let apply = apply_for(&tx, account, MsgIdScope::ConversationAuthor, at).unwrap();
+        let id = allocate(&apply, &net, conv, &key, at).unwrap();
+        assert_ne!(id.local, first, "the line's id was skipped");
+        assert!(
+            apply.by_key(conv, "", &id.local).unwrap().is_none(),
+            "and the id it got is free"
+        );
+    }
+
     /// The attempt that sends `kind` for `message` from outbox row 5.
     fn attempt(
         key: &ConvKey,
@@ -3581,6 +4764,7 @@ mod tests {
                 only: None,
                 is_recipient_update: false,
             },
+            attachments: Vec::new(),
             number: 1,
             started_at: 300,
         }
@@ -3632,7 +4816,7 @@ mod tests {
         let conv = ConversationId(id_of(conn, "SELECT id FROM conversations"));
         let record = |conn: &mut Connection, a: &Attempt| {
             let (scope, answer) = (MsgIdScope::AccountAuthor, accepted(&alice));
-            record_outcome(conn, account, scope, 1_000, a, answer).unwrap()
+            record_outcome(conn, account, NetRules::signal(scope), 1_000, a, answer).unwrap()
         };
 
         // A reaction to `first` was in flight when its row went.
@@ -3748,8 +4932,15 @@ mod tests {
             ],
         });
         let a = attempt(&key, conv, message, text("to the group"));
-        let recorded =
-            record_outcome(conn, account, MsgIdScope::AccountAuthor, 1_000, &a, answer).unwrap();
+        let recorded = record_outcome(
+            conn,
+            account,
+            NetRules::signal(MsgIdScope::AccountAuthor),
+            1_000,
+            &a,
+            answer,
+        )
+        .unwrap();
         assert!(recorded.failed.is_none());
         assert_eq!(waiting(conn), (1, 1), "bob's counts, the stranger's waits");
         let by: String = conn
@@ -3822,12 +5013,106 @@ mod tests {
         // The attempt still names the row's old message and conversation.
         let stale = attempt(&pni_key, old_conv, dropped, text("hello"));
         let scope = MsgIdScope::Conversation;
-        let recorded = record_outcome(conn, account, scope, 1_000, &stale, accepted(&pni)).unwrap();
+        let recorded = record_outcome(
+            conn,
+            account,
+            NetRules::signal(scope),
+            1_000,
+            &stale,
+            accepted(&pni),
+        )
+        .unwrap();
         assert_eq!(id_of(conn, "SELECT count(*) FROM outbox"), 0, "done");
         let got: Vec<RecipientState> = send_states(conn, kept).unwrap().into_values().collect();
         assert_eq!(got, [RecipientState::Sent { sealed: true }]);
         assert!(recorded.changes.conversations.contains(&conv));
         assert!(!recorded.changes.conversations.contains(&old_conv));
+    }
+
+    /// The wait of a released row follows the cap of the account's policy (K-B1 B6): a row
+    /// with ten attempts waits a minute under Signal's 15 minute cap and five seconds under a
+    /// cap of five.
+    #[test]
+    fn release_waits_no_longer_than_the_cap_of_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = kourier_db::DbKey::from([7u8; 32]);
+        let mut conn = kourier_db::open(&dir.path().join("core.db"), &key).unwrap();
+        kourier_db::migrate(&mut conn, &crate::store::MIGRATIONS).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO outbox(id, message_id, conversation_id, kind, request, state, attempts,
+               deadline_at) VALUES (1, 1, 1, 'Message', '{}', 'Transmitting', 10, 0),
+                                   (2, 2, 1, 'Message', '{}', 'Transmitting', 10, 0)",
+            [],
+        )
+        .unwrap();
+        let capped = OutboxPolicy {
+            max_backoff: Duration::from_secs(5),
+            ..OutboxPolicy::SIGNAL
+        };
+        let rules = |outbox| NetRules {
+            outbox,
+            ..NetRules::signal(MsgIdScope::AccountAuthor)
+        };
+        let released = |conn: &mut Connection, outbox, row| {
+            release(conn, AccountId(1), rules(outbox), row, 1_000)
+                .unwrap()
+                .released
+        };
+        assert!(released(&mut conn, OutboxPolicy::SIGNAL, 1));
+        assert!(released(&mut conn, capped, 2));
+        let next = |id: i64| -> i64 {
+            conn.query_row(
+                "SELECT next_attempt_at FROM outbox WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(next(1), 1_000 + ms(backoff(11)), "Signal's curve");
+        assert!(next(1) > 1_000 + 5_000, "a minute, not five seconds");
+        assert_eq!(next(2), 1_000 + 5_000, "the policy's cap");
+    }
+
+    /// The back-off keeps its curve for every cap and only moves where it stops.
+    #[test]
+    fn backoff_capped_keeps_the_curve_and_moves_the_cap() {
+        for n in [0, 1, 2, 5, 12, 40, u32::MAX] {
+            assert_eq!(backoff_capped(n, MAX_BACKOFF), backoff(n), "attempt {n}");
+        }
+        let one = Duration::from_secs(1);
+        assert_eq!(backoff_capped(4, one), Duration::from_millis(685));
+        assert_eq!(backoff_capped(5, one), one, "1,303 ms is capped");
+        assert_eq!(backoff_capped(u32::MAX, one), one);
+        assert_eq!(
+            backoff_capped(40, Duration::from_secs(3600)),
+            Duration::from_secs(3600),
+            "a higher cap lifts the old one"
+        );
+    }
+
+    /// A stored challenge counts for the lifetime the network's policy states.
+    #[test]
+    fn a_stored_challenge_is_fresh_for_the_lifetime_of_the_policy() {
+        let stored = StoredChallenge {
+            url: "https://example.invalid/c".into(),
+            token: None,
+            retry_at: None,
+            since: 1_000,
+        };
+        let short = OutboxPolicy {
+            challenge_lifetime: Duration::from_secs(3600),
+            ..OutboxPolicy::SIGNAL
+        };
+        assert!(stored.is_fresh(1_000 + 3_600_000, short));
+        assert!(
+            !stored.is_fresh(1_001 + 3_600_000, short),
+            "an hour is over"
+        );
+        assert!(
+            stored.is_fresh(1_001 + 3_600_000, OutboxPolicy::SIGNAL),
+            "Signal's is a day"
+        );
     }
 
     #[test]
@@ -3845,5 +5130,678 @@ mod tests {
             total += backoff(n);
         }
         assert!((100..=120).contains(&n), "{n}");
+    }
+
+    /// An own message of `key` with a `Message` outbox row in flight (`row` 5, the first
+    /// attempt) whose `cancel_state` is `mark`; its attempt, ready for [`record_outcome`].
+    fn in_flight_with_mark(
+        h: &mut crate::testing::IngestHarness,
+        key: &ConvKey,
+        local: &str,
+        row: i64,
+        mark: i64,
+    ) -> (MessageId, ConversationId, Attempt) {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::scripts::own;
+
+        h.apply(vec![BackendEvent::Message(own(key, local, 100, "picture"))])
+            .unwrap();
+        let conn = h.connection_mut();
+        let message = MessageId(id_of(
+            conn,
+            &format!("SELECT id FROM messages WHERE net_local = '{local}'"),
+        ));
+        let conv = ConversationId(id_of(conn, "SELECT id FROM conversations"));
+        let mut a = attempt(key, conv, message, text("picture"));
+        a.outbox = row;
+        // The stored request is the attempt's own, so `take_due` can read the row again.
+        conn.execute(
+            "INSERT INTO outbox(id, message_id, conversation_id, kind, request, state, attempts,
+               deadline_at, cancel_state) VALUES (?1, ?2, ?3, 'Message', ?5, 'Transmitting', 1,
+               9000, ?4)",
+            (row, message.0, conv.0, mark, sql::to_json(&a.req).unwrap()),
+        )
+        .unwrap();
+        (message, conv, a)
+    }
+
+    fn mark_of(conn: &Connection, row: i64) -> Option<(String, i64)> {
+        conn.query_row(
+            "SELECT state, cancel_state FROM outbox WHERE id = ?1",
+            [row],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// Upload progress, critic B2. What an attempt's end does to a message depends on what the
+    /// backend promised: after `Stopping` (mark 2) nothing went out, so `Failed` AND no reply
+    /// take the message back with its outbox row; a send that went out anyway is recorded as
+    /// sent (a backend bug, the mark goes). A mark that was only ASKED (1) promises nothing:
+    /// the outcome is read as it comes, and the row goes on without the mark.
+    #[test]
+    fn a_stopped_attempt_is_taken_back_and_an_asked_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let account = h.account();
+        let scope = MsgIdScope::AccountAuthor;
+        let transient = || {
+            Some(TransmitOutcome::Failed(BackendError::new(
+                ErrorKind::Transient { retry_after: None },
+                "timed out",
+            )))
+        };
+        let refused = || {
+            Some(TransmitOutcome::Failed(BackendError::new(
+                ErrorKind::Internal,
+                "stopped by the user before anything was sent",
+            )))
+        };
+        // (name, mark, outcome, taken back?)
+        let cases: Vec<(&str, i64, Option<TransmitOutcome>, bool)> = vec![
+            ("stopped, failed", CANCEL_STOPPING, refused(), true),
+            (
+                "stopped, a transient failure",
+                CANCEL_STOPPING,
+                transient(),
+                true,
+            ),
+            ("stopped, no reply", CANCEL_STOPPING, None, true),
+            (
+                "asked, a transient failure",
+                CANCEL_ASKED,
+                transient(),
+                false,
+            ),
+            ("asked, no reply", CANCEL_ASKED, None, false),
+        ];
+        for (n, (name, mark, outcome, taken_back)) in cases.into_iter().enumerate() {
+            let local = format!("{}", 200 + n);
+            let (message, conv, a) = in_flight_with_mark(&mut h, &key, &local, 10 + n as i64, mark);
+            let conn = h.connection_mut();
+            let rec =
+                record_outcome(conn, account, NetRules::signal(scope), 1_000, &a, outcome).unwrap();
+            let there = count_of(conn, "messages", message);
+            if taken_back {
+                assert_eq!(there, 0, "{name}: the message is gone");
+                assert!(mark_of(conn, a.outbox).is_none(), "{name}: so is its row");
+                assert!(rec.changes.timelines.contains(&conv), "{name}: published");
+            } else {
+                assert_eq!(there, 1, "{name}: the message stays");
+                assert_eq!(
+                    mark_of(conn, a.outbox).map(|(_, m)| m),
+                    Some(CANCEL_NONE),
+                    "{name}: the row goes on without the mark"
+                );
+            }
+        }
+        // A stopped attempt that reports a send went out: sent, never taken back.
+        let (message, _, a) = in_flight_with_mark(&mut h, &key, "299", 99, CANCEL_STOPPING);
+        let conn = h.connection_mut();
+        record_outcome(
+            conn,
+            account,
+            NetRules::signal(scope),
+            1_000,
+            &a,
+            accepted(&alice),
+        )
+        .unwrap();
+        assert_eq!(
+            count_of(conn, "messages", message),
+            1,
+            "it was sent: it stays"
+        );
+        assert!(mark_of(conn, 99).is_none(), "its row ended with the send");
+    }
+
+    fn count_of(conn: &Connection, table: &str, message: MessageId) -> i64 {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE id = ?1"),
+            [message.0],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Upload progress, critic B2. A start after a quit or a crash in the middle of a stop:
+    /// the row whose stop the backend had ACCEPTED (2) is taken back with the files'
+    /// attachment rows, a row only asked (1) and one never asked (0) are queued again, all
+    /// without a mark.
+    #[test]
+    fn a_start_takes_back_a_stopped_attempt_and_queues_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice);
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let account = h.account();
+        let (m0, conv, _) = in_flight_with_mark(&mut h, &key, "300", 20, CANCEL_NONE);
+        let (m1, _, _) = in_flight_with_mark(&mut h, &key, "301", 21, CANCEL_ASKED);
+        let (m2, _, _) = in_flight_with_mark(&mut h, &key, "302", 22, CANCEL_STOPPING);
+        let conn = h.connection_mut();
+        // The stopped message has an attachment row, which goes with it.
+        conn.execute(
+            "INSERT INTO attachments(message_id, idx, kind, state)
+             VALUES (?1, 0, 'Image', '\"Local\"')",
+            [m2.0],
+        )
+        .unwrap();
+        let (rows, changes) =
+            reset_transmitting(conn, account, MsgIdScope::AccountAuthor, 5_000).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(count_of(conn, "messages", m2), 0, "the stopped one is gone");
+        assert!(mark_of(conn, 22).is_none());
+        assert_eq!(
+            id_of(conn, "SELECT count(*) FROM attachments"),
+            0,
+            "with its attachment rows"
+        );
+        assert!(changes.timelines.contains(&conv), "the chat is published");
+        for (m, row) in [(m0, 20), (m1, 21)] {
+            assert_eq!(count_of(conn, "messages", m), 1);
+            assert_eq!(
+                mark_of(conn, row),
+                Some((QUEUED.to_owned(), CANCEL_NONE)),
+                "queued again, without a mark"
+            );
+        }
+    }
+
+    /// Upload progress, fix K1 (the cancel review's HIGH 1). A stop mark never outlives the
+    /// attempt it was written for. When an outcome cannot be recorded, `release` hands the row
+    /// back: with the backend's `Stopping` (mark 2) the attempt reached nobody and the user
+    /// asked for the message to go, so it is TAKEN BACK in the same write (rows, files by the
+    /// returned changes) and no second attempt ever starts; a mark that was only asked (1)
+    /// becomes 0, the second attempt is a normal one, and its no-reply outcome keeps the message.
+    #[test]
+    fn a_release_ends_the_stop_with_its_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice);
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let account = h.account();
+        let rules = NetRules::signal(MsgIdScope::AccountAuthor);
+
+        // Mark 2: the message goes with its attachment rows, published, and nothing starts.
+        let (stopped, conv, _) = in_flight_with_mark(&mut h, &key, "600", 50, CANCEL_STOPPING);
+        let conn = h.connection_mut();
+        conn.execute(
+            "INSERT INTO attachments(message_id, idx, kind, state)
+             VALUES (?1, 0, 'Image', '\"Local\"')",
+            [stopped.0],
+        )
+        .unwrap();
+        let released = release(conn, account, rules, 50, 1_000).unwrap();
+        assert!(released.released);
+        assert!(released.changes.timelines.contains(&conv), "published");
+        assert_eq!(count_of(conn, "messages", stopped), 0, "taken back");
+        assert!(mark_of(conn, 50).is_none(), "with its row");
+        assert_eq!(id_of(conn, "SELECT count(*) FROM attachments"), 0);
+        let due = take_due(conn, account, rules, 3_000, &Skip::default(), 4).unwrap();
+        assert!(due.attempts.is_empty(), "no second attempt: {due:?}");
+
+        // Mark 1: queued again without the mark; attempt 2 is an ordinary attempt.
+        let (asked, _, _) = in_flight_with_mark(&mut h, &key, "601", 51, CANCEL_ASKED);
+        let conn = h.connection_mut();
+        let released = release(conn, account, rules, 51, 1_000).unwrap();
+        assert!(released.released && released.changes.timelines.is_empty());
+        assert_eq!(
+            mark_of(conn, 51),
+            Some((QUEUED.to_owned(), CANCEL_NONE)),
+            "the mark ends with the attempt"
+        );
+        assert_eq!(count_of(conn, "messages", asked), 1, "the message stays");
+        let due = take_due(conn, account, rules, 3_000, &Skip::default(), 4).unwrap();
+        let [second] = &due.attempts[..] else {
+            panic!("{due:?}")
+        };
+        assert_eq!((second.message, second.number), (asked, 2));
+        record_outcome(conn, account, rules, 3_001, second, None).unwrap();
+        assert_eq!(
+            count_of(conn, "messages", asked),
+            1,
+            "attempt 2 never asked to stop: a lost reply keeps the message"
+        );
+        assert_eq!(
+            mark_of(conn, 51).map(|r| (r.0, r.1)),
+            Some((QUEUED.to_owned(), CANCEL_NONE))
+        );
+    }
+
+    /// Upload progress, fix K1, belt and braces. A mark that is on a row anyway (an older
+    /// build, a write that went wrong) is cleared when `take_due` starts the row's next
+    /// attempt, so it is never read as that attempt's: the lost reply of attempt 2 keeps the
+    /// message in both cases.
+    #[test]
+    fn a_stale_stop_mark_is_cleared_when_the_next_attempt_starts() {
+        for stale in [CANCEL_ASKED, CANCEL_STOPPING] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = ConvKey::Direct(UserId::parse(ALICE).unwrap());
+            let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+            let account = h.account();
+            let rules = NetRules::signal(MsgIdScope::AccountAuthor);
+            let (message, _, _) = in_flight_with_mark(&mut h, &key, "700", 60, CANCEL_NONE);
+            let conn = h.connection_mut();
+            // The row waits for its retry, with the mark written directly.
+            conn.execute(
+                "UPDATE outbox SET state = ?2, cancel_state = ?3 WHERE id = ?1",
+                (60, QUEUED, stale),
+            )
+            .unwrap();
+            assert_eq!(mark_of(conn, 60).map(|r| r.1), Some(stale));
+            let due = take_due(conn, account, rules, 3_000, &Skip::default(), 4).unwrap();
+            let [second] = &due.attempts[..] else {
+                panic!("mark {stale}: {due:?}")
+            };
+            assert_eq!(second.number, 2);
+            assert_eq!(
+                mark_of(conn, 60),
+                Some((TRANSMITTING.to_owned(), CANCEL_NONE)),
+                "mark {stale}: cleared with the start"
+            );
+            record_outcome(conn, account, rules, 3_001, second, None).unwrap();
+            assert_eq!(
+                count_of(conn, "messages", message),
+                1,
+                "mark {stale}: a message that may have gone is never taken back"
+            );
+        }
+    }
+
+    /// The dispatcher's write of the backend's answer: `Stopping` makes the mark durable and
+    /// only from "asked"; `TooLate` (or nothing) clears it; a row nobody asked about is left
+    /// alone.
+    #[test]
+    fn the_answer_to_a_stop_is_written_from_asked_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ConvKey::Direct(UserId::parse(ALICE).unwrap());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let (m0, _, _) = in_flight_with_mark(&mut h, &key, "400", 30, CANCEL_NONE);
+        let (m1, _, _) = in_flight_with_mark(&mut h, &key, "401", 31, CANCEL_ASKED);
+        let (m2, _, _) = in_flight_with_mark(&mut h, &key, "402", 32, CANCEL_ASKED);
+        let conn = h.connection_mut();
+        assert!(!answer_cancel(conn, m0, true).unwrap(), "never asked");
+        assert_eq!(mark_of(conn, 30).map(|r| r.1), Some(CANCEL_NONE));
+        assert!(answer_cancel(conn, m1, true).unwrap());
+        assert_eq!(mark_of(conn, 31).map(|r| r.1), Some(CANCEL_STOPPING));
+        assert!(
+            !answer_cancel(conn, m1, false).unwrap(),
+            "a mark that is Stopping is never cleared by a later TooLate"
+        );
+        assert_eq!(mark_of(conn, 31).map(|r| r.1), Some(CANCEL_STOPPING));
+        assert!(answer_cancel(conn, m2, false).unwrap());
+        assert_eq!(mark_of(conn, 32).map(|r| r.1), Some(CANCEL_NONE));
+    }
+
+    /// Upload progress, fix K2 (the cancel review's LOW 2). A message that waits is taken back
+    /// by the flag's own rule, judged inside the write: one nothing was attempted for goes; a
+    /// retry wait (an attempt before may have reached the server: a dropped reply, a temporary
+    /// failure) is refused `BeingSent` and stays with its row; one a recipient has stays too.
+    #[test]
+    fn a_cancel_of_a_waiting_message_follows_the_rule_of_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ConvKey::Direct(UserId::parse(ALICE).unwrap());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let scope = MsgIdScope::AccountAuthor;
+        let (retry, _, _) = in_flight_with_mark(&mut h, &key, "800", 70, CANCEL_NONE);
+        let (fresh, _, _) = in_flight_with_mark(&mut h, &key, "801", 71, CANCEL_NONE);
+        let conn = h.connection_mut();
+        // 70 waits for its retry after one attempt; 71 was never attempted.
+        conn.execute(
+            "UPDATE outbox SET state = ?2, attempts = ?3 WHERE id = ?1",
+            (70, QUEUED, 1),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE outbox SET state = ?2, attempts = ?3 WHERE id = ?1",
+            (71, QUEUED, 0),
+        )
+        .unwrap();
+        match cancel(conn, scope, retry, 1_000, false) {
+            Err(CoreError::Refused { reason, .. }) => assert_eq!(reason, Refusal::BeingSent),
+            other => panic!("a retry wait is not taken back: {other:?}"),
+        }
+        assert_eq!(count_of(conn, "messages", retry), 1, "the message stays");
+        assert_eq!(mark_of(conn, 70).map(|r| r.0), Some(QUEUED.to_owned()));
+        match cancel(conn, scope, fresh, 1_000, false).unwrap() {
+            Cancelled::TakenBack(_) => {}
+            other => panic!("a message never attempted is taken back: {other:?}"),
+        }
+        assert_eq!(count_of(conn, "messages", fresh), 0, "gone");
+        assert!(mark_of(conn, 71).is_none(), "with its row");
+    }
+
+    /// The command's half of the rule: an uploading first attempt is ASKED (the mark is
+    /// written, the message stays) and only once; a message in flight that the rule does not
+    /// allow (no reported upload, a retry, a recipient that has it) is refused as before.
+    #[test]
+    fn a_cancel_of_a_message_in_flight_asks_once_and_only_where_it_may() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(&dir, MsgIdScope::AccountAuthor);
+        let (message, conv, _) = in_flight_with_mark(&mut h, &key, "500", 40, CANCEL_NONE);
+        let conn = h.connection_mut();
+        let scope = MsgIdScope::AccountAuthor;
+        let refusal = |r: Result<Cancelled>| match r {
+            Err(CoreError::Refused { reason, .. }) => reason,
+            other => panic!("not refused: {other:?}"),
+        };
+        // No upload reported.
+        assert_eq!(
+            refusal(cancel(conn, scope, message, 1_000, false)),
+            Refusal::BeingSent
+        );
+        assert_eq!(mark_of(conn, 40).map(|r| r.1), Some(CANCEL_NONE));
+        // A retry.
+        conn.execute("UPDATE outbox SET attempts = 2 WHERE id = 40", [])
+            .unwrap();
+        assert_eq!(
+            refusal(cancel(conn, scope, message, 1_000, true)),
+            Refusal::BeingSent
+        );
+        conn.execute("UPDATE outbox SET attempts = 1 WHERE id = 40", [])
+            .unwrap();
+        // The first attempt of an uploading message: asked, the message stays, the chat's
+        // timeline is published for the greyed X.
+        match cancel(conn, scope, message, 1_000, true).unwrap() {
+            Cancelled::Asked(w) => {
+                assert_eq!(w.conv, conv);
+                assert!(
+                    w.changes
+                        .messages
+                        .get(&conv)
+                        .is_some_and(|ids| ids.contains(&message)),
+                    "the row is read again: the X greys out"
+                );
+            }
+            other => panic!("not asked: {other:?}"),
+        }
+        assert_eq!(mark_of(conn, 40).map(|r| r.1), Some(CANCEL_ASKED));
+        assert_eq!(count_of(conn, "messages", message), 1);
+        // Asked once.
+        assert_eq!(
+            refusal(cancel(conn, scope, message, 1_000, true)),
+            Refusal::BeingSent
+        );
+    }
+    // ---------- the gate of a new send (G4) ----------
+
+    /// Every reason the model has for "the user cannot send here". A new variant of
+    /// `CannotSend` stops the exhaustive `slot` below from compiling until it is listed here.
+    fn every_cannot_send() -> Vec<kourier_model::CannotSend> {
+        use kourier_model::CannotSend::*;
+        let all = vec![
+            NotMember,
+            AdminsOnly,
+            Blocked,
+            RequestPending,
+            Unregistered,
+            NotAccepted,
+            StillLoading,
+            InvitationPending,
+            JoinRequestPending,
+            Other("a reason in the network's words".into()),
+            NotYetBuilt,
+        ];
+        let slot = |c: &kourier_model::CannotSend| match c {
+            NotMember => 0,
+            AdminsOnly => 1,
+            Blocked => 2,
+            RequestPending => 3,
+            Unregistered => 4,
+            NotAccepted => 5,
+            StillLoading => 6,
+            InvitationPending => 7,
+            JoinRequestPending => 8,
+            Other(_) => 9,
+            NotYetBuilt => 10,
+        };
+        assert_eq!(
+            all.iter().map(slot).collect::<Vec<_>>(),
+            (0..11).collect::<Vec<_>>(),
+            "every variant is listed once"
+        );
+        all
+    }
+
+    /// The backend states the features of the chat with Alice, `reason` being why we cannot
+    /// send there (`None`: we can), as `ConversationUpsert` does.
+    fn state_cannot_send(
+        h: &mut crate::testing::IngestHarness,
+        reason: Option<kourier_model::CannotSend>,
+    ) {
+        use kourier_backend_api::BackendEvent;
+        let mut features = kourier_fake::scripts::signal_features(false);
+        features.cannot_send = reason;
+        let mut patch =
+            kourier_model::ConversationPatch::new(ConvKey::Direct(UserId::parse(ALICE).unwrap()));
+        patch.features = Some(features);
+        h.apply(vec![BackendEvent::ConversationUpsert(patch)])
+            .unwrap();
+    }
+
+    /// A chat with Alice that holds one message of hers and no stated features (`features`
+    /// NULL), a draft, and a fake network to send through.
+    fn a_chat_with_a_draft(
+        dir: &tempfile::TempDir,
+    ) -> (
+        crate::testing::IngestHarness,
+        kourier_fake::FakeNetwork,
+        ConversationId,
+    ) {
+        use kourier_backend_api::BackendEvent;
+        use kourier_fake::scripts::remote;
+        let alice = UserId::parse(ALICE).unwrap();
+        let key = ConvKey::Direct(alice.clone());
+        let mut h = harness(dir, MsgIdScope::AccountAuthor);
+        h.apply(vec![BackendEvent::Message(remote(
+            &key, &alice, "100", 100, "hello",
+        ))])
+        .unwrap();
+        let net = kourier_fake::FakeNetwork::new(
+            kourier_fake::Flavor::SignalLike,
+            kourier_fake::Script::new("gate", vec![UserId::parse(ME).unwrap()]),
+        );
+        let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
+        save_draft(h.connection(), conv, Some(&Text::plain("my unsent draft"))).unwrap();
+        (h, net, conv)
+    }
+
+    /// What a send stores: messages, outbox rows, `files` rows and attachment rows.
+    fn stored_rows(conn: &Connection) -> (i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM outbox),
+                    (SELECT count(*) FROM files), (SELECT count(*) FROM attachments)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn draft_stays(conn: &Connection, conv: ConversationId) -> bool {
+        conn.query_row(
+            "SELECT draft LIKE '%my unsent draft%' FROM conversations WHERE id = ?1",
+            [conv.0],
+            |r| r.get::<_, Option<bool>>(0),
+        )
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    fn contact_card() -> kourier_model::ContactCard {
+        kourier_model::ContactCard {
+            name: Some("Synthetic Person".into()),
+            ..Default::default()
+        }
+    }
+
+    /// G4: a NEW send into a chat whose stored features say `cannot_send` is refused with
+    /// `Refusal::CannotSend`, whatever the reason, for a text, for files with a caption and for
+    /// a card: nothing is written (no message, outbox row, file or attachment row) and the
+    /// draft stays. The composer is not there for such a chat; this is the core's own check
+    /// against a stale UI, a second front-end and a race.
+    #[test]
+    fn a_new_send_into_a_chat_that_cannot_send_is_refused_and_stores_nothing() {
+        for reason in every_cannot_send() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut h, net, conv) = a_chat_with_a_draft(&dir);
+            state_cannot_send(&mut h, Some(reason.clone()));
+            let conn = h.connection_mut();
+            let before = stored_rows(conn);
+            assert_eq!(before.1, 0, "{reason:?}: the premise, an empty outbox");
+
+            let text = enqueue_text(conn, &net, conv, Text::plain("typed too late"), None, 1_000);
+            assert_eq!(
+                text.err().and_then(|e| e.refusal()),
+                Some(Refusal::CannotSend),
+                "{reason:?}: a text"
+            );
+            let files = enqueue_files(
+                conn,
+                &net,
+                conv,
+                files_of(2),
+                Some(Text::plain("a caption")),
+                None,
+                1_000,
+            );
+            match files {
+                Err(FilesError::Other(e)) => {
+                    assert_eq!(e.refusal(), Some(Refusal::CannotSend), "{reason:?}: files")
+                }
+                Err(other) => {
+                    panic!("{reason:?}: files were refused for another reason: {other:?}")
+                }
+                Ok(step) => panic!("{reason:?}: files were stored: {step:?}"),
+            }
+            let card = enqueue_contact(conn, &net, conv, contact_card(), 1_000);
+            assert_eq!(
+                card.err().and_then(|e| e.refusal()),
+                Some(Refusal::CannotSend),
+                "{reason:?}: a card"
+            );
+            assert_eq!(stored_rows(conn), before, "{reason:?}: nothing was written");
+            assert!(draft_stays(conn, conv), "{reason:?}: the draft stays");
+        }
+    }
+
+    /// The gate refuses on what is STATED: a chat with no features at all (a new chat the
+    /// backend has not described yet) sends, as `ConversationRow.can_send` and the old
+    /// behaviour of every send have it; so does a chat that states features without a
+    /// reason. And a chat that cannot send now sends again once the backend clears the reason.
+    #[test]
+    fn a_chat_without_a_stated_reason_sends_and_one_that_lost_it_sends_again() {
+        // No features stored.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, net, conv) = a_chat_with_a_draft(&dir);
+        let conn = h.connection_mut();
+        assert_eq!(
+            id_of(conn, "SELECT features IS NULL FROM conversations"),
+            1,
+            "the premise: no features stored"
+        );
+        enqueue_text(conn, &net, conv, Text::plain("one"), None, 1_000).unwrap();
+        match enqueue_files(conn, &net, conv, files_of(2), None, None, 1_100) {
+            Ok(FilesStep::Done(..)) => {}
+            other => panic!("not stored whole: {other:?}"),
+        }
+        enqueue_contact(conn, &net, conv, contact_card(), 1_200).unwrap();
+        assert_eq!(
+            id_of(conn, "SELECT count(*) FROM outbox"),
+            4,
+            "a text, two files, a card"
+        );
+        assert!(!draft_stays(conn, conv), "the text took the draft");
+
+        // Features without a reason.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, net, conv) = a_chat_with_a_draft(&dir);
+        state_cannot_send(&mut h, None);
+        enqueue_text(
+            h.connection_mut(),
+            &net,
+            conv,
+            Text::plain("two"),
+            None,
+            1_000,
+        )
+        .unwrap();
+
+        // A reason, then none.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, net, conv) = a_chat_with_a_draft(&dir);
+        state_cannot_send(&mut h, Some(kourier_model::CannotSend::NotAccepted));
+        let refused = enqueue_text(
+            h.connection_mut(),
+            &net,
+            conv,
+            Text::plain("too early"),
+            None,
+            1_000,
+        );
+        assert_eq!(
+            refused.err().and_then(|e| e.refusal()),
+            Some(Refusal::CannotSend)
+        );
+        assert!(draft_stays(h.connection(), conv));
+        state_cannot_send(&mut h, None);
+        let conn = h.connection_mut();
+        enqueue_text(conn, &net, conv, Text::plain("accepted now"), None, 2_000).unwrap();
+        match enqueue_files(conn, &net, conv, files_of(1), None, None, 2_100) {
+            Ok(FilesStep::Done(..)) => {}
+            other => panic!("not stored whole: {other:?}"),
+        }
+        assert_eq!(
+            id_of(conn, "SELECT count(*) FROM outbox"),
+            2,
+            "only the sends after the reason went"
+        );
+        assert!(!draft_stays(conn, conv), "the text took the draft");
+    }
+
+    /// G4: only the FIRST part of a send is gated. A send of more than `ENQUEUE_CHUNK`
+    /// messages whose chat loses the right to send after its first part is finished: every
+    /// message is queued, in order, as for a chat that kept the right (a half of a send
+    /// would otherwise stay `Staged` for ever, or be dropped by the caller after the user
+    /// was told "sent"). The next NEW send into that chat is refused.
+    #[test]
+    fn a_large_send_whose_chat_loses_the_right_after_its_first_part_still_finishes() {
+        use kourier_model::CannotSend;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, net, conv) = a_chat_with_a_draft(&dir);
+        state_cannot_send(&mut h, None);
+        let n = 2 * ENQUEUE_CHUNK + 22;
+        let messages = store_in_parts(&mut h, &net, conv, n, 4_000, |h| {
+            state_cannot_send(h, Some(CannotSend::NotMember));
+            assert_eq!(
+                id_of(
+                    h.connection(),
+                    "SELECT json_extract(features, '$.cannot_send') = 'NotMember'
+                     FROM conversations"
+                ),
+                1,
+                "the premise: the chat lost the right between the parts"
+            );
+        });
+        assert_eq!(messages.len(), n);
+        let conn = h.connection_mut();
+        assert!(
+            row_states(conn, &messages).iter().all(|s| s == QUEUED),
+            "every message of the send is due"
+        );
+        assert_eq!(
+            id_of(conn, "SELECT count(*) FROM outbox WHERE state = 'Staged'"),
+            0
+        );
+        let next = enqueue_text(conn, &net, conv, Text::plain("another"), None, 5_000);
+        assert_eq!(
+            next.err().and_then(|e| e.refusal()),
+            Some(Refusal::CannotSend),
+            "a new send is gated again"
+        );
     }
 }

@@ -37,12 +37,57 @@
 //! A message that reached some recipients and failed for the others goes with the clear like
 //! any sent message: its outbox row is only kept for a "Retry" the user did not ask for, the
 //! other devices have the message, and the device that cleared deleted it.
+//!
+//! A clear BY TIME (K-B1, `ConversationCleared.before_ms`; WhatsApp's range carries a time,
+//! not anchors) and the user's own clear keep a CUT: `conversation_cuts`, the newest `sent_at`
+//! the clear covers per canonical conversation KEY (not the row id: a clear can come before its
+//! chat exists, as an app-state patch before the history that makes the chat). The cut is
+//! stored FIRST, so a clear for a chat the core does not have yet still holds; it only rises
+//! (a lower one never lowers it) and is never further ahead than the core's clock plus
+//! [`CLEAR_CLOCK_TOLERANCE`] (a time later than that is read as that bound, at ingest and at
+//! the user's clear: one wrong time would otherwise delete live messages and refuse the chat's
+//! history for good; a few minutes of a clock that runs behind the network's are not wrong).
+//!
+//! A clear by time is IDEMPOTENT. The table keeps the CLAIM beside the cut (`claimed_ms`, the
+//! time as the event stated it, before the clamp), and a delivery raises the cut, and removes
+//! what is at or below it, only when its claim is LARGER than the stored claim. The same clear
+//! delivered again (an app-state resync, a redelivery after a crash) changes nothing, so a live
+//! message that arrived in between ("what arrived after the clear came stays") is not removed
+//! by the replay, and a claim in the far future does not slide the cut to every later "now".
+//! Anchors apply on every delivery, as before. Then, when the conversation is here, every
+//! message at or below the cut goes, with the same exceptions as the anchors ([`UNSENT`],
+//! [`DELETE_QUEUED`]) and the same memory of keys. What it REFUSES is the history that comes
+//! later: a HISTORY row (a `HistoryBatch` row, K-B2's on-demand rows too) of the conversation at
+//! or below the cut is dropped, once per batch ([`Apply::cut_of`], the batch arm of
+//! `ingest/mod.rs`), and its key is REMEMBERED like the key of a removed row
+//! ([`Apply::remember_refused`]), so the order of a history chunk and a clear does not decide
+//! whether a later copy of that message shows. A chat cleared on the phone or here is not filled
+//! up again by chunks that keep coming. LIVE rows and catch-up rows are never refused by a cut: a
+//! live row's `sent_at` can be a sender's claim and a clock a day behind must not hide its live
+//! messages ("what arrived after the clear came stays" holds as for anchors). Merges move the
+//! cut with the alias (`merge::CUTS_REKEY`, keeping the larger of two, claim included) and
+//! then clear the HISTORY rows of the merged chat at or below the joined cut
+//! ([`Apply::clear_history_below_cut`]; live rows stay), or the order of a merge and the history
+//! would decide what shows.
+//!
+//! A cut is kept when its chat is removed (`ConversationRemoved`, the chat deleted here or on
+//! another device): a chat that is made again has the older history of the old one refused, as
+//! on the phone, whose clear also stands for the chat it made. The table grows by one row per
+//! cleared conversation key and nothing prunes it (a cut is a few dozen bytes). NOT done: a cut
+//! inferred from Signal's anchors; a `remove` whose chat the core does not have yet stores the
+//! cut but not the `remove` (the next upsert makes a listed empty chat: named for W6, whose
+//! `deleteChatAction` maps here).
+//!
+//! The user's own clear stores a cut too: the newest `sent_at` that went (a notice's included),
+//! or NOW when it removed nothing (a chat whose history has not arrived yet: the chunks that
+//! come later are older than the clear and stay out). The durable command carries the times of
+//! what went, split as the network's range splits them ([`Cleared`]).
 
-use kourier_backend_api::{CLEAR_ANCHORS, DurableCommand};
+use kourier_backend_api::{CLEAR_ANCHORS, CLEAR_CLOCK_TOLERANCE, DurableCommand};
 use kourier_db::rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use kourier_model::{
     AccountId, AccountState, AttachmentId, Body, CmdId, ConvKey, ConversationFeatures,
-    ConversationId, MessageId, MsgIdScope, MsgTarget, NetMsgId,
+    ConversationId, MessageId, MsgIdScope, MsgTarget, NetMsgId, Origin,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +126,66 @@ const UNSENT: &str = "EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = m.id
 const DELETE_QUEUED: &str =
     "EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = m.id AND o.kind = 'Delete')";
 
+/// SQL: the cut of the conversation key `?2` of account `?1` (one primary-key lookup; plan test
+/// `tests::the_cut_of_a_history_row_is_one_key_lookup`).
+pub(crate) const CUT_OF: &str =
+    "SELECT before_ms FROM conversation_cuts WHERE account_id = ?1 AND conv_key = ?2";
+
+/// SQL: stores the claim `?4` (the time as the clear stated it) and its clamped cut `?3` for a
+/// conversation key. Only a LARGER claim than the stored one changes the row (the cut rises, never
+/// lowers; the claim is taken): a clear delivered again changes nothing, and `execute` says
+/// whether this one did (1 row) or not (0).
+pub(crate) const STORE_CUT: &str =
+    "INSERT INTO conversation_cuts(account_id, conv_key, before_ms, claimed_ms)
+ VALUES (?1, ?2, ?3, ?4)
+ ON CONFLICT(account_id, conv_key) DO UPDATE SET
+   before_ms = max(before_ms, excluded.before_ms), claimed_ms = excluded.claimed_ms
+ WHERE excluded.claimed_ms > claimed_ms";
+
+/// SQL: the user's OWN clear here (a clear made in Kourier, at the core's clock): the local cut
+/// `?3` rises to at least this clear's time, whatever claim is stored. [`STORE_CUT`] does nothing
+/// when the stored claim is the larger (a far-future claim of the phone, clamped to the clock of
+/// its day): the user's clear, hours later, would leave the cut where the old clamp put it and the
+/// history between the two would come back. The claim only rises to `?3` (`max`, never lowered), so
+/// a replay of the phone's claim still changes nothing.
+pub(crate) const STORE_OWN_CUT: &str =
+    "INSERT INTO conversation_cuts(account_id, conv_key, before_ms, claimed_ms)
+ VALUES (?1, ?2, ?3, ?3)
+ ON CONFLICT(account_id, conv_key) DO UPDATE SET
+   before_ms = max(before_ms, excluded.before_ms),
+   claimed_ms = max(claimed_ms, excluded.claimed_ms)";
+
+/// The range of a clear by time: every message at or below the cut `?2`.
+const BY_TIME: &str = "m.sent_at <= ?2";
+
+/// The range of the clean-up after a merge joined two cuts: the HISTORY rows at or below the
+/// joined cut `?2` (live rows stay, [`Apply::clear_history_below_cut`]).
+const HISTORY_BY_TIME: &str = "m.history = 1 AND m.sent_at <= ?2";
+
+/// SQL: remembers the key of a history row the cut refused, as [`Apply::remove_messages`]
+/// remembers a removed one: `?1` account, `?2` scope, `?3` conversation key, `?4` author, `?5`
+/// local id, `?6` now, `?7` the oldest time that still counts
+/// ([`REMEMBER`](crate::expiry::REMEMBER)). Once per key: a refused chunk that is delivered again
+/// adds nothing (the table has no unique key, and a replay must not grow it).
+pub(crate) const REMEMBER_REFUSED: &str =
+    "INSERT INTO expired_messages(account_id, net_scope, conv_key,
+   net_author, net_local, expired_at)
+ SELECT ?1, ?2, ?3, ?4, ?5, ?6
+ WHERE NOT EXISTS (SELECT 1 FROM expired_messages WHERE account_id = ?1 AND net_local = ?5
+   AND net_scope = ?2 AND conv_key = ?3 AND net_author = ?4 AND expired_at >= ?7)";
+
+/// What clearing a set of messages did.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cleared {
+    /// Something changed for the user.
+    changed: bool,
+    /// The newest `sent_at` among the rows that went (or were hidden) that a person sent: not
+    /// `System`, not `Placeholder` (the filter of [`Apply::anchors`]), when any did.
+    newest_message_at: Option<i64>,
+    /// The newest `sent_at` among the other rows that went (or were hidden), when any did.
+    newest_system_at: Option<i64>,
+}
+
 /// What a delete made on this device did: the invalidations, and the durable commands that
 /// tell our other devices (already stored in `pending_commands`).
 #[derive(Debug)]
@@ -88,6 +193,24 @@ pub(crate) struct LocalDelete {
     pub account: AccountId,
     pub changes: Changes,
     pub commands: Vec<(CmdId, DurableCommand)>,
+}
+
+/// SQL: the messages of the conversation `?1` that `range` selects and a clear removes
+/// (`id`, `sent_at`, `body_kind`): not what still has to go out.
+fn select_gone(range: &str) -> String {
+    format!(
+        "SELECT m.id, m.sent_at, m.body_kind FROM messages m WHERE m.conversation_id = ?1 AND {range}
+           AND NOT {UNSENT} AND NOT {DELETE_QUEUED}"
+    )
+}
+
+/// SQL: the rows of a message whose delete for everyone still waits, that `range` selects and a
+/// clear hides (same columns).
+fn select_hidden(range: &str) -> String {
+    format!(
+        "SELECT m.id, m.sent_at, m.body_kind FROM messages m WHERE m.conversation_id = ?1 AND {range}
+           AND {DELETE_QUEUED} AND (m.deleted IS NULL OR m.deleted <> 'ForMe')"
+    )
 }
 
 thread_local! {
@@ -111,15 +234,28 @@ impl Apply<'_> {
     /// conversation
     /// left without a message a person sent loses its notices too and is hidden from the
     /// conversation list until it is used again. An anchor that is not here yet is waited
-    /// for (module docs).
+    /// for (module docs). With `before_ms` every message at or below that time goes too, and
+    /// the time is kept as the conversation's cut (module docs).
     pub(crate) fn conversation_cleared(
         &mut self,
         key: &ConvKey,
         up_to: &[MsgTarget],
         remove: bool,
+        before_ms: Option<i64>,
     ) -> Result<()> {
         let key = self.canon_conv(key)?;
         let encoded = key.encode();
+        // The cut first: a clear that comes before its chat holds for the chat (the early
+        // return below), and a kill after this line leaves the clear's other half to the
+        // event's replay (the transaction is the event's). A claim that is not larger than the
+        // stored one (a replay of the clear) raises nothing and removes nothing by time.
+        let cut = match before_ms {
+            Some(claim) => {
+                let cut = self.clamp_cut(claim);
+                self.store_cut(&encoded, claim, cut)?.then_some(cut)
+            }
+            None => None,
+        };
         let conv = sql::conversation_id(self.conn, self.acc.id, &key)?;
         // The newest anchor that is a message of this conversation. A reference that resolves
         // to a message of another chat (account-wide ids) is no anchor here; like one that
@@ -151,11 +287,116 @@ impl Apply<'_> {
         let Some(conv) = conv else {
             return Ok(());
         };
-        let changed = match newest {
-            Some(position) => self.clear_up_to(conv, position)?,
+        let mut changed = match newest {
+            Some(position) => self.clear_up_to(conv, position)?.changed,
             None => false,
         };
+        if let Some(cut) = cut {
+            changed |= self.clear_where(BY_TIME, (conv.0, cut))?.changed;
+        }
         self.after_clear(conv, remove, changed)
+    }
+
+    /// A time further ahead than the core's clock plus [`CLEAR_CLOCK_TOLERANCE`] is read as that
+    /// bound: a clear cannot name the far future, and a cut only rises, so one wrong time (a
+    /// phone's clock, a peer's claim) would otherwise be for ever. The network's clock may run
+    /// ahead of this computer's by minutes, which is not wrong.
+    fn clamp_cut(&self, claim: i64) -> i64 {
+        claim.min(
+            self.now
+                .saturating_add(crate::outbox::ms(CLEAR_CLOCK_TOLERANCE)),
+        )
+    }
+
+    /// The cut of the conversation with canonical key `conv_key` (encoded), when it has one.
+    pub(super) fn cut_of(&self, conv_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached(CUT_OF)?
+            .query_row((self.acc.id.0, conv_key), |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Stores the claim of a clear and its cut (already clamped) for the conversation with
+    /// canonical key `conv_key` ([`STORE_CUT`]). True when the claim was larger than the stored
+    /// one, i.e. the clear is news; false for a replay of a clear that was applied.
+    fn store_cut(&self, conv_key: &str, claim: i64, cut: i64) -> Result<bool> {
+        let changed =
+            self.conn
+                .prepare_cached(STORE_CUT)?
+                .execute((self.acc.id.0, conv_key, cut, claim))?;
+        Ok(changed > 0)
+    }
+
+    /// Stores the cut of the user's own clear ([`STORE_OWN_CUT`]): always at least `cut`, also when
+    /// a larger claim of the network is stored (the claim stays).
+    fn store_own_cut(&self, conv_key: &str, cut: i64) -> Result<()> {
+        self.conn
+            .prepare_cached(STORE_OWN_CUT)?
+            .execute((self.acc.id.0, conv_key, cut))?;
+        Ok(())
+    }
+
+    /// A history row the cut of its chat refuses: its key is remembered, as the key of a row a
+    /// clear removed is ([`Self::remove_messages`]), so a later copy of the message (a live
+    /// one, one under another identity) is dropped whichever came first, the history chunk or
+    /// the clear. The key is the one `message` would look up: the canonical chat, the author after
+    /// identity resolution (`''` for our own), the local id, and the call lines' own scope.
+    pub(super) fn remember_refused(&self, m: &kourier_backend_api::IncomingMessage) -> Result<()> {
+        let key = self.canon_conv(&m.conv)?;
+        let (scope, author) = if m.body.call_line().is_some() {
+            (MsgIdScope::Conversation, String::new())
+        } else {
+            let author = match &m.origin {
+                Origin::Remote { author, .. } => {
+                    let a = self.resolve_user(author)?;
+                    if self.is_own(&a) {
+                        String::new()
+                    } else {
+                        a.as_str().to_owned()
+                    }
+                }
+                Origin::OwnThisDevice | Origin::OwnOtherDevice { .. } => String::new(),
+            };
+            (self.scope, author)
+        };
+        self.conn.prepare_cached(REMEMBER_REFUSED)?.execute((
+            self.acc.id.0,
+            scope.db_code(),
+            key.encode(),
+            author,
+            &m.local,
+            self.now,
+            self.now
+                .saturating_sub(crate::outbox::ms(crate::expiry::REMEMBER)),
+        ))?;
+        Ok(())
+    }
+
+    /// After a merge joined the cuts of two conversation keys: the HISTORY rows of the
+    /// conversation with key `conv_key` at or below its cut go (their keys remembered), as if the
+    /// merge had come first and the chunks after it. LIVE rows stay ("what arrived after the clear
+    /// came stays"). One primary-key look-up of the cut when the conversation has none; with one,
+    /// a pass over the conversation's rows, which a merge of a cleared chat makes once.
+    pub(super) fn clear_history_below_cut(&mut self, conv_key: &str) -> Result<()> {
+        let Some(cut) = self.cut_of(conv_key)? else {
+            return Ok(());
+        };
+        let Some(conv) = self.conversation_by_key(conv_key)? else {
+            return Ok(());
+        };
+        let changed = self.clear_where(HISTORY_BY_TIME, (conv.0, cut))?.changed;
+        self.after_clear(conv, false, changed)
+    }
+
+    /// The conversation of this account with canonical key `conv_key` (encoded).
+    fn conversation_by_key(&self, conv_key: &str) -> Result<Option<ConversationId>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT id FROM conversations WHERE account_id = ?1 AND conv_key = ?2")?
+            .query_row((self.acc.id.0, conv_key), |r| r.get(0))
+            .optional()?
+            .map(ConversationId))
     }
 
     /// The anchor `row` of a clear that waited for it arrived (`payload`: the
@@ -165,7 +406,9 @@ impl Apply<'_> {
         let parked: ParkedClear = sql::from_json(payload)?;
         let (bound_key, bound_id) = parked.bound.unwrap_or((i64::MIN, i64::MIN));
         let range = "(m.id = ?2 OR m.sort_key < ?3 OR (m.sort_key = ?3 AND m.id <= ?4))";
-        let changed = self.clear_where(range, (row.conv.0, row.id.0, bound_key, bound_id))?;
+        let changed = self
+            .clear_where(range, (row.conv.0, row.id.0, bound_key, bound_id))?
+            .changed;
         self.after_clear(row.conv, parked.remove, changed)
     }
 
@@ -186,8 +429,11 @@ impl Apply<'_> {
     fn was_removed(&self, conv_key: &str, anchor: &CanonTarget) -> Result<bool> {
         let author = match (&anchor.author, self.scope) {
             (Some(a), _) => a.as_str(),
-            // Without an author an account-wide key cannot be looked up.
-            (None, MsgIdScope::AccountAuthor) => return Ok(false),
+            // Without an author a key that holds one (account-wide, or per sender in a chat)
+            // cannot be looked up.
+            (None, MsgIdScope::AccountAuthor | MsgIdScope::ConversationAuthor) => {
+                return Ok(false);
+            }
             (None, MsgIdScope::Conversation) => "",
         };
         for local in &anchor.locals {
@@ -221,49 +467,55 @@ impl Apply<'_> {
     }
 
     /// Deletes the messages of `conv` up to `position` in timeline order, apart from what
-    /// still has to go out (module docs). Returns whether anything changed for the user.
-    fn clear_up_to(&mut self, conv: ConversationId, position: (i64, i64)) -> Result<bool> {
+    /// still has to go out (module docs).
+    fn clear_up_to(&mut self, conv: ConversationId, position: (i64, i64)) -> Result<Cleared> {
         let range = "(m.sort_key < ?2 OR (m.sort_key = ?2 AND m.id <= ?3))";
         self.clear_where(range, (conv.0, position.0, position.1))
     }
 
     /// Clears the messages of the conversation `?1` that `range` (SQL over `m`, the other
     /// parameters) selects: they go, apart from an own message nobody has yet, which stays,
-    /// and a message whose delete for everyone still waits, whose row stays hidden. Returns
-    /// whether anything changed for the user.
+    /// and a message whose delete for everyone still waits, whose row stays hidden. Says
+    /// whether anything changed for the user and the newest `sent_at` of what went.
     fn clear_where(
         &mut self,
         range: &str,
         params: impl kourier_db::rusqlite::Params + Copy,
-    ) -> Result<bool> {
-        let gone: Vec<i64> = self
+    ) -> Result<Cleared> {
+        let gone: Vec<(i64, i64, String)> = self
             .conn
-            .prepare_cached(&format!(
-                "SELECT m.id FROM messages m WHERE m.conversation_id = ?1 AND {range}
-                   AND NOT {UNSENT} AND NOT {DELETE_QUEUED}"
-            ))?
-            .query_map(params, |r| r.get(0))?
+            .prepare_cached(&select_gone(range))?
+            .query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
         // The row of a message whose delete still has to reach the others carries that
         // delete (a queued delete is always sent, §4.8 step 7: the user asked for the
         // message to be taken from everybody, and a delete for me must not leave it with
         // them). For the user it is gone like the rest: nothing shows a tombstone "for me".
-        let hidden: Vec<i64> = self
+        let hidden: Vec<(i64, i64, String)> = self
             .conn
-            .prepare_cached(&format!(
-                "SELECT m.id FROM messages m WHERE m.conversation_id = ?1 AND {range}
-                   AND {DELETE_QUEUED} AND (m.deleted IS NULL OR m.deleted <> 'ForMe')"
-            ))?
-            .query_map(params, |r| r.get(0))?
+            .prepare_cached(&select_hidden(range))?
+            .query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<kourier_db::rusqlite::Result<_>>()?;
-        for id in &hidden {
+        for (id, _, _) in &hidden {
             let Some(row) = self.msg_row(MessageId(*id))? else {
                 continue;
             };
-            self.tombstone(&row, "ForMe", "")?;
+            self.tombstone(&row, "ForMe", Some(""))?;
         }
-        self.remove_messages(&gone)?;
-        Ok(!gone.is_empty() || !hidden.is_empty())
+        let ids: Vec<i64> = gone.iter().map(|(id, _, _)| *id).collect();
+        self.remove_messages(&ids)?;
+        let newest = |system: bool| {
+            gone.iter()
+                .chain(&hidden)
+                .filter(|(_, _, kind)| (kind == "System" || kind == "Placeholder") == system)
+                .map(|(_, at, _)| *at)
+                .max()
+        };
+        Ok(Cleared {
+            changed: !gone.is_empty() || !hidden.is_empty(),
+            newest_message_at: newest(false),
+            newest_system_at: newest(true),
+        })
     }
 
     /// The end of every clear of `conv`: with `remove`, a conversation without a message a
@@ -294,7 +546,9 @@ impl Apply<'_> {
                 let hidden = self
                     .conn
                     .prepare_cached(
-                        "UPDATE conversations SET hidden = 1, marked_unread = 0, unread_hint = 0
+                        "UPDATE conversations SET hidden = 1, marked_unread = 0, unread_hint = 0,
+                           unread_server = CASE WHEN unread_server IS NULL THEN NULL ELSE 0 END,
+                           mentions_server = CASE WHEN mentions_server IS NULL THEN NULL ELSE 0 END
                          WHERE id = ?1 AND hidden = 0",
                     )?
                     .execute([conv.0])?;
@@ -320,7 +574,7 @@ impl Apply<'_> {
     /// Deletes message rows for good and remembers their keys, so a later copy of one is
     /// dropped: their attachments and files first (unlinked after the commit), then the rows;
     /// reactions, receipts, revisions, send states and outbox rows go with them.
-    fn remove_messages(&mut self, ids: &[i64]) -> Result<()> {
+    pub(super) fn remove_messages(&mut self, ids: &[i64]) -> Result<()> {
         for id in ids {
             self.conn
                 .prepare_cached(
@@ -397,7 +651,7 @@ impl Apply<'_> {
     fn remove_attachment(&mut self, row: &MsgRow, body: Body, at: usize) -> Result<()> {
         if matches!(body, Body::Sticker(_)) {
             // The sticker is the message.
-            return self.tombstone(row, "ForMe", "");
+            return self.tombstone(row, "ForMe", Some(""));
         }
         let idx = i64::try_from(at).unwrap_or(i64::MAX);
         // The row, its files and its download target, then the rows behind it (ascending, so
@@ -437,7 +691,7 @@ impl Apply<'_> {
         }
         let rest = crate::attachments::derive::without_attachment(body, at);
         if matches!(&rest, Body::Text(t) if t.body.trim().is_empty()) {
-            return self.tombstone(row, "ForMe", "");
+            return self.tombstone(row, "ForMe", Some(""));
         }
         let revisions: Vec<(i64, Option<String>)> = self
             .conn
@@ -553,7 +807,11 @@ pub(super) fn conversation(
 /// the same delete made on another device), remembers their keys and stores the durable
 /// command that tells our other devices, which names the newest messages the conversation
 /// had. With `remove` the draft goes too and a conversation that is left without a message a
-/// person sent leaves the list.
+/// person sent leaves the list. The newest `sent_at` that went (at most the clock plus the
+/// tolerance), or now when nothing went, is kept as the conversation's cut, and it always raises
+/// the LOCAL cut to at least that time, also when a larger claim of the network is stored
+/// ([`STORE_OWN_CUT`]); the command carries the times of what went as `before_ms` and
+/// `system_before_ms` (module docs).
 ///
 /// No command is stored for an account that is not linked, on a network that does not sync
 /// deletes for me, or for a clear that had nothing to name (there is nothing the other devices
@@ -572,7 +830,19 @@ pub(crate) fn clear_conversation(
     // What the other devices delete up to: read before anything goes.
     let newest = apply.anchors(conv, &key, false)?;
     let newest_non_expiring = apply.anchors(conv, &key, true)?;
-    let changed = apply.clear_up_to(conv, (i64::MAX, i64::MAX))?;
+    let cleared = apply.clear_up_to(conv, (i64::MAX, i64::MAX))?;
+    let changed = cleared.changed;
+    // The times of what went, never after the clock plus the tolerance (one wrong `sent_at` of a
+    // peer would refuse the chat's history for good): of the rows a person sent and of the
+    // others (a notice, a stand-in), as the network's range keeps them apart (WhatsApp, W6).
+    // The cut is the larger of both, and NOW when nothing went (a chat whose history has not
+    // arrived yet: the chunks that come later are older than this clear). Kept for every
+    // network, so a chat cleared here stays cleared while history chunks still arrive. The
+    // durable commands carry the two times, not the cut: `None` when nothing of that kind went.
+    let before_ms = cleared.newest_message_at.map(|at| apply.clamp_cut(at));
+    let system_before_ms = cleared.newest_system_at.map(|at| apply.clamp_cut(at));
+    let cut = before_ms.max(system_before_ms).unwrap_or(apply.now);
+    apply.store_own_cut(&key.encode(), cut)?;
     if remove {
         let cleared = tx
             .prepare_cached(
@@ -591,6 +861,8 @@ pub(crate) fn clear_conversation(
             newest,
             newest_non_expiring,
             remove,
+            before_ms,
+            system_before_ms,
         })?);
     }
     apply.finish()?;
@@ -652,13 +924,14 @@ pub(crate) fn delete_attachment(
     let (_, key, features) = conversation(&tx, row.conv)?.ok_or_else(gone)?;
     let body = apply.body_of(row.id)?;
     let sending = if row.is_own() {
-        actions::sending_of(&tx, row.id)?
+        actions::sending_of(&tx, row.id, false)?
     } else {
         Sending::Settled
     };
     let queued = row.is_own() && actions::send_waits(&tx, row.id)?;
     actions::delete_attachment(&Facts {
         active: apply.acc.state == AccountState::Active,
+        registered: true,
         blocked: false,
         features: features.as_ref(),
         admin: false,
@@ -720,7 +993,104 @@ pub(crate) fn delete_attachment(
 
 #[cfg(test)]
 mod tests {
-    use kourier_model::RecipientState;
+    use kourier_model::{MsgIdScope, NetworkKind, RecipientState, UserId};
+
+    /// The plan of `sql` with its parameters `?1..` replaced by `values`.
+    fn plan(h: &crate::testing::IngestHarness, sql: &str, values: &[&str]) -> Vec<String> {
+        let mut text = sql.to_owned();
+        for (i, v) in values.iter().enumerate().rev() {
+            text = text.replace(&format!("?{}", i + 1), v);
+        }
+        h.connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {text}"))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .expect("rows")
+    }
+
+    /// T23: the lookup of the cut that every history batch makes, and the statements that write
+    /// it and the keys of what it refuses, are key lookups (a batch of 500 rows must not walk the
+    /// account's cuts or its expired keys, and `core.db` has no planner statistics). F8: so are
+    /// the clear by time and the clean-up after a merge. They walk the CONVERSATION's rows (the
+    /// time has no index of its own: `messages_timeline` by conversation), never the account's
+    /// messages, and a clear that is delivered again does not run the first one at all (F2).
+    #[test]
+    fn the_cut_of_a_history_row_is_one_key_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([4u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::ConversationAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let cut_args = ["1", "'d:pn:1'", "5", "5"];
+        assert_eq!(
+            plan(&h, super::CUT_OF, &cut_args),
+            ["SEARCH conversation_cuts USING PRIMARY KEY (account_id=? AND conv_key=?)"],
+            "{}",
+            super::CUT_OF
+        );
+        for (name, sql, values) in [
+            ("the cut", super::STORE_CUT, &cut_args[..]),
+            ("the user's own cut", super::STORE_OWN_CUT, &cut_args[..]),
+            (
+                "the key of a refused row",
+                super::REMEMBER_REFUSED,
+                &["1", "2", "'d:pn:1'", "'lid:7'", "'X1'", "5", "0"][..],
+            ),
+        ] {
+            let steps = plan(&h, sql, values);
+            assert!(
+                steps
+                    .iter()
+                    .all(|s| !s.starts_with("SCAN") || s == "SCAN CONSTANT ROW"),
+                "{name}: {sql}\n{steps:#?}"
+            );
+        }
+        // The key of a refused row is looked for by its local id, like `expiry::remembered`.
+        let steps = plan(
+            &h,
+            super::REMEMBER_REFUSED,
+            &["1", "2", "'d:pn:1'", "'lid:7'", "'X1'", "5", "0"],
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("expired_messages") && s.contains("net_local=?")),
+            "{steps:#?}"
+        );
+        // F8: the clear by time and the history clean-up of a merge. A SEARCH of the
+        // conversation's rows through the timeline key, whatever the range adds, and the
+        // correlated look-ups of `UNSENT` / `DELETE_QUEUED` through the outbox's own index.
+        for (name, sql) in [
+            ("gone, by time", super::select_gone(super::BY_TIME)),
+            ("hidden, by time", super::select_hidden(super::BY_TIME)),
+            (
+                "gone, history by time",
+                super::select_gone(super::HISTORY_BY_TIME),
+            ),
+        ] {
+            let steps = plan(&h, &sql, &["1", "5"]);
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s
+                        .starts_with("SEARCH m USING INDEX messages_timeline (conversation_id=?")),
+                "{name}: the conversation's rows through `messages_timeline`\n{steps:#?}"
+            );
+            assert!(
+                steps.iter().all(|s| !s.starts_with("SCAN")
+                    && !s.contains("LIST SUBQUERY")
+                    && !s.contains("messages_key_account")
+                    && !s.contains("USING INDEX messages_local")),
+                "{name}: a walk of the account's messages or a scan\n{steps:#?}"
+            );
+        }
+    }
 
     /// [`super::UNSENT`] reads `send_state.state` with a pattern: the JSON of a recipient
     /// that has the message starts as the pattern says, and no other state does.

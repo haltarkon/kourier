@@ -9,7 +9,7 @@
 //! an account whose request for a lost file went out and got no answer, closed, and started
 //! again an hour later.
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -21,6 +21,15 @@ pub fn conversation_title(row: &ConversationRow) -> String {
     crate::core_source::conversation_title(row)
 }
 
+/// `name` without the "~" mark: the core puts one "~" in front of a name a person chose for
+/// themself on WhatsApp (`kourier-core` `query.rs` `shown_name`, as the phone's own app shows it).
+/// The mark belongs to labels; whatever hashes or splits a name (the notification's monogram and
+/// its colour) takes the name without it, so a push-named person looks the same as the name itself
+/// (W6a2 PRIV-1). One leading "~" is dropped and no more. QML's twin: `Style.unmarked`.
+pub fn unmarked_name(name: &str) -> &str {
+    name.strip_prefix('~').unwrap_or(name)
+}
+
 /// Whether a title is a placeholder without a name ("Signal user ⋯1f2e", a phone number): its
 /// avatar shows a person glyph instead of initials.
 pub fn is_anonymous_title(title: &str) -> bool {
@@ -50,8 +59,14 @@ fn author_name(msg: &MessageRow) -> Option<String> {
 }
 
 /// The notification line of a message: its text (mentions as `@Name`, spoilers hidden) or a
-/// media label, prefixed with the author's first name in groups ("Ari: see you").
+/// media label, prefixed with the author's first name in groups ("Ari: see you"). A protected
+/// chat's line names nothing of the message, not even its author or kind: it is the "New
+/// message" of a notification that hides its content (Threema Desktop leaves the body of such a
+/// chat's notification empty, `common/notification.ts` 382-385).
 pub fn message_line(detail: &ConversationDetail, msg: &MessageRow) -> String {
+    if detail.row.protected {
+        return fixed_texts().new_message;
+    }
     let mut names = NameMap::new();
     if let (Some(author), Some(name)) = (&msg.author, author_name(msg)) {
         names.insert(author.clone(), name);
@@ -65,7 +80,7 @@ pub fn message_line(detail: &ConversationDetail, msg: &MessageRow) -> String {
         names.insert(by.clone(), name);
     }
     let text = match &msg.deleted {
-        Some(d) => deleted_text(d, msg.author.is_none()),
+        Some(d) => deleted_text(d, msg.author.is_none(), msg.author.as_ref()),
         None => body_summary(&msg.body, &names).text,
     };
     let text = clip(&single_line(&text), LINE_MAX_CHARS);
@@ -204,6 +219,9 @@ mod tests {
             features_hash: 0,
             has_draft: false,
             hidden: false,
+            can_send: true,
+            roaming: kourier_core::facade::Roaming::Hidden,
+            protected: false,
         }
     }
 
@@ -326,6 +344,53 @@ mod tests {
         );
     }
 
+    /// A protected chat's notification line names nothing of the message: no text, no author,
+    /// no media kind, no call; the same fixed "New message" whatever the message was.
+    #[test]
+    fn a_protected_chat_s_line_names_nothing_of_the_message() {
+        use kourier_model::{CallDirection, CallLine, CallState, SystemEvent};
+        for kind in [ConvKind::Direct, ConvKind::Group] {
+            let mut d = detail(kind);
+            d.row.protected = true;
+            let mut call = msg(
+                Body::System(SystemEvent::Call(CallLine::signal(
+                    CallDirection::Incoming,
+                    true,
+                    CallState::Missed,
+                    5,
+                ))),
+                Some("Ari Kestrel"),
+                false,
+            );
+            call.author = None;
+            for m in [
+                msg(
+                    Body::Text(Text::plain("the secret plan")),
+                    Some("Ari Kestrel"),
+                    false,
+                ),
+                msg(Body::Text(Text::plain("the secret plan")), None, true),
+                call,
+            ] {
+                let line = message_line(&d, &m);
+                assert_eq!(line, fixed_texts().new_message, "{kind:?}");
+                assert!(!line.contains("secret") && !line.contains("Ari"), "{line}");
+            }
+        }
+        // The same message in the same chat, not protected: its text.
+        assert_eq!(
+            message_line(
+                &detail(ConvKind::Group),
+                &msg(
+                    Body::Text(Text::plain("the secret plan")),
+                    Some("Ari Kestrel"),
+                    false
+                )
+            ),
+            "Ari: the secret plan"
+        );
+    }
+
     #[test]
     fn titles() {
         assert_eq!(
@@ -337,6 +402,17 @@ mod tests {
         assert!(is_anonymous_title(&t), "{t}");
         assert!(is_anonymous_title("+49 151 2345"));
         assert!(!is_anonymous_title("Olena"));
+    }
+
+    #[test]
+    fn the_mark_is_dropped_once_before_a_name_is_hashed_or_split() {
+        assert_eq!(unmarked_name("~Rika Lowe"), "Rika Lowe");
+        assert_eq!(unmarked_name("Rika Lowe"), "Rika Lowe");
+        // One mark only: a name that really starts with a second "~" keeps it.
+        assert_eq!(unmarked_name("~~Rika"), "~Rika");
+        assert_eq!(unmarked_name(""), "");
+        // The placeholder check follows the unmarked name.
+        assert!(is_anonymous_title(unmarked_name("~+49 151 2345")));
     }
 
     #[test]
@@ -362,6 +438,9 @@ mod tests {
             avatar: None,
             number: None,
             linked_at: 0,
+            hold: None,
+            roaming_writes: None,
+            pin_limit: None,
         };
         assert_eq!(account_label(&a), "Work");
         a.display_name = None;

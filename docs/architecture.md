@@ -137,7 +137,7 @@ such.
 | Idle CPU | On the fake network: ≤ 0.2 wakeups/s over 5 min for all threads, no 100 s part above 0.5/s, process CPU below 50 ms per 5 min. With a Signal connection the target stays in words until it is measured: no periodic wakeups besides the chat keepalive (30 s) and timers that have work | Fake network (no keepalive): 0.04 wakeups/s shown, 0.01 hidden over 300 s, busiest 100 s part 0.09, process CPU under 10 ms. Signal mock with the 30 s keepalive: 0.42 wakeups/s over 90 s for all 9 threads (`kourier-e2e` `signal_idle`, run by hand) | `cargo xtask perf` counts the voluntary context switches of all threads (`/proc/<pid>/task/*/status`) over the idle time and over each of its 100 s parts, and reads the process's CPU time from `/proc/<pid>/stat`: three rows per state. A run that idles for less than 5 min (`--quick`) shows them for information. On a real connection: `powertop` / `perf stat` over 10 min |
 | Receive → notification | ≤ 150 ms from the envelope at stage 1 to the accepted notification, and ≤ 50 ms for `recv.commit` → `notify.shown` (outside catch-up) | 37 ms median (30 to 43) on the fake network, envelope at stage 1 → notification accepted by the server; of that `recv.commit` → `notify.shown` 9 to 11 ms | marks `recv.stored` (`kourier-signal`, stage 1) and `recv.commit` (core) on the `tracing` target `kourier::perf`, `notify.shown` in the app: `KOURIER_TRACE_STARTUP=1 KOURIER_LOG=warn,kourier::perf=trace` |
 | Catch-up ingest | ≥ 3,000 messages/s for the release build on the Signal mock, from stage 1 to core commit (5,000 queued 1:1 and group texts); the mock test's own assert of 500 stays for debug builds. History with media on the fake network: ≥ 800 messages/s, for information only | 9,219 to 9,766 messages/s, slowest run 8,812 (release build on the Signal mock; the test queues 5,000 1:1 texts of one sender and times connect → all committed). Debug build: 2,450 (S7). History with 8 % media on the fake network: 1,294 to 1,375 messages/s | mock test `kourier-e2e` `five_thousand_queued_messages_ingest_at_500_per_second`; the core's mark `recv.catchup`. Fake network: the seeding of the reference profile by `cargo xtask perf` |
-| Binary size | ≤ 60 MiB for the default release profile | 52.2 MiB | `target/release/kourier` as built with default features. The budget is there so that debug information coming back fails the table (260 MB once) |
+| Binary size | ≤ 80 MiB for the file a user installs: the default-features release binary without its symbol table, as `cargo xtask dist` ships it (60 MiB before the WhatsApp backend was compiled in, W2b; his decision of 2026-10-15; the function names go into a names file kept per release, §14.2) | 57.0 MiB with Telegram's pre3 and TG-3 (receive) on main with blended chats (`cargo xtask perf`'s row on the build server, `lane-telegram` rebased onto main `5bb1e60`, 2026-10-28; +1.0 MiB over main's 56.0; the headroom is 23.0 MiB); 56.0 MiB with blended chats (main `5bb1e60`, +0.2 MiB over W5b's 55.8); 55.8 MiB with W5b, the WhatsApp media send (`cargo xtask perf`'s row on the build server, `lane-whatsapp` rebased onto main `6f640d7` with LOC, 2026-10-27; the headroom is 24.2 MiB); 55.4 MiB after S-names (`cargo xtask perf`, 2026-10-27, main before LOC landed). Before the split the same binary was 83.17 MiB with its names (the table was 28 MiB of it); the headroom there had shrunk to 118 KB at P5 and W5a together, which is why the split was taken (his answer, 2026-10-26: "Drop, keep names file"). History of the unsplit size: 80.23 MiB with P5, W5a and W5b (by `stat` on the build server, before the rebase onto S-names, 2026-10-27), 79.88 MiB with P5 and W5a (2026-10-26), 78.49 MiB at the end of W5a, 79.98 MiB at the end of W4, 76.2 MiB at the end of W2b, 52.2 MiB before the backend | `target/release/kourier` with default features (the WhatsApp backend included, its crates optimised for size, root `Cargo.toml` `[profile.release.package.*]`), split by `names::split` (`xtask/src/names.rs`) into the stripped file and the names file in a temporary directory, and the stripped file measured (a superset of the published file: the test network, Telegram and Threema are compiled in). The split refuses an input with debug information (a policy: 260 MB once, with `line-tables-only`), and that aborts the run |
 | Timeline scroll | no frame > 16 ms while flicking through image-heavy history | Not measured on the GPU. Software renderer, offscreen: median 15.9 to 16.1 ms, slowest frame 17.7 to 18.6 ms | on the Plasma session: `QT_LOGGING_RULES="qt.scenegraph.time.renderloop.debug=true"` with `KOURIER_LOG=qt=debug` (Qt 6 has no `QSG_RENDER_TIMING`) |
 | Wayland | runs on `wayland` QPA with no XWayland; `app_id = app.kourier.Kourier`; window raise via `xdg-activation-v1`; fractional scaling crisp; `text-input-v3` IME; DnD and clipboard images; portal or KDE file dialogs | not run (manual) | manual checklist in §10.6 |
 
@@ -277,14 +277,17 @@ is in the release gate now: §14.2 item 14.)
 | `kourier-model` | The data contract: ids, content model, features, receipts, states, errors, login steps. Pure data, `serde`. | — | serde, serde_json, thiserror, uuid | tokio, rusqlite, protocol crates, Qt |
 | `kourier-backend-api` | The boundary: `Network` trait, `AccountContext`, `AccountHandle`, `Command`, `BackendEvent`, `Envelope`, `Ack`, `Clock` | model | tokio (`sync`), tokio-util (`CancellationToken`) | core, db, protocol crates, Qt |
 | `kourier-db` | Open SQLCipher files with a raw key, pragmas, forward-only migration runner, `schema_version`, writer-thread helper, synchronous `zone` API, the generic `core_outbox` table (opaque versioned bytes) and its forwarder loop used by every backend (§5.6) | — | rusqlite 0.38, libsqlite3-sys 0.36 (patched), zeroize | anything domain-specific |
-| `kourier-blob` | Encrypted file format (streaming AEAD), atomic writes, `$XDG_RUNTIME_DIR/kourier/media` plaintext cache with cleanup | — | aes-gcm (STREAM), rand, zeroize | domain crates |
+| `kourier-blob` | Encrypted file format (streaming AEAD), atomic writes, `$XDG_RUNTIME_DIR/kourier/media` plaintext cache with cleanup, the writer of a plaintext copy into a folder of the user's (`save_to`, `save_copy`, §5.8.2) | — | aes-gcm (STREAM), rand, zeroize | domain crates |
 | `kourier-media` | Image decode/resize/re-encode, EXIF strip, blurhash, thumbnails; used by core (import) and backends (per-network transcoding) | — | image, blurhash | Qt, protocol crates |
 | `kourier-core` | `core.db` schema and queries, account registry and supervisor, ingest, outbox, pending modifiers, disappearing-message sweeper, typing timers, notification *policy*, read-state logic, `facade` (`CoreHandle`, `UiCommand`, `UiEvent`, query DTOs) | model, backend-api, db, blob, media | tokio, tracing | any backend crate, zbus, Qt |
 | `kourier-fake` | `FakeNetwork`: scripted backend for core, UI and screenshot tests (login flows, duplicates, permutations, slow acks, crash points), with its own `core_outbox`; contract-conformance suite (§10.2) | model, backend-api, db | tokio | core, Qt |
 | `kourier-signal` | Signal backend (§6) | model, backend-api, db, blob, media | libsignal-* (git tag v0.104.0), prost 0.14, reqwest 0.13 (rustls + ring), tokio | core, app, desktop, Qt, other backends |
-| `kourier-threema` / `kourier-whatsapp` | Later backends (§7) | same as signal | libthreema (vendored) / whatsapp-rust (git rev) | same as signal |
+| `kourier-whatsapp` | WhatsApp backend (§7.1): the store contract of whatsapp-rust over `backend.db` (W1), the link and the connection of one account (W2a), the pre-pair refusal of a wrong phone (W2c), the receive path (W3a), the history at the link (W4), the send path (W5a), the media send (W5b), the phone's chat settings and calls from app state (W6a1) and the groups and people (W6a2: the group fetch, roles, names, the address book, merges, admin deletes and the 1:1 timer set); registered by `kourier-app` from W2b (debug builds, while turned on) | model, backend-api, db, blob, media (W5b: the core's encrypted files, the sealed temporary upload file, the re-encode of pictures) | whatsapp-rust, whatsapp-rust-tokio-transport, whatsapp-rust-ureq-http-client, wacore, wacore-binary, waproto (ONE git rev, `default-features = false`), tokio, tokio-util, ureq 3 (rustls only: Kourier's own HTTPS agent, W5b) | core, app, desktop, Qt, other backends |
+| `kourier-telegram` | Telegram backend (§7.5): `TelegramNetwork`, the account actor (an explicit arm for every `Command`), its `backend.db` (component `telegram`), the app's end of the helper protocol (`link`), the required seam `TgParts` that only `kourier-app` fills (`real::helper_parts`; the pinned TDLib it expects, `pin::PIN`, with the patch tag); the SOCKS5 gate (`gate/`), the helper supervisor (start to WaitPhoneNumber, stop, back-off, watchdog); TG-2: the login machine (TDLib's auth states -> login steps, QR first), the session (connection states, the freeze hold, logout), presence and network hints, `AccountReady` through `core_outbox`; TG-3: the receive path (backend.db schema 2, the chat and message machines, the sync lane, the start sync, the reconcile of gaps, group-committed rows shipped through `core_outbox`, the read act, the clean stop's drain; sends nothing yet); the app reads an API pair only in a debug build inside a kept run profile; the gate refuses every dial unless the run tool's one-shot confirmation stands (§7.5, "The dialing mode and the run tool"). Test only (TD-4a): the fake-DC cases and the recording cases (`supervisor/tests/fakedc*`, `testdata/rec-*.jsonl`) over `fakedc/`, the fake data centre, a workspace of its own (never a member, never in a shipped binary) | model, backend-api, db, tdlib | tokio, tokio-util, serde, serde_json, thiserror, tracing, hkdf, sha2, base64, rand, zeroize | core, app, desktop, Qt, other backends |
+| `kourier-tdlib` | The TDLib helper (lib + bin): the frame protocol, the serve loop (log and proxy hardening, one receiver, a control queue, heartbeat, one closer), `dlopen` of the pinned `libtdjson` (the one file naming TDLib's entry points), `spawn` (the one file naming a process command), the lock-down (`lockdown`: seccomp, Landlock network, scopes and filesystem, raw syscalls; `harden`: the core limit {1, 1} and the dumpable rule), the offline test child (`spawn::run_self_offline`), the fake DC's start inside it (`spawn::spawn_offline_companion`) and the trap listeners (`traps`), all behind the cargo feature `test-support` that only dev-dependencies turn on; feature `scripted`: a scripted TDLib with TDLib's request parking | — | libc, serde, serde_json | every other Kourier crate |
+| `kourier-threema` | Threema backend (§7.2, §7.4): the account's `backend.db` (schema component `threema`: schema 1 the identity row and the CSP and D2D nonce stores, schema 2 what a device join imports and the `join_ready` marker, schema 3 the `deferred` envelopes, schema 4 the send queue, sealed), the parts (`ThreemaParts`: the crate's own WebSocket and HTTPS traits, made lazily, with the allow-list of test IDs and the host name), `dial` (the one module that names the real connectors: pinned TLS, WebSocket, HTTPS; the application's entry to them), the connection to the mediator and the chat server (TH3), the device join by QR code (TH4: the rendezvous, the three emoji, the import in two zones), the follower's receive (TH5a, TH5b) and the send core (TH6a), which nothing in a real build reaches, so a real build still sends no message; registered by `kourier-app` in debug builds only, while turned on, and listed only in a prepared run profile (§7.4) | model, backend-api, db (dev: fake) | libthreema (vendored at `third_party/libthreema`, path dependency, `default-features = false`; only this crate may name it), tokio, tokio-util, async-trait, async-channel, zeroize, prost (build: prost-build), rand, sha2, base64; only in `dial`: rustls with ring, tokio-rustls, webpki-roots, tokio-tungstenite, reqwest, http | core, app, desktop, Qt, other backends |
 | `kourier-desktop` | zbus notification client (inline reply, activation token), `org.freedesktop.Application` single-instance server, tray (ksni), Secret Service (oo7), autostart file, logind `PrepareForSleep` and NetworkManager watchers | — | zbus 5, oo7 0.6, ksni (git) | core, Qt, protocol crates |
-| `kourier-app` | Composition root: tokio runtime, XDG paths, master key and per-account key wraps (§5.2), registry of compiled-in networks (cargo features `signal`, `fake`), wiring of core + desktop; `AppHandle` and the media handle table for the UI (§8.6); the walk and the .zip of a folder given to the composer (`folders`, §8.3) | core, backend-api, model, desktop, blob, signal (feature), fake (feature) | tokio, tracing-subscriber, zip | Qt |
+| `kourier-app` | Composition root: tokio runtime, XDG paths, master key and per-account key wraps (§5.2), registry of compiled-in networks (cargo features `signal`, `fake`, `whatsapp`, `telegram`, `threema`; WhatsApp, Telegram and Threema are registered by a debug build only, §7.1, §7.4, §7.5), wiring of core + desktop; `AppHandle` and the media handle table for the UI (§8.6); the walk and the .zip of a folder given to the composer (`folders`, §8.3) | core, backend-api, model, desktop, blob, signal (feature), whatsapp (feature), telegram (feature), threema (feature), fake (feature) | tokio, tracing-subscriber, zip | Qt |
 | `kourier-viewmodel` | Qt-free UI projections: conversation rows, message rows with grouping flags, diff engine → `ListOp`, timestamp and preview formatting, typing text | core (`facade` module only), model | — | Qt, backend crates, `kourier_core` internals |
 | `kourier-qt` | The only cxx-qt crate: `App` singleton, list models, controllers, `image://kourier` C++ shim, QClipboard and badge bindings; all QML under `crates/kourier-qt/qml/` | app, viewmodel, model | cxx-qt 0.10, cxx-qt-lib (`qt_full`), cxx-qt-lib-extras | core internals, db, backend crates |
 | `kourier-coexist` (test-only) | One process proving libsignal-net BoringSSL, SQLCipher (RustCrypto) and Qt's OpenSSL TLS backend coexist; `nm -D` clean (§5.3, S1) | db | libsignal-net-infra, rustls, tokio, cxx-qt-build (C++ shim for QtNetwork) | everything else |
@@ -337,11 +340,29 @@ boring-sys = { git = "https://github.com/signalapp/boring", tag = "signal-v5.2.0
 # (refs/gurk-rs/Cargo.toml:133-137) [V].
 libsqlite3-sys = { git = "https://github.com/boxdot/rusqlite", rev = "a2f393913d9994645c94810498bef07b2183b3dc" }
 
+[profile.dev.package."*"]            # T2, 2026-10-14: every dependency optimised in dev and test builds
+opt-level = 2
+debug = "line-tables-only"           # the Rust dependencies' debug info: backtraces keep file:line; -12 % to -19 % binary size
+[profile.dev.package.kourier-media]  # workspace crates that instantiate the hot generic code of
+opt-level = 2                        # dependencies (JPEG encoder, fixture pictures, AES-GCM stream):
+[profile.dev.package.kourier-blob]   # "*" does not reach workspace members
+opt-level = 2
 [profile.dev.package.sqlcipher-crypto-provider]
 opt-level = 3          # DB decryption is slow in debug otherwise (gurk does the same)
 [profile.dev.package.sha2]
 opt-level = 3
 ```
+
+Why (T2, `target/next/t2-build.md`): libsignal, SQLCipher, BoringSSL and the image codecs compiled
+at opt-level 0 were most of the CPU of a test and of a screenshot (a chat screenshot cost 9.5
+CPU-s in the debug build, 8.7 of it Rust at opt-level 0, and 1.45 in the release build). Only the
+optimiser changes: debug assertions, overflow checks and UB precondition checks stay on, the
+pixels and hashes are the same. The cost is one cold build of every dependency after the
+change, and the same again after each `Cargo.lock` or toolchain change. Only the debug info of the Rust
+dependencies is cut to line tables (the C and C++ ones keep full DWARF): measured -12 % for the
+`chat_ui` test binary and -19 % for the app, more for small test binaries. A workspace crate other
+than the two above stays at opt-level 0 so that it can be stepped through; to step into a
+dependency, give it `opt-level = 0` and `debug = true` in a local copy of the manifest.
 
 `kourier/.cargo/config.toml` (both entries fix traps verified on this machine):
 
@@ -421,17 +442,23 @@ variants (never by index) and `#[serde(default)]` for evolution.
 | Account uuid | `AccountUuid(Uuid)` | stable forever | Names `accounts/<uuid>/`; recorded in `key.wrap`, so it survives a `core.db` rebuild (§5.2) |
 | Network kind | `NetworkKind::{Signal, WhatsApp, Threema, Fake}` | — | Stored as TEXT |
 | User id | `UserId(Arc<str>)` | per account | Opaque, backend-defined, versioned grammar. Signal: `aci:<uuid>`, `pni:<uuid>`, `e164:+<digits>`. WhatsApp: `lid:<n>`, `pn:<n>`. Threema: `ECHOECHO`. The core never parses it |
-| Conversation key | `ConvKey::{Direct(UserId), Group(Arc<str>), Broadcast(Arc<str>), Channel(Arc<str>)}` | per account | Signal group: `gv2:<base64url group id>` (the id, never the master key). Threema group: creator id + u64. `Broadcast` and `Channel` are reserved for Threema distribution lists and WhatsApp newsletters |
-| Message id | `NetMsgId { author: Option<UserId>, local: Arc<str> }` | see matching scope | `author: None` = our own account (whichever own id the network used). Stored as `net_author` (`''` = own) and `net_local`. Signal: sender ACI + sent timestamp in ms (author + timestamp is Signal's message identity, `SD/ts/messages/handleDataMessage.preload.ts:123-145`). WhatsApp: sender + stanza id. Threema: sender + u64 hex. The core never parses `local` |
-| Matching scope | `NetworkDescriptor.msg_id_scope: AccountAuthor \| Conversation` | — | `AccountAuthor` (Signal): key `(account, author, local)`, unique account-wide, as Desktop dedups by sender + `sent_at` (R:signal-desktop-receive §5). `Conversation` (WhatsApp, Threema): key `(conversation, local)`; the author is compared only when both sides carry one, after alias resolution |
-| Message reference | `MsgTarget { conv: Option<ConvKey>, author: TargetAuthor, local: Arc<str>, alternates: Vec<Arc<str>> }`, `TargetAuthor::{Own, User(UserId), Unknown}` | — | `conv: None` when the network does not say (Signal receipts and read syncs carry only author + timestamp); the core then looks the key up account-wide (`AccountAuthor` scope only). `Unknown`: the reference has no sender (Threema reactions, quotes and receipts carry only the u64, `TD/packages/libthreema-wasm/libs/libthreema/threema-protocols/src/csp-e2e.proto:605-607`). `alternates` = other `local` values of the same message; none are known today. PNI/ACI and PN/LID aliasing goes through `identity_alias`, never through ids |
+| Conversation key | `ConvKey::{Direct(UserId), Group(Arc<str>), Broadcast(Arc<str>), Channel(Arc<str>)}` | per account | Signal group: `gv2:<base64url group id>` (the id, never the master key). Threema group: `threema:<creator ID>.<the group id's 8 little-endian bytes as 16 hex digits>` (Desktop's `groupDebugString`; it holds the creator's ID, so no log line prints a `ConvKey` unredacted). `Broadcast` and `Channel` are reserved for Threema distribution lists and WhatsApp newsletters |
+| Message id | `NetMsgId { author: Option<UserId>, local: Arc<str> }` | see matching scope | `author: None` = our own account (whichever own id the network used). Stored as `net_author` (`''` = own) and `net_local`. Signal: sender ACI + sent timestamp in ms (author + timestamp is Signal's message identity, `SD/ts/messages/handleDataMessage.preload.ts:123-145`). WhatsApp: sender + stanza id (unique per sender in a chat, not per chat: upstream dedupes by chat, sender and id, `WA/src/types/durability_hook.rs:24-25`). Threema: sender + u64 hex. The core never parses `local` |
+| Matching scope | `NetworkDescriptor.msg_id_scope: AccountAuthor \| Conversation \| ConversationAuthor` (`messages.net_scope` 0 / 1 / 2, §5.4) | — | `AccountAuthor` (Signal): key `(account, author, local)`, unique account-wide, as Desktop dedups by sender + `sent_at` (R:signal-desktop-receive §5). `Conversation` (Threema): key `(conversation, local)`; its ids are unique per conversation and random and its references carry no sender, so a second author under a taken id is refused (logged, ignored) and the author is compared only when both sides carry one, after alias resolution. `ConversationAuthor` (WhatsApp, since core.db schema 16): key `(conversation, author, local)` with the author after alias resolution (`''` = own), so two members of a group may use one id and neither hides the other's message. Call lines are keyed `(conversation, local)` on EVERY network (the other side chooses a call's id; `LINE_SCOPE`, `ingest/call.rs`), so a line and a message share an id space only under `Conversation`; under scopes 0 and 2 the core keeps them apart in both directions (a call signal whose id an own message has makes no line, and an own send is never given the id of a call line). Rows of a WhatsApp account made under scope 1 before schema 16 are NOT converted (none exist in a real profile: WhatsApp registers in debug builds only, and K-B1 lands before the first real run) |
+| Position | `net_seq: Option<i64>` (`IncomingMessage.net_seq`, `messages.net_seq`; KT-2) | per conversation | The network's own order number of a message in its conversation, for a network whose server numbers its messages (Telegram): higher is newer, in `0..=MAX_NET_SEQ` (2^53, TDLib's `int53`; `Envelope::validate` refuses another with `ContractViolation::PositionOutOfRange`). The backend states it; the core never parses it from `local`. It decides what is READ (§3.5.1), never where a row stands (§3.9: the timeline sorts by time). `NULL` on Signal, WhatsApp and Threema |
+| Message reference | `MsgTarget { conv: Option<ConvKey>, author: TargetAuthor, local: Arc<str>, alternates: Vec<Arc<str>> }`, `TargetAuthor::{Own, User(UserId), Unknown}` | — | `conv: None` when the network does not say (Signal receipts and read syncs carry only author + timestamp); the core then looks the key up account-wide (`AccountAuthor` scope only). `Unknown`: the reference has no sender (Threema reactions, quotes and receipts carry only the u64, `TD/packages/libthreema-wasm/libs/libthreema/threema-protocols/src/csp-e2e.proto:605-607`; WhatsApp's own read and played syncs). Under `Conversation` an `Unknown` reference takes the first row with that id; under `ConversationAuthor` it resolves only when EXACTLY ONE message of the conversation has the id (distinct ids over messages and revisions) and otherwise waits as a missing target, so it never picks another member's message by chance; a PARKED author-less RECEIPT or READ MARKER (WhatsApp's own read syncs, where a wrong pick costs a read mark) is applied to an arriving message under the same rule (`apply_pending_depth` counts the rows with that id first), while a parked author-less edit, delete or reaction (a fault of the backend's mapping) stays parked until it expires, because a pick by arrival would change or delete another member's message and depend on the order. `alternates` = other `local` values of the same message; none are known today. PNI/ACI and PN/LID aliasing goes through `identity_alias`, never through ids |
 | Backend data | `BackendBlob { v: u16, bytes: Vec<u8> }` | — | Opaque bytes the core stores verbatim: attachment pointers, raw payloads, per-row backend metadata |
 
 Rules:
 - Id grammars are versioned (prefix) and frozen once data exists (mautrix's warning in
   `networkid/bridgeid.go`, R:multi-protocol-prior-art §2.1).
+- A network whose server gives a sent message an id of its own (KT-2: `TransmitOutcome::SentAs`, §4.2) has its own messages RE-KEYED from the
+  allocated id to the server's: same `MessageId`, position and files, new `net_local`; the allocated id stays another name of the row
+  (`message_aliases`, §5.4), so a late copy, a quote or a modifier under the old id still finds it, and the allocator never hands the
+  old id out again. Allocated ids never equal an id the server gives (the fake: `k<hex>` against decimal numbers), so an own row under
+  the server's id is the message's echo. The steps are §4.8 step 3 and `ingest/rekey.rs`.
 - Own ids never enter stored message ids. A WhatsApp own message allocated while the chat is
-  PN-addressed still matches its LID-addressed echo and receipts (`WA/src/request.rs:268-280`
+  PN-addressed still matches its LID-addressed echo and receipts (`WA/wacore/src/request.rs:205`
   derives the id from the device PN; R:whatsapp §8 req 1).
 - A phone number is never a required field anywhere.
 
@@ -452,14 +479,26 @@ pub struct Account {
 ### 3.3 Contacts, aliases, members, persons
 
 - `Contact` (per account, per `UserId`): profile name, system/nickname, avatar (blob ref),
-  `trust: TrustLevel::{Unverified, ServerVerified, Verified}` plus `identity_fingerprint`,
+  `trust: TrustLevel::{Unverified, ServerVerified, Verified, Changed}` plus `identity_fingerprint`
+  (`Changed`, P5a: the user verified this person, then the key changed = Signal's identity state 2;
+  a send waits for the user's Confirm, §6.9),
   `blocked`, `hidden` (Threema group-only/deleted contacts, R:threema §7 req 3),
   `unregistered_at`, `identifiers: Vec<Identifier>` (phone, username: for display and search only),
-  `meta: Option<BackendBlob>`.
+  `meta: Option<BackendBlob>`. For a person's page (people pages P1, core.db 18): `about` and
+  `about_emoji` (the profile's about text and its emoji, plain text from the network, redacted in
+  `Debug` like a name) and `number_shown: Option<bool>`, the BACKEND'S verdict whether the person's
+  phone number may be shown: `Some(true)` shown, `Some(false)` hidden, `None` never said, which counts
+  as hidden. The viewmodel shows a number only on `Some(true)` (a person known by their number alone
+  and the user's own page are the two exceptions, §8.3); the rule that makes the verdict belongs to
+  the backend (Signal: §6.10). A `ContactPatch` leaves the three alone unless it sets or clears them,
+  and an alias merge gives the canonical row the alias's value only when it has none.
 - `identity_alias(account, alias UserId → canonical UserId)`. A backend event
   `IdentityMerged { from, into }` rewrites `from` to `into` in contacts, members, `net_author`,
-  reactions, receipts, `send_state` and `pending_modifiers` (a resulting key conflict merges the
-  two rows as in step 1 below), then either re-keys the direct
+  reactions, receipts, `send_state`, `pending_modifiers` and `conversation_cuts` (a resulting key
+  conflict merges the two rows as in step 1 below; two cuts become one, the larger; a row whose message was
+  REMOVED under the key the rewrite would give it - a clear, a delete for me, the sweeper: `expired_messages` -
+  and that has no live twin is removed with the merge, not re-authored, so a merge never brings back a message a
+  later copy would not), then either re-keys the direct
   conversation of `from` or, if `into` already has one, runs `merge_conversation`. The alias row
   stays, so references that still name `from` resolve. Signal uses it for PNI→ACI (after a verified
   `PniSignatureMessage`) and E164→ACI (Storage Service `ContactRecord`s carry ACI, PNI and E164;
@@ -479,7 +518,8 @@ pub struct Account {
   older aliases), joins are
   `CROSS JOIN`s from the user's rows (core.db has no planner statistics, so an `a = ? OR
   b = ?` is two `EXISTS`: given the OR the planner took the index of `account_id` alone),
-  deletes are `EXISTS`-scoped; one `ALIAS_OWNS` query first, and an alias that owns nothing
+  deletes are `EXISTS`-scoped; one `ALIAS_OWNS` query first (it asks `conversation_cuts` too: a cut
+  made before its chat exists lives under the alias's key and must follow the merge), and an alias that owns nothing
   only gets its alias row and the contacts change flag; the parked receipts whose sender may
   have become a recipient are looked at once per transaction, after all its merges
   (`Changes::receipts_to_retry`, consumed in `Apply::finish`), not once per merge; the
@@ -493,13 +533,31 @@ pub struct Account {
   `ingest::merge::tests::a_merge_looks_only_at_the_rows_of_the_alias`, the budget test
   `kourier-core/tests/merge_cost.rs` (20,000 messages, 45 days of expired keys, 5,000 parked
   modifiers, 303 merges: 25 ms in debug, 7.7 s without the indexes; and 300 merges look at
-  each of 40 parked receipts once).
+  each of 40 parked receipts once). Under per-sender ids (`ConversationAuthor`, K-B1) a message
+  can be stored twice under two ids of its author before the backend says they are one (a group
+  message from a history chunk under `pn:X`, the same id live under `lid:X`), and the unique key
+  `(conversation, author, local)` would refuse the `net_author` rewrite. So `identity_merged`
+  first merges the alias's rows whose `(conversation, into, local)` exists (the older row stays,
+  `merge_older`, as under `AccountAuthor`) and only then rewrites the authors; the statements
+  start from the alias's rows (`messages_by_author`) and end on the partial key
+  `messages_key_conv_author`, and are in `merge::LOOKUPS` like the others. Which of the two
+  copies' `history` flag, `received_at` and position survives depends on the order they arrived
+  in; the merge tests assert only what does not (one row, the author, the body, no constraint
+  error, the envelope acked). `messages_key_conv_author` is PARTIAL (`WHERE net_scope = 2`), so
+  no statement that does not say `net_scope = 2` can use it and it cannot tie with a hot one.
 - `merge_conversation(from, into)` (core, one `core.db` transaction):
-  1. Move messages. On a key conflict (§3.1) keep the older row (smaller `sort_key`), merge state
+  1. Move messages. On a key conflict (§3.1; under `ConversationAuthor` the pair `(net_author,
+     net_local)` of the two chats) keep the older row (smaller `sort_key`), merge state
      into it monotonically (out/read state, revisions, reactions, receipts, `send_state`), delete
-     the other.
-  2. Move `pending_modifiers` (rewrite `conv_key`) and members (union).
-  3. Recompute `unread`, `mentions`, `last_activity`; `read_up_to` = max; draft = newest non-empty;
+     the other; a row of `from` with no twin whose message was removed under `into`'s key (the memory of
+     removed keys, `expired_messages`) is removed, not moved.
+  2. Move `pending_modifiers` (rewrite `conv_key`), the cut of the conversation (`conversation_cuts`,
+     the larger of the two keys' cuts: an upsert that keeps the max, then a delete, never a plain
+     `UPDATE` of the key, which would meet the primary key when both have one; the claim moves with it, the
+     larger) and members (union). After step 5 the HISTORY rows of the merged chat at or below the joined cut
+     go (their keys remembered); live rows stay.
+  3. Recompute `unread`, `mentions`, `last_activity` (the sort key of the newest LISTED message, §3.4);
+     `read_up_to` = max; draft = newest non-empty;
      local mute = later; roaming fields of `into` win.
   4. Delete `from`; keep the alias row.
   5. Emit `UiEvent::ConversationMerged { from, into }`: an open ChatPage switches to `into`, and
@@ -510,6 +568,19 @@ pub struct Account {
   contact row is optional.
 - `Person` (later, optional): links (account, user) pairs across networks for display only.
 
+- Safety numbers (P5a, 2026-10-25): `kourier_model::SafetyNumber { digits, scannable, key, state:
+  VerifyState::{Default, Verified, Changed} }` (`Debug` hides digits, scannable bytes and key) or
+  `SafetyUnavailable::{NoAccountId, NoKey, OwnId, Unsupported, NotRunning}` = `SafetyAnswer`. The
+  backend computes it from OUR identity key and the person's STORED key on every ask (nothing is
+  stored in core.db); `key` is the key the number was made of and travels back with the user's Mark,
+  Clear or Confirm, so a state is never applied to a key the user did not see (§4.2, §6.9).
+  `NetworkDescriptor.safety_numbers` says whether a network offers them (Signal and the fake's Signal-like
+  flavour: yes; WhatsApp, Telegram, Threema: not yet). `NetworkDescriptor.contact_cards` (P5c, serde default false)
+  says whether a network can SEND a contact card (Signal and the Signal-like fake: yes; WhatsApp, whose vCard send is
+  a later item, and the playing fake: no); receiving cards is not this flag. `NetworkDescriptor.receipts_always_sent`
+  (KT-1b, serde default false) says the network's accounts always send read receipts, typing and online status, so
+  Settings says it under those two rows (Telegram: yes; Signal, WhatsApp, Threema and the fakes: no).
+
 ### 3.4 Conversations
 
 ```rust
@@ -518,6 +589,7 @@ pub struct Conversation {
     pub kind: ConvKind,                         // Direct | Group | Broadcast | Channel
     pub is_self: bool,                          // note to self
     pub title: Option<String>, pub avatar: Option<BlobRef>,
+    pub description: Option<String>,            // a group's description (people pages P2, core.db 19)
     pub members: Vec<Member>,                   // empty for Direct
     // Roaming state: changed ONLY by backend events (source of truth = network)
     pub muted_until: Option<i64>, pub archived: bool, pub pinned_order: Option<u32>,
@@ -527,13 +599,116 @@ pub struct Conversation {
     // Core-local state
     pub local_muted_until: Option<i64>, pub draft: Option<Text>,
     pub unread: u32, pub mentions: u32, pub read_up_to: Option<i64 /* sort_key */>,
-    pub last_activity: i64 /* sort_key of newest visible message */,
+    pub last_activity: i64 /* sort_key of the newest LISTED message (quiet notices, below) */,
+    pub protected: bool,                        // roaming: protected on another device (S-P, core.db 0022)
 }
 ```
 
 A chat our account deleted on another own device is hidden, not removed: the core keeps the row
 with its title, members and features (`conversations.hidden`, §5.4) and leaves it out of the
 conversation list until a message is stored or queued in it again.
+
+**The group's description and rules (people pages P2, core.db 19).** `Conversation.description` (and
+`ConversationPatch.description`, a `Patch<String>`: Set, Clear, Unchanged) is the text a group states about itself,
+plain text from the network and redacted in `Debug` like a title; `None` = the network never said (WhatsApp states
+none in P2, W6 reads a group's metadata; a 1:1 chat never has one). It is the core's column `conversations.description`
+(nullable, no row converted); a silent patch keeps it, `Clear` empties it. `ConversationFeatures.group_info:
+Option<GroupInfo>` (§3.8) carries the four rules of a group as the network states them (`attributes_admin_only`,
+`members_admin_only`, `announcements_only`, `terminated`); `None` = the network did not say, and it is then skipped
+when the features are hashed, so a 1:1 chat's hash (and every group stored before P2) keeps the build's older value.
+A Signal group stored before P2 is restated ONCE at the next start (`refresh_group_features` also sets the
+description from the stored snapshot); a fetch states both with every revision.
+
+**Protected chats (S-P, 2026-10-29; his answer "Like Threema Desktop" for the phone's PIN-protected
+chats: listed and readable, notifications without the text, left out of search).** `Conversation.protected` (and
+`ConversationPatch.protected: Option<bool>`, serde default, left out of the JSON when `None`; a network that has no
+such state never sets it, so no other backend's literal changed) says the user protects the chat on another device:
+ITS MESSAGES SHOW NOWHERE OUTSIDE THE OPEN CHAT. The core keeps it in `conversations.protected` (core.db 0022,
+final, the next step takes 0023: `INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1))`, no row converted), a
+later patch changes it both ways, a patch that says nothing keeps it, and a conversation merge keeps it when either side
+had it. `facade::ConversationRow.protected` carries it and such a row has NO `preview` (no text, author, kind or time
+leaves the core for the list); its timeline reads as any other. Each path that shows a message's text outside the open
+chat follows Threema Desktop (which, unlike Kourier, does not even open such a chat): the list row shows "Protected
+chat" in place of the last message AND of a draft, with no author, icon, receipt or time (Desktop
+`conversation-preview-list/helpers.ts` 46-56, `ConversationPreview.svelte` 161: "Private", no time); a search of the
+list finds it by its title only, never by a preview or the placeholder (Desktop's message search drops such chats,
+`search/nav/store/helpers.ts` 164-167); a notification keeps the title (the chat's name) and shows "New message" or
+"3 new messages" in place of the text: the "name and message" choice is "name only" for it (`policy::content_mode`,
+and `notify::message_line` returns the fixed text for it; Desktop `common/notification.ts` 382-385 empties the body and
+keeps the names in the title); the inline reply stays where it is offered (its field shows the fixed placeholder and a
+reply quotes nothing). Counts only, untouched: the catch-up summary, the tray's tooltip and the badge. The share
+picker shows titles only. The gallery follows the same line: outside the open chat the pictures and file names of a
+protected chat show nowhere. The person page's and the group page's media sections and the level of all media (the
+gallery slots) ask the core nothing for such a chat and show nothing; inside the open chat they read as any other. The
+rule FAILS CLOSED: a chat the viewmodel's list snapshot does not hold (the list is not read yet, or the chat is hidden)
+counts as protected, and a list read that lists a chat, lifts or sets its flag, or no longer holds it runs the slots of
+that chat again. A chat that BECOMES protected while a notification of it is on screen, or after one expired with its
+text, is dealt with in §8.7. What a network must do (the contract): state the flag (`Some(true)` / `Some(false)`) NO
+LATER than the envelope that carries the chat's first message after the change, keep it in its own store, and restate it
+with the chat on `StartMode::Rebuild` (core.db starts at 0 there); the core cannot know a flag the network has not said.
+Known limits (the lead's list): no lock mark in the list yet (Desktop shows one, a QML change); a mention in a muted
+group still notifies (without text; Desktop's mention check reads the emptied body, so it does not); the typing label
+("Ari is typing…") still shows in a protected group's row (presence and a name, not message text).
+
+**Quiet notices (2026-10-15; user: "'Your safety number with ...' messages should have toggle to
+disable showing in All chat as latest messge in chat. It looks like digital garbage.").** Four
+notice kinds are QUIET: a safety number that changed (`SystemEvent::IdentityKeyChanged`), a
+refreshed session (`SessionRefreshed`; Signal Desktop's incoming END_SESSION message), a changed
+phone number (`NumberChanged`) and an accepted message request (`MessageRequestAccepted`):
+`SystemEvent::is_quiet` / `Body::is_quiet` in `kourier-model` name them with an exhaustive
+`match`, so a new kind must choose. A quiet notice is a row of the chat's timeline like any
+other and stays there for good; what it does not do, unless the user asks for it, is stand for
+its conversation in the LIST: the preview, the time label and the place (`last_activity`) come
+from the newest LISTED row, which is a loud row, or any row when the choice is on. The choice is
+the second setting that is the core's (§8.9): `settings` scope `core`, key `quiet_notices`,
+value `show`; no row means hidden, the default (his word: "Hidden, setting to show").
+Everything that is not the list is untouched: the timeline, unread counts, mentions,
+notifications, the tray count and the catch-up summary never counted these notices (they are
+never unread). A group's "X left the group" (`MemberLeft`) stays LOUD, although Signal Desktop
+and Android keep it out of the list too: he asked that group changes still show.
+
+The rule is written twice and a test holds the copies together: `SystemEvent::is_quiet` and the
+generated column `messages.quiet` (core.db schema 15, `0015_quiet_notices.sql`; its newest
+definition is `0021_verified_notice.sql`, which redefines it for `VerifiedChanged`: a later
+redefinition copies the newest one), a TOTAL prefix rule on the serialised body (`substr(body, 1, N) = '{"System":{"IdentityKeyChanged":'` and so on;
+never `json_extract`, which raises on a body that is not JSON, and a generated column runs on
+every write of a `messages` row). `kourier-core/tests/quiet_notices.rs`
+`the_column_and_is_quiet_agree_for_every_kind` writes every kind through serde and compares
+(and so pins serde's spelling). The column is VIRTUAL and has no index: the walks that use it go
+along `messages_timeline` and stop at the first listed row, a quiet notice or two at the top
+costing a step each (measured, debug build: 1,000 quiet rows on top of a 20,000-row chat 0.74
+ms per recount hidden, 0.03 ms shown). `kourier-core/src/notices.rs` holds the SQL fragments
+(`listed!`, `newest_listed!`) that `ingest::RECOUNT`, `query::PREVIEW` and the flip below use; a new statement that picks the newest row for the list uses
+them, never its own `ORDER BY sort_key DESC LIMIT 1`.
+
+`UiCommand::SetQuietNotices { shown }` stores the choice and, in the same transaction, gives
+every conversation the sort time its newest listed row says now (`notices::set`), so that no
+read behind the command sees the old order; it is awaited like `SetExpiryPolicy`, on the global
+lane, and `ConversationsChanged` names the conversations whose sort time moved. The preview of a
+chat can change without that (two rows with one sort key; a pinned chat does not move), so the
+front-end READS THE WHOLE LIST AGAIN after the command (`CoreSource::set_quiet_notices` drops the
+answers to list queries sent before it). THE LIST NEVER LEAVES A CHAT OUT FOR WHAT IT HOLDS
+(the lead's decision F1, 2026-10-15): a chat with no listed row is listed as an empty chat (no
+preview, after the chats that have a sort time), so a chat that is listed (an empty group after
+a link, a chat he cleared, one whose messages all expired) cannot vanish when a quiet notice
+lands in it; Desktop's "hidden until a real message" rests on Desktop not listing empty chats
+at all, which Kourier does. The existing profiles take the default at the migration: every chat
+that ended in a quiet notice moves down once, and the chats that exist then and hold ONLY quiet
+notices (the garbage chats quiet notices made before the ingest guard, e.g. a stranger's
+refreshed session) are hidden once, in the state of a chat deleted on this device
+(`conversations.hidden`; no row is deleted and nothing is queued for any network), except a
+pinned chat, a chat with a draft, a message request, a chat with unread messages or an unread
+mark, and a chat without a visible row. A loud message lists such a chat again as it lists any
+deleted chat; a quiet notice never does, and neither does the switch.
+
+THE INGEST GUARD NEVER READS THE CHOICE. A quiet notice opens no chat (one for a chat the core
+does not have is dropped) and does not bring back a chat the user's other device deleted
+(`ingest/message.rs`), whatever the switch says; it used to open a new, otherwise empty chat
+for a stranger's refreshed session. Only the recount of `last_activity` (and the preview) reads
+the choice, in SQL through `listed!`, as the list's rule. The history import follows the same rule
+(`kourier-signal` `transfer/map.rs` `is_loud`: not quiet, and not `MemberLeft`; `stage::FORMAT`
+7, so a stage written under the old rule is read again), and a chat the archive gives only quiet
+notices is staged as not shown.
 
 ### 3.5 Messages and content
 
@@ -547,7 +722,7 @@ pub struct Message {
     pub received_at: i64, pub arrival: Option<u64>,          // from the backend's stage 1 (§3.9)
     pub sort_key: i64,
     pub revision: u16, pub edited_at: Option<i64>,           // edits: §3.5.3
-    pub deleted: Option<Deletion>,                           // tombstone: ForEveryone{by} | ForMe
+    pub deleted: Option<Deletion>,                           // tombstone: ForEveryone{by} | ForMe | Unattributed (KT-2)
     pub out_state: Option<OutgoingState>,                    // own messages
     pub read_state: Option<ReadState>,                       // incoming: Unread → Read → Viewed
     pub expiry: Option<Expiry>,                              // timer + started_at (AfterRead/AfterSend)
@@ -604,10 +779,28 @@ pub enum SystemEvent {
 - `reactions(message, user, emoji, at)`; `ConversationFeatures.reactions_per_user` is 1 for Signal
   and WhatsApp (a new reaction replaces the old one) and unbounded for Threema (a set of emoji per
   sender, R:threema §4.11).
+- Taking a reaction back: `Reaction { emoji, remove: true }` with an emoji removes that emoji of
+  the sender (Signal, Threema); with NO emoji (`emoji: ""`, WhatsApp's way: one reaction per sender
+  and message, taken back with an empty one) it removes every reaction the sender has on the
+  message that is not newer than it. It is stored as the tombstone of the empty emoji (row
+  `emoji = ''`, `removed = 1`, the later removal stands) and sweeps the sender's rows, each
+  becoming a removal at the removal's time; a reaction that arrives later in the order and is not
+  newer than the tombstone is stored as a removal at its time, so the rows end the same in any
+  order, and a newer reaction stands. With nothing to remove it changes nothing the user sees and
+  tells the UI nothing. An empty emoji that does not remove is no reaction.
 - `receipts(message, user, kind ∈ {Delivered, Read, Viewed}, at)` per member, plus the aggregated
   `OutgoingState` on the message.
 - `ReadMarker { conv, up_to }`: own read position from another own device (Signal
   `SyncMessage.read`, WhatsApp `MarkChatAsReadUpdate`, Threema reflected read).
+- Reading by POSITION (KT-2, `ingest/position.rs`): a row with a `net_seq` (§3.1) is read by position and never by time; a row
+  without one by time, as above (Telegram's dates are whole seconds, so two messages of one second must not share a read state).
+  `ReadUpTo { conv, seq }` is our own position from another session: every unread row at or below `seq` goes read
+  (`conversations.read_seq`). `PeerReadUpTo { conv, seq }` says the other side read our messages up to `seq` (`peer_read_seq`): the
+  own rows in `(old, new]` rise to `Read`; it is no per-member fact. Both only rise and are no-ops otherwise (a position that does
+  not rise still reads what is unread at or below it); a chat the core does not have is not made by one, the event is dropped. A
+  row that arrives, learns its position or is re-keyed at or below a position follows it, and an incoming one stored that way does
+  not notify. A `ReadMarker` that names a row with a `net_seq` is `ReadUpTo` at that number and leaves the time watermark alone; a
+  read here raises `read_seq` to the newest row somebody else wrote. The cost is what moved, never the chat (§5.4).
 
 #### 3.5.2 Deletes
 
@@ -621,6 +814,12 @@ command telling the other devices (`Command::ClearConversation`, `Command::Delet
 §4.8 "Durable commands"). Both directions follow the same rule for what stays. A delete for
 everyone with `by: None` on another member's message is our own admin delete from another device;
 it applies when the features have `admin_delete` and one of our own ids is an admin there.
+On a network whose server checks deletes (`ServerRules.validates_deletes`, §3.8; KT-2) a delete for everyone is applied as it
+comes, with no author, admin or window check, and one that names nobody (`by: None`) is stored with `deleted_by` NULL and read as
+`Deletion::Unattributed`: not "You deleted this message" (an own row with `by: None` elsewhere) and not an admin's. The timeline and
+the chat list word it alike, "This message was deleted" (`query::deletion_of`, `preview::deleted_text`). The row stays as a
+tombstone, as on Signal and WhatsApp (his M8 answer, "Keep the line (Recommended)"). A delete for a message that is not here yet
+waits for it, as everywhere.
 
 #### 3.5.3 Edits
 
@@ -628,9 +827,18 @@ it applies when the features have `admin_delete` and one of our own ids is an ad
 new DataMessages with a new timestamp whose `targetSentTimestamp` is the *previous revision's*
 timestamp (`SD/ts/util/editHelpers.std.ts:20-50`), so every revision's key is indexed and resolves
 to the same message. The latest revision is copied into `messages.body`. An edit of a message
-with attachments is a new caption: the attachment rows and files stay. The target of an own edit
-is chosen when the edit is sent, not when it was typed: the revision right before its own that
-still exists (an earlier edit the network refused is rolled back and never reached anyone).
+with attachments is a new caption: the attachment rows and files stay. What an own edit
+NAMES is the network's rule, `NetworkDescriptor.edit_target`. `LatestRevision` (Signal, the
+default): the revision right before its own that still exists, chosen when the edit is SENT, not
+when it was typed (an earlier edit the network refused is rolled back and never reached anyone;
+Desktop sends the same, `SD/ts/util/sendEditedMessage.preload.ts:98`). `Original` (WhatsApp, and
+the fake's WhatsApp-like and Threema-like flavours): the message's own key, whatever was edited
+since, because those networks key every edit by the original message (an edit is a protocol
+message whose key is the original: `WM/send.go:607-624`, `WA/src/client/messaging.rs:205`), so
+the id of an earlier EDIT is no message to them and `outbox::retarget_edit` does nothing. Under
+both rules the edit is stored as a new revision under its own allocated id and every revision's
+key resolves to the message, so the "edited" mark, `Query::Revisions` and an incoming reference
+to any revision work the same.
 Only a text, a caption (where every file kind of the message takes one; a caption can always be
 removed) and an undecryptable placeholder take an incoming edit. A sticker, contact card,
 location, poll, notice, view-once content and unsupported content never do: the core drops such
@@ -679,11 +887,45 @@ Three tiers:
 1. `NetworkDescriptor` (static, per network): display name, icon name, login flows, identifier
    kinds accepted for "start chat", default `history: HistorySource::{None, PushedOnLink, OnDemand}`
    (a conversation may override it, e.g. WhatsApp newsletters are fetched per conversation),
-   `msg_id_scope: AccountAuthor | Conversation` (§3.1), `typing: TypingPolicy { refresh, stop_after }`
+   `msg_id_scope: AccountAuthor | Conversation | ConversationAuthor` (§3.1),
+   `edit_target: LatestRevision | Original` (what an own edit names on the wire, §3.5.3),
+   `outbox: OutboxPolicy { budget, max_backoff, challenge_lifetime }` (the numbers of the network's
+   outbox, §4.8; the default is Signal Desktop's 24 h / 15 min / 24 h), `typing: TypingPolicy { refresh, stop_after }`
    (Signal 10 s / 3 s, `SD/ts/models/conversations.preload.ts:1270-1320`),
-   `risk_notice: Option<RiskNotice>` (shown before login; §7.4).
+   `risk_notice: Option<RiskNotice>` (a network the user is warned about before an account is
+   linked; §7.4), `history_transfer: bool` (a fresh link can bring the history as ONE archive the
+   phone uploads, `BackendEvent::HistoryTransfer`: a UI offers "Transfer History from Phone…" for
+   such an account and for no other; Signal sets it together with its offer; K-A, 2026-10-16: it
+   replaced the reading "the descriptor says `HistorySource::PushedOnLink`", which says only HOW
+   history arrives; WhatsApp's batches are `PushedOnLink` with `history_transfer` false, because
+   for it that action would be a link and unlink cycle, a risk for the account) and
+   `experimental: bool` (off until the user turns it on: `kourier-app` registers the network only
+   while its switch is on, §4.3, §7.4, §8.9). Both flags, `edit_target` and `outbox` are `#[serde(default)]`
+   (a stored descriptor without them reads as Signal's values; a partial `outbox` keeps Signal's for the
+   rest). The core makes one `Copy` value of the three rules it acts on, `NetRules { scope, edit_target,
+   outbox }` (`kourier-core/src/rules.rs`, `NetRules::of(descriptor)`), where a supervisor starts a
+   dispatcher; the outbox reads its numbers from it and from nowhere else.
+   `server: ServerRules { owns_unread, validates_deletes }` (KT-2; `#[serde(default)]`, both off: a stored descriptor without it
+   reads as every network always worked; `NetRules.server` carries it, and every site that has a network's `NetRules` begins its
+   `Apply` under it, `Apply::under_rules`) says what the network's SERVER decides. `owns_unread`: the count the network states
+   (`ConversationPatch.server_unread` / `server_mentions`) is the chat's unread and mentions instead of the rows' count (§5.4
+   `RECOUNT`), a live row does not move it, and the network states it at every change; off, a stated count is ignored with one debug
+   line and `unread_hint` is what such a network says. `validates_deletes`: `Deleted { for_everyone }` is applied without the core's
+   author, admin and receive-window checks, and a delete that names nobody reads `Deletion::Unattributed` (§3.5.2). All off for
+   Signal, WhatsApp, Threema and the real Telegram descriptor until the Telegram lane maps onto it; both on for the fake's
+   `Flavor::TelegramLike`. `FakeNetwork::playing*` state both off on purpose (the rehearsals and fixtures do not move).
+   `cleaned_pictures: Option<CleanedPictures { types, max_bytes }>` (LOC, 2026-10-27; per network, not
+   per conversation; `#[serde(default, skip_serializing_if = "Option::is_none")]`, never stored or hashed)
+   is the network's statement that the bytes it sends of a still picture of those MIME types (up to
+   `max_bytes`, none = no bound) carry no location (`CleanedPictures::cleans(mime, size)`). `None`
+   states nothing, and then every located file asks (§5.8.1). Signal and the Signal-like fake state
+   JPEG, PNG, WebP and BMP; WhatsApp and the fake's WhatsApp play the same up to 64 MiB (W5b, §7.1);
+   Telegram and Threema state `None`. A
+   network that strips on its server does not qualify: the statement is about what leaves this PC.
 2. `AccountCaps` (dynamic, backend event `AccountCaps`): limits from server config (Signal
-   `global.attachments.maxBytes`, text attachment limit), feature flags.
+   `global.attachments.maxBytes`, text attachment limit), feature flags, `max_pinned_chats` (the
+   account's pin limit; `None` = the network states no limit, and a network that has one states it)
+   and the flag `roaming_writes` (three states, §4.2).
 3. `ConversationFeatures` (per conversation, sent with `ConversationUpsert`, hashed):
 
 ```rust
@@ -715,8 +957,13 @@ pub struct ConversationFeatures {
                                                  // | Unregistered | NotAccepted | StillLoading
                                                  // | InvitationPending | JoinRequestPending
                                                  // | Other(String)
+    pub roaming_listed: Option<bool>,            // A10a: Some(false) = the network does not list this chat for its
+                                                 // roaming settings yet (a message request, a person known only by
+                                                 // a number): no Archive/Pin/Mute is offered; None/Some(true) = listed
 }
 ```
+
+`None` is left out of the stored JSON, so a network that states nothing keeps every stored value and `stable_hash`.
 
 The core validates commands against features *before* queuing (for example, edit window); the
 backend re-validates and may still return `Unsupported`. The same check functions
@@ -805,7 +1052,27 @@ sharing.
    roaming state go to the backend as commands; the backend confirms by emitting the event after
    its network transaction (needed for Threema transactions and WhatsApp app-state, R:threema §7
    req 14, R:whatsapp §8 req 8). Core-local state (drafts, local mute, UI prefs) is committed
-   locally.
+   locally. The one change the core makes on roaming state ON ITS OWN, with no click behind it,
+   is the clearing of a "marked unread" mark when the user reads the chat (`local::mark_read`).
+   For a network that keeps roaming settings for the account's other devices (its caps state
+   `roaming_writes`, the account's switch on or off, §4.2) that clearing is **durable**: the
+   same transaction that marks the messages read stores `DurableCommand::ChangeConversation {
+   SetMarkedUnread { false }, asked_at }` in `pending_commands`, the supervisor sends it, and
+   sends it again at every start until the backend answers `CommandPersisted` after its own
+   durable write (§4.8). A kill between the reading and the telling cannot lose it. `asked_at`
+   is the moment the user read the chat on the core's clock (`Shared::now`, the clock
+   `CoreConfig` was started with; the supervisor hands the very same clock to the backend as
+   `AccountContext::clock`, so the core and the backend read ONE clock and a backend may compare
+   `asked_at` with the time it merged what another device wrote): the runtime reads it when the
+   `MarkRead` command comes in, in the same synchronous step that takes the reading's turn,
+   BEFORE the reading waits behind an earlier change of the same chat, so a mark another device
+   made meanwhile is newer than `asked_at` (the read state and the `AfterRead` timers take the
+   later time the reading ran). A network that states no such flag (or whose stored caps this
+   build cannot read) keeps the plain, best-effort `ChangeConversation` the runtime sends after
+   the commit. A stored clear whose account does not state the flag at a start (the network or
+   the build changed) is deleted by the core and not sent: no row is resent for ever; a clear
+   whose account's caps this build cannot READ is kept, unsent, for a later start that can read
+   them.
 5. **Backends own their protocol view.** Sessions, keys, group secrets, nonce stores and
    decrypted-but-unprocessed envelopes live in the backend's `backend.db`; the core never reads it.
 6. **Transactional outbox (contract rule for every backend).** Every `backend.db` transaction that
@@ -833,17 +1100,25 @@ use tokio_util::sync::CancellationToken;
 pub trait Network: Send + Sync + 'static {
     fn kind(&self) -> NetworkKind;
     fn descriptor(&self) -> &NetworkDescriptor;
-    /// Pure function. Returns only the network-local part of an own message id plus `sent_at`;
-    /// the stored author of own messages is always `None`. The core persists the result in the
-    /// outbox BEFORE the first transmit, so retries reuse it. `now_ms` is strictly increasing per
-    /// account (core ensures).
+    /// Returns only the network-local part of an own message id plus `sent_at`; the stored
+    /// author of own messages is always `None`. Not necessarily pure: the core calls it once
+    /// per send, refuses an id that is taken (account-wide under `AccountAuthor`, in the
+    /// conversation otherwise; and calls again, up to 1,000 times) and persists the result in the outbox BEFORE the first transmit, so retries reuse
+    /// it; a random id is fine (Threema's and WhatsApp's are). `now_ms` is strictly increasing
+    /// per account (core ensures). A network whose server names the message itself (`SentAs`) allocates
+    /// ids that never equal one its server gives.
     fn allocate_message_id(&self, own: &[UserId], conv: &ConvKey, now_ms: u64) -> (Arc<str> /*local*/, i64 /*sent_at*/);
     /// Pure function, default empty. The names attachment `index` of own message `local` will have
     /// on the network, in the string form of `Attachment::net_ids` (Signal: `uuid:<hex>` of the
     /// client UUID derived from both). The core stores them with the queued message and echoes
     /// them in the request, so `AttachmentDeleted` from another device finds attachments this
-    /// device sent, and a delete made here can name them.
+    /// device sent, and a delete made here can name them. A network that answers `SentAs` states none.
     fn attachment_net_ids(&self, local: &str, index: usize) -> Vec<String>;
+    /// P5b "Copy Link": whether the network has links to people (default false: no button), and the
+    /// link made of a number the page MAY show (Signal: `https://signal.me/#p/<+E164>`, E.164 only;
+    /// default None). The result holds a third party's number: never a log field.
+    fn contact_links(&self) -> bool;
+    fn contact_link(&self, user: &UserId, number: &str) -> Option<String>;
     /// Spawns the per-account actor (Signal: own OS thread + current_thread runtime + LocalSet).
     fn spawn(&self, ctx: AccountContext) -> Result<AccountHandle, BackendError>;
 }
@@ -887,26 +1162,40 @@ pub struct Ack(pub oneshot::Sender<Result<(), PersistError>>);              // c
 
 pub enum BackendEvent {
     Login(LoginStep),
-    AccountReady { own_ids: Vec<UserId>, device: Option<u32>, display_name: Option<String>,
+    AccountReady { own_ids: Vec<UserId> /* the PRIMARY id first, never changing for the account
+                     (Signal the ACI, WhatsApp the LID); the one-identity rule compares it */,
+                   device: Option<u32>, display_name: Option<String>,
                    number: Option<String> /* own number (Signal E.164); None leaves what the core has */ },
     AccountSettings(AccountSettingsPatch),            // read receipts, typing, link previews, sealed-sender indicators…
     AccountCaps(AccountCaps),
     ContactUpsert(ContactPatch),                      // Option<Option<T>> = unchanged | clear | set
-    IdentityMerged { from: UserId, into: UserId },
+    IdentityMerged { from: UserId, into: UserId },    // only for a pair the server vouches for (an
+                                                      // authenticated sync, a server-signed mapping): a
+                                                      // merge is final, nothing moves back. Until it comes,
+                                                      // the two ids are two authors (§3.1, §4.9)
     ConversationUpsert(ConversationPatch),            // title, avatar, members (full|delta), features, timer,
                                                       // timer_version (the core drops the timer of an older patch),
                                                       // muted_until, archived, pinned_order, blocked, request_pending,
-                                                      // marked_unread, unread_hint (history), parent
+                                                      // marked_unread, unread_hint (history), parent,
+                                                      // server_unread / server_mentions (KT-2, §3.8)
     PinnedConversations(Vec<ConvKey>),               // full ordered list
     ConversationRemoved { conv: ConvKey },
-    ConversationCleared { conv: ConvKey, up_to: Vec<MsgTarget>, remove: bool, at: i64 },
-                                                      // own delete for me of a chat's messages on another
+    ConversationCleared { conv: ConvKey, up_to: Vec<MsgTarget>, remove: bool, at: i64,
+                          before_ms: Option<i64> },   // own delete for me of a chat's messages on another
                                                       // own device (§4.9); remove = the chat itself too.
-                                                      // May arrive before the messages it names: the core parks it
+                                                      // May arrive before the messages it names: the core parks it.
+                                                      // before_ms = a clear by TIME (WhatsApp): everything of the
+                                                      // chat at or below it goes, and a HISTORY row at or below
+                                                      // it is refused from then on (the cut, §4.9); a time more
+                                                      // than CLEAR_CLOCK_TOLERANCE (1 h) after the core's clock
+                                                      // is read as that bound, and it is a CLAIM: only a claim
+                                                      // larger than the stored one clears again (a replay is a
+                                                      // no-op)
     AttachmentDeleted { target: MsgTarget, net_ids: Vec<String>, at: i64 },   // one attachment, same origin;
                                                       // also matches attachments this device sent (attachment_net_ids)
     Message(IncomingMessage),
     HistoryBatch { conv: ConvKey, messages: Vec<IncomingMessage> /* ≤ 500 */, has_more: bool, progress: Option<f32> },
+                                                      // rows at or below the chat's cut are dropped (§4.9)
     Edited { target: MsgTarget, by: Option<UserId> /* None = own */, new_local: Option<Arc<str>>, body: Body, edited_at: i64,
              keeps_quote: Option<bool> /* Some(false): the edit carries no quote, the message loses its
                                           quote for good (Signal); None: the network does not say */ },
@@ -916,21 +1205,34 @@ pub enum BackendEvent {
                                                       // the target can be edited (§3.5.3)
     Deleted { target: MsgTarget, by: Option<UserId>, for_everyone: bool, at: i64 },
     Reaction { target: MsgTarget, by: Option<UserId>, emoji: String, remove: bool, at: i64 },
+                                                      // remove with an emoji: that emoji; remove with emoji "": every
+                                                      // reaction of `by` on the target (WhatsApp, §3.5.1)
     Receipts { targets: Vec<MsgTarget>, by: UserId, kind: ReceiptKind, at: i64 },
                                                       // counts only from someone the message was sent to (§4.9);
                                                       // a backend that knows the conversation sets targets[i].conv
     ReadMarker { conv: Option<ConvKey>, up_to: MsgTarget },       // own read elsewhere
+    ReadUpTo { conv: ConvKey, seq: i64 },             // KT-2: own read position elsewhere, in `net_seq` numbers (§3.5.1)
+    PeerReadUpTo { conv: ConvKey, seq: i64 },         // KT-2: the other side read our messages up to `seq` (no per-member fact)
     OwnSendState { local: Option<LocalMsgId>, target: MsgTarget, per_recipient: Vec<(UserId, RecipientState)> },
     CommandPersisted { cmd: CmdId },                 // a durable command is in the backend's own job table (§4.8)
     Typing { conv: ConvKey, by: UserId, device: Option<u32>, on: bool, ttl: Duration },  // ephemeral
-    AttachmentProgress { local: LocalMsgId, index: u16, done: u64, total: u64 },
+    AttachmentProgress { local: LocalMsgId, index: u16, done: u64, total: u64 /* one file of an upload: `index` is the
+                     file's place in the request, `total` its final blob size (every picture re-encoded FIRST,
+                     so it never grows), `done == total` only when that file is up; the promise of the abort
+                     below rests on it (upload progress, 2026-10-17) */ },
     AttachmentDone { attachment: AttachmentId, request: Option<DownloadId> /* echoed; an answer to
                      another request is ignored */, result: Result<AttachmentMeta, BackendError> },
     TransmitProgress { local: LocalMsgId, progress: f32 /* upload share */,
-                       phase: Option<SendPhase> /* Uploading | RefreshingGroup |
+                       phase: Option<SendPhase> /* Preparing | Uploading | RefreshingGroup |
                        SettingUpKeys{done,of} | RepairingDevices | Sending{done,of} |
                        SyncingOwnDevices; ephemeral, a group send reports it at most
-                       every 250 ms per phase (link feedback L6) */ },
+                       every 250 ms per phase (link feedback L6). `Preparing` (upload
+                       progress fix U3): a backend that makes its files ready before the
+                       first byte (Signal re-encodes every picture) says it from the
+                       attempt's start until every file's size is known, then the per-file
+                       `AttachmentProgress` at 0 and `Uploading` follow; one that does not
+                       may skip it. The core counts it as "an upload is reported" (the X is
+                       offered), so a backend that reports it must be able to stop in it */ },
     Notice(BackendNotice),                           // safety-number change pending, …; ChallengeRequired{url,
                                                      // retry_after}: a job met a challenge (§4.8 step 3)
 }
@@ -940,10 +1242,12 @@ pub struct IncomingMessage {
     pub origin: Origin,                              // NetMsgId = (Remote author | None for own, local)
     pub body: Body, pub reply_to: Option<ReplyTo>, pub sent_at: i64, pub server_at: Option<i64>,
     pub received_at: i64, pub arrival: Option<u64>,  // from the backend's stage 1 (§3.9)
+    pub net_seq: Option<i64>,                        // KT-2: its position in the conversation (§3.1); None = the network numbers nothing
+    pub allocated_as: Option<Arc<str>>,              // KT-2: the echo of an own message of THIS device: the id it was allocated under
     pub expiry: Option<Expiry>, pub view_once: bool, pub mentions_me: bool,
     pub silent: bool,                                // never notify (history, …)
     pub catch_up: bool,                              // arrived before the catch-up boundary: summarized (§4.5)
-    pub initial_out_state: Option<OutgoingState>,    // own messages in history imports
+    pub initial_out_state: Option<OutgoingState>,    // own messages, live and imported (the core reads it for every echo)
     pub read: bool,                                  // already read elsewhere (history imports)
     pub edits: Vec<HistoryEdit>,                     // history only: later versions' ids and times, oldest first
     pub reactions: Vec<(Option<UserId>, String, i64)>, // history imports
@@ -960,6 +1264,10 @@ pub enum Command {
     SubmitLoginInput { txn: u64, values: Vec<(String, String)> },
     CancelLogin,
     Transmit { local: LocalMsgId, req: OutgoingRequest, reply: oneshot::Sender<TransmitOutcome> },
+    // A transmit of an id the network already has (`req.local`: a resend after a kill, a retry after a
+    // lost answer) makes no second message: answered as sent (or as the first attempt's failure), never
+    // a second send. A backend whose library keeps its own send queue keeps a map from `req.local` to
+    // what it sent (§4.8 step 7).
     // Durable: the core keeps a pending_commands row until CommandPersisted{cmd} (§4.8).
     SendReceipts { cmd: CmdId, conv: ConvKey, targets: Vec<MsgTarget>, kind: ReceiptKind },  // read / viewed
     SyncReadMarker { cmd: CmdId, conv: ConvKey, up_to: MsgTarget, read: Vec<MsgTarget> },
@@ -969,9 +1277,26 @@ pub enum Command {
     ClearConversation { cmd: CmdId, conv: ConvKey,
                         newest: Vec<MsgTarget> /* ≤ CLEAR_ANCHORS (5) newest person-sent messages the chat
                         held, newest first */, newest_non_expiring: Vec<MsgTarget> /* the same without
-                        messages that have a timer */, remove: bool /* the chat itself was deleted */ },
+                        messages that have a timer */, remove: bool /* the chat itself was deleted */,
+                        before_ms: Option<i64> /* the newest `sent_at` among the removed rows that a person
+                        sent (the filter of the anchors: not System, not Placeholder); None when it removed
+                        none. A network whose clear names a time (WhatsApp: `lastMessageTimestamp`) sends
+                        it; Signal ignores it */,
+                        system_before_ms: Option<i64> /* the same for the other removed rows (notices, stand-
+                        ins): WhatsApp's `lastSystemMessageTimestamp`; a network with one time sends the
+                        larger of the two. The cut the core keeps is the larger of both */ },
     DeleteAttachment { cmd: CmdId, conv: ConvKey, target: MsgTarget, index: u16 /* position before the
                        removal */, net_ids: Vec<String> /* every name the attachment had; never empty */ },
+    // Durable too (A10a): a roaming change the core makes ON ITS OWN, with no click behind it and no one
+    // waiting (today only the clearing of "marked unread" when the user reads a chat). It is
+    // ChangeConversation without a reply: the backend answers CommandPersisted{cmd} after its OWN durable
+    // write, never a oneshot; a backend with nothing to write for it (no roaming settings, the account's
+    // switch off) still answers CommandPersisted and drops it, or the core sends the row at every start.
+    // The core queues it only for an account whose caps state `roaming_writes` (Some(_)).
+    // A backend applies (or files) it in the order it receives it relative to ChangeConversation of the
+    // same chat: a later click on the same setting wins.
+    ChangeConversationDurable { cmd: CmdId, conv: ConvKey, change: ConversationChange,
+                                asked_at: i64 /* the core's clock (ms) when the user read the chat */ },
     SetTyping { conv: ConvKey, on: bool },           // ephemeral
     DownloadAttachment { attachment: AttachmentId, request: DownloadId /* attachment_downloads.id,
                          never reused */, remote: BackendBlob, dest: BlobTarget },
@@ -983,7 +1308,12 @@ pub enum Command {
     ChangeContact { user: UserId, change: ContactChange, reply: oneshot::Sender<Result<(), BackendError>> },
     ChangeAccountSettings { patch: AccountSettingsPatch, reply: oneshot::Sender<Result<(), BackendError>> },
     ChangeProfile { patch: ProfilePatch, reply: oneshot::Sender<Result<(), BackendError>> },
-    ConfirmIdentity { user: UserId },                // user accepted a safety-number change
+    SetRoamingWrites { on: bool, reply: oneshot::Sender<Result<(), BackendError>> },  // A10a: the account's switch
+    ConfirmIdentity { user: UserId, key: IdentityFingerprint,   // user accepted a safety-number change; key = the one SHOWN (P5a RC2)
+                      reply: oneshot::Sender<Result<(), BackendError>> },  // the core requeues the paused sends only after Ok (RC6)
+    SafetyNumber { user: UserId, reply: oneshot::Sender<Result<SafetyAnswer, BackendError>> },  // P5a: from the backend's own store, at once
+    SetVerified { user: UserId, verified: bool, key: IdentityFingerprint,  // P5a: Mark / Clear ONLY (Confirm is ConfirmIdentity, BQ-2b)
+                  reply: oneshot::Sender<Result<(), BackendError>> },  // refused (InvalidInput) when the stored key is not `key`
     SubmitChallenge { token: Option<String> /* ErrorKind::Challenge.token of the paused attempt */,
                       answer: String /* what the browser handed back: solution token or redirect link */,
                       reply: oneshot::Sender<Result<(), BackendError>> },  // Ok: the core lifts its pause (§4.8)
@@ -1003,18 +1333,38 @@ pub struct OutgoingRequest {
 }
 pub enum OutgoingKind {
     Message { body: Body, reply_to: Option<ReplyTo>, expiry: Option<Duration> },
-    Edit { target: MsgTarget, body: Body },
+    Edit { target: MsgTarget /* the latest revision the recipients have, or the original message,
+                                 per NetworkDescriptor::edit_target (§3.5.3) */, body: Body },
     Delete { target: MsgTarget, for_everyone: bool },
     React { target: MsgTarget, emoji: String, remove: bool },
 }
 pub enum TransmitOutcome {
     Sent { server_at: Option<i64>, per_recipient: Vec<(UserId, RecipientState)> },
+    SentAs { assigned: AssignedId, server_at: Option<i64>, per_recipient: Vec<(UserId, RecipientState)> },  // KT-2: `Sent`, and the server named the message
     Partial { delivered: Vec<(UserId, RecipientState)>, failed: Vec<(UserId, BackendError)> },
     Failed(BackendError),
 }
+pub struct AssignedId { pub local: Arc<str>, pub seq: i64 }   // KT-2: the server's id for the message and its position
 ```
 
 Notes:
+- **Cloud ids and read positions (KT-2)**, for a network whose server names, numbers and counts messages (Telegram); every field
+  and variant is absent or off for Signal, WhatsApp and Threema. `SentAs` is `Sent` in every respect plus the server's id and
+  position: the core re-keys the row (§3.1, §4.8 step 3). A network that answers so promises: only a `Message` is answered so (a
+  `SentAs` to an edit, delete or reaction is read as `Sent`, one warn line); a resend under the allocated id gets the SAME
+  `assigned`, from a map held durably BEFORE the request leaves; its allocated ids never equal one the server gives; `assigned.local`
+  passes the id grammar and no other message of the conversation has it; a request queued behind an unsent message may name either
+  id and the network resolves both (a Delete may name the allocated id of an attempt that was never answered); a reply to a message
+  whose send FAILED goes out without the quote; it states no `attachment_net_ids`. The echo states `net_seq` and, for an own
+  message of this device, `allocated_as` (read only under `Origin::OwnThisDevice`: another device cannot know it); echo and answer
+  state one `server_at`, so their order changes nothing. A numbering network states `net_seq` on EVERY message it delivers,
+  echoes and call lines included (a row without one is read by time and a position passes it by), and `StartMode::Rebuild`
+  restates what a rebuilt core cannot know: positions, `ReadUpTo` / `PeerReadUpTo`, `server_unread` / `server_mentions` and, where
+  it knows them, the allocated ids. A position outside `0..=MAX_NET_SEQ` (2^53) fails `Envelope::validate`
+  (`ContractViolation::PositionOutOfRange`): the envelope is acked as a non-retryable `PersistError` and what it said is never
+  applied. `net_seq` decides what is read, never where a row stands (§3.9): a network whose dates are whole seconds and needs the
+  order within a second states it in the milliseconds of `sent_at`. On a network with `validates_deletes` (§3.8) `Deleted.by:
+  None` means nobody was named, and a target whose author the backend never saw is `TargetAuthor::Unknown`.
 - `Option<Option<T>>` in patches = (unchanged | clear | set). `MemberList { full: bool, .. }`
   separates a snapshot from a delta (bridgev2 semantics, R:multi-protocol-prior-art §2.1).
 - `BlobTarget { path, key }` is created by the core; the backend streams plaintext into
@@ -1025,9 +1375,63 @@ Notes:
 - `ChangeConversation` covers archive, pin, mute, block, accept message request, leave;
   `ChangeContact` (names, block, verify), `ChangeAccountSettings` and `ChangeProfile` exist because
   Threema routes every shared-state mutation through a D2M transaction (R:threema §7 req 14) and
-  WhatsApp through app state. In M1 the Signal backend answers `Unsupported` for all four (Storage
-  Service read-only, §6.9), except `ChangeConversation{SetTimer}` in a 1:1 chat (§6.13); the UI
-  hides these actions through `features`.
+  WhatsApp through app state. The Signal backend writes the four roaming changes of
+  `ChangeConversation` (archive, pin, mute, marked unread) to the Storage Service since A10c (§6.9)
+  and answers `Unsupported` for `ChangeContact`, `ChangeAccountSettings`, `ChangeProfile` and the
+  other conversation changes (block, accept, leave), except `ChangeConversation{SetTimer}` in a 1:1
+  chat (§6.13); the UI hides the roaming ones through the account's statement (below).
+- The persisted form of `ChangeConversationDurable` is `DurableCommand::ChangeConversation { conv,
+  change, asked_at }` (`pending_commands.command` JSON, spelling pinned by
+  `contract::a_durable_conversation_change_is_a_command_without_a_reply`:
+  `{"ChangeConversation":{"conv":..,"change":{"SetMarkedUnread":{"marked_unread":false}},"asked_at":<ms>}}`);
+  `into_command(cmd)` makes the `Command` above.
+- **Roaming settings** (archive, pin, mute, marked unread: a chat setting that the network keeps for
+  the account's other devices) are written through `ChangeConversation`, and whether a network can
+  is stated in the account's caps, in `AccountCaps::FLAG_ROAMING_WRITES` (`"roaming_writes"`), read
+  through `AccountCaps::roaming_writes()` in THREE states: **absent** = the network cannot write
+  them (the UI hides the entries; WhatsApp, Telegram and Threema until their own steps; a Signal
+  account that is linked states `false` or `true` from A10c on); **`false`** = it can, but this account's switch is off (the entries are shown greyed,
+  with the reason); **`true`** = on. The backend alone states the flag, with the other caps
+  (`BackendEvent::AccountCaps`); the core never sets it. The switch is `UiCommand::SetRoamingWrites
+  { account, on }` -> `Command::SetRoamingWrites { on, reply }` (not durable): the backend stores
+  it, answers, and states the new flag; the core changes nothing before that event. A network that
+  cannot write answers `Unsupported`. `AccountCaps::max_pinned_chats` is the account's pin limit
+  (`None` = the network states no limit; a network that has a limit states it: the common limit is
+  4, a network may have its own). Signal states the flag and the limit TOGETHER, in every statement
+  of its caps (the start, a rebuild, a remote-config refresh, a switch change), so the core never
+  holds one without the other.
+- A chat the network does not list for its roaming settings yet (a message request, a person known
+  only by a number) says so in its features: `ConversationFeatures::roaming_listed == Some(false)`
+  (`None` and `Some(true)` = listed, so a network that states nothing changes nothing, and a stored
+  features value keeps its JSON and `stable_hash`); `ConversationFeatures::lists_for_roaming()`
+  reads it. Features are replaced as a whole, so a backend that lists or unlists a chat states the
+  chat's features again.
+- The core's automatic clearing of "marked unread" (`local::mark_read`) is the first user of the
+  durable `ChangeConversationDurable` (above); every backend must answer it with `CommandPersisted`
+  (the ones that write nothing, after a debug line with no content). **A backend applies (or files)
+  it in the order it receives it relative to `ChangeConversation` of the same chat: a later click on
+  the same setting wins.** The core keeps its side of that order (a reading holds the chat's turn
+  until the durable command is queued, a later click waits for the turn and goes through the same
+  channel behind it, and at a start `resend_pending` runs before the account's control loop); a
+  backend that files the durable command as a job that runs later must not let a plain
+  `ChangeConversation` that came after it overtake it, or a user who reads a marked chat and marks
+  it again at once ends with the clear landing after the mark.
+- The core is the second line for the four roaming changes (`roaming::check`; the backend is the
+  gate): `SetArchived`, `SetPinned`, `SetMuted` and `SetMarkedUnread` (the list is
+  `ConversationChange::is_roaming`, one exhaustive `match` in kourier-model that the core, the fake
+  and every backend use) are refused with `Refusal::NotAllowedHere` when the chat's account does not
+  state `roaming_writes == Some(true)` or the network does not list the chat, and, only when the
+  network states a pin limit (`pin_limit`; `None` = no limit stated, no refusal for a count), a pin
+  that would be the account's one too many with `Refusal::TooMany` (a pin of a chat that is pinned
+  already adds none). The pins are counted PER ACCOUNT (a blended list holds several; the change
+  carries only the conversation id and goes to the chat's own account). Nothing reaches the backend
+  then, the turn ends and a mark that was counted for the reading behind it is forgotten.
+  `SetTimer`, `AcceptRequest`, `Leave`, `SetBlocked` and every other change are not looked at. The
+  count is the pinned chats the core LISTS (a chat deleted here is hidden and is not counted, as no
+  front-end can count it); the backend's gate counts what the network lists (entries this device
+  does not show too) and is the real limit. The second line reads the account's caps strictly: a
+  value this build cannot read refuses the click (the safe side), while the STATE the queries show
+  treats such an account as one that states nothing (`Hidden`, §8.3).
 - Timer rows: the backend writes the `TimerChanged` timeline row for own changes and for incoming
   ones (`by: None` = our own account); the core never writes one and changes a conversation's
   timer only from the patch. For an own `SetTimer` the backend uses `id` as the id of the update
@@ -1039,11 +1443,92 @@ Notes:
   conversation; the backend sends 1:1 copies and emits, through `core_outbox`, one
   `Message{origin: OwnThisDevice, linked_local}` per member DM, so the one-message,
   one-conversation outbox model holds (R:threema §7 req 22).
+- `RefreshContact { user }` (people pages P1) is the UI's wish for a fresher profile when a person's
+  page opens (`UiCommand::RefreshContact { account, user }` through `Control::Backend`, not durable,
+  no answer: the result is an ordinary `ContactUpsert`). A backend decides whether one is due; Signal
+  fetches at most once a day per person and never for a person it holds no profile key for (§6.10).
+  The page itself is read with `Query::Person { account, user }` -> `QueryData::Person(Option<Box<PersonDetail>>)`
+  (§8.3): the contact row, the 1:1 chat's id, timer and features, and the groups both are full members
+  of; `None` for an account the core does not know. `PersonDetail`, `PersonChat` and `CommonGroup`
+  hide every name, text and number from `Debug`.
+- `Query::Group(ConversationId)` -> `QueryData::Group(Option<Box<GroupDetail>>)` (people pages P2): the group's
+  title, avatar, description, timer, features (with `group_info`) and one `GroupMember` row per member row (Member,
+  Admin, Pending, Requesting; our own row is marked `is_self`); the viewmodel lists the full members and counts the others. ONE statement
+  (`query::GROUP_MEMBERS`: `members` LEFT JOIN `contacts` LEFT JOIN `files` for the avatar, planned from the members
+  primary key, no `SCAN`, no `blob_ref` per row, a plan test). It answers `Some` for kind `Group` only (`None` for a
+  1:1 chat, a channel, a broadcast and an unknown id). `GroupDetail` and `GroupMember` hide titles, names and the
+  description from `Debug`. The description travels whole; the viewmodel cuts what it shows (§13 limits).
+  `ConversationPatch.description` is the contract's other new word (§3.4).
+- Safety numbers (people pages P5a, 2026-10-25): `Query::SafetyNumber { account, user }` ->
+  `QueryData::SafetyNumber { answer: SafetyAnswer, waits: bool }` is the ONE query that asks a backend
+  (`Command::SafetyNumber`; an account that is not running or not linked answers `NotRunning` without asking);
+  `waits` says whether a send of the account waits on that person's new key (the core's in-memory pauses).
+  `PersonDetail.safety_numbers` is the account's descriptor's flag (a network not registered at this start
+  offers none). `UiCommand::SetVerified { account, user, verified, key }` is Mark as Verified / Clear
+  Verification ONLY and `UiCommand::ConfirmIdentity { account, user, key }` is Confirm New Safety Number
+  (BQ-2b: Desktop's "Send anyway"); both carry the key of the number ON SCREEN and the backend refuses
+  (`InvalidInput`, reported as `ActionFailed { "SetVerified" | "ConfirmIdentity", Person(user) }`) when its
+  stored key is another one. The core releases the sends paused on that person after every `Ok` of either
+  (F2, RC6; §4.8). `UiEvent::SafetyWaitChanged { account, user }` says a person's wait began or ended (the
+  page asks again), and `MessageActions.safety_number: Option<UserId>` is set on every own row of the paused queue that
+  still waits, the paused head and the rows behind it (BQ-3, U4: the message menu's "Show %1's Safety Number"). A
+  person's page asks again for `PersonDetail.safety_waits` (U7).
+- Copy Link (people pages P5b, 2026-10-25): `PersonDetail.link: LinkState { Hidden, Link(Redacted<String>), NotShared,
+  NoNumber }`, filled in the `Query::Person` arm by `LinkState::of` from `Network::contact_links()` /
+  `contact_link(user, number)` (the account's network; `is_e164` in `kourier-backend-api`). THE NUMBER RULE: the network
+  is handed a number ONLY when the page may show it, `number_shown == Some(true)` (the Phone identifier) or the id is
+  the number (`e164:` / `pn:`, `+` added); `Some(false)` -> `NotShared` (Signal states `false` also for a profile
+  never fetched, so its sentence says only "not shown", Z1); `None` (never said, a profile not fetched yet) or a number
+  the network does not link -> `NoNumber` (never a claim that the person does not share, critic F20); a network without
+  links and the user's own page (read-only, BQ-4) -> `Hidden`. Signal's only form is `#p/+E164` (`is_e164`: `+` and 7 to
+  15 digits, the log scrubber's bound, Z2: Niue's 7-digit numbers link): the `#eu/` username link needs entropy only its
+  owner has. `Debug` hides the link; no log field carries it.
+- Share Contact (people pages P5c, 2026-10-26): `UiCommand::SendContact { conv, account, user }` sends `user`'s contact
+  card into `conv`, only on his click and his choice of chat. THE CORE BUILDS THE CARD (`PersonDetail::contact_card`;
+  QML and the viewmodel never assemble one): `ContactCard { name: <their Signal PROFILE name, trimmed>, identifiers:
+  [Phone <the SHOWN number>] }` and nothing else: never the address-book name or his nickname (SC1: both are his own
+  naming), the number only by THE NUMBER RULE above (`PersonDetail::shown_number`, shared with `LinkState::of`), no
+  avatar, no ACI (BQ-7), one card per message, the name at most `MAX_CARD_NAME_BYTES` (512, Kourier's own cap, §13).
+  `PersonDetail.share: ShareState { Hidden, Ready, NotShared, NoNumber, NoName }` (`ShareState::of`: the own page and
+  a network without `contact_cards` -> `Hidden`; the number first, as Copy Link, then the name; a name over the cap is
+  `NoName`; ONE number rule with the link: a shown number that is not E.164 (`kourier_backend_api::is_e164`: `+` and 7
+  to 15 digits, what Signal's `contact_link` checks too) is `NoNumber` for the card as for the link, since a receiver
+  would read it as a number of ITS region: SD3). Refused (`ActionFailed { "SendContact", Conversation(conv) }`, nothing queued): `conv` of another account
+  than `account` (InvalidInput; checked FIRST: a card never goes through another account), a network without
+  `contact_cards` (NotAllowedHere), no card for the person (InvalidInput), a chat with `cannot_send` (the outbox's
+  refusal: the picker's `can_send` filter is only the UI's, this is the core's own gate, and a card into a chat the phone
+  never accepted would also hand our profile key to a stranger, SD2). Queued like `SendText` (`queues.compose`, one
+  `Body::Contact` message, the chat's draft kept); it waits behind a paused head like any message of the chat (P5a, SD4).
+  A reply to one of his own cards quotes it as Signal Android quotes a card (`Contact.quoteText`): the text "👤 " and
+  the card's NAME, never the number (SD5; `outbox::` quote snapshot). `ConversationRow.can_send`
+  (`features.cannot_send` absent) is what the share picker lists (§8.3).
+- `Query::ChatMedia(ChatMediaQuery { conv, kind, before, limit })` -> `QueryData::ChatMedia(ChatMediaPage { items, more, other })`
+  (people pages P4, core.db 20): a page of ONE chat's gallery, newest message first, the attachments of one message in
+  their order. `kind` is `MediaKind::Visual` (image, video, GIF) or `Files` (file, audio file; a picture sent as a file
+  is a file); a voice note is neither, and a sticker is a `Sticker` row, not a `Media` row. Left out: a message deleted
+  (for me or for everyone), a view-once message, one hidden because its time ran out on an unconfirmed clock, an
+  attachment that is the rest of a long text, and one that cannot be had (`Unavailable`, `Expired`, `AskFailed`: the
+  state is JSON, so a unit variant is its name in quotes and `AskFailed` an object matched by its TOTAL prefix, never
+  `json_extract`); kept: not downloaded, downloading, here, failed, asking the phone. ONE statement per kind
+  (`query::gallery_sql`) starts at the PARTIAL index of its kind, `messages_media_visual` or `messages_media_files`
+  (`WHERE body_kind = 'Media' AND media_<kind> = 1` over the message flags `media_visual` / `media_files`, which triggers on
+  `attachments` keep right, core.db 20; named with `INDEXED BY`, so the statement is an error and not a slow scan if the
+  index ever stops applying; one index over every media message walked 20,000 pictures to find one file), takes the
+  timeline's row-value range `(sort_key, id) <= (?, ?)` and reads an album's attachments by the unique key of
+  `attachments` (no sort); the page goes on after a `MediaCursor { sort_key, message, idx: Option<u32> }` (`idx: None` starts the page AT the message, with its first attachment: what the picture viewer asks for), which may stand inside an
+  album; `more` is "one row more than asked was read"; the first page also says whether the OTHER kind has any (`other`,
+  an `EXISTS` by the other kind's index) so a chat with files and no picture still has a section. The answer registers the media
+  handles of its items as a timeline page does (`query::chat_media_handles`), or `image://kourier/thumb/<id>` of a square
+  would draw nothing. A page is at most `MAX_MEDIA_PAGE` (1,000) attachments (§13 limits). Plan tests pin the index
+  of each kind (`the_gallery_starts_at_the_partial_index_of_its_kind`) and that the timeline's page statement still goes along
+  `messages_timeline` (`the_timeline_page_still_uses_the_timeline_index`).
 
 ### 4.3 Account lifecycle and supervision
 
 1. **Add account**: the UI picks a network; if `descriptor.risk_notice` is set, the UI shows it and
-   requires explicit consent. The core creates an `accounts` row (`state = Linking`, new uuid),
+   requires explicit consent (a page with a tick box that is never ticked beforehand, §8.3; the
+   consent is the UI's: the core takes `AddAccount` of every registered network). The core creates
+   an `accounts` row (`state = Linking`, new uuid),
    creates `accounts/<uuid>/` (mode 0700) with a fresh `key.wrap` and account secret (§5.2), calls
    `Network::spawn(start = Fresh)` and sends `StartLogin{flow, relink: None}`.
 2. **Login** streams `Login(LoginStep)` events (§4.4). On `Done` the backend emits `AccountReady`;
@@ -1054,7 +1539,8 @@ Notes:
    finished just then does not leave a device on the server; a backend without a device simply
    exits on it. A backend never aborts a login that may already have registered something: the
    Signal backend stops it, waits for the answer of a link request that is on its way and
-   removes the device the server linked (§6.5).
+   removes the device the server linked (§6.5). Threema's backend drops its own device at that `Logout` from the
+   identity its join stored (RP-b, §7.4).
 3. **Startup**: for each `Active` account, unwrap `db_key`, spawn with `start = Resume`, send
    `Connect` after the first UI frame.
 4. **Supervisor**: awaits `exited`. `Panicked`/`Failed` → restart with capped exponential backoff
@@ -1092,7 +1578,11 @@ Notes:
    One identity is one account of a profile, checked twice. FIRST LINE, in the backend, before a
    device exists: `Command::StartLogin` carries `taken`, the primary own ids (with whether that
    account is logged out) of the profile's other accounts of the network that are not
-   `Removing`; the Signal backend compares the ACI of the phone's provisioning message with
+   `Removing` and whose removal was not asked for (the core task counts an account as
+   removing, `Shared::removing`, when it takes `UiCommand::RemoveAccount`, before the
+   account's supervisor, which may be busy or waiting for its key, writes `Removing`: the
+   window's "Remove and Link Again" sends the removal and the new login back to back, and the
+   login must not meet the account it replaces); the Signal backend compares the ACI of the phone's provisioning message with
    them and, on a match, ends the login with `ErrorKind::AlreadyAdded { logged_out }` BEFORE
    `PUT /v1/devices/link` (the phone never gets a second device; the mock harness counts the
    link requests, `sendStats.linkRequests`). SECOND LINE, in the core, for a backend that
@@ -1135,10 +1625,32 @@ Notes:
    server no longer knows the device or its credentials), and a 401 or 403 (or "device
    deregistered") at the door of a socket opened for the request, as `Removed`; a 5xx, 429,
    413, any other refusal (a 404 at the door too), a timeout or a transport error is
-   `NotReached`. The core tells the front-end once, AFTER the removal is done (after the shred
-   and the deletion of the row, BEFORE the wait for the derive permits and the removal of the
-   account directory, which a big account takes a while for; the window in which a kill loses
-   the notice is then the return of one store write):
+   `NotReached`. The `DELETE` rides on the socket that stands, else on the one the connection
+   task's attempt under way opens (waited for, never given up for a second connect: the connect
+   runs in Kourier's network runtime, `Net::run` spawns it and dropping the `JoinHandle` detached
+   it, so it ran on after the future that waited for it was dropped; the server closes the older
+   of two sockets of a device with 4409, and the request used to ride on the closed one: F1;
+   `Net::run_aborting` now aborts a connect nobody waits for, and the connection task's connect
+   `select!` is `biased` towards its stop token), else on a socket opened for the request; the
+   task does not start its post-connect work (one-time keys, sync requests) on the socket of a
+   device being removed, and nothing NEW rides on it either (the history transfer's long poll,
+   sends and the group lanes take their socket from `Shared::work_socket`, which gives none from
+   the start of the removal to the end of `unlinked`: `logout` sets `unlinking` the moment the
+   removal returns; what already runs on a socket that stands, the job runner's requests and a
+   long poll in flight, goes on until `unlinked` stops the task, and fails or is lost with the
+   device); a socket that closes under the request (4409, 4401, gone) or does not
+   answer it in time (a dead socket nobody noticed yet; the server may have served it, a new
+   connection is then refused with 401 or 403 = `Removed`) is asked again once, on the task's
+   new socket when the task is reconnecting (the failed one is skipped), else on a new
+   connection; no connect is started once the deadline has passed, and a removal that gives up
+   there stops the connection task and waits for it before it returns (an upgrade answered
+   later must not start post-connect work for a device that is still linked). `LoggedOut` is
+   the last connection state of an actor (`Shared::set_conn` takes nothing but another
+   `LoggedOut` after it): the task, stopping after `unlinked` wrote it, does not take the
+   banner's "logged out" back. The core tells the front-end once, AFTER the removal is
+   done (after the shred and the deletion of the row, BEFORE the wait for the derive permits and
+   the removal of the account directory, which a big account takes a while for; the window in
+   which a kill loses the notice is then the return of one store write):
    `UiEvent::LogoutOutcome { seq, account, removed, report, who }`; no report = `NotReached`, a
    logged-out account's removal = `NoDevice`. A shred or a row deletion that fails keeps the
    `Removing` row and tells nothing; the next start finishes the removal and tells then, so the
@@ -1184,6 +1696,49 @@ Notes:
    records; Signal also re-requests contact sync). Messages lived only in `core.db` and come back
    only where the network re-delivers history (WhatsApp); identities and sessions are intact.
 
+**Paused accounts, no runtime switch (K-A, 2026-10-16).** An experimental network (`experimental`,
+§3.8) is not started and stopped by the core. `kourier-app` registers it only while the user's
+preference `networks-on` (a list of kind names in `kourier.toml`, absent = none) names it, reads
+that preference once at the start and tells the UI which networks are compiled in but off (a plain
+list; the front-end shows them as "Off · experimental"). The core's lifecycle has no state for it.
+An account of a network that is not registered in this run is a PAUSED account
+(`kourier-core/src/networks.rs` writes the definition, `tests/networks.rs` pins it): its row, chats
+and messages stay and are read like any account's; it is not wiped, logged out or marked failed; no
+supervisor runs for it (the start logs that its network is not in this build); its connection state
+is the default `Offline`, a defined state that needs no action. Nothing new leaves: every command
+that needs the network (send, edit, react, delete, retry, `AddAccount`) is refused with
+`UnknownNetwork`, and the front-end disables the composer first ("WhatsApp is turned off"); rows
+queued before the network went away stay in the outbox and go out when it is back and the account
+is online. What a message of a paused account OFFERS is what the core would accept (K-A fix C2): the
+timeline query carries the fact "the network is registered" (as `Query::Accounts` carries
+`conn_states`) and `actions::all` answers false for edit, delete for everyone, react, retry and the
+download asks while it is not, so a queued own message of a paused account offers only Take Back, and
+`cancel_message` works without a network (it reached nobody). `Unlink`, `Relink`, `RestartAccount` and
+`CancelLogin` fail with `UnknownAccount` and touch nothing (the front-end does not offer them while
+the network is off). `RemoveAccount`
+removes the account locally (`networks::remove_without_network`) with the outcome `NotReached`
+(`NoDevice` for a logged-out account), and the front-end says that the phone keeps listing the
+device until it is removed there; a `Removing` row found at a start whose network is off is
+finished the same way by `reconcile` (the tail of `networks::remove`, which tells the kept report),
+and an `Unlinking` row (a cut-off Unlink) ends `LoggedOut` here with the chats kept and the
+credentials wiped, its kept report told (C8). The banner `NetworkOff` ("WhatsApp is turned off", button
+"Turn On and Restart", drawn as information: the person turned it off himself) sets the preference and
+restarts Kourier; "Restart Now" of Settings, the warning's "Turn On and Restart" and this button all
+go through the window's quit question first when a history transfer, a history the network
+pushes (WhatsApp, `QuitWork::History`) or the update after a link still runs ("Restart Kourier?" with "Restart"; nothing is written before the answer, K-A fix U4), and
+the preference is SAVED before the process is replaced (C5: the desktop task drains the preference
+commands queued before the stop, saving the newest, and `App::shutdown` for a restart saves the
+preferences it holds in memory itself once the runtime has stopped, for a desktop task that was busy
+longer than `DESKTOP_SHUTDOWN_TIMEOUT` and was abandoned, so a restart never comes back with the old
+preferences): `kourier_app::restart` replaces the process
+after the core has stopped and the profile's lock and the single-instance name are free, carries
+over the profile and nothing else of the command line (no link given on it, which would run a
+second time), and in a fixture, screenshot, dev-control or measuring run only records the request.
+A link that the warning page started goes on after the restart through the one-shot preference
+`pending-link`, which is read and cleared at the start and opens the link page once the window is
+up (the tick counts for that link). Turning a network off while it has an account asks first
+(§8.9). No core.db or backend.db migration came with this.
+
 ### 4.4 Login flows
 
 ```rust
@@ -1203,6 +1758,31 @@ The UI has one generic `LinkAccountPage` that renders any step (§8.3); a relink
 account's banner. Signal: `Input{device name}` (prefilled with the hostname) → `ShowQr` repeated
 every 45 s (max 6) → `Progress("Linking")` → `Progress("Syncing contacts and groups")` → `Done`.
 
+**Step vocabulary and two ways to link (K-A, 2026-10-16).** The front-end keys the words of a step on
+its `step_id`, the PURPOSE of the step: `qr`, `phone`, `code`, `done`, Signal's `device-name`, and
+`passkey` (reserved for W9, with a confirmation-code step); a `step_id` it does not know gets the
+generic hint (a test). A failed step carries the step it failed at: a number the network refused
+fails at `phone` (`RateLimited`: a wait text with the time; `Unsupported`: "not available yet" with
+no Try Again and a button back to the QR code; `InvalidInput`: "Check the phone number."), a code
+that ran out at `code` (Try Again restarts the same flow); `ErrorKind::TooManyDevices { max }` says
+the phone has no room for another linked device; `ErrorKind::NotTheExpectedAccount` (W2c) says the phone that scanned belongs to another
+account than the one the run expects (a debug run with an expected number tail; it fails at `qr`, or at `code` in the phone flow, and Try Again stays; Threema (TH4) uses it at `qr` when the run profile names no test ID, before any code is shown (no Try Again there: the list is read once at the start, so every new attempt is refused the same way; "OK" goes back), and at `linking` when the phone's ID is not on the list (Try Again stays), §7.4). A network that offers two ways
+(`login_flows`: WhatsApp's `qr` and `pair-code`) shows the QR code first and one button for the
+other way ("Link with Phone Number Instead" / "Scan a QR Code Instead"). The switch
+(`UiSource::switch_login_flow`) cancels the running login and starts the other flow in its place,
+without the "Stop Linking?" question; it is ignored while the new login is still waiting (the
+debounce) and the late steps of the old login are ignored. The typed number is kept for Try Again.
+The phone-number way says that the phone will list "Chrome (Linux)": WhatsApp accepts only a
+browser name there. The code is shown as XXXX-XXXX. Signal's three QR steps moved from QML to
+Rust byte for byte (a test pins them).
+
+**The code's delivery and the refusals' own steps (KT-1b).** `InputField.code: Option<CodeDelivery>` says, on the code
+field of a step, how the network sent the code (`CodeVia`: app, SMS, SMS word, SMS phrase, call, Fragment, other) and, in
+`CodeResend`, the wait that REMAINS before a new code may be asked for (0 = at once; every showing of the step restates
+what is left; `None` = no new code by a way Kourier can take). The value id `RESEND_FIELD` (`"resend"`), sent alone,
+asks for it. Three more step ids exist only as the step a `Failed` login failed at: `registration` (the number has no
+account), `purchase` and `update`; the UI words them from the step and the error kind, never from the error's detail.
+
 ### 4.5 Connection state
 
 ```rust
@@ -1212,14 +1792,16 @@ pub enum ConnState {
     Syncing { fraction: Option<f32> },        // catch-up, until the boundary below is committed in core.db
     Online { detail: Option<String> },        // e.g. Threema "leader"
     NeedsUserAction(UserAction),              // Relink | UpdateApp | SolveChallenge{url} | FixClock{skew_ms} | Reconnect
-    Restricted { until_ms: Option<u64>, reason: String },   // WhatsApp temporary ban, reach-out lock
-    LoggedOut { reason: String },
+    Restricted { until_ms: Option<u64>, reason: String,     // WhatsApp temporary ban: no connection until
+                 kind: Restriction, note: NetworkNote },    //   then; kind = Banned(BanReason) | Unknown
+    LoggedOut { reason: String, cause: LogoutCause,         // cause = RemovedOnPhone | PhoneInactive |
+                note: NetworkNote },                        //   AccountGone | Unofficial | Unknown
 }
 ```
 
 **Catch-up boundary** (contract rule). When the server says its backlog is delivered (Signal
 `QueueEmpty`, Threema `ReflectionQueueDry`, WhatsApp `OfflineSyncCompleted`), the backend records
-its current stage-1 arrival counter as the boundary. It stays in `Syncing` until every row up to
+its current stage-1 arrival counter as the boundary (Threema keeps none: its boundary is `core_outbox`'s newest seq, §7.2). It stays in `Syncing` until every row up to
 the boundary has passed stage 2 *and* been acked by the core, then switches to `Online`. Messages
 emitted while `Syncing` (arrival ≤ boundary, or boundary not yet known) carry `catch_up = true`.
 Signal Desktop does the same: `#onEmpty` waits until
@@ -1242,6 +1824,59 @@ the one the 428 came on dropped. The `Online` that ends the catch-up the 428 was
 same connection, not a return after an interruption: it neither lifts the pause nor hides the
 challenge, which also stays on show over the catch-up's own progress updates
 (`kourier-core/src/dispatch.rs`, `paused_in_catch_up`).
+
+*Restrictions, holds and logouts (K-A, 2026-10-16).* Four things a network can do to an account are
+four contract shapes. (1) A temporary BAN (no connection until a date) is
+`ConnState::Restricted { kind: Banned(BanReason), until_ms, note }`: the account stays as it is,
+the outbox waits as for any lost connection, the backend leaves the state when the ban ends. The
+banner says why from the typed `BanReason` (WhatsApp 101 strangers, 102 blocked, 103 groups, 104
+the same message, 106 broadcast list, `Other(code)` with no reason; the raw code and the backend's
+`reason` string are for the log and are never shown) and until when ("today at 14:00", "tomorrow
+at 09:00", a date), rebuilds itself at that time (`tick`, `banner_instants`), and once the date has
+passed shows "Reconnect" (the existing restart path, `BannerKind::Error`): nothing reconnects by
+itself (his word: "Wait for my Reconnect"). (2) A REACH-OUT LOCK, where the connection stays up, is
+NOT a connection state but an account SEND HOLD: `BackendEvent::AccountHold(Option<AccountHold {
+until_ms, reason: HoldReason }>)`, a state the core PERSISTS per account (K-A fix C1: a core.db
+`settings` row `hold` in the account's scope, `{until_ms, reason, since_ms}` (`since_ms`: when the hold
+began on the core's clock), no migration; written when the
+backend states it, forgotten when it states `None` or `until_ms` passes, and restored into the
+dispatcher at the start of a run BEFORE the first transmit, so a crash, a reboot or "Restart Now" does
+not send into a lock the backend has not restated yet). The contract: a backend that can hold sends
+states `AccountHold` (`Some` or `None`) at EVERY connect before its first Syncing/Online (the fake does
+it from `Script::after_connect`, after Online, to prove the restored hold is enough); an actor restart
+does not clear it, an over-hold being safer than an under-hold, and the core lets it go by itself at
+`until_ms`. A hold is not a Wait: it does not use up a message's retry budget (a row never fails as
+`Challenge` for a hold, C4), and the time it stood is GIVEN BACK at the lift: in the transaction that
+forgets the stored hold, the deadline of every waiting row of the account moves on by the time since the
+hold began or the row was made, whichever is later, up to `until_ms` for a hold that ran out by its date
+(`outbox::give_back_held_time`; K-A fix 2; a row's start is read as its deadline minus the
+network's budget, see "The numbers are a network's" below), so the first attempt after a lift of days that fails
+transiently is retried like any other and not the row's last, also across a restart during the hold. While it lasts `SetConversationTimer` is refused with the typed `Refusal::Held`, which names the
+hold (C3: the timer would be a message on that network), and the chat's "Disappearing Messages" entry
+is disabled with that reason (`ChatHeader.timer_held`); Leave and AcceptRequest go on (no descriptor
+says they are messages a hold covers). The dispatcher
+(`kourier-core/src/dispatch.rs`, `held`) keeps every message, reaction, edit and delete made in
+Kourier in the outbox while it lasts and arms a timer for its end; receiving, downloads, read
+receipts and the missed-call summary go on (tests for each in `tests/account_hold.rs`; downloads and
+the summary never pass the dispatcher, so no dedicated test). `AccountRow.hold` and
+`UiEvent::AccountHold` tell the front-end: a banner of kind `Restricted` and the wait line under a
+waiting message ("Waiting: WhatsApp restricted this account until …", with no "since" timer: a hold
+lasts days, the seconds since the send mean nothing, and the reason wraps whole so the date stays
+readable; K-A fix U3); a hold's banner beats
+Offline and Syncing and loses to a ban, a logout, a challenge and a clock problem. (3) A LOGOUT
+carries a `LogoutCause`: RemovedOnPhone and PhoneInactive offer "Link Again", AccountGone and
+Unofficial have a sentence of their own and no button, Unknown is the old text. Ban and logout may
+carry a `NetworkNote { explanation, appeal_url }`, the network's own words (his answer "Their text as
+well"): the explanation is shown as PLAIN text under Kourier's sentence, cut to one line of at most
+400 characters, and is never logged (the note's `Debug` prints only which parts exist); the page opens
+only as `https://`, through the button "Open WhatsApp's Page", after a click
+(`App.openExternalUrl`). The cause and the note live in the connection state, in memory: after a
+restart a logged-out account shows the generic text. (4) A network that PUSHES history (no
+`history_transfer`) fills its chats after a link: the account shows `BannerKind::History` ("Getting
+your message history from your phone…", with the percentage when a batch says it) between Syncing
+and Updating. It is per account, ends when no chat has more, after five minutes without a batch
+(`HISTORY_FILL_IDLE_MS`), on a connection that is not up, on a logout and on removal, and the
+percentage is the latest batch's, whichever chat it was for.
 
 *A known limit.* A send made while a history import still fills its chat sorts behind every
 imported row that is already there and behind those that come later, because an imported row
@@ -1271,7 +1906,10 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
 
 - `CancellationToken` tree: app → account → operation. `Command::Shutdown` → backend stops
   accepting work, finishes the current durable step (never mid-transaction), emits nothing more,
-  exits; the core waits 5 s, then cancels the token, then joins the thread. A `Shutdown` during
+  exits; the core waits 5 s (a network may state a longer grace in its descriptor, `shutdown_grace`:
+  WhatsApp 20 s, because a quit waits up to 15 s for a history chunk that was announced in this run and not yet captured, §7.1; the application's limit for the
+  core is the largest grace of the registered networks plus 5 s, `app::core_shutdown_timeout`, 10 s with Signal alone), then cancels the
+  token, then joins the thread. A `Shutdown` during
   a login is the end of that login, because the core discards an unfinished link at its next
   start without a logout: the Signal backend stops the login and removes a device the server
   had already linked for it (3 s of the 5, §6.5). A core that shuts down keeps every hold on
@@ -1299,7 +1937,18 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
 1. **Enqueue** (one `core.db` transaction for up to 64 messages): insert the message row
    (`out_state = Queued`, `origin = OwnThisDevice`, `net_author = ''`), allocate
    `(local, sent_at)` with `Network::allocate_message_id`, insert the `outbox` row with the
-   `OutgoingRequest`. Attachments are imported into the blob store first (encrypted copy, metadata via `kourier-media`). One
+   `OutgoingRequest`. Attachments are imported into the blob store first (encrypted copy, metadata via `kourier-media`).
+   A conversation whose stored features say `cannot_send` takes no NEW send: the first transaction
+   of a send reads the features and refuses (`Refusal::CannotSend`) before it stores anything or
+   clears the draft, so a refused `SendText` or `SendFiles` leaves no row and keeps the draft (the
+   composer is not offered for such a chat; this covers a stale front-end and a race with the
+   backend's statement). Only the first transaction is gated: the later transactions of a send in
+   parts continue a send the chat accepted, so a chat that loses the right between two parts still
+   gets the whole send. The same reading (`actions::cannot_send`) refuses "Send Again" of a message
+   that failed in a chat that has since lost the right to send, and a change of the disappearing
+   timer into such a chat (it is one more message to the network on some networks): both end
+   `Refusal::CannotSend` before anything is queued, allocated or sent, and the row's `retry` flag is
+   off. One
    user action can become several messages, stored all or none (also across a crash), each
    with its own strictly increasing id and its own outbox row, sent in order through the
    conversation's FIFO: `SendFiles` is split by `ConversationFeatures::plan` (§3.8), with the
@@ -1322,7 +1971,9 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
    order and wait behind a running import of that chat; nothing waits for another chat, and
    there is no order across chats. `SetConversationTimer`, `ChangeConversation`,
    `DownloadAttachment` and `SubmitChallenge` are not in the lanes.
-2. **Schedule**: one FIFO per conversation; the head runs only when the account is `Online`.
+2. **Schedule**: one FIFO per conversation; a head runs while the account's connection is up, `Syncing` or `Online`
+   (`ConnState::can_send`: the outbox does not wait for the catch-up, as Signal Desktop, §4.5; only the backend's own
+   side-effect queues wait for `Online`).
    `Command::Transmit` is one attempt; the backend does its internal repair inside it (Signal
    409/410 device mismatch, unsealed fallback). A look at the outbox reads one head per
    conversation along the partial index `outbox_waiting`, not every waiting row (a send of
@@ -1331,6 +1982,23 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
    account's dispatcher.
 3. **Outcome** (written to `send_state` per recipient in the same transaction as the state change):
    - `Sent` → state Sent; next item.
+   - `SentAs` (KT-2: the server named the message, §3.1) → recorded as `Sent` (`went` and `reached` count it as one: a stopped
+     attempt that reports it is not taken back, the disappearing timer starts), and `record_outcome` RE-KEYS the row
+     (`ingest/rekey.rs`) in TWO PARTS around the end of the send, in the outcome's transaction, also when an echo already
+     finished the outbox row and for a tombstone. Part one (`rekey_own`), before `finish_attempt`: `net_local` and `net_seq`
+     become the server's, revision 0 follows, the allocated id is kept as an alias, the queue is rewritten. Part two
+     (`settle_rekey`), after it: an own row at or below `peer_read_seq` rises to `Read`, and what waited under the server's id
+     (parked receipts, reactions, deletes) applies, inside a SAVEPOINT; if that cannot apply, what waited is dropped with one warn
+     line and the outcome still commits (an error would roll the outcome back and every resend would meet it again). A clash is
+     never an error: a bad id, an id a remote row, a call line, a row of another chat or an own message with its own send queued
+     holds, or a message the server named already (it has a position: the first name counts) leaves the allocated id and the send
+     counts; an own row under the server's id that has no send queued is the echo that knew no binding, and is merged into ours
+     (ours keeps its `MessageId`, position and files; if the echo was deleted meanwhile its tombstone wins, with the files and the
+     queue handled as a delete does). The queue rewrite changes only `target.local` of the queued edits, deletes and reactions and
+     `reply.target.local` of a queued send, never the message's own `req.local`: a resend or a Retry goes out under the ALLOCATED
+     id, which the network's map is keyed by. The echo (`IncomingMessage.allocated_as`, this device only) re-keys the same way, and
+     the three orders of outcome and echo end as one row (outcome, echo; echo with the binding, outcome; echo without it,
+     outcome). A `SentAs` to an edit, delete or reaction is read as `Sent` with one warn line.
    - `Partial{delivered, failed}` → delivered members `Sent`; if any failure is retryable, the item
      stays at the head with `only = <retryable failed members>` and `is_recipient_update = true`
      (unchanged when nobody was delivered: the retry is still the first send), under the backoff
@@ -1341,7 +2009,8 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
      failed for good make the message `PartiallyFailed`.
    - `Transient` / `RateLimited` → the conversation queue pauses; backoff 0 ms, 190 ms, ×1.9, capped
      at 15 min, total budget 24 h (Signal's `conversationJobQueue`,
-     `SD/ts/jobs/conversationJobQueue.preload.ts:339-340`); then `Failed{retryable}`.
+     `SD/ts/jobs/conversationJobQueue.preload.ts:339-340`; the cap and the budget are the network's,
+     below); then `Failed{retryable}`.
    - `Challenge` → the *account* outbox pauses, `ConnState::NeedsUserAction(SolveChallenge)`, until
      the backend accepts the user's answer (`UiCommand::SubmitChallenge` →
      `Command::SubmitChallenge` with the token of the paused attempt), the backend is `Online` anew,
@@ -1351,13 +2020,14 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
      token, retry_at, since}` is a `settings` row (scope `account:<id>`, key `challenge`), written
      in the transaction that records the refused attempt (or by the dispatcher for a challenge a job
      announced). The first actor of the next run takes it up for a linked account when it is not
-     older than 24 h (Desktop's `DEFAULT_EXPIRE_AFTER`, `SD/ts/challenge.dom.ts`): the account shows
+     older than the network's challenge lifetime (Signal 24 h, Desktop's `DEFAULT_EXPIRE_AFTER`,
+     `SD/ts/challenge.dom.ts`): the account shows
      it again, nothing is sent into it, the answer carries the stored token and the retry time
      counts from the server's answer. It is forgotten at a login or relink, at a later actor start
      of the same run and with the account. An answer the backend accepted forgets it by a write
      of its own directly behind the backend's reply, before the pause is lifted (the reply is no
      durable event, so no transaction can hold both; a kill between the reply and that write
-     shows the solved challenge once more). The wait counts against each row's 24 h budget, but only
+     shows the solved challenge once more). The wait counts against each row's budget, but only
      the part between the challenge's arrival and the earlier of its own end (`retry_after`) and the
      moment the core looks (`outbox::Wait { conv, since, until }`): a row whose budget ended in that
      interval gives up (a message becomes `Failed{Challenge, retryable}`, a modifier is rolled back
@@ -1373,10 +2043,35 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
    - `UntrustedIdentity` → the conversation queue pauses until `ConfirmIdentity` or the user
      cancels. The wait is bounded like a challenge's: rows of the paused conversation whose
      budget ends during it give up. This pause lives in memory: after a core restart the head
-     is tried once and pauses again.
+     is tried once and pauses again if the backend still refuses (Signal: a contact in state 2;
+     a never-verified contact is TOFU, §6.9).
+     RELEASE (P5a): the core requeues a paused head (`Supervisor::confirmed`: the person's 1:1
+     chat and every group paused on them; a group paused on ANOTHER member stays paused, R2)
+     after an `Ok` reply to `ConfirmIdentity` (RC6: a refusal of a stale key leaves the head
+     paused and nothing is transmitted), after EVERY `Ok` of `SetVerified` (F2: a Mark from
+     Default releases too), and on `BackendNotice::IdentityTrusted` (an incoming Verified sync
+     or Storage record that lifts state 2, F4: the users are collected in `publish` and
+     `confirmed` runs after it returns). The supervisor shares the dispatcher's pauses with the
+     queries (`Shared.paused`) and emits `UiEvent::SafetyWaitChanged` for each person whose wait
+     began or ended. A backend's own jobs to a person in state 2 (receipts, timer updates,
+     resends, retry answers without an open session: `jobs::wait_untrusted`,
+     `retry::run_request` RC7) wait without a request and without counting an attempt until
+     `jobs::release_untrusted` wakes them or their day-long age bound drops them (M1, BQ-6, R4).
    - Anything else → `Failed{retryable: false}` for that message; the queue continues (a permanent
      failure does not block later messages, unlike matrix-rust-sdk's wedge, because Signal
      receivers order by arrival anyway).
+   - `ReachOutRefused` (WhatsApp's 463: the recipient has not written to this account; K-A,
+     2026-10-16) → `Failed{ReachOutRefused, retryable: false}`, and the chat's other WAITING messages
+     fail the same way with no attempt of their own (`outbox::fail_waiting_of`, `Queued` and `Staged` rows
+     alike; the parts of the SAME large send that are stored after the 463 fail when the send's last part
+     is stored instead of turning due, `reach_out_refused_in`; K-A fix 2): each attempt would
+     be one more reach-out, and a retry counts against the account. `RetryMessage` is refused by ONE
+     rule (`actions::retry`) that also fills `MessageActions.retry`, so the menu and the command
+     cannot disagree; the row says "Not sent: WhatsApp accepts this message only from your phone.
+     Send it from your phone." and has no "Send Again" (taking the message back stays). Other chats
+     are untouched and nothing holds the account (a group-wide hold may come with W5). A message
+     typed in that chat afterwards is attempted (and refused) again; the sentence names WhatsApp,
+     the only network with a 463.
    - The answer is recorded for the attempt's own row (`outbox.id` is never reused) and read by
      what the attempt sent. Message and conversation are read from the row, so a conversation
      merge during the transmit is followed. Row gone (an echo finished it): a send's per-recipient
@@ -1384,15 +2079,21 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
 4. **Restart**: rows in `Transmitting` go back to `Queued` and are resent with the *same*
    `local`/`sent_at`, `only` = recipients not `Sent` in `send_state`; the backend also skips
    recipients its own `send_progress` records as accepted (§6.7), so a crash between the server's
-   acceptance and the core commit causes no second delivery. Receivers dedup by the id anyway
-   (Signal: author + timestamp). Desktop resumes half-finished sends the same way
+   acceptance and the core commit causes no second delivery. This is the contract's resend promise
+   (§4.2): a `Transmit` of a `req.local` the network already has makes no second message, so a
+   backend whose library keeps its own send queue (TDLib would) keeps a map from `req.local` to what
+   it sent. Receivers dedup by the id anyway (Signal: author + timestamp; WhatsApp: chat, sender and
+   stanza id). The fake network's server log is keyed `(local, recipient, conversation)`, so the same
+   `local` in two chats is two messages there (a backend with random ids, Threema's, can meet it; the
+   core's own allocator never repeats one). Desktop resumes half-finished sends the same way
    (`sendStateByConversationId`, `SD/ts/jobs/helpers/sendNormalMessage.preload.ts:160-505`).
 5. **User actions**: "Retry" on a failed message re-queues it with the same id and `only` = the
    failed members; deleting a queued message that nobody has removes the message and its outbox
    row if it was never attempted (a delete for me also when it was); a delete for everyone of a
    message that waits for a retry leaves a tombstone and sends the delete, because the earlier
    attempt may have reached the server; a message whose transmit is in flight cannot be deleted
-   until the answer is there. A message nobody has (queued and never attempted, or refused by
+   until the answer is there (it can only be STOPPED, while its files go up and nobody can have it:
+   "Stopping an upload" below). A message nobody has (queued and never attempted, or refused by
    the network for good) is edited in place while it has no revision yet; such an edit is local
    and not bound by the chat's edit window, count or `features.edit`; with an edit already
    waiting, further edits are revisions behind it. A send that gave up on its budget after
@@ -1411,8 +2112,80 @@ Libraries use `thiserror`; `anyhow` only in the bin. `detail` follows the log-sa
    tombstone for this account only); a change that already reached some recipients stays. A
    delete for me is local; its sync to own devices is best effort. Queued rows of a tombstoned
    message other than deletes are deleted with the tombstone, not sent (one in flight goes with
-   its answer); a queued delete always stays. An edit names its target when it is sent (§3.5.3).
+   its answer); a queued delete always stays. What an edit names is the network's rule (§3.5.3):
+   under `LatestRevision` it is chosen when the edit is sent (`outbox::retarget_edit`), under
+   `Original` it is the message's own key at once and never changes.
    Own-message disappearing timers start when the first recipient has the message, not at enqueue.
+
+**Stopping an upload (upload progress, 2026-10-17; his words: "Uploading files: we should show progress", the X on the ring).**
+A message in flight can be TAKEN BACK while its files go up, but only where nobody can have it:
+`actions::stoppable` is the AND of (1) the outbox row is `Transmitting` and the message a `Message` (not an
+edit, delete or reaction), (2) the backend has reported an upload of it that is not over (`Shared.uploading`,
+filled by the first `AttachmentProgress` with `done < total` or by the phase `Preparing` (the stop covers the
+re-encoding too) BEFORE the UI hears the report, emptied by the final `TransmitProgress` at 1.0, by a phase other than
+`Preparing` and `Uploading` and at the attempt's end), (3) this is its first
+attempt (`attempts = 1`: a retry that uploads again may have reached the server before), (4) no recipient has it
+(`send_state` holds no `Sent`: a Partial group resend that uploads is not stoppable) and (5) no stop is asked yet
+(`outbox.cancel_state = 0`, so the X greys out once pressed). `MessageActions.cancel_sending` is that rule OR "take
+back" (never attempted); the menu's "Cancel Sending" and the X on every ring read it, QML decides nothing
+(§3.8). `delete_*` still refuse every in-flight row (`Sending::InFlight`): a stop is never a delete, and the
+delete commands run no stop rule. `UiCommand::CancelMessage` on such a row judges the rule again INSIDE its write
+(the set is read there), writes `cancel_state = 1` and hands the dispatcher `Signal::Abort`, which sends
+`Command::AbortTransmit { local, reply }` and waits for the ANSWER, bounded by `SEND_TIMEOUT` (no reply is
+`TooLate`): `Stopping` means nothing can go out any more, so `cancel_state = 2` is written durably (failpoint
+`outbox_after_cancel_answer`) and the attempt's `Failed` outcome, a missing one or the next start takes the
+message back with its attachment rows and files (`outbox::take_back`, ONE body for `cancel`,
+`record_outcome` and `reset_transmitting`). A stop mark NEVER OUTLIVES ITS ATTEMPT (fix K1): `outbox::release`
+(an attempt that ended without an outcome: a lost answer, a backend that went) follows `reset_transmitting`'s rule in
+its own write, mark 2 takes the message back and is published like the start's take-back, mark 1 becomes 0, and
+both `take_due` UPDATEs set `cancel_state = 0`, so a stale mark can never take back the message of the NEXT attempt.
+The mark is written BEFORE the attempt's outcome is recorded even when the backend is slow to answer (fix K3): the
+supervisor waits for the answer in a `select!` with the account's event channel (`Dispatcher::abort_target`,
+`ask_to_stop`, `abort_answered`; `dispatch.wake()` is not polled meanwhile), so a backend whose command loop is
+inside an emit on a full event queue (8) can still answer, and the answer is never lost to a time-out. A
+`UiCommand::CancelMessage` on a row that is not `Transmitting` (queued, or waiting for a retry) judges the flag's own
+rule inside its write too (fix K2): never attempted, it is taken back; after an attempt that may have reached the
+server it is refused (`BeingSent`). Kill points of the tests (`cancel_upload.rs`, one child each): after the
+`ASKED` commit (`outbox_after_cancel_asked`: the restart clears the mark and the send goes on), after the answer
+(`outbox_after_cancel_answer`), and at the outcome's commit with mark 2 (the start takes the message back, no
+orphan file). `TooLate` writes 0 at once, the message goes on and ends `Sent`, and
+only when that attempt's outcome is recorded as `Sent` or `Partial` does the UI get `UiEvent::CancelTooLate`
+(the note "Already sent" with "Delete for Everyone", which works at once because the row is sent). A `Failed`
+outcome after `Stopping` says nothing; mark 1 never takes a message back (the answer may still be `TooLate`),
+mark 2 does, also after a kill (`core.db` 17, `0017_outbox_cancel.sql`: the column, CHECK 0..2, no row
+converted). The Signal side (`send/stop.rs`): `Shared.transmits` holds a `Stop` per attempt (`Open`,
+`Requested`, `Closed`); the abort and the attempt's passing of its point of no return (`close()` right after
+`outgoing::build`, before the first message request) are plain functions on the single-thread actor, so one
+wins; a `Requested` stop ends the uploads where they stand (`select!` in `Uploader`), the attempt answers
+`Failed(Internal "stopped by the user before anything was sent")` and its `Transmit` is ALWAYS answered (the task
+is never killed from outside). The upload requests run under `Net::run_aborting` and the progress ticker is an
+abort-on-drop guard, so a stopped upload leaves no request and no ticker. Every picture of a message is
+re-encoded FIRST (the phase `Preparing`, shown as "Preparing files" and an empty ring with the X on every file at
+once: the progress ticker says it at 0 from the attempt's start and `Uploading` in the tick the per-file reports
+begin; an abort during it is answered `Stopping`, nothing is uploaded and the temporary files go) into a TEMPORARY sealed blob of its own key in
+`accounts/<uuid>/upload-tmp` (one picture in memory at a time, the total known before the first byte, so the
+share never jumps down); the attempt's guard empties the directory, so does the account's start (a kill leaves
+nothing for long). A backend that cannot stop answers `TooLate` (WhatsApp until its media send, W5b, builds the upload; W4 did not, and every edit, delete and
+reaction), so the X is offered only where the whole chain exists. The fake network holds an upload per
+conversation (`UploadScript::{Moving, Held, TooLate}`) and answers the abort the same way.
+
+**The numbers are a network's (K-B1, B6).** Budget, back-off cap and the lifetime of a stored challenge
+are `NetworkDescriptor.outbox` (`OutboxPolicy`, §3.8); the curve (0, 190 ms, ×1.9) stays the core's and only
+its cap comes from the policy. The default is Signal Desktop's 24 h, 15 min, 24 h (`OutboxPolicy::SIGNAL`;
+`outbox::BUDGET` and `MAX_BACKOFF` are its values, kept as the default's source and for the tests), because
+the receive windows of the other Signal clients are built on them; WhatsApp states the same
+numbers on purpose since W5a (`kourier_whatsapp::network::OUTBOX`, D11: a message the network cannot take within a day is failed for the person to see; edits are bounded by the backend's slack rule, not by the budget; a constant of its own, so a change to one network's numbers is not a change to the other's); the fake's WhatsApp-like flavour has a 6 h budget
+(`WHATSAPP_LIKE_BUDGET`) so a test can tell a network's number from the constant. A dispatcher is built with
+`NetRules { scope, edit_target, outbox }` and every site that used a constant reads it: the deadline at
+enqueue (`store`, `modify::queue`), the "due" limit of a wait (`take_due`), the back-off cap (`release`,
+`record_outcome`, `modify::record_outcome`; `backoff_capped(failures, cap)`, while `backoff(failures)` keeps
+its signature and the default cap), `classify`, `retry` (the fresh budget of a retried message and of its
+held rows), the stored challenge's freshness and `give_back_held_time`. RISK: `give_back_held_time` reads a
+row's start as `deadline_at - budget` of the policy in force now, so a build that CHANGES a network's budget
+while rows wait in a hold moves the time given back once, by the difference (the stored deadlines do not
+move); W5a kept WhatsApp's value equal to the default, so no stored deadline moved. An account whose network is not registered (paused)
+has no `NetRules`: the paths that run for it (take back, the derive spawn) keep the scope-only fallback and
+do no key lookup that needs more.
 
 **Durable commands.** Read receipts, viewed receipts and read syncs must survive a crash (else the
 phone keeps the unread notification; Desktop persists them in `readSyncJobQueue` and
@@ -1427,11 +2200,38 @@ that are hidden on an unconfirmed clock (§9.6): the read sync and the receipts 
 shows, and a hidden message is still unread when it shows again. Marking a chat read also
 clears the "marked unread" flag another device set (`marked_unread`; Signal Desktop does the
 same when a chat is read), also when that flag was all there was to read; such a chat has no
-message to tell anybody about, so no durable command is stored for it. The network is told
-about the cleared flag with `ChangeConversation { SetMarkedUnread { false } }`, not durable
-and with no answer waited for: a backend that cannot write roaming state (Signal's, until
-Storage Service writes exist) refuses, the chat stays read on this device and the phone
-keeps its mark until it reads the chat itself. Deletes for me made in Kourier
+message to tell anybody about, so no read sync is stored for it. The network is told about the
+cleared flag in one of two ways (A10a, §4.1 principle 4): for an account whose caps state
+`roaming_writes` (the switch on or off) the clearing is the durable
+`DurableCommand::ChangeConversation { SetMarkedUnread { false }, asked_at }`, stored in the
+reading's own transaction and resent at every start until `CommandPersisted`; for any other
+account it is the plain `ChangeConversation { SetMarkedUnread { false } }`, not durable and
+with no answer waited for: a backend that cannot write roaming state refuses, the chat stays
+read on this device and the other devices keep the mark until they read the chat themselves. The network hears the changes of one
+conversation in the order the UI asked for them (`NetOrder` in `runtime.rs`: `ui_command` takes a
+`Turn` per `MarkRead`, `ChangeConversation` and `SetConversationTimer`, in the order the UI sent
+them; the task of each waits for the turn before it as its first statement, before anything can
+end it early, and then tells the network; the network's answer is not part of the turn). The
+order is transitive: a turn is over only when the turn before it is, so a command that tells
+the network nothing (a reading with no mark to clear, a refused timer, a failed read) cannot let
+a later one pass an earlier one. The clearing of a mark came from a task of its own after the row
+changed, and a mark set right after the reading used to reach the network first, which then
+ended on the clearing. A reading right behind a mark the UI set (`SetMarkedUnread { true }`)
+clears it too: the row turns marked only when the backend's echo is ingested, so `NetOrder`
+remembers, in the UI's order, that the UI set a mark since the last reading (taken back by a
+`SetMarkedUnread { false }`), and the reading counts that as the mark to clear (`told_mark` of
+`local::mark_read`); the network hears the mark and then the clearing, and the echoes leave the
+row unmarked. The marks the UI set and no reading has taken (`NetOrder::marks`) are a COUNTER per
+conversation, not a set (N-D): two marks in a row are two, a mark the backend REFUSES is forgotten
+(the next reading does not tell "unmarked" for a mark the network never took, and the echo that
+would have marked the row never comes), a refusal of one of two marks leaves the other, and the
+refusal of a mark of an older run (after a reading, or a mark taken back, ended it) changes nothing
+of the newer run. A dropped reply (the account stopped) is not known to be a refusal: the mark stays
+counted, a clearing for nothing is harmless. The order rules are unchanged: `mark_read` still waits
+for its turn before it reads the row. (Not built, on purpose: forgetting a mark when a clearing ECHO
+is ingested; a mark the phone cleared stays counted until the next reading, which then tells
+"unmarked" once more. A10b's filing of the clearing, only when the newest stored state or a live
+intent says marked, absorbs it.) Deletes for me made in Kourier
 (`ClearConversation`, `DeleteAttachment`) are durable commands of the same kind, stored in the
 transaction that deletes locally. None is stored for a logged-out account, where the features
 have no `delete_for_me`, for a clear that removed nothing a person sent and does not remove the
@@ -1439,6 +2239,13 @@ chat, or for an attachment without `net_ids`. Delivery receipts are backend-inte
 batches them 500 ms / ≤ 100, `SD/ts/util/deliveryReceipt.preload.ts`); typing stays
 fire-and-forget, and the core sends none for a blocked chat, an unaccepted request, a chat with
 `cannot_send`, Note to Self or a chat whose features have no typing.
+`pending_commands` is read by a WRITE at a start (`local::resendable_commands`): a stored
+`DurableCommand::ChangeConversation` of an account whose caps do not state `roaming_writes` is
+deleted there (debug line with the count only), every other command is sent as before. An account
+whose stored caps this build cannot read keeps its roaming rows (neither sent nor deleted; one warn
+line with the account id and the count) and its other commands are sent as before. A backend applies
+(or files) a durable `ChangeConversation` in the order it receives it relative to
+`ChangeConversation` of the same chat: a later click on the same setting wins (§4.2).
 
 ### 4.9 Idempotent ingest (core)
 
@@ -1449,19 +2256,28 @@ across accounts, so a WhatsApp history import never delays Signal live ingest. R
 
 | Event | Apply |
 |---|---|
-| `Message` | Resolve aliases (author through `identity_alias`); find or create the conversation; upsert by the message key (§3.1). A key recorded in `expired_messages` within the last 45 days, by the disappearing sweeper or by a clear of the chat, is dropped (a late copy must not bring an expired or cleared message back). Existing row: if it is a placeholder → replace body, keep `sort_key`; if it is an own outbox row → merge state; else ignore (duplicate, including the same Signal (author, timestamp) in another conversation). New row: assign `sort_key` from `received_at`/`arrival` (§3.9), update unread/mentions, link `linked_local`, then apply matching `pending_modifiers` in arrival order. Decide notification (§8.7; `catch_up` → summary) |
-| `HistoryBatch` | Same upsert, `history = true`, never notified and never in the catch-up summary (a live message that later fills an imported undecryptable placeholder is a live message and is announced), `sort_key` from `sent_at`; applies `initial_out_state`, `read`, `reactions` and `expiry` (as for a live message) and `edits` (history only). THE ROWS ARE THE TRUTH about unread: a row that says `read: false` is known to be unread and counts for `unread` and `mentions` like a live row (reading the chat here, a read marker of another device, a delete and a timer lower the count by the row; a row delivered twice counts once). `ConversationPatch.unread_hint` adds only unread messages the backend has no rows for; a backend whose rows are of unknown read state says `read: true` and uses the hint. `edits` (a NEW row, or one that fills a placeholder): one revision key per version and the "edited" mark, so a later reaction, receipt, quote or edit that names the newest version's id finds the row. Timers without a start: an own row that was not sent (queued, sending, failed) keeps its timer unstarted until its echo says it was sent (the Signal mapper gives a SENT own item without a start the import's time; a start that is given stands); a notice of a remote origin starts an after-read timer at ingest; a call line takes the `read` and `expiry` its signal states |
-| `Edited`/`Deleted`/`Reaction`/`Receipts`/`ReadMarker`/`OwnSendState` | Resolve the target through current and revision keys and `alternates`: a modifier that states a conversation resolves only to a message of that conversation, also under `AccountAuthor` scope, where ids match account-wide (else a member of one chat could edit, delete or react in another); `conv = None` (receipts, read syncs) stays account-wide; `TargetAuthor::Unknown` matches on `local` within the conversation. Found → validate and apply: states only move forward; a receipt from another user counts only for an own message whose direct peer, group member or send-state holder that user is (else it is parked 2 days without effect and tried again whenever its sender can have become a recipient: at `IdentityMerged`, which keeps a receipt from a contact's ACI for a message in the PNI-keyed chat, at a `ConversationUpsert` that adds a member, at `OwnSendState` and at the answer of the message's transmit; a third party's receipt on someone else's message is dropped); reactions replace per user when `reactions_per_user = 1`, and a reaction longer than 64 bytes is dropped; edits only from the author, of a body that can be edited (§3.5.3), within `edit_receive`, and an edit with `keeps_quote: Some(false)` removes the message's quote for good, in any arrival order; deletes only from the author within `delete_receive` or from an admin when `admin_delete` (`by: None` on another member's message = our own admin delete, §3.5.2); both windows are measured from the original's `server_at`, else `sent_at` (§3.8). Not found, or found in another conversation than the stated one → insert `pending_modifiers` row with expiry (receipts and read markers 2 days, like Desktop's `syncTasks`; others 7 days); it is never applied to the message elsewhere |
-| `ConversationCleared` | Hard-delete every message of the conversation up to the newest of `up_to` that is here (timeline order) and remember each key in `expired_messages` (45 days). Kept: what arrived later, and an own message whose send row is in the outbox unless that row is `Failed` and some recipient has the message (a partly failed message goes with the clear and can be an anchor; one nobody has, or one queued for a retry, stays). A tombstone whose delete for everyone still waits becomes a hidden `ForMe` tombstone and its delete is still sent. With `remove` and no message a person sent left: the notices go too and the conversation is hidden (`conversations.hidden`) until a message is stored or queued there. Files are unlinked after the commit. A clear that finds none of its anchors is parked for 2 days with the conversation's newest timeline position at that moment: the first anchor to arrive deletes itself and everything up to that position, which is the in-order outcome. When an anchor was present, a late anchor deletes only itself. Idempotent. A clear made in Kourier follows the same rules |
+| `Message` | Resolve aliases (author through `identity_alias`); find or create the conversation; upsert by the message key (§3.1). A key recorded in `expired_messages` within the last 45 days, by the disappearing sweeper or by a clear of the chat, is dropped (a late copy must not bring an expired or cleared message back). Existing row: if it is a placeholder → replace body, keep `sort_key`; if it is an own outbox row → merge state; else ignore (duplicate, including the same Signal (author, timestamp) in another conversation; under `Conversation` the same key from ANOTHER author is refused with a log line, under `ConversationAuthor` the author is part of the key, so another member's message with the id is a message of its own). New row: assign `sort_key` from `received_at`/`arrival` (§3.9), update unread/mentions, link `linked_local`, then apply matching `pending_modifiers` in arrival order. Decide notification (§8.7; `catch_up` → summary) |
+| `HistoryBatch` | Same upsert, `history = true`, never notified and never in the catch-up summary (a live message that later fills an imported undecryptable placeholder is a live message and is announced), `sort_key` from `sent_at`; applies `initial_out_state`, `read`, `reactions` and `expiry` (as for a live message) and `edits` (history only). THE ROWS ARE THE TRUTH about unread: a row that says `read: false` is known to be unread and counts for `unread` and `mentions` like a live row (reading the chat here, a read marker of another device, a delete and a timer lower the count by the row; a row delivered twice counts once). `ConversationPatch.unread_hint` adds only unread messages the backend has no rows for; a backend whose rows are of unknown read state says `read: true` and uses the hint. `edits` (a NEW row, or one that fills a placeholder): one revision key per version and the "edited" mark, so a later reaction, receipt, quote or edit that names the newest version's id finds the row. Timers without a start: an own row that was not sent (queued, sending, failed) keeps its timer unstarted until its echo says it was sent (the Signal mapper gives a SENT own item without a start the import's time; a start that is given stands); a notice of a remote origin starts an after-read timer at ingest; a call line takes the `read` and `expiry` its signal states. THE CUT (K-B1): a row whose `sent_at` is at or below the cut of its conversation (`conversation_cuts`, set by a clear by time, §4.2, or by the user's own clear here) is dropped before it is stored (a debug line with the account id only, never the key; no chat is made for it); the cut is looked up once per batch (a batch names one conversation; a row of another conversation is judged by its own chat's cut), so a chunk of history that arrives after a clear does not fill the chat up again. Only history rows are refused, never a live or a catch-up message (a live row's time can be a sender's claim, and a peer's clock a day behind must not hide its live messages). The user's clear stores a cut for every network, Signal included: a Signal history row older than the newest message the clear removed is dropped, which is what a re-read of a lost stage should do |
+| `Edited`/`Deleted`/`Reaction`/`Receipts`/`ReadMarker`/`OwnSendState` | Resolve the target through current and revision keys and `alternates`: a modifier that states a conversation resolves only to a message of that conversation, also under `AccountAuthor` scope, where ids match account-wide (else a member of one chat could edit, delete or react in another); `conv = None` (receipts, read syncs) stays account-wide; `TargetAuthor::Unknown` matches on `local` within the conversation (under `Conversation` the first row; under `ConversationAuthor` only when EXACTLY ONE message of the conversation has the id, else it waits like a missing target, and a parked author-less modifier is applied to an arriving message only when that count is one too, so another member's message never takes it by chance). Found → validate and apply: states only move forward; a receipt from another user counts only for an own message whose direct peer, group member or send-state holder that user is (else it is parked 2 days without effect and tried again whenever its sender can have become a recipient: at `IdentityMerged`, which keeps a receipt from a contact's ACI for a message in the PNI-keyed chat, at a `ConversationUpsert` that adds a member, at `OwnSendState` and at the answer of the message's transmit; a third party's receipt on someone else's message is dropped); reactions replace per user when `reactions_per_user = 1`, and a reaction longer than 64 bytes is dropped; edits only from the author, of a body that can be edited (§3.5.3), within `edit_receive`, and an edit with `keeps_quote: Some(false)` removes the message's quote for good, in any arrival order; deletes only from the author within `delete_receive` or from an admin when `admin_delete` (`by: None` on another member's message = our own admin delete, §3.5.2); both windows are measured from the original's `server_at`, else `sent_at` (§3.8). Not found, or found in another conversation than the stated one → insert `pending_modifiers` row with expiry (receipts and read markers 2 days, like Desktop's `syncTasks`; others 7 days); it is never applied to the message elsewhere |
+| `Message` with `allocated_as` (KT-2) | An own message of THIS device that finds no row under its key, but an own row of the chat under the allocated id: that row is re-keyed to the message's key and position (§4.8 step 3), then the ordinary existing-row path joins the echo and finishes the send; the outcome that comes after finds the id there and only records who has the message. No such row and the allocated id remembered as removed (`expired_messages`): dropped, so a chat removed while the send was in flight does not come back through its echo. A second echo finds the row under its key. Another device's echo that names an allocated id re-keys nothing |
+| `Message` under an alias, or with a position the row lacks (KT-2) | A late copy under an old (allocated) id finds the row through `message_aliases` (`by_key`, own keys only) and is the ordinary duplicate. A copy that states a `net_seq` the row lacks gives the row the position (`coalesce`, also a tombstone or a call line; not a copy of another author under a colliding id) and runs the two position rules for that row once: an unread row at or below `read_seq` goes read, an own row at or below `peer_read_seq` rises to `Read` |
+| `ReadUpTo`, `PeerReadUpTo` (KT-2) | Chat unknown: dropped (one debug line). `ReadUpTo` raises `read_seq` when the position rises (`read_up_to` follows) and in every case reads the unread rows at or below it (`READ_BY_POSITION`, pinned to the partial index `messages_unread_seq`: a replay, or a server that restates its position with each new message, finds none and walks none); `AfterRead` timers start, the chat is recounted. `PeerReadUpTo` raises `peer_read_seq` and the floors of the own rows in `(old, new]` only (`messages_seq`); a replay or a lower position is a no-op. A row with no `net_seq` is never touched |
+| `Deleted` on a network with `validates_deletes` (KT-2) | Applied as it comes, for everyone, with no author, admin or window check (a call line too); `by: None` is stored as `deleted_by` NULL, read as `Deletion::Unattributed`; a target that is not here waits as usual (7 days) and the delete that waited for the server's id is applied by the outcome or the echo under the network's own rules (`Apply::under_rules`). Flag off: every rule above stands |
+| `ConversationUpsert.server_unread` / `server_mentions` (KT-2) | With `owns_unread`: stored (`unread_server`, `mentions_server`; an unstated one stays) and the chat recounted, `coalesce(stated, rows)`; a live row does not move it, a read here sets it to 0 until the network's next statement. Flag off: ignored, one debug line |
+| `ConversationCleared` | Hard-delete every message of the conversation up to the newest of `up_to` that is here (timeline order) and remember each key in `expired_messages` (45 days). Kept: what arrived later, and an own message whose send row is in the outbox unless that row is `Failed` and some recipient has the message (a partly failed message goes with the clear and can be an anchor; one nobody has, or one queued for a retry, stays). A tombstone whose delete for everyone still waits becomes a hidden `ForMe` tombstone and its delete is still sent. With `remove` and no message a person sent left: the notices go too and the conversation is hidden (`conversations.hidden`) until a message is stored or queued there. Files are unlinked after the commit. A clear that finds none of its anchors is parked for 2 days with the conversation's newest timeline position at that moment: the first anchor to arrive deletes itself and everything up to that position, which is the in-order outcome. When an anchor was present, a late anchor deletes only itself. Idempotent. A clear made in Kourier follows the same rules. With `before_ms` (a clear by time) the time is a CLAIM: it is clamped to the core's clock plus `CLEAR_CLOCK_TOLERANCE` (one hour: the network's clock may run minutes ahead of this computer's, but a clear cannot name the far future, and one wrong time would otherwise be permanent, because a cut never lowers) and stored FIRST as the conversation's cut together with the claim (`claimed_ms`), also when the core has no such conversation yet (the clear can come before the history that makes the chat). Only a claim LARGER than the stored one does more: then every message of the conversation with `sent_at` at or below the cut goes by the same rules and with the same exceptions as the anchors (an own message nobody has, the row of a queued delete), its key remembered, and `remove` hides the chat as above. The same clear delivered again (an app-state resync, a redelivery after a crash) changes nothing by time, so a live message that arrived in between is not removed by the replay, and a far-future claim does not slide the cut to every later "now"; anchors apply on every delivery. A HISTORY row the cut refuses (the batch arm of ingest) has its key remembered like a removed row's, once, so the order of a history chunk and a clear does not decide whether a later copy shows. The cut is keyed by the conversation KEY, not its row, so it follows `IdentityMerged`, which then clears the HISTORY rows of the merged chat at or below the joined cut (live rows stay). A cut is kept when its chat is removed (a re-made chat's older history stays dropped, as on the phone). The user's clear stores the newest `sent_at` of the rows it removed (clamped the same way) as a cut, or NOW when it removed nothing (the history that arrives later is older than the clear), and sends the times in the durable command: `before_ms` over the rows a person sent and `system_before_ms` over the others (each `None` when none of that kind went). A `remove: true` clear for a chat the core does not have stores the cut but not the removal (a later `ConversationUpsert` makes a listed, empty chat; W6 names it) |
 | `AttachmentDeleted` | Remove the first attachment of the target whose `net_ids` contain one of the event's names, with its files; own attachments carry the names of `Network::attachment_net_ids`; a message left with neither attachment nor text becomes a `ForMe` tombstone; an unknown name changes nothing; for a message that is not here yet the event is parked 2 days and applied on arrival |
 | `ContactUpsert`/`ConversationUpsert` | Field-wise patch; `members.full` replaces, else delta |
-| `IdentityMerged` | Rewrite authors and members, add alias row; re-key the direct conversation, or `merge_conversation` when both exist (§3.3; the result is hidden only when both were); then try the parked modifiers of the merged chat again (`Apply::retry_pending`), so one sent under the contact's other identity lands |
+| `IdentityMerged` | Rewrite authors and members, add alias row; re-key the direct conversation, or `merge_conversation` when both exist (§3.3; the result is hidden only when both were); then try the parked modifiers of the merged chat again (`Apply::retry_pending`), so one sent under the contact's other identity lands. Under `ConversationAuthor` the alias's rows whose `(conversation, into, local)` exists are merged first, the older row staying, and the conversation's cut moves to the surviving key keeping the larger (§3.3) |
 | `CommandPersisted` | Delete the `pending_commands` row |
 | `Typing` | Not persisted; forwarded to the UI with TTL; a `Message` from the same `(author, device)` clears it |
 | everything | Emits `UiEvent` invalidations after commit |
 
 Property tests replay every scripted stream twice and in permuted order and require identical
 final DB state; the conformance rules are in §10.2.
+KT-2's any-order test, `tests/cloud_ids.rs` `the_facts_about_one_own_message_end_in_one_dump_in_every_order` (and its proptest twin
+with redeliveries), plays eight facts about one own message under the fake's `TelegramLike` rules (the echo, both positions, a
+reaction and a delete under the server's id, incoming messages at and above the read position, the stated count) in 150 sampled
+orders and 64 random ones, and requires one `OrderInsensitive` dump.
 
 ### 4.10 Backfill and history
 
@@ -1472,7 +2288,9 @@ final DB state; the conformance rules are in §10.2.
 - `PushedOnLink` (WhatsApp; Signal by default, whose archive import, §14.2 item 14, is
   delivered the same way): `HistoryBatch` events during and after linking, with progress; the
   backend splits them into ≤ 500 messages per `core_outbox` row, so each is one bounded core
-  transaction that the writer interleaves with live traffic.
+  transaction that the writer interleaves with live traffic. WhatsApp's push has no archive to import: the phone
+  uploads chunks over minutes or hours and says when a chat has no more (`has_more: false` in an empty batch,
+  never an `AccountProgress`), see §7.1 "History (W4, as built)".
 - `OnDemand` (WhatsApp PDO, newsletters): when the user scrolls past the oldest local message, the
   core sends `FetchHistory` once per conversation and anchor.
 - What is unread in an import is said by its rows (`IncomingMessage.read`), never by a count
@@ -1585,6 +2403,13 @@ CREATE TABLE contacts(
   trust TEXT, fingerprint BLOB, blocked INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0,
   unregistered_at INTEGER, identifiers TEXT /* JSON */, meta BLOB, updated_at INTEGER,
   UNIQUE(account_id, user_id));
+-- later migrations add columns (see §13): 0018 contacts.about, about_emoji, number_shown (people pages P1);
+-- 0019 conversations.description (TEXT, nullable; people pages P2, no row converted);
+-- 0020 messages.media_visual / media_files (flags kept by triggers on attachments) and the two PARTIAL indexes
+--   messages_media_visual / messages_media_files ON messages(conversation_id, sort_key DESC, id DESC) WHERE body_kind = 'Media'
+--   AND media_<kind> = 1 (people pages P4: the gallery of a chat, `Query::ChatMedia`; the flags of the rows that exist are set)
+-- 0023 messages.net_seq, conversations.read_seq / peer_read_seq / unread_server / mentions_server (all NULL), the table
+--   message_aliases and three indexes (KT-2: cloud ids and read positions; the paragraph below)
 CREATE TABLE identity_alias(account_id INTEGER NOT NULL, alias TEXT NOT NULL, user_id TEXT NOT NULL,
   PRIMARY KEY(account_id, alias));
 CREATE TABLE conversations(
@@ -1603,7 +2428,7 @@ CREATE TABLE messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT /* since migration 0003: = LocalMsgId, never reused */,
   account_id INTEGER NOT NULL, conversation_id INTEGER NOT NULL
     REFERENCES conversations ON DELETE CASCADE,
-  net_scope INTEGER NOT NULL /* 0 AccountAuthor, 1 Conversation */,
+  net_scope INTEGER NOT NULL /* 0 AccountAuthor, 1 Conversation, 2 ConversationAuthor (since 0016) */,
   net_author TEXT NOT NULL /* '' = own */, net_local TEXT NOT NULL,
   origin TEXT NOT NULL, device INTEGER, linked_message_id INTEGER,
   sort_key INTEGER NOT NULL, sent_at INTEGER NOT NULL, server_at INTEGER, received_at INTEGER NOT NULL, arrival INTEGER,
@@ -1612,9 +2437,11 @@ CREATE TABLE messages(
   deleted TEXT, out_state TEXT, read_state TEXT, expiry_timer INTEGER, expires_at INTEGER,
   view_once INTEGER NOT NULL DEFAULT 0, history INTEGER NOT NULL DEFAULT 0, mentions_me INTEGER NOT NULL DEFAULT 0,
   meta BLOB, raw BLOB);
--- the message key (§3.1): account-wide for Signal, per conversation for WhatsApp and Threema
+-- the message key (§3.1): account-wide for Signal, per conversation for Threema (and for call lines on every
+-- network), per conversation and sender for WhatsApp
 CREATE UNIQUE INDEX messages_key_account ON messages(account_id, net_author, net_local) WHERE net_scope = 0;
 CREATE UNIQUE INDEX messages_key_conv ON messages(conversation_id, net_local) WHERE net_scope = 1;
+CREATE UNIQUE INDEX messages_key_conv_author ON messages(conversation_id, net_author, net_local) WHERE net_scope = 2; -- 0016
 CREATE INDEX messages_timeline ON messages(conversation_id, sort_key DESC);
 CREATE INDEX messages_expiring ON messages(expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE message_revisions(message_id INTEGER NOT NULL REFERENCES messages ON DELETE CASCADE,
@@ -1660,10 +2487,34 @@ tables that later migrations added are listed per phase in §13 (core schema ver
 with an AUTOINCREMENT id, so an account id is never handed out again, and adds the partial index
 `outbox_waiting(conversation_id, id) WHERE state IN ('Queued', 'Transmitting')` and the table
 `download_orphans`, 0009 adds `messages.expiry_hidden` and the partial index
-`messages_expiry_hidden(account_id) WHERE expiry_hidden = 1`, §9.6). Outbox rows have a fourth
+`messages_expiry_hidden(account_id) WHERE expiry_hidden = 1`, §9.6). Migration 0016 (K-B1, core.db
+schema 16) adds the partial unique index `messages_key_conv_author` above and the table
+`conversation_cuts(account_id INTEGER NOT NULL REFERENCES accounts ON DELETE CASCADE, conv_key TEXT NOT
+NULL, before_ms INTEGER NOT NULL, claimed_ms INTEGER NOT NULL, PRIMARY KEY(account_id, conv_key)) WITHOUT
+ROWID`: the time of the last clear by time of a conversation, keyed by the conversation KEY (the clear can come
+before the chat exists, and the key follows `IdentityMerged` like `pending_modifiers.conv_key` does), only ever
+raised (`before_ms = max(...)`, and only when the new claim is larger than `claimed_ms`, the time as the clear
+stated it before the clamp to the core's clock plus the tolerance), read once per `HistoryBatch` by its primary
+key (§4.9). The migration rebuilds no table and converts no row: no core.db
+holds a WhatsApp message row made under scope 1 (WhatsApp registers in debug builds only and K-B1 lands
+before the first real run), and the index is partial, so no statement that does not say `net_scope = 2` can
+use it and it cannot tie with a hot statement (the migration-14 trap). Outbox rows have a fourth
 state `Staged` (a large send whose messages are still being written, §4.8 step 1), stored in
 the same `state` column. The `settings` table also holds the one option the core keeps for the
 user: scope `core`, key `expiry_policy` (§9.6).
+
+Migration 0023 (KT-2, `0023_cloud_ids.sql`, core.db 22 -> 23; the number is the next free one at landing) adds `messages.net_seq`
+(§3.1), `conversations.read_seq` and `peer_read_seq` (the two read positions, only rising), `unread_server` and `mentions_server`
+(the server's counts, NULL = the rows count), the table `message_aliases(message_id REFERENCES messages ON DELETE CASCADE,
+account_id, net_local, PRIMARY KEY(message_id, net_local)) WITHOUT ROWID` with `message_aliases_by_local(account_id, net_local)` (the
+allocated id of a re-keyed own message; not a `message_revisions` row, which every reader takes for an edit), and two PARTIAL
+indexes: `messages_seq(conversation_id, net_seq) WHERE net_seq IS NOT NULL` and `messages_unread_seq(conversation_id, net_seq)
+WHERE read_state = 'Unread' AND net_seq IS NOT NULL`. `READ_BY_POSITION` is pinned to the second, so the own position walks only
+the unread rows at or below it; through `messages_unread` it walked every unread row of the chat, and a server that restates its
+position with every new message (TDLib's `updateChatReadInbox`) would pay that per message in a muted group. Both indexes are
+partial so that no statement that does not name `net_seq` can pick them and they never tie with a hot index (the migration-14
+trap, `.claude/rules/core.md`); on a network that numbers nothing they are empty. `RECOUNT` is `unread = coalesce(unread_server,
+unread_hint + rows)` and `mentions = coalesce(mentions_server, rows)`. No row is converted and no table is rebuilt.
 
 `core.db` keeps no planner statistics (nothing runs `ANALYZE`). A read that must use a
 particular index says so in its SQL (the sweeper's `+account_id`, §13 phase J), and a unit
@@ -1686,7 +2537,7 @@ The Qt thread never touches the DB (§8.5).
 
 | Table | Content |
 |---|---|
-| `account` | ACI, PNI, E164, device id, password, registration ids (ACI, PNI), profile key, master key / AEP, storage key, manifest version, `post_link_sync` state, arrival counter, catch-up boundary, `device_name` (the name the device was linked with, what the phone lists; NULL for a link made before schema 22, migration 0022) |
+| `account` | ACI, PNI, E164, device id, password, registration ids (ACI, PNI), profile key, master key / AEP, storage key, manifest version, `post_link_sync` state, arrival counter, catch-up boundary, `device_name` (the name the device was linked with, what the phone lists; NULL for a link made before schema 22, migration 0022), `keep_muted_archived` (the phone's "Keep muted chats archived", AccountRecord field 25, migration 0023), `roaming_writes` (the per-account switch "Sync chat changes with my phone": 0 = off for EVERY account, existing and new, the only writer is `Command::SetRoamingWrites`; backend.db 25), `storage_generation` (bumped when the storage key changes or the records are reset: a write planned against an older generation drops its result), `storage_intent_seq` (the source of `storage_intents.seq`, so a seq is never reused) |
 | `own_identity` | our ACI and PNI identity key pairs (never generated by us; from provisioning) |
 | `identities` | remote identity keys + verified state + first use |
 | `sessions` | `(our_service_id, their_service_id, device_id) → SessionRecord` |
@@ -1697,16 +2548,22 @@ The Qt thread never touches the DB (§8.5).
 | `msl_payloads`, `msl_recipients`, `msl_message_ids` | Message Send Log, 14-day retention; `msl_payloads.group_id` names the group a payload was sent in (a resend adds our distribution message) |
 | `send_progress` | per outgoing `(local, recipient)`: accepted by the server; a repeated `Transmit` skips these (§6.7) |
 | `attachment_uploads` | pointers of attachment uploads, keyed by SHA-256 of what was uploaded and how, reused for 3 days and purged hourly (§6.7 step 2). Each pointer holds the attachment key, also after its message was deleted or expired |
-| `peers` | per contact: profile key, access key, sealed-sender state, expiring profile-key credential, last profile fetch, unregistered_at, `profile_sharing` (whitelisted), `share_my_number`, the 1:1 chat's disappearing timer and its version (`expire_timer`, `expire_timer_version`) |
+| `peers` | per contact: profile key, access key, sealed-sender state, expiring profile-key credential, last profile fetch, unregistered_at, `profile_sharing` (whitelisted), `share_my_number`, the 1:1 chat's disappearing timer and its version (`expire_timer`, `expire_timer_version`), and what the core was last told of the chat's archive state and mute (`roaming_archived` 0/1 and `roaming_muted_until`, migration 0023, NULL = never told: the base a Storage record is diffed against, and what the receive path's unarchive rule reads; groups keep theirs in `groups.archived`/`muted_until`); `phone_sharing` (0/1, NULL = the profile was never fetched: what the person's profile said about sharing their number, backend.db 24, §6.10), `profile_tried_at` (the last fetch that ended WITHOUT a profile, cleared by a success; `profile_fetched_at` is the last success) |
 | `sent_quotes` | the encoded quote of every reply our account sent (from this device, and from other own devices out of their sync transcripts), keyed by the reply's network id and by each edit's id: an edit must carry the quote again (§6.7). Personal data; purged after 14 days with the Message Send Log |
 | `groups` | master key, secret params, revision, decrypted state snapshot, endorsements + expiry, last fetch, `dirty` |
 | `group_credentials` | 7-day auth credential window |
-| `storage_records` | raw decrypted Storage Service records (kept for the M2 write path) |
+| `storage_records` | raw decrypted Storage Service records, never rewritten (the write engine edits copies of their bytes); `target` (backend.db 25) says what a record belongs to: `contact:<service id string>`, `group:<master key, lower-case hex>`, `account`, or the empty string for a record nobody can ask to change (a kind the engine never edits, a contact record that names nobody or only ourselves, a group record without a 32-byte master key); NULL = not filled yet, which only a row stored before migration 0025 can be (`storage::fill_targets` fills it once, offline, when the intents or the write job first need the records by target); `ours` (backend.db 25, 0/1) marks a record OUR write put there (stored by the 200 zone, or merged by the sync that landed the write it belongs to); every other record is the phone's (a phone rotation is a new id: 0): the automatic clear's "the phone marked it after the reading" never counts our own record, and the merge of our own record states no flag of its chat (the landing stated what it should) |
+| `storage_intents` | a change made here that the phone has not been told yet (A10, backend.db 25): per `(target, field)` the wanted value, the `base` (the phone's value when it was made: the stored record's, for `archived` the base the core was told; the value a write in flight sets when it carries the field; moved to the written value after a landing, back to the phone's value before the write when that write did not land), the `shown` value (what the core showed before the first click), the identity key of an `identity` intent (its `base` is the state the key had here before the click, for a record of the same key too: every applied sync and merged record writes it, so it is at least as new as the record's; for another key the phone derives a new key's state by the same rule, DEFAULT after DEFAULT, UNVERIFIED after VERIFIED or UNVERIFIED), the `seq` (from `account.storage_intent_seq`) and whether it is the automatic clear of "marked unread"; STRICT, WITHOUT ROWID. Personal data: targets name chats; never logged |
+| `storage_write_inflight` | at most one row (id 1): the Storage Service write that was planned and may have reached the server: the manifest `version` it sets, the new raw ids (`new_keys`), the `generation` it was planned in, and `planned`, the JSON list of the `(target, field, value, seq)` the write carries, X1's ride-along `archived` of a rotated record included (`"rides": true`, seq 0), an entry a message overtook marked `"overtaken": true`, and per entry the phone's value before the write (`"prior"`, what a write that did not land puts back) (the plaintext of the records is NOT kept); it decides after a kill (the landing rule). Its `planned` list says which intents it closes (by `seq`) and which value each field got; it is retired by the landing zone, by a write found not landed (or a row this build cannot read, which counts as not landed), or by `storage::reset`. `account.storage_generation` moves at every `reset`: a result computed under an older generation is dropped |
+| `storage_write_times` | when the writes that may have reached the server were made (ms, one row per write: a 200 or a lost answer; a refusal below 500 takes its row back), so the rate cap (at most 6 per 10 minutes and 30 per hour per account) survives a restart; rows older than an hour are deleted by the job that counts them |
 | `jobs` | backend job queue (sync requests, read receipts and syncs with the core's `cmd` id (unique), delivery receipts, profile refresh, group refresh, key maintenance, resend requests, deletes for me made here); `challenged` and `held_from` mark the jobs a send challenge holds (§6.12) |
+| `job_holds` | per job kind the end of a rate-limit hold (ms): until then no job of the kind is made due (profile fetches after a 429; backend.db 24, §6.12) |
 | `identity_links` | which ACI a PNI belongs to, as far as this device learned it (§6.13); one funnel writes it and emits `IdentityMerged` once per pair |
 | `number_links` | which ACI a phone number belongs to, as the Storage Service told this device (§6.13, schema 21); `links::learn_number` emits `IdentityMerged{number → aci}` only when the pair is new or the number moved |
 | `remote_config`, `sender_certs` | `/v2/config` (ETag) and the two sender certificates |
 | `retry_state` | decryption-error dedup and session-reset rate limits |
+
+- The WhatsApp backend (`kourier-whatsapp`, §7.1) keeps its own `backend.db` per account: the schema component `whatsapp` (migrations in `crates/kourier-whatsapp/migrations/`, numbered from 1; they never meet Signal's) beside `core_outbox`. It holds whatsapp-rust's store contract and, from W3a (migration 2), Kourier's `inbox` (stage 1's rows and the redelivery ledger; its states are `new`, `deferred` and `done`, and `deferred` rows keep their content and `map_version`) and `catch_up` (the current connection's boundary) and, from W4 (migration 4), the books of the history at the link (`history_announced`, `history_cursor`, `history_delivery`, `history_chats`, `history_chunks`, `history_deferred`, `history_counts`, `history_live`; §7.1 "History (W4, as built)"), and, from W5a (migration 5, `0005_send.sql`, STRICT), the books of the send path: `send_outcomes` (the outcome ledger: per `(conv, local)` the server's answer to a message Kourier sent, `acked` with the server's time or `refused` (463) and nothing else, the `kind` and the `target` of an edit or a revoke; rows go after 14 days), `chat_started` (D6 in the backend: a direct chat started on the phone, with the first reason: the peer's message, our other device's, a history chat that carries a real message, an acked own message), `features_stated` (the features version and started fact each chat was last stated with) and `receipt_jobs` (the receipts the core asked for, until written; jobs older than 14 days go at a start), and, from W5b (migration 6, `0006_media.sql`, STRICT, WITHOUT ROWID), `media_uploads` (the upload record: per local of a file Kourier sent, the conversation, the `MediaPointer` JSON with the media key, both SHA-256 values, the length, the CDN's url and direct path, the sent shape and type, and the upload time; written in ONE zone after the upload and before the frame, reused by a resend within 6 h of the upload, read by a caption edit of the file, swept at start after 30 days), and, from W6a1 (migration 7, `0007_chat_state.sql`, STRICT), the app-state books: `chat_state` (the mirror of the phone's chat settings, one row per chat and field: archived, pinned with its order, muted, marked unread; written in the zone of the core events it causes, with the generation of its collection and a `stated` flag that stays 0 while the core does not know the chat), `chat_counted` (per chat the sent time of the newest message that would bring an archived chat back), `chat_cut` (per chat the newest clear or delete time the backend knows, only raised: the live or history form of a call-log line), `account_link` (the pairing's time: a call-log record from before it adds no chat), `account_appstate` (the phone's "unarchive on a new message" setting), `appstate_resyncs` (per collection when Kourier last asked for a snapshot, the generation it opened and a fatal mark), `appstate_map` (the app-state map version), `call_lines` (which conversation a call's line was filed under; swept after 30 days), and, from W6a2 (migration 8, `0008_people.sql`, STRICT), the people books: `group_state` (per group what the core was told: whether the whole member list, the title's time, the timer with its version, the rules and our place as the last answered fetch said them, a truncated or left mark, the parent and whether it was stated, the persisted "fetch me" mark `dirty_at` with its newest time `dirty_last`; a Rebuild keeps the server's facts in it), `merges_stated` (each number and LID pair once, with the history row that recorded it, if any), `names_stated` (the profile name, the address-book name and the number last stated per person; a Rebuild keeps the profile rows marked not stated), `address_book` (the MIRROR of the phone's contacts, each row with its origin, app state or history, and the live ones with the generation of their collection: not forgotten by a Rebuild), `persons_known` (the people the core was told of as a chat's peer, a member or an author), `blocked_stated`, `blocklist_read` (when the list was last stated) and the column `inbox.members_wait` (the group a parked admin delete waits for), and nothing else. None of them holds a message body. The chunks themselves are NOT in this file: they wait in a stage file of their own, `history/stage.db` beside it, with its own key and schema component (`whatsapp-history-stage`, v1). The contract's tables are `device` (ONE row: the JSON of `wacore::store::Device` with the noise, identity and signed-prekey keys and the ADV secret; `format` 1), `identities`, `sessions`, `prekeys`, `signed_prekeys`, `sender_keys` (Signal state, addressed `user[:device]@server`), `app_state_keys`, `app_state_versions` (the JSON of `HashState`), `app_state_mutation_macs`, `appstate_dirty` (Kourier's rule (b), §7.1), `sender_key_devices`, `lid_pn_mapping` (several LIDs may share a phone number), `base_keys`, `device_registry`, `group_metadata`, `tc_tokens`, `sent_messages`, `pending_inbound_messages` (the inbound durability buffer), `msg_secrets`. There is no `device_id` column: one account per file. No secret of the WhatsApp device lives outside this file (no Secret Service entry, no second file, no snapshot copy). `sent_messages` and `pending_inbound_messages` hold message content past a disappearing timer or Clear Chat until the client's sweep removes them; their retention (W3a): `pending_inbound_messages` goes only by upstream's 7-day keepalive sweep, `sent_messages` after 7200 s (`CacheConfig.sent_message_ttl_secs`, stated by Kourier; W5 may revisit it), and §7.1 has the rest. Every backend opens its file through `kourier_db::check_backend_file` BEFORE its first migration: a `backend.db` may carry `core_outbox` and the backend's own component and nothing else (an allow-list, read only; Signal's `open` and this one both call it), so a registry mix-up that hands one backend the other's file is refused with the file's bytes untouched (`OpenError::OtherNetwork` here, `Error::ForeignComponent` in kourier-db).
 
 ### 5.6 Durability protocol (stage 1, stage 2, forwarder)
 
@@ -1797,18 +2654,24 @@ message, which the catch-up budget (§1.3) needs.
   size limit, a kind the chat does not take) nothing is queued, no blob stays and the refusal
   names each such file by position. Files are copied one after the other in 64 KiB chunks; only
   one picture at a time is held in memory (up to 64 MiB, for thumbnail and blurhash; a larger
-  picture goes without them). An empty file is sent like any other. A file marked "as original
+  picture goes without them). The thumbnail and the blurhash of a big original come from a
+  two-step fit (an area average down to twice the edge, then the triangle filter to the exact
+  size of the one-step fit; `Decoded::fit_thumbnail`, T2): small derived previews that are
+  sent too (the quote thumbnail of a reply to a picture, the `blurHash` of the pointer) and
+  that the other side shows as placeholders, a level or two from what the one-step fit gave;
+  the picture itself that is sent is cut by `Decoded::fit` and stays byte-identical. An empty file is sent like any other. A file marked "as original
   file" is copied undecoded as a generic `File` with its true MIME type and name and gets no
   thumbnail; the backend sends its bytes untouched. While it copies, the core reports
   `Progress::Import` for the send's request id (first at 0, last at all files, at most about
   ten a second between).
 - Plaintext appears only in `$XDG_RUNTIME_DIR/kourier/media/` (tmpfs, 0700) for AnimatedImage,
-  video and audio playback, when the user saves/opens a file, and for images pasted into the
+  video and audio playback, when the user opens a file, and for images pasted into the
   composer (`paste/`, 0600, until removed from the strip, or after sending for at least 120 s
   and for as long as the core still prepares files for that conversation). Media files are
   deleted when the view closes,
   at exit, and at startup. Still pictures and avatars are decrypted in memory only (§8.6).
-  A hidden message (§9.6) has no playback copy: hiding removes an open one.
+  A hidden message (§9.6) has no playback copy: hiding removes an open one. A copy the user SAVES is written
+  into the folder he chose and nowhere else (§5.8.2).
 - One plaintext file is written to the disk, not to the tmpfs: the archive of a folder the
   user sends as one .zip (`kourier_app::folders::ArchiveFiles`, §8.3). It lies in
   `$XDG_CACHE_HOME/kourier/outgoing/<24 random hex digits>/<folder>.zip` (directory 0700, file
@@ -1823,6 +2686,259 @@ message, which the catch-up budget (§1.3) needs.
 - Retention: files live as long as their message; deleted/expired messages delete their files in
   the same transaction (unlink after commit). Avatars are replaced in place. A "storage used" view
   and per-conversation cleanup come after M1.
+
+#### 5.8.1 Location in sent files
+
+A photo, video or other file can say where it was taken: EXIF GPS, an XMP packet, a QuickTime or
+ISO 6709 location atom, a telemetry track. LOC (user decisions of 2026-10-26, asked with options;
+the Settings row is §8.9, the question §8.3): Kourier looks at every file it is about to send,
+asks before one leaves with where it was taken, and the core refuses to send such a file unless
+the composer said the user agreed.
+
+- The look: `kourier_media::look(r: &mut dyn ReadSeek, len) -> Look` (`Found(Evidence)`, `None`,
+  `Unreadable`). It reads the metadata containers through the caller's `Read + Seek`, decodes no
+  pixel and never turns a coordinate into a number; `Evidence { format: LookFormat, kind:
+  EvidenceKind }` names only the container and the kind of proof, and its `Debug` holds nothing
+  else. One `dyn` copy of the walkers is in the binary. Formats: JPEG (APP1 `Exif\0\0`, the XMP
+  segments and Extended XMP put together per GUID; the segment walk stops at SOS), PNG (`eXIf`,
+  `iTXt` `XML:com.adobe.xmp`, compressed or not, ImageMagick's `Raw profile type` hex text), WebP
+  (RIFF `EXIF`, `XMP `), TIFF-shaped files (`II*\0`, `MM\0*`, DNG, RW2 `IIU\0`, ORF `IIRO`/`IIRS`),
+  HEIF, HEIC and AVIF (the `meta` items `Exif` and `application/rdf+xml`; `iloc` v0-v2 and
+  construction methods 0 and 1), the JPEG XL container (`Exif`, `xml `) and every ISO-BMFF
+  movie or audio file (MP4, MOV, 3GP, M4A: `udta` `©xyz`/`loci`/`XMP_`, `meta` `keys`/`ilst`
+  with `com.apple.quicktime.location.ISO6709`, the top-level XMP `uuid`, and the sample entries
+  `gpmd`, `camm`, `djmd`, `dbgi` or an ISO 6709 `mebx` key = a telemetry track, of which no
+  sample is read). ISO-BMFF is recognised by `ftyp` or by the first box a QuickTime file starts
+  with; `meta` is a FullBox in ISO files and a plain container in QuickTime's `moov/meta`,
+  told apart by content. The box walker (`bmff.rs`) is read-lenient: a read-only look refuses
+  nothing a reader can read safely (a box reaching past its container is cut there).
+- One FOUND rule for every format: a latitude and a longitude are present and not both zero.
+  EXIF GPSStatus `V` is not a reason to skip (cameras keep the last fix), an EXIF rational with
+  denominator 0 counts as zero, an ISO 6709 `+00.0000+000.0000/` and a `loci` of 0, 0 are
+  placeholders, and in XMP a value with no digit 1-9 is zero; one coordinate non-zero is a place.
+  Found in any place of a file wins; a broken place makes the file `Unreadable` only when no other
+  place had a location. `Unreadable` does not ask (the user cannot be told what is not known);
+  the bounds below are what keeps it honest.
+- Bounds of the look on a hostile file (one row each in §13): a payload read at most 1 MiB
+  (`PAYLOAD_MAX`; every inflate stops there too, so a zip bomb in a PNG is `Unreadable`), 2 MiB read
+  per file (`FILE_READ_MAX`; a read costs at least 8 bytes of it and an empty HEIF extent reads
+  nothing, so a loop of tiny reads ends after 2 MiB / 8, RF1), 100,000 headers walked (`HEADERS_MAX`; `mdat`, `moof`, `free`, `skip`
+  and the JPEG XL code boxes are skipped by header and not counted), depth 12 (`DEPTH_MAX`), 8 IFDs
+  of 1,000 entries (`IFDS_MAX`, `IFD_ENTRIES_MAX`; an IFD already visited ends its chain), a leaf
+  value read up to 4 KiB (`LEAF_MAX`), 64 HEIF Exif/XMP items (`ITEMS_MAX`), the HEIF `iloc` parse
+  (field sizes of 0 are allowed, so an extent can cost no byte: at most 64 extents in an entry, 4,096
+  in the box, one entry per wanted item; a 512 KiB box of free extents once looped 4e9 times, PR1),
+  and 2 s of wall clock per file (`TIME_MAX`, looked at before each read: a cold disk or a network mount makes the file
+  `Unreadable`). An XMP value is searched for its end in at most 64 bytes (`xmp::VALUE_MAX`): a
+  longer one is no value, which keeps the search over a packet linear (a name repeated in a hostile
+  packet used to be searched to the end of the text for every occurrence: 140 s for 2 MiB in a debug
+  build, outside the 2 s clock); 2 MiB of `GPSLatitude>` is looked at in about 20 ms in a debug
+  build (the test allows 100 ms). The parts of a JPEG's XMP (main packet and Extended XMP) are each
+  narrowed from UTF-16 once and searched joined, as they are: a second narrowing took a run of tiny
+  parts for UTF-16 and hid a located packet behind them. Every `Unreadable` look leaves ONE log line in the core
+  (`attachments/looks.rs` `look_noted`, level info): the reason (`time` = the clock, `bound` = any
+  other bound, a damaged or cut file) and the format (`jpeg`, `png`, `webp`, `tiff`, `heif`, `jxl`,
+  `bmff`, `unknown`), never a path, a name or a value. That is where one sees how often a file
+  leaves unasked for want of a judgement.
+- The verdict: `kourier_core::facade::leaves_with_location(look, content, as_file, size, cleaned)`
+  is the one decision, used by the plan and by the import. No location found (`None` or
+  `Unreadable`) = false; sent as an original file = true; a picture whose format the LOOK read by
+  its magic (never `Inspected.mime`, which may come from the name: a TIFF called `.jpg`) is one the
+  network states in `cleaned_pictures`, within its bound = false; otherwise, and with no statement
+  (a network that is paused, off or states none), true. `Query::FilePlan` returns the verdict per
+  file (`FilesPreview::location`, false for a refused file). The look runs in `import::open` on the
+  opened descriptor after the 64-byte head and is kept in a core-side cache (`attachments/looks.rs`,
+  process-wide, 4,096 files, oldest first out) keyed by (device, inode, size, mtime, ctime) of that
+  descriptor, so a caption, a reply or an "original file" toggle that plans again does not read the
+  file again; `Unreadable` is never kept, and a clean that failed is kept and makes the verdict ask.
+  The import (`import_one`) does not use the cache: it looks at the descriptor it reads
+  (`look_fresh`), and when that look is `Unreadable` the kept look of the same key, if one is kept,
+  decides (else the file goes, BQ6). The plan and `send_files` still answer from the cache, and the
+  backstop's last word is the fresh look. Measured in a debug build: a plan of 41 mixed files 1.2 ms
+  cold and 0.4-0.5 ms with the looks kept; 1,000 files 20.7 ms and 7.5 ms.
+- Cleaning, and who may say a network cleans: `kourier_media::clean_still(bytes, level)` is THE
+  function (`CLEANED_TYPES`: JPEG, PNG, WebP, BMP). It classifies by magic; another format is
+  `NotCleaned::NotMine` (the backend sends the bytes as they are, because the verdict, by the look's
+  format, asked about exactly those); otherwise the picture is re-encoded by `scale_to_level`, a
+  JPEG or PNG that does not re-encode is stripped (`strip_metadata`), and what neither way cleans is
+  `NotCleaned::Refused`. The result is looked at once more and a `Found` result is `Refused` too, so
+  the function never returns located bytes. A refused picture fails that attachment
+  (`ErrorKind::InvalidInput`, "the picture could not be cleaned of its metadata", no input byte in
+  the log); its row shows the generic reason. `strip_metadata` for a PNG drops `eXIf`, `tEXt`,
+  `zTXt`, `iTXt`, `tIME` and `caBX` (a C2PA manifest; its `stds.exif` assertion can hold a GPS
+  position), for a JPEG the APPn and COM segments (JFIF, the ICC profile and Adobe's marker stay);
+  it reads the orientation with the crate's own TIFF walker, and a turned picture that does not
+  decode keeps only the orientation in a minimal EXIF block (before LOC such a file left with every
+  block). Signal's `encode_still` calls it (its upload-cache transform is `image-level-3-clean`, so
+  a pointer made before LOC for a located original is not reused), and so does WhatsApp's
+  `send::upload::still` (W5b G7b, §7.1). A network states
+  `cleaned_pictures` only through this function: `cargo xtask deps-check` fails when a non-comment,
+  non-test line under `crates/*/src` of a crate whose sources do not call
+  `kourier_media::clean_still` mentions `cleaned_pictures` in any way but `cleaned_pictures: None`
+  and the field's declaration (`.replace(..)`, `.get_or_insert_with(..)`, a swap, a clone all fail;
+  the core's reads, `.clone()` and `.as_ref()`, are the one other allowed mention). Its limits: a
+  struct update (`..other.descriptor()`) copies the field without naming it, and a crate that calls
+  `clean_still` once is trusted for every picture path it has. `kourier-fake` is the one named
+  exception, because it sends nothing off this PC (`xtask/src/cleaned.rs`).
+- The backstop (the core does not trust the composer): `UiCommand::SendFiles` carries
+  `with_location: Vec<bool>` by position (missing = false), and `RefusedFiles` hands it back as
+  sent. `send_files` looks at every file before any is copied and refuses by position, with the
+  other refusals, a file whose verdict is true and whose flag is false: `FileRefusal::Location`
+  (log-safe reason "a file holds its location and was not agreed to be sent with it"; the strip
+  says "Not sent: it holds where it was taken"); a file refused for another reason keeps that
+  reason. `import_one` judges the look it takes through the opened descriptor again, and after
+  the copy compares that descriptor's size and modification time: when they moved and the file
+  was not agreed to it looks again (a streamed file through the descriptor, a picture at the
+  bytes in memory, which are what is sent) and refuses a located result, its blob removed. The
+  viewmodel sends the rest again at once when some files were refused, with `as_file` and
+  `with_location` re-indexed, so a located file the user agreed to is not refused again because a
+  neighbour was too large.
+- A folder sent as one .zip: the packer (`kourier_app::folders::write_archive`) looks at each member
+  through `kourier_core::facade::look_file` on the descriptor it packs, until one is `Found`, and
+  the archive's row carries "location inside" (`Packed.located`, `StripFile::archive_located`, ORed
+  into the archive's verdict, because the core sees only a zip). The archive keeps what the packer
+  found when a send of it comes back: the controller remembers `archive_located` per sent archive
+  (`PastedOut`, until the request is over) and hands it to `FileStrip::add_handed` /
+  `restore_refused` (`HandedFile::archive`), so a refused send (a deleted quote, a file the network
+  cannot take) does not turn the archive into a plain file that leaves unasked; the core cannot see
+  inside a zip. `kourier-app` reaches the look through the facade: no crate edge to `kourier-media`.
+- Named gaps (what the look and the backstop do not cover): a zip the user made himself;
+  Matroska/WebM tags, AVI, Vorbis/FLAC `LOCATION`, GIF XMP, IPTC and XMP place NAMES, Canon CR3, a
+  motion photo whose GPS is only in its trailer video, a Samsung trailer after the last box,
+  BigTIFF, a bare JPEG XL codestream, Brotli-compressed `brob` boxes, photos inside PDF or office
+  files; C2PA / JUMBF manifests (Content Credentials: JPEG APP11, PNG `caBX`, the ISO-BMFF
+  `uuid`/`jumb` box) are not read by the look (the strippers drop APP11 and `caBX`, so a stripped or
+  re-encoded picture has none; a picture sent as an original file keeps its manifest); a location
+  only in a JPEG's secondary image (MPF images after the first EOI: Ultra HDR gain maps, some
+  previews); archives other than zip (tar, 7z, rar) and zip-based containers (docx, odt);
+  `Unreadable` itself: a file the look could not judge within its bounds (a slow disk or a network
+  mount, a damaged file) leaves unasked, and the log counts it; a file rewritten after the import's
+  look and before its last byte is read, in a way that keeps its size and modification time (the
+  import's fresh look closed the window before it; the post-stream check of size and mtime names
+  this one); messages that were queued before the LOC build, which leave unasked after the update
+  (the backstop applies at `SendFiles`); a located picture that Signal cannot clean (a damaged file)
+  fails to send with the generic reason; location in the TEXT of a message. M1 extends
+  `leaves_with_location` with the formats it cleans at import (an ISO-BMFF video).
+
+#### 5.8.2 Saving a copy
+
+A downloaded attachment can be written to a folder of the user's choice (F3, his answers: "Hover bar + menu + viewer"
+for where the control is, "Only once downloaded" for what it saves; the dialog asks each time and starts in the folder
+used last, the first time Downloads). It is the one place where plaintext leaves the store for a path the user owns.
+The saved file is the sender's original with whatever metadata the sender left: a received file has no cleaned copy
+(§5.8.1 is for sending).
+
+- THE FLAG AND THE COMMAND. `MessageActions.save_attachments` lists the attachments of a row that
+  `UiCommand::SaveAttachment { attachment, target: SaveTarget { dir, name }, mode }` accepts. ONE rule answers both
+  (`actions::save_attachments`, made of `may_save_message` and `may_save_file`), and the command asks both halves
+  again on the attachment's own row, so a message that was deleted or hidden while the dialog was open writes nothing.
+  An attachment is listed when it is `Local` (a file that is not here has Download: nothing is fetched for a save,
+  which also keeps Save away from the networks that cannot download yet: WhatsApp before W7, Telegram, Threema), is
+  not the rest of a long text, and its message is not deleted, not hidden because its time came on an unconfirmed
+  clock (§9.6) and NOT view-once. A view-once message is never saved, in any form; the clause matters on WhatsApp,
+  whose view-once media keeps an attachment (Signal maps one with none: `Unsupported "view-once"`), and its test runs
+  on the fake that plays WhatsApp. A disappearing message may be saved (the copy is the user's own act and outlives
+  the message), a sticker too (Desktop's and Android's refusal is their UI choice), and so may the files of a
+  logged-out or paused account.
+- THE ANSWER. `UiEvent::AttachmentSaved { attachment, bytes }`, or `ActionFailed { action: "SaveAttachment", subject:
+  Attachment(id) }` with `Refused(Gone)` (unknown or hidden), `Refused(Deleted)`, `Refused(WrongKind)` (view-once, the
+  rest of a long text), `InvalidInput` (not here) or `CoreError::Save(SaveError)`: `Exists` (no-replace mode and the
+  name is taken), `BadName`, `NoFolder` (also for a folder that is not an absolute path: it is never opened against
+  the process's working directory), `NotWritable`, `NoSpace`, `Source` (the blob did not read to its end) and `Io`.
+  Saves are served in the order they were sent, on a queue of their own (`Queues::saves`), the copy on the blocking
+  pool: the Qt thread never waits for the disk and a long save never delays an open or a send. `SaveTarget`'s `Debug`
+  shows neither the folder nor the name; the log says that a copy of some size was saved (§9.1).
+- THE WRITER (`kourier_blob::save_to(dir, name, mode, &mut dyn Read)`; `save_copy(blob, key, dir, name, mode)` is the
+  thin wrapper over a `BlobReader`, and the Markdown file of M2b calls `save_to` with its text). The name is ONE path
+  component (`check_name`: not empty, at most 255 bytes, no `/`, no NUL, not `.` or `..`); nothing is joined to the
+  folder's path: the folder is opened once (its own path may be a link: `~/Downloads` often is) and every later step
+  is relative to that open directory (`openat`, `linkat`, `renameat`), so nothing is written outside it, and the NAME
+  is never followed: a link of that name is replaced (replace mode) or counts as a file that exists (no-replace mode,
+  dangling or not). The data waits in an anonymous `O_TMPFILE`, so nothing half written shows under any name; where
+  the file system refuses that (FAT and exFAT sticks, some FUSE and network file systems) it waits in a hidden
+  `.kourier-<random>.part` created `O_EXCL | O_NOFOLLOW` and removed on every error (`Staging::Auto` or `Named`; the
+  tests force the second). A KILL is not an error: a kill during a copy on the named route, or between the hidden
+  link and the rename of a replace, leaves that hidden `.part` (plaintext, whole or partial) in the folder, and
+  nothing removes it later (known limit). The copy is published only after the reader returned `Ok(0)`, which a `BlobReader` does
+  only after every chunk authenticated, so a tampered or truncated blob leaves nothing. The file is created with the
+  mode `0o666`, which the umask and a default ACL can only narrow: never an executable bit. It is flushed before it
+  gets its name and the folder after. `SaveMode::Replace` puts the copy over what has the name (the dialog asked;
+  `rename`, atomic); `SaveMode::NoReplace` (several files into one folder) never replaces and answers
+  `SaveError::Exists`, decided by the file system in the call that makes the name (`linkat`, or `renameat2` with
+  `RENAME_NOREPLACE`); only a file system that has neither (the named route on FAT) looks first, the one race left. In
+  the no-replace mode the writer also looks at the name right after it opened the folder and answers `Exists` at once,
+  before a byte is decrypted or written (a batch tries up to 99 names; an early answer only, the call that makes the
+  name still decides).
+- THE NAME OF THE FILE (`kourier-viewmodel` `save_name`). The sender's file name is untrusted: only "not empty, at
+  most 255 bytes" is checked on receive. `clean_name` removes control characters and U+FFFC; whatever hides in an
+  address (`richtext::hides_in_link`, called WITH the neighbours, after the characters that go whatever stands beside
+  them (controls, U+FFFC, the invisible and bidi set) were taken out: a joiner is judged by the neighbours that STAY,
+  so a Persian word keeps its U+200C, an Indic conjunct its joiner after the virama and an emoji family its joiners,
+  while `ex` U+200D `ample` loses it); turns `/ \ : * ? " < > |` into `_`; collapses white space; trims spaces and
+  dots at both ends; turns a leading `-` or `~` into `_`; puts `_` before a Windows device stem (`CON`, `PRN`, `AUX`,
+  `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9` and the superscript forms `COM¹ COM² COM³ LPT¹ LPT² LPT³` of Microsoft's naming
+  rules, with or without an extension); calls an empty result `Attachment` (translated); and cuts the whole name to
+  140 BYTES (a Cyrillic letter is two) at a grapheme boundary, the extension never cut; a joiner the cut leaves at the
+  end of the stem is dropped with it, so `clean_name` of a cleaned name is that name: a cut can also make the tail of
+  a name an extension (the space that kept it from being one went with the cut-off words), so `clean_name` cleans
+  again until the name holds still (at most 8 rounds), and the nameless form (`<sender> <date> <time>.<ext>`) is
+  cleaned as a whole (a sender called `COM1.x` would make a device name of the stem). A proptest holds both:
+  `clean_name(clean_name(x)) == clean_name(x)` and the same for the offered name of a file with none. A file that came
+  without a name is `<sender> <date> <time>[ n].<ext>` (`Ari 2026-10-13 18.30.05.jpg`; an album's n-th picture gets `
+  2`, ` 3`; local time, digits only, no `:`; no chat name); the sender enters through `notify::unmarked_name`, because
+  a WhatsApp push name arrives as `~Ann` and `~Ann 2026-….jpg` is a shell trap; its extension is the one of the
+  content when that is a precise class, else of the stated type, else of whatever the content looks like, else none.
+  Extension rule E2 (`suggested_name`): the content corrects the extension only where it is precise (JPEG, PNG, GIF,
+  WebP, BMP, PDF, ZIP, FLAC, WAV, MP3), by ADDING the right one when the name has none or says another type the table
+  knows (`photo.pdf` that is a PNG is offered as `photo.pdf.png`); never for a container (the sniffer calls every EBML
+  file `video/webm` and every unknown `ftyp` brand `video/mp4`: `.mkv`, `.mov`, `.m4a`, `.3gp` stay), and an extension
+  the table does not know stays (`.docx` is a ZIP). `Query::SaveFacts(id)` gives who sent the message (none: our own),
+  when, the file's place among the files of its message, the stored name and type and the content's type
+  (`kourier_media::sniff_mime` over the plaintext's first 16 bytes; the stored type is the sender's claim). It answers
+  `None` (and decrypts nothing) for a file the save rule refuses: view-once, deleted, hidden (`m.view_once = 0 AND
+  m.deleted IS NULL` beside `expiry_hidden = 0`), so the dialog says "gone" before it opens. `with_number(name, n)` is
+  the next name to try when a name is taken (`report (1).pdf`), inside the same budget.
+
+- THE UI (F3b). Where the control is (his answer "Hover bar + menu + viewer"): a Save button in the hover toolbar
+  beside React and Reply (a `Loader`, made only for a row that has something to save and only while the toolbar
+  shows), "Save As…" (one file) or "Save All…" (several) in the message menu (`MessageRow.actions.saveAttachments` and
+  the row's `saveIds`, from the core's list), a Save icon beside "Open in Another Application" in the picture viewer
+  with Ctrl+S (a key of the viewer, `StandardKey.Save` in its own `Keys.onPressed`, so it cannot fire behind it; the
+  tooltip names the key) and a small icon on a file row (`FileBlock`, so the gallery's Files list has it too). Every
+  one is shown only where the core says so (`block.save`, `viewer item .save`, `MediaRow.save`, `ChatMediaItem.save`):
+  a file that is not on this PC has none of the four. The click reaches the window through
+  `MediaActions.save(attachments)`; the window (`MainWindow.startSave`) asks `App.askSave(attachment)` for ONE file:
+  the viewmodel asks the core for `SaveFacts`, builds the name (`save_name::suggested_name`, sender through
+  `unmarked_name`) and the start folder (`kourier_app::show::start_folder_then`: the folder of the last successful
+  save, kept as the preference `last-save-folder` and written only after a save that wrote a file; the first time the
+  Downloads folder of `user-dirs.dirs`; else home. The look at the file system (`is_dir` of a folder chosen long ago,
+  which may be a network share that is gone) runs on a thread, never on the Qt thread, and a folder that does not
+  answer in 2 s gives the home folder; `saveSuggested(attachment, url)` is sent only when both the name and the folder
+  are known) and `saveSuggested(attachment, url)` opens `dialogs/SaveDialog.qml` (a `FileDialog` in `SaveFile` mode on
+  that `file:` URL, no name filter, the dialog's own question about replacing; made on first use from
+  `App.saveDialogSource()`, so `QtQuick.Dialogs` is not loaded by the start). The answer goes to
+  `App.saveTo(attachment, url)` (the name goes on EXACTLY as the dialog returned it, mode `Replace`: the dialog's
+  question about replacing was about that very name, and a cleaned name written with `Replace` could overwrite another
+  file it never asked about; only the writer judges it, `check_name`, and a name it refuses ends in a failed notice);
+  SEVERAL files ask for a folder (`App.askSaveFolder()`, answered by `saveFolderReady(url)` from the same thread-made
+  lookup; then a `FolderDialog`, started where the last save went) and `App.saveAll(ids, folder)` writes each under
+  its offered name in `NoReplace` mode, a name that is taken gets the next ` (1)`, ` (2)` (`save_name::with_number`)
+  and the viewmodel asks again, so no file is replaced and no race is left. All of it off the Qt thread: the core
+  writes the copy on its `saves` queue, the answers are `UiEvent::AttachmentSaved` / `ActionFailed` and come back as
+  ONE `App.saveFinished(saved, failed, name, url, reason)` per call (`reason`: "nospace", "notwritable", "nofolder",
+  "gone", "nothere", "other"). The window tells it with `MainWindow.notify` (qml.md): `Saved “<name>”` or `Saved %1
+  files` with "Show in Folder", or the failure in the same form with the class of the reason and no path. "Show in
+  Folder" calls `App.showInFolder(url)` -> `kourier_app::show::in_folder` (a thread of its own):
+  `org.freedesktop.FileManager1.ShowItems` through `kourier_desktop::file_manager` (the folder opens with the file
+  selected), else the folder is opened with the desktop's opener (`xdg-open`, the person's environment). View-once is
+  never offered (the core's rule); the window test cannot see that rule on the fixture (it plays Signal, which maps
+  view-once with no attachment): the core's table and `tests/save.rs` on the fake that plays WhatsApp carry it. The
+  answer of a dialog belongs to the files THAT dialog was opened for (`SaveDialog.attachments`, set by
+  `openSaveDialog`), not to the window's `saveWanted` (the Save asked last): a Save asked while a dialog is open keeps
+  its place and gets its own dialog. In the viewmodel ONE save of an attachment is in flight at a time
+  (`CoreSource.save_runs`; the core's answers name the attachment only): a second save of it (Save All of an album,
+  then Ctrl+S in the viewer on one of its pictures) waits in `save_waiting` and is sent when the first is answered, so
+  every call gets its own folder, its own retries and its own notice.
 
 ---
 
@@ -2127,6 +3243,16 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
   `DecryptionErrorMessage` in `PlaintextContent` to the sender device; emit an `Undecryptable`
   placeholder with the would-be id `(sender, timestamp)` when the content hint is `Resendable`;
   fall back to archiving the session and sending a NullMessage (≤ 1 per hour per device).
+- Verified syncs IN (P5a, BQ-1, R3): a `SyncMessage.verified` from our phone is applied for the SAME key
+  only (no row: insert; 2 -> 0/1 releases the paused sends through `IdentityTrusted`; the quiet notice
+  "... from another device"); another key queues a profile fetch and stores nothing. The LATEST CLICK WINS
+  BY TIME: a sync whose envelope timestamp is older than our queued `VerifiedSync` job's `set_at` is
+  kept out (our job converges the phone); a newer one is applied and deletes our queued job for that
+  person (one DELETE by `(kind, key)`, pinned to the kind and the person: RC4, RC8). The runner sends a
+  `VerifiedSync` only when its key AND state still equal the stored row. A key saved by a profile fetch
+  goes through device 1, whose own session keeps the old key: the first send then meets
+  `UntrustedIdentity`, and B1 archives every session with that person at that refusal, so the retry
+  builds a session with the stored key (§6.9).
 
 ### 6.7 Send path
 
@@ -2144,6 +3270,19 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
    that carried the signature (MSL `hasPniSignatureMessage`;
    `SD/ts/background.preload.ts:2660-2674`, `SD/ts/messageModifiers/MessageReceipts.preload.ts:289-305`).
    This is how contacts who know us only by number merge our ACI conversation.
+   A contact card (P5c) is `Body::Contact`: `prepare_body` (`send/media.rs`) takes it with no text and no
+   attachments (never an edit revision) and `DataMessage.contact` carries ONE `ContactDetails { name: { givenName },
+   number: [{ value, type: MOBILE }] }` (`media::contact_card`; no avatar, no organization, no field 8-10; a card
+   without a name, with a name over 512 bytes, or without exactly ONE phone number is refused: SD3). In a group the
+   card is the same `DataMessage` on the sender-key path (`content::in_group` sets only `group_v2`; the e2e
+   `signal_group_send::a_contact_card_sent_to_the_group_reaches_every_member`). Both e2e tests assert the EXACT set of
+   fields that hold a value on the phone's decoding (SE3, `signal_share::assert_fields`, names only): the card
+   `{name, number}`, the name `{givenName}`, the number `{type, value}`, the message `{contact, expireTimer,
+   expireTimerVersion, profileKey, timestamp}` (a group message has `groupV2` instead of the timer version), no
+   `$unknown`. This is the NARROW send side on today's `ContactCard`
+   (the lead's BQ-10): the typed RECEIVE of Signal cards, and the wider card model (name parts, types, addresses, the
+   avatar as an attachment), stay with the step "the kinds, read-only", which replaces this stand-in; until then a
+   received card, also the sync transcript of one sent here, stays `Unsupported { "contact" }`.
    **Profile sharing (M1 rule):** Desktop sets `profileSharing` when the user sends the first
    message in a chat and writes it to the Storage Service (R:signal-desktop-send §5.5). Kourier
    cannot write in M1, so a 1:1 chat with `whitelisted = false` and no pending request gets
@@ -2255,7 +3394,7 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
   a refresh job retries with backoff (5 s … 10 min) and, until then, messages from senders that are
   members under the last known state are applied with it (§6.6).
 
-### 6.9 Contacts and Storage Service (read-only in M1)
+### 6.9 Contacts and Storage Service (read in M1, written since A10)
 
 - Contact sync blob (`SyncMessage.Contacts`): download the `AttachmentPointer` from the CDN with
   retries and decrypt it (receive-side attachment code, §6.11, built in S9), parse varint-delimited
@@ -2273,9 +3412,185 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
   PNI and E164. The manifest version is stored in the last of these zones, so a crash re-reads
   the remaining records. Raw records are kept for M2 writes. Triggered after link, at startup, and
   on `SyncMessage.FetchLatest{STORAGE_MANIFEST}`.
-- M2 (not M1): write path with unknown-field preservation (prost drops unknown fields, so writes
-  re-encode known fields and append the unknown field bytes carried from the raw record), 409
-  handling, `FetchLatest` to other devices.
+- **A new message brings an archived chat back (A1).** Signal's rule (Desktop
+  `canConversationBeUnarchived`, Android `allowedToUnarchive`), and it lives in `kourier-signal` only
+  (`receive/unarchive.rs`; the core takes any `ConversationUpsert { archived }`): a chat the phone
+  archived comes back to the chats when a message arrives, a muted one too, unless the phone's "Keep
+  muted chats archived" (AccountRecord field 25, `account.keep_muted_archived`: NULL until first read, then 0/1;
+  filled ONCE and offline from the newest stored account record, false when there is none, because a
+  profile from before migration 0023 never merges its old record again until the phone changes an
+  account setting; every account record merged writes it) is on and the chat is muted at that moment (`muted_until > now`; Kourier's own "mute on this
+  computer" never keeps a chat archived). `bring_back` runs in the dispatch zone of an inbox row,
+  after the features of the chats, and puts ONE `ConversationUpsert { archived: Some(false) }` in
+  front of the first counting message of an archived chat. What counts: a person's message unless it
+  says it was read elsewhere first, a sync transcript of our phone, every call line, and our own
+  new message once the server took it (`after_own_send`, called by `send/` at the end of a 1:1
+  and a group transmit, never for edits, reactions or typing). What does not: reactions, edits,
+  deletes, receipts, read markers, typing, notices (group changes, timer changes, safety number, session
+  refresh, number change), stand-ins for undecryptable messages, a group's story reply, profile and
+  group-state updates, and every history-import row. The base moves in the same zone (the next
+  Storage record would otherwise be compared with a record that said archived too, and never archive the
+  chat again): `peers.roaming_archived`/`roaming_muted_until` for a 1:1 chat and Note to Self (the
+  record's archive state and mute as the core was last told; NULL = never told), `groups.archived`
+  for a group; the stored record is never rewritten (A10 needs its bytes). `merge_contact` and
+  `merge_account` diff against the base, not against the previous record; a peer whose base was
+  never written (a profile from before migration 0023, or a chat no record stated yet) learns it once,
+  offline, from its newest stored record at its first counting message (`storage::fill_roaming`). That
+  base is what the phone says, not what the core was told, so the first counting message of such a
+  peer states `archived: Some(false)` whatever the filled base says (unless the chat stays archived by
+  the keep-muted rule): one idempotent upsert per peer in the profile's life, which heals a core that
+  kept the chat archived across Link Again (a fresh backend.db states no flag of its first records).
+  Groups are unaffected (their refresh states `groups.archived`). KNOWN LIMIT (a relink question, not
+  A1's): after Link Again a chat the phone archived while the account was logged out stays in the chats
+  until the phone's next record of it. The import states a chat's archive
+  state and writes the base with it; `storage::reset` and a rebuilt core.db (`rebuild_events`) clear it. The
+  hot path is two column reads and only for a row with a counting message.
+- **Safety numbers: what blocks a send (P5a; the lead's R1, 2026-10-25).** `identities.verified` is
+  0 DEFAULT, 1 VERIFIED or 2 UNVERIFIED (was verified, then the key changed; the core's
+  `TrustLevel::Changed`). The security property of P5a is STATE 2: libsignal refuses every send to a
+  contact in state 2 until the user confirms (`SqlIdentityStore::is_trusted_identity`, Sending: the stored key
+  is the session's or the bundle's AND the state is not 2), on every path: a message, a group's resume, a
+  restart (the core's pause is in memory: the head is tried once and the refusal pauses it again), the
+  jobs. A DEFAULT contact is TOFU, as in Desktop and Android: a new key learned from an incoming message
+  or a prekey bundle of the new install, or by a profile fetch (a Storage record that names another key
+  stores nothing and only queues that fetch), stops the FIRST send (the old session's key is not the
+  stored one; B1 archives every session with them at that refusal), and that stop is a UX stop, like
+  Desktop's "send anyway" dialog, not a guarantee: Desktop's `isTrustedForSending`
+  (`ts/SignalProtocolStore.preload.ts:2008-2021`) blocks a DEFAULT contact's new key only within
+  `TIMESTAMP_THRESHOLD` (5 s) of the change unless `nonblockingApproval` is set, and Android's
+  `isTrustedForSending` does the same (`SignalBaseIdentityKeyStore.java:233-262`, 5 s;
+  `isNonBlockingApprovalRequired`); Desktop's "stopped for verification" state is in memory (a restart
+  re-runs the job). So the retry after the archive builds a session with
+  the stored key and sends, whoever released it: the user's Confirm, the confirm of ANOTHER member of a
+  group whose head is paused (the core's M4/F19 release), a restart. Confirm New Safety Number
+  (`UiCommand::ConfirmIdentity`, BQ-2b) is Desktop's "Send anyway": on state 2 it sets DEFAULT (the quiet
+  "as not verified" notice and a Verified sync DEFAULT to our other devices) for the key the user was
+  SHOWN (the command carries it as `SetVerified` does; RC2: when the stored key is another one the backend
+  confirms and writes nothing, the paused send meets the new key and pauses again, and the page shows the
+  new number); in any other state it only approves (paused sends released, state unchanged, no sync, no
+  notice; the key is ignored). There is no per-key approval
+  column (BQ-9: no backend.db migration in P5). The jobs that send to a person in state 2 (delivery
+  receipts, read and viewed receipts, timer updates and the answers to their retry requests) wait locally
+  without a request and without counting an attempt until a release (`jobs::release_untrusted`) or
+  their age bound (a day) drops them (R4, `jobs::wait_untrusted`); our own retry request to them carries
+  nothing of ours and is sent whatever the state, as Desktop does (RC3). The Verified sync to our other
+  devices waits for the catch-up (`JobKind::needs_online`, RC1), so the phone's earlier Verified syncs meet
+  the queued job (the time rule of R3) before it runs.
+- `storage_write`: the job that writes the user's archive, pin, mute and marked-unread changes and a
+  safety number's state to the Storage Service; one row (key ""), due a second after the last change (a
+  trailing debounce: a click moves it later, never earlier), re-run on request, waits for a history
+  transfer and for the catch-up (`needs_online`: the phone's queued Verified syncs meet a live
+  safety-number change before any write carries it). A10b files it from the intents; A10c runs it (the
+  switch, the job and the rate below).
+- The phone's records and the queued changes (A10b): a merged record is compared with the intents of its
+  target by one rule (ours = the intent's value, base = the phone's value when it was made: the stored
+  record's, for the archive flag what the core was told, since a message that brings a chat back moves
+  it here as it does on the phone; theirs = the merged record's): the phone did not touch the field ->
+  the intent stays and nothing is stated; the phone did the same -> the intent is deleted; the phone did
+  something else -> the phone wins (Signal's rule for these fields), the intent is deleted and the
+  phone's value is stated. A change the phone has not been told yet therefore survives every rotation of
+  the record for other reasons, and a change the phone made meanwhile is never overwritten.
+- The plan of a write is a pure function of the manifest the phone has NOW (fetched unconditionally at
+  every write), the stored raw records, the queued changes and the bases the core was told: it edits
+  copies of the records' bytes (every field it does not name is copied), gives each changed record a new
+  identifier and deletes the old one, and builds the new manifest from the fetched one, so records this
+  build cannot read or does not know stay listed untouched. Before anything is sent the plan is checked
+  against the rules whose breach makes the phone rewrite all of its storage (a record listed under the
+  wrong type, a duplicate or missing identifier, a changed version step or key material); a plan that
+  fails the check is dropped with the queued changes kept.
+- A write is judged after a restart by the manifest the phone has now and the new identifiers the write
+  meant to insert: if the phone shows them (at our version or a later one) the write landed; if the
+  phone shows the same version without them it wrote that version itself and ours goes again; if the
+  manifest moved on and shows none of them, the write is counted as landed, because a change lost is
+  better than a change of the phone undone, unless it still lists a record this write deleted: a write
+  is atomic, so the write was not applied (or the phone put its own record back) and it goes again.
+  A write found NOT to have landed is judged as soon as that
+  manifest is decrypted, before its records are read (a manifest OLDER than the write proves nothing,
+  the write may still be on its way: that case is left to the write job), so a change made while they
+  are read is measured against what the phone has; the judgement of a write that landed and the merge of
+  that manifest are one moment (the landing runs in the first merge zone, after the records were read
+  and before they are merged, and nothing runs between the merge zones), so a click, a reading or an
+  unpin made after the write was planned is never mistaken for a change the phone made; the records our
+  own write put there are known as ours, so they never count as a newer mark of the phone and their
+  merge states nothing the landing did not; when the server answers a write, the written records are
+  stored in the same zone that closes its changes, so nothing ever reads the replaced records as the
+  phone's (an answer that comes after a sync already judged the write changes nothing). Turning the sync
+  off while a write is on its way does not hide the write: its values still reach the list, except an
+  archive that a new message has overtaken meanwhile (the chat stays in the inbox here). A new storage
+  key or a rebuilt `core.db` starts the Storage Service over; a write planned before that is forgotten,
+  the queued changes are kept and compared with the phone's records again.
+- A write that never landed is not left behind a switch that is off: when the sync is turned off while a
+  write is on its way, the changes that write carried stay queued until the write is judged; if it is
+  then found not to have landed (the phone is behind it, or wrote that version itself), nothing carries
+  those changes any more and nothing will write them, so they are dropped and the phone's values are
+  shown again, also for a field the write carried that was changed again while it was on its way (the
+  phone's value from before the write). With the sync on they stay and go out again with the next write;
+  a change made while the write was on its way is then measured against the phone's value from before
+  the write, not against what the write would have set; a change that goes back to the value the failed
+  write carried is a change to write again, not an undo of something that was never written. A new
+  storage key while a write is on its way does not make it a write that did not land: if the server then
+  answers 200 the result is dropped, the queued changes keep what they were measured against (the
+  written value; the full sync after the new key merges the phone's records), and with the sync off they
+  are dropped and the phone's values shown again. A record of the write in flight that this build cannot
+  read (a build that changed its shape) counts as a write that did not land: it is logged without
+  content, deleted and the queued changes go out again; it never stops a sync, a click or the receiving
+  of a message. The promise "the answer states the written value" survives a switch that is turned off
+  and on again while the write is on its way: the newer click on a carried field that the switch-off
+  deleted is marked in the write's row, and the answer states the written value (a 200) or the phone's
+  value from before it (a refusal) whatever the switch says by then.
+- Deviation (the review's L4, the lead's call): a contact record that Kourier rotates keeps the phone's
+  identity bytes (`identityKey`, `identityState`) as the phone wrote them, and writes `identityState`
+  only for an identity intent of the SAME key (a Mark / Clear / Confirm of a safety number made here and
+  not written yet). Signal Desktop rebuilds those fields from its own database at every write; Kourier
+  does not, because that could revert a change the phone made that Kourier has not merged yet, and every
+  local Verify / Confirm is an intent anyway. An intent for a key the record does not hold is not
+  written (the next profile fetch decides).
+- A manifest the phone wrote with TWO account records (Desktop's conflict check would repair it on its
+  next write): a write that does not touch the account record lists both exactly as the phone did (as it
+  keeps the untouched duplicates of any other record); a write that rotates the account record rotates
+  the newest and deletes the other. A write never adds a second one.
+- **The switch and the route (A10c).** Every account's switch (`account.roaming_writes`) starts OFF. The
+  backend stores a change of it in one zone (off also drops the queued changes and states the phone's
+  values back; what a write in flight carries stays), then states the account's caps again: the flag
+  and the pin limit (`global.pinnedChatLimit` of the remote config, 4 by default) together. With the
+  switch on a click (archive, pin, mute, marked unread) becomes a queued change in one zone and the
+  reply comes after the commit; with it off the backend refuses it (`Unsupported`; the core refuses
+  first) and writes nothing to the Storage Service. A change the backend cannot file (a chat the phone
+  does not list, a record this build cannot read, Note to Self's mute, a pin over the limit) is refused
+  with its kind and nothing is stored. The core's automatic clearing of "marked unread" is filed as a
+  queued change with the switch on and acknowledged and dropped with it off. Mark / Clear / Confirm New
+  Safety Number: with the switch on and the phone's contact record of the person holding the same key
+  the verified state travels in that record (`identityKey` + `identityState`) and no Verified sync
+  message is queued; the Verified sync message remains the route when the switch is off, the phone has
+  no record of the person or its record holds another key (then both routes carry the same state for
+  the same key). The queued change takes part in "the latest click wins by time" as the queued sync did:
+  a Verified sync from the phone that is not newer than the click is ignored, a newer one is applied
+  and the queued change is dropped (a write in flight that carries the older state is followed by the
+  phone's newer one), and the write job waits for the catch-up so the phone's queued syncs are read
+  first. A safety-number change that is dropped before it was written (the switch turned off, 30 days)
+  becomes the Verified sync message, so the other devices still hear of it.
+- **The write job (A10c).** One run fetches the manifest unconditionally, merges it through the one merge
+  path it shares with the sync (a write not landed is judged before the items are read, a landed one
+  inside the first merge zone), and only then looks at the switch; a merge alone causes no write. Plan
+  and in-flight row are one zone. A 2xx lands in the zone of the answer. A refusal below 500 (409, 400,
+  401/403 after one new-credentials try, 413, 429) means nothing was applied, so the row goes; a lost
+  answer (a transport error, a timeout or any 5xx, which a gateway may answer after the write was
+  applied) keeps the row and the next run judges it by the manifest. A 409 waits 1 s, 5 s, 30 s, then
+  the normal backoff (never under 30 s); a 429 waits for the server's Retry-After (at least a second)
+  and holds the kind. After a 401/403 the second try is sent only if the switch is still on and the
+  storage key unchanged once the new credentials arrived.
+  Nothing in a run sleeps and every failure is a repeat capped at an hour, so a job is never dropped
+  while changes are queued; queued changes age out after 30 days. A change is written a second after
+  the last click; at most 6 writes per 10 minutes and 30 per hour go out per account (the times are
+  kept in `backend.db`, so a restart does not forget them), and clicks beyond that wait together for
+  the next free place. A write that landed is announced to the account's other devices with
+  `SyncMessage.fetchLatest` (storage manifest; sent after the catch-up; a later landing renews the
+  hour of the one still queued), so they fetch it at once; a device that misses it finds it at its
+  next sync. Known limits: a 429 on the job's own GET requests (credentials, manifest, items) is a
+  failure with the normal backoff, not a hold (`Retry-After` is read only for the write itself); while only changes a later record
+  decides are queued (a chat the manifest does not list, a record this build cannot read) or no
+  manifest exists, the job looks again in an hour; a fetched manifest older than the merged version (a
+  server rollback) lands the write without storing its records until the next newer manifest.
 
 ### 6.10 Profiles
 
@@ -2289,6 +3604,42 @@ also inserts `ContactUpsert` (and `System IdentityKeyChanged` when the key chang
 `core_outbox`. One avatar per contact is stored: the synced setting `preferContactAvatars`
 decides whether the address-book photo or the profile picture wins when a contact has both, and
 a change of the setting asks the phone for a contact sync or fetches the profiles again.
+
+People pages (P1): a profile's about text and emoji go into the `ContactUpsert` (`about`, `about_emoji`);
+the old `ProfileMeta` blob is cleared at the next fetch. A person's page asks for a fresh profile
+(`Command::RefreshContact`), but a profile fetched within 24 hours (`PAGE_REFRESH_AFTER`) is not
+fetched again, and a person with no profile key is not asked for at all (opening pages one after
+another must not become a profile request each; the routine refresh keeps its 3 days). Kourier also
+fetches the account's OWN profile, once a day through the same path, with the account's own key and no
+avatar or identity update, so the user's own page has its about text. Every fetch that ends without a profile records its
+time (`peers.profile_tried_at`; a success clears it): a page does not ask again within an hour of a failed
+one, the routine refresh does not queue the person again within a day, and our own fetch is due a day after its last attempt, so a failing fetch is not repeated every hour; a
+404 marks another person unregistered, never our own row. A `ProfileRefresh` job waits for a
+running history transfer (`JobKind::waits_for_transfer`, with the Storage sync and the contact sync): the
+own-profile fetch must not put a contact into the core before the import is over.
+
+Who may see a number (`peers::number_shown`; Desktop's `getE164`, `ts/util/getE164.std.ts`): a profile
+carries `phoneNumberSharing`, encrypted with the profile key; the number is exactly one byte 0x01 when
+the person shares (`field_says_sharing`), anything else decrypted, or no field, means not sharing, and a
+profile never fetched counts as not sharing. The number is SHOWN when the person shares it, or is a
+system contact (or in the contact sync), or when Kourier holds no profile key for them (a number-only
+chat, a PNI, an unknown sender); it is HIDDEN for a person with a key who does not share and is not in
+the address book. The verdict is stored as `peers.phone_sharing` (backend.db 24, `0024_phone_sharing.sql`,
+NULL = never fetched) and stated to the core as `ContactPatch.number_shown` by every site that states a
+number: the profile fetch, the Storage Service record, the contact sync, the sealed-sender certificate and
+the history import, and again when a new profile key, a system-contact flag or the sharing field changes
+the verdict of a person a `peers` row already knew (`number_shown_event`; a full contact sync that drops
+someone from the address book restates it too). The rule is computed for the ACI a PNI or a number is linked
+to where one is known (`identity_links`, `number_links`), because the core resolves the alias in every event;
+only an address-book GIVEN or FAMILY name makes a system contact, never a nickname alone (`isInSystemContacts`).
+A core merge never carries an alias's verdict to the canonical person (a renamed row's flag becomes NULL =
+not shown until the backend states it), so a PNI signature states the ACI's verdict itself (`pni_signature`
+makes sure the ACI has a `peers` row). A PNI-only address-book record is judged by the OR of the PNI row's and
+the linked ACI row's address-book flags. The first start on backend.db 24 states the verdict of EVERY `peers`
+row once (`maintenance::restate_number_verdicts`, `account.number_verdicts_stated`; with or without `peers.e164`,
+because Storage, the contact sync and the import keep a number only in the core): a person with
+no profile key is shown by the rule and is never fetched, so nothing else would state it. Tests: the peers rule table,
+the Storage merge, and the mock test `contacts_storage::the_number_is_shown_by_signals_rule_and_the_verdict_follows_every_change`.
 
 ### 6.11 Attachments (receive)
 
@@ -2448,7 +3799,10 @@ the next job starts when the whole batch has ended. A history import or a first 
 Service sync queues one fetch per contact. One after another they took many minutes on
 the user's account (2026-10-10). A 413 or 429 on a profile fetch holds every queued
 profile fetch until its Retry-After, or one minute without one, as Desktop pauses its
-queue. A batch logs one `jobs done` line, not one line per profile. After every batch, and
+queue. The hold is REMEMBERED (`job_holds`, backend.db 24) and lasts 24 hours at most
+(`jobs::MAX_KIND_HOLD`: a Retry-After is an unbounded number): until it ends no job of the kind
+is made due, whoever asks (a person's page, the routine refresh, a new profile key;
+`jobs::due_floor`). A batch logs one `jobs done` line, not one line per profile. After every batch, and
 whenever no job is due, the runner looks at the post-link gate (§6.5 step 8), so the jobs a
 link queues never hold its `Done`. An accepted `SubmitChallenge` makes
 the job that met the challenge due at once and gives each held job its own time back (now, if
@@ -2484,6 +3838,8 @@ answered otherwise. The cost is one refused job request and one new notice per f
 | Receipts, read syncs, delivery receipts | after catch-up; retried on transient errors | §4.8, §6.7 |
 | Delete sync (`delete_sync`) | after `Command::ClearConversation` or `DeleteAttachment` | `SyncMessage.deleteForMe` to our own devices (§6.13); the payload is the message without padding, so a resent command finds its job or its done record |
 | Profiles | §6.10 | |
+| Storage write (`storage_write`, A10c) | 1 s after a filed change (debounced, and after the catch-up), at a start for intents left behind; again after a 409 (1 s, 5 s, 30 s, then the backoff, never under 30 s), a lost answer (the backoff), a full rate window (the oldest write leaves it) or a 429 (Retry-After) | `storage::write::run`: fetch and merge the manifest, write the plan, judge the answer (§6.9); at most 6 writes per 10 minutes and 30 per hour per account; the 429 and the rate hold the kind (`job_holds`) |
+| Fetch latest sync (`fetch_latest_sync`, A10c) | queued by the zone that lands a write (also a landing a sync finds), after catch-up, expires after 1 h | `SyncMessage.fetchLatest { STORAGE_MANIFEST }` to our own other devices (§6.9); does not look at the switch |
 
 ### 6.13 Mapping Signal → core events
 
@@ -2561,37 +3917,55 @@ backend-side handling (§5.6).
 
 ---
 
-## 7. How Threema and WhatsApp plug in later
+## 7. How Threema, WhatsApp and Telegram plug in
 
 ### 7.1 WhatsApp (whatsapp-rust, R:whatsapp)
 
 | Flow | Through the contract |
 |---|---|
-| Crate | `kourier-whatsapp`, whatsapp-rust pinned by git rev, `default-features = false` (no `sqlite-storage`; keep `tokio-transport`, `tokio-runtime`, `ureq-client`); implements whatsapp-rust's `Backend` store traits over its `backend.db`. The async store calls go over a channel to a dedicated per-account DB thread that owns the connection; blocking rusqlite never runs on the shared runtime, which is also whatsapp-rust's read loop (R:whatsapp §3.5) |
-| Linking | `StartLogin{"qr"}` → `ShowQr` every 60 s then 20 s (`WA/src/pair.rs:115-117`) → `Done`; `StartLogin{"pair-code"}` → `Input{phone}` → `ShowCode{8 chars}`. `risk_notice` shown first |
-| History | `HistorySource::PushedOnLink`: `Event::HistorySync` → `HistoryBatch` (≤ 500 messages per `core_outbox` row; silent; `sort_key` from `sent_at`; `initial_out_state`, `read`, `reactions`; per-chat unread → `unread_hint`); later PDO → `FetchHistory` (`OnDemand`); newsletters per conversation |
-| Receive: E2E messages | inline `EventHandler` (never the default closure delivery, which drops events on overflow, `WA/src/bot/event_delivery.rs:37-59`); `InboundDurabilityHook` commits the batch to the backend inbox and returns Ok → stage 2 and forwarder as Signal; `Messages` → `Message` |
-| Receive: everything else | App-state mutations, receipts, group notifications, contact updates and history results arrive as events *after* whatsapp-rust has persisted its cursor through our store traits (`WA/src/client/app_state.rs:2283-2292`: the version is stored before return, a dropped collection is "lost for good"), and `EventHandler::handle_event` is synchronous (`WA/wacore/src/types/events.rs:404-407`). Adapter rules: (a) `handle_event` translates the event and inserts it into `core_outbox` through the DB thread (`block_in_place` + wait for the commit) before it returns; (b) our `AppSyncStore::set_version` writes `appstate_dirty(collection, version)` in the same transaction as the version, the flag is cleared in the transaction that puts that collection's mutations into `core_outbox`, and a dirty collection at startup triggers a full snapshot resync (`WA/src/features/app_state_resync.rs`); (c) PDO-recovered messages and newsletters bypass the hook (`WA/src/types/durability_hook.rs:40-49`) and are at-most-once: accepted and documented. Mapping: `Receipt` → `Receipts` per participant; app state → `ConversationUpsert{archived, pinned, muted, marked_unread}` / `ReadMarker` / `Deleted{for_me}`; LID↔PN → `IdentityMerged` (+ `merge_conversation`) |
-| Catch-up | `Syncing` until `OfflineSyncCompleted` and the boundary rows are acked by the core (§4.5) |
-| Send | `allocate_message_id` returns only the local id in whatsapp-rust's format (`RequestUtils::message_id_at(pn, secs)`, `WA/src/request.rs:268-280`); own messages are stored with `author: None`, matched per conversation, so PN vs LID addressing never matters; `Transmit` uses `SendOptions::with_message_id`; nack 463 → `Failed{retryable: false}` with a user message, never auto-retried |
-| Roaming state | `ChangeConversation` → app-state mutation → backend emits `ConversationUpsert` after the server confirms |
+| Crate | `kourier-whatsapp`, whatsapp-rust pinned by git rev (`50a723d4`, root `Cargo.toml`, bumped by a step of its own), `default-features = false` with `tokio-runtime` only (no `sqlite-storage`, and NEITHER `tokio-transport` NOR `ureq-client`: with them the client builder pre-fills the real WebSocket transport and HTTPS client, so `Bot::builder().with_backend(store).build()` compiles and can dial without naming either; without them its typestate REQUIRES `with_transport_factory` and `with_http_client`, which a compile-time test holds; `whatsapp-rust-tokio-transport` and `whatsapp-rust-ureq-http-client` are direct dependencies of this crate only, and W2 puts them into those two slots in ONE module); implements the whole `Backend` store contract of whatsapp-rust (five traits, `wacore/src/store/traits.rs`) in `KourierStore` over its `backend.db` (W1, as built): one SQLCipher file per account, the schema component `whatsapp` (§5.5), no `device_id` column, the device as one JSON blob, no snapshots (`snapshot_db` stays the trait's no-op: a snapshot is a second copy of every key). One `kourier_db::Writer` thread per account owns the connection and the ACTOR owns the writer (`StoreOwner`; `KourierStore` holds a handle, so a client task never joins a thread); every trait method is ONE job and every atomic operation ONE transaction (a batch is one job; `commit_patch`, the two token merges and the pending-inbound compare-and-swaps are never a read job followed by a write job), so the single serial history makes them atomic and `SQLITE_BUSY` cannot happen; blocking rusqlite never runs on the shared runtime, which is also whatsapp-rust's read loop (R:whatsapp §3.5). The pending-inbound methods of `ProtocolStore` are REQUIRED: their defaults fail closed, and the builder refuses a store without them when an `InboundDurabilityHook` is set (`WA/src/client/builder.rs:672`, probe `:851`, `ClientBuilderError::UnsupportedDurabilityBackend` `:107`). Shutdown order (W2 keeps it): the client is stopped and released (`store_release()` handshake, `WA/src/store/release.rs`), then the owner is closed (queued jobs finish), then the exit is reported, on every path. W2a, as built: the client runs on a runtime of the account's own, built at the first Connect or StartLogin (not at start); upstream's run loop supervises reconnects and Kourier reads a failed connect at its own transport and HTTP wrappers (`Offline`, no retry time); a pairing is judged BEFORE its device exists (W2c, below): the client's one stanza interceptor reads the `<pair-success>` stanza before upstream does and runs the login's identity checks on the ids it carries, so a refused pairing is answered with upstream's own pair error and ends the login with nothing stored; the same checks on the `PairSuccess` event in the event handler stay as the second line (a pairing that got that far is logged out at once); `AccountReady` is appended in one `core_outbox` zone; the reach-out lock is pulled at the first connect of a run and pushed after; usage statistics are held out in three layers; upstream's log lines are filtered by module path and redacted (wired into the app's log by W2b, §9.1). The login steps are `qr`, `phone`, `code`, `passkey`, `done` |
+| Linking | `StartLogin{"qr"}` → `ShowQr` every 60 s then 20 s (`WA/src/pair.rs:135-137`) → `Done`; `StartLogin{"pair-code"}` → `Input{phone}` → `ShowCode{8 chars}`. Step ids `qr` / `phone` / `code`, both ways offered (§4.4); the warning page first (§8.3). A pairing is judged BEFORE the device exists (W2c, as built): upstream completes a pairing the moment its `<pair-success>` verifies (it writes the other account's number, LID and signed identity into the store, sends `<pair-device-sign>`, the frame that makes the phone list the companion, and reconnects as that device), and the stanza carries both ids, so the login's own rules (`Rules::decide`: the relink's account, an id another account of the profile has, the run's expected number tail, an unreadable device) run on the STANZA. The client's one stanza interceptor (registered before the client dials; upstream offers it every `<iq>` that is no ping and matched no waiter BEFORE its own IQ handler, and a claimed `<iq>` gets no answer from upstream) copies upstream's gate (`from` is the server, any type, every `pair-success` child judged, more than one refused) and decides BEFORE the HMAC and the account signature are checked (refusing is always safe; an accepted pairing is still verified by upstream). A refusal is claimed, answered with upstream's own pair error (`<iq type=error><error code=500 text=internal-error/></iq>`, the frame whatsmeow's pre-pair refusal sends), and then ends the login with `Failed` at `qr` or `code` (`ErrorKind::NotTheExpectedAccount` for the expected number, `AlreadyAdded`, `InvalidInput`) and a stop, not a logout: Kourier never signs the pairing and stores nothing of the other account (no number, LID or signed identity, no `pair-device-sign`, no 515), and the core's `Logout` after the failed link finds no device. What the PHONE shows after the 500 is in no source (R1 records it if a wrong scan ever happens). A client with no login, a login that ended without a device and a pairing after a refusal are refused too; after an accepted pairing the same identity passes again and another is answered without ending the login. The claim remembers the accepted pairing when it passes it, before upstream verifies it, so a pairing that upstream then drops silently (no id, a `<pair-device>` child ahead of it, the client stopping) leaves the login waiting until its QR refs run out, and a later scan of another identity is answered and told to nobody: the trade is accepted (fail closed, never a wrong device, at the cost of a silent wait; W2c review L5). The run's expected number tail reaches the backend only through `BackendConfig` at process start; a fixed log token and the development state say whether the check is on |
+| History | `HistorySource::PushedOnLink`. As built (W4): the phone's chunks (`HistorySync`, each announced by a notification from our own phone) are made durable in a stage file by upstream's capture hook BEFORE the phone is told, then delivered as `HistoryBatch` events (≤ 500 messages and 1 MiB per `core_outbox` row; silent; `read: true`; `sort_key` from `sent_at`; `initial_out_state`, reactions; the per-chat unread count → `unread_hint`, stated once); the paragraph "History (W4, as built)" below has the road, the loss window and what answers it; later PDO → `FetchHistory` (`OnDemand`, K-B2); newsletters per conversation |
+| Receive: E2E messages | inline `EventHandler` (never the default closure delivery, which drops events on overflow, `WA/src/bot/event_delivery.rs:30-60`: three lossy policies, not a durable queue); `InboundDurabilityHook` commits the batch to the backend inbox and returns Ok → stage 2 and forwarder as Signal; `Messages` → `Message`. As built (W3a): the hook's one zone writes the inbox row and the facts together; a failed zone ends the connection and the actor builds a new client after a backoff; stage 2 (<= 50 rows, one zone) maps and finishes the rows; the ledger key makes a redelivery a no-op; an item the map cannot handle yet stays in the inbox as `deferred` with its content (not counted by the poison rule) until a later build maps it; while a link has no account, stage 2 and the handler's writes wait so that `AccountReady` leads `core_outbox` As built (W3b): stage 2's map is pure and makes a LIST of events per inbox row (a merge of two ids when the stanza vouches a pair, the chat's upsert, the message or the modifier) that becomes ONE `core_outbox` row. One table classifies every field of `wa::Message`; the wrappers WhatsApp puts around a message (device-sent, ephemeral, the view-once forms, an edit, an album child, a sticker, a bot invocation, a group mention, a poll v4, a spoiler) are peeled first. Text keeps WhatsApp's formatting as ranges (markers removed) and mentions as placeholders; quotes carry the quoted author and a snapshot; media are remote pointers (no download before W7) with their caption; stickers, contact cards, locations and poll creations are bodies of their own; a reaction, an edit and a revoke target the message by its key with the author read from the SENDER's side of the key (whatsmeow `msgsecret.go:130-150`) and the server's time, and a reaction's removal is an empty emoji with `remove` set; the chat's disappearing-timer setting sets the chat's timer and, in a 1:1 chat, is a notice. A status is let go on arrival (his word); a vote, an encrypted reaction or edit, a comment, a pin, an album parent, a companion upload of a picture or video, the group history bundle and its notice (W4) and a channel's item stay `deferred` with their content for the step that maps them (an admin's delete-for-everyone in a group is mapped since W6a2: "Delete"), and `MAP_VERSION` (4 since W6a2) takes up what an older build deferred. A hosted device (`@hosted`, `@hosted.lid`) is read as its ordinary namespace. |
+| Receive: everything else | App-state mutations, receipts, group notifications, contact updates and history results arrive as events *after* whatsapp-rust has persisted its cursor through our store traits (the version is stored before return, a dropped collection is "lost for good"), and `EventHandler::handle_event` is synchronous (`WA/wacore/src/types/events.rs:405-408`). Adapter rules: (a) `handle_event` translates the event and inserts it into `core_outbox` through the DB thread (the handler waits on a std channel for the commit of a group commit, on the account's own two-worker runtime (so no `block_in_place` and no shared worker is parked)) before it returns; (b) our `AppSyncStore::commit_patch` (the patch path, `WA/wacore/src/appstate_sync.rs:1315`: the version, the removed and added MACs and the flag in ONE transaction) and `set_version` (the snapshot and pagination paths, `WA/wacore/src/appstate_sync.rs:1174, 1340, 1384`) write `appstate_dirty(collection, version)` in the transaction of the version (`set_version` only when the version MOVES: upstream's empty sync writes the state again at the version it has, no event zone follows, and a flag set there would never be cleared), and `delete_version` leaves a dirty row; the flag is cleared (`DELETE … WHERE name = ? AND version <= ?`, so a patch committed after the look keeps its flag) at exactly two quiet points and never mid-session: after a start-up resync (`appstate::startup::run`: a collection the report calls synced, once no version write and no event moved for 250 ms, in ONE writer job that first checks no version was written since that look and reads the stored version itself) and at a clean quit (`appstate::stop_quietly`: `Client::pause()`, a quiet look, the stop and the release, a second look, the same job); both clear only the collections whose mutations the handler writes as events (`appstate::EVENTS_WRITTEN`: since W6a1 the five collections, with the `appstate_map` version row, so a build that maps more verbs marks those collections dirty once), and neither clears a collection that lost an event in this process or that is still owed its resync; a crash leaves every collection that moved since the start dirty and the next start asks for those once (W6a1, below). Upstream has no public 'every event of collection C at version V was dispatched' (its dispatch loop is `WA/src/client/app_state.rs:2414-2420`), which is why the clear cannot ride in the events' zone; a snapshot replays, it does not reconcile, so the resync repairs the mirror's missing records only; (c) PDO-recovered messages and newsletters bypass the hook (`WA/src/types/durability_hook.rs:47-49`) and are at-most-once: accepted and documented; newsletter and PDO items are written by a plain submit that does not wait, and their durability (channels) goes to K8b's brief. Mapping: `Receipt` → `Receipts` per participant; app state → `ConversationUpsert{archived, pinned, muted, marked_unread}` / `ReadMarker` / `Deleted{for_me}`; LID↔PN → `IdentityMerged` (+ `merge_conversation`) As built (W3b), the handler's kinds: receipts (also our own read or play on the phone, by our id; the pair of ids the stanza vouches for for the actor goes first as an identity merge), typing (ephemeral, 25 s, recording is typing, dropped while the link hold is closed), group notices (`gp:<notification id>:<action index>`; our own act is `by: None`; a change without an actor gives none; the group's timer and a rename's title also set the chat; the roles, the rules, the fetches and the title's time are W6a2's: "Groups") and undecryptable placeholders (nothing when WhatsApp says hide, `resendable: false` when the message is unavailable). As built (W6a1; decisions `target/wa/w6-decisions.md`, build report `target/wa/w6a1-build.md`), rule (b) is live and the phone's chat settings reach the core; NOTHING is written to WhatsApp's app state (that is W6b). (1) THE ZONE (`appstate/map.rs`, `zone.rs`): each app-state mutation event (archive, pin, mute, mark as read, clear chat, delete chat, delete for me, and the account's "unarchive on a new message" setting; star, lock, labels and every other verb are ignored) becomes a row of the mirror `chat_state` (backend.db 7) and the core events it causes (`ConversationUpsert{archived, muted_until, marked_unread}`, the FULL pin list of the chats the core knows, newest pin first, as `PinnedConversations`, a `ReadMarker` up to the newest key of a read range, `ConversationCleared` with the range's time in milliseconds, `Deleted{for_everyone: false}`) in ONE zone through the holding event writer (`EventWriter::write_settings_and_wait`): the handler returns only after the commit and waits while the link hold is closed, so a full sync that arrives before `AccountReady` lands after it; a failed zone ends the connection and keeps the collection's flag through a quiet quit (`Activity::lose`, in memory: the version write upstream already made is the persisted mark, so the next start reads the collection again). A value for a chat the core does not know waits in the mirror (`stated = 0`) and is stated in the zone that first states the chat (`features::state` calls `zone::settings_of`, the one helper every such zone shares: stage 2, the history delivery, the event writer, the start sweep); "the core knows a chat" is a `features_stated` row under the exact key of the phone's event. When the phone's setting says unarchive, stage 2's zone puts `archived: false` in front of the first counting message of an archived chat that is NEWER than the archive (Signal's A1 rule; never written to the phone). The phone writes nothing when its own setting moves a chat out of the archive, so its `archive` record keeps naming the old range: the map dates an archive by the last message of its range, the zones of the messages (stage 2, the event writer, the history's rows) note per chat the time of the newest message that counts (`chat_counted`; a call line is not one, G1: the range is dated by the last text), and while the setting says unarchive an archive that such a message is strictly newer than is stale, in `zone::apply`, in `settings_of` and when the setting arrives after the records (R1's `settings` step shows the phone's behaviour). A mute end below zero is for ever, a positive end is milliseconds. A `Rebuild` of the core states every chat's settings again. Only app-state mutation events and version writes count as traffic for the quiet look. (2) THE START-UP RESYNC (`appstate/startup.rs`): the reason is the dirty set read WHEN THE STORE OPENS, before the client connects (what a kill or an unquiet quit left; a flag set during the session is no reason, because the quiet quit clears it or it stays for the next start); the link stamps the books (no Kourier snapshot in the link's session); ONE task after the first `Online` of a start asks for the reason collections one after another, each at most once per start and once per 6 h (the ask is stamped before the request, so a crash loop asks once); a fatal answer (400 or 404) is recorded (`fatal_at`) and asked again only after a higher map version or a new link; the snapshot is polled on the client's runtime (`RealSession::resync`), so its events reach the handler on `wa-client`; a quiet quit waits up to 15 s for a resync that is running, on one deadline shared with the announced chunk's capture wait and the ack wait (`appstate::startup::STOP_WAIT`, F7), so the quit stays inside the 20 s `shutdown_grace` (the quiet look gets what is left after the store's 5 s release and none at all when less than one 250 ms window is left, G6: the flags stay); a replay the bound cuts leaves its flags (the next start asks again). (3) THE RECONCILE: after a synced report for a snapshot Kourier asked for, the mirror rows of that collection the replay did not mention go back to their defaults and the core is told, but ONLY when the replay mentioned at least one mutation Kourier maps in this generation (an empty replay keeps the mirror; a snapshot upstream starts itself, the link's or a recovery, resets nothing); a named hook (`zone::has_open_intent`) keeps W6b's rows with an open intent out of it. A 5,000-mutation replay reaches the core in about 2.4 s on the builder (one zone and one group commit per mutation on the client's two workers). Left to W6a2: groups, roles, names, merges, admin deletes, the one-to-one timer's set. |
+| Catch-up | `Syncing` from `Connected` until Kourier's own boundary (the arrival counter at the tail commit of the drain, written by the handler in the writer's order) is through stage 2 and the core acknowledged the rows written until then; `OfflineSyncCompleted` is not proof (upstream also dispatches it after a failed tail and after its own 60 s wait); `Connected` is dispatched after the offline wait, so the account needs both; a completion that never comes is gone on without after 90 s |
+| Send | `allocate_message_id` returns only the local id in whatsapp-rust's format (`wacore::request::RequestUtils::message_id_at(pn, secs)`, `WA/wacore/src/request.rs:205`: `3EB0` and 18 upper-case hex digits, random, so the core persists it before the first transmit; `pn` is the account's own `pn:` id, `None` before the link; nothing sends before `AccountReady`, and a `Transmit` for an account whose own `pn:` and LID are not both known yet is answered `Transient`, W5a); own messages are stored with `author: None`, matched per conversation, so PN vs LID addressing never matters; `Transmit` passes it as `MessageId` (`SendOptions::with_message_id(MessageId)`, `WA/src/send/mod.rs:470`; the client's `Client::generate_message_id`, `WA/src/request.rs:268`); nack 463 → `ErrorKind::ReachOutRefused` → `Failed{ReachOutRefused, retryable: false}`, never auto-retried (§4.8). As built in W5a: "Send (W5a, as built)" below |
+| Ids (K-B1) | `msg_id_scope: ConversationAuthor` (core.db schema 16, §3.1): the key is `(conversation, author, local)`, as upstream's own dedupe is by chat, sender and stanza id (`WA/src/types/durability_hook.rs:24-25`), so two members of a group may use one id and neither hides the other's message; the other route, an id seen live and reused by a member before the victim's message comes in a later history chunk, is closed by the same key. What it GAINS: per-sender ids. What it LOSES: a message seen under two ids of its author (a `pn:` copy in a history chunk, a `lid:` copy live) is shown twice until the backend says they are one person (`IdentityMerged`, which joins the rows, §3.3); the old scope-1 key hid the second copy by accident. Requirements for W3b: a group message's author is emitted under the LID whenever the store knows the mapping, never the PN form; `IdentityMerged { from: pn, into: lid }` only for a mapping the server gave (the contract's promise, §4.2); every reference carries its author (`Own` or `User`), and the author-less ones that exist (own read and played syncs) resolve only when the id is unique in the chat (§3.1). K-B1 lands BEFORE the first real run (R1): a profile written under scope 1 is not converted, so after the flip every key lookup would miss its rows and every redelivered or history copy would double. The R1 / T1 brief carries that as a prerequisite (core.db schema at least 16 before `wa-run start`). The fixture's WhatsApp (`FakeNetwork::playing`) keeps SignalLike's scope, edit target and numbers ON PURPOSE (`playing_descriptor`; K-A: the same ids and chats for every `wa*` page) |
+| Edits and clears (K-B1) | `edit_target: Original`: an own edit names the original message, whatever was edited since (§3.5.3), so W5 sends `target.local` as the original's id. A clear and a delete-chat carry a TIME (`SyncActionMessageRange.lastMessageTimestamp` / `lastSystemMessageTimestamp`, seconds): W6a1 maps `max(...) × 1000` to `ConversationCleared.before_ms` and the range's message keys to `up_to` (built), and W6b sends the durable `ClearConversation.before_ms` as `lastMessageTimestamp` (the time of `newest[0]`, which is the key it names) and `system_before_ms` as `lastSystemMessageTimestamp`; the core keeps the time as the chat's cut and drops the history chunks that come after (§4.9). The local clear (`ClearConversation`, and a chat delete, which is the same command with `remove`) is confirmed by W6a1 at once, in one zone that also deletes the chat's `media_uploads` rows; the phone is not told until W6b, which writes `clearChat` / `deleteChat` from its own intent. A live or catch-up message older than the cut stays: a known limit, and W6 can pass the range's keys as anchors, which the anchor rule handles |
+| Outbox numbers (K-B1) | the descriptor's `outbox` is `kourier_whatsapp::network::OUTBOX` since W5a (D11): 24 h, 15 min, 24 h, the default's numbers on purpose (the challenge lifetime is never used: WhatsApp has none; edits are bounded by the backend's slack rule); `Transmit` of a `req.local` the network has makes no second message (the `3EB0…` id is the stanza id, so receivers dedupe by chat, sender and id) |
+| Calls | Shown, never taken (§14.2 item 15). A stanza interceptor (`StanzaInterceptor`, registered once per client before it starts, its handle kept in the running client) claims every `<call>`, reads it with upstream's own `parse_call_stanza` and writes at most one `IncomingMessage::call` per signal (an offer: ringing for 60 s, an offline offer: missed at once with `catch_up`, a group offer in `wag:<group>`; a terminate by the caller with no reason, `timeout` or `group_call_ended` and no duration: missed), waiting for the commit; upstream's call handler never runs, so no offer-ack, no accept, no reject: the only frame sent is the transport `<ack>`, after the line is durable. A line is written only for a creator who is the stanza's sender (the same user as `participant` or `from`, or the other id of the same person by the store's LID-number mapping); `call-creator` is the sending device's claim, and so is the offer's `caller_pn`, which ties nothing, so a stranger's stanza that names a contact shows nothing. A terminate that says `accepted_elsewhere` or `rejected_elsewhere` is the caller's word and reports nothing: the ring ends as missed at its deadline until the phone's call log says what happened (W6a1, below). A debug-only switch (`KOURIER_WA_CALL_BUILTIN=1`) lets upstream answer after the line is written, for R2's test; a release build cannot reach it. As built (W6a1), THE PHONE'S CALL LOG (`calls/log.rs`; the app-state `call_log` mutation, and the history's kept call records taken up once after the push) is a second signal of the same line: `call_lines(call_id, conv, at)` is written by the interceptor in the zone of its line, and the log's outcome lands in the SAME conversation and `call:<id>` / `gcall:<id>` (whichever namespace the log names), the state only moving up (a call somebody made to us: connected or accepted elsewhere = answered, rejected = declined, missed or cancelled = missed; a call we made: connected = answered, rejected = declined, missed, cancelled or unavailable = unanswered; any other result says nothing), by `Origin::OwnOtherDevice`, the direction being the creator's side, never the record's `isIncoming`. A record Kourier never saw ring is placed by its direction: an incoming one in the creator's chat (under the LID when the store maps it), an outgoing one (`from_me`) in the record's group, else the ONE participant that is not us (none or several: no line, a count); its time is the record's start time, else the mutation's. The conversation `call_lines` holds for a call id is taken only when it FITS the record (a group record: only that group; a 1:1 record: a direct chat of its creator or of one other person it lists, in either form of that person), since call ids are chosen by the calling side; and the interceptor's zone gives its line the chat the log already filed under that id, so log-then-interceptor makes one line. A call from BEFORE THE LINK (its start, else the mutation's write time, strictly before the pairing's time in `account_link`; his answer "Only calls after link") adds no chat: it lands only in a chat the backend already holds, else it is counted and dropped. A log line is QUIET (silent, read, no badge, sorted at the call's time) in one of three forms by the chat's CUT (`chat_cut`: the newest clear or delete of the chat the backend knows, from Kourier's own confirmed `ClearConversation` and the phone's `clearChat` / `deleteChat`): a call at or below the cut, or in a chat with no known cut, is a `HistoryBatch` row (a clear's cut and a deleted chat honoured: the core drops it); a call AFTER the cut is a LIVE `Message` (still silent and read), which brings a deleted chat back (his words: an unknown caller must appear in the chat list, whether or not Kourier saw it ring); a signal for a call whose line is already filed and which started within the last two minutes (a line can ring no longer) is a live `Message` with `read: false` and not silent, which settles it as the interceptor's own terminate would (a Missed whose hang-up was lost becomes unread and announced; an older filed call takes the other forms, so a replay or a `Rebuild`'s take-up announces nothing old). None of the forms goes through the unarchive of a counting message. A person with NO chat gets the chat ADDED in the line's zone, still `cannot_send: NotAccepted` because a call is no start. `call_lines` rows go after 30 days. |
+| Roaming state | `ChangeConversation` → app-state mutation → backend emits `ConversationUpsert` after the server confirms. W6a1 builds the receiving half: the phone's own changes arrive as app-state mutations and are mirrored and told to the core (see "Receive: everything else"); Kourier's own changes are W6b's, except ONE: W6a2 sets the 1:1 disappearing timer (`ChangeConversation{SetTimer}` in a DIRECT chat: 24 hours, 7 days, 90 days or off, `features::TIMER_CHOICES`; a group's timer is K8c's), in `send/timer.rs`, as a `protocolMessage` EPHEMERAL_SETTING with `ephemeralExpiration`, `ephemeralSettingTimestamp` and `disappearingMode {initiator: CHANGED_IN_CHAT, trigger: UNKNOWN}` exactly as the pinned upstream's own `build_ephemeral_setting_message` writes it (`src/client/iq_ops.rs:226-249`; whatsmeow's older `send.go` form leaves the mode out; fix F1) through the ONE `Client::send`, on the user's command only, through the send path's gates (a started chat, the hold, the token) and its frame discipline (ONE frame per id per connection, no return after the point of no return, a quit takes its key like any attempt); the command is answered `Ok` only after the server's ack AND the confirmation (the chat's `timer` and `timer_version` in seconds, the notice `TimerChanged{by: None}` under the allocated id) is committed in one zone (a confirmation that cannot be committed fails the command `Internal`, the core hears nothing and the frame is not sent again); no ack within `ACK_WAIT` is `Transient` and ends the connection (the change is then not confirmed even if the server applied it), and any nack halts like a send's |
+| Groups (W6a2, as built; decisions `target/wa/w6-decisions.md` D9-D10, build report `target/wa/w6a2-build.md`) | THE READS: after `Online`, never before, under ONE bucket per account that lives as long as the actor (`groups/fetch.rs`: at least 30 s between two fetches, at most 10 per 10 minutes; a server's `backoff`, or a 429 with none, closes it for that delay or 10 minutes; it counts on the account's clock STEADIED so that it never goes back, `Steady`: a wall clock set back by hours does not shut it for the skew, F7b): at each start `Session::participating` (upstream's `list_participating`) and ONE `fetch_metadata_batch` of the listed groups (two IQs, ONE bucket slot, applied in ONE zone `groups::zone::fetched_by_group` that appends ONE `core_outbox` row PER GROUP, F22: a group's whole member list and description is a big statement, and one event the core refuses quarantines that group's row, not the whole batch's); per group only after a MARK (`group_state.dirty_at`, the time of the FIRST ask, the order the marks are served in, and `dirty_last`, the NEWEST, persisted: it outlives a kill and the next start's batch covers it; an answer clears a mark only when `dirty_last` is not newer than the answer's own ask, so a notice that came while the answer was on its way stays marked, F16) that a raw `groups_dirty` notification (`translate::dirty_groups`) or a notice the event cannot carry has set (a create, a modify, a link or unlink, a promote or demote of a linked group, an unknown `member_add_mode`, incomplete participant information; and a member change or a rule when the row holds no whole list or no rules yet); a TRUNCATED group (no member list) gets ONE single `fetch_metadata` per start under the same bucket; a MARKED group is asked one by one too, and AGAIN in the same start when its newest mark is later than its last single query of the start (F17: a notice hours later is served, not left for the next start; the bucket caps any loop); a read that never reached the server (no client, not connected, a timeout, a failed zone) ends the task and the next `Online` asks again after its slot; an answer the server REFUSED (or one that cannot be read) is final for the start and forbids single queries too (the next start's batch is the retry: no retry loop, no burst). Upstream's four group and blocklist calls are named in ONE place each (`session/client.rs`; `tests/builder.rs` counts `list_participating(`, `fetch_metadata_batch(`, `fetch_metadata(` and `get_blocklist(`, one call site each). THE MAP (`groups.rs`, pure): a `Found` group is ONE `ConversationUpsert` with the title (only when its `subject_time` is newer than the stored one, M5: a missing time is never "older", an empty subject changes nothing), the description (Set, or Clear when the group has none), the FULL member list (super admin and admin are `Admin`, a person named twice once with the higher role, the id in the group's addressing mode, our own place found through both forms of our id), the parent (below), the timer (the metadata carries no time: the version is the fetch's time in seconds) and the FEATURES in the same patch (M4: `group_info` from the rules locked, add-by-admins-only, announcements-only and suspended; `cannot_send` `NotMember` first (also for a SUSPENDED group, which is ended for everybody: the core gates a send on `cannot_send` alone, so the composer and an admin's delete are refused there, F4), else `AdminsOnly` when only admins may post and none of our ids is one, never `StillLoading`; `admin_delete` is true for a group); the zone that states a group's members ALWAYS states its features, and every restate (`features::VERSION` is 4 since W6a2, a Rebuild, the start sweep) is made from the stored row (`group_state.rules`), so it never takes `group_info` or `cannot_send` back. A `Rebuild` keeps the row's server facts (`not_member`, `rules`, the Deleted bit, `truncated`, `parent`, the times and the marks) and takes back only `members_stated`, `parent_stated` and the title's time `subject_time` (F15, DUR-1; G3: the new core was told no title, and a time that a notice dated by its own clock set later than the server's would hold the next answer's title back): a group we left stays `NotMember` and an announcements-only one stays closed in the rebuilt core, and the start's batch states the list again and releases the parked deletes. A `Found` answer the server flags `missing_participant_identification` (upstream's `has_missing_participant_identification`: at least one identity was left out) is NO snapshot: it states the title, rules and features, at most an upsert-only member delta (never `full`, never a removal, and only on a list the core holds), leaves `members_stated` as it was (so it releases no parked admin delete), keeps our own place when the list does not name us, and marks the group like a truncated one so the start's one single query asks it whole (F2). A `Truncated` answer states nothing and keeps the stored list; `Forbidden` and `NotFound` state the `NotMember` features (the list untouched; a group the backend never stated states nothing). A subgroup's `parent` is stated only when the core already has the parent chat (a `features_stated` row with version above 0) or the same answer states it first; otherwise the row names it and waits (`parent_stated = 0`) and the zone that first states the parent states it for the subgroups that name it, once (the core would make a bare, title-less chat for an unknown parent). THE NOTICES (`notice.rs`, `groups/zone.rs`): a promote or demote carries the ACTION's role (never the notice's `type`), an add or a remove a member delta, announce / locked / member-add-mode / suspend and our own promote or demote the rules; a delta is stated only when `members_stated` (else the group is marked) and a rule only when the row holds `rules`; a rename is judged IN the zone against `subject_time`, so an older notice never sets an older title; a remove that names us (or an add) moves `not_member`; a `Gone` or `Deleted` notice finishes the group's parked admin deletes at once when its list was never stated (no event, content wiped, in the notice's own zone: F5). NOTHING a group answer says is a merge (D7). THE BLOCKLIST (D22): `Session::blocklist` (upstream's `get_blocklist`) after `Online`, at most once per 24 hours per account (the stamp `blocklist_read`, written in the zone that states an ANSWER; a read with no answer stamps nothing; a link deletes the stamp; a stamp from the future is due; a refused or stated read is not asked again in the same start even when the client is rebuilt, F7a), states `ContactPatch.blocked` for the people it names (unblocks first, `blocked_stated`); upstream's own per-connection read stays, so this is a second identical IQ at most once a day. Logs: counts and kinds only, and a `GroupError`, an `AskFailure` or an `AppStateError` is never formatted (L5). |
+| Names (W6a2, as built; D8, his U5) | THE PUSH NAME (`names.rs`): a message of somebody else states his self-chosen name (`profile_name`) in the zone of that message when it differs from `names_stated` (a name is stated on a CHANGE only, and a zone that fails records nothing); the group notice states its actor's name the same way; the history path uses the same `names::clean` (trimmed, a blank or the placeholder `"-"` dropped, cut to 128 characters), and a chunk's older name never beats a live one (`history_named`). A chunk's push names follow D8's scope too (F11, N25 everywhere): the name of a person the core does not know is KEPT in backend.db (`kept_names`) and stated once, in the zone where he first becomes known (`strangers::release`), unless the live path or an earlier statement gave him a name; `kept_pairs` and `kept_names` are what the phone said, like the address book, and a Rebuild keeps them. Our own push name is not stated, and OUR OWN ids are no address-book person (F13): `book::states` never makes them known and states nothing for them (they are read from the stored device by SQLite's JSON functions, `store::own_forms`, so no zone needs the actor's ids handed down). THE ADDRESS BOOK: the `contact` mutation (collection `critical_unblock_low`, which raised the app-state `MAP_VERSION` to 2, so a store at 1 asks that snapshot once), `ContactRemoved` and the history's kind-3 entries (taken up once, then deleted) fill the MIRROR `address_book` (not forgotten by a Rebuild; it goes with the account's file). One person is one entry: each row carries its ORIGIN (the app state's live word, or the history's older one); a history entry is not taken while ANY row is indexed under or names its number or its LID (the app state may index a contact by its LID where the history keeps it by its number), and a live put or remove also takes the history rows that name the same forms, so the phone's REMOVE clears the name and no older history name comes back. A name reaches the core as `system_name` ONLY for a person Kourier has a chat with or who is in one of its groups (`persons_known`, written in the zone that states him as a direct chat's peer, a member or an author); the rest wait in the mirror and are stated by the zone in which the person first appears (`book::states`, after the merges). A live row of the mirror carries the GENERATION of its collection, stamped like `chat_state` (`address_book.gen`; a replay that says the same word again is a touch), and the reconcile of a snapshot Kourier asked for takes the contacts the replay left on an older generation back as a REMOVE takes them, the name cleared from the people the core knows and another entry of the same person keeping him a name, only after a replay that touched a row of the collection (`book::reconcile`, from `appstate::zone::reconcile`, F19: a contact deleted on the phone while Kourier was down leaves no REMOVE in a snapshot); a history row has no generation and stays. A `Rebuild` keeps the push names as rows marked NOT stated (`names_stated.stated = 0`, the address book's names and numbers go: the mirror states them) and each is stated once, where the person is named to the new core again: the start sweep for a direct chat, the zone that lists a group's members (`book::states`, F21), so a member who never writes keeps his self-chosen name. A history chats row the core REFUSES is taken back with what it stated (F18): the address-book name's and number's rows, a push name that is still the recorded one (put back into `kept_names`) and, for a dropped chats single, the `persons_known` of the people it named (a limit: also one the core knew from an earlier acked row; he is known again by the next zone that names him, and his address-book name waits in the mirror meanwhile, the safe side). `RefreshContact` restates what the mirror and `names_stated` hold and asks the network nothing. THE NUMBER (`number_shown`): stated ONLY with an address-book name that names it (`identifiers = [Phone "+<digits>"]`, `number_shown: Some(true)`: the phone shows the number of a contact it saved); the entry's removal (or an entry that loses its number) clears the name and states `identifiers: Some([])` with `Some(false)`, so core.db keeps no number the phone no longer shows; a LID member of a group who is not in the address book shows no number (WhatsApp hides it too), and a person known by his number alone shows it as his label anyway. THE "~" MARK (his answer "~Name, as the phone"): a WhatsApp person with no nickname and no address-book name shows his self-chosen name with "~" in front, in every place the core names a person: the one `shown_profile_name!` rule of `kourier-core/src/query.rs` (`display_name`, a direct chat's title, the group members' rows; the account's stored network is WhatsApp) and `person_view` in the viewmodel; the contact card and the stored `profile_name` stay unmarked, and every other network's names are unchanged. The mark belongs to LABELS only: the monogram's letters and colour, every colour taken from a name, the notification's avatar and the accessible names take the name WITHOUT it (`Style.unmarked` in QML, `notify::unmarked_name` in Rust; one leading "~" dropped), so a push-named person looks as the name itself does. The mark's seam is a KNOWN SHORTCUT: the network literal sits in core SQL and the mark arrives inside the shown string; main's follow-up is a descriptor capability `marks_chosen_names` (WhatsApp, and Threema's public nicknames), the core returning the name and its source unmarked and the viewmodel marking labels only. Known limits: a verified business name is not shown; profile pictures are W7's. Names are never logged (the Wire cases grep the child's output for the fixture's names). |
+| Merges (W6a2, as built; D7, H4) | `merges.rs` states `IdentityMerged{from: number, into: LID}` for a pair the store VOUCHES for, each pair once (`merges_stated`, answered from its two indexes, the primary key and `merges_stated_lid` (F20); every pair a message, a notice or a history chat states live is recorded there too, so a merge stays final; a refused history row takes back the pairs ITS OWN zone recorded, F18; `merges_stated.by_seq` is the history row that recorded a pair, claimed by `deliver::write_row` through `store::merges::mark` and `claim_since`, so a pair an earlier row, the live path or the sweep told stays told when the refused row only repeated it, G2). The sources are the rows of upstream's `lid_pn_mapping` whose source is `usync`, `recipient_latest_lid`, `migration_sync_latest` or `blocklist_active`, and the `contact` mutation's pair from the address book (which upstream does not learn and Kourier does not feed to it); never `_old`, `_inactive`, `device_notification`, `other`, `pairing`, a peer's claim or a number change. Only the number's CURRENT row counts (the newest `updated_at`, then rowid): a recycled number whose newest row is a peer's message merges nothing; when the store's LID and the address book disagree, or the book names two LIDs, nothing merges; a LID that two numbers claim merges neither; a pair that would put a second pair around a number or a LID the core was already told about is never stated; our own ids are skipped; and a pair is stated only when the core KNOWS one of its two people (`persons_known`): the scope is applied to the pairs the rules CHOSE (a stranger's row is still a witness against a pair, so a recycled number whose store row names a stranger's LID while a stale book entry names a known one merges nothing), in `merges::gather` and again in the zone. A history chunk's own pairs (`phoneNumberToLidMappings`) follow the same scope, N25 everywhere (W6a2 F11): a pair of which the core knows no person is KEPT in backend.db (`kept_pairs`), not in the chunk's row, and is stated once, in the zone where one of its two people first becomes known (`strangers::release`, from `book::states`), unless it would cross a pair the core was told; every pair a chunk states, now or later, is recorded in `merges_stated` in the same zone (F12), so the sweep never states a second pair around that number, and a chunk's pair that crosses one the core was told is dropped. The sweep (task `merges::Sweeper`, zones of at most 256 pairs; the zone that states a merge also states the LID's address-book name and number, `book::states`) runs when the connection comes `Online`, after a committed address-book change, after a committed group answer that states a member list and at the history driver's quiet step; it asks the network nothing. Our phone's `LID_MIGRATION_MAPPING_SYNC` rows are `Class::Inert`: upstream consumes that push itself and stores its pairs as `migration_sync_latest`. Kourier NEVER calls upstream's `add_lid_pn_mapping` (a source check in `tests/builder.rs`). |
+| Delete (W6a2, as built; D11, his U4) | RECEIVE: a group revoke is the AUTHOR's own delete when the participant it names is the sender or his other id by a stored `lid_pn_mapping` pair (from our own phone: one of our two ids); it is stated with the sender as the target's author and as the deleter, and needs no member list. Any other group revoke is an ADMIN's delete, mapped only once the core holds the group's member list (`group_state.members_stated`; the map stays pure and the caller supplies the facts, `map/facts.rs`): stage 2 PARKS it on the group (`inbox.members_wait`, `parked_until = received_at + 45 days`, no poison attempt counted, never counted from `aged_from`), and the zone that states the whole list un-parks it in the SAME transaction, so a kill leaves both or neither; an answer that says we are not in the group (`Forbidden`, `NotFound`) or the 45 days finish the group's parked revokes with no event (M3). The history's revokes stay deferred items taken up by `MAP_VERSION` and never reach the core. The core gives the tombstone `Deletion::ForEveryone{by}` and the viewmodel says "This message was deleted by an admin" when `by` is not the author (the timeline, a quote, the notification; the chat list's preview does not: the core's `Preview` row has no deleter). SEND: the core offers Delete for Everyone on another member's message only when the group's features say `admin_delete` and we are an admin (`actions.rs`); the backend builds it (`send/content.rs`) only when the group's ROW says we are an admin still in the group (`people::is_admin`, a second line behind the core's offer): the key is `fromMe: false` with `participant` the author EXACTLY as his message's own key named him when the backend still knows that form (the inbox ledger row of the group, the id and a sender that is the author or his paired id: `people::received_as`; upstream's own revoke passes the original sender through unchanged, `src/send/actions.rs:139-146`), else in the group's current addressing mode (history messages and rows swept after 14 days); a SUSPENDED group refuses it (F4); upstream's send turns the key into `edit="8"` (an admin revoke), through the ONE `Client::send` like every frame; a 1:1 chat never. |
 | Presence | reads `UiPresence` (focus, visible chat): available only while the window is focused; chatstate subscriptions for the visible chat |
-| States | `TemporaryBan` → `Restricted`; `StreamReplaced` → `NeedsUserAction(Reconnect)`; `ClientOutdated` → `NeedsUserAction(UpdateApp)`; `LoggedOut` → `LoggedOut` |
-| Media | `DownloadAttachment` with directPath+mediaKey blob; expired media → `AttachmentDone{Err(Expired)}`; re-upload request is a later `Command` |
+| States | `TemporaryBan` → `Restricted{Banned(reason), until}`; the reach-out time lock → `AccountHold` (§4.5); `StreamReplaced` → `NeedsUserAction(Reconnect)`; `ClientOutdated` → `NeedsUserAction(UpdateApp)`; `LoggedOut` → `LoggedOut` |
+| Media | `DownloadAttachment` with directPath+mediaKey blob; expired media → `AttachmentDone{Err(Expired)}`; re-upload request is a later `Command` As built (W3b): the pointer of an attachment is a versioned JSON blob of hex strings (path, key, hashes, size) that never prints its key; a message without the data to fetch it is `Unavailable`; `DownloadAttachment` is answered with a durable retryable failure until W7. |
+
+Retention (W3a, as built): the content of an inbox row is wiped at stage 2 (the pages stay encrypted in the WAL until a checkpoint); the ledger row (ids and JIDs) is swept only after a LATER connection's drain completed durably and only when older than 14 days; `pending_inbound_messages` only by upstream's 7-day keepalive sweep; `sent_messages` 7200 s (`CacheConfig.sent_message_ttl_secs`, stated by Kourier); message secrets are kept as long as their message (`MsgSecretPolicy::Full`).
+
+History (W4, as built; 2026-10-18; decisions `target/wa/w4-decisions.md`). THE PROMISE, honestly: every chunk the capture answered Ok for reaches the core exactly once in the backend's appends, whatever kills the process (a kill loop at every hit of eight kill points proves it); a chunk that was announced and never captured is LOST, because upstream keeps no replay buffer and gives Kourier no way to ask again at this pin (the media key stays inside upstream) and the phone is not known to send a chunk again unless it got no receipt, and the person is told. THE ROAD: upstream decrypts the notification, honours it only from OUR OWN phone (`is_from_me`), downloads the blob (or reads the inline payload) and calls the capture hook (`HistorySyncCaptureHook`, registered only in `session::build_bot`); the hook commits the compressed bytes into the stage in ONE zone and only then answers Ok, and upstream sends the chunk's `hist_sync` receipt only after that (over the Wire: none while the stage's writer is parked, exactly one after, `tests/history_wire.rs`). Nothing is decoded in the hook. The feeder then reads the stage on a thread of its own: pass 1 plans the chunk (its chats in the order of delivery, the sync type, the chunk order and progress; a blob that does not inflate or decode is `bad`, kept 14 days, counted), pass 2 cuts it into rows (people, then chats least recent first, then each chat's messages oldest first, ≤ 200 people / 50 chats / 500 messages / 1 MiB a row), and the delivery zone appends each row to `core_outbox` in ONE `backend.db` zone (the look at the cursor, the row's message secrets keyed as upstream keys its own, the kept items, the chats' states, the entry, the counts, the cursor), at low priority behind live rows; the core answers through the forwarder, a row the core refuses is taken back, split into single units, and a refused single is dropped and counted (Signal's bounds: a window of two unanswered rows, 10 minutes of running time, 3 starts, 3 out-of-step looks). The driver waits for the link hold (`AccountReady` leads a link) and for a captured chunk; a chunk whose rows all settled is retired (`done`, its bytes gone). THE MAP is the live map's (`map::message_events`), so a message has the same key live and in the history (a chat is placed by its LID form wherever the chunk states one); what a build cannot show (stubs, call records, former members, the kinds the live map defers) is kept in `history_deferred` with the map version and taken up silently when a later build can show it. THE HINT: `unread_hint` is stated once per conversation, never after a read on this computer or on the phone (the live path's own `ReadSelf`/`PlayedSelf` receipt sets `history_chats.read_here` in the zone that writes its row), and without the live messages of others that arrived since the link (`history_live`, written by stage 2 only while a push can still state a hint: a chat owes an end, a chunk waits or an announced chunk is unresolved; forgotten in stage 2's own zone a day before the oldest chunk that waits for its delivery, `history_cursor.live_floor`, because the hint is decided at the delivery, possibly days after the capture); the core does not raise an existing row from a history copy (`read: true` there is only "not known": the descriptor's `history_read` is `Unknown`), so a live message not yet seen stays unread. THE NAMES: a chunk is a snapshot older than its delivery, so a title or push name the live path stated since the link (`history_named`, noted in the zone that states it: stage 2's or the handler's group commit) is left `Unchanged` by the history delivery. THE ENDS: only the sync types that push chats say `has_more`; a chat ends with an empty batch when the phone marked it or its sync type's push is over (the last chunk at 100 % with none waiting or announced), and every chat that still owes an end gets it once nothing of the account can still arrive (no chunk waits, no announced chunk is unresolved) and the push cannot be taken for running (a chunk was lost or did not read, or the newest capture is six hours old: `Facts::account_over`), so a lost or unreadable last chunk does not leave the banner and a 30 s look running for the life of the account. THE LOSS WINDOW: the notification's own delivery receipt leaves before the capture (confirmed over the Wire), so a chunk is lost when the process dies, or the download fails, between the notice and the commit. Answers: stage 2 records every announced notice of our phone in the zone that finishes its row (`history_announced`); a quit waits up to 15 s before it stops the client, ONLY while a chunk announced in this run is not captured (an ordinary quit is as fast as ever; the network's stop grace, §4.7, makes room for it); the next start counts the rest lost, but not too early: the phone may upload again a chunk that got no receipt, so a notice counts lost only when its announcement is more than 24 h old or a chunk with the final progress was captured after it (the notice's own sync type is unknown: upstream takes its payload out before the hook), and a chunk captured after its notice was counted lost takes the count back (`lost = 0`, `history_counts.lost - 1`, `lost_told` clamped) in a `backend.db` zone behind the capture's wake; the quit waits only for chunks announced in the run that quits; the start appends ONE durable `BackendNotice::HistoryLost{count}` per start until the core took the row, which the viewmodel shows as a quiet line of the account banner (the core keeps the last count of each account for the run and tells it again at `UiReady`, since an account's actor starts before any front-end listens). Limits: a notice stage 2 has not recorded yet is counted one start late; the quit wait does not see a capture that was never announced; a `Rebuild` of the core gets no history from chunks already `done`; a stage that another owner left is replaced and its undelivered chunks are counted lost, and a stage that does not open (a damaged file) is set aside under another name, never deleted. THE STAGE is a file of its own, `accounts/<uuid>/history/stage.db`, because a 1-20 MB insert on `backend.db`'s one writer would stall live receiving and `secure_delete` would make removing a chunk rewrite its pages: key = HKDF-SHA256 of the backend key with a fixed info string, its own schema component (migrated, never removed for a version), opened when first needed, removed whole at a logout, a fresh link or a foreign owner; the bytes of a chunk are in a table of their own (`chunk_bytes`), not in the row every look at a chunk's state reads; the feeder's worker keeps one chunk inflated and lets it go at its last row, when it stops reading and after 30 s without a job; the kept parts of a chunk have positions of their own after its people and are cut into rows by the byte bound like messages; every file has an incarnation id and `backend.db`'s books record the one they point into, so whoever replaced the file and however the run ended, the books start over before anything is delivered from a stage they do not describe. Migrations: `backend.db` schema 4 (`0004_history.sql`) and the stage's component 1; no `core.db` migration (the core's ingest already takes a `HistoryBatch` idempotently: a revoke before or after the copy never brings the body back, `kourier-core/tests/history_rules.rs`). Chat Lock: locked chats of the history are kept and shown, like any chat (his word; re-decided after R1). Left: older history on demand (K-B2), a way to dismiss the lost-history line. Since W6a1 the kept call records are taken up once after the push as quiet call lines (see "Calls"); stubs and former members stay kept.
+
+Send (W5a, as built; 2026-10-25; decisions `target/wa/w5-decisions.md`, build report `target/wa/w5a-build.md`). W5a sends text (markup, mentions in groups, quotes, the chat's timer), edits of a text or a caption, deletes for everyone, reactions, receipts and read syncs, typing, and group text; files are W5b's ("Send (W5b, as built)" below) and no link preview is fetched (a URL is text). THE CALL: every kind goes through ONE `Client::send(SendRequest::new(..).with_options(SendOptions::default().with_message_id(MessageId(req.local))..))` (`session/client.rs`; a source check in `tests/builder.rs` counts the call sites), so the stanza id of every frame is the core's local; upstream's edit, revoke and reaction helpers are not used. The message is built pure (`send/content.rs`: `conversation` or `extendedTextMessage`; the markup written back from the core's ranges and read back with the receive parser, sent plain on a mismatch; the timer through `with_ephemeral_expiration`; an edit is a `protocolMessage` MESSAGE_EDIT keyed by the ORIGINAL; a revoke `REVOKE` with `fromMe=true`; a reaction upstream's `build_reaction_message`), and every key and receipt target goes through one address rule (`send/address.rs`, D20: a 1:1 chat in the account's namespace, LID once upstream says the account is LID-migrated and the mapping knows the LID; a group participant in the group's `addressing_mode`). THE PROMISE (D21, as amended by the fix round F1): the backend writes at most one frame of a local per connection while its outcome is unknown; after a nack at most one more per floor (below); upstream's own same-id resends (its phash repair to the devices an ack's `phash` shows were not covered, a DM's `resend_dm_to_uncovered_devices` and a group's repair, and the answers to retry receipts) are the protocol's, keep the id and are not counted (`tests/send_kill.rs` checks exactly these); and the core is answered only after the server's answer is durable. The OUTCOME LEDGER (`send_outcomes`, §5.5) records `acked` (with the server's time) and `refused` (463) in ONE zone (kill points `wa_inside_send_outcome` / `wa_after_send_outcome`) BEFORE the reply and is read FIRST by every `Transmit`: a recorded outcome is answered with no frame (`Sent{server_at}` or `Failed(ReachOutRefused)`); failures are not recorded, so Send Again works for every failure but the 463; the ledger is read by the LOCAL alone (F13: the core's locals are unique per account, and a resend whose chat the core re-keyed between the send and the resend still finds its row); the delivery and read receipts of a message Kourier sent land on the chat the ledger holds for it (F9: a `pn:` chat is written to its LID, so the peer's receipts come back from the LID; the event writer's zone moves them to the ledger's chat with its peer as `by`, only when the mapping says the two are one person); an acked revoke takes upstream's `sent_messages` copies of the original and of EVERY edit of it, found by what the copy holds (F18: a `MESSAGE_EDIT` keyed by the revoked id, whatever the edit's ack), and the late ack of an edit whose original was revoked meanwhile takes its copy too, so a late retry receipt never sends a deleted text again. THE ACK REGISTRY (`send/acks.rs`, D5) is keyed by (local, connection): a second `Transmit` of a local whose frame is in the air writes nothing and hears the first's answer; no ack within 75 s of the written frame ends the connection (upstream's reconnect; the waits answer `Transient`), and the resend goes out only on a LATER connection with the SAME id (his answer of 2026-10-25: WhatsApp very likely drops the repeat; R2 checks it once with his OK); a late ack is still committed. EVERY answer is remembered for the connection (F1): an ack and a 463 or 475 for the rest of it, a NACK for its FLOOR (429 five minutes, 421, 500 and 503 thirty seconds) or, when it has none, for the rest of the connection; while it is remembered a `Transmit` of that local writes NO frame and is answered the remembered failure with `retry_after` = the time left of the floor, and after the floor ONE new frame may go out (the nack is known, so no duplicate is possible), after a 421 asking upstream for fresh group metadata (`with_group_metadata_freshness(Refresh)`), so the core's own retries of a retryable nack cannot make a burst of frames of one local. The registry's connection count follows `Disconnected` and the actor's own ends only: upstream reconnects BY ITSELF (keepalive watchdog, dead-socket timer) without one, and nothing at the pin can start a new registry connection before a frame of the new socket may be written (`<success>` is never offered to an interceptor, `Connected` comes after the offline wait), so the count can lag; that can only write FEWER frames and costs one extra reconnect (F12, `send/acks.rs` "THE LAG"). A quit waits up to 10 s for the acks of written frames, inside the 20 s shutdown grace, and commits them (D19). A second frame of one local can therefore exist only on a later connection, after a kill between the frame and the ledger commit, after a quit whose ack did not come in time, or after a lost ack: the kill loop (`tests/send_kill.rs`) checks exactly that (D21). THE ERRORS (`send/errors.rs`, D6): 463 is `ReachOutRefused` and so is 475 (a cap on messages to new chats, F8: recorded `refused` like a 463 and never resent until a real run shows what it means; R2 looks at it); 429 `RateLimited` and 500, 503 and 421 `Transient`, each with the floor above as `retry_after`; every other code non-retryable with the code in the message; the failures before the wire by the same table (a recipient with no usable device is tried once with a fresh device list). D6 IN THE BACKEND (D7, as amended by F2-F4): a DIRECT chat may be sent into only once the phone started it: the backend keeps the fact (`chat_started`) from the peer's message or our other device's (stage 2's zone), a history chat whose chunk carries at least one REAL message of it from either side (W4's delivery zone; a chats row alone, with a time, an unread count, a name, flags or a token, is no start) or an acked own message (the ledger's zone), never from a call line or call record, a system line, typing, a receipt, a presence or a merge (ONE rule for the live and the history path, `started::proves_start`); the fact is read by the DESTINATION's own resolution (F3: for a `pn:` chat its own row and its CURRENT LID's, for a `lid:` chat its own row and its number's only while this LID is the number's current one), so a fact is never lent to another LID a number once had; a store that ran under W3 or W4 (before the fact existed) has no source that proves a real message, so every 1:1 chat of it starts `NotAccepted` until the peer's next message (F4: the peer writes first; the later send run says so); until then the chat states `cannot_send: Some(NotAccepted)`, and `Transmit` is refused with no frame (`Unsupported`, "start this chat on your phone", never `ReachOutRefused`), `SetTyping` sends nothing and `SendReceipts` is confirmed with no receipt. Groups are always started (membership is the server's). (The core's own refusal of `SendText`/`SendFiles` into a `cannot_send` chat is a core item for later, G4.) THE HOLD (D8): the reach-out lock is pulled and awaited up to 10 s before `Syncing` is published and stated as `AccountHold`; a send waits (`Transient`, 30 s) while the run's first pull is unanswered or a lock is in force, typing waits too, receipts do not; the gate is one shared view (`send/hold.rs`) asked again right before the frame and right before a typing state (F6), and a pull's answer older than a push never overwrites it; after 10 minutes of unknown (counted from the run's first ask) the gate opens with one WARN line, and D7 and the 463 floor guard what remains. THE TOKENS (D12): the privacy tokens of the history's chats are kept in W4's delivery zone with upstream's own statements, and right after a link a 1:1 send into a chat with no stored token waits (`Transient`, 60 s) while the initial history push runs, at most 30 minutes after the link; then it goes bare. RECEIPTS (D10): `SendReceipts` is a `receipt_jobs` row and its `CommandPersisted` in one zone; a runner writes it when connected (`mark_as_read`; viewed: `mark_as_played`; in a group one call per author) and deletes the job after the write returned Ok; before the FIRST 1:1 read or played write of a connection it has the session make the phone's read-receipt setting known (F5: upstream's `read` / `read-self` choice reads it; a fetch that fails keeps the jobs), and only a failure of the CONNECTION stops the drain (F14: a job that fails for a reason of its own is dropped and logged by kind, a group whose addressing mode cannot be read waits only on a connection failure, and the real session reads a failed group-info ask by upstream's typed error, so a timeout, a dropped socket or a 5xx keeps the job: F21; jobs older than 14 days go at a start); delivery receipts are upstream's own. `SyncReadMarker` is noted for the history hint and confirmed: the receipt carries the reads of live messages; reads of history rows, of blocked senders and of pending requests do not reach the phone until W6 sends `markChatAsRead`. His phone's read-receipt setting acts through upstream (`read` or `read-self`); W5 states no `AccountSettings`. KEYS AND NAMES (F7, F10, F20): in a group the key of an EDIT or a REACTION to our own message names us as the `participant` in the group's addressing mode (WhatsApp Web's own keys; upstream's `message_ref_addon_key`), the sender revoke's names nobody; in a group whose addressing mode is LID or unknown NO phone number is written into the text or a `mentionedJid` entry or a quote's `participant` (a person the core holds by number whose LID the mapping lacks becomes plain text / no participant; every `pn:` person in an unknown-mode group), because every member reads it; the `participant` of a KEY that names another's message (a reaction to a member) follows the same rule but cannot leave its person out, so in a LID group whose mapping lacks the author's LID the reaction fails for good (`Unsupported`, no frame), in a group whose addressing mode could not be read it is `Transient` (the mode is asked again at the next send, no frame), and a number is written only into a group addressed by numbers (F20). FEATURES (`features.rs`, D9): bold, italic, strike and mono; mentions in groups only; 65,536 bytes of text; replies; edits for 900 s; received edits within 1,200 s of their original and received deletes at any age (F16: the core DROPS a received edit or delete when the window is `None`; the receivers drop an edit 1,200 s after its original, upstream `msg_secret.rs`); delete for everyone for 216,000 s; no delete for me (one that still arrives is answered `Sent` with no frame and logged as a fault); one reaction per person; typing, read and delivery receipts; stated once per features version and started fact in the zone that writes the chat's events; a `Rebuild` states every chat again. The fake playing WhatsApp states the same features (`kourier_fake::scripts::whatsapp_features`, a test compares them) and gives 22-character ids. Group text is one stanza with sender keys, answered whole (never `Partial`).
+
+Send (W5b, as built; 2026-10-27; decisions `target/wa/w5b-decisions.md`, build report `target/wa/w5b-build.md`). W5b sends files: one file per message (the core's default packing; the caption, quote and mentions on the first; no album parent, a `Body::Media` with more than one file is refused with nothing uploaded), pictures, videos, audio and documents. THE ORDER (`send/attempt.rs` module doc): every W5a gate first (ledger, delete for me, D7, slack rule, hold, token gate, own ids, a session), so nothing is read, re-encoded or uploaded for a message that will be refused; then, still before any file work, the account's addressing mode and the group's are asked ONCE and `content::check_file` runs the refusals of the build that do not depend on the pointer (none or several files, a quote naming another chat, a quoted author that does not parse) through the SAME function `build` uses (fix F4: no second copy of the rule; `captioned` is judged by the RENDERED caption in both, so a bare mention placeholder is no caption); then the FILE WORK: a record of this local younger than 6 h is reused (no upload, the pointer reported full at once); else, when an earlier POST thread of this local still runs on a blocking thread (upstream cannot cancel a POST), the attempt answers `Transient{30 s}` with NO work, no prepare, no temporary file, no IQ (fix F5: the guard is held by the source's reader and goes when upstream's thread drops it; KNOWN LIMIT: other locals are not limited, each lingering POST holds one blocking-pool thread and one ciphertext-sized sealed temporary file for up to its body budget, about 34 h for 2 GB, and a write the peer stalls runs a few more periods of what was left when it started: up to several times the budget for a stall at the body's start, `real::body_budget`); else `Preparing` is reported, the core's blob is read (its path checked inside the blob directory), ROUTED, a still picture re-encoded (one picture in memory per process: a `Semaphore(1)` taken under the stop before the blocking prepare and moved into it, fix F17), the file encrypted under a FRESH random media key into ONE sealed temporary file (`accounts/<uuid>/upload-tmp`, a kourier-blob under a key held in memory, holding WhatsApp's ciphertext; removed by the attempt's guard on every exit, the folder emptied at every start), the reach-out hold asked AGAIN (fix F3: a lock another frame earned during the prepare keeps `w:m` and the POST from starting; `Transient` as every hold wait, the prepared file goes with the return), uploaded (`Session::upload` -> upstream's `upload_stream`, its media_conn cache, its single forced refetch after a 401/403 and its host order, called only inside the client's runtime with abort-on-drop), and the pointer committed to `media_uploads` (§5.5) in ONE zone (kill points `wa_inside_media_upload` / `wa_after_media_upload`); then the build, the hold again, and THE POINT OF NO RETURN: the stop state is closed right before `write_once`; a stop that won answers `Failed(Internal, "stopped by the user before anything was sent")` with no frame, and it wins over EVERY other way out of the part before the frame (the record write's error, the build's `GroupModeUnknown`, the hold's re-check, any later one): such a `Failed` answers the same stop once the abort was accepted, never `Transient`, which the core would resend (fix F1). THE STOP (`send/stop.rs`): atomics + `Notify` (the attempts are `Send` tasks), registered synchronously in `Actor::transmit` before the spawn, open only for a message with files; `AbortTransmit` is answered at once from it (`Stopping` while nothing can go out, else `TooLate`); the attempt sees the stop at its next await or read (the sealed source fails every read once a stop is requested or the quit took the attempt). THE QUIT (fix F16, Q-B16): a normal quit used to wait the whole `QUIT_ACK_WAIT` and then the client's 5 s release wait for an attempt that was only uploading (it had written nothing and waits for nothing the quit needs; 15.7 s in the test). Now `Transmits::quit_all` moves every attempt still before its point of no return to a FOURTH state, `QUITTING`, by the same `compare_exchange(OPEN, ..)` as the abort and the close, so exactly one of the three wins: the attempt that lost to the quit never writes, ends at its next await or read and answers `Transient{None}` (`stop::quitting`: the core sends the message again at the next start, nothing went out; NOT the person's `Internal` stop, which the core shows as failed for good; its upload record stays for that resend); the attempt that passed first, and every attempt closed from the start (text, edit, delete, reaction), is waited for as before (W5a D19: a frame in the air gets its ack). After the wait, whatever is left is ended (`abort_all`) BEFORE the client stops, so no upload task holds the client into the release wait. An X pressed after the quit is still `Stopping` (nothing goes out either way) and turns the state into the person's stop. A kill during prepare or upload leaves nothing recorded (the next start removes the temporary file; the resend uploads again; the CDN keeps an orphan); a kill after the record and before the frame, a kill after the frame and before the ledger commit, and every Transient after the upload (the hold, a nack floor, a lost ack) resend the SAME message (same key, path and hashes) under the same id with no second upload. THE RECORD'S LIFE (fix F13): the upload record (media key, paths, preview) does not outlive a delete for everyone or a stop: an acked revoke deletes the record of its target in the SAME zone that records the ack, and an attempt of a NEW message with a file that ends for good before its frame (the stop, the build refusing, any other permanent answer) deletes its own row in one zone before it answers (a failed delete is logged by kind and left to the 30-day sweep); a transient end keeps the row, a frame written and then failed for good and a permanent nack keep it to the sweep, and the chat clear (`ClearConversation`, a no-op until W6) must delete `WHERE conv = ?` when it is built. THE ROUTE (`send/route.rs`, one table that decides the message shape, the upload path and the HKDF type together, by CONTAINER): a still picture (not GIF) of at most 64 MiB is read whole and cleaned by ONE function, `upload::still`, through `kourier_media::clean_still` (§5.8.1; G7b, after the rebase onto LOC): re-encoded at Signal's level THREE (at most 4096 px, JPEG 0.75, every metadata block dropped), a JPEG or PNG that does not re-encode stripped (only the orientation kept), never bytes that still carry a location; a picture whose cleaned bytes decode is sent as `imageMessage` with their type and size and a 100 px JPEG thumbnail (quality 0.5, left out above 16 KiB), one only stripped (it does not decode: arithmetic-coded, a side over 16,384 px) goes as a document; a type `clean_still` does not clean (HEIC, AVIF, by its magic) goes as a document as it is (the core asked first: §5.8.1), and a picture of a cleaned type that cannot be cleaned fails its attachment (`InvalidInput`, "the picture could not be cleaned of its metadata"). So WhatsApp states `cleaned_pictures` = JPEG, PNG, WebP and BMP up to 64 MiB (`upload::stated_cleaning`; a larger picture is streamed untouched as a document, and the core asks for it); the fake playing WhatsApp states the same (`kourier_fake::scripts::whatsapp_cleaned_pictures`, compared by `tests/network.rs`); an MP4 (`video/mp4`, `audio/mp4`) whose box walk (`send/mp4.rs`: moov at most 4 MiB, depth 64, 4096 boxes) finds an `avc1`/`avc3` video track is a `videoMessage` with `seconds`, width and height, the streaming sidecar and the type `video/mp4` (also for a file typed `audio/mp4` that carries a video track, fix F10), no thumbnail and no transcoding (his answer: "Send as video, no preview"); an MP4 with only an `mp4a` sound track, an Ogg whose first packet is `OpusHead` and an `audio/mpeg` that starts with an ID3 tag or an MPEG frame header (a 0-byte file or any other bytes typed so are a document, fix F9) are an `audioMessage` (`ptt` false, sidecar, `seconds` for MP4) unless they carry a caption (`audioMessage` has none: then a document); everything else (a GIF, his answer "As a file"; QuickTime, WebM, raw AAC, FLAC, WAV, HEIC, AVIF; any media over 16,000,000 bytes; "send as file") is a `documentMessage` with the true type, `fileName` and `title`, in `documentWithCaptionMessage` when it has a caption; nothing is refused (adapt, never refuse). ONE BUILDER (`media::file_message`) writes the send and the caption edit from the stored pointer, so a caption edit of an own file (its pointer from the TARGET's record) writes exactly the sent file with the new caption. THE CHAT'S TIMER on a file (fix F8): upstream's `with_ephemeral_expiration` sets `contextInfo.expiration` on the first top-level carrier only, so for `documentWithCaptionMessage` Kourier writes the timer into the INNER document's context itself (`media::put_timer_inside_wrapper`) and asks upstream for nothing; every file shape carries it where the receiver reads it. A captioned document that arrives from the phone stores `shape = document_captioned` in its pointer (fix F11, an optional field, `POINTER_V` unchanged), so a caption edit of it writes the wrapper again. THE UPLOAD UNDER THE CONTRACT (§4.8): `Preparing` from the first moment, a report every 250 ms (`AttachmentProgress` of the one file and `TransmitProgress` up to 0.99, `done` monotone and below `total` until the upload returned), then the file whole and `{1.0, None}` before the build; THE STALL WATCH (armed only while upstream reads the body: 60 s without a byte, five such periods after the last byte) answers `Transient{30 s}`; the last byte is found by POSITION (the reader knows the source's length: ureq, which sends a sized body, never reads again after the last byte, so no read ever answers 0; a test over a real `execute_upload` pins both ureq facts), and the watch goes idle when the reader is DROPPED (ureq holds it until the answer's head is in; the next host's resume check and the 401's IQ are no stall) (fix F6). Upload failures by one table (`send/errors.rs`, the status read from the error chain, never by formatting it) with RETRY FLOORS (fix F2: the core's own retry must not be immediate): 429 `RateLimited{5 min}`; 401 and 403 (after upstream's one refetch), 408, 5xx and an unfinished upload `Transient{30 s}`; no client `Transient` with none; 413 and every other status non-retryable with its code. KNOWN LIMIT: a 3xx or a cut 2xx answer is an unfinished upload (no status is kept) and is retried after 30 s as a whole new upload. A read error of the core's blob that is the machine's moment (EMFILE, EIO, Interrupted ...) is `Transient{30 s}` (fix F18), and so is a temporary file that cannot be written (a full disk: every try would read and encrypt the whole file again); a missing blob and a tag that does not verify stay non-retryable. THE HTTP SIDE (`src/real.rs`, still the ONE real-client module): `RealHttp` is upstream's ureq client over Kourier's own agent (connect 30 s, response head 120 s, body read 300 s, no proxy, no redirects), and the upload is Kourier's own copy of upstream's POST (exact `Content-Length`, a per-request send-body budget of 60 s plus the length at 16 KiB/s that ureq enforces as a cap on the whole body, the answer read through 64 KiB; the plain `execute` of the version file and the resume check reads its answer through a 4 MiB cap, while the streaming download keeps upstream's limit and W7 decides its own, fix F7); the agent is built only inside the maker (`tests/builder.rs`). FEATURES: `files` = Image, Video, Gif, Audio and File, each at `FILE_LIMIT` (2,000,000,000 bytes), a caption on all but Audio; features `VERSION` 3; the fake playing WhatsApp states the same. TESTS (fix round): the privacy grep of the media children also looks for the CDN fake's host names, the received media key and both hashes (hex, base64 and URL-safe base64) and runs the token-shape check over upstream's WARN+ lines of its upload path. Not built: voice notes and stickers (the composer makes neither), video thumbnails, a derived media key (a broken large upload restarts from zero), the album parent; open until the real run R3: [U2] the media limits, [U3] how long the CDN keeps an unreferenced upload, [U7] what the receivers show.
+
+Log lines (D10): Kourier's new lines carry counts, arrival numbers and error kinds only; the receive tests grep the children's output for the fixture's synthetic number, LIDs and push name (W6a2: also the groups' titles, descriptions, member numbers and the address-book names; a group's list, a name and an error's text never reach a field). Start-up: nothing on the start path; the binary's size is measured with W2b, which registers WhatsApp in the app.
 
 ### 7.2 Threema (libthreema + ported Threema Desktop logic, R:threema)
 
 | Flow | Through the contract |
 |---|---|
-| Crate | `kourier-threema` with vendored libthreema (path dependency, no features) and the `[patch.crates-io] blake2` it needs in our root `Cargo.toml`; own thread + LocalSet (libthreema state machines are `Rc<RefCell>`), sans-IO driver feeding the mediator WebSocket |
-| Linking | `ShowQr{threema://device-group/join#…}` → `ConfirmEmoji{rendezvous path hash}` → `Input{password}` (only if we keep Threema's own key-file model; with Secret Service we skip it) → `Progress("Importing contacts and groups")` → `Done`; EssentialData → `ContactUpsert` (with `trust`, `hidden`), `ConversationUpsert` (groups keyed creator+id, distribution lists as `Broadcast`) |
-| Receive (follower) | reflected envelope → one `backend.db` transaction: inbox row + D2D nonce, and for `ContactSync`/`GroupSync`/`SettingsSync` reflections the applied state *plus* its events in `core_outbox` (R:threema §5 item 5) → `reflected-ack` → stage 2 / forwarder |
+| Crate | `kourier-threema` with vendored libthreema (`third_party/libthreema`, threema-ios `bf7c14ed`, path dependency, `default-features = false`, its own workspace excluded from ours; Kourier's patches P1-P6, P9, P10 and P11 listed in its `VENDORED.md` (P5: the open and seal functions of the reflection, the transaction scope, the device info and the CSP boxes, and the nonce hash, public); the patched blake2 is the renamed crate `libthreema-blake2` inside the copy, so the root `Cargo.toml` has NO `[patch.crates-io]`); own thread + LocalSet (libthreema state machines are `Rc<RefCell>`), sans-IO driver feeding the mediator WebSocket. As built (TH1-TH5b): the store (schema 1: `identity`, `csp_nonce`, `d2d_nonce`; schema 2 by TH4: `contact`, `grp`, `dist_list`, `own_profile`, `settings`, `held_blob`, `join_ready`, each synced object whole as the protobuf bytes of its `d2d_sync.*` message; schema 3 by TH5a: `deferred`, the plaintext of the envelopes this build cannot map yet, bounded, and its kept sum `deferred_total`; schema 4 by TH6a: `send_task` and `send_receiver`, the send queue, sealed; opened through `check_backend_file` before any migration), the parts, the offline fake of the mediator and the chat server (the oracle of every later step; TH5a adds the phone's envelope and body builders and a parent-resident form whose child process is killed), the connection (mediator + chat server, keep-alive, what a close means) and the pinned connectors, the device join (§7.4), the follower's receive (the next rows; §7.4), the kill loops of every multi-row write (the user's clear included) and of the actor's receive, and (TH6a) the send core, which nothing in a real build reaches (the Send row below). The leader, the user's sending and the roaming changes are not built (every Threema chat states `CannotSend::NotYetBuilt`, and a `Transmit` is refused in a real build): the leader and Roaming rows below describe the design; TH6, TH7 and TH9 rewrite them as built |
+| Linking | As built (TH4, §7.4): `StartLogin` → `ShowQr{threema://device-group/join#…}` (step `qr`) → `ConfirmEmoji{three glyphs of the rendezvous path hash}` (`emoji`) → `Progress("Linking")` (`linking`) → `Done`; no password step (Secret Service holds the keys). The import is stored in two zones and the core hears of it from zone 2: `AccountReady` first (with `AccountSettings`), then `ContactUpsert` (profile and system name, `hidden` for a group-only or deleted contact, `blocked`) and `ConversationUpsert` for groups (`threema:<creator>.<group id>`); distribution lists and pictures are stored, not stated yet |
+| Receive (follower) | As built (TH5a, TH5b, §7.4): up to 30 reflected envelopes of a pass are drained, each OPENED (DGRK, patch P5) and replay-checked by its D2D nonce, CLASSIFIED by one table (`reflect/classify.rs`: mapped, deferred, unsupported, dropped, ephemeral), and the whole batch is made durable in ONE `backend.db` transaction: the D2D and CSP nonces, the events as ONE `core_outbox` row per envelope (there is no inbox table: that row is the durable copy), the applied BLOB of a `ContactSync` / `GroupSync` / settings, profile or list sync, and the `deferred` row of a kind this build cannot map yet (the plaintext as decrypted, under `MAP_VERSION`) → `reflected-ack` of each envelope after the commit, in order (an ephemeral one is never stored nor acked; a replay is acked and writes nothing) → stage 2 / forwarder. Mapped now: text (a 1:1 or group text, own other device's or incoming) with quotes, mentions and `*bold*` / `_italic_` / `~strike~` markup; files (one attachment, or a sticker, with its caption; the blob reference stays remote until TH8's download, which is answered as a failure meanwhile) and locations; edits, deletes and reactions (addressed by the message id alone, dated by their own `created_at`); the peer's delivery receipts, our phone's own read, the deprecated acknowledge / decline as a reaction pair (on our message for the peer's, on the peer's for ours in a 1:1 chat), and the phone's `sent` and `read` updates (`OwnSendState` per recipient, `Receipts`; an own message into a notes group is `Sent` at its arrival; a `sent` update that names a distribution list is also kept in `deferred` for the lists step); the contact and group syncs field by field (with the group notices); the settings, profile and distribution list syncs (stored whole; the blocked contacts, the account's switches and the nickname are stated, lists are not); each conversation's state. An ephemeral typing indicator from a contact goes straight to the core as `Typing` (15 s) and is never stored or acked. A build with a higher `MAP_VERSION` maps the older `deferred` rows again at its start (2 since TH5b: the first start of that build maps every version-1 row), its messages as HISTORY rows (one `HistoryBatch` per page and conversation: never announced, and the core's cut of a chat cleared meanwhile refuses them). The user's Clear Chat or Delete Chat deletes that chat's `deferred` rows and, since TH6a, its unsent rows of the send queue (not one a `Transmit` is attached to), and is confirmed with `CommandPersisted` in the same zone (Threema syncs no clear to the phone). Not mapped yet: poll votes and calls (kept in `deferred`), and anything addressed to a distribution list |
 | Receive (leader) | CSP message → decrypt → reflect to own devices → await reflect-ack → commit inbox + CSP nonce → CSP `message-ack` → stage 2 / forwarder; `ConnState::Online{detail: "leader"}` |
-| Catch-up | `Syncing` until `ReflectionQueueDry` and the boundary rows are acked by the core (§4.5) |
+| Catch-up | As built (TH5a): `Syncing` until `ReflectionQueueDry` is counted (nothing is held for a join, the file is join-ready) AND the core has acked every `core_outbox` row up to the newest seq at that moment (§4.5; Threema has no stage-1 arrival counter, the boundary is that seq); everything mapped before Dry is counted is `catch_up`, and so is everything that waited for the join's zone 2; a re-mapped message is a history row, below the first socket's boundary |
 | Ids | `msg_id_scope: Conversation`; `local` = u64 hex; reactions, quotes and receipts carry only the u64, so the backend emits `TargetAuthor::Unknown` and the core resolves within the conversation (as Threema Desktop's `getMessage(messageId)`, `TD/apps/desktop/src/common/network/protocol/task/common/message-reaction.ts:56`) |
-| Send | `allocate_message_id` = random u64; Transmit = reflect `OutgoingMessage` → per-receiver CSP sends (honouring `only`, recording accepted receivers like `send_progress`) → reflect `Sent` update; groups are client-side fan-out and may end `Partial`; distribution lists send 1:1 copies and emit per-member `Message{linked_local}` (§4.2) |
-| Roaming state | every contact/group/settings/profile change is a D2M transaction inside the backend (`ChangeConversation`, `ChangeContact`, `ChangeAccountSettings`, `ChangeProfile`); the core applies it only from the resulting events (principle 4.1.4) |
-| Features | 6-hour edit/delete windows, receipts 1:1 only, typing 1:1 only, `reactions_per_user: None` (set), mentions/quotes as inline markup parsed by the backend |
+| Send | As built (TH6a, the send core; nothing in a real build reaches it): `allocate_message_id` = random u64 (`local` is the id); a `Transmit` is the Bundled Messages Send Steps over a persistent queue in `backend.db` schema 4 (`send_task`, `send_receiver`), SEALED ONCE and resumed by window. ZONE PREPARE (the task, one sealed box per receiver, the sealed reflect, every nonce; its commit is the point of no return) → reflect `OutgoingMessage` → its ack → ZONE REFLECTED → the boxes of every pending receiver in one pass → their acks → ZONE ACKS (per pass; the last one seals the `Sent` update) → reflect the update → its ack → ZONE DONE. A frame goes only after the zone that holds its bytes, an answer only after the zone that makes it true; a resend after a kill writes the stored bytes, byte for byte, and only where the outcome is not durable (a receiver with a durable ack gets nothing, after `done` no frame goes), so the peer opens one message per receiver and the phone maps one `OutgoingMessage`. A follower sends (no leader gate); a `transmit` row runs from the login-ack while the core's `Transmit` waits on it, a `job` row (the backend's own: a receipt, a creator's answer, from TH6) at `Online`, one row at a time. No ack in 60 s ends the socket (close 1000, through the backoff); a row whose frames stood unanswered at such an end or at the server's close has a failed run, the first is free and from the second it cools (2 min, doubling, 15 min), later rows go, and a job gives up at 12; the account never reaches `NeedsUserAction` through a row. Outcomes are read from the rows: `Sent { server_at }` when every receiver the core asked for is acked and the update is acked (blocked receivers are unnamed and count as sent, a notes group sends nothing but the reflects), `Partial` for a socket lost between receivers or an `invalid` (`PeerUnregistered`) or `no-key` (`Unsupported`) receiver, `Failed(Transient)` otherwise, `only` honoured; a second `Transmit` of a `local` finds its row and writes no frame. The user's clear deletes the chat's unsent rows. Plain text only; replies, expiry, ranges, files, edits, reactions, lists and the directory are TH7 and TH6. Design for the rest: groups are client-side fan-out and may end `Partial`; distribution lists send 1:1 copies and emit per-member `Message{linked_local}` (§4.2) |
+| Roaming state | As received (TH5a): the phone's archive, pin, mute and protected flag ride on the `ConversationUpsert` of every chat (QC: "only when mentioned" counts as not muted; not changeable here until TH9). Design: every contact/group/settings/profile change is a D2M transaction inside the backend (`ChangeConversation`, `ChangeContact`, `ChangeAccountSettings`, `ChangeProfile`); the core applies it only from the resulting events (principle 4.1.4) |
+| Features | As built (TH5a): receive windows OPEN for edit and delete (`Window { None, None }`: the spec says the receiver will always accept), the SEND side off until TH7 (no edit, delete for everyone, reply or reaction offered; `cannot_send: NotYetBuilt` on every Threema chat, so the composer says sending comes in a later version), `reactions_per_user: None` (a set), and `files` for every attachment kind with a caption and no size limit (TH5b, only so the core takes a received caption edit; sending stays off). Design for TH7: 6-hour edit/delete windows on send, receipts 1:1 only, typing 1:1 only; mentions and quotes are inline markup parsed by the backend (TH5a: `> quote #<id>` and `@[ID]`, `@[@@@@@@@@]`) |
 
 ### 7.3 What the M1 contract already contains for them (so the core does not change)
 
@@ -2601,7 +3975,8 @@ backend-side handling (§5.6).
 | Conversations | `ConvKey::{Broadcast, Channel}`, `ConvKind` beyond Direct/Group, `ConversationPatch.{parent, marked_unread, unread_hint}` |
 | Login | `LoginStepKind::{ShowCode, ConfirmEmoji, Input}`, repeated `ShowQr`, `StartLogin.relink` |
 | History | `HistoryBatch`, per-conversation `HistorySource`, `FetchHistory`, `history`/`silent`, `IncomingMessage.{initial_out_state, read, reactions}` |
-| Identity and references | structured `NetMsgId`, `msg_id_scope`, `TargetAuthor::Unknown`, `IdentityMerged`, `identity_alias`, `merge_conversation` |
+| Identity and references | structured `NetMsgId`, `msg_id_scope` (`ConversationAuthor` for per-sender ids, K-B1), `TargetAuthor::Unknown`, `IdentityMerged`, `identity_alias`, `merge_conversation` |
+| Edits, clears, outbox numbers (K-B1) | `NetworkDescriptor.{edit_target, outbox}`, `ConversationCleared.before_ms` and the durable `ClearConversation.before_ms` (a clear by time and the cut it leaves, §4.9), the resend promise of `Transmit` and the other written promises of §4.2 (`allocate_message_id` not necessarily pure, `IdentityMerged` only for a vouched pair, `own_ids` primary first, `initial_out_state` live too) |
 | Catch-up | `IncomingMessage.catch_up`, the boundary rule (§4.5) |
 | Features | `reactions_per_user: None`, per-conversation receipt/typing flags, receive windows, `group_actions`, `cannot_send` |
 | Roaming changes | `ChangeConversation`, `ChangeContact`, `ChangeAccountSettings`, `ChangeProfile` with replies; `ListOwnDevices` |
@@ -2611,7 +3986,8 @@ backend-side handling (§5.6).
 
 The kourier-fake conformance suite carries one script per future network before the contract is
 frozen in S3 (R:multi-protocol-prior-art §6): WhatsApp history shapes (own messages with states,
-reactions, unread hints, PN→LID merge with both chats populated), Threema references with
+reactions, unread hints, PN→LID merge with both chats populated, a group message whose author is
+reported under both ids by two history copies), Threema references with
 `TargetAuthor::Unknown`, a rejected Threema transaction, a distribution-list send.
 
 Additions expected later, all additive (new enum variants or commands, no schema rewrite):
@@ -2621,11 +3997,356 @@ flavours/OnPrem config in `BackendConfig` (Threema).
 ### 7.4 Policy gates
 
 - Threema: the ToS (2022-03-23, §2.1, §4.2) allow operational use only with official or approved
-  clients; §4.3 allows modified open-source clients for testing (R:threema §6). The backend stays
-  unbuilt until the user decides.
+  clients; §4.3 allows modified open-source clients for testing (R:threema §6). The backend is built
+  in the lane `lane-threema` (TH1 the crate, the store and the parts; TH2 the offline fake; TH3 the
+  connection and the pinned connectors; TH4 the device join; TH5a the follower's receive: messages are received, none is sent)
+  behind the cargo feature `threema` of `kourier-app` and `kourier` (in `default`, so ci
+  builds and tests the wiring; `cargo xtask dist` builds `signal,whatsapp` without it).
+  `kourier-app` `threema_registration(build, on, linking)`: a RELEASE build neither registers nor
+  lists it; a DEBUG build registers it while `networks-on` names it, and lists it as off only when
+  this start can link: `linking` is `kourier_threema::LINKING_BUILT` (true since TH4) AND the start's
+  allow-list of test IDs is not empty (E1: an action that does nothing is not shown). Kourier links
+  Threema only in a PREPARED run profile. THE ALLOW-LIST (C10) is read only by a debug build inside a
+  kept run profile (`KOURIER_HOME` a canonical direct child of `<data>/kourier-threema-run/`), from
+  `<data>/kourier-threema-run/threema-allowed-ids` (0600, its directory 0700, both owned by this user; a line
+  `sha256:<64 hex digits>` per ID, the digest of `kourier-threema-allow-v1:` + the 8 ID characters, so an ID is
+  out of plain sight, not secret); anything else is an EMPTY list (one malformed line voids the whole list)
+  and a file that is there but unusable is told once as a warning of fixed words. The tool that writes the
+  file and starts the run profile (TR) is not built: until then Threema is listed, and links, only in a test.
+  THE GATES (G1, B1): THE FILE IS THE ONLY GATE BEFORE THE FIRST SOCKET TO THREEMA in a debug build. A plain
+  debug start does not list Threema; a hand-edited `networks-on` still registers it, and the backend then refuses
+  `StartLogin` at step `qr` before it makes a transport (`NotTheExpectedAccount`, no code shown) while the list is
+  empty (B1). With a list the join dials Threema's production rendezvous relay as soon as the person clicks Link,
+  before the QR code exists, so the digest is no secret and a file in a kept run profile is the whole permission:
+  only TR writes it, after the user's go in that session (there is no refusing dialer as Telegram's and no
+  `--confirmed-by-user` as WhatsApp's). The second line: the ID the phone sends is checked against the list before
+  anything is written (`NotTheExpectedAccount` at step `linking`); it bounds WHICH account is stored, not WHETHER
+  Threema is contacted, since an ID can only be refused after the phone has sent that ID's keys. The third: a
+  release build never reads the file and never lists Threema (dist's check of the packed binary refuses Threema in
+  either list as well).
+- Threema's device join (TH4, as built; decisions `target/threema/th4-decisions.md`, `th4-fix-decisions.md`).
+  Kourier is the rendezvous initiator: it shows the QR code and the phone scans it. THE QR: the text is
+  `threema://device-group/join#` and the URL-safe base64 WITH padding (Desktop's form; [U] whether the phone takes it
+  unpadded) of a `DeviceGroupJoinRequestOrOffer` of `url-payloads.proto`, the one protocol file libthreema does not
+  build (the crate's `build.rs` compiles it with prost-build onto libthreema's generated types): join version
+  `V1_0`, D2D protocol version `V0_3` (what libthreema's reflections carry; Desktop writes `V0_2`; [U: the Android
+  app takes `V0_3` in a join]), `request_to_join`, a `RendezvousInit` with a random 32-byte key, ONE relayed
+  WebSocket path (id 1) and no direct TCP. The relay URL is built by libthreema's own `RendezvousServerBaseUrl::path`
+  (patch P11; a first key byte below 0x10 needs P9's two-digit prefixes). THE EMOJI: once the phone has nominated a path
+  the rendezvous path hash gives three of Desktop's 128 emoji, `EMOJI[hash[i] % 128]` for `i` in 0..3 (the list of
+  Desktop's `emoji-list.ts`, variation selectors kept, pinned by a digest test; [U] that the phone shows the same
+  three); the person compares them (`ConfirmEmoji`, each glyph with its name, §8.3) and confirms on the phone. THE
+  BOUNDS: a message of the relay may be 100 MiB (a frame after the nomination), so the join counts on arrival
+  (blobs: 1,000 and 32 MiB in all) and on the wire form of `EssentialData` before it decodes it (contacts, groups,
+  lists, members, blocked IDs, nonces, the profile and settings bytes); every number and its enforcer is a row of the
+  §13 limits table, and the peak of one rendezvous socket is about six messages, 600 MiB, before the emoji too.
+  THE IMPORT: `EssentialData` is checked whole before anything is written (identity data, the keys' lengths, no Work
+  data, each contact, group, list and picture reference; a bad item REFUSES the join, `Unsupported` at `linking`, the
+  log line names the rule only), then the rules run in this order: relink (the core's expected own ID), taken (an own ID
+  of another account), allow-list. THE END ORDER (nothing is told to the phone before it is durable, nothing before the
+  core owns the account): zone 1 (`store::import_join`: the identity with device slot state `new`, profile, settings,
+  contacts, groups, lists, held blobs and both nonce stores; NO `core_outbox` row, so the core hears nothing) → the
+  mediator connection with the join hook, whose first `ServerInfo` must say the slot is NEW (a 4115 or any other 41xx
+  on this first socket fails the link, with no retry) → zone 2 (`ready_join`: the `core_outbox` rows, `AccountReady`
+  first, then contacts and groups in rows of at most 500 events, and the `join_ready` marker in the SAME commit) → the
+  actor waits until the core has APPLIED row 1 (acked and not refused) → `Registered` to the phone → `Done` once every
+  zone-2 row is acked. Any failure before zone 2 is `Failed` at `linking` and the core deletes the `Linking` account
+  with its directory; a refused row 1 sends no `Registered` and no `Done`. THE MARKER: a file with an identity and no
+  `join_ready` row is a join that stopped between its zones, and a `Resume` or a `Rebuild` start of it ends the actor
+  `LoggedOut` ("the link was never finished") before anything is stated or connected. A `Rebuild` of a joined file
+  states the same rows again from the file. [U: real phone] the window "zone 2 written, `Registered` not sent" (a kill
+  there), and how long the phone's transaction waits while `Registered` waits for the core. §4.3 STEP 2 (RP-b, M3
+  closed): a `CancelLogin` after the join's `ClientHello` reached the mediator, and a join that fails after it (the
+  mediator registered the device, the core never acked), leave the new device's slot there and zone 1's identity row in
+  the file until the core's `Logout` that follows (the core sends one after a failed login step and after `CancelLogin`,
+  before the `Linking` directory is deleted): it drops the device. NOT COVERED: a kill, a panic of the connection task or
+  an actor exit between the join's `ClientHello` and the core's commit of `AccountReady` sends no `Logout`: the core
+  discards a `Linking` account at its next start with no actor and no `Logout` (and `after_exit` of an actor that ended
+  while linking goes to `login_failed` without one), so that orphan slot stays until the phone's linked-devices list (or
+  the device list, TH10) removes it. A follow-up of the core, not built: its reconciliation of a discarded `Linking` row
+  of a backend that registers a device should send it a `Logout`, which the actor then serves from zone 1's identity.
+  THE OWN DEVICE'S DROP at every `Logout` with a stored identity (`src/conn/drop_own.rs`; Desktop's unlink): `DropDevice`
+  of the own D2M id on the running connection's socket past `ServerInfo`, else on a D2M-only socket of its own whose
+  `ClientHello` expects the slot EXISTING and that proxies no CSP login, so a slot that is gone is never made again (4115);
+  within 8 s of the actor's clock taken at the start of the logout, every wait ending one second earlier (inside the core's
+  10 s). The ack of the own id, the server's 4113 / 4114, or a 4115 is `Removed`; while the file's slot state is still
+  `new` (a join's `ClientHello` may be in flight at the mediator) a first 4115 is final only after ONE more EXISTING socket
+  about 1 s later (a second 4115 or the ack is `Removed`: a late slot is dropped by that socket). No answer in time, a
+  refused connect or another close is `NotReached`; no identity is `NoDevice`. The drop of OTHER devices (the device list)
+  stays TH10's. [U: real server] the 4113 after the ack, a device dropping itself, a D2M connection without a CSP leg, how
+  late a `ClientHello` abandoned in flight can still register, whether 4114 frees the slot, an ack that queues behind a long
+  reflection backlog, reflection acks and Proxy frames after `DropDevice` on the live socket, and a 4111 before the 4115 when
+  the slots are full. THE LOG RULE: libthreema's
+  records (and those of the transport crates of `src/dial/`) are written from WARN up only, as time, level, target and
+  message (§9.1).
+- Threema's follower receive (TH5a, as built; decisions `target/threema/th5-decisions.md`, his answers QA-QD). Kourier is a
+  FOLLOWER: the phone takes each message from the chat server and reflects it, Kourier gets it as a D2M `Reflected`
+  envelope (the leader's own receive is TH6). THE LOOP (`reflect/`, `conn/`): a pass drains up to 30 datagrams; an
+  envelope with the EPHEMERAL flag has no zone, no nonce and no ack (the spec forbids that ack; TH5b opens it only to state an incoming typing); the others are
+  opened with DGRK (patch P5; one that is too short, does not open, is no `d2d.Envelope` or is outside 1..=65,536 bytes
+  is acked and dropped with a counted WARN by rule name), replay-checked by the hashed D2D nonce (a redelivery after a
+  kill is acked, writes nothing), classified, mapped, and the batch is ONE `backend.db` zone (nonces, one `core_outbox`
+  row of events per envelope, the BLOB of a sync, the `deferred` rows with their bounds); then one `reflected-ack` per
+  envelope in order, only after the commit. STEP 0: until the file is join-ready (a join, between its first `ServerInfo`
+  and zone 2) nothing is applied; envelopes wait in memory (30 or 2 MiB, over it the socket closes 1000 and the mediator
+  sends them again; the next socket waits for zone 2 or one backoff step, never a tight loop). A zone that fails is run
+  again one envelope per zone; the failure's SQLite code decides (`StoreError::Sql { code }`, `is_content()`): a content
+  failure of an envelope (CONSTRAINT, MISMATCH, TOOBIG, a decode) is acked and dropped (WARN `zone-failed`), the store's
+  (FULL, IOERR, NOMEM, BUSY, LOCKED, READONLY, CORRUPT, an unknown code) ends the connection, un-acked, and the redelivery
+  is applied once. A server close found in the same drain: the batch is applied, nothing acked after the close. THE TABLE (`classify.rs`; tests
+  parse the pinned protos: every CSP type and every `Envelope` content has exactly one row): MAPPED text and group text and
+  the contact and group syncs (TH5b: also the location and the file, the delivery receipt, the reaction, the edit and the
+  delete, each with its group form, and the sent and read updates and the settings, profile and list syncs); UNSUPPORTED (an
+  unsupported line, the raw body kept) polls, the old picture, voice and video kinds and a file or a location whose body cannot
+  be read; DEFERRED (kept whole in `deferred`, acked, mapped by a later build under a higher `MAP_VERSION`) a poll vote, a
+  call's offer, answer and hangup and a group call, anything addressed to a distribution list, an envelope with no content and
+  a CSP type this build does not know; EPHEMERAL typing; DROPPED the control messages the group sync replaces (with the desync WARN from a phone below D2D V0.2),
+  a call's ICE candidates and ringing (quiet: signalling no later build can use), the invalid type, a message of an
+  unknown sender or group or of a stored group that is not visible (Desktop does the same), a text aimed at the wrong kind of conversation, a bad container. TEXT:
+  quotes (`> quote #<16 hex>`, a blank line, the comment) and mentions (`@[ID]`, `@[@@@@@@@@]`) in Desktop's forms
+  (marked `[I]`); a message from the phone's own account is `Sending` until the phone's `sent` update (TH5b) moves it. THE SYNCS change the
+  schema-2 BLOBs field by field (a present field replaces the stored one whole, absent is unchanged, `member_identities`
+  is replaced, never appended) and restate the whole new state: a delta's public key for a stored contact is ignored
+  (counted WARN `contact-key-change`), an empty name clears, a `Create` of a stored contact is an update, an `Update` of an
+  unknown one with a key a create (Desktop discards both), a removal (acquaintance `GROUP_OR_DELETED`) hides the contact. The
+  GROUP NOTICES follow the group's `ConversationUpsert` in the envelope's row: members added, removed, left (sorted by ID),
+  title and picture changed; a `Create` shows none; a `Delete` removes the chat and its history here; a group that becomes
+  not visible (KICKED or LEFT with no members) states nothing (its history stays). THE CHATS (his QA,
+  QB, QC): zone 2, a Rebuild and a contact sync state a 1:1 `ConversationUpsert` for EVERY direct contact, an empty chat
+  at once (E1); every Threema chat carries the same features (§7.2), the protected flag from `conversation_category` (both
+  ways), archived or pinned (all pinned at order 0) and muted as the phone has it ("only when mentioned" counts as NOT
+  muted; nothing of it changes here until TH9); a message into an ARCHIVED chat brings it back in its own row and sets the
+  stored BLOB to normal in the same zone (H5; at arrival only, never at the re-map: the phone's later archive wins); a message of a contact the phone hides states that chat's patch first (E5),
+  the hidden contact alone states no chat. A known message id with a fresh nonce is shipped again and the core's
+  idempotent ingest drops it (O1). THE RE-MAP: at the start of a linked file, before any connection, rows below
+  `MAP_VERSION` are mapped again, 30 per zone, each deleted or given its new kind and version in the zone of its events,
+  the page's messages as HISTORY rows (one `HistoryBatch` per conversation of the page: the core's cut of a chat cleared
+  here or on the phone refuses them and remembers their keys, a deleted chat drops them; a deferred message NEWER than
+  everything its chat showed at the user's own clear is not refused, the contract's limit); a page fails by the store's
+  code (it stops, the rows stay, and the START FAILS: the actor ends `Failed`, nothing connects and the core restarts it
+  with its back-off, so the re-map runs again before anything is applied live) or by its content (the row is left,
+  `remap-failed`, the next rows go on; the start does not fail); the actor's cancel is checked between pages; a table with
+  no row below the version costs one index search (the start's cheap check) and reads no page. THE BOUNDS: over 20,000 rows or 256 MiB the oldest
+  LOW-VALUE row goes first (receipts, the read and sent updates, calls; index `deferred_by_kind`), then the oldest of the
+  rest; the SYNC kinds (settings, profile, lists: deltas whose loss leaves a BLOB wrong for good) are never evicted and
+  never expire; the 45-day age bound runs on every insert of a socket whose `ServerInfo` proved the clock and once per
+  start at the first such `ServerInfo` (never before the first socket, never under "Connect Anyway"). TH5a is a committable state, not
+  a user state: a Threema chat cannot be sent in, and no real run comes before RT1.
+- Threema's follower receive, the second half (TH5b, as built; decisions `target/threema/th5b-decisions.md` R1-R18, which win over the
+  brief; report `target/threema/th5b-build.md`; every test runs against the offline fake). It maps what TH5a deferred, in the same loop and
+  zone, and raises `MAP_VERSION` to 2: the first start of a TH5b build maps every version-1 row again through the same mapper (a message
+  as a history row, a modifier or a sync as a live event after it, a stranger's row dropped), with a REAL-start actor test and a test of
+  the cancelled start. FILES and LOCATIONS: a file is one attachment (image, gif, video, voice or file by the rendering type and the
+  media type; the animated flag makes a GIF of an image type only, and a sticker is an image type only, otherwise the file is read as media or a file) or a sticker, with a caption read as a text; its blob reference is kept as received (`remote`, state `Remote`) and the
+  download, the blurhash and the thumbnail are TH8's, so a download is answered as a failure meanwhile; the chats state `files` with a
+  caption for every kind and no size limit only so that the core takes a received caption edit. A location is its coordinates in
+  degrees times ten million with a name and an address. A body that cannot be read is an unsupported line with the raw body, never a
+  drop. MARKUP `*bold*` `_italic_` `~strike~` is read in texts, captions and edits (our rule: Desktop's library is not on disk; the
+  markers go, the inner text gets ranges, mention ranges move). EDITS, DELETES and REACTIONS address a message by its id alone (author
+  unknown, resolved by the core within the conversation) and are dated by the envelope's own `created_at`, never by the reflection;
+  the core refuses an edit or a delete by somebody who is not the author. RECEIPTS: the peer's delivered / read, our phone's own read,
+  the deprecated acknowledge and decline as a removal without an emoji one millisecond earlier and then the thumb (in a 1:1 chat the
+  peer's pair is on OUR message and ours on the peer's, as the spec's receipt steps say; in a group the target names no author); a group
+  receipt carries legacy reactions only. The SENT update becomes a per-recipient `Sent` (a group: every stored member but us, the creator
+  included), which moves the phone's own message from `Sending` to `Sent`; a message into a NOTES group (the user's own group with nobody
+  else: its Sent update names no receiver) is `Sent` at its arrival and that update is skipped quietly; a Sent update that names a
+  distribution list is also kept as a deferred `list` row; the READ update becomes one `Receipts` per chat and time.
+  TYPING: an ephemeral typing indicator (one byte 0 or 1) from a contact is stated to the core as `Typing` with a 15 s lifetime on the
+  actor's event channel, lossy, never stored, never acked, only for a chat the core has. THE SYNCS: the settings delta replaces the
+  stored settings field by field (blocked contacts replaced, never appended) and states the account's switches and every stored
+  contact whose blocked state changed; the profile delta states the nickname (a cleared nickname is stored but the core cannot clear
+  its name: a limit); a distribution list delta is stored and states nothing. THE CLEAR: the user's Clear Chat or Delete Chat reaches
+  the backend as a `ClearConversation` command; Threema syncs no clear, so the backend deletes the `deferred` rows of that chat (read
+  in pages, each placed by the map's own placement rules) and writes `CommandPersisted` in the SAME zone; the core's command stays
+  pending, and is sent again at the next start, until both are there. LIMITS: a clear on the phone is not synced; rows of an unknown
+  type are kept by a clear; a clear that waited across an upgrade is handled after the re-map; polls and calls are still deferred;
+  a chat TH5a stated is not restated with the new features until a Rebuild.
 - WhatsApp: the ToS forbid unofficial clients; bans and companion removals are reported in 2025-26
   (R:whatsapp §5.1). If built: opt-in only, `risk_notice` with explicit consent, WA-Web-parity
-  device props, no auto-resend after 463, behind a cargo feature and a runtime "experimental" flag.
+  device props, no auto-resend after 463, behind a cargo feature and a switch of the user's: the
+  descriptor's `experimental` flag, held in `kourier.toml` as `networks-on`, read once at the start,
+  with no runtime lifecycle in the core (§4.3 "Paused accounts"; K-A, 2026-10-16). The cargo feature `whatsapp` of `kourier-app` and `kourier` (in `default`; W2b) compiles the backend into every default build, `cargo xtask dist` included (it builds `signal,whatsapp`), but `kourier-app` REGISTERS it in a DEBUG build only and only while `networks-on` names it (`whatsapp_registration`, lane decision L1): a release build, so every archive, neither registers nor lists it until W3a, W4, W5 and the first real runs have landed and the user says so (`cargo xtask dist` proves it on the packed binary: the hidden flag `--print-networks` prints the kinds a start would register and list as off, and the verify step fails when a profile with `networks-on = ["whatsapp"]` gets WhatsApp in either list). A start builds the lazy `NetParts` only (the real transport and HTTP client are made at an account's first Connect or StartLogin), the descriptor carries a `risk_notice` so that K-A's page asks first, the device label comes from the app's one host name reader, and the core hands a login every own id of the other accounts (`StartLogin.taken`). The release profile optimises the WhatsApp crates for size (root `Cargo.toml`) and the binary budget is 80 MiB (§1.3).
+
+### 7.5 Telegram (TDLib in a helper process; TG-1)
+
+- Process shape. TDLib never runs in Kourier's process. Each Telegram account gets ONE helper process, the binary
+  `kourier-tdlib`, started by `kourier_tdlib::spawn` (environment cleared but `KOURIER_TDLIB_FD=3`, stdin and stdout
+  `/dev/null`, stderr piped, every descriptor above 3 closed at exec). It opens the pinned `libtdjson.so.<version>` at
+  run time (`dlopen`, RTLD_NOW|RTLD_LOCAL) and speaks td_json as tagged lines over one Unix socket on fd 3: app to
+  helper `C` (create a client), `G` (the gate's port and credentials), `S` (send), `E` (execute), `Q` (quit); helper
+  to app `H` (hello: protocol, library version, commit and Kourier's patch tag), `K`, `U` (an update or an answer), `X` (an execute's
+  answer), `F` (a typed failure code, never TDLib's text), `P` (heartbeat), `B` (bye). The helper hardens itself first
+  (TG-2b: the core limit {1, 1} in every build, which also stops a pipe `core_pattern` such as systemd-coredump's,
+  where 0 does not; non-dumpable in release, in debug with `KOURIER_DEV_NO_DUMP=1`, and wherever that limit cannot be
+  set) and leaves with `_exit` on every path; TDLib's own fatal path ends as `F tdlib-fatal` and exit 7.
+- The log rule. Before the hello and before any client, the helper sets TDLib's log stream to empty and its verbosity
+  to 0, and refuses every log request of the app (`F refused-log-request`). TDLib's JSON lines, its error messages and
+  anything typed by the person never reach a log line, a panic text or a test's output: errors keep their numeric code
+  and a fixed class.
+- The proxy rule and the gate (TG-1b). The helper owns the proxy: it refuses every proxy request of the app, writes
+  `addProxy` (127.0.0.1, the gate's port, SOCKS5, enabled) itself right before forwarding `setTdlibParameters`, refuses
+  parameters without a gate, and removes every other proxy once the client is up. Between the two it writes
+  `setOption store_all_files_in_files_directory = true` (TG-2b), so every download lands in the files directory and
+  `tdlib/` holds the binlog and SQLite only; the app's own setting of that option is refused. TDLib parks the network requests
+  that come before the parameters and answers them after (TDLib `Td.cpp:189-247, 350-356, 1043-1069`, BSL-1.0, read
+  for behaviour), so `addProxy` and `setTdlibParameters` are written back to back and both answers awaited. The gate
+  in the app process is the only way out: it dials Telegram's ranges directly (no user proxy; a configured proxy is
+  refused, typed). TDLib's third-party config fallback is kept off by the patch
+  `third_party/tdlib/patches/0001-no-config-fallback.patch`, the gate and the helper's lock-down (Landlock: TCP
+  connect only to the gate's port; seccomp: no UDP), never by one of them alone.
+- The gate and the lock-down (TG-1b). The gate (`kourier-telegram/src/gate/`): SOCKS5 on 127.0.0.1 and an OS-chosen
+  port, fresh credentials per start, CONNECT to a listed range and port 443/80/5222 only, counts-only log; its dialer
+  refuses every dial unless the run tool's one-shot confirmation stands (the next bullet). The lock-down runs in the helper after the `dlopen` and before the first
+  client, with no switch to disable it: seccomp (an allow-list of socket families: inet only as TCP, Unix, netlink;
+  no io_uring, no listen) and Landlock ABI >= 4 (TCP connect only to the gate's port, no bind; scoped from ABI 6); an
+  unavailable Landlock is reported in the hello and logged once. Landlock also handles every filesystem right (TG-2b):
+  TDLib may write only inside the account's `tdlib/` and its files directory (both passed on the helper's command line,
+  named by inode, 0700 and this uid's; REFER only in the files directory), read a few measured system files, and
+  nothing else; seccomp answers EPERM for the path-based metadata calls Landlock cannot restrict (chmod, chown, xattrs,
+  utimes with a path); `setTdlibParameters` naming other directories is refused. The gate's port is 1024 or above and
+  never 443, 80 or 5222 (Landlock names a port, never an address). Protocol 4 came with this step (history; it is 5 since
+  LC-20, below); the app's real parts refuse a helper whose hello does not say the lock-down ran.
+- The dialing mode and the run tool (TR R0a). The gate's dialer is a `DialMode` of the parts (`real.rs`): `Refuse`, the
+  default, or `Telegram`, a TCP dialer that checks the address list and the port list a second time behind the gate and
+  is the crate's only non-test TCP connect. `Telegram` is chosen in one place of the application, `dial_confirmation`
+  (`kourier-app/src/telegram.rs`), and only for a debug build inside a kept run profile that holds the run tool's
+  one-shot confirmation: the file `tg-run/dial-go.json` (a version, the time it was issued, the servers `test` and the
+  SHA-256 of a nonce) and the nonce itself in the process environment (`KOURIER_DEV_TELEGRAM_DIAL`), and a number tail.
+  The app opens the file without following links, unlinks it at once and judges it on the open descriptor; the nonce is
+  never in a file or on a command line, and the app's restart and its probe (`--print-networks`) take no confirmation.
+  The parts that dial are refused typed for the production servers and for the test-only API pair, and need a lock-down
+  word `on`; every test build refuses a dial outside the offline child (the tripwire). `cargo xtask tg-run`
+  (`xtask/src/tg_run/`, the third sibling of `smoke` and `wa-run`, runbook `docs/telegram-run.md`) is the only thing
+  that writes the confirmation: `connect --confirmed-by-user --env test` checks a long list of preconditions (a clean
+  `main`, the verified address list, the user's own API file, the checked TDLib library, the CPU cap, an encrypted
+  disk), stages a stamped copy of the app, its helper and the library into a kept profile (`kourier-tg-run/<name>` below
+  the data home), starts the app offscreen (after a probe that only asks which networks it would register) and asks it
+  for ONE login QR code that nobody scans (the number tail is a sentinel no phone number ends in; the link is never
+  printed), then changes the page, which cancels the login, and has the app quit. The verdict (QR shown, no failed step,
+  no error, exactly one gate session whose lock-down word is `on`, the gate's final counts) is written as counts, words
+  and times in `tg-run/report.md`, never a value. `rehearse` runs the same tool against the fake that plays Telegram
+  inside `unshare -rn`; `wipe` deletes the profile; `ranges` prints the hash that the VERIFIED line of `gate/ranges.rs`
+  must carry.
+- The supervisor (TG-1b, TG-2). The first `StartLogin` (or a linked account's `Connect`) starts the gate, then the helper
+  (`--gate-port`), writes `G` and the parameters back to back, and hands the first authorization state, with the
+  updates seen after the parameters (at most 512), to the session; the stop is `Q`, SIGKILL at 17 s, always reaped;
+  back-off 5 s to 5 min, reset after 120 s of life or a start that reached a first state, one error notice per five
+  aborts in 10 min; TDLib's in-use lock error is transient and a notice, never a login step; a watchdog of two missed
+  heartbeats or an unanswered probe.
+- Login (TG-2). TDLib carries the protocol (SRP, code types, QR token export, DC migration); Kourier maps its
+  `authorizationState*` to login steps in a pure machine: QR first (one `requestQrCodeAuthentication` per login, ended
+  after 10 links or 5 minutes without a scan), phone (the number checked against the profile's other accounts BEFORE the
+  code is sent), code (resent only when TDLib offers it; a refused resend keeps the sent code), the 2FA password with
+  Telegram's hint as foreign text (never a recovery), the e-mail address and code; registration and purchases refused,
+  and the helper refuses the account's other doors, derived by seven classes from the pinned `td_api.tl` (a third party
+  into the account, the 2FA password and its recovery e-mail, the login e-mail, sessions, the phone number, account
+  creation and deletion, money: 116 requests; the getters stay allowed and are listed) and every call request Kourier
+  never makes (165 names in all, protocol 5; the login's own requests are never among them, and a spend carried in a
+  field of a request Kourier makes is the send step's to refuse). A `Failed` step ends the login; a wrong input
+  re-shows its step (`-again` ids); a helper death resumes TDLib's persisted state without a new request. Ready ->
+  `getMe` -> the identity checks on both ids -> `AccountReady` (durable, with the user id in one transaction) -> `done`
+  after the core's ack. Telegram's session list names the device `Kourier (<host name>)`.
+- Connection, holds, logouts (TG-2). `updateConnectionState` -> `ConnState` only after Ready; `AccountHold` stated at
+  every connect before the first Syncing/Online (`Frozen` with no end while TDLib reports a freeze); TDLib's own logout
+  after Ready -> `tdlib/` removed, `LoggedOut{Unknown}` and the actor ends (no `BackendEvent::Logout`); a wrong server
+  environment or another user's TDLib data halts the account (`unsupported`); the core's `Logout` -> `logOut` 4 s,
+  `destroy` 2 s, the report, a kill, `tdlib/` and the files directory removed: under 8 s. Online only for the account
+  whose chat is open while a window has focus (5 s off delay, 2 s gap); network hints only while not Ready, at most one
+  per 10 s.
+- Secrets (TG-2). The login's typed values are zeroized on the backend's side (moved, never copied; JSON written into
+  an exact-size zeroizing buffer; every dropped value wiped); the helper's line buffer and TDLib keep plain copies (TDLib
+  needs the password for SRP), and so do the core, the viewmodel and QML.
+- Offline proof (TG-1b). The real library runs in tests only inside an `unshare -rn` child whose every address routes to
+  `lo`, with trap listeners on 443/80/5222/53; measured 2026-10-25 with a gate that holds the CONNECT for 15 s: patched +
+  lock-down 0 hits; patched without the lock-down 0; unpatched without the lock-down 4 DNS hits (the fallback, seen);
+  unpatched + lock-down 0; TDLib left without its proxy: with the lock-down 0, without it 5 TCP hits. The patch, the gate
+  and the lock-down each close a way the others leave open.
+- The pinned TDLib. `third_party/tdlib/tdlib.pin` names the commit, git's tree id, a sha256 over `git ls-tree -r HEAD`,
+  the licence files' sha256, the exported symbols, the NEEDED list, the SONAME and the size range; `cargo xtask tdlib
+  build` fetches the source by hash, applies the patches, builds, strips and checks it into
+  `~/.cache/kourier/tdlib/<key>/` and copies it to `target/tdlib/`. No archive carries TDLib or Telegram code before
+  T9 (`cargo xtask dist` builds `signal,whatsapp`). Patch 0002 (`0002-no-incoming-calls.patch`): an incoming call gets
+  no call actor, so TDLib never sends `phone.receivedCall` or `phone.discardCall` (an account linked to Kourier never
+  ends a caller's call as missed on its other devices); Kourier shows the call from the chat's `messageCall`. Its second
+  hunk makes TDLib answer the synchronous option `kourier_patch_level` with "0002": the hello carries it and the app
+  refuses any other value or none, so a stock, 0001-only or pre-0002 library is refused before any client exists. The pin also holds the sha256
+  of TDLib's two handshake keys: `check`, `path` and the cache hit require each exactly once and the commit exactly once.
+- The fake DC (TD-4a; a test harness, TEST ONLY). `crates/kourier-telegram/fakedc/` (`tg-fakedc`, a workspace of its own,
+  never in Kourier's workspace or a shipped binary) is an MTProto 2.0 server on 127.0.0.1 with a synthetic world. The
+  tests run it, the real helper and a test-only library (the pinned 0002 library with both handshake keys replaced, one
+  by the fake's own, and the commit zeroed, which `tdlib check`/`path` and every real parts refuse) inside the `unshare -rn`
+  child; the gate's test dialer hands each allowed CONNECT to the fake. It speaks the pin's MTProto layer (232 at TDLib
+  1.8.69): its TL types are grammers' crates.io package vendored under `fakedc/` with the layer's `api.tl`, and the xtask
+  refuses to build or run it when that layer is not the pin's. It takes TG-2's login past the phone step (code,
+  QR, Ready, logout, a kill and a restart) and records what TDLib writes for TG-3's reconcile
+  (`testdata/rec-*.jsonl`, scrubbed; every run compares its stream with them, and a pin bump re-records); a fact that
+  depends on the fake's own choices is never relied on.
+- The database. TDLib's message database is off and its chat-info database on (set by the start sequence, TG-1b); its files are encrypted with
+  `HKDF-SHA256(account's backend.db key, info = "kourier tdlib database v1" ‖ the account's uuid)`, so shredding the
+  account secret makes them unreadable too. The backend's own `backend.db` component is `telegram` (one `account` row; schema 2 since TG-3: chats, cursors, gaps,
+  the run state, see Receive and the reconcile).
+- The registration rule (TG-1 decisions D2, TG-2 critic H3). `kourier-app` `telegram_registration(build, prefs, state)`:
+  a build whose parts cannot log in (no API pair, or no helper files) neither registers nor lists it, switched on or off,
+  release or debug: its accounts are paused and the app keeps why (`TelegramMissing::{ApiKey, Library}`, always compiled,
+  nothing in a build without the `telegram` feature) for Settings ("Not available in this build", no switch) and for the
+  banner of every Telegram account (KT-1b); a build whose parts can log in: a RELEASE build never registers or lists it,
+  a debug build registers it while `networks-on` names it and lists it as off otherwise. No API pair is compiled in; a debug build inside a kept run profile reads the developer's
+  pair from a fixed 0600 file; even then the gate's dialer refuses every dial unless the run tool's one-shot confirmation stands.
+- Receive and the reconcile (TG-3). backend.db schema 2 (`migrations/0002_chats.sql`, frozen) keeps one row per TDLib chat
+  (kind, listed, held, the gate's hash of the last patch stated, THE CURSOR = the newest message id durably handed to the
+  core, `verified_max_id`, read positions parked for KT-2), the hashes of stated contacts, the recent delivered messages
+  (`delivered`: author and direction, swept after 14 days outside a chat's newest 200 unless unread), the gaps (`open`, or
+  `lost` at the cap for KT-3), parked deletes and whether the last run ended cleanly. The cursor, the delivered rows, the
+  gap changes and the `core_outbox` rows that carry the messages move in ONE transaction, so the cursor is never ahead of
+  its rows; a gated event whose hash equals the last stated one is left out. Chats are learnt from TDLib's first update of
+  a helper run and stated only after the link; a chat becomes a conversation when TDLib places it in the main list or the
+  archive or a message of it is delivered; broadcast channels, bot chats, public groups, channels' direct-messages groups
+  and users or groups Telegram marks restricted are held until sponsored messages are shown (T7). A chat's patch is stated
+  once per commit batch, hash-gated, so a helper restart that re-tells every chat states only what changed; Telegram's
+  archive is Kourier's archived chats and the main list's pins are Kourier's pins; the unread hint never counts a message
+  Kourier delivered. One `updateNewMessage` is one row with its author's and its chat's patches before it. Telegram's
+  entities map to Kourier's ranges as Signal's do (a hidden link is a link because the UI shows every link's target before
+  opening it, §8.4). Media arrives as pointers (`tg-file v1`, nothing downloaded until T6); kinds Kourier has no words for
+  are normal rows with Kourier's generic text (`tg:<type>`), restricted content (`restriction_reason`) is never shown, and
+  media marked `has_sensitive_content` is T6's to blur. Calls are shown from the chat's ended-call message (one line per
+  call, never a ringing line: TDLib under patch 0002 reports no live incoming call); group-call messages other than a
+  started video chat read as Kourier's call words. Edits pair TDLib's content update with the edit that follows it, taking
+  the author from the delivered messages (one local `getMessage` otherwise); permanent deletes are parked for KT-2 and
+  never make a row; read positions become a read marker on the newest delivered message at or below them and, in private
+  chats, read receipts for our own messages; typing is ephemeral. The actor commits the receive in groups (64 frames / 50
+  ms / an empty queue) and ships `core_outbox` from a wake arm of its loop (one batch in flight), so inbound frames keep
+  flowing while the core withholds an ack; a failed durable write of received rows ends the helper run (TDLib cannot be
+  asked for the frames again; the next run recovers them through the start decision and the gap rules). All requests of the
+  receive go through ONE sync lane (one in flight; paced at one per second, except `getChat`, `getUser`, `getSupergroup`
+  and `getBasicGroup`, which TDLib answers from memory and which cost no server request; a 429 pauses the lane). Each helper
+  run of a linked account loads the chat lists (`loadChats` main then archive until TDLib's 404, 100 per page) and, for a
+  chat Kourier never delivered from, its last message and up to 20 unread ones as ONE batch of history rows per chat
+  (one transaction: a failure or a kill before it leaves the chat to be loaded again at the next start; a page whose
+  answer is LOST is never taken for the end of the chat's plan, a timeout asks it again and a closed link leaves it to
+  the next start, and a lost `loadChats` answer never ends a list); while that batch is not complete a live row of the
+  chat waits for it, and on a first link a live row of a chat Kourier has no cursor for waits until the lists are loaded
+  (it arrives as a catch-up row); chats Kourier already has are not crawled; `Online` follows once those rows are acked.
+  At each start a chat whose last message (as TDLib tells it) is above Kourier's cursor, and every gap a crash or a jump
+  in a supergroup's ids left, is fetched back in pages of 50, at most three pages per gap (a supergroup's decision waits
+  2 s for its own difference first); a message newer than everything the chat already shows arrives as a catch-up row,
+  an older one (overtaken by a newer row, or streamed after the decision) as a history row sorted by its date. A gap
+  still open after three pages is kept (lost) for the later "history missing" marker (KT-3); nothing is shown for it. A
+  clean stop asks TDLib to close and reads what it still hands out before the last commit; the run counts as cleanly
+  ended only when TDLib said it closed and nothing is left waiting (Q-D3); any other end makes the next start check for
+  a lost tail. The receive asks TDLib for nothing but chat lists, history pages, single messages, chats, users and
+  groups it does not know, and the read act (`viewMessages`), which is also asked again at the next start for a read
+  Telegram did not get (a helper that died between TDLib's answer and its request): once per chat, when Kourier's stored
+  read position is above what TDLib told in the run; it never opens a chat. Known gaps: an edit of a message
+  TDLib no longer holds (made while Kourier was off) is not seen, and a message deleted on Telegram stays visible until
+  KT-2 (deletes are parked); a very long absence of a running helper can leave a hole in private chats and basic groups
+  (TDLib drops the window of a too-long common-box difference and bridges it in its local history; recorded in
+  `rec-difference-too-long`; a restart that comes before the chat's next message is delivered has the start decision
+  fetch it, a later one finds nothing: the hole then lies below the cursor); a read marker targets only a delivered
+  message; a call has no ringing line (the message comes when it ended) and a voice note's waveform is not read yet.
+- Ids (the grammar; users and ids mapped in TG-2, chats from T3). Users `tg:<user id>`; a private chat `Direct(tg:<user id>)`; groups and supergroups `Group("tg:<chat id>")`;
+  channels `Channel("tg:<chat id>")` with TDLib's signed chat id; own message ids `k` + 16 lower-case hex digits,
+  never a TDLib number.
+- Instead of the outbox rule (TD-3, not built yet): TDLib keeps its own send queue; Kourier reconciles its rows with TDLib's answers (TD-3).
 
 ---
 
@@ -2678,22 +4399,31 @@ flavours/OnPrem config in `BackendConfig` (Threema).
 crates/kourier-qt/qml/
   Main.qml                    Kirigami.ApplicationWindow; states: noAccounts | ready; wideScreen ⇒ 2 columns
   AccountsDrawer.qml          Kirigami.GlobalDrawer (collapsible sidebar when wide, modal when narrow):
-                              "All chats", one entry per account (avatar, network icon, state dot),
-                              "Add account", "Settings"
+                              "All Chats", one entry per account (avatar, network icon with its number,
+                              state dot, a check box beside the name), "Add account", "Settings";
+                              the accounts whose chats are shown are tinted, the others faded
   pages/WelcomePage.qml       first run: choose a network → LinkAccountPage
   pages/LinkAccountPage.qml   generic LoginStep renderer: Prison Barcode (QR), code, emoji row,
-                              FormCard inputs, progress, error with retry; risk notice dialog first
+                              FormCard inputs, progress, error with retry; the steps, the explanation
+                              and the flow button come from `App.login` (Rust, §4.4)
+  pages/RiskNoticePage.qml    the warning before a new account of an experimental network (§8.3 below)
   pages/ConversationListPage.qml  Kirigami.ScrollablePage + ListView(App.conversations);
                               RoundedItemDelegate rows: Components.Avatar(image://kourier/avatar/…),
                               title, preview, time, unread pill, muted/pinned icons, network badge
-                              (only when several accounts); SearchField filters in Rust; sync banner;
+                              (only when several accounts; with a number where a network has 2 or
+                              more) and the account's name (several shown); SearchField filters in Rust; sync banner;
                               components/AccountBanner.qml on top (offline, link again, verify, clock,
-                              reconnect); the composer's notice when the composer cannot show it
+                              reconnect); the composer's notice when the composer cannot show it;
+                              "Archived Chats (N)" is the list's FOOTER (archive icon, own tab stop),
+                              and the same page, titled "Archived Chats" with a Back arrow and one
+                              line, is the archive view (§8.4, "Archived chats")
   pages/ChatPage.qml          ONE instance, created when the first conversation opens (a cheap
                               stand-in page holds the chat column of a wide window until then);
                               App.timeline.conversationId switches the model;
                               header: avatar, title, typing subtitle, timer menu (with "Custom
-                              Time…"), "Clear Chat History…" and "Delete Chat…"; footer: Composer
+                              Time…"), "Clear Chat History…" and "Delete Chat…"; the header itself
+                              is a button that opens the details panel; footer: Composer
+  components/DetailsPanel.qml the person's page inside ChatPage (below, "The person's page")
   timeline/TimelineView.qml   ListView BottomToTop (row 0 = newest), DelegateChooser on `kind`
                               (Message, DateHeader, UnreadMarker, System, Loading), paging by distance
                               to the ends, "Jump to Latest" button parented to the ScrollView and shown
@@ -2705,7 +4435,9 @@ crates/kourier-qt/qml/
                               block names an action, else opens its menu; Ctrl+Enter goes to the
                               quoted message; Menu or Shift+F10 always opens the menu)
   timeline/MessageDelegate.qml  bubble; author line (showAuthor from model); Repeater over `blocks`;
-                              toolbar (React, Reply, More); reaction chips below the bubble
+                              toolbar (React, Reply, More); reaction chips below the bubble; ONE
+                              TapHandler: a click on the sender's name or picture opens that person
+                              (`authorId` role, §8.3 P3)
   timeline/SystemRow.qml      notices; context menu with "Delete…" where the row's actions allow
   timeline/{MessageMenu,ReactionPicker,ReactionsPopup}.qml   context menu built from the row's
                               `actions` role (singleton TimelineActions.qml), reaction picker
@@ -2714,15 +4446,19 @@ crates/kourier-qt/qml/
   timeline/blocks/{Text,Image,Album,File,Voice,Quote,Sticker,Placeholder,Unsupported}Block.qml
                               TextBlock = read-only TextEdit (RichText from Rust, selectByMouse,
                               onLinkActivated → confirmation) + spoiler overlay rectangles;
-                              AlbumBlock = grid of the neighbouring pictures and videos of one
-                              message (2 to 5 tiles, "+N" beyond five)
+                              ImageBlock = one picture, video or sticker, shown whole (below);
+                              AlbumBlock = the neighbouring pictures and videos of one message
+                              as justified rows, every picture whole (2 to 5 tiles, "+N"
+                              beyond five)
   composer/Composer.qml       QQC2.TextArea (Sonnet spell check from the style), Enter sends,
                               Shift+Enter newline, attach (a menu "Files…" and "Folder…" over
                               composer/AttachDialog.qml), DropArea, paste (files, folders or an
                               image); a folder is a row of its own in the list while it is
                               counted, asked about (dialogs/FolderQuestionDialog.qml) and then
                               replaced in place by its files or by one .zip, with a progress
-                              bar while it is packed (below); the waiting files are a list
+                              bar while it is packed (below); Send asks before files that
+                              would leave with where they were taken
+                              (dialogs/LocationQuestionDialog.qml, below); the waiting files are a list
                               (App.composer.files: any number, each with size, its message number
                               or the reason it cannot go, a summary line "46 files, 19 messages"),
                               kept per chat for the session; a picture or video row has a "send
@@ -2734,12 +4470,13 @@ crates/kourier-qt/qml/
                               reaction picker uses the same grid
   settings/*.qml              FormCard pages via pageStack.pushDialogLayer: General (tray, autostart,
                               compact layout), Notifications, Privacy (shows synced read-receipt/typing
-                              settings read-only in M1), Accounts (linked device info, unlink), About.
+                              settings read-only in M1; since LOC its first row is the
+                              choice "Files with location data", §8.9), Accounts (linked device info, unlink), About.
                               As built it is one file, settings/SettingsPage.qml, with the groups
                               General, Notifications, Privacy, Disappearing Messages (three radio
                               buttons for the core's expiry option, §8.9) and About
   dialogs/{ImageViewer,DeleteDialog,ChallengeDialog,RevisionsDialog,TimerDialog,ChatDeleteDialog,
-           AttachmentDeleteDialog,FolderQuestionDialog}.qml   created lazily; the viewer steps
+           AttachmentDeleteDialog,FolderQuestionDialog,LocationQuestionDialog}.qml   created lazily; the viewer steps
                               through a whole album and
                               follows its message's row (a picture that arrives or is deleted);
                               RevisionsDialog is the edit history behind the "edited" mark and
@@ -2747,7 +4484,9 @@ crates/kourier-qt/qml/
                               chat's range and, for a time that is off the range's step, names
                               the nearest times that can be set; the two delete dialogs say
                               what happens on the other devices; FolderQuestionDialog asks what
-                              to do with the folders in the composer; SafetyNumberChanged,
+                              to do with the folders in the composer;
+                              LocationQuestionDialog asks before files with location data are
+                              sent (below); SafetyNumberChanged,
                               RiskNotice and Passphrase are not built yet
 ```
 
@@ -2779,8 +4518,258 @@ never with a `..` part, with each file's modification time and permission bits a
 Where it is written and when it is removed is §5.8; what the packing may open is §9.4. The
 question for a chat that is not open waits until that chat is opened.
 
-Unified inbox is the default ("All chats"); selecting an account filters the list. The composer
-always sends through the conversation's own account.
+The location question (LOC, 2026-10-27; his answers 2026-10-26; what the look finds and the core
+refuses is §5.8.1). Every file in the list carries the core's verdict on location for its current
+"send as original file" choice (`StripFile::location`, from `FilesPreview::location`; `None` while
+unknown). A caption or reply change plans again but keeps the verdicts; a new choice of "original
+file", a new file, a folder's archive and a file that comes back from a send start without one, so a
+returned file carries no earlier agreement and the next Send asks again. Send waits for the verdicts
+of the files that go (`FileStrip::can_send`; the summary says "Checking files…",
+`StripSummary::checking`); a plan that cannot be made sets the unknown verdicts to false, because
+the core's own look at the send refuses a located file without the agreement. A file that goes with
+a true verdict shows his words as its note, "Location and device data stay in this file", joined
+with " · " to the network's hard-to-save note. A row whose second line speaks of where the file was
+taken (`FileRow.located`, role `located`: that note, or the held or Never reason ending with the
+setting's name) wraps with no line cap and the row grows by its text; every other row keeps one
+line and `files.rowHeight`, and the list is at most 4.5 rows high (`min(max(contentHeight, count *
+rowHeight), 4.5 rows)`), so lists without such rows did not move (U2, UR1: a cap of three cut the
+setting's name in Ukrainian narrow at 14 pt). What Send does follows the setting "Files with
+location data" (§8.9), read at the press from the desktop handle (no app: Ask); the decision is
+`ComposerRust::files_send`, pure and unit-tested:
+
+- Ask each time: a located file that goes opens `dialogs/LocationQuestionDialog.qml`, created lazily
+  by `Composer.syncLocationDialog()` on `locationAsking` beside the folder question (it waits while
+  the composer is blocked); `send()` returns false. Title "Send It Anyway?" ("Send Them Anyway?" for
+  several files), under it his sentence by kind: "This video contains where it was taken.", "This
+  photo contains where it was taken.", "This recording contains where it was made." (audio and
+  voice), for any other file "This file contains where it was taken.", for a folder's archive "This
+  archive holds files that contain where they were taken.", for several "%1 files contain where they
+  were taken."; up to five names (plain text, middle-elided) and "and %1 more"; one line of what
+  [Don't Send] still sends ("The other files and the text are sent without it/them.", empty when it
+  sends nothing); the tick box "Remember my choice"; "You can change this in Settings.". Buttons in
+  his order: [Send with Location] (`mail-send`), [Don't Send] (`dialog-cancel`). Several recordings
+  are "made", not "taken" ("%1 recordings contain where they were made."); any other mix keeps "%1
+  files contain where they were taken.". The accessible body for screen readers is the kind line,
+  the shown names ("and %1 more" after five) and the line of what still goes (U7). Every text is
+  built by the viewmodel (`LocationQuestion`) and travels as `App.composer.locationQuestion`.
+- Focus (F2): on [Don't Send] only when that answer sends nothing; otherwise on the tick box,
+  because the dialog opens inside the Return press that pressed Send. Return and Enter answer
+  NOTHING in this dialog, whatever has the focus (QQC2 buttons click only with Space and Select);
+  Space answers on a focused button and ticks the focused box (U6). The box has no focus frame of
+  its own: in an active window Breeze draws the focused indicator's frame in the focus colour, as on
+  every check box (UR5, seen in a nested KWin window proven active; offscreen draws none). When the
+  question ends with the composer still shown, by any answer or because it no longer stands, the
+  text area gets the focus back at once (UR7, `Composer.focusAfterQuestion()`). The footer is a
+  `QQC2.Control` of its own (not Kirigami's
+  `customFooterActions`, whose buttons are made in a Repeater where no `Keys` filter can sit): its
+  grid puts the two buttons side by side at the end of the row, or stacks them full width in his
+  order when the row does not fit (English up to 14 pt narrow, Ukrainian at 10 pt; Ukrainian narrow
+  at 11 and 14 pt stacks, U4), with `Kirigami.Units.mediumSpacing` between them, the desktop
+  DialogButtonBox's (UR2; StopLinkingDialog's footer alike); the buttons and the grid take no key before `opened`, no auto-repeat,
+  and no release whose press they did not see (Tab and Backtab pass). A Popup takes no `Accessible`,
+  so the body (`accessible`) is the `Accessible.description` of the content and of each control
+  (F15).
+- The question is a SNAPSHOT: the strip's identity, the conversation, every file that goes with its
+  id, `as_file` and verdict, the reply, and the text of the press (QML passes `area.text` to
+  `send()`, which first stops the 300 ms `captionSettle`). It does not hold the strip's serial: a
+  caption re-told after the press moves the serial and changes nothing that was asked.
+  `answer_location(&snapshot, ..)` compares it with the strip as it stands; any difference (a folder
+  listing added a file, a verdict changed, another chat or reply) is `Stale`: nothing changes,
+  nothing is remembered, and Send asks again about what stands now. [Send with Location] releases
+  the asked-about files and sends with `with_location` true exactly for them and the snapshot's
+  text; [Don't Send] holds them (`StripFile::held`: still in the list, not a refusal, they stay when
+  the rest goes) and sends the other files with the text, and when no file would go NOTHING goes and
+  the text stays in the composer (BQ2: a caption written for that photo must not leave alone). A
+  held file shows "Not sent: it holds where it was taken"; a verdict that turns false or a new
+  `as_file` ends the hold. A held file (the answer, or Never) stays in the list and is not lost:
+  under Ask and Always it still counts for Send (`sendableCount`), so a lone held file with no text
+  can be sent again; the next press asks about it again (Ask) or lets it go, flagged, without a
+  question (Always). Its row says the way back: "Not sent: it holds where it was taken. Send asks
+  again." (Ask) / "... Send now sends it." (Always). Under Never held and unheld located files are
+  out of `sendableCount` (a strip of only such files and no text cannot be sent), and the row names
+  the setting (U3). After a send the notice joins "%1 file with location data stayed in the list.".
+- Remember my choice: ticked, the composer writes `App.settings.locationFiles` (1 Always, 2 Never)
+  only AFTER an answer that applied: `answerLocation` returns whether it did (`false` for a stale
+  answer, a dismissal or no question), and a stale answer (the files changed while the question was
+  open, F3) remembers nothing and opens the question again about what stands now, unticked (U1). The
+  setting has ONE owner, the `SettingsController`, which keeps the only copy and saves it through
+  the desktop handle (F1): the composer never writes the handle, so a later toggle on the Settings
+  page cannot undo it.
+- A close without an answer (Escape, the close button, a click outside) dismisses the question
+  at once (L3): `onClosed` answers `dismiss` while `locationAsking` is still true
+  (FolderQuestionDialog's guard), which drops the question with nothing sent, held or
+  remembered (F23), and the text and the files stay; the next Send asks again with that
+  press's text. A dismissed question never comes back by itself. `send()` while a question
+  stands is a no-op (Return repeats), and a chat switch drops the question and keeps the text
+  as the draft.
+- Always send: held files are let go and every sendable file carries `with_location` whatever its
+  verdict (a verdict that turns true between the plan and the import must not bounce it, F16). Never
+  send: the located files are held and the rest goes with the text; when nothing would go, nothing
+  goes. Under Never the row of a located file says "Will not be sent: it holds where it was taken
+  (Settings: Files with location data)" and, once held, "Not sent: … (Settings: Files with location
+  data)", and `sendableCount` leaves them out, so a list of only such files and no text cannot be
+  sent.
+- A changed setting reaches the waiting list at once: `Composer.qml` follows
+  `App.settings.locationFiles` and calls `App.composer.refreshLocationPref()`, which publishes
+  the strip again (row notes, Never's reason, the counts).
+
+**Blended chats (his request 2026-10-13, refresh 2026-10-27: "user selects on side panel which account's
+chats should be showed at the moment (one or many) and all selected shows in list in chrono order").**
+Unified inbox is the default ("All Chats"). The side panel chooses which accounts' chats the list shows:
+one, several or all, mixed in one list, newest first. The composer always sends through the
+conversation's own account. The choice is the Qt-free `kourier_viewmodel::shown_accounts::ShownAccounts`
+(state: `blend`, the `hidden` uuids). Its operations take the visible accounts' rows in panel order and
+return an `Outcome { changed, save, last_stays }`: `click` (only it), `toggle` (Shift+click, Ctrl+click,
+Ctrl+Space, the check box and the menu; with blending off, or with fewer than two accounts (the blend rules
+start at two, M12), it is a click; the last shown account stays and the outcome says `last_stays`), `show_all`, `set_blend` (turning blending off with several shown shows
+"All Chats", his Q1; the same rule normalises a saved choice at load), `observe(rows, known)` (the rules of
+the accounts coming and going: the first COMPLETE answer is the baseline; a later new account joins with
+blending on and takes the list over with it off; accounts that are gone leave the set; when no account is
+shown any more all are; nothing of this runs before the accounts answered) and the replace carry
+(`replace_begin(rows, old)`, `replace_answered(old, new_id)`, `replace_ended(rows, old)`; news of another
+replace changes nothing). The carry is keyed by the replace's OWN login: `CoreSource` counts the
+`AddAccount`s ahead of the replace's and tells the id its `AccountAdded` carries
+(`UiSource::take_replace_news`: `Answered { old, new }` / `Ended { old }`), so another link of the same
+network never takes the carry; while it waits, the replaced account's place counts as shown (no prune to
+"All Chats"). The source keeps the announced id until that account is visible or gone: a cancel of its
+login, a failed step of it, or an accounts answer that no longer lists it after one did ends the replace
+(`Ended`), and every news comes with `Changes { accounts: true, .. }` so the slot goes at once. Before the
+first complete accounts answer a saved choice that hides accounts is not "All Chats" (`all_shown()` false,
+the title empty). The App keeps ONE copy of the hidden set: every filter it hands the source is built from
+`ShownAccounts::hidden()` at the call (`App::filter`), never a stored copy. With ONE account the panel and the title stay as before blending:
+`current()` is the account only after a click on it, `all_shown()` tints "All Chats" otherwise (M12).
+`fill_rows` fills `AccountRow.shown` and `place` (the place among the visible accounts of its network, 0
+when it is alone); `AccountRow.uuid` is Rust-only.
+
+- *Clicks and keys* (`AccountsDrawer.qml`, Entry). A click, Space or Return shows that account ALONE (the
+  quick switch he had); Shift+click or Ctrl+click adds the account or takes it out; Ctrl+Space does the
+  same from the keyboard; a check box at the end of each entry (where the panel shows names) and the entry's
+  menu ("Show in List", "Show Only This Account") do too. Two `TapHandler`s, one per modifier
+  (`entryShiftTap`, `entryCtrlTap`), because `acceptedModifiers` is an exact match. MEASURED (C5): on a
+  `RoundedItemDelegate` a `ReleaseWithinBounds` handler loses its grab to the delegate's own press, so the
+  handlers stay passive and tap, and the delegate's click that follows a Shift or Ctrl press is dropped
+  (`notePress` sets a flag on the press, `Qt.callLater` clears it after the release; `modifierClick()`).
+  `drawer.toggleEntry` calls `App.toggleAccount(id)`; `false` (the last shown account stays) raises
+  `lastAccountStays` and a passive notification "At least one account stays in the list". The last shown
+  account's check box is greyed out; a `MouseArea` over it (`entryBoxGuard`) takes the click so it neither
+  toggles nor closes a modal drawer (L8), gives the reason on ITS hover (a disabled control gets none) and
+  tells by the same notification on a click or tap (UI-7). The box is built only while it can show (a
+  `Loader`, active for an account entry while `drawer.boxes`: cost M1). The entries filter every auto-repeat
+  but Tab and Backtab (`pressKey`, `releaseKey`), so a held Space or a Ctrl let go while Space is held does
+  not click the entry. With the setting "Show chats of several accounts together" off (§8.9), and whenever
+  the choice is not offered (`drawer.choosing` false: one account, or the 300 ms before a second counts)
+  there are no check boxes, no menu items, no fade, and Shift/Ctrl+click and Ctrl+Space act as a plain click
+  (and close a modal drawer, L9, UI-3). Space, Return and Enter stay the plain click (Return and Enter on
+  every entry, "All Chats" too: `pressKey`, UI-5). THE KEYBOARD (KDE's sidebar pattern, UI-4): the panel is
+  ONE Tab stop, `drawer.tabEntry` (the first tinted entry: "All Chats" while all are shown, else the account
+  the list follows), every other entry `Qt.NoFocus`; Up and Down move between "All Chats", the accounts, "Add
+  Account" and "Settings" (`moveFocus`, with the Tab focus reason so the delegate draws its focus frame); in a
+  wide window Shift+Tab from the search field reaches the stop (`MainWindow.qml`, the search field's
+  `KeyNavigation.backtab`). While the drawer is modal it reaches the toolbar's menu button instead
+  (`MainWindow.menuButton`: Kirigami's private `HandleButton`, found in the list page's `globalToolBarItem` as
+  the item whose `drawer` is ours; fix V5, before it no key opened the narrow panel), Space on it opens the
+  drawer, and the drawer's `opened` puts the keyboard on `tabEntry` when the menu button had it.
+- *The panel's marks.* An account is tinted when it is the one shown alone (`currentAccount`) or one of
+  several shown; "All Chats" is tinted when every account is shown and none is singled out. The pictures of
+  hidden accounts are faded to 40 % (network badge and state dot with them); the unread pill stays at full
+  strength, and a hidden account's unread messages count there (`App.hiddenUnread` = the sum of the hidden
+  accounts' pills; a chat only marked unread adds nothing there while the taskbar total counts it as one,
+  L1). The panel's avatars carry the badge number (`place`). The connection state dot moved from the
+  picture's top end corner, where the unread pill hid it, to the top start corner.
+- *Narrow window.* The drawer is modal; the CLOSED menu button carries a pill with the sum of the hidden
+  accounts' unread (his "Dot with count", UI-1). That button is Kirigami's private `HandleButton` of the list
+  page's `ToolBarPageHeader` (the drawer's own `drawer.handle` takes the toolbar's place and its opacity is
+  `drawer.position`, so it is invisible while closed; a `handleAnchor` of our own would be the same), so the
+  pill is drawn by the list page's title delegate (`chatsHeading`, and the archive view's `archiveTitle`: one
+  inline component `MenuButtonPill` of `ConversationListPage.qml` for both), right after the button: anchored to the
+  title's start (its end edge on the button's end edge plus the layout's spacing, its bottom on the title's
+  vertical centre), so it mirrors in RTL; visible while the drawer is modal, its handle shown and the drawer
+  NOT open; made by `createObject` on the first need (cost L1), never at every start. Its accessible text is
+  the handle's closed tooltip (Kirigami's button has no accessible name). KNOWN LIMIT: in a narrow window with
+  a chat open the chat page's menu button has none. The
+  handle's tooltips are set in Kourier's catalog (Kirigami's are untranslated): "Open the side panel" with
+  the plural "· %1 unread messages in hidden accounts" while any are hidden, "Close the side panel".
+- *The avatar.* The network badge sits on the avatar's bottom END corner. With `badgeNumber > 0` (the
+  account's place among the accounts of its network: the row role `badgeNumber`, the panel's `place`) the
+  disc grows into a pill toward the START side: the network icon at the start end (inset 0.1 of the side),
+  the digit at the end (margin 0.18 of the side), DemiBold, `round(side * 0.62)` px in
+  `Kirigami.Theme.defaultFont.family`, the text colour on the background colour; under `Style.highContrast`
+  the pill (not the plain disc) gets a 1 px ring in the text colour. The whole badge (disc, icon, digit) is
+  ONE `Loader`, active only with a badge, so a one-account row makes no item for it. Both the badge and the
+  dot are placed by anchors and mirror in RTL. The number stays whenever 2 or more accounts of that network
+  are linked, even with one account shown; hiding an account does not renumber, an account that goes closes
+  the numbers up. Two accounts of different networks need no number (each is alone in its network).
+- *Accessibility.* When the row's account name chip shows (several accounts shown, or a hidden account's
+  search match), the row's accessible description starts with "Account <chip>". An account entry's
+  description says "Shown in the list" or "Hidden from the list" and "Ctrl+Space shows or hides it"; the
+  check box's name is "Show <account> in the list" (ACCESSIBILITY.md).
+- *The page's title.* `App::list_title`: "Archived Chats" in the archive view; the one account's name when one
+  is shown (and, with a single account, as before); "All Chats" when all are shown; else the shown accounts'
+  names (a network's name for an account without one) joined by " · " in panel order. When two shown accounts
+  have the same name the names do not tell them apart and the title reads "%1 accounts" (plural,
+  `currentTitleShort`, empty unless several are shown). The page shows the names while they fit and
+  `currentTitleShort` when they do not (`ConversationListPage.qml` `chatsHeading`, a `TextMetrics` of the full
+  title against the item's width, M7, UI-2); `title` stays the full names (window title, accessible name).
+  The page's `titleDelegate` is a binding: Kirigami's OWN delegate while `globalToolBarStyle` is None (the
+  page outside its row), else `archiveTitle` or `chatsHeading`. Kirigami keeps a page's toolbar loaded
+  whenever the delegate is not its own, and when the list leaves the row (`pageStack.clear()`) the row turns
+  null first: a `ToolBarPageHeader` left without its `pageRow` printed "Unable to assign [undefined] to
+  bool" (its line 61, `link_actions_ui drawer`); with Kirigami's delegate back the toolbar unloads with the
+  style, as on every page.
+  The empty list's text reads `bannerShownTransfer`, the transfer of a SHOWN account alone (M2).
+
+**What a chat offers of the settings its network keeps for the account's other devices** ("roaming": archive,
+pin, mute, marked unread) is decided once, by the core, and carried by two rows. `AccountRow.roaming_writes`
+is the account's statement (`AccountCaps::roaming_writes`, stated by the backend alone): `None` = the network
+cannot (nothing is offered), `Some(false)` = it can and this account's switch is off
+(`UiCommand::SetRoamingWrites`), `Some(true)` = on; `AccountRow.pin_limit` is how many chats the account may
+pin (the network's `max_pinned_chats`; `None` = the network states NO limit, or not the flag at all: the core
+refuses no pin for a count and A10d disables Pin only at a stated limit, from the same count of the pinned
+chats the core lists). `ConversationRow.roaming` (`facade::Roaming`) joins that statement of the chat's OWN
+account with the chat's own statement (`ConversationFeatures::roaming_listed`, `Some(false)` = the network
+does not list the chat: a message request, a person known only by a number): `Hidden` (the account's network
+states no such settings: no entry), `NotListed` (the account states them but not this chat: no entry until the
+network lists it, whatever the switch says), `Off` (entries shown disabled, with the reason) and `On`. In a
+list that blends several accounts one row can be `Off` and the next `On`; nobody re-implements the rule above
+the core. The rows are read from the account's stored caps ONCE per query (`roaming::accounts`: one `SELECT
+id, caps FROM accounts`, parsed per account, never per row and never in SQL; an account whose stored caps this
+build cannot read states nothing, so its chats are `Hidden` and the other accounts' chats list as ever, with
+one warn line per query naming the account id only); the chat's statement is `json_extract(features,
+'$.roaming_listed')` in the one list statement (absent and `true` list the chat, only `false` unlists it, as
+`ConversationFeatures::lists_for_roaming`). When an account's statement moves (stated for the first time, the
+switch turned on or off, withdrawn) the ingest names all the account's chats as changed
+(`UiEvent::ConversationsChanged`) so a front-end re-reads rows whose state changed with no event about them.
+
+**Networks in the UI (K-A, 2026-10-16).** The welcome page and Add Account list every network that is
+in the build (`network_choices`, `kourier-viewmodel/src/login.rs`, from the app's registered list
+and its "compiled in but off" list, §4.3): WhatsApp's row says "Off · experimental" while it is off
+and "Experimental" while it is on, and the "Coming later" rows are gone. A row of a network with a
+`risk_notice` opens the warning page `RiskNoticePage.qml` before every NEW account, never for Link
+Again. The words are `NetworkChoice::risk_view`, not the descriptor's strings (R4): for WhatsApp five
+paragraphs (not made or approved by WhatsApp, may restrict or ban, never starts a new chat, a separate
+number if you can, "Your phone lists this computer as a linked device. No usage statistics are sent to
+WhatsApp." with no promise of the label the phone shows) and a tick box "I understand that WhatsApp may
+restrict or ban this account", never ticked beforehand and not remembered; a network the viewmodel has
+no words for shows the descriptor's text and a box "I have read this". The button reads "Continue"
+while the network is on and "Turn On and Restart" while it is off, with a note that Kourier starts
+again and then opens the link page. The link page's words come from Rust (`LoginView`: `steps`,
+`explain`, `icon`, `flow`, `other_flow`, `other_flow_label`, keyed on `step_id`, §4.4; Threema's comparison step also
+`emoji: Vec<EmojiView { glyph, name }>`, each glyph named by `login::emoji_name` (128 short capitalised names for Desktop's
+list, from CLDR's annotations), shown as three large glyphs with their names under them and only Cancel, and `rotates`, false
+for Threema's QR step, whose one code never changes, so the page leaves the "changes every few seconds" line out; the emoji row
+keeps the phone's order in a right-to-left language (the mirror is switched off on the row, as for the safety number's digits);
+a failed step's sentence also keys on the network: Threema's `NotTheExpectedAccount` is "Kourier links Threema only in a prepared
+test profile. No code was shown." at step `qr`, which offers no "Try Again" (the gate would refuse the same until a restart; "OK"
+goes back), and "This Threema ID is not on Kourier's list of test IDs. Kourier did not link it." at `linking`, which keeps it,
+§7.4); the welcome page's footnote ends at "keeps your message history." unless a network the person can choose now can send a copy
+of it (`HistorySource::PushedOnLink`: it then ends "and can send a copy of it."), and is only "Kourier links as an additional
+device." when every choosable row is `OnDemand` (Telegram alone: no phone keeps the history) (`login::welcome_footnote` over the typed `NetworkChoice.history`; `App.networksNote`, which the page only shows); a network this build cannot log in to (`NetworkEntry.missing`) is a Settings row "Not available in this build" without a switch, never an Add Account row, and each of its accounts shows a banner without a button that says what is missing (missing beats "turned off"); Settings adds "Always sent for Telegram." under "Read receipts" and "Typing indicators" for a network that is on and states `receipts_always_sent` (`login::privacy_note`, KT-1b); the QR code has
+Kourier's own icon in its centre and a network's badge is a neutral mark (`icons/whatsapp.svg`: a
+slate circle with two chat bubbles, not the network's logo; the icon key stays `whatsapp`). Banners
+(`BannerKind`): `NetworkOff` (below LoggedOut and Error, above Offline), `Restricted` (a ban or a
+hold), `History` (`TransferStatus.qml` phase `history`: a quiet line, a bar only when a number is
+known, no button) and, for an ended ban, `Error` with "Reconnect" (§4.5). A refusal line under a
+bubble wraps when no timer stands beside it (a reason with a timer still elides).
 
 ### 8.4 Rust models and the viewmodel crate
 
@@ -2789,8 +4778,10 @@ always sends through the conversation's own account.
 | `AccountListModel` | name, network, avatar, conn state, unread | `UiEvent::AccountsChanged` + queries |
 | `ConversationListModel` | title, preview, time, unread, mentions, muted, pinned, avatarUrl, accountBadge | query by filter, read in pages of 500 to the end (no cap on the number of chats; nothing half-read is shown); invalidations patch single rows; sort pinned → last activity in Rust (`beginMoveRows`) |
 | `AttachmentListModel` | fileId, name, kind, icon, preview, size, reason, part, partFirst, partLast, stage, progress | the composer's waiting files and folders (`kourier_viewmodel::FileStrip`); the split and the refusals come from `Query::FilePlan`, which is asked about the entries that are not folders (§8.3); `stage` is a folder row's `counting`, `asking`, `listing` or `packing`, `progress` its packing from 0 to 1 |
-| `TimelineModel` | kind, blocks (QVariantList), author, showAuthor, showDateHeader, time, outState, edited, reactions, replyPreview, actions (what the core allows for the row, §3.8) | windowed (≤ 500 rows), keyset paging, diffs from `kourier-viewmodel` |
-| `MemberListModel`, `EmojiModel` | | |
+| `TimelineModel` | kind, blocks (QVariantList), author, authorId, showAuthor, showDateHeader, time, outState, edited, reactions, replyPreview, actions (what the core allows for the row, §3.8) | windowed (≤ 500 rows), keyset paging, diffs from `kourier-viewmodel` |
+| `MemberListModel` | user, name, avatarUrl, admin, isSelf; key = the member's user id | the group page's member rows (§8.3 P2b): `App.groupMembers` (every listed member, narrowed by its `filter` string through the viewmodel's `member_matches`) and `App.groupPreview` (the first `members_preview` rows), both filled where the group answer arrives and diffed in place |
+| `MediaListModel` | attachment, message, kind, url, fullUrl, placeholderUrl, animated, media, pixelWidth, pixelHeight, mediaState, progress, sizeLabel, fileName, detail, iconName; key = the attachment's id; properties `more`, `other`, `loaded` | the gallery of a chat (§8.3 P4): four instances, `App.groupMedia` and `App.personMedia` (the six squares of a page's section), `App.mediaGrid` and `App.mediaFiles` (the level of all media); each is one `MediaSlot` of the viewmodel and is filled where `Changes.chat_media` arrives, diffed in place (a download is one `dataChanged`, a page an insert at the end, a deletion a remove) |
+| `EmojiModel` | | |
 | `LoginController`, `ComposerController`, `SettingsController` | properties + invokables | commands |
 
 `kourier-viewmodel` (no Qt) does row building, grouping flags (same author within 5 min ⇒ no author
@@ -2798,6 +4789,487 @@ line; date headers), preview text, relative time formatting, `RangeKind` → mes
 conversion for the composer, and the diff engine producing
 `ListOp::{Reset, Insert{at,n}, Remove{at,n}, Move{from,to}, Change{at, roles}}`. It is tested with
 plain `cargo test`.
+
+**What stands for a chat in the list.** A row's preview, time and place are those of the chat's
+newest LISTED message: a quiet notice (a safety number change, a refreshed session, a changed
+number, an accepted request) stands for its chat only when Settings > General says so (§3.4,
+"Quiet notices"; hidden by default). The core decides; the viewmodel and QML hold no rule. The
+fixture (`FixtureSource`, `kourier-fake`) follows the same rule: it takes the newest non-quiet
+message for the preview and the order, and ends two of its chats (the ninth contact's and the
+first group's) in one silent safety-number notice, which no compared picture opens.
+
+**The account filter and the rows' account marks (blended chats).** The conversation list's filter does not
+name accounts by id. `ConversationFilter { hidden: BTreeSet<AccountUuid>, query, archived }` holds the uuids
+of the accounts whose chats the list LEAVES OUT (hidden, not shown: a new account joins the list with no
+rule, a stale uuid harms nothing; its Debug prints a count, L4). A source resolves the set ONCE PER CALL
+into `Hidden::Unknown | Hidden::Ids(..)` (`ConversationFilter::resolve`, with the source's `(id, uuid)`
+pairs and `UiSource::accounts_known()`; `CoreSource`: `accounts_q.applied() > 0`). While the accounts have
+not answered, a non-empty set is `Unknown` and lists NOTHING (no flash of hidden chats); an empty set
+depends on nothing. A filter is applied only through `apply_resolved` / `matches_resolved` with the
+source's `Hidden`; there is no apply without it, on purpose. A query ignores the set: a search looks in
+every account, hidden ones included, and their matches are mixed in with the shown accounts' by time,
+newest first (his Q2), each with its account's name. `unread_total` takes no filter: the taskbar and the
+tray count every account.
+
+Every list call builds ONE `AccountTable` (`conversations.rs`) from the visible accounts in panel order and
+the call's resolved `Hidden` set, then `decorate`s each row: `badge_icon` when 2 or more accounts are
+visible; `badge_number` = the account's place among the visible accounts of its network (`network_places`:
+1, 2, ... where the network has 2 or more, 0 alone; the same function fills `AccountRow.place`);
+`account_badge` (the name chip) when 2 or more accounts are shown, and in a search also on every row of a
+hidden account; the chip text is the profile name, else the network's name, and `Name · place` where
+another visible account of the SAME network has the same name; `account_order` = the account's place in
+the panel. A row builder leaves `account_badge`, `badge_icon` empty and `badge_number`, `account_order` 0:
+the chip, icon, number and place are the account table's. `compare_rows` puts the pinned chats first,
+account by account in panel order, each in its phone's pin order, then everything else newest first
+(`compare_order`, which the share picker uses, is unchanged). The pure fixture uses the same table with its
+own labels ("Work", none for the others) as chip names. In a search with one account shown the shown
+account's rows carry no chip while the hidden matches do.
+
+Banners: `UiSource::banners(&filter) -> Banners { state, transfer, shown_transfer }`. An account whose chats
+are hidden still speaks when it needs the user: its history transfer shows whatever its state is
+(`transfer_of` directly; the phases `History` and `Updating` are transfers too), its state banner only for
+`Error`, `Restricted`, `Clock`, `Challenge` and `LoggedOut`; `NetworkOff`, `Offline`, `Connecting`, `Syncing`
+and `HistoryLost` stay hidden (H6). The "%1: %2" prefix names the account whenever 2 or more accounts are
+visible. `shown_transfer` is the transfer of the SHOWN accounts alone, for the empty-list placeholder.
+`banner()` and `transfer_banner()` stay as the no-hidden wrappers.
+
+The App feeds the accounts to the choice and calls ONE `apply_choice()` after every operation: filter,
+`fill_rows` (roles `shown`, `place` of `App.accounts`), `currentAccount`, `blend`, `shownCount`,
+`hiddenUnread`, `allShown` (last), `accountActions` (each map carries `shown` and `lastShown`), the title and
+`currentTitleShort`, the banners and the list with its archive count; the hidden set is saved when the
+outcome says `save`. `initialize` loads `ShownAccounts::load(blend-accounts, hidden-accounts)` and copies the
+set into the filter BEFORE the first list build; the first complete answer of the accounts normalises it and
+the App reads the list again at that moment. Bridge: `App.toggleAccount(id) -> bool`, `selectAccount(id)` =
+click (`-1` = all), properties `blend`, `allShown`, `shownCount`, `hiddenUnread`, `currentTitleShort`,
+`bannerShownTransfer`; the conversation model's role `badgeNumber`, the account model's `shown` and `place`.
+A message to a hidden account notifies as usual and counts on its entry; a click on its notification opens
+the chat and the list stays as chosen. A newly linked account joins the list at once (with blending off
+the list switches to it); "Transfer History from Phone…" (a new uuid for the same account) keeps the
+choice.
+
+**Archived chats (A1).** A chat the phone archived (Storage Service: `ConversationUpsert { archived }`;
+Kourier writes nothing back before A10) is out of the chat list and in the archive, which opens like a
+chat list page:
+
+- *Data.* The core's one list query reads the inbox, the archive or both (`ConversationListQuery.archived:
+  Option<bool>`, `None` = both; `query.rs` `list_sql()` `(?2 IS NULL OR c.archived = ?2)`), and the
+  viewmodel asks for both, so a chat that moves between them is a row patch, not a second read.
+  `ConversationRow.archived` is `archived && not pinned` (`conversations::shown_archived`: a pinned
+  chat stays in the chats, as in Signal), the ONE rule of both row builders. `ConversationFilter.archived`
+  says which view the list shows (an empty search shows the inbox or the archive; a typed search lists the
+  inbox matches and then the archived ones, `apply` sorts the archived matches last, and picking
+  an archived match opens the chat and switches the list to the archive with that chat the current
+  row, `App.revealChat`; only when the chat's account is SHOWN: a hidden account's archived match
+  picked from a search opens, and the list stays as chosen, H3). `UiSource::archived_count(&ConversationFilter)`
+  counts the archived chats of the SHOWN accounts (`counts_archived`), which is the N of the entry.
+- *Unread counts.* An archived chat counts in no badge and in no account number
+  (`unread_total`, `account_rows` skip `archived_row`); it still notifies by the mute rules, and the
+  entry "Archived Chats (N)" carries no mark for the unread messages inside (the chats in the archive
+  view show their own pills as any row does).
+- *The entry.* "Archived Chats (N)" is the list's footer (`ListView.footer`, a
+  `RoundedItemDelegate` with KDE's `archive-insert` icon), shown only when N > 0 and the search is
+  empty, so a list without archived chats has no extra band. The footer is its own tab stop after
+  the list (Down stops at the last chat); the chats' "No conversations" text does not show while the
+  entry is the only row (every chat archived). Opening it (`App.showArchive(true)`, QML
+  `openArchive()`) swaps the title for a Back arrow and "Archived Chats", hides the search field
+  and shows one line ("These chats are archived. They come back to your chats when a new message
+  arrives.", never closable, only while the archive has chats); an empty archive says "No archived
+  chats" and no more. Opening and leaving the archive leave no row current and no row focused
+  (`openArchive()` / `closeArchive()` clear `currentIndex` BEFORE the model changes; Qt makes row 0
+  current when rows are replaced, gives it the focus, and a later `currentIndex = -1` leaves that
+  focus frame on it, and Space would open it); the list keeps the keyboard. Esc and Alt+Left (the page
+  stack's own Back shortcut needs `Keys.onShortcutOverride`) go back; Ctrl+K leaves the archive
+  and searches in the chats. ONE function names the page (`App::list_title`: archive, else the
+  shown accounts' names, else "All Chats", see "Blended chats" above), used by the account choice, the
+  archive switch and the rename refresh. A start always opens in the chats.
+- *Moves while a chat is open.* The viewmodel reports a chat that moves between the views while it
+  is open (`Changes.archive_move`, `ArchiveMove::{ToInbox, ToArchive}`, only a chat both reads list
+  has a side): a chat that comes back leaves the archive view for the chats (the chat stays
+  open); an open chat the phone archives closes (a narrow window goes back to the list), as
+  Desktop does. A notification's click and the step keys open a chat without switching the view.
+
+**The person's page (people pages P1, 2026-10-20).** A click, Return or Space on a 1:1 chat's header (or
+on Note to Self's, which opens the user's own page) opens the details panel; a group's header opens the group's page
+(P2, below); a channel's or broadcast's header is a plain title (`ChatHeader.has_details`). His words: a side panel by the chat, Signal Desktop's order.
+
+- *Data.* `App.showPersonOfChat()` asks the viewmodel for the open chat's person
+  (`ChatHeader.peer`, the other person; the user's own id in Note to Self): `UiSource::request_person`
+  sends `UiCommand::RefreshContact` once and `Query::Person`; the answer comes back as `Changes.person`
+  and `UiSource::take_person` -> `PersonUpdate::{Show(PersonView), Ended}`, set as the map `App.person`
+  with `personLoaded()` / `personEnded()`. The page is asked again whenever the contact (`ContactsChanged`),
+  its chat (`ConversationsChanged`, `ConversationMerged`) or a group changes while it is shown, and it ENDS
+  when the chat is removed, the account is removed or cannot be used, or the core answers `None`;
+  `App.closePerson()` stops the updates. The queries are coalesced by the tracker (one in flight, one
+  follow-up). `kourier-viewmodel/src/person.rs` builds the `PersonView`: name (nickname, address book,
+  profile name, else a label made from the id; the user's own page takes the account's name), the profile name
+  when it differs, the about text with its emoji (links in it only when her 1:1 chat exists and is accepted),
+  the number ONLY when the contact's `number_shown` is
+  `Some(true)` (a person known by their number alone shows it from the id, the own page shows the account's),
+  the notes "Blocked" and "Not on Signal any more", the chat's timer and its offered times, and the groups in
+  common BY NAME (alphabetical; at most 5, then "Show All (N)"), each group of which both are full members
+  (never a group left or only invited to; archived ones count; `GROUPS_IN_COMMON` starts at the members
+  index). The own page has NO groups in common (the account is in all of its own groups; the core returns none
+  for `is_self`), and a person known only by their number shows it as the name, not a second time as a line.
+- *Place.* The panel lives INSIDE `ChatPage` (one rule, no change of the page row, no drawer `modal` flip,
+  `wideScreen` untouched): a `Loader` made on the first open, parented to the page, as tall as the page, on its
+  trailing edge (the left one in a right-to-left layout: the Loader's `x` and the composer's padding do not mirror
+  by themselves, so both follow `LayoutMirroring`; the timeline's and the drop area's margin mirror as anchors).
+  BESIDE the timeline when the page is at least 36 grid units wide (the timeline keeps 20; the panel
+  is `min(22, width - 20)` gu wide; the timeline and the composer get a right inset), else it COVERS the chat page
+  (in a narrow window the chat page is the window, so "over" is "alone"; in a mid window the list stays).
+  The numbers at the default window (64 x 42 gu, rail collapsed): chat column 39.5 gu, panel 19.5 gu beside;
+  with the rail open (17 gu) the column is 26 gu and the panel covers. `chatShown` is false while it covers the chat.
+- *Back and closing.* The toolbar's arrow and Alt+Left are the page stack's Back: the chat page accepts
+  `backRequested` while the panel is open (the page of all groups first goes back to the person's), so Back
+  closes the panel and does not leave the chat; Escape does the same while the keyboard is in the panel; the
+  keyboard returns to the header. One hook closes it when the chat page's conversation id changes (the list, the
+  step keys, the quick switch, a notification, a group in common, "Message") and when the chat is deleted
+  (id 0). The panel's plate takes every pointer press and wheel event, so nothing under a covering panel
+  sees a click, and a covering panel also takes the timeline, the composer and the drop area out of the
+  keyboard's and the drop's reach (`enabled: !panelCovers`: Tab and Shift+Tab never enter the hidden chat,
+  typed text and dropped files never land in its composer). Everything that belongs to one person alone ("Show
+  All", the opened about text) is forgotten at every open and close. The panel is a named pane for a screen
+  reader (the person's name); the group rows take the keyboard (Tab, Return, Enter and Space open a group).
+- *Parts* (a part with nothing in it is left out; a number not shared has no line): picture, name, profile name,
+  about (3 lines, "More"), number, notes; "Message" (only when the person has a 1:1 chat that is not the open
+  one); "Disappearing Messages" (a combo of the chat's offered times plus "Custom Time…", HER chat's, not the
+  open chat's; a choice changes only what the combo shows and "Apply" / "Cancel" stand under it while it differs
+  from the chat's time, Escape takes it back; after Apply the applied time stays shown, the combo is grey and
+  "Applying…" says so until the chat has the time or the change failed, and a failure is a line under the combo;
+  a time chosen from the popup wakes Apply and Cancel after a double click interval; a blocked chat shows its
+  time only; disabled with the account's hold, which a line under it says); "Groups in Common" (a click opens
+  that group). Every text is plain text.
+  Test: `chat_ui.rs` steps `person…` to `deletedPerson` (real clicks and keys; geometry at 1200 x 800 with the
+  rail collapsed and open, at the default size and at 600 x 800, and again under mirroring; the pointer probe
+  under the panel; the focus chain of a covering panel; Show All, Back, Escape, the X and a reopen with seven
+  groups in common, `FixtureOptions::person_groups`).
+  Fixture page `person` (the generated contact in the most groups, with an about text, an emoji and a
+  number she shares).
+
+**The group's page and its member list (people pages P2, 2026-10-22).** The same panel, now a STACK of levels
+(`DetailsPanel.levels`: "group", "members", "person"; `level` is the one on top, `loaded` is the top level's own flag).
+His answers (taste, all the recommended ones): five member rows and "Show All (N)" only when two or more would be
+hidden (the same rule cuts P1's groups in common), a description of three lines with "More" / "Less" in place
+(selectable, with a menu and, in an accepted chat, with links: F1), one short
+line per group rule that is on (under the members, nothing when none is), the quiet word "Admin" at the row's end.
+
+- *Data.* A SECOND trio beside the person's: `UiSource::request_group(account, conversation)` / `take_group` /
+  `close_group`, `Query::Group` (§4.2), `Changes.group`, `GroupUpdate::{Show(GroupView), Ended}`, the map `App.group` (the page WITHOUT its member rows, plus `memberCount`) and the two member list models, with
+  `groupLoaded()` / `groupEnded()`. Each trio clears its own map when a new page is asked for. Both follow ONE origin
+  rule (`end_pages_of`): a page ends when the chat it was opened from is removed (a person's page opened from a group
+  is the group's page's; the group is its own origin), the account is removed or cannot be used, or the core
+  answers `None`. The group page is asked again only for `ConversationsChanged` naming ITS id and `ContactsChanged`;
+  an answer EQUAL to the page on screen changes nothing (no flag, nothing reaches Qt; the person trio too), which is
+  what keeps a busy 1,000-member group cheap (below). `kourier-viewmodel/src/group.rs` builds `GroupView`: the rows
+  (you first when you are a full member, then the administrators, then the others, each by name; our own invitation or
+  request and every Pending or Requesting row counts in the "%1 invited" / "%1 requests to join" lines, to EVERY member,
+  never as rows), the member count through the ONE helper the chat header uses too (full members only), the
+  description (cut at the first of 4,096 graphemes or 16 KiB with "…", never inside an address, the stored text
+  stays whole; its HTML and its links come from `pagetext`, links only where the chat is not a request, an
+  invitation or blocked), the rule lines, `timer_part` (the
+  timer's table: the combo, or a read-only value with a note: "Only admins can change this." / "Change this group's
+  timer on your phone." / none for a group we are not in or that has ended) and `preview_rows` (the cut at 5). A group
+  that has ended keeps its rows with the note "This group has ended." and no rule lines.
+- *Levels.* The pages are made with the panel and kept ALIVE (hidden) while in `levels`, so Back finds the group page
+  at its scroll and the member's row with the keyboard on it. `openMember(user)` pushes the person level
+  (`App.showPerson(account, user)`, origin = the open chat), "Show All" pushes `members`, a group in common or
+  "Message" goes through `openChat`. Back, Alt+Left and Escape go one level back and close at the bottom level;
+  the X closes the whole panel at any level and the next open starts at one level. The members search is the
+  viewmodel's rule (`listed_members` = `member_matches`, run in Rust on the model's `filter`, never a rule in QML); the field's OWN Escape empties a non-empty text
+  and accepts the key, everywhere else Escape is Back. The members list is the Rust list model `App.groupMembers` (P2b), keyed by user
+  id and diffed IN PLACE (`kourier_viewmodel::diff`: a rename is one `dataChanged` of `name`, a join an insert, a
+  leave a remove, a new admin a move; `diff_or_reset` resets the model when a side is empty or a large share of
+  the rows changes, e.g. the first letter typed into a 1,000-member search), so a small change never resets its `contentY`, current index or the
+  keyboard's place; the search field writes the model's `filter` (the rule runs in Rust, `listed_members`); the group
+  level lists `App.groupPreview`. `App.group` is set only when the page without its rows changed (`split_page`, `member_count` is part of what is
+  compared; a refresh that changes one member touches the models alone). The members level binds the model only
+  while it is in the panel's stack, so "Show All" always opens at the top with no current row; `groupLoaded` still fires on every answer. Why: with the rows in the
+  one `QVariantMap` a 1,000-member refresh cost the Qt thread 62 ms (38 ms in `set_group`, 10 ms in a JS `sync()`);
+  with the models 21 ms, of which about 14 ms is the rest of the window's reaction to a timer change and ~6 ms the
+  viewmodel's building of the 1,000 rows in `on_event` (`target/next/p2b-build.md`). A person's page opened from a
+  member's row acts on HER OWN chat: the timer's Apply and "Custom Time…" call `App.setTimerOf(chat, secs)`, never
+  the open chat's `setTimer`. The group's page has the same `TimerPart` and the same Apply rule.
+- *Test and fixture.* `chat_ui.rs` steps `herOpen` to `deletedGroup` (54 steps; P1's steps are unedited and stay the
+  regression gate): real clicks and keys, the pointer probe, Show All, search, Back at the same scroll, the timers of a
+  member's page, Escape, Tab, the X, the deleted group. Fixture page `group` (the not-newest group with the most members:
+  description, Signal's rules with attributes admin-only, one invited member; `FixtureOptions::group_members` grows it
+  for a test, with a markup-named member and one without a contact row).
+
+**Senders and mentions open the person (people pages P3, 2026-10-23).** A group's rows show the sender's name (first
+message of a run) and picture (last); a click on either, and a click on a mention (`@name`) in a message, opens that
+person's page in the details panel. His answers: from "a sender's name or picture beside their messages in a group" and
+"a mention (@name in a message)"; the user's own name or mention opens his own page (read-only); a mention keeps today's
+look, bold, with a pointer cursor on hover.
+
+- *The author role.* `TimelineModel` has the role `authorId` (the sender's user id, `MessageRow.author_id`; "" for a
+  notice and for the user's own messages, which show no name or picture). `MessageDelegate.qml` has ONE `TapHandler`
+  for the whole row (the row is made many times, `.claude/rules/qml.md`): `enabled` only where the row shows an author
+  or a picture and has an id, and its `hitsSender(point)` tests the tapped point against the picture's rectangle and the
+  name's own width (not the whole line), so a click on the rest of the bubble is not a click on the sender. A click
+  goes `TimelineActions.person(user)` -> `TimelineView.personRequested` -> `ChatPage.openSender(user)` ->
+  `App.showPersonInChat(user)` (the account is the open chat's, the open chat is the page's origin, as for a
+  member's row). Popups put over a name or picture (the message menu, the reaction picker, the emoji picker) take the
+  click themselves: `chat_ui` steps `snPopup*` click with real events at the popup's blank corner placed over the
+  name and over the picture and assert no page and no viewer.
+- *The keyboard's and the screen reader's way (the menu's pages; his answer 2026-10-23 "Menu entries").* The message
+  menu (right click, the Menu key on the row with the keyboard, Shift+F10) offers "Show Sender's Page" on another
+  person's message in a group and one "Show <name>'s Page" per person the text mentions ("Show Your Page" for the user
+  himself). The CORE states them (the menu rule, §4.8, CLAUDE.md): `MessageActions.show_sender` (`actions::show_sender`:
+  not own and the chat is a `ConvKey::Group`) and `MessageActions.show_people: Vec<ShownPerson { user, own }>`
+  (`actions::show_people`, from the body's own mention ranges: the distinct people in the order of the first mention,
+  all of the user's own ids as ONE entry flagged `own`; none for a deleted message, a range that is not one placeholder,
+  or a mention under a spoiler: the core cannot know whether the user revealed the spoiler, so it never states one, and a
+  click on the revealed mention still opens it). Our own messages have no sender entry and keep the entries of their
+  mentions; a 1:1 chat has no sender entry. The viewmodel gives them words (`timeline::page_entries`, `MessageRow.pages:
+  [PageEntry { user, label }]`, `RowActions.show_sender` / `show_people`, which also make a row worth a menu): "Show
+  Sender's Page", "Show Your Page", "Show %1's Page" (the name one line of plain text, never cut in Rust). The Qt model
+  has the role `pages` (index 23); `MessageMenu.qml` makes one entry per page with an `Instantiator` after its own
+  separator, `Style.plain` on the text and `TextMetrics` eliding it to 20 grid units (the accessible name is the whole
+  text; an "&" in a name is doubled in the entry's text, a menu reads "&x" as a mnemonic); a choice is `TimelineActions.person(user)`,
+  the click's own path: `ChatPage.openSender`, the stacking rule below, the keyboard on the page. When such a page closes the
+  keyboard goes back to the ROW the menu was opened on (`ChatPage.panelOpener`, `TimelineView.keepCurrent` keeps its current
+  row; a click in the timeline gives it to the composer, the header to the header). The menu's separators follow its groups:
+  one after a group that is not empty when a later one is, so none at an end or doubled. "Who is mentioned" is ONE rule,
+  `Text::shown_mentions` (one mention per placeholder, the last stored range, "everyone" counts as one), asked by the renderer
+  and by `actions::show_people`, so the menu never offers a person the text does not show. `chat_ui` steps `sm*` choose the entries with the Menu key, Down and Return.
+- *The panel's levels (the rule).* A person opened from the timeline STACKS (the lead's call after the review; the first
+  version restarted the panel as that person and lost the members' search and the group page). With the panel closed the
+  person is its only level (Back, Escape and the X close it, and the keyboard goes back to the composer: the header did not
+  open it). With the panel open, `DetailsPanel.pushPerson` replaces a person already on top and pushes the new one without
+  closing the group trio: `levels` is `group,person` or `group,members,person`; Back, Alt+Left and Escape return to the kept
+  level with its search text and place, the X closes all. The timeline is not an opener row: the level below forgets its
+  opener and Back puts the keyboard on its first row; the page takes the keyboard itself (a click in the timeline leaves it
+  in the hidden members' search otherwise, and Escape would only empty that). A group in common that is the OPEN chat closes
+  a one-level panel (the chat asked for is behind it) and goes back to the group page otherwise. The timer combo of
+  that page acts on HER chat (`setTimerOf`), never on the open group.
+- *Mentions.* `richtext::render` makes a mention that stands outside a link an `<a href="kourier:mention/<i>">` around
+  its bold `@Name` (`MENTION_HREF`; `RichText.mentions[i]` is the user, `mention_spoilers[i]` whether a spoiler
+  covers it); a mention inside a link stays that link, "everyone" has no link. The scheme is made ONLY there:
+  `ALLOWED_SCHEMES` is unchanged and `allowed_href` refuses `kourier:`, so a message's own link range or text that
+  says `kourier:mention/0` stays plain text (critic M10; a viewmodel test with a real mention at index 0 beside the
+  forged one). The block variant carries `mentions: [{user, spoiler}]` (user ids only, no names).
+  `TextBlock.qml` handles the scheme BEFORE the link question: it opens the person (`TimelineActions.person`) unless
+  the mention lies under a spoiler that has not been revealed (the spoiler's rectangle takes the click that reveals it,
+  the text never sees it; the rule covers the one pixel above and below the rectangle), the index is no mention, or the
+  text is the list of earlier versions (no `message`: nothing opens and the cursor is the I-beam, not the hand). `colorLinks(doc, linkColor, ink)` gives
+  a mention the text's ink and no underline (Qt would paint an anchor in the link color, underlined), so the look
+  is the one it had as plain bold text (`models` check "a mention keeps the look of the text"); the pointer cursor is the
+  TextEdit's hovered-link cursor.
+- *Test and fixture.* `chat_ui.rs` steps `snOpen` to `snForged` and the fix-round steps `sx*` (after P2's `mlClosed`; they also cover a run of two rows, right to left, the open group's row, the keyboard's way back, the stack over a members search, an index that is no mention and the cursor): name, picture, a second
+  sender (her timer combo changes her chat), the three popups over name and picture, the group page replaced by a
+  sender's page and a member's page replaced likewise, the two mentions of one text (A, you), a mention under a
+  spoiler (hidden: nothing; revealed: opens), a mention inside a link (the question, no page) and the forged text
+  (nothing). `FixtureOptions::group_mentions` adds ten messages to the group of the page (`P3 bare`, `P3
+  turned`, `P3 below` of §8.4's links, `P3 lead`, `P3 run 1`, `P3 run 2`, `P3 welcome`, `P3 forged`, `P3
+  hidden`, `P3 linked`); never set by a fixture page.
+
+**Media and Files of a chat (people pages P4, 2026-10-23).** The LAST part of a person's page and of a group's page
+(Signal Desktop's order; his round-3 answers: "Media and Files LAST", a part with nothing in it is left out): the six
+newest pictures, videos and GIFs of the page's chat as cropped squares (the small previews stay cropped; the timeline shows
+a picture whole) and "Show All", which opens a LEVEL of the panel, "All Media and Files", with a grid ("Media") and a list
+("Files") in two tabs. A chat with neither shows nothing; a chat with files and no picture shows the title and the button; the button
+"All Media and Files" is shown whenever the section is (it is the section's one stop of the keyboard). The person's page shows the gallery of HER 1:1 chat (none: no section), the group's page the
+group's.
+
+- *Data: five slots.* `UiSource::open_chat_media(slot, account, conv)` / `open_media_viewer(from, message)` / `more_chat_media(slot)` / `close_chat_media(slot)` /
+  `take_chat_media()` (`Changes.chat_media`), `kourier-viewmodel/src/chat_media.rs` (`MediaSlot`, `MediaRow`,
+  `MediaUpdate`) and `core_source/media_slots.rs`. A slot is one place the gallery is shown: the section of the group's
+  page, the section of the person's page, the grid and the list of the level, and the picture viewer's own (below); each has its own chat, tracker, rows and
+  follow-ups, so the two pages that stay alive in the stack (hidden, with their place) never share rows and a Back finds
+  a section as it was. A section asks for 7 (one more than its 6 squares: that one says "more"), the level asks for
+  pages of 48 and goes on from the last row's cursor (`more_chat_media`, asked when the view comes within a viewport of
+  its end, once per length); a change of the chat (`MessagesChanged`, `TimelineInvalidated`: a picture came, was deleted,
+  finished downloading) reads the slot again from the newest, as many rows as are loaded (at most `MAX_MEDIA_PAGE`), and
+  the answer REPLACES the loaded rows: past that window the rows go, so a picture deleted there never stays, and "more"
+  loads them again; a "more" asked while such a read is in flight is served after it (the tracker is re-armed); a download's
+  progress (`Progress::Download`) is overlaid on the Downloading rows; a merge moves the slot to the survivor; a removed chat
+  or a removed account closes the slots of its chats (each slot remembers its account) and they are told to show nothing. An answer equal
+  to what the front end has changes nothing. Closing a slot drops the answers still on their way.
+- *Rows.* `MediaRow` is the timeline's own block made flat (`timeline::attachment_block`: the thumbnail's URL, the blurhash,
+  the download state, the size or duration label, the file's name, detail and icon), so a picture here and in the chat are
+  one picture; a clip has no still (its blurhash and a play glyph show), a GIF plays from its copy in the viewer. The Qt
+  side is `MediaListModel` (`models/media.rs`, four instances `App.groupMedia`, `personMedia`, `mediaGrid`, `mediaFiles`,
+  keyed by the attachment, diffed in place; `more`, `other` and `loaded` are properties of the model; role names avoid
+  `width`, `height`, `state` and `icon`, which an `Item` delegate cannot take).
+- *QML.* `MediaSection.qml` (both pages; it owns its slot: `App.showChatMedia(slot, account, conversation)` when the page has a
+  chat, nothing without one; its one stop is the button "All Media and Files"), `MediaTile.qml` (a square, no Tab stop: blurhash, `thumb/<id>` through the provider with `sourceSize` in
+  logical pixels, a glyph to fetch, play or wait, a video's length; one click does what a click on the picture in the
+  chat does: download, `MediaActions.viewGallery(slot, ...)` (the ONE viewer, opened with the slot's own rows, see below), or `MediaActions.open` for a video), `MediaPage.qml` (the
+  level: back arrow, title, two tabs, a `GridView` and a `ListView` bound only while the level is in the stack, a
+  placeholder per empty tab, "Files" rows are the timeline's own `FileBlock` with its round action button). The level is
+  `DetailsPanel.levels` "media" on top of the page it was opened from (`showMedia(account, conversation)`); Back, Alt+Left and
+  Escape go one level back and close its two slots, the X closes everything (`ChatPage.closeDetails` calls
+  `App.closeChatMedia("all")`); the keyboard returns to "All Media and Files" of the page below (`opener = "media"` of the
+  group page and of the person page). A person opened from the timeline (`pushPerson`) keeps only the BASE levels (`group`,
+  `members`) under it and drops every level above them, a media level included (`group,person,media` + a sender -> `group,person`;
+  `group,media` + a sender -> `group,person`), so there is never more than one media level and never one that lost its page. A chat with files and no
+  pictures opens the level on Files until the user chooses a tab.
+- *The viewer of a square.* A square or a cell of a level opens the viewer through `MediaActions.viewGallery(slot,
+  attachment, message)` -> `galleryRequested` -> `MainWindow`, never through the open timeline's rows (a member's page, or a
+  person opened from a sender, shows ANOTHER chat's pictures). The viewer opens AT ONCE with the items `App.galleryViewerItems(slot,
+  message)` builds from the slot's rows (the shape of `viewerItems`), and the window opens the viewer's OWN query for the message
+  (`App.showGalleryViewer(slot, message)` -> `UiSource::open_media_viewer(from, message)`: the fifth slot `viewer`, which finds the
+  message among the rows of `from` for its chat, account and `sort_key`). That query is the gallery statement with a cursor AT the
+  message (`MediaCursor { idx: None }`: its first attachment included), `VIEWER_ASK` (32) rows, and the slot keeps only the
+  message's own: the WHOLE album, which the section's six squares and the level's loaded pages cut or lose (a fresh read of the level
+  keeps at most 1,000 rows). It reads again with every change of the chat like any slot and is told to show nothing only when the
+  message has no picture left. `ImageViewer` replaces its items when the query first answers (`App.galleryLoaded("viewer")`) and
+  follows it at `App.galleryChanged("viewer")` (emitted after the slot's rows were set): it stays open, on the same picture, when a
+  picture arrives in the chat, and closes when the message is deleted, expires or is swept. The slot ends with the viewer
+  (`viewerComponent` closes it unless another viewer took it meanwhile; `closeChatMedia("all")` leaves it alone). `App.viewerItems`
+  never returns `undefined` to QML (an empty list when the message is not among the loaded rows: the old path of a timeline block
+  falls back to the picture alone), and `App.viewerMessageLoaded(message)` keeps the timeline viewer on screen when the window
+  moved on. A gallery call made while the source is borrowed (a binding of a page runs inside `apply_pending`) is repeated from
+  the event loop only if no later call about the same slot was made since (`SlotCalls`: a queued show never undoes a later
+  close, a queued close empties the model).
+- *Test and fixture.* `chat_ui.rs` steps `mdOpen` to `mdDone` (additions; the changed lines of earlier steps: the next-step
+  target of `smOnly...`, `"delOpen"` -> `"mdOpen"`, the `focusCover` count 24 -> 26 with a wait for `mediaAll` and an assertion of the item the
+  count was made for, and `herEsc` / `herField`: a wait for the modal timer dialog's overlay to go and a one-time print of the keyboard's place, no re-click): the albums chat's person page with six squares, three in a row, the part last, a real click opening ONE viewer and a click on the viewer's picture over the square
+  opening no second one, the level (grid starts with the section's first picture, the Files tab says "No files", a cell
+  opens the viewer through the level's rows, Back closes the lists and puts the keyboard on "All Media and Files"), the keyboard
+  (Tab from the close button reaches "All Media and Files", Return opens the level, Tab reaches the grid, Right, Right and Down move
+  the current cell, Return opens ONE viewer, Escape closes the viewer, Escape in the grid goes back, the X closes the panel from the
+  level), the group page with three pictures sent from the composer (the button is there for three pictures too),
+  then a file sent meanwhile (the section changes live), the Files tab, the keyboard back on
+  "All Media and Files", and fifty more pictures (the level's first page of 48, the next page asked for when the grid is scrolled
+  to the end, 53 rows, the view not reset); then a member's page opened from the group page (her square belongs to a chat the open
+  timeline does not hold: ONE viewer, the old path with an unknown message shows the picture and no script error, mirrored the one
+  square stands at the right edge, her level's oldest picture opens the viewer, a deleted picture closes it and empties the grid)
+  and the stacking rule for both sequences; then eight pictures sent into the group make albums (the sixth square is the first picture of an album of three, of which the section shows one) and the viewer of that square has all three, stays open on its picture when one more picture arrives, and closes when its message is deleted. Fixture page `chatmedia`: the media chat's person page at the level of all media (the grid of its
+  pictures).
+
+**The safety number of a person (people pages P5a, 2026-10-25).** His answer "As in Signal Desktop": the row "View
+Safety Number" (with a quiet line "Verified" or "Safety number changed" under it) sits after Disappearing Messages and
+before Groups in Common on another person's page of a network with safety numbers (`PersonView.safety_shown`: never the
+own page, never a person known by their number alone). It opens a LEVEL of the panel, "safety".
+
+- *Data.* The third trio `UiSource::request_safety` / `take_safety` / `close_safety` (`kourier-viewmodel/src/safety.rs`,
+  `core_source.rs` slot `MODEL_SAFETY`): `Query::SafetyNumber` through a tracker (one in flight, one follow-up: 50
+  `ContactsChanged` give at most 2 computations, F16), asked again on `ContactsChanged` of that account, `AccountsChanged`,
+  `SafetyWaitChanged` of the shown person and a refused action; an answer equal to the shown one changes nothing.
+  `SafetyView`: the title, the pane's accessible name "Safety number with %1", the 12 groups of 5 digits and their one
+  accessible text, the scannable BYTES, the key (held in Rust), the state line, the hint and the buttons by state:
+  Default -> Mark; Verified -> Clear; Changed -> Confirm (primary) + Mark; Default with a send waiting on that person
+  (`waits`, F2) -> Confirm + Mark; no number -> the reason only. A refusal of the shown key adds "The safety number
+  changed. Look at the new one before you mark it." and the page asks again.
+- *Bridge.* `App.safety` (a map; the scannable as a `QByteArray`, the key NOT in it), `App.showSafety(account, user)`,
+  `App.closeSafety()`, `App.safetyAction(name)` (`mark`, `clear`, `confirm`) and the signal `safetyLoaded`. The Rust
+  side keeps the `SafetyView` ON SCREEN next to the map (both set together in `apply_pending`), and `safetyAction` acts
+  only with that view's person and KEY and only with a button that view offers: QML passes the action's name alone. So a
+  stale page acts on the key it shows, which the backend refuses after a change (Mark, Clear and the Confirm of a
+  contact in state 2; the Confirm of a never-verified contact is an approval that ignores the key), never on a newer
+  answer QML has not drawn. Mark / Clear -> `UiCommand::SetVerified`, Confirm -> `UiCommand::ConfirmIdentity` (never a SetVerified).
+- *QML.* `SafetyPage.qml`: its back row, the title, the QR card (Prison, its `content` the `QByteArray`), the digits in
+  the fixed-width font, 4 groups per row (2 when narrow) in a `Grid` that never mirrors (F9: the number reads left to right
+  in RTL too), the hint, the state line, the buttons, the notice. `DetailsPanel.levels` "safety" stands only above a person
+  page that offers it, one at most; Back and Escape close it and put the keyboard on "View Safety Number"
+  (`opener = "safety"`); `pushPerson` drops it like a media level; the X closes everything. The message menu of a row of the PAUSED
+  queue (`MessageActions.safety_number`, BQ-3, U4: the head and the rows behind it) offers "Show %1's Safety Number" first: `ChatPage.openSafety` opens the
+  person (the stacking rule of `openSender`) and `DetailsPanel.safetyWanted` opens the level once THAT person's page has
+  loaded (another person's or a stale page never opens one). The line under the waiting messages names the person
+  ("Waiting for you to confirm the new safety number with %1"); the paused head, which shows as failed, says "Not sent: the
+  safety number with %1 changed" (U4).
+- *Keyboard and speech.* The level never lets one more keypress verify a number nobody compared. Opening the level puts the keyboard
+  on the DIGITS (a tab stop whose accessible name is the number as one text; W1), never on a button: a second press right behind
+  the one that opened the level acts on nothing, and Tab reaches the buttons. After an answer that takes the keyboard off its
+  button it goes back to a button only when the last press was Mark or Clear (the button of that action, else the first: U3),
+  else to the back arrow (V2: Confirm is an approval and Mark is then the only button; W2: also after an answer in between
+  that rebuilt nothing, which does not use up the press). When the number on screen turned into ANOTHER key
+  (`App.safety.swapped`: the Qt side compares with the last number it SHOWED, held through answers without one, V3; the
+  viewmodel's notice does the same with its own copy of the key, which a click sets to the key it acted on, W3) the keyboard LEAVES every button of the level for the back
+  arrow, also one that survived because the answer offers the same buttons (V1: a refused click keeps the button's focus).
+  The buttons are dead for one second WHENEVER they appear for a number that was not on screen just before (X1: the first
+  number after the level opened, a number after an answer without one, and a swap; `SafetyPage.arrived`, called in the very
+  turn the answer is here, with a flag `numberShown` that `reset()` and an answer without a number clear), so a double click
+  on the menu's entry or the row, whose second click lands where a button now stands, cannot reach a number nobody has
+  compared; a state that changes for the same number (Mark becomes Clear) wakes nothing and sleeps nothing. The
+  buttons that replace an approval are dead for a second too (Y2): when the last press was Confirm and Confirm is gone, the state line went with it
+  and Mark has moved up under the pointer, where the second click of a double click on Confirm lands. A keyboard user
+  who Tabs within the first second finds no button yet (a disabled button is no tab stop). No held key acts twice: Return
+  and Enter ignore `isAutoRepeat` (`activateKey`), and the repeats of every other key, Space and Select among them (the
+  style clicks with their release and the platform sends a release and a press, both marked as repeats, for every repeat
+  of a held key), are taken before the button sees them (`holdKey`; X2, Y3), except those of Tab and Backtab. The Qt side
+  takes an answer only while a level is open (Y4: an answer taken in the very drain that closed the level is dropped). The notice of a change or a
+  refusal is announced to a screen reader assertively AFTER the keyboard has moved (V4). The primary button carries the
+  `dialog-ok-apply` icon only when it is Confirm or Mark (V6), never Clear Verification.
+- *Test and fixture.* `chat_ui.rs` steps `svOpen` .. `svDone` between `mdDone` and `delOpen` (the row's Tab place, the
+  level, Mark, Clear, Back, the stacking, the X, the QR's bytes and a decode of its grab with the dev-only `quircs` crate
+  compared with the core's scannable (never printed), the mirrored layout, then a key change: the menu entry of the paused
+  head, Confirm + Mark, a Mark refused for the old key with the digits changing to the new number, Confirm of the new one
+  sending the text). P1's `focusCover` counts 28 Tab presses (its Shift+Tab walk 15) and `mdKeys` is counted from the
+  page; `groupTabs` and `keyGroup` reach the groups through "View Safety Number" (BQ-11). Fixture pages `safety` (a
+  Default person) and `safetychanged` (a person whose key changed after it was verified), one synthetic key each. The fixture page `timerpending` shows the person's page with a time chosen and not applied.
+
+**Copy Link (people pages P5b, 2026-10-25).** His answer "Under the safety number": a flat button "Copy Link" (`detailsLink`,
+icon `edit-copy`) right under "View Safety Number" on another person's page of a network with links (`PersonView.link_shown`
+= `LinkState` not `Hidden`; never the own page, BQ-4). Without a link it is disabled with ONE quiet line under it
+(`PersonView.link_note`, also its `Accessible.description`): "%1's phone number is not shown." (`NotShared`; neutral on
+purpose, Z1: Signal states "not shown" also for a profile never fetched) or "Kourier does not know %1's phone number."
+(`NoNumber`); a disabled button is no Tab stop.
+- *Data and bridge.* `PersonView.link: Option<Redacted<String>>` stays in Rust: `App` holds it next to `App.person`
+  (`put_person`, the ONE place both change; `closePerson` drops it), and `App.person` (the map) carries only `linkShown`
+  and `linkNote`, NEVER the URL. `App.copyPersonLink()` copies the held link of the page on screen with
+  `set_clipboard_text` and returns false when there is none; only his click calls it.
+- *QML.* `PersonPage.qml` `detailsLinkPart`: the button and its note; on true the window's passive notification
+  "Link copied" (no number in it, critic L9) and the same words to a screen reader (`announceCopy`:
+  `Accessible.announce(..., Accessible.Polite)` on the button, Z4: Kirigami's toast has no announcement of its own and the
+  focus stays on the button). Return and Enter press it.
+- *Test.* `chat_ui.rs` steps `lkOpen` .. `lkDone` between `svDone` and `delOpen`: the button right under View Safety Number
+  by geometry, no URL in `App.person`, the clipboard read back by a paste equals her link (compared, never printed), the
+  toast and its polite announcement (`PersonPage.linkAnnounced`), and on a person whose number was never said to be shown the disabled button with its note, whose click copies
+  nothing. P1's `focusCover` counts 30 Tab presses (Shift+Tab walk 16); `groupTabs` and `keyGroup` start on "Copy Link"
+  (BQ-11, the Tab paths in `target/next/p5-build.md`); `mdKeys` adds "Copy Link" when it is shown and enabled.
+
+**Share Contact (people pages P5c, 2026-10-26).** His answers "Under the safety number" and "Pick, then Send": a flat
+button "Share Contact…" (`detailsShare`, icon `document-share`) right under "Copy Link", on another person's page of a
+network with `contact_cards` (`PersonView.share_shown`; never the own page, BQ-4). Without a card it is disabled with
+ONE quiet line (`PersonView.share_note`, also its `Accessible.description`): Copy Link's two number sentences, or
+"%1 has no name to share." (no profile name, SC1). When both buttons say the SAME sentence (the number ones) it is said
+once, under the pair (the Share part's line; `PersonPage.oneNote`): Copy Link's line is not shown and its
+`Accessible.description` keeps it (SD11).
+- *Data and bridge.* `App` holds who the card is of (`person_share`, set in `put_person` only when `Ready`, dropped in
+  `closePerson`); QML never names the person to send. `App.prepareShare()` fills `App.shareTargets` (`ShareTargetListModel`,
+  `models/share.rs`: roles conversation, title, avatarUrl, isSelf; a writable `filter`) from the viewmodel's
+  `share::listed_targets`: the chats of the page's account that can take a message (`can_send`), Note to Self
+  included, archived ones after the inbox, hidden ones never (they are not in the list), searched by title in Rust.
+  `App.shareContact(conv)` sends only to a LISTED chat (`UiCommand::SendContact`); a core refusal shows "The contact
+  card could not be sent."
+- *QML.* `dialogs/ShareContactDialog.qml` (one per `DetailsPanel`): title "Send %1's Contact Card" in an own header
+  label that WRAPS (SD9: Kirigami's header is one line that elides, and at a large font or in a narrow window it cut the
+  NAME, which ends the Ukrainian sentence; its close button goes, "Cancel" and Escape close; plain text), a search field
+  ("Search chats…") with the keyboard at open (Down to the list), the list of chats (the chosen row is a selected list
+  item for a screen reader and its name takes `highlightedTextColor`: the desktop style fills the row with the selection
+  colour and leaves a custom label in the normal text colour, white on yellow in the high-contrast dark scheme, SD8; Note
+  to Self's row shows the account's own picture treatment, `selfChat`); a list with no chat says "No chat of this account
+  can take a message." (a search with no match says "No chats match."); Escape closes the picker from EVERY stop (the
+  popup's own `CloseOnEscape`; an outside press does not close it), except that the search field takes the first Escape
+  while it has text and empties it (`Keys.onShortcutOverride`), the second closes (SD7); a
+  click or double click on a row only CHOOSES it (SC2), "Send" (disabled until a row is chosen) or Return on the chosen
+  row sends; typing drops the choice. A HELD Return acts once (SE1): the auto-repeats of Return and Enter are taken, on
+  "Share Contact…" (the keyboard returns to it after a send, and a repeat would open the picker again) and on the
+  picker's list. The picker belongs to the person and the account it opened for (SE2): a page answer for another person
+  or account closes it (a refresh of the same person keeps it), so its title never names one person while "Send" sends
+  another's card. On a queued send the dialog closes, the window's passive notification says
+  "Sending the contact card to %1" (the CHAT's name, never a number; "Sending" because it appears when the command left,
+  before the core's checks, and a refusal still shows its own notice) and a screen reader hears it; the keyboard goes back to
+  the button.
+- *Test.* `chat_ui.rs` steps `shOpen` .. `shDone` between `lkDone` and `delOpen` (the double click that sends nothing,
+  a REAL click on "Send" that sends, the toast and announcement, Escape twice from the search, "Cancel" clicked with a
+  row chosen (closed, nothing sent, the keyboard back on the button), Tab to "Cancel" and Escape there (SD7, SD10),
+  Return on a chosen row that sends a second card, the auto-repeat of Return handed to both handlers as a stand-in
+  event (SE1: `TestEvent` has none), the picker kept by a refresh and closed by another person's or account's page
+  (`shSwap*`, SE2), the disabled button with its one note; the chosen row's role,
+  selection and text colour (SD8); a long name that wraps in the title without eliding (SD9); the empty picker's line
+  (SD11)), then the fake's two own
+  `Body::Contact` checked against her profile name and shown number; `models::share_targets_exclude` (a chat with
+  `cannot_send` and one of another account are not listed). P1's `focusCover` counts 32 Tab presses (Shift+Tab walk
+  17); `groupTabs` and `keyGroup` start on "Share Contact…"; `mdKeys` adds it when shown and enabled. Fixture page
+  `share` (the picker over her page with its third row chosen; also looked at under `shots --matrix --variant
+  hc-dark,hc-light --page share`).
+- *What the card holds* (SD9, his "Yes, show it"). The picker states what it is about to send: a line under its title,
+  "The card holds <profile name> and <phone number>.", worded by the viewmodel from the core's
+  `PersonDetail::contact_card()`, the same function that builds the card on send, so the line and the card cannot
+  disagree; the front end only shows the string (`PersonView::share_card`) and builds nothing.
 
 **The line under a message on its way** (link feedback L6). An own message that has not left
 three seconds after its `sent_at` (`timeline::WAIT_SHOWN_AFTER_MS`; normal sends stay clean) gets
@@ -2826,7 +5298,88 @@ read-only `TextEdit { textFormat: TextEdit.RichText; selectByMouse: true }` fed 
 Rust generates from `Text` ranges using a fixed whitelist: `<b> <i> <s> <code>` and `<a href>`
 with schemes `http`, `https`, `sgnl` only; every text run is HTML-escaped; no `img`, `style`,
 `font` or attributes besides `href`. Network-provided markup never reaches Qt. `onLinkActivated`
-opens a link only after a confirmation. Spoilers: the viewmodel passes their UTF-16 ranges; QML
+opens a link only after a confirmation; the one exception is a mention (`kourier:mention/<i>`, made by
+`richtext::render` for a mention outside a link and never accepted from a message's own text), which opens
+that person's page (§8.3 P3). A link never holds a character of the set below, and holds a zero-width joiner only in context; what stays (a variation
+selector after any character) cannot change the HOST that opens: Qt's QUrl drops a variation selector from a host and
+refuses a joiner outside its IDNA context, so in a path or query it can only change what the same host is asked for.
+`richtext::is_invisible_or_bidi` names 3,915 characters that draw nothing or reorder the text around them, whatever stands
+beside them: U+00AD, U+034F, U+061C, U+115F, U+1160, U+17B4, U+17B5, U+180E, U+200B, U+200E, U+200F, U+202A..U+202E,
+U+2060..U+206F (with the unassigned U+2065), U+3164, U+FEFF, U+FFA0, U+FFF0..U+FFFB (the unassigned U+FFF0..U+FFF8 and the
+interlinear annotation characters), U+1BCA0..U+1BCA3, U+1D173..U+1D17A, the tag characters U+E0000..U+E007F, the unassigned
+U+E0080..U+E00FF and U+E01F0..U+E0FFF (no control character, none is white space). The unassigned ones are
+default-ignorable: the shaper hides them and Qt 6.11.1 draws them as nothing (measured: `a` U+FFF0 `b` is as wide as `ab`,
+while an ordinary unassigned code point draws a box). The zero-width non-joiner U+200C and joiner U+200D are judged by their
+place (`richtext::hides_in_link`): they stay in an address straight after a virama (a code point of Canonical_Combining_Class
+9, 69 of them in `richtext::VIRAMAS`: legacy Malayalam chillu, old Bengali khanda ta; whatever follows, also the end of a
+word, RFC 5892 A.1 and A.2), or between two characters that are not ASCII, white space, control characters, joiners or
+members of the set (a Persian word with its ZWNJ, an emoji ZWJ sequence: they change how the neighbours are drawn), and hide
+anywhere else (at the start or the end of an address, beside an ASCII character as in `exam` U+200D `ple`, beside another
+joiner). The variation selectors U+FE00..U+FE0F and U+E0100..U+E01EF (an emoji domain carries U+FE0F) and the Mongolian free
+variation selectors U+180B..U+180D and U+180F change a visible glyph and are not in the set. Known limits: after an ASCII
+character a variation selector draws nothing and stays in a path or query; the tag characters end a link also inside an
+emoji subdivision flag (England, Scotland, Wales), because letting tags through after U+1F3F4 would let an unsupported tag
+sequence hide letters in a path. A bare URL ends before a hiding character (`find_urls`; the character stays in the text,
+outside the link; a joiner left at the end of a URL by a following character that then ended or was trimmed from it goes
+too, unless it follows a virama), and `allowed_href` refuses an address that holds one, so a link range whose address does
+is plain text. The confirmation is the only guard of a link (the dialog shows the whole address), so it must
+read as the address that opens: `TextBlock.qml` shows it between U+2066 (a left-to-right isolate) and U+2069 (its pop), and
+Qt's bidi algorithm cannot reorder it or let it reorder anything outside it. The label of a link range is the sender's and
+may hold such a character; only the address is judged.
+
+**Which words become links.** A text makes links by itself (`richtext::find_urls`): bare `http://` and `https://`
+URLs, and addresses without a scheme by Signal Desktop's rule (`Linkify.dom.tsx`: linkify-it's fuzzy links with
+`fuzzyIP` off and Desktop's list of the 290 TLDs of 2010, `richtext::TLDS`; his answer "Also bare domains"). Such a
+match is a host of at least two labels of 1 to 63 characters, no hyphen at a label's end, whose last label is on the
+list in any case or `xn--` and 1 to 59 of `a-z0-9-`; an optional port up to 65535; then a path, a query or a fragment
+that end and are trimmed like those of a URL with its scheme. It opens as `https://` and the match (`href_of_match`);
+the shown text stays what was written; the confirmation shows the whole `https://` address, because `TextBlock.qml`
+gives it the `href`, never the shown text. In front of a match stands the start of the text or the end of a word, none
+of `.:/-_@`; behind its host and port the end of a word, not `-`, `_`, `:` and a digit, `.-`, or a dot before another
+word. Both are judged past what a reader does not see (the set above and the joiners), so `exam` U+200B `ple.org` and
+`a@` U+2066 `example.org` make no link, and U+200F `example.org` U+200F does. A variation selector (U+FE00 to U+FE0F)
+draws nothing after a letter, so the text around a match is judged past it like the other unseen characters (`exam`
+U+FE0F `ple.org` is one word and links nothing); after an emoji base it stays with the emoji and the match links. An
+emoji ends a word (Desktop looks for links between emoji). NOT a link: an e-mail address, neither its name
+(`john.de@example.org`) nor its domain; `@name`; an IP address without a scheme; a host of ASCII and other characters
+together (Desktop's `isLinkSneaky`: `münchen.de`, and a word of a language without spaces written against a domain);
+`//example.org`. A word that holds no address stays text whatever the cut of "Read more" leaves of it. False positives
+Desktop has too are accepted: `.rs` and `.md` were ccTLDs in 2010, so `main.rs` and `readme.md` are links, and nothing
+opens before the confirmation. Differences from linkify-it, all on the side of less: `$+=^|~` and the backtick are no
+letters of a host, `[john.de@example.org]` is an e-mail address, and `a.de@1.2.3.4` is the one place where a link is
+more: its `a.de` (no e-mail rule for an IP address).
+
+**What an address may not hold.** `allowed_href`, for a link range too: at most 4,096 UTF-16 units; no white space,
+control or hiding character (the set above); no U+2500..U+25FF (U+2571 reads as a slash); for http(s) no user name or
+password (`https://bank.example@evil.example` opens `evil.example`; a `@` anywhere before the first `/`, `?` or `#`,
+also behind a backslash), and a host that is not empty, holds no `%`, has at most 2,048 units and no empty label.
+These come from Desktop's `isLinkSneaky`. Not from it: two labels at least (`http://localhost:3000` and an intranet's
+name are real addresses; Desktop's own choice); no ASCII beside other characters in a host written with its scheme
+(`https://münchen.de`: real, and the scheme says it is meant; the rule holds only for a match without a scheme); a
+parse by a URL parser (there is none below the toolkit; what `QUrl` refuses does not open); decoding `xn--` for that
+same rule (nothing hides: the host shows as written). A match `allowed_href` refuses stays text, and nothing inside it
+becomes a link. An address written WITH its scheme keeps its link even when its host mixes scripts
+(`https://раypal.com`): `https://münchen.de` is a real address, so only the "Open Link?" dialog guards it, and the
+dialog cannot tell look-alike letters apart; a match WITHOUT a scheme is judged (a mixed host is no link).
+
+**A bidi control left open before a link.** Qt's bidi algorithm runs over the whole text block, and `<br/>` does not
+end it, so an embedding, override or isolate (U+202A, U+202B, U+202D, U+202E, U+2066, U+2067, U+2068) that nothing
+closes before a link would reorder the address in the bubble (an override turns its letters around). `richtext`'s
+`Emitter` keeps what is open by the algorithm's rules (U+202C closes the last embedding or override unless an isolate
+came after it; U+2069 the last isolate and all after it) and, when a link with an address starts, turns each open one
+into U+2060 in the HTML only. U+2060 draws nothing, reorders nothing and has the same length in UTF-8 and UTF-16, so
+`plain`, `whole`, the spoilers and every offset into the document are what they would be without it; only a selection
+dragged over it copies U+2060 instead. A control closed in time, one behind the link, and one in a mention's name
+before only the mention's own link stay as written. (Desktop's `shouldLinkifyMessage` takes every link from a text
+with U+202C, U+202D or U+202E; here the links stay.) Known limit: a link in a right-to-left paragraph with no control
+at all: the bidi algorithm lays the address's words out in the paragraph's direction; the confirmation reads left to
+right.
+
+A group's description and a person's about text are shown through the same detector and the same dialog (`pagetext`,
+`DescriptionText`); `trim_url_end` counts the brackets of an address once (a run of closing brackets after an address
+was quadratic).
+
+Spoilers: the viewmodel passes their UTF-16 ranges; QML
 draws opaque rectangles over them (from `positionToRectangle`) until clicked. S4 measures the
 per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with a per-message
 "select text" mode.
@@ -2859,7 +5412,66 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   and calls the Rust reader (`kourier-qt/src/media.rs`) through a function pointer. Rust decrypts
   the `kourier-blob` file into memory and returns `[format, flags, codec]` + the still encoded file
   (or RGBA pixels for a blurhash or a tile); C++ decodes at `requestedSize` (cover, no upscaling,
-  EXIF orientation), crops avatars to a circle and zeroes the bytes. Nothing plaintext is written.
+  EXIF orientation; a cover within one pixel of the request on both sides, when the item is not
+  cornered, becomes exactly the request, so a picture shown whole is drawn 1:1 and not
+  resampled by a fraction of a pixel), crops avatars to a circle and zeroes the bytes. Nothing plaintext is written.
+- A timeline picture or video is shown WHOLE, never cropped (user decision, 2026-10-14, his
+  words: "do not crop images/video in previews, show full image fit into maximal size for
+  it"; other messengers crop, which confuses him; `ImageBlock.qml`, `Style.qml`). The
+  block's BOX is what the bubble measures; the PICTURE RECT (the `picture` child, `Image` with
+  `PreserveAspectFit`) is the picture's own shape inside it, centred. Single picture: as large
+  as fits `imageMaxWidth` (16 grid units, 288 px) wide and `imageMaxHeight` (24 grid units,
+  1.5 times the width) tall, never above its own size and never narrower than
+  `imageMinWidth` (7 grid units) or lower than `imageMinHeight` (3 grid units) as a box, so a
+  phone screenshot is whole at about 200 px wide and a small icon keeps its size. A very thin
+  picture (a strip narrower than the minimum width, a panorama lower than the minimum height)
+  sits whole in a box of the minimum size on the bubble's own colour: no blurred fill. A
+  picture whose size is not known yet is a 4:3 box until it is. The stand-in (gradient,
+  blurhash, in the picture's own shape) and the Download/ask pills follow the box. Stickers
+  keep their own rule (a height over width ratio clamped to 0.4..1.6, at most `stickerSize`
+  wide). A caption under a picture wraps at the
+  picture's width (with a floor of 11 grid units), so the bubble is as wide as the
+  picture, and the author's name in a group counts only up to that width (it elides).
+  Only the small previews stay cropped squares, as before: the quoted message's thumbnail,
+  the media gallery page and the composer's list (a click shows the whole).
+- The ring and the X of an upload (upload progress, 2026-10-17; his picture: a ring on each file, the
+  X in it, the percentage in the corner, the line "Uploading 45% · 12 of 30 MB" under the message). Every number
+  is the viewmodel's: per file `UploadView { share, label, cancel }` on `ImageBlock`, `FileBlock` and each album
+  item, `AlbumBlock.more` for the "+N" tile (the bytes of the pictures behind it together), and the line is
+  `WaitReason::Uploading { done, total }` ("Preparing files" while the backend says `Preparing`, merged with a
+  report of 0 bytes; the sizes in the total's unit, `time::file_size_pair`: from 10 units up whole numbers, the total
+  rounded half up from the size label's one-decimal figure, so a 31.46 MB file is "31.5 MB" and the line
+  "12 of 32 MB", never "of 31"; below 10 units one decimal for both, "1.2 of 4.2 MB", the total the same text as the
+  label). A report moves ONE row: `Changes.uploads` (per whole percent of a file, of the
+  message for the line) reaches `refresh_uploads`, which patches the row's `blocks` (a model reset never, a
+  timeline rebuild never: 5 µs to handle a report and 56 µs to patch one row among 301 with a 31-picture album,
+  against 2,003 µs for a rebuild). Own files that wait their turn (Queued or Staged, not Failed) show an empty ring,
+  its X following `cancel_sending`; a retry wait shows the ring without an X; a sticker shows none; a file that is up
+  keeps a FULL ring with its X while the message is stoppable and its other files go on (100 % / 45 % / 0 %), and
+  its entry goes when the message's uploads are over (U9). The X is drawn only while the core offers it
+  (`uploadCancel`); once pressed it stays, dimmed, until the core says no (`cancelAsked` resets when `uploadCancel`
+  goes false and true again; U7). A picture's X is the block's EXISTING `TapHandler` by position (inside the badge
+  circle, `overBadge`; no new handler or button per row); a tap on the ring never opens the viewer, a tap beside it
+  does. The "+N" tile draws its own ring and X over the overlay and takes the fifth tile's own ring away
+  (`ringByAlbum`): the ring counts the fifth tile's own picture too (U6, `items.skip(ALBUM_TILES - 1)`), its
+  number is never below the theme's small font and stands BESIDE the ring when the tile is too short. There is
+  ONE `Loader` per album (over its last tile, U4; measured by `files_ui`: an album row at rest holds 132 items,
+  its grid 78 with 6 Loaders, before 136, 82 and 10), and no third handler: the ring is not in the tile's middle when
+  the number stands beside it, so `ImageBlock`'s `TapHandler` returns for `ringByAlbum` and the album overlay's
+  existing `TapHandler` takes the whole "+N" tile by position (`AlbumBlock.overMore(p)` -> `cancelMore()`); the disc of
+  the ring has no handler of its own. A small tile shows no percentage in its pill unless the badge leaves room. A file's X is the disc's existing button (a Tab stop only while the X shows; its accessible name and
+  tooltip are "Cancel Sending"; a disc without an X is a static text named with the state, "Uploading 40%", and so is
+  a badge after the press, disabled until the answer: U8), its detail line adds " · 45%". The rings are `RingDots.qml` (24 dots; the
+  download ring of `ImageBlock` is unchanged). Keyboard: the row's menu has "Cancel Sending" while `cancelSending`.
+  The pages `uploading` (an album of seven pictures held at 100 %, 45 %, three empty rings, the "+2" ring, and a
+  file queued behind it) and `uploadfile` (a 30 MB file at 40 %) show it; `wait_ui` clicks the X of a tile, beside
+  it, the "+N" ring and a file's disc with real mouse events, one process per case, and counts the commands the
+  fake heard. The note "Already sent" (the X came too late; the fake's `UploadScript::TooLate`,
+  `FixtureUpload::Late`) offers "Delete for Everyone" ONLY on its own note (`App::notice_message` compares the
+  source's note with the one the composer SHOWS: a notice the composer sets itself, a dropped link, takes the action
+  away; U1) and the action opens the delete question of the message menu for that row, never a delete at once
+  (`Composer.deleteNoteRequested` -> `ChatPage` -> `TimelineView.deleteFor`; U2); the `late` and `latenote` cases of
+  `wait_ui` show both.
 - Decoder allow-list: Qt never picks an image decoder by content, because the installed image
   plugins include EPS (runs Ghostscript), PDF, SVG, camera raw and PSD. `Codec::sniff` (Rust) tells
   JPEG, PNG, GIF, WebP, BMP, HEIF, AVIF or JXL from the first bytes, never from the sender's MIME
@@ -2877,8 +5489,10 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   logs the requests and compares them with the item). The core's `MediaEntry::timeline_blob(want)` serves the 400 px thumbnail
   (`kourier_media::THUMBNAIL_EDGE`) only when it covers `want` (the picture drawn to cover it,
   as `PreserveAspectCrop` does: `max(want.w / w, want.h / h) <= min(1, 400 / longest edge)`,
-  compared in integers), or while there is no file, or when nothing is known or asked (no
-  dimensions, no size), or when the file is no larger than the thumbnail. Otherwise it serves
+  compared in integers; the picture is shown whole now, so its item has its own shape and
+  fitting it is covering it: the request is the item's size and nothing is cut off), or while
+  there is no file, or when nothing is known or asked (no dimensions, no size), or when the file
+  is no larger than the thumbnail. Otherwise it serves
   the FILE (but the provider, which has the bytes, takes the thumbnail instead when the file
   is not a JPEG BY ITS CONTENT, `Codec::sniff`, never the sender's MIME type, and has more than
   4096 × 4096 pixels, `MediaEntry::exceeds_timeline_pixels`: Qt decodes those whole), which the provider decodes down to the asked size and never up (a JPEG by libjpeg's
@@ -2922,6 +5536,18 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   window is focused on that conversation; never for `catch_up` messages (one summary when `Syncing` ends);
   muted (synced or local) 1:1 never; muted groups only for mentions/replies when allowed; reactions
   to own messages if enabled; content mode NameAndMessage | NameOnly | Hidden.
+- A protected chat (§3.4 "Protected chats") notifies like any other but never with the text: its
+  "name and message" is "name only" (`policy::content_mode`; the line is not even made), the title keeps
+  the chat's name, the inline reply shows no text. A chat that BECOMES protected (the user protects it on the phone)
+  while its notification shows text: the book remembers the mode each notification was shown in, and on
+  `ConversationsChanged` a tracked chat that is protected now is shown again WITHOUT the text under the same
+  `replaces_id` (the server updates the popup and its history entry in place): the chat's name and "New message" or
+  "N new messages". The notifications of THIS RUN that expired while they showed text (Plasma keeps an expired one in
+  its history; one the user dismissed or the client closed it drops) are remembered by chat, at most 64, and revoked
+  with `CloseNotification` at the same moment. LIMIT: what Kourier cannot reach stays as it was: notifications of an
+  earlier run of Kourier (their ids are not kept across restarts; whether Plasma 6 keeps its history across a login is
+  not known), a server that restarted (ids mean nothing to it), and anything a user copied or a screenshot took. A
+  chat that was protected before its first message in this run never shows a text at all.
 - Delivery (`kourier-desktop`): own zbus client for `org.freedesktop.Notifications` with hints
   `desktop-entry=app.kourier.Kourier`, `image-data` (avatar), `category=im.received`,
   `x-kde-origin-name` (account when several), inline reply (`inline-reply` action +
@@ -2932,6 +5558,14 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
 - Click → activation token → `App.activationRequested(token, conv)` → QML
   `KWindowSystem.setCurrentXdgActivationToken(token); KWindowSystem.activateWindow(root)` → open the
   conversation. Inline reply → `UiCommand::SendText{conv}` and mark read.
+  The reply field is offered only where the core takes the message (`policy::can_reply`: the
+  conversation's `can_send`, not blocked, no message request pending): the reply never reads the
+  core's answer, so a reply the core refuses (a chat that states a `cannot_send` reason) would
+  vanish without a trace. The composer's own refusal handling is not shared with it: the viewmodel
+  keeps the composer's last sent text (`LastSent`) and gives it back only to the refusal that names
+  ITS conversation and only until the core has stored that send (a row of this device above the
+  timeline's newest row at the send); the text goes back into the composer AND is stored again as
+  the chat's draft (`SaveDraft`), because the composer clears the stored draft before it sends.
 
 ### 8.8 Tray, single instance, activation, badge, autostart
 
@@ -2951,7 +5585,38 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
 ### 8.9 Settings
 
 - App prefs (`kourier.toml`): tray, autostart, start hidden, compact layout, notification content
-  mode, auto-download policy, log level, proxy (later).
+  mode, files with location data, auto-download policy, log level, proxy (later).
+- Files with location data (LOC; his answers 2026-10-26, "All networks"): `location-files = "ask"
+  | "always" | "never"` in `kourier.toml`, one preference for every network, absent = `ask`;
+  Settings > Privacy, the first row of the card, a combo "Files with location data": "Ask each
+  time" (the default; "When Kourier finds where a photo, video or file was taken, it asks before
+  sending it unchanged."), "Always send" ("Such files are sent with their location, without a
+  question."), "Never send" ("Such files stay in the list; everything else is sent."). What each
+  does at Send is §8.3. A value this version does not know (a typo by hand, a newer version's
+  choice, a number or a boolean) reads as `ask`: `LocationFiles` has a hand-written
+  `Deserialize`, because the derived one would fail the whole file and `load_or_default` would
+  then reset every other pref and the next save would write those defaults. The combo index is
+  `LocationFiles::index` / `from_index` (0 ask, 1 always, 2 never; out of range = ask), carried
+  like `notification-content` by `SettingsController.locationFiles` and applied at once. The
+  pref has one owner, the `SettingsController`; the composer reads it from the desktop handle at
+  each press and changes it only through the controller's setter. The core's backstop refuses a
+  located file that was not agreed to whatever the pref says (§5.8.1).
+- Blended chats (his answers 2026-10-13 to 2026-10-27; §8.3): two keys of `kourier.toml`, both shared
+  preferences like `round-avatars` (§8.10 R7). `blend-accounts` (bool, default `true`, a file from before it
+  blends too): Settings > General, "Show chats of several accounts together" (uk «Показувати чати кількох
+  акаунтів разом») after "Compact conversation list", with a small text that says Shift+click or Ctrl+click
+  an account in the side panel adds it to the list (`SettingsController.blendAccounts`, LISTED in
+  `SettingsRust::prefs()`). A change is saved by the controller and then QUEUED to the App
+  (`App::blend_setting_changed`, after the current call: the re-entrancy rule), which runs
+  `ShownAccounts::set_blend`; turned off with several shown, the list shows "All Chats" (his Q1). Off, a
+  click on an account simply switches to it and the panel has no check boxes. `hidden-accounts` (a list of
+  account uuid strings, absent while none is hidden): the accounts whose chats the list leaves out, "remember
+  the last choice" (his answer). The App is its ONE writer, through `DesktopHandle::update_prefs` (the
+  `networks-on` pattern); `SettingsRust::prefs()` does NOT list it, so the page's toggles (`set_prefs` of a
+  merged copy) keep what is stored (F1; `settings_ui`: the hidden second account outlives four "Round
+  avatars" flips). It is read LENIENTLY (`prefs.rs` `lenient_uuids`): an entry that is not a string or not a
+  uuid is skipped (uuids are normalised to the lower-case hyphenated form, duplicates dropped), and a value
+  that is not a list reads as none hidden; neither is ever a parse error of `kourier.toml`.
 - One setting is the core's and lives in `core.db`, not in `kourier.toml`, because it must
   hold with no UI and before any window exists: what happens to disappearing messages whose
   time is up while the clock is unconfirmed (§9.6; user decision, 2026-10-07). The settings
@@ -2964,6 +5629,28 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   store the new one. A command that could not be sent changes nothing on the page. The page
   asks for the option when it is first created (`App.settings.load()`), not at start, and
   the buttons are disabled until the core has answered.
+- The second setting of the core's (§3.4, "Quiet notices"; user, 2026-10-15): Settings > General,
+  under "Compact conversation list", a switch "Show minor notices in the conversation list"
+  (uk «Показувати другорядні сповіщення у списку чатів») with a small text that names the four
+  kinds, off by default. It is applied at once (`UiCommand::SetQuietNotices`); the page asks for
+  it with the expiry choice (`Query::QuietNotices`), the switch is disabled until the core has
+  answered, and a choice the core could not store comes back as it was with "The setting could
+  not be saved.". After the command the viewmodel reads the list again.
+- Networks (K-A, 2026-10-16; his answers "Always listed in Add Account", "At next start + Restart
+  Now", "Pause the account"): Settings > "Networks" has a switch for every experimental network that
+  is in the build (WhatsApp). It is a preference of the app (`networks-on` in `kourier.toml`), not of
+  the core; a change shows "Takes effect when Kourier starts again." and a "Restart Now" button
+  (`App.restartNow`, §4.3; it asks "Restart Kourier?" first while a history transfer or the update
+  after a link runs). Turning a network OFF while an account of it exists first asks "Turn Off
+  WhatsApp?" (the account stays linked and readable, nothing is sent or received until it is turned
+  on again, and the network logs out a device that stays unused for about 30 days: the question's
+  text is the viewmodel's, `NetworkChoice.turn_off_text`, keyed on the network). A network switched
+  off in Settings stays registered until the restart, so Add Account and the warning follow the
+  PREFERENCE, not this start's registry: the row says "Off · experimental"
+  (`NetworkChoice.off_description`) and the warning offers "Turn On and Restart" (`Style.networkWanted`,
+  `App.networkRisk`), or an account linked now would be paused at the next start (K-A fix U7). The page writes
+  its preferences on top of the stored ones (`SettingsRust::prefs()`), so a page preference changed
+  elsewhere does not lose the list.
 - Account settings that the network syncs (read receipts, typing indicators, link previews) are
   shown read-only in M1 with "change on your phone"; Kourier-local ones (notifications per
   account, local mute) are editable.
@@ -3026,7 +5713,9 @@ front-end except its binary.
 - R6 The application's id, name, version, licence and links are defined once
   (`kourier_desktop::APP_ID`, `kourier_app::about`); front-ends and packaging read them.
 - R7 Shared preferences are in `kourier.toml` or `core.db`; a front-end's own (window
-  size) are kept by its toolkit.
+  size) are kept by its toolkit. The choice of shown accounts is shared too (`blend-accounts`,
+  `hidden-accounts`, §8.9): its rules are `kourier_viewmodel::shown_accounts`, so another front-end
+  gets them with the viewmodel.
 - R8 Each front-end has its own test rig (UI tests, pages, screenshots, perf). The fixture
   data and the dev-control wire format are shared.
 
@@ -3069,6 +5758,23 @@ compares it). In the front-end: the KI18n translator, `KAboutData` and the About
   number becomes `+[number]`, a `sgnl://` or `signalcaptcha://` link keeps its scheme. libsignal's
   protocol crate prints full `<service id>.<device>` addresses on some WARN and ERROR paths, and
   at INFO when `KOURIER_LOG` lifts its cap.
+- whatsapp-rust and the crates under it (module paths in `kourier_whatsapp::logs`) log names, numbers, the pair
+  code and whole stanzas on some lines. A per-layer filter in front of both `EnvFilter`s
+  (`kourier_app::logging::upstream::Rule`, W2b) judges each RECORD by its module path, never a formatted
+  line: nothing of theirs below WARN is written whatever `KOURIER_LOG` says (a record without a module path
+  counts as theirs), and a record that passes is written as time, level, target and its message through
+  `redact_upstream`, no other field. The writer's `redact` still runs on every line. The filter says
+  `Interest::sometimes` for the `log` bridge's shared callsites, so libsignal's records are not silenced.
+- libthreema (module paths in `kourier_threema::logs`, TH4) puts its data in event and span FIELDS (an INFO span prints
+  `?self`, a TRACE event the whole result), so the same filter, a second arm of it under the `threema` feature, writes its records
+  from WARN up only, whatever `KOURIER_LOG` says, as time, level, target and message and nothing else: no field and no span
+  (a span is judged by its callsite's module path). The transport crates of Threema's `src/dial/` (the TLS, WebSocket, HTTP/2
+  and HTTPS libraries) are on the same list, so the rule holds in a build without WhatsApp; they are shared, so a Signal
+  build loses their INFO and DEBUG lines too. `redact_upstream` stays WhatsApp's.
+- Hex runs (P5a H2): `redact` cuts a run of 32 or more hex digits (a key, a digest) to `[hex]`:
+  libsignal logs a contact's identity key as 64 hex digits on every send it refuses
+  (`session_management.rs` "Identity key {} is not trusted ..."). Kourier's own fields print at most
+  8 bytes of a digest or an id; safety numbers, scannable bytes and identity keys reach no field.
 - The target `kourier_signal::requests` (DEBUG, off by default) logs one line per request:
   `via`, `method`, the log-safe `route`, `status` or the transport error, `ms`. The smoke run
   turns it on (`docs/smoke-run.md`).
@@ -3090,6 +5796,13 @@ bus, `KOURIER_DESKTOP=0`).
 
 - No telemetry. A panic hook writes a redacted report (version, thread, backtrace, last 200 log
   lines) to the state dir; the next start shows "Kourier crashed last time" with "Copy report".
+  Not built yet. The release binary has no symbol table (§14.2: the names are in a names file kept
+  per release), so a backtrace captured in-process has no function names and absolute addresses
+  (PIE and ASLR). The report therefore carries the build-id (`.note.gnu.build-id`) and the
+  module-relative offsets of the frames (each address minus the load base from `dl_iterate_phdr`),
+  and the maintainer resolves it offline with that release's names file (`gdb -batch -ex 'info symbol
+  0x<offset>' bin/kourier` after unpacking the names archive, or `addr2line -f -C -e
+  kourier-<build-id>.debug 0x<offset>`). Today's one panic line (§14.2) needs none of this.
 - Backend errors reach the UI as `ConnState`, `Failed{reason}` on messages, or `Notice` banners with
   `user_message`.
 
@@ -3118,7 +5831,10 @@ bus, `KOURIER_DESKTOP=0`).
   confirmation unless their type is a well-known picture, sound or video type (the confirmation
   escapes the sender's file name, because Kirigami's label guesses its text format), message
   RichText generated in Rust from a tag and scheme whitelist with
-  all text escaped (never markup from the network, §8.4), link previews off (not in M1); the
+  all text escaped (never markup from the network, §8.4), no link whose address holds an invisible or bidi
+  character, a zero-width joiner out of context or a user name or password, a word becomes a link only by Signal
+  Desktop's rule and opens as https (§8.4), the
+  confirmation showing the address as a left-to-right isolate (§8.4), link previews off (not in M1); the
   `sgnl://` scheme handler only focuses the window in M1 (group invite and `signal.me` links are
   later features and must never act without a confirmation); a `signalcaptcha://` link answers
   the challenge of whichever account waits for one and does nothing else. URIs from other
@@ -3130,7 +5846,8 @@ bus, `KOURIER_DESKTOP=0`).
   rendered and an `<img>` fetched. Rule for new QML: text from a backend, a contact or the
   account goes through `Style.plain(text)` (angle brackets become ‹ ›) where the label guesses
   its format, and every other label showing such text sets `textFormat: Text.PlainText`.
-- A URL from a backend reaches `Qt.openUrlExternally` only as `https://` without white space or
+- A URL from a backend reaches `App.openExternalUrl` (`xdg-open` started with an environment
+  without the two FFmpeg variables Kourier sets for itself, §8.6) only as `https://` without white space or
   control characters (the challenge address, `conversations::browser_url` in the viewmodel);
   anything else leaves the dialog's button disabled. The browser is opened only by a click.
 - Release builds set `PR_SET_DUMPABLE 0` first thing in `main` (`kourier_app::process::deny_dumps`,
@@ -3145,10 +5862,18 @@ bus, `KOURIER_DESKTOP=0`).
   must never hold a real account, and `cargo xtask install` refuses it. A non-dumpable process
   also hides `/proc/<pid>/root` from its own user, which `xdg-desktop-portal` uses to identify
   a caller: file dialog, drag and drop and paste are not yet checked on a real session.
-- Safety numbers: identity-key changes show a system message; sends to that contact pause until
-  the user confirms when libsignal reports an untrusted identity (Desktop's `OutgoingIdentityKeyError`
-  flow, `SD/ts/jobs/conversationJobQueue.preload.ts:1076-1160`) [I: exact trigger rules to be
-  ported in S8].
+- Safety numbers: identity-key changes show a (quiet) system message; sends to that contact pause
+  when libsignal reports an untrusted identity (Desktop's `OutgoingIdentityKeyError` flow,
+  `SD/ts/jobs/conversationJobQueue.preload.ts:1076-1160`). As built in P5a (2026-10-25): the
+  guarantee is STATE 2 (verified, then the key changed): no send of any kind until the user confirms
+  the key ON SCREEN; a never-verified contact is TOFU like Desktop and Android (§6.9). The person's
+  page shows the number (60 digits, 12 groups of 5) and its QR code (the `ScannableFingerprint` of
+  our side) and offers Mark as Verified, Clear Verification or Confirm New Safety Number; every one
+  names the key of the number shown, held in Rust (never round-tripped through QML text). The
+  backend refuses a key that is no longer the stored one for a Mark, a Clear and a Confirm of a
+  contact in state 2, so a stale page never acts on a newer key (§8.3); a Confirm of a never-verified
+  contact is an APPROVAL that ignores the key (TOFU, §6.9: nothing is marked, the paused sends go). Out of scope: Key Transparency (libsignal's `keytrans`; Desktop's "automatic key
+  verification") and scanning a QR code with a camera (the code is shown for the other phone to scan).
 
 ### 9.5 i18n
 
@@ -3288,7 +6013,9 @@ due after the clock was set right, or the option changed). The same hide and sho
 - in the transaction that stores a change of the option (`UiCommand::SetExpiryPolicy`). The
   command is awaited in the core task, so a query sent right behind it follows the new
   option. A change to `erase` hides, in that transaction, every message that is due and
-  still shown, in all accounts, and wakes the sweeper, which erases them in its batches.
+  still shown, in all accounts, and the command then runs the sweeper's batches itself
+  before it returns (`expiry::sweep_once`), so a change back to `keep` right behind it can
+  never show again what `erase` hid (2026-10-28, settings_ui's `erased` step).
 
 The option in memory changes only on the writer thread, behind the commit that stored it,
 and the sweeper reads the option and the unconfirmed accounts inside its own write on that
@@ -3337,6 +6064,62 @@ The conformance suite rejects: durable events sent with `ack: None`, group messa
 `Origin::Remote{author}`, own messages with an author, `HistoryBatch` over 500 messages; it also
 runs the per-network scripts of §7.3. The UI fixture mode (`--fixture`) runs the real core on a
 temp `KOURIER_HOME` with this backend.
+
+`FakeNetwork::playing(NetworkKind::WhatsApp)` plays WhatsApp for fixtures and tests (K-A, 2026-10-16;
+nothing of WhatsApp is contacted, no WhatsApp backend exists in `main`): its descriptor says
+WhatsApp (flows `qr` and `pair-code`, `PushedOnLink`, `experimental`, no `history_transfer`, an EMPTY
+`start_chat` pinned by a test, a one-sentence `risk_notice` as the fallback text), its ids stay
+`Flavor::SignalLike` so the fixture's chats are row for row the plain fixture's, `Script.pair_code`
+scripts the phone-number flow (a refusal, a code that expires) and `FakeControl::login_flows`
+records the flow a login asked for. `--fixture-network=whatsapp` (kourier-app `FixtureNetwork`) seeds
+the fixture account as WhatsApp's with the network on; the plain fixture also holds a second fake
+playing WhatsApp that is OFF (in the "compiled in but off" list, not registered), which is what
+the welcome list and `warisk` show.
+
+`FakeNetwork::playing(NetworkKind::Threema, script)` plays Threema the same way (TH4 K1; nothing of Threema is contacted): the
+descriptor copies the Threema backend's (a test of that crate compares them: one flow `qr`, an empty `start_chat`, the
+risk notice, no safety numbers and no contact cards), the ids stay `SignalLike`, and after the scan of its QR code it
+shows `ConfirmEmoji` with three fixed glyphs of Threema's list for `Script::emoji_for` (2 s of the account clock) before
+it links; a cancel ends the wait. `--fixture-network=threema` seeds the fixture account as Threema's with the network on,
+and the fixture pages `thqr` and `themoji` hold the link at its QR code and at the emoji. An unheld link walks ONE code whatever
+`FixtureOptions::qr_codes` says (the real actor shows one, `valid_for: None`). The pages that stand at a link page (WhatsApp's `waqr`, `waphone`, `wacode`
+and these two) tick the network's risk warning for the person and start the link, so they exist on a fixture only: the binary's argument
+parser refuses `--page=<p>` for them without `--fixture` or `--fixture-link`, and the QML takes those branches only when `App.fixture`.
+
+`FakeNetwork::playing(NetworkKind::Telegram, script)` plays Telegram (KT-1b; nothing of Telegram is contacted, and `kourier-fake` holds no Telegram code): the descriptor copies the Telegram backend's in the fields the UI reads (that crate's tests compare the whole descriptor, and the chat features), the ids stay `SignalLike`, and the `phone` login flow is a table of accounts keyed on the typed digits (`PhoneLoginScript`), in TDLib's order: the typed number's tail is checked before any code, a number in no row fails at `registration`, the code step states its delivery and the remaining resend wait, then the password, the e-mail and the link; after a QR scan the account's password comes first and the number check last. `kourier_fake::telegram` adds `FakeNetwork::rehearsal_telegram[_with]` for the run tool's rehearsal (its own `Timings`, one direct chat and one basic group served on the link, Telegram-shaped ids, synthetic constants). `--fixture-network=telegram` and the pages `tgwarn`, `tgqr`, `tgcode` and `tgpassword` use the fake.
+
+**The roaming settings (A10a).** The fake plays a network that writes the settings it keeps for the account's other devices
+(archive, pin, mute, marked unread: "roaming"). `Script::roaming_writes` is what it states in its `AccountCaps`
+(`AccountCaps::roaming_writes`): `Some(true)` by DEFAULT (so a fake-driven test or fixture page that archives or pins keeps
+working), `Some(false)` = the network can and the account's switch is off, `None` = it states nothing (the scripts of the
+fake that plays WhatsApp or Threema, and the rehearsal, say `None`: those networks write no roaming setting yet;
+`scripts::as_whatsapp`, which makes any script WhatsApp's, sets it, so the WhatsApp account of the 3-account fixture states
+nothing, and the Threema fixture is cleared where it is made, in `demo_network`). The statement rides on events the script
+already delivers: the FIRST delivery of an account that has stated no caps gets an `AccountCaps` in front of its events
+(`{roaming_writes, max_pinned_chats: 4}`; `PIN_LIMIT`), and every `AccountCaps` the script delivers that does not state the
+flag itself gets the flag and the limit added (a script that states its own flag, on or off, is not touched; the flag is the
+one the account has now, so a switch turned stays turned). Nothing is added to the link's `AccountReady` envelope, so a
+script that delivers nothing never states the flag and its clicks are refused. A relink that resumes a script that was played
+(the unlink wiped the account's `backend.db` and with it what it had stated) puts the statement into the fake's memory again
+in the link's own transaction, beside the pins and the timer versions: the newest `AccountCaps` the script played (its own
+numbers survive) with the flag and the limit added as a delivery would add them, or the statement alone when the script
+played no caps; no event goes to the core, which keeps the account's stored caps, and the clicks the core lets through are
+applied, not refused. The fake keeps the account's PIN LIST (`fake_state` keys `pin:<conversation>` = place, filled from
+every event it commits: a `PinnedConversations` list, a patch with a `pinned_order`, a removed conversation; it survives a
+restart) and states the whole list on a pin or an unpin: a new pin goes to the END, a chat that is pinned already keeps its
+place, a pin over the stated limit is refused (`InvalidInput`; the limit is `PIN_LIMIT`, the common limit of 4, unless the
+script's own `AccountCaps` carry `max_pinned_chats`: `Some(3)` plays a network with 3 pins, and caps that state the flag and
+no limit play a network without one), a pin also unarchives the chat (in the same row), archiving takes the chat out of the
+list (in the same row) and states no list when it was not pinned. THE BACKEND IS THE GATE: while the flag the account last
+stated is not `Some(true)` the fake refuses `SetArchived`, `SetPinned`, `SetMuted` and `SetMarkedUnread` (`Unsupported`),
+though the core refuses them first; `SetBlocked`, `SetTimer`, `AcceptRequest` and `Leave` are not roaming and pass.
+`Command::SetRoamingWrites { on }` turns the flag: the fake states its newest caps again with the flag as asked (every other
+cap as it was) and answers `Ok`; a fake that states no flag answers `Unsupported`. `Command::ChangeConversationDurable` is
+kept as a job like the other durable commands (kind `change`, payload kept) and acknowledged with `CommandPersisted`; while
+the switch is on the fake also APPLIES it in the same row, ahead of the acknowledgement (a clearing of a mark states
+`marked_unread: false` like the plain command), once however often the core sends it; with the switch off it is acknowledged
+and dropped. Not played: the phone's own newer mark that a clearing must not overwrite (`asked_at`); that is the rule of a
+backend that merges what the other devices wrote, and that backend's own test (BQ3).
 
 ### 10.3 Signal mock server harness
 
@@ -3402,7 +6185,16 @@ harness's `npm ci`, the release build and `cargo xtask symbols-check` are run by
 the 6-core machine (2026-10-13, same tree, one core taken by another process): the test steps took
 15.0 minutes through `cargo test` (non-Qt 669 s, Qt 233 s) and 6.4 minutes through nextest
 (non-Qt 271 s, Qt 87 s, doc tests 12 s; with the harness-based suites 2, 4 and 6 at a time the
-non-Qt run took 654, 360 and 271-283 s, the Qt run 103 s at 3 UI tests at a time). Not part of `ci` either:
+non-Qt run took 654, 360 and 271-283 s, the Qt run 103 s at 3 UI tests at a time).
+
+A smaller target directory (T3, 2026-10-14): the integration tests of `kourier-core`,
+`kourier-signal`, `kourier-e2e`, `kourier-app`, `kourier-fake` and `kourier-model` are one test
+binary each (`tests/it.rs`, every `tests/<name>.rs` a `mod` of it; 122 test executables became 57), and
+`ci` (both tiers) prunes `target/debug` after a green run to what its own build graph names
+(`xtask/src/prune.rs`; never a file a process runs, nothing younger than 15 minutes, nothing while
+another cargo builds; `--keep-target` skips it, `cargo xtask prune [--dry-run]` does it by hand):
+the first real run took the directory from 138 GB to 39 GB. The rules are in CLAUDE.md (Build, test,
+run; Traps). Not part of `ci` either:
 
 - `cargo xtask perf [--out <file>] [--quick] [--report-only] [--idle <s>] [--runs <n>] [--no-mock]
   [--no-build] [--keep-profile]`: the §1.3 table (§13 phase I). A full run takes 13 to 15 min.
@@ -3560,6 +6352,15 @@ they are skipped, not replaced.
   thumbnails/blurhash, temp media for GIF/video/voice, limits from remote config.
 - Done when: a mock image renders in the timeline (screenshot); a file from Kourier is
   byte-identical on the phone; a scan finds no plaintext attachment in `KOURIER_HOME`.
+- LOC (`kourier-e2e/tests/signal_attachments.rs` `located_files_leave_only_as_agreed`, through the
+  real core and the Signal backend against the mock): a phone JPEG with EXIF GPS needs no question
+  (`Query::FilePlan` says `location [false]`: Signal states it cleans JPEGs) and the phone decrypts
+  a JPEG whose look is `None`; a located HEIC (sent as it is) is planned `[true]`, a `SendFiles`
+  without the agreement ends in `ActionFailed { SendFiles, Files(..) }` with `FileRefusal::Location`
+  at index 0 and uploads nothing, and the same send with `with_location [true]` arrives
+  byte-identical; a located JPEG broken after its EXIF (no decode, no strip) is planned `[false]`,
+  Signal's `clean_still` refuses it and the message ends `Failed { Other("invalid input"),
+  retryable: false }` with nothing uploaded and no file name in the row.
 
 **S13. Modifiers and correctness handlers**
 - Scope: edits (revisions), remote deletes, reactions, receive windows and admin deletes in the
@@ -4164,7 +6965,20 @@ compact list, S13 core side, id fixes; 2026-10-06):
   handed to other applications are closed when the conversation changes. A picture's height
   follows its own width, capped by the bubble's maximum width (a wider caption crops it
   slightly). Voice notes play through Qt Multimedia (`VoicePlayer.qml`; `QtMultimedia` is loaded
-  on first play, so packages must depend on `qml6-module-qtmultimedia`).
+  on first play, so packages must depend on `qml6-module-qtmultimedia`). Qt's FFmpeg backend would
+  probe every hardware VIDEO device at that first play (1.4 s on the GUI thread, +300 MB on an
+  NVIDIA machine, measured 2026-10-14; the player only plays audio), so `main` sets
+  `QT_FFMPEG_DECODING_HW_DEVICE_TYPES` and `QT_FFMPEG_ENCODING_HW_DEVICE_TYPES` to the empty list
+  first thing (`kourier_qt::prepare_environment`, unless the person set them; before the runtime
+  starts a thread, because `set_var` is a data race with a reader). Programs the app starts for the
+  person (`App.openExternalUrl`: "Open in Another Application", links) get the environment the
+  person gave it, and the process's own environment is not touched after start: `kourier_app::opener`
+  starts `xdg-open` detached with `env_remove` of the names `prepare_environment` set (the child's
+  own copy). `App.openExternalUrl(QUrl)` is also the slot of `QDesktopServices::setUrlHandler` for
+  http, https, mailto and file, so every `Qt.openUrlExternally` of the process (Kirigami's About
+  page and link delegates call it themselves) goes there; other schemes keep Qt's services. Media
+  research D2 rule 6 ("hardware probing off") is done for voice notes this way; a video player
+  inside the app takes its device types from a setting.
 - §8.6 avatars: handles live in `kourier-app` (`media::AvatarHandles`; the core's table covers
   attachments only); cropped round in C++ (also on the software renderer); the revision goes up
   when the same file comes back with another key; the table starts over at 16,384 entries. Group
@@ -4292,7 +7106,8 @@ groundwork and follow-ups; 2026-10-06/07):
   with `Body::System` and an own origin gets no outgoing state. The account's own avatar is the
   `ContactUpsert` avatar of `own_ids[0]`.
 - Facade (`kourier_core::facade`): `MessageRow.actions: MessageActions { reply, react, edit,
-  delete_for_everyone, delete_for_me, copy, take_back, until }` and `TimelinePage.now`. Each
+  delete_for_everyone, delete_for_me, copy, take_back, until, ... }` (and, P3, `show_sender` and `show_people`: the
+  pages of the message menu, §8.3) and `TimelinePage.now`. Each
   flag is the answer of the check its command runs: the rules live in
   `kourier-core/src/actions.rs`; `modify.rs` and `outbox.rs` call them before they change
   anything and `query.rs` calls them on the same facts at `TimelinePage.now` (core clock).
@@ -4550,7 +7365,7 @@ groundwork and follow-ups; 2026-10-06/07):
   for. The drawer shows the account's own avatar. This covers parts of the R1 gate early
   (§14.2 item 3 own bubbles and contrast, item 4 context menu and no disabled stubs).
 - §8.3 account states (UI): `components/AccountBanner.qml` above the conversation list shows the
-  most pressing state of the accounts: a quiet line for offline, connecting and syncing; "Link
+  most pressing state of the accounts: a quiet line for offline, connecting and syncing, and for a pushed history that lost a part (W4: it stays for the session, the lowest of the kinds, no button); "Link
   Again" (`Relink` of the same account, then the link page); "Verify…"
   (`dialogs/ChallengeDialog.qml`); the clock-skew notice; "Reconnect"; "Restart" for a halted
   account. A logged-out account's composer says why it cannot send. Relink: `CoreSource`'s
@@ -4570,9 +7385,10 @@ groundwork and follow-ups; 2026-10-06/07):
   message current (the list sees the release of that Tab); Up and Down move between messages,
   Menu or Shift+F10 opens the current row's menu, Esc returns to the composer. A pointer never
   makes a row current: a click into a message's text gives that text the focus (selection,
-  Ctrl+C) and the view stays; the first arrow key afterwards starts at that row. When the focus
-  leaves the timeline (not for its own popups) `currentIndex` goes back to -1, because a
-  `ListView` keeps its current item in view and would move the timeline under the pointer.
+  Ctrl+C) and the view stays; the first arrow key afterwards starts at that row. When the focus leaves the
+  timeline (not for its own popups) `currentIndex` goes back to -1. A key brings the row it makes current into
+  view at once, by the least move (`makeCurrent`); the list's own following of its current row is off, so
+  nothing else moves the view for it.
   Toolbar buttons take focus by Tab only, so a click on React or Reply leaves the typing focus
   in the composer. `atTop`/`atBottom` are distances (within margin + one grid unit), not
   `atYBeginning`/`atYEnd`: a programmatic jump to the newest row rests one margin short of the
@@ -4865,9 +7681,25 @@ revision history, the desktop side of S15; 2026-10-07):
   their send and for as long as files are in preparation for that conversation
   (`ComposerController::release_sent_pastes`).
 - §8.3 timeline (UI): `Block::Album` groups neighbouring pictures and videos of one message
-  (a file ends the group); `timeline/blocks/AlbumBlock.qml` draws 2, 3, 4 or 5 tiles and "+N"
-  beyond five (`ALBUM_TILES`); the grid is always `imageMaxWidth` wide, centred when a long
-  caption widens the bubble. `ImageViewer` takes `items` and `index` and steps through the
+  (a file ends the group); `timeline/blocks/AlbumBlock.qml` draws up to five tiles and "+N"
+  beyond five (`ALBUM_TILES`) as JUSTIFIED ROWS, every picture whole (user decision,
+  2026-10-14, "do not crop images/video in previews, show full image fit into maximal size
+  for it"): the pictures of a row share one height and their widths follow their shapes, the
+  rows fill the album's width (`imageMaxWidth`, centred when a long caption or a file widens
+  the bubble), 2 px between tiles. Which pictures share a row is chosen in Rust, once per
+  message, by `kourier_viewmodel::media_layout::album_rows` and travels in the block as
+  `rows` (`count`, `aspect`, `prefix` of each row; no layout rule lives in QML, which only
+  turns the rows into whole pixels for the width it has): every cut of the shown tiles into
+  consecutive rows is tried and the cheapest wins (a row near 0.45 and the album near 0.75
+  of the width tall, at most 1.5 tall, no tile with a side under 2.6 grid units so the
+  round badge fits; a mix of very different shapes that meets neither takes the cut whose
+  smallest tile is the largest, up to 2 times the width). A tile is the shape of its picture
+  within a pixel, clamped to 0.4..5 (a thinner picture sits whole and centred in a tile of
+  that shape, on the bubble's own colour). The tiles keep their shape, so the album's height
+  depends on the pictures' sizes: it changes when a size becomes known or is corrected by
+  the file (the viewmodel rebuilds the rows with the dims, a `retain_ui` case holds the
+  reader's row through it). The album no longer grows with a wide caption (the 2-tile
+  album used to), and a right-to-left chat does not mirror it, as before. `ImageViewer` takes `items` and `index` and steps through the
   whole album (Left/Right, Page Up/Down, Home/End, buttons, a "2 of 9" counter). The messages
   of one send appear in order, each with its own state.
 - Limits audit (user decision of 2026-10-06, CLAUDE.md "Rules"): every limit in the three lanes
@@ -4899,6 +7731,10 @@ revision history, the desktop side of S15; 2026-10-07):
   | Edit send window 24 h | `features::edit_send_secs` | receivers: 48 h after the original (Desktop `isTooOldToEditMessage`, iOS), on Android the delete window plus a day (`MessageConstraintsUtil.kt` `RECEIVE_THRESHOLD`); an accepted edit may wait 24 h in the outbox | Kept; capped by the server's delete window when that is shorter |
   | Edit receive window 48 h, any count | `edit_receive` | Desktop and iOS apply it | Kept; measured from the original's server time |
   | Edits of bodies that are not a text or a caption | core `actions.rs` and ingest (by target); `kourier-signal` drops edits that are themselves view-once, contact-share or voice messages | every client drops edits of view-once, contact-share and voice messages (`handleEditMessage.preload.ts`; Android `validTarget`; iOS `checkForValidEdit`, which also refuses stickers and polls) | Kept as a drop on receive |
+  | Saved file name: one path component, at most 140 bytes | `kourier-viewmodel` `save_name` (the cleaner); `kourier-blob` `check_name` (the writer: 255 bytes, no `/`, no NUL, not `.` or `..`) | the file system (255 bytes; eCryptfs about 143) and the shell (a leading `-` or `~`); Desktop saves the sender's name as it is and relies on its dialog, Android cuts it to its last path component | Adapted: Kourier's own 140 and the cleaner of §5.8.2, so a name that reaches a folder without a human check ("Save All…") is safe |
+  | Saving a sticker, or a file of a "dangerous" extension (Desktop: 47 extensions, with a toast) | nobody | Desktop's own UI choice; no server or other client enforces it | Dropped |
+  | Saving a view-once message | core `actions::may_save_message` | every official client; his "Show once, then remove" | Kept |
+  | Saving what a Telegram sender marked "may not be saved" | not enforced yet: Telegram's flag (`can_be_saved`) stays in the backend's `meta` blob and the core cannot see it | the sender's choice, a privacy limit the other clients enforce | Kept, as a rule for the download step: see the Telegram row in `telegram.md` ("Before downloads land") |
   | Edit window, count and `features.edit` on an in-place edit of a message nobody has | core `actions.rs` | nobody: nothing of it reaches the network | Dropped |
   | Delete for everyone window | `delete_for_everyone`, `delete_receive` | server `global.normalDeleteMaxAgeInSeconds` (1 day); receivers a day longer (`SD/ts/util/canDeleteForEveryone.preload.ts:228` `MESSAGE_SEND_GRACE_PERIOD`, Android `RECEIVE_THRESHOLD`) | Kept; delete for me has no limit |
   | One reaction per user; a reaction is one emoji of at most 64 bytes | `reactions_per_user`; core `MAX_EMOJI_BYTES`; `kourier-signal` `emoji.rs` | protocol (receivers replace) and receivers (anything else is dropped); 64 bytes is Kourier's own security bound (the longest recommended sequence is 35 bytes) | Kept; the bound now also applies to incoming reactions |
@@ -4914,9 +7750,11 @@ revision history, the desktop side of S15; 2026-10-07):
   | Retry requests: 5 per message, one session reset per hour | `kourier-signal` `retry.rs` | protects the peer from resend storms (Desktop's values) | Kept |
   | Device name 50 UTF-16 units | `kourier-signal` provisioning | unverified: Desktop's comment names 256 encrypted bytes on the server (`SD/ts/types/InstallScreen.std.ts`) | Kept as a cut, not a refusal |
   | Pacing inside the core: 4 transmits in flight, 5 s send timeout, sweep batch 200, 60 s sleep cap, 2 derive workers, 5 download resends, history batch, event queue | core | none refuses a user request | Kept |
+  | Group description shown: the first of 4,096 graphemes or 16 KiB of UTF-8 (`DESCRIPTION_BYTES`, at a char boundary), then "…"; the person's about text is cut the same way; never inside an address | viewmodel `group.rs` `DESCRIPTION_LIMIT` | protects the panel from a hostile member (the Signal decode keeps any length and a member may set it where attributes are not admin-only); the stored text stays whole | Kept: a display cut, the text is not refused |
+  | The gallery of a chat: at most 1,000 attachments in one query (`MAX_MEDIA_PAGE`); the level asks for pages of 48 and goes on without end | core `facade.rs` `MAX_MEDIA_PAGE` (clamped in `query::chat_media`) | protects the reader from one query that holds a chat's whole history; a page, not a limit of the list: "more" asks the next page from the cursor, to the end of the chat | Kept: a cap of one query; a list longer than 1,000 rows is read in pages and a refresh keeps its tail |
   | Conversation list: the first 500 chats | viewmodel `CONVERSATION_LIMIT` | Kourier's own | Dropped: `CONVERSATION_PAGE` is a page size, every page is read |
   | Timeline window 500 rows and page 50; 5 album tiles; previews clipped at 256, 160 and 300 characters; six quick reactions | viewmodel; core `PREVIEW_MAX` | memory window with paging, layout, display | Kept: nothing is unreachable (every picture is in the viewer, the whole text in the chat) |
-  | Composer previews only for eight raster formats by content; link schemes http, https, sgnl; https-only browser URL; a dropped web link is not fetched | `kourier-qt` `media.rs`; viewmodel `richtext.rs` | security and privacy (§8.6, §9.4) | Kept |
+  | Composer previews only for eight raster formats by content; link schemes http, https, sgnl and no invisible or bidi character (nor a zero-width joiner out of context) in an address; an address of at most 4,096 UTF-16 units, a host of at most 2,048, no U+2500..U+25FF, no user name or password, no % or empty label in a host; a word without a scheme only with a TLD of Desktop's list of 2010, labels of at most 63 characters; https-only browser URL; a dropped web link is not fetched | `kourier-qt` `media.rs`; viewmodel `richtext.rs` | security and privacy (§8.6, §9.4) | Kept |
   | URIs from other processes: 16, each 4096 bytes | `kourier_desktop::instance` `MAX_URIS`, `MAX_URI_LEN` | security bound on input from D-Bus and the command line | Kept; the length is now 16 KiB (a `signalcaptcha` link carries the captcha token, about 2,600 bytes with no documented maximum; Desktop sets no limit on that route) |
   | A pasted file is deleted 120 s after its send | `kourier-qt` `controllers.rs` `PASTED_GRACE` | Kourier's own timer, tuned for 32 files | Changed: at least 120 s and for as long as files are in preparation for that conversation. Phase I: "in preparation" is known from the send's request id (`FilesStored`), no longer guessed from timeline rows |
   | dev-control: `attach` took one existing file per call, `send` needed a text | `kourier-qt/src/dev` | test tooling | Dropped |
@@ -4958,6 +7796,63 @@ revision history, the desktop side of S15; 2026-10-07):
   | Asking the phone for a lost file: the answer is awaited 30 s after the request went out, and 2 min more after each answer that still has a PENDING slot | core `Timeouts::restore_answer` / `restore_pending` (`ingest::restore::tune_waits`) | Kourier's own (Desktop has no wait: it shows nothing until an answer); a phone that never answers must end as a note the user can act on | Kept, own |
   | A backfill request that cannot go out is given up 1 h after the click, also before its first attempt; the core ends the wait itself 5 minutes later when nothing was reported | `kourier-signal` `backfill::REQUEST_MAX_AGE`, `jobs::expired_before_run`; core `ingest::restore::UNSENT_BOUND_MS` | Kourier's own: a request the phone gets hours later finds a user who gave up; the core's wait ends as "did not answer" (`NotSent`, or its own deadline when the backend never says) | Kept, own |
   | Backfill answers only from device 1 | `receive/dispatch.rs` `backfill_response`, `PRIMARY_DEVICE` | Kourier's own (security): Desktop and Android take one from any of our devices; only the phone has the files | Kept, own |
+  | A contact card sent (P5c): one card per message, one number (the shown one), the name at most 512 bytes | core `facade::MAX_CARD_NAME_BYTES`, `ShareState::of`; `kourier-signal` `send::media::MAX_CARD_NAME_BYTES`, `contact_card` | Kourier's own cap (`notes/research/media-and-kinds.md` D9): a card hands out a third party's data, so only what the page shows goes, kept small | Added: a longer name means no card ("%1 has no name to share."), never a cut name |
+  | WhatsApp: an edit is sent only while its original is at most 1,080 s old by the original's server time; when that time is unknown (an original from the phone: W3 keeps no arrival time), an edit that waited more than 180 s since the person made it is not sent (W5a, F15) | `kourier-whatsapp` `send::attempt` `EDIT_SEND_LIMIT_SECS` (the receivers' 1,200 s less 120 s for clocks and the way), `EDIT_WAIT_PROXY` (1,200 s less the stated 900 s less the same 120 s margin: 300 s left no margin at the receivers' boundary), `edit_too_late` | receivers: upstream drops an edit older than 1,200 s after the original (`EDIT_PROCESSING_WINDOW_SECS`, `wacore/src/msg_secret.rs`); the 180 s wait is a PROXY, not an upstream fact (U4: R2 checks an edit at 10 and at 25 min) | Added: `Failed(Expired)`, no frame, nothing recorded; the features state an edit window of 900 s |
+  | WhatsApp: a nack is remembered per connection with a floor: while it is remembered a `Transmit` of that local writes no frame and answers the failure with the time left; after the floor ONE new frame may go out (W5a, F1) | `send::acks` (`Nack::floor`: 429 `RATE_LIMITED_FLOOR` 5 min, 421/500/503 `TRANSIENT_FLOOR` 30 s, any other nack for the rest of the connection), `send::errors` | server: a rate limit answered by a burst of resends is what the server escalates on (and a 421 resent from the same cached group metadata meets 421 again); the floors are Kourier's own, upstream handles no ack error beyond a log | Added |
+  | WhatsApp: a 475 (a cap on messages to new chats) is refused like a 463 and never resent (W5a, F8) | `send::acks::Nack::recorded`, `send::errors` | server (`nack.rs` `NewChatMessagesCapped`); what it means on our acks is [U] until R2 | Added |
+  | WhatsApp: a received edit is taken within 1,200 s of its original and a received delete at any age (W5a, F16) | `kourier-whatsapp` `features` (`edit_receive`, `delete_receive`) | receivers: upstream drops an edit authored 1,200 s or more after its parent (`wacore/src/msg_secret.rs`); the window of a received revoke is [U], so none is stated. KNOWN GAP (core item L-a): in WhatsApp's own chat ("Message yourself") the core lets an edit of ANY age through (`ingest/modifier.rs`, Signal Desktop's note-to-self rule), where the phone drops one past 20 minutes; the exemption should be a per-network descriptor flag | Added |
+  | WhatsApp: no ack within 75 s of a written frame ends the connection; the resend goes on a later connection with the same id (W5a) | `send::attempt::ACK_WAIT`, `send::acks` | Kourier's own (D5): upstream waits for no ack; one frame per local per connection | Added |
+  | WhatsApp: a quit waits up to 10 s for the acks of written frames (W5a) | `actor::QUIT_ACK_WAIT` | Kourier's own: inside the network's 20 s shutdown grace, beside the history capture's wait | Added |
+  | WhatsApp: a send waits 30 s at a time while the reach-out lock is unknown or in force; unknown ends 10 minutes after the run's first ask (W5a) | `send::attempt::HOLD_RETRY`, `actor::HOLD_FIRST_WAIT` (10 s before `Syncing`), `HOLD_UNKNOWN_END` | server: the reach-out time lock refuses a first contact (463); the 10 minutes are Kourier's own bound, so a pull that never answers does not stop every send | Added |
+  | WhatsApp: a 1:1 send into a chat with no privacy token waits 60 s at a time while the link's history push runs, at most 30 minutes after the link (W5a) | `send::tokens::TOKEN_RETRY`, `TOKEN_WAIT_BOUND` | server: a 1:1 message without the chat's token can be refused (463, `MissingTcToken`); the push brings the tokens | Added |
+  | WhatsApp: nothing is sent into a direct chat the phone never started (W5a) | `send::started`, `send::attempt` (`cannot_send: NotAccepted` in the features) | the reach-out rules of the server, and his rule D6 (Kourier never opens a chat) | Added |
+  | The look at a file's location (LOC): a payload read at most 1 MiB (`PAYLOAD_MAX`, also the output of every inflate), 2 MiB read per file (`FILE_READ_MAX`), 100,000 headers (`HEADERS_MAX`), depth 12 (`DEPTH_MAX`), 8 IFDs of 1,000 entries (`IFDS_MAX`, `IFD_ENTRIES_MAX`), 64 HEIF Exif/XMP items (`heif::ITEMS_MAX`), 64 `iloc` extents per entry and 4,096 per box (`ITEM_EXTENTS_MAX`, `EXTENTS_MAX`), an `infe` read up to 4 KiB (`INFE_READ_MAX`) | `kourier-media` `location.rs`, `tiff.rs`, `bmff.rs`, `heif.rs`, `chunks.rs` | Kourier's own: bounded work on untrusted input, no real file has more | Added: past a bound the file is `Unreadable` and does not ask; nothing is refused |
+  | The look: 2 s of wall clock per file; a leaf value 4 KiB | `kourier-media` `location::TIME_MAX`, `movie::LEAF_MAX`, `tiff::VALUE_MAX` | Kourier's own: a cold disk or a network mount must not hold Send for ever; a leaf value is a coordinate, a name or a packet start | Added: past the time the file is `Unreadable` |
+  | The look: an XMP value is searched for its end in 64 bytes (LOC P2) | `kourier-media` `xmp::VALUE_MAX` | Kourier's own: the search over a packet stays linear (a hostile packet that repeats a name cost 140 s for 2 MiB, outside the clock); a coordinate is a few bytes | Added: a longer value is no value |
+  | Look cache: 4,096 files | core `attachments/looks.rs` `CAPACITY` | Kourier's own bound on memory | Added: a look is taken again after eviction, nothing is refused |
+  | A file the look cannot judge (`Unreadable`) leaves unasked (LOC BQ6, P4) | core `attachments/looks.rs` `look_noted` | his decision 2026-10-26: the user cannot be told what is not known | Added: not refused; ONE info log line per such look (reason `time` or `bound`, the format; no path, name or value) |
+  | A located file leaves only if the composer said the user agreed (LOC) | core `send_files`, `import_one` (`FileRefusal::Location`); UI `ComposerRust::files_send` | Kourier's own (privacy; his decision 2026-10-26): no client asks | Added: the core refuses by position and the viewmodel sends the rest; a network that cleans location (`cleaned_pictures`) asks nothing for its pictures |
+  | WhatsApp: a picture, video or audio message carries at most 16,000,000 bytes of plaintext; a larger file goes as a document (W5b) | `kourier-whatsapp` `send::route::MEDIA_LIMIT` | server/receivers: WhatsApp Web's "16 MB" media default, MB or MiB unknown, the smaller reading taken [U2 until R3] | Adapted: never refused, sent as a document |
+  | WhatsApp: a file of any kind at most 2,000,000,000 bytes (W5b) | `send::route::FILE_LIMIT`, `features.files[*].max_size` | server: WhatsApp's 2 GiB document limit, with room [U2] | Kept as the stated limit; a broken large upload restarts from zero (no derived media key) |
+  | WhatsApp: a still picture is cleaned (`kourier_media::clean_still`) only up to 64 MiB, the bound of its `cleaned_pictures`; a larger one goes as a document, streamed untouched, and the core asks before a located one leaves (W5b, G7b) | `send::route::PICTURE_LIMIT` (the core's `MAX_PICTURE_BYTES`), `send::upload::stated_cleaning` | memory bound | Adapted: sent as a document |
+  | WhatsApp: pictures re-encoded at level three (4096 px, JPEG 0.75, metadata dropped) through `clean_still`, one that does not re-encode stripped and sent as a document, one that cannot be cleaned not sent (its attachment fails); inline thumbnail 100 px JPEG 0.5, left out above 16 KiB (W5b, G7b) | `send::upload::PICTURE_LEVEL`, `THUMB_EDGE`, `THUMB_QUALITY`, `THUMB_MAX` | nobody enforces WhatsApp's own 1600/2560 px (a sender's choice); the thumbnail size is [U7] | Kept: Signal's picture policy (privacy) |
+  | WhatsApp: what goes as a picture, video or audio is decided by the container (MP4 with `avc1`/`avc3` video; MP4 audio, Opus Ogg, MP3), everything else as a document; a GIF as a document (W5b) | `send::route` | receivers: a video or audio message they cannot play shows broken; his answer for GIFs ("As a file") | Adapted: never refused |
+  | WhatsApp: the MP4 box walk reads moov up to 4 MiB, 64 levels, 4096 boxes (W5b) | `send::mp4::MOOV_MAX`, `MAX_DEPTH`, `MAX_BOXES` | Kourier's own: memory and loops against an odd file | Added: past a bound the video goes without metadata |
+  | WhatsApp: an upload with no byte moved for 60 s (five such periods after the last byte) ends Transient; the send body of one POST has 60 s plus its length at 16 KiB/s, a cap on the whole body (ureq 3.4.2 refuses a write that starts past it: a slow body ends at that time plus the write in flight), while a fully stalled write ends after a few of ureq's write periods (the time left of the body when the write started, again after each partial write; three measured); connect 30 s, answer head 120 s, body read 300 s (W5b) | `send::upload::UPLOAD_STALL`, `UPLOAD_TAIL_STALLS`; `real` (`BODY_BASE`, `BODY_RATE`, `body_budget`, `CONNECT`, `RECV_RESPONSE`, `RECV_BODY`) | pacing (Signal's stall numbers) | Added: refuses nothing, the core retries |
+  | WhatsApp: an upload record is reused by a resend within 6 h and kept 30 days (W5b) | `send::record::REUSE_MS`, `KEEP_MS` | the CDN's keeping of an unreferenced upload is [U3]; 30 days for W7's re-upload request | Added |
+  | WhatsApp: a failed upload is tried again no sooner than its floor: 429 five minutes, 401/403/408/5xx and an unfinished upload (a 3xx or a cut 2xx answer too, no status is kept) 30 s (W5b fix F2) | `send::errors::upload_error` (`RATE_LIMITED_FLOOR`, `upload::STALL_RETRY`) | pacing: the core's retry of a transient answer would otherwise be immediate and repeat `w:m` and the POST | Added: refuses nothing |
+  | WhatsApp: while an earlier POST thread of a local still runs, a resend of that local answers `Transient` (30 s) and does no file work; other locals are not limited (W5b fix F5) | `send::upload::Lingering` (held by the source's reader) | a blocking POST outlives its attempt for its body budget (about 34 h for 2 GB; a stalled write runs a few periods of the time left when it started, so up to several times that) and holds a pool thread and a sealed temporary file; each resend would add another | Added; KNOWN LIMIT across locals |
+  | WhatsApp: one still picture is decoded at a time in the whole process (W5b fix F17) | `send::upload::PICTURES` (a `Semaphore(1)`, taken under the stop) | memory: one picture in memory per attempt only | Added: a second picture waits for its turn (its X works meanwhile) |
+  | WhatsApp: the plain request's answer (the version file, the resume check) is read through a 4 MiB cap (W5b fix F7); the streaming download keeps upstream's 2 GiB limit until W7 | `real::EXECUTE_CAP` | memory against a hostile or broken answer | Added |
+  | WhatsApp: a quit takes the sends that are still before their frame at once and waits only for the ones past their point of no return and for the frameless kinds (text, edit, delete, reaction), at most 10 s (W5b fix F16) | `send::stop::Transmits::quit_all`, `actor::QUIT_ACK_WAIT` | the network's 20 s shutdown grace | Added: the taken sends answer `Transient`, the core sends them again |
+  | Telegram: a fresh link loads each listed chat's last message and at most 20 unread ones (`FRESH_UNREAD_CAP`); the rest is the chat's unread hint (TG-3) | `kourier-telegram` `sync::FRESH_UNREAD_CAP` | Kourier's own (G-2): a fresh link's load stays small; KT-3 loads more on demand | Added |
+  | Telegram: chat lists loaded 100 per page, main then archive until each 404 (TG-3) | `kourier-telegram` `sync.rs` | TDLib's own paging; one page per lane step | Kept |
+  | Telegram: the reconcile pages a gap in pages of 50 (`PAGE_LIMIT`), at most 3 pages over all runs (`PAGE_CAP`); the gap then stays `lost` for KT-3 (TG-3) | `kourier-telegram` `sync/reconcile.rs` | Kourier's own (plan): a crash's tail is bounded; the rest is KT-3's "history missing" | Added |
+  | Telegram: the sync lane has one request in flight and paces history pages and `getMessage` at one per second (`FETCH_PACE_MS`); `getChat`, `getUser`, `getSupergroup`, `getBasicGroup` are not paced; a 429 pauses the lane for its `retry_after` + 10 % (TG-3) | `kourier-telegram` `session/lane.rs` | the server: Telegram's flood limits (FLOOD_WAIT); the unpaced requests are answered by TDLib from memory | Kept |
+  | Telegram: a group commit of at most 64 frames (`COMMIT_FRAMES`) or 50 ms (`COMMIT_AFTER_MS`) (TG-3) | `kourier-telegram` `actor.rs` | Kourier's own (brief §4.3): fewer fsyncs in a burst | Added |
+  | Telegram: a supergroup's start decision waits 2 s (`QUIET_MS`) for its own stream (TG-3) | `kourier-telegram` `sync/reconcile.rs` | TDLib's channel difference (Q-L8; measured in TP) | Added |
+  | Telegram: messages of an unknown or undecided chat wait for its `getChat` / group object: 64 per chat (`WAITING_PER_CHAT`); the overflow and a failed `getChat` (3 tries per run, `CHAT_TRIES`) leave a gap row for the reconcile (TG-3) | `kourier-telegram` `receive/messages.rs`, `receive/chats.rs` | Kourier's own bound (memory) | Added |
+  | Telegram: a clean stop with a message still waiting for its chat leaves the run unclean (TG-3) | `Session::receive_unsettled` | Kourier's own: the next start's checks must run | Added |
+  | Telegram: `delivered` keeps a row 14 days (`DELIVERED_KEEP_MS`) and a chat's newest 200 (`DELIVERED_KEEP_PER_CHAT`), plus EVERY unread incoming row (TG-3) | `kourier-telegram` `store::sweep` | Kourier's own (M4): a bounded store; an unread row is never swept, so a later read marker still finds it | Added |
+  | Telegram: a clean stop waits 3 s (`CLOSE_DRAIN`) for TDLib's `Closed`; on the bound the run counts as unclean (TG-3) | `kourier-telegram` `actor::drain_close` | the core's shutdown window | Added |
+  | Threema: a WebSocket message and frame is at most 65,536 bytes on the mediator's socket (64 messages queued) and 100 MiB + 4 on the rendezvous relay's (2 queued); one rendezvous socket can hold about six such messages, 600 MiB, before the emoji too (TH3, TH4 C6, S8, P11) | `kourier-threema` `dial/ws.rs` `MAX_MESSAGE`, `MAX_RENDEZVOUS_MESSAGE`, `event_depth` | protocol: the mediator's D2M limit of 65,536 bytes (the offline fake pins it) and one rendezvous frame after the nomination (libthreema `d2d_rendezvous/frame.rs`, a 4-byte length); libthreema refuses a frame over 16 KiB before the nomination only after the message is buffered, so a holder of the QR can make the peak happen early; [U: real phone] whether the phone cuts a big `BlobData` over several messages | Kept as the protocol's; one byte more closes 1009 |
+  | Threema: an HTTPS response body is read chunk by chunk up to 4 MiB (`DEFAULT_MAX_BODY`) unless the request names its own `max_body`; over it the request fails with `https: body too large` (TH3 fix S-L2) | `kourier-threema` `dial/https.rs` `DEFAULT_MAX_BODY`, `read_body`; `parts.rs` `HttpsRequest::max_body` | Kourier's own (memory): a server cannot make Kourier hold more than the limit; no protocol limit is known for the directory and blob-mirror answers, and TH3's actor does not call the HTTPS client yet, so the number is a request's field to raise | Added: `NetError::Failed`, nothing kept of the body |
+  | Threema: the chat server is asked for an idle timeout of 30 s (`IDLE_S`, in SECONDS), an echo request goes out every 10 s (`ECHO_EVERY`) and must be answered within 10 s (`ANSWER_WITHIN`) or the socket is dead; a network hint on an open socket sends one probe echo answered within 5 s (`PROBE_WITHIN`); `Resumed` replaces a socket that heard nothing from the server for over 5 min (`STALE_AFTER`) without a probe (TH3, decision C9) | `kourier-threema` `conn/keepalive.rs` | Threema Desktop's numbers for the idle timeout, the echo and its answer (`connection.ts:173-178`); only CSP frames reset the chat server's idle timer, so the echo keeps the leg alive (and resets the mediator's own timer, 4013, as a D2M frame); the probe and the stale cut are Kourier's own (the stale cut is Signal's rule) | Kept as Desktop's (idle, echo, answer); Added (probe, stale) |
+  | Threema: after the first `ServerInfo` the chat server login (CSP) must finish within 20 s of the LAST frame heard (every frame heard pushes the deadline out); the connect, TLS, upgrade and the D2M handshake up to `ServerInfo` have 20 s in all (TH3 fix P-L7, critic M10) | `kourier-threema` `conn/mod.rs` `LOGIN_WITHIN`, `HANDSHAKE_WITHIN` | Kourier's own: a dead leg is noticed, and a reflection backlog that is still arriving is progress, not a stall; [U: real server] whether the mediator answers the held CSP hello only after the backlog (RT1) | Added: the attempt ends and counts in the reconnect backoff (`Outcome::TimedOut`) |
+  | Threema: a join holds at most 1,000 blobs and 32 MiB of blob bytes (ids and data) in all, counted on each `BlobData` as it arrives, and a blob id is exactly 16 bytes (TH4 H4, S7) | `kourier-threema` `join/mod.rs` `MAX_BLOBS`, `MAX_BLOB_BYTES`, `join/essential.rs` | Kourier's own (memory): the spec and Desktop name none; counted before `EssentialData` is there, because the pictures come first | Added: `Unsupported` at once, the relay closed 4100 |
+  | Threema: an `EssentialData` is refused over 100,000 contacts, 10,000 groups, 10,000 distribution lists, 10,000 members of one group or one list (1,000,000 member entries in all), 100,000 blocked and 100,000 excluded IDs, 1,000,000 hashed nonces in each store, a user profile over 1 MiB or settings over 4 MiB; counted on the decrypted frame before it is decoded (TH4 C7, S2, C1, C2) | `kourier-threema` `join/essential.rs` `Bounds::REAL`, `MAX_PROFILE_BYTES`, `MAX_SETTINGS_BYTES`, `wire_check` | Kourier's own (memory: a 2-byte empty entry decodes to hundreds of bytes); `md-d2d-sync.proto`, `md-d2d-join.proto` and Threema Desktop name no limit (the only 256 in Desktop is the example value of a UI test), so 10,000 members is a fallback | Added: `Unsupported` at `linking`, nothing written; N passes and N+1 is refused |
+  | Threema: a join waits 20 s to connect, 5 min for the scan (from the QR), 60 s for the phone's nomination, 5 min for its `Begin` (from the emoji) and 2 min for `EssentialData` (pushed out by every message after `Begin`); the mediator's handshake up to the first `ServerInfo` has 20 s; a frame write and a close are each cut at 1 s (TH3, TH4 C8, P8) | `kourier-threema` `join/mod.rs` `CONNECT_WITHIN`, `SCAN_WITHIN`, `NOMINATE_WITHIN`, `BEGIN_WITHIN`, `ESSENTIAL_WITHIN`, `CLOSE_WITHIN`; `conn` `HANDSHAKE_WITHIN` | Kourier's own: a code is not shown for ever, a silent phone does not keep the link open, and a stuck send cannot hold `CancelLogin`, `Logout` or `Shutdown`; the relay's own timeout for a path nobody joined (closes 4003) is the relay's | Added: the scan deadline and 4003 before the phone's hello are `Expired` (Try Again), the others as §7.4 |
+  | Threema: a `core_outbox` row of a join after the first holds at most 500 events (TH4) | `kourier-threema` `join/events.rs` `ROW_EVENTS` | Kourier's own: one bounded core transaction, as `kourier_backend_api::MAX_HISTORY_BATCH` | Added |
+  | Threema: the file of test IDs is at most 16 KiB (TH4) | `kourier-app` `threema.rs` `ALLOW_FILE_MAX` | Kourier's own: a list is a handful of 71-byte lines | Added: a larger file is an empty list and one warning |
+  | Threema: a pass drains at most 30 reflected envelopes and writes them in ONE zone; before the file is join-ready at most 30 envelopes or 2 MiB are held in memory, over it the socket is closed 1000 and the mediator delivers them again (TH5a H1, B1) | `kourier-threema` `reflect/mod.rs` `BATCH`, `HOLD_BYTES` | Kourier's own (§5.6's stage-1 batch; memory): one fsync per batch, a bounded hold | Added: nothing is lost, the mediator keeps what is not acked |
+  | Threema: a reflected envelope's plaintext is kept at 1..=65,536 bytes; another size is acked and dropped (`reflected-bad-length`) (TH5a) | `kourier-threema` `reflect/mod.rs` `ENVELOPE_MAX`; migration 0003's CHECK | the mediator's message limit (65,536); the same number is the `deferred` row's CHECK | Kept |
+  | Threema: `deferred` keeps at most 20,000 rows and 256 MiB of envelopes (a kept running sum) and none older than 45 days; over a bound the oldest LOW-VALUE rows (receipts, read / sent updates, calls) go first, then the oldest of the rest, counted per rule; the sync kinds (settings, profile, lists) are never evicted and never expire; the age bound runs only under a clock a `ServerInfo` proved; the re-map takes 30 rows per zone (TH5a C14, M3, round B M-2, S9) | `kourier-threema` `store.rs` `DeferredBounds::REAL`, `REMAP_PAGE`, `next_to_evict`; `reflect/classify.rs` `LOW_VALUE_KINDS`, `EXEMPT_KINDS`; `migrations/0003_receive.sql` | Kourier's own (disk, privacy: the rows are plaintext, kept up to 45 days even after a Clear Chat): a later build maps a row again, so it is kept, but not for ever | Added: the oldest are dropped with a counted WARN, never refused |
+  | Threema: a text maps at most 64 mentions (the rest stay plain text); a contact or group sync is applied up to 100,000 contacts, 10,000 groups and 10,000 members of a group, the join's numbers (TH5a) | `kourier-threema` `reflect/body.rs` `MAX_MENTIONS`; `reflect/sync.rs` `MAX_CONTACTS`, `MAX_GROUPS`, `MAX_MEMBERS` | Kourier's own: the spec and Desktop name none (`[I]`) | Added: the envelope is dropped by its rule (`over-bound`) |
+  | Threema: the send queue holds at most 2,000 open rows and 64 MiB of sealed bytes for the core's sends, and 2,000 rows and 16 MiB for the backend's own jobs (receipts, rejects, a creator's answers); over a budget a `Transmit` answers `Transient` (60 s) and a job fails the zone that queued it, so the message it answers is not acked; `bytes` counts what a row still holds (an ack lowers it); a `Transmit`'s PREPARE that finds its budget spent first evicts, in the same zone, the oldest un-attached `prepared` or `reflected` `transmit` rows at least 24 hours old (the core's own budget for a message), never an `acked`, a `done` or an attached row and never a job (TH6a R3, S-M1) | `kourier-threema` `send/queue.rs` `TRANSMIT_BUDGET`, `JOB_BUDGET` | Kourier's own (disk): a row is an owed protocol step, so it waits rather than goes, except a `transmit` row nobody owns any more (its 24 hours are over) | Added: the core retries a send, and an evicted message the core sends again is prepared anew under the same id; a refused job leaves the chat server's message queued |
+  | Threema: one box is at most 8,170 bytes and one reflected envelope at most 65,516 (a group's nonces count); a larger message is refused `TooLarge` before anything is written; the padding is random, so within about 300 bytes of the box bound a body may fit or not (TH6a) | `kourier-threema` `send/prepare.rs` `PAYLOAD_MAX`, `ENVELOPE_MAX` | the chat server's frame limit (8,192, less the length, the tag and the container head) and the mediator's message limit (65,536, less its header) | Kept: the composer's bound (TH7) must stay below them |
+  | Threema: an ack that does not come within 60 s closes the socket (1000); a row cools for 2 min, doubling to 15 min, from its second failed run in a row (a missing ack or a server close; a lost network does not count) and at once when it fails by its content; the backend's own job is given up after 12 failed runs; a socket write that stalls 10 s ends the socket; done rows are kept 14 days, open sends 30, jobs 14 (TH6a R2, C11, C14, C15) | `kourier-threema` `conn/mod.rs` `ACK_WITHIN`, `SEND_WITHIN`; `send/shared.rs` `COOL_FIRST`, `COOL_MOST`, `JOB_GIVES_UP_AT`; `send/queue.rs` `DONE_KEEP_MS`, `TRANSMIT_KEEP_MS`, `JOB_KEEP_MS` | Kourier's own: the spec names no wait for an ack and Desktop waits on the keep-alive only, so one silent ack would hold its queue for ever | Added: a row the server refuses can neither stop the account nor hold the rows behind it |
+  | Pins: at most 4 per account (the remote config's `global.pinnedChatLimit`, default 4), counted from the stored account record's entries plus the queued pins (A10) | core `roaming::check` (`Refusal::TooMany`, per account, only when the network states `AccountCaps::max_pinned_chats`); `kourier-signal` `storage::intents::{pin_limit_of, intend}`, `storage::write::plan` (a rebase over the limit drops our newest addition) | the phones: Desktop and Android refuse a 5th pin in their UIs and the pin list is shared with them (interop) | Kept: the phone's number, read from the config |
+  | Storage Service writes: one write a second after the last change, at most 6 in 10 minutes and 30 in an hour per account, a 409 waits 1 s, 5 s, 30 s then the normal backoff (never under 30 s), a change not written in 30 days is dropped (A10c) | `kourier-signal` `storage::write::job` (`DEBOUNCE_MS`), `job/rate.rs` (`WINDOWS`), `intents::drop_stale` | nobody known: Kourier's own bound on the load it puts on the Storage Service and on the phone's merge work (BQ4) | Added |
 
   Not limits: the sticker send refusal (a missing feature), sender key needing two recipients
   (a path choice; there is no group size limit), unknown `DataMessage` flags and newer protocol
@@ -5296,9 +8191,10 @@ core, Signal and UI; 2026-10-07):
   binary (cargo feature `perf`, which implies `dumpable` and `fake`; copied to
   `target/perf/kourier-perf`) and the normal release binary. It seeds the reference profile of
   §1.3 through the real core on the fake network (`Launch::Perf`, `kourier_app::perf`: 200
-  conversations, 50,000 messages = 101,166 events, 3,654 attachments = 7,308 blob files, the
-  history ending 10 minutes before now; about 40 s, and again whenever the measuring binary
-  changed, so a schema change is never measured as a migration at start). It starts a private
+  conversations, 50,000 messages = 101,166 events, 3,727 attachments = 7,454 blob files, the
+  image-heavy last chat with phone-screenshot shapes (216 x 468, 225 x 400) and albums of 2 to 6
+  pictures of mixed shapes since the whole-picture step, the history ending 10 minutes before
+  now; about 40 s, and again whenever the measuring binary changed, so a schema change is never measured as a migration at start). It starts a private
   D-Bus session with a mock notification server and tray host (`kourier-desktop` example
   `mock_session`, one per app run) and runs the app offscreen on copies of the profile: 10 plain
   starts that are quit through the tray menu, 3 starts with Kourier's own files evicted from the
@@ -5995,7 +8891,8 @@ its measurement; leftovers of phase I's open list in core, Signal and UI; 2026-1
 - §9.6 changing the option (`runtime::set_expiry_policy`, `expiry::set_policy`): the row is
   stored and the hide and show step runs in one transaction; a change to `erase` also hides
   there every message that is due and still shown (`DUE_AND_SHOWN`), in all accounts, and the
-  sweeper, woken at once, erases them in its batches. All six directions between the three
+  command erases them in the sweeper's batches before it returns (the sweeper's own look at
+  the same time finds what is left: one writer). All six directions between the three
   options are tested with a read right behind the command. A store that fails leaves the
   option and every message as they were and is reported as `UiEvent::ActionFailed { account:
   None, action: "SetExpiryPolicy", subject: ActionSubject::None, .. }` with an error whose
@@ -6787,12 +9684,36 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   Otherwise the topmost row in the viewport, by its top edge (`held`): after a change the
   view is put back so that row is where it was (`settle`, asked for by the model's
   `rowsInserted`, `rowsRemoved` and `dataChanged` before the list lays the change out, and by
-  the content height, the list's height and the held row's `y`). A list alone does not keep a
+  the content height, the list's height and the held row's `y`; the last two are corrected at once, in the frame that
+  changed them, not one event later). A list alone does not keep a
   reader's place: a row inserted at index 0 takes the place of row 0 when row 0 reaches into
   the viewport and pushes the rows up (a newest message taller than the window is always in
   the viewport), and a row below the viewport that changes its height moves everything
   above it, because a BottomToTop list lays its rows out from the newest one it has made. So
   for a reader a row grows downward, and a window that changes its height keeps its top.
+- The held row is never left empty while the view does not follow (2026-10-15, the load
+  flakes of `scroll_ui`). A `ListView` lays out pending model changes inside a write of
+  `contentY` (the move makes it refill), before it says that `contentY` changed: the held row
+  moved by an arrival, `realign` put it back where it stood before the wheel step, and the
+  step was lost. And a move cleared `held` while `rest` held a row again only a moment later:
+  a layout in between (a polish that runs first, `settle`) was taken for where the user left
+  the view, and the row being read stayed moved by the arrival's height (178 of 240 px; with a
+  reaction's row -28 px). Now a move holds the row at the top at once, `realign` first takes a
+  move still in progress (the held row's place moves with the view, then the layout's push is
+  put back), `rest` holds the row at the top again, and a removal of the held row holds the
+  topmost row that stays before the list lays it out. `scroll_ui` forces both orders in its
+  third and fourth wheel steps; the old code fails them in every run.
+- A change of the list's height is put right in the frame that made it. The composer is the page's footer, so a composer
+  that grows (an edit starts, a new line, the reply banner) or shrinks (save, cancel) is a list that changes its height,
+  and so is a resized window. `onHeightChanged` calls `settle()` itself: following, the newest message is put back above
+  the composer; holding a row, the held row is put back where it stood (a window that changes its height keeps its top,
+  in every frame). Queued one event later (`keep`), the correction would come after the frame had been drawn: at the
+  newest message a frame with the last message under the composer (30 px for an edit start, 116 px for a long one), in the
+  middle every row moved by the composer's whole change for one frame (12 to 124 px) and back. At a display scale of 1.25
+  the late correction would also lose following for good (a sub-pixel write in that frame is taken for the user's own
+  scroll). Signal Desktop does the same on a size change (`Timeline.dom.tsx`: scroll to the bottom when near it, else
+  keep the top, before the paint). Proof: `crates/kourier-qt/tests/edit_jump_ui.rs` judges every frame of a change of the
+  composer's or the window's height at scales 1 and 1.25.
 - Not solved. The wheel handler animates to positions it fixed when the event came: a row
   that arrives or goes during the 200 ms of that animation moves the rows once by its height
   (the view cannot correct a position the next animation step overwrites). A change that
@@ -6802,7 +9723,8 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   scrolled away: a first attempt to keep the row (no reset while a row stays) is kept as
   `target/ui-context/reset-rework-unfinished.patch` and was not finished. The
   first Up or Down in a timeline that has no current row makes the newest message current
-  and goes there, wherever the view was (the keyboard design of phase G).
+  and goes there, wherever the view was (the keyboard design of phase G). A wheel step that starts at the
+  newest message while the view follows, with an arrival laid out inside its write, moves the rows by the arrival's height less.
 - The test, `crates/kourier-qt/tests/scroll_ui.rs`: the real `MainWindow` in a `QApplication`
   with `QT_QUICK_CONTROLS_STYLE=org.kde.desktop` and `QT_QPA_PLATFORMTHEME=kde`, real wheel,
   mouse, key and touch events (`TestEvent`), one session run in two child processes with a
@@ -6823,6 +9745,8 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   fails at the first wheel step: "after the wheel: the view went back to the newest message
   (following true, … wheel events sent 1 and taken by the style's handler 1, movements the
   list reported 0 …)".
+  Every frame also has every row with a delegate right above the newer one, and a row made current by a key is in view
+  when the key is over.
 - Fixture and fake, for that test: `FixtureOptions::arrivals` (`kourier_app::Arrivals`)
   appends to the fixture script what happens after its data: the peer of the showcase chat
   with the timer sends a message every `every`, read on arrival and gone `lifetime` later.
@@ -6838,7 +9762,9 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   `graphemeAndLinkAwareSlice`: 800, 3,000, buffer 100), counted in grapheme clusters instead
   of UTF-16 units (`unicode-segmentation`). The cut is made in
   `kourier-viewmodel/src/readmore.rs` on the text and its ranges, before the RichText is made,
-  never on HTML. It never falls inside a grapheme cluster, a link (a bare URL or a link range)
+  never on HTML. The shown part links what the whole text links, so a word cut right after what would be its TLD
+  (`foo.debar`) is no link. The cut never falls inside a grapheme cluster, a link (a bare URL, an address
+  without a scheme or a link range)
   or a mention: it moves to the end of the one it falls into. A formatting range (bold,
   italic, strike, monospace, spoiler) that crosses it ends at it, so the shown part is a
   `Text` of its own and its markup is well formed. As in Desktop the cut can fall inside a
@@ -6935,6 +9861,117 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   profile seeded once per screenshot run, a shorter fixed wait before a screenshot (done by S1: none),
   `kourier-core`'s test files as one binary, the two kill-at-every-failpoint loops on 7
   threads, and a 20 s fixed wait in the rehearsal's `step send`.
+
+- People pages P1 (the person's page, 2026-10-20; his words: "Also I see that there no support for opening User's
+  pages."; his answers in `target/next/people-pages-decisions.md`). core.db SCHEMA 18 (`0018_people.sql`:
+  `contacts.about`, `about_emoji`, `number_shown`, no row converted; the next people step takes 0019), Signal
+  backend.db SCHEMA 24 (`0024_phone_sharing.sql`: `peers.phone_sharing`, `peers.profile_tried_at`, `job_holds`, `account.number_verdicts_stated`; A10 moves to 0025). The contract
+  (`Contact`, `ContactPatch`), the Signal profile fetch (about, the 24 h throttle, the own profile, the number
+  rule, §6.10), `Query::Person` and `UiCommand::RefreshContact` (§4.2), `PersonView` and the trio
+  `request_person`/`take_person`/`close_person` (§8.3), the panel inside `ChatPage` (§8.3) and the fixture page
+  `person`. Known limits: the page shows no media, no safety number and no Share or Copy Link yet (P4, P5); the
+  Signal about text of a person is fetched only for people a page is opened for and by the routine refresh; "Message"
+  never shows on a page opened from the person's own chat (it waits for the group page and the mentions, P2, P3).
+
+- People pages P2 (the group page and its member list, 2026-10-22; his taste answers in
+  `target/next/people-pages-decisions.md`). core.db SCHEMA 19 (`0019_group_page.sql`: `conversations.description`, no
+  row converted; the next step takes 0020). The contract (`Conversation.description`, `ConversationPatch.description`,
+  `ConversationFeatures.group_info: Option<GroupInfo>`, §3.4), Signal's stating of both (`ACCESS_ADMINISTRATOR = 3`, the
+  proto number, pinned by a test; a group stored before P2 is restated once at the next start), `Query::Group`
+  (§4.2), `GroupView` and the group trio (§8.3), the panel as a stack of levels (§8.3) and the fixture page `group`.
+  The mock harness's access constants were wrong (every mock group was admin-only: 3 is ADMINISTRATOR, 2 is MEMBER) and
+  are fixed: `createGroup` takes `attributesAccess` / `membersAccess`. Known limits: WhatsApp states no
+  description, rules or members yet (`group_info: None`, W6); the page cannot edit anything (no rename, no add or remove
+  member, no promote: P3 and later); a refused timer of a member's chat reports under the OPEN chat's composer (rare:
+  the combo offers allowed values only); the history import's server-snapshot group gets its description with its
+  first fetch.
+
+- People pages P3 (senders and mentions open the person, 2026-10-23; no schema change). The `authorId` timeline role,
+  one `TapHandler` per row, `ChatPage.openSender` (the person opened from the timeline is the panel's only level when it was closed, else it stacks on the levels),
+  `App.showPersonInChat`, the stacking of that page on the panel's levels (`DetailsPanel.pushPerson`), the mention link `kourier:mention/<i>` (`RichText.mentions`, `mention_spoilers`; the scheme is
+  made in `richtext::render` only, `allowed_href` and `ALLOWED_SCHEMES` unchanged), `TextBlock.openMention`, the mention's
+  look kept by `colorLinks` (§8.3, §8.4). Known limits: a sender's name and picture are mouse and touch only (the keyboard
+  reaches a person through the message menu: "Show Sender's Page" and one entry per mentioned person); a mention under a spoiler has no menu entry whether revealed or not; a mention of a person the account has no contact for opens a page with the fallback name.
+
+- People pages P4 (media and files of a chat, 2026-10-23; his words, round 3: "Media and Files" last, a part with
+  nothing in it left out). core.db SCHEMA 20 (`0020_chat_media.sql`: the columns `messages.media_visual` and `media_files`,
+  three triggers on `attachments` that keep them and the two PARTIAL indexes over the media rows of each kind, no table
+  rebuilt, no text converted; the next step takes 0021). `Query::ChatMedia` (§4.2), the
+  five gallery slots of the viewmodel (the fifth is the picture viewer's own query) and `MediaRow` (§8.3), `MediaListModel`, `MediaSection` / `MediaTile` /
+  `MediaPage` and the level "media" of the panel (§8.3) and the fixture page `chatmedia`. Measured in a release build
+  (`target/next/p4-build.md`, Fix round): the section's statement in a chat of 50,000 texts and 21 pictures 0.154 ms; in a chat of 20,000 pictures and 5 files the section 0.141 ms, the level's page 0.236 ms and the Files page 0.144 ms. Known limits: no Save All for a whole gallery and no date headers in the grid (the file rows are the timeline's own: Download, Open, Save); the viewer opened from a square saves the picture it shows (its item carries `save` from `ChatMediaItem.save`); a video opens in another
+  application (there is no in-app player); the squares of a section are no Tab stops (a screen reader presses one through its accessible action); the section has ONE stop, the button "All Media and Files" (shown whenever the section is), and the level's grid takes the arrow keys, Return and Space, so every picture has a keyboard way (P1's `focusCover` step presses Tab 26 times, not 24, since the person page has 14 stops now, after waiting for the section's stop to be there, and asserts the item the count was made for: with the `herEsc` / `herField` fix for the modal timer dialog's overlay, these are the edits of P1-P2 steps in P4, besides next-step targets); the live download progress of a square is applied between two reads of the
+  chat (`Progress::Download` overlays a Downloading row); the grid and the list ask for the next page by the view's own position, a
+  screen reader meets the rows loaded so far; a group's gallery is read by the core only while a page of it is on screen.
+
+- People pages P5a (Verify: the safety number, 2026-10-25; his taste answers and the lead's calls in
+  `target/next/people-pages-decisions.md`, P5 section). core.db SCHEMA 21 (`0021_verified_notice.sql`: the quiet
+  VIRTUAL column dropped and added again with the prefix of `SystemEvent::VerifiedChanged`, no row rewritten; the next
+  step takes 0022); NO Signal backend.db migration (BQ-9: no per-key approval column; 0025 stays A10's). The contract
+  (`TrustLevel::Changed`, `VerifyState`, `SafetyNumber`, `SafetyUnavailable`, `Command::SafetyNumber` / `SetVerified` /
+  `ConfirmIdentity { key, reply }`, `BackendNotice::IdentityTrusted`, `NetworkDescriptor.safety_numbers`, §3.3, §4.2), the
+  Signal side (the number from libsignal's `Fingerprint` of the ACI keys, version 2; Mark / Clear / Confirm of the SHOWN
+  key; the outgoing `VerifiedSync` job (`needs_online`, sent only while key and state equal the stored row); the incoming
+  Verified sync and Storage record of the same key; B1: the refused send archives every session with that person; jobs to
+  a state-2 person wait locally, §6.6, §6.9), the core's release rules (§4.8), the hex cut of the log (§9.1), the level
+  "safety" and the message menu's entry (§8.3) and the fixture pages `safety` and `safetychanged`. Known limits: Key
+  Transparency is out of scope; no camera scan of the other phone's code (Kourier shows its own code); a DEFAULT contact's
+  pause is TOFU (one stop, a UX stop like Desktop's dialog, R1); a Verified sync already on the wire when the phone's newer
+  sync arrives tells the phone the older state once, and a phone click that reaches the server only after our catch-up
+  loses to ours (both need a stored last-click time, a migration: not in P5); WhatsApp, Telegram and Threema show no
+  safety number yet (`safety_numbers: false`).
+- People pages P5b (Copy Link, 2026-10-25): no schema change. The contract's `Network::contact_links` /
+  `contact_link` and `is_e164` (§4.2), Signal's `https://signal.me/#p/<+E164>`, `PersonDetail.link: LinkState` with the
+  number rule (§4.2), the button under "View Safety Number" (§8.3). Known limits: no Copy Link on the own page (BQ-4; his
+  link of choice is the phone's username link, which only the phone can make); a person whose number was never said to
+  be shown gets no link even when the address book knows the number; WhatsApp, Telegram and Threema have no links yet.
+- People pages P5c (Share Contact, 2026-10-26): no schema change. `UiCommand::SendContact`, `PersonDetail.share:
+  ShareState`, the core-built card (profile name + the shown number, §4.2), `ConversationRow.can_send`,
+  `NetworkDescriptor.contact_cards` (§3.3), Signal's `DataMessage.contact` (§6.7), the button and the picker (§8.3),
+  the fixture page `share`, the e2e `signal_share::a_contact_card_reaches_ada`. Known limits: Signal cards are SENT
+  only; receiving them typed waits for the kinds step (BQ-10), until then they show as unsupported; a person without
+  a Signal profile name, or whose number is not shown, has no card (no address-book name, never his nickname, SC1);
+  no picture on the card (his "Profile name + number"); one card per message and one number; no Share on the own page
+  (BQ-4); WhatsApp, Telegram and Threema send no cards yet (`contact_cards: false`). SD6, two more known limits:
+  the profile name goes whole into `givenName` (no `familyName`: the contact row stores the joined name, so Android and
+  Desktop show it as sent, but a name whose family part comes first (CJKV) reads in the joined order and an "Add to
+  contacts" on Android puts the whole name in the first-name field); a card is frozen when it is queued and is not
+  re-checked when it finally goes out (a number the person turns off while the card waits behind a pause or an offline
+  account goes out as it was built, as on Android: the decision was his click while the number was shown). SE4, one
+  more: a card can hand out a number the person did not publish on Signal (Signal's number rule shows a number also
+  when the phone's address book gave it or when Kourier holds no profile key for the person, `peers::number_shown`, as
+  Desktop's `getE164` does), as Signal Android's own contact picker does; SC3 allows it, the page shows the same number.
+- Blended chats (2026-10-27; his request and answers in §8.3, the keys in §8.9, the filter and rows in §8.4): no
+  schema change. Built as designed except: (a) Shift and Ctrl+click use PASSIVE `TapHandler`s and drop the
+  delegate's following click, not `ReleaseWithinBounds` (measured: the delegate's press takes the grab and the
+  handler is cancelled); (b) the narrow window's hidden-unread pill is drawn by the list page's title delegate
+  over Kirigami's toolbar menu button, not on `drawer.handle` (invisible while closed), and the title delegate
+  is Kirigami's own while the page is out of its row (§8.3, fix round U1/U2); (c) a hidden
+  account's transfer and its needing-the-user states show whatever the choice (H6). Known limits: a chat only
+  marked unread counts in the taskbar total but not in the hidden accounts' pills (L1); the narrow pill sits on the
+  list page's menu button only, in the chats and the archive view (a chat page's has none); the badge digit follows the avatar's size, not the font
+  (his "12 / 9 logical px" at the default font: at 14 pt it stays about 8-11 px, UI-9); with ONE account the
+  panel, its tint and the title are as before blending (M12); the pictures are made with a WhatsApp account
+  whose fake pushes its history as one script batch (no transfer banner). Pages `accounts` and `accountsdrawer`
+  hold three accounts (`FixtureOptions::accounts`).
+- A10 (2026-10-29): backend.db SCHEMA 25 (`0025_storage_writes.sql`: `account.roaming_writes`,
+  `storage_generation`, `storage_intent_seq`, `storage_records.target`, `storage_records.ours`,
+  `storage_intents`, `storage_write_inflight`, `storage_write_times`; no row converted, every account's switch
+  off).
+- KT-2 (cloud ids and read positions in the core, 2026-11-01 to 11-04; §3.1, §3.5.1, §3.5.2, §3.8, §4.2, §4.8 step 3, §4.9, §5.4; the brief
+  with the critic's changes, two reviews, a fix round and a re-check are `target/wa/kt2/{brief,critic,review-1,review-2,fix-a,fix-b,recheck}.md`): core.db
+  SCHEMA 23 (`0023_cloud_ids.sql`, the number is the next free one at landing; no row converted, no table rebuilt). Built as designed except
+  what the critic and the reviews changed: `AssignedId.seq` is plain, the re-key runs in two parts around `finish_attempt` and its second part
+  in a savepoint, the queue rewrite leaves the message's own `req.local`, call lines take part in positions, positions are bounded by
+  `MAX_NET_SEQ`, and the unread rows that have a position have an index of their own (`messages_unread_seq`, re-check N1). His M8 answer,
+  "Keep the line (Recommended)": a delete for everyone the network did not attribute stays a tombstone, `Deletion::Unattributed`. Nothing
+  changes for Signal, WhatsApp and Threema (every new field is absent or off) and the real Telegram descriptor keeps `ServerRules` off until
+  the Telegram lane maps onto it; the fake's `Flavor::TelegramLike` plays it. Known limits: a row rewritten while it is `Transmitting` is
+  overwritten with its attempt's request when the attempt fails (only a late echo can cause it, and the network's map still resolves the
+  id); parked receipts under an alias and a removal that remembers aliases have no network path; positions compare only within one id
+  space, so a conversation that moved to another (a basic group upgraded to a supergroup) is not a plain merge, and no path does that
+  today; no test pins that the fake commits the echo before the answer (the other order is proved from the other side). Not in KT-2: the
+  Telegram mapping, history on demand (KT-3), T5's send path, any UI.
 
 ## 14. FOSS readiness track (user requirement, 2026-10-06)
 
@@ -7446,7 +10483,11 @@ go in that session. Research with sources (working notes outside this repository
       `in_deleted_chat`; a LIVE message still lists a deleted chat again);
       closing the window while the transfer or the update runs asks "Quit While …?" (the
       work goes on at the next start; the tray's Quit and the end of the desktop session
-      never ask).
+      never ask). A history a network PUSHES (WhatsApp, W4) asks first and says quitting now may lose
+      part of it (`QuitWork::History`, "Quit While History Arrives?", asked before the others,
+      while the fill banner shows; it does not promise a next start and does not say the phone
+      sends it only once: that is not established, the phone may upload a chunk again that got
+      no receipt).
     - A logout in the middle ends the transfer without an event (the backend deletes it
       with the login): the UI drops a running state when it sees the account logged out,
       and "Link Again" shows the steps of that login, never a transfer.
@@ -7546,7 +10587,8 @@ item 8 (Flatpak) and the Flatpak parts of items 10 and 12 move behind the first 
 with Flathub, AUR and the other channels of §14.3. What the first release needs instead
 is small: `cargo xtask dist` makes, from a clean commit, a binary archive of the installed
 tree (`bin/`, `share/` with the desktop file, icon, metainfo, catalogs, the licence and the
-third-party notices) and a source archive, with `SHA256SUMS`; the maintainer builds them on
+third-party notices), a source archive and a names archive (the binary's symbol table, split off
+by `cargo xtask dist`: the shipped binary has none), with `SHA256SUMS` and `SHA256SUMS.names`; the maintainer builds them on
 his own machine and attaches them to a draft GitHub release, when he asks for it. A binary
 archive is not portable the way a Flatpak is: it runs where the system has the Qt and KDE
 Frameworks it was built against or newer (the archive says which), so the source archive
@@ -7718,7 +10760,9 @@ keep is §8.10):
   `pending_derives` reads the whole attachment table on a blocking thread at every start.
   KCrash in a normal run was not exercised;
   a release build is non-dumpable, so DrKonqi gets the panic line but no backtrace (kept:
-  the keys in memory matter more). The window icon is the theme's icon of the application;
+  the keys in memory matter more). The shipped binary also has no symbol table (S-names), so a
+  `RUST_BACKTRACE=1` stack needs that release's names file beside it (`bin/.debug/`, found by the
+  debuglink `kourier-<build-id>.debug`); the panic line and the KCrash text do not change. The window icon is the theme's icon of the application;
   a run that is not installed has none there and gets the bundled file once the first
   frame is on screen (`kde::set_fallback_window_icon` in `App::ready`; user: "leave it as
   is. Or add icon after if it possible"), so the start does not load the SVG icon plugin.
@@ -7733,9 +10777,23 @@ keep is §8.10):
   desktop file without link handlers, icon, metainfo, catalogs, `LICENSE`,
   `THIRD-PARTY.html` with the crates by `cargo about` and a section for what is linked in
   and is no crate: SQLCipher, SQLite, BoringSSL, the Rust standard library; a generated
-  `README.txt`), a source archive (`git archive` of the commit the run started with) and
-  `SHA256SUMS`; the same input packs to the same bytes. The release binary is built in its
-  own target directory with `--no-default-features --features signal`, so it has no test
+  `README.txt`), a source archive (`git archive` of the commit the run started with), a names
+  archive (`kourier-<v>-linux-<arch>-names[-suffix].tar.gz`, one file `bin/.debug/kourier-<build-id>.debug`)
+  and `SHA256SUMS` (binary and source) with `SHA256SUMS.names`; the same input packs to the same bytes.
+  The names come off AFTER the build, from the stamped binary: `objcopy --only-keep-debug` writes the
+  names file, `objcopy --strip-all --add-gnu-debuglink` the shipped file (about 51 MiB instead of 77);
+  the profile keeps `strip = "debuginfo"`, so every other build keeps its names. The tie is checked on
+  what was packed: one GNU build-id in the build output, the unpacked binary and the unpacked names
+  file, the debuglink naming `kourier-<build-id>.debug` with the names file's CRC (std's backtrace does
+  not check the CRC, gdb does; the per-build name keeps a stale file of another release from being
+  found), no `.symtab` in the packed binary, the dynamic symbols unchanged, and the names file searched
+  for private names like every packed file. Because the build cannot be repeated, a release's names
+  archive is copied out of `target/` (RELEASING.md step 3); whether it is also published is open (T-1).
+  Packagers: a Flatpak built from source strips and writes its `.Debug` extension from the unstripped
+  profile build (so never `strip = "symbols"` in the profile); an AppImage recipe (linuxdeploy strips
+  every ELF with a `strip` older than RELR) uses `names::split` or `NO_STRIP=1` after the split;
+  distro debuginfo tools work on the unstripped build as usual. The release binary is built in its
+  own target directory with `--no-default-features --features signal,whatsapp`, so it has no test
   network, and with every private path mapped away (`--remap-path-prefix` and
   `-ffile-prefix-map` for the workspace, the cargo home, the build directory and the
   toolchain): a plain build names the maintainer's home directory 1,331 times, this one
@@ -7746,7 +10804,8 @@ keep is §8.10):
   (`TODO(maintainer)` blanks, the placeholder id, tracked files naming private paths, no
   repository address), `-unreleased` for any other run from a clean tree, `-dirty` for a
   tree with changes. After packing the archive is unpacked and checked: the exact set of
-  paths, modes and owner, `--version`, `--fixture` refused, no measuring build, no link
+  paths, modes and owner, `--version`, `--fixture` refused, `--print-networks` on a profile that turns
+  WhatsApp on names it nowhere (a release build neither registers nor lists it), no measuring build, no link
   scheme in the desktop file, the notices, the validators, and that the source archive is
   the commit. `README.txt` states what the binary needs as read from it: glibc 2.38, Qt
   6.11 (it uses three symbols of Qt's private API, which hold for one minor version), the
@@ -7762,7 +10821,8 @@ keep is §8.10):
   `panicked at <file>:<line>:<column> on thread "<name>"`. The panic's message is never
   part of it (`unwrap`, `expect` and `assert_eq!` print the values they failed on); a
   dependency's file is shown without the registry path; the line passes `logging::redact`,
-  goes to the log and to the front-end's sink, and then the previous hook runs.
+  goes to the log and to the front-end's sink, and then the previous hook runs. The line is the same
+  with the stripped release binary: the file comes from `core::panic::Location` in `.rodata`.
 - Avatar shape (user, 2026-10-08: "add option to force disable avatars rounding. May be
   this should also be theme-dependent"). Settings > General > "Round avatars"
   (`round-avatars` in `kourier.toml`, default on, a shared preference: §8.10 R7). Off,
@@ -7775,7 +10835,8 @@ keep is §8.10):
   new request, so the avatars on screen change at once. `Avatar.qml` draws the tinted
   shape, the initials and the glyph itself, because Kirigami Add-ons' `Avatar` draws a
   fixed circle outline. The notification avatar takes the theme's corner as a share of the
-  side from QML (`App.settings.avatarCorner`; Breeze's share until the window has said).
+  side from QML (`App.settings.avatarCorner`; Breeze's share until the window has said). Like it,
+  `blend-accounts` and `hidden-accounts` (§8.9) are shared preferences of `kourier.toml`.
 - Two CI tiers (user, 2026-10-08: "tests should be optimized or there should be some lower
   count subset to test regularly and full set for bigger cases"). `cargo xtask ci --quick
   [--since <rev>]` (`xtask/src/quick.rs`): rustfmt, clippy, deps-check, the unit tests of
@@ -7789,6 +10850,65 @@ keep is §8.10):
   through `cargo test` (unit tests 44 s, `kourier` 26 s, `kourier-qt` 233 s) and 2.1 through
   nextest (23 s, 17 s, 87 s), same tree and machine. Still open from the
   audit of waiting times: the rest of its list.
+- Quiet notices stay out of the chat list (user, 2026-10-15; §3.4, §8.4, §8.9). core.db is
+  SCHEMA 15 (`0015_quiet_notices.sql`: the generated column `messages.quiet`, an UPDATE of
+  `conversations.last_activity` to the newest listed row, so the migration moves every chat that
+  ended in a quiet notice down once, and a one-time `hidden = 1` for the chats that hold only
+  quiet notices, §3.4), `stage::FORMAT` is 7, and the kept smoke profile needs
+  `smoke backup` and `start --allow-schema-change` for core.db too. Four kinds are quiet
+  (`SystemEvent::is_quiet`: IdentityKeyChanged, SessionRefreshed, NumberChanged,
+  MessageRequestAccepted); Signal Desktop and Android also leave a member leaving a group
+  (`MemberLeft`) out of the list, which Kourier keeps in it on his word (group changes still
+  show). The
+  choice is `UiCommand::SetQuietNotices` / `Query::QuietNotices`; the ingest guard never reads it
+  (a quiet notice opens no chat and brings no deleted chat back, as Desktop's keychange gives no
+  `active_at`); no chat is left out of the list for its rows (§3.4: the migration hides the old
+  all-quiet chats once). Measured:
+  `cargo xtask perf --start` before and after (median of five cold starts, the 400 ms budget),
+  in `target/next/quiet-build.md`.
+- K-A, the network shows up honestly (user, 2026-10-15/16; §3.8, §4.3-§4.5, §4.8, §7.4, §8.3, §8.9,
+  §10.2): everything the user sees of WhatsApp before its backend exists, built and pictured on the
+  fake network. No core.db or backend.db migration (core.db stays 15, backend.db 22, `stage::FORMAT`
+  unchanged). The contract gained, all `serde(default)`: the descriptor flags `history_transfer` and
+  `experimental`; `Restriction`, `BanReason`, `LogoutCause` and `NetworkNote` on `ConnState::Restricted`
+  and `LoggedOut`; `AccountHold` as a state the backend reports (`BackendEvent::AccountHold`) and the
+  core honours in the outbox; `ErrorKind::TooManyDevices` and `ReachOutRefused`. The switch is the
+  app's (`networks-on`, `pending-link`, Restart Now), the core has no new state, and a paused
+  account is defined and tested (§4.3). The viewmodel owns every text (warning, steps, restriction
+  reasons, the 463 line: R4); the UI has the warning page, both link ways, the "Networks" group of
+  Settings and the banners. Ten fixture pages (`networks` `warisk` `waqr` `waphone` `wacode`
+  `wahistory` `waban` `walock` `waoff` `wafailed`; 59 pages, 236 pictures), `--fixture-network`.
+  Left on purpose: the WhatsApp backend (W2), the `passkey` and confirmation-code steps (W9, ids
+  reserved), a group-wide reach-out hold (W5 may add one), the logout cause across a restart.
+  Measured: `cargo xtask perf --start` before and after in `target/next/ka-build.md`.
+- W2c, Kourier never signs a pairing the login's rules refuse and stores nothing of the other account (2026-10-17; §7.1 "Linking"; decisions `target/wa/w2c-decisions.md`, design D1 of `target/wa/t1-decisions.md`):
+  the WhatsApp backend refuses a pairing BEFORE the device exists, through the client's one stanza interceptor, and answers upstream's own
+  pair error (500 `internal-error`). One contract addition, `ErrorKind::NotTheExpectedAccount` (the wrong phone of a run with an expected
+  number tail; its words are the viewmodel's, a KDE context and a Ukrainian draft). No core.db or backend.db migration. Beside it: the
+  app drops every `KOURIER_DEV_*` variable from the environment of the programs it starts (`xdg-open`) and Restart Now drops the
+  expected tail alone (the one secret; a run with `--dev-control` never restarts), because the tail sits there; a fixed log token and
+  the development state say whether the number check is on (`expected_number_check`).
+  Wire tests (a scripted server that plays the phone and signs a pairing upstream WOULD complete) prove that a wrong scan gets no
+  `pair-device-sign` and a right one still does (the two stay in one tier). Left: what the phone shows after the 500 (R1 observes it).
+  Signal's own expected-tail refusal carries the same `NotTheExpectedAccount` (one cause for both networks). The words say "Kourier did
+  not link it", never "nothing was linked" or that the phone never lists the device: the primary signs its half before the server
+  sends the pair-success, and what the phone shows after the 500 is in no source.
+
+- W4, the WhatsApp history at the link (2026-10-18; §7.1 "History (W4, as built)", §4.7, §4.10; decisions `target/wa/w4-decisions.md`, design
+  `target/wa/briefs/w4.md` with its critic): the phone's chunks are made durable in a stage file of their own before upstream tells the phone, and
+  reach the core exactly once in the backend's appends whatever kills the process. Migrations: `backend.db` 4 (`0004_history.sql`: `history_announced`,
+  `history_cursor`, `history_delivery`, `history_chats`, `history_chunks`, `history_deferred`, `history_counts`, `history_live`) and the stage's own
+  schema component `whatsapp-history-stage` v1; `core.db` stays 17. The contract gained, both `serde(default)`:
+  `BackendNotice::HistoryLost { count }` (a durable notice, once per start until the core took it) and `NetworkDescriptor.shutdown_grace` (the
+  network's own stop grace: WhatsApp 20 s, the core's 5 s for the rest; the application's limit for the core is the largest grace plus 5 s). The
+  viewmodel gained `QuitWork::History` ("Quit While History Arrives?") and `BannerKind::HistoryLost` (a quiet line, the lowest kind, one per account);
+  the fixture page `walost` makes 62 pages (248 pictures); 793 messages in the catalogue, uk 793/793. Proof: unit tests for every piece, a kill loop
+  over the real driver and stage (`history::kill::`, eight kill points, the sample in the regular set and the loop ~19 s under the cap), a core pin
+  that a revoke before or after the history copy never brings the body back under `ConversationAuthor` ids, and the Wire tests of
+  `tests/history_wire.rs` (a real client with Kourier's own adapter: no `hist_sync` receipt while the stage's writer is parked; live texts and a chunk
+  interleave under one conversation key). Left on purpose: older history on demand (K-B2), the kept items (stubs and former members; the call records are taken up since W6a1),
+  a way to dismiss the lost-history line, the first real push (R1: Chat Lock is re-decided there, and what the phone sends in
+  practice). Binary size: see the table in §1.3 (measured at the end of W4).
 
 ### 14.3 Soon after R1
 

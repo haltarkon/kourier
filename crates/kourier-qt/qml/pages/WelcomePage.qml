@@ -63,7 +63,9 @@ Kirigami.ScrollablePage {
 
         FormCard.FormCard {
             Repeater {
-                model: App.networks
+                // A network this build cannot log in to is a row of Settings only, never a choice
+                // (`missing`: the viewmodel's word for it).
+                model: App.networks.filter(n => !n.missing)
                 delegate: ColumnLayout {
                     id: entry
 
@@ -78,7 +80,7 @@ Kirigami.ScrollablePage {
                     }
                     FormCard.FormButtonDelegate {
                         text: entry.modelData.name
-                        description: entry.modelData.description
+                        description: entry.modelData.experimental && !Style.networkWanted(entry.modelData.kind) ? entry.modelData.offDescription : entry.modelData.description
                         icon.source: Style.icon(entry.modelData.icon)
                         icon.width: Kirigami.Units.iconSizes.medium
                         icon.height: Kirigami.Units.iconSizes.medium
@@ -91,7 +93,8 @@ Kirigami.ScrollablePage {
         }
 
         FormCard.FormSectionText {
-            text: L10n.i18nc("@info", "Kourier links as an additional device: your phone stays the main device, keeps your message history and can send a copy of it.")
+            // The viewmodel's choice by what the networks of the list can do (U7).
+            text: App.networksNote
         }
     }
 }

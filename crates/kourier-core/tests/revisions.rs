@@ -2,7 +2,7 @@
 //! their times, for the edit history behind the "edited" mark; and the account's own number
 //! (`AccountReady.number`), which follows a number change.
 
-mod support;
+use crate::support;
 
 use kourier_backend_api::BackendEvent;
 use kourier_core::facade::{MessageRevisions, Query, QueryData, UiCommand};

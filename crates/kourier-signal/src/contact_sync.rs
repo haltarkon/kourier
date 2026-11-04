@@ -343,6 +343,8 @@ fn apply_zone(
                 kind: IdentifierKind::Phone,
                 value: number.to_owned(),
             }]);
+            // The phone's address book knows them: a system contact shows (the rule decides).
+            patch.number_shown = Some(peers::number_shown(tx, &contact.sid)?);
         }
         if let Some((file, hash)) = written.get(&contact.sid) {
             patch.avatar = avatar::record(
@@ -407,11 +409,19 @@ fn apply_zone(
                     continue;
                 };
                 let before = peers::load(tx, &sid)?;
+                let shown_before = peers::number_shown_before(tx, &sid)?;
                 tx.prepare_cached("UPDATE peers SET in_contact_sync = 0 WHERE service_id = ?1")?
                     .execute([&sid])?;
                 let after = peers::load(tx, &sid)?;
                 let mut patch = ContactPatch::new(user.clone());
                 patch.system_name = Patch::Clear;
+                // The address book was an input of the number rule: restate the verdict when
+                // the person's leaving it changed it (P1 F3).
+                if let Some(BackendEvent::ContactUpsert(stated)) =
+                    peers::number_shown_event(tx, &user, &sid, shown_before)?
+                {
+                    patch.number_shown = stated.number_shown;
+                }
                 events.push(BackendEvent::ContactUpsert(patch));
                 // Out of the address book: a chat the core has may no longer be accepted
                 // (`with_features` sends its new features).

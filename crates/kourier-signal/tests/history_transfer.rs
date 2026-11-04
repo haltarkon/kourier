@@ -23,7 +23,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (set `KOURIER_REQUIRE_MOCK_HARNESS=1` to fail instead).
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -402,6 +402,9 @@ impl World {
 /// (a) and (i): a fresh link with a transfer, end to end, and the time the link took.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_link_takes_the_history_transfer_before_it_receives() {
+    if support::in_own_process!() {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt as _;
 
     let Some(world) = World::start().await else {
@@ -1289,11 +1292,17 @@ async fn a_download_that_trickles_past_its_deadline_fails_the_transfer() {
     let Some(world) = World::start().await else {
         return;
     };
-    // A deadline of three seconds; the stall time stays far away (a minute).
+    // A deadline of eight seconds; the stall time stays far away (a minute). The deadline
+    // counts from the start of the download, before its first request: on a loaded machine
+    // (six mock tests side by side, ci's rule) the first request can fail or wait for its
+    // backoff, and with a deadline of three seconds that left no byte at all once (F7,
+    // 2026-10-15: "it was moving: [Waiting, Downloading { done: 0 }, Failed]"); the
+    // trickle itself makes more than a hundred requests a second, so it is moving long
+    // before the deadline.
     let bounded = network()
         .with_history_transfer_limits(1 << 30, Duration::from_secs(60))
         .with_history_transfer_download_bounds(
-            Duration::from_secs(3),
+            Duration::from_secs(8),
             0,
             Duration::from_secs(60),
             Duration::from_secs(600),
@@ -1333,18 +1342,33 @@ async fn a_download_that_trickles_past_its_deadline_fails_the_transfer() {
     );
     assert!(
         started.elapsed() < Duration::from_secs(30),
-        "by its deadline of 3 s, not by the stall time: {:?}",
+        "by its deadline of 8 s, not by the stall time: {:?}",
         started.elapsed()
     );
-    assert!(
-        linked
-            .seen
-            .transfer
-            .iter()
-            .any(|s| matches!(s, HistoryTransfer::Downloading { done, .. } if *done >= 64)),
-        "it was moving: {:?}",
-        linked.seen.transfer
-    );
+    if !linked
+        .seen
+        .transfer
+        .iter()
+        .any(|s| matches!(s, HistoryTransfer::Downloading { done, .. } if *done >= 64))
+    {
+        // What the server did, so that a failure explains itself (F7).
+        let stats = world
+            .harness
+            .request_value("downloadStats", serde_json::json!({}))
+            .await
+            .expect("downloadStats");
+        let served: Vec<&serde_json::Value> = stats["downloads"]
+            .as_array()
+            .map(|d| d.iter().collect())
+            .unwrap_or_default();
+        let sent: u64 = served.iter().filter_map(|d| d["sent"].as_u64()).sum();
+        panic!(
+            "it was moving: {:?}; the mock served {} requests ({sent} body bytes), the first {:?}",
+            linked.seen.transfer,
+            served.len(),
+            served.iter().take(3).collect::<Vec<_>>()
+        );
+    }
     world.expect_over("failed", Some("download"));
     world
         .expect_arrival(&linked.device, held, "waits for the trickle")
@@ -1731,12 +1755,11 @@ fn spawn_child(world: &World, frame_delay_ms: u64) -> tokio::process::Child {
         frame_delay_ms,
     };
     tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
+        .arg(support::child_filter(
+            module_path!(),
             "transfer_child_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())

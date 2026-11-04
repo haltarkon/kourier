@@ -29,7 +29,7 @@
 //! Skips without Node ≥ 24 or the harness's `node_modules` (`KOURIER_REQUIRE_MOCK_HARNESS=1`
 //! fails instead).
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
@@ -1178,8 +1178,11 @@ async fn a_timer_set_from_either_side_expires_messages_on_time() {
         "expired {took:?} after the phone read it"
     );
 
-    // -- our own message from the phone: its timer started when the phone sent it
-    let started = now_ms() - 2_000;
+    // -- our own message from the phone: its timer started when the phone sent it. The row
+    // carries the phone's start, which is the proof; a wall-clock bound cannot be one: with
+    // 2 s of the 3 gone before the send, a loaded machine delivered the message expired and
+    // the core removed it before the test could see it (Threema landing ci, 2026-10-26).
+    let started = now_ms() - 500;
     club.send(json!({
         "from": club.world.phone.aci, "to": me, "text": "sent from the phone",
         "timestamp": started, "expireTimer": 3, "expireTimerVersion": 2, "withProfileKey": true,
@@ -1187,25 +1190,16 @@ async fn a_timer_set_from_either_side_expires_messages_on_time() {
     }))
     .await;
     let since = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = None;
-    loop {
-        let rows = app.rows_with_text(conv, "sent from the phone").await;
-        match (rows.first(), seen) {
-            (Some(row), None) => seen = Some(row.id),
-            (None, Some(_)) => break,
-            _ => {}
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the phone's message never expired"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let row = app.wait_text(conv, "sent from the phone").await.remove(0);
+    assert_eq!(
+        row.expiry.and_then(|e| e.started_at),
+        i64::try_from(started).ok(),
+        "the timer starts when the phone sent it, not when it arrived"
+    );
+    let took = gone_after(&app, conv, row.id, since).await;
     assert!(
-        since.elapsed() <= Duration::from_secs(4),
-        "one second of its timer was left, not three: {:?}",
-        since.elapsed()
+        took <= Duration::from_secs(8),
+        "expired {took:?} after the phone's copy arrived (2.5 s of its timer left)"
     );
 
     // -- we change the timer: Ada and the phone get the update, the chat and timeline show it
@@ -1396,12 +1390,11 @@ async fn an_edit_and_a_reaction_are_sent_once_across_a_kill() {
         };
         let point = kourier_signal::failpoints::AFTER_MODIFIER_ENCRYPT_COMMIT;
         let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
+            .arg(support::child_filter(
+                module_path!(),
                 "modifier_child_process",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            ))
+            .args(["--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
             .env("KOURIER_FAILPOINT", format!("{point}:1"))
             .env(

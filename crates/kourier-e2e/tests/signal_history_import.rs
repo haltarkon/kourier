@@ -29,7 +29,7 @@
 //!
 //! Tests print counts and times only.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1636,7 +1636,7 @@ const DAVE: u32 = 902;
 async fn page(app: &App, account: AccountId, archived: bool) -> Vec<ConversationRow> {
     let query = ConversationListQuery {
         account: Some(account),
-        archived,
+        archived: Some(archived),
         limit: 500,
         ..ConversationListQuery::default()
     };

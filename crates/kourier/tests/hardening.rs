@@ -13,7 +13,7 @@
 
 #![cfg(debug_assertions)]
 
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -156,4 +156,352 @@ fn a_second_process_on_a_profile_is_refused_and_changes_nothing() {
     let mut again = started(kourier(&dir, &home), &dir.join("again.log"));
     drop(again.stdin.take());
     assert!(wait_exit(&mut again).success());
+}
+
+/// `kourier --print-networks` (hidden; `cargo xtask dist` runs it on the packed RELEASE binary): the
+/// real debug binary says which networks a start of the profile would register and which it would
+/// list as off, from `kourier.toml` of the profile: with WhatsApp switched on it registers it, else
+/// it lists it as off; Telegram it names in neither list, switched on or not, because the binary
+/// has no API pair (TG-2 critic H3: `Unavailable(ApiKey)` while on, `Absent` while off; none is
+/// compiled in, and the test's profile is no Telegram run profile). It is run as the dist check runs it (an empty environment but the profile,
+/// no display, no bus, no keyring service) and starts nothing: no window, and no data directory,
+/// database or lock is made on the profile.
+#[test]
+fn print_networks_says_what_a_start_would_register_and_starts_nothing() {
+    for (name, switched) in [
+        ("off", None),
+        ("on", Some("WhatsApp")),
+        ("telegram", Some("Telegram")),
+    ] {
+        let on = switched == Some("WhatsApp");
+        let text = switched.map(|kind| format!("networks-on = [\"{}\"]\n", kind.to_lowercase()));
+        let dir = scratch(&format!("print-networks-{name}"));
+        let home = dir.join("home");
+        let prefs = home.join("kourier/config/kourier.toml");
+        if let Some(text) = &text {
+            std::fs::create_dir_all(prefs.parent().expect("config dir")).expect("create");
+            std::fs::write(&prefs, text).expect("write prefs");
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kourier"))
+            .arg("--print-networks")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &dir)
+            .env("KOURIER_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start kourier");
+        let status = wait_exit(&mut child);
+        let (mut out, mut err) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("stdout");
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut err)
+            .expect("stderr");
+        assert!(status.success(), "{name}: {status:?}: {err}");
+        let line = out.strip_suffix('\n').expect("a line");
+        assert!(!line.contains('\n'), "{name}: one line: {out:?}");
+        let list = |key: &str| -> Vec<&str> {
+            line.split(' ')
+                .find_map(|w| w.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("{name}: no {key}= in {line:?}"))
+                .split(',')
+                .filter(|k| !k.is_empty())
+                .collect()
+        };
+        assert!(line.starts_with("networks registered="), "{name}: {line:?}");
+        // (A build without the WhatsApp backend has nothing to register or list; the switch still shows.)
+        let built = cfg!(feature = "whatsapp");
+        assert_eq!(
+            list("registered").contains(&"WhatsApp"),
+            built && on,
+            "{name}: {line:?}"
+        );
+        assert_eq!(
+            list("off").contains(&"WhatsApp"),
+            built && !on,
+            "{name}: {line:?}"
+        );
+        // The Telegram backend: this binary cannot log in (no API pair), so it is neither
+        // registered nor listed as off, whatever the switch says (critic H3).
+        assert!(
+            !list("registered").contains(&"Telegram"),
+            "{name}: {line:?}"
+        );
+        assert!(!list("off").contains(&"Telegram"), "{name}: {line:?}");
+        assert_eq!(
+            list("on"),
+            switched.into_iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+        assert_eq!(
+            list("registered").contains(&"Signal"),
+            cfg!(feature = "signal"),
+            "{name}: {line:?}"
+        );
+        // Nothing was started on the profile: the only thing below it is the file written above.
+        if let Some(text) = &text {
+            let mut files = Vec::new();
+            let mut walk = vec![home.clone()];
+            while let Some(d) = walk.pop() {
+                for e in std::fs::read_dir(&d).expect("read_dir") {
+                    let path = e.expect("entry").path();
+                    if path.is_dir() {
+                        walk.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+            assert_eq!(files, std::slice::from_ref(&prefs), "{name}: {files:?}");
+            assert_eq!(
+                &std::fs::read_to_string(&prefs).expect("prefs"),
+                text,
+                "{name}: the preferences were not touched"
+            );
+        } else {
+            assert!(!home.exists(), "{name}: the profile was made");
+        }
+    }
+}
+
+/// TR R0a A4, the run tool's probe: the real debug binary with `KOURIER_DEV_REHEARSAL=telegram` and
+/// `networks-on = ["telegram"]` says Telegram is REGISTERED (the scripted rehearsal fake holds the slot)
+/// although the binary has no API pair, no helper files and no run profile; without the switch the same
+/// profile registers it nowhere (the binary cannot log in); a value that is not a network fails the run
+/// without echoing it. It starts nothing: nothing below the profile but the preferences written here
+/// (no `tg-run` directory, no data directory, no file of Telegram's).
+#[cfg(all(feature = "telegram", feature = "fake"))]
+#[test]
+fn print_networks_registers_the_telegram_rehearsal_without_an_api_pair_and_starts_nothing() {
+    for (name, rehearsal) in [
+        ("rehearsal", Some("telegram")),
+        ("plain", None),
+        ("typo", Some("Telegramm")),
+    ] {
+        let dir = scratch(&format!("print-networks-tg-rehearsal-{name}"));
+        let home = dir.join("home");
+        let prefs = home.join("kourier/config/kourier.toml");
+        std::fs::create_dir_all(prefs.parent().expect("config dir")).expect("create");
+        std::fs::write(&prefs, "networks-on = [\"telegram\"]\n").expect("write prefs");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kourier"));
+        cmd.arg("--print-networks")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &dir)
+            .env("KOURIER_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(value) = rehearsal {
+            cmd.env("KOURIER_DEV_REHEARSAL", value);
+        }
+        let mut child = cmd.spawn().expect("start kourier");
+        let status = wait_exit(&mut child);
+        let (mut out, mut err) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("stdout");
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut err)
+            .expect("stderr");
+        if name == "typo" {
+            assert!(!status.success(), "{name}: the run went on: {out:?}");
+            assert!(
+                !out.contains("Telegramm") && !err.contains("Telegramm"),
+                "{name}: the value is repeated: {out:?} {err:?}"
+            );
+        } else {
+            assert!(status.success(), "{name}: {status:?}: {err}");
+            let line = out.strip_suffix('\n').expect("a line");
+            let list = |key: &str| -> Vec<&str> {
+                line.split(' ')
+                    .find_map(|w| w.strip_prefix(&format!("{key}=")))
+                    .unwrap_or_else(|| panic!("{name}: no {key}= in {line:?}"))
+                    .split(',')
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            };
+            assert_eq!(
+                list("registered").contains(&"Telegram"),
+                rehearsal.is_some(),
+                "{name}: {line:?}"
+            );
+            assert!(!list("off").contains(&"Telegram"), "{name}: {line:?}");
+            assert_eq!(list("on"), ["Telegram"], "{name}: {line:?}");
+        }
+        // Nothing was started on the profile: the only thing below it is the file written above.
+        let mut files = Vec::new();
+        let mut walk = vec![home.clone()];
+        while let Some(d) = walk.pop() {
+            for e in std::fs::read_dir(&d).expect("read_dir") {
+                let path = e.expect("entry").path();
+                if path.is_dir() {
+                    walk.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        assert_eq!(files, std::slice::from_ref(&prefs), "{name}: {files:?}");
+    }
+}
+
+/// The Threema twin of `print_networks_says_what_a_start_would_register_and_starts_nothing` (TH1,
+/// lane decision Q2; review F8: the same form): the real debug binary registers Threema while
+/// `networks-on` names it and, while it is off, lists it NOWHERE in a plain profile (TH4 decision E1:
+/// the backend can link, but only a PREPARED run profile, a kept profile with a list of test IDs,
+/// shows Threema as off; a plain debug start keeps it absent). The third case is that prepared
+/// profile, made the way the binary looks for it (`HOME`, no `XDG_DATA_HOME`): there Threema is
+/// listed as off and registered nowhere. Run as the dist check runs it, with a deadline; its stderr
+/// is part of a failure; nothing is made on the profile except the file written here, whatever the
+/// directory.
+#[test]
+fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
+    for (name, on, prepared) in [
+        ("threema-off", false, false),
+        ("threema-on", true, false),
+        ("threema-prepared", false, true),
+    ] {
+        // A kept run profile must be canonical: the scratch directory may sit below a link.
+        let dir = std::fs::canonicalize(scratch(&format!("print-networks-{name}")))
+            .expect("canonical scratch dir");
+        let keeper = dir.join(".local/share/kourier-threema-run");
+        let home = if prepared {
+            keeper.join("p")
+        } else {
+            dir.join("home")
+        };
+        let prefs = home.join("kourier/config/kourier.toml");
+        let ids_file = keeper.join("threema-allowed-ids");
+        // `printf 'kourier-threema-allow-v1:TESTID01' | sha256sum`: a synthetic ID.
+        let ids_text = "sha256:871ad9802d67bec50e0d5a9d2c4113efec962437723daac9d86b8f1e0ab82a87\n";
+        if prepared {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::create_dir_all(&home).expect("create the run profile");
+            std::fs::set_permissions(&keeper, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod the keeper root");
+            std::fs::write(&ids_file, ids_text).expect("write the list");
+            std::fs::set_permissions(&ids_file, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod the list");
+        }
+        if on {
+            std::fs::create_dir_all(prefs.parent().expect("config dir")).expect("create");
+            std::fs::write(&prefs, "networks-on = [\"threema\"]\n").expect("write prefs");
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kourier"))
+            .arg("--print-networks")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &dir)
+            .env("KOURIER_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start kourier");
+        let status = wait_exit(&mut child);
+        let (mut out, mut err) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("stdout");
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut err)
+            .expect("stderr");
+        assert!(status.success(), "{name}: {status:?}: {err}");
+        let line = out.strip_suffix('\n').expect("a line");
+        assert!(!line.contains('\n'), "{name}: one line: {out:?}");
+        let list = |key: &str| -> Vec<&str> {
+            line.split(' ')
+                .find_map(|w| w.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("{name}: no {key}= in {line:?}"))
+                .split(',')
+                .filter(|k| !k.is_empty())
+                .collect()
+        };
+        assert!(line.starts_with("networks registered="), "{name}: {line:?}");
+        let built = cfg!(feature = "threema");
+        assert_eq!(
+            list("registered").contains(&"Threema"),
+            built && on,
+            "{name}: {line:?}"
+        );
+        // E1: listed as off only in the prepared run profile (and registered only while on).
+        assert_eq!(
+            list("off").contains(&"Threema"),
+            built && prepared,
+            "{name}: {line:?}"
+        );
+        assert_eq!(
+            list("on"),
+            if on { vec!["Threema"] } else { vec![] },
+            "{name}"
+        );
+        assert_eq!(
+            list("registered").contains(&"Signal"),
+            cfg!(feature = "signal"),
+            "{name}: {line:?}"
+        );
+        // Nothing was started on the profile: the only thing below it is the file written above.
+        if on {
+            let mut files = Vec::new();
+            let mut walk = vec![home.clone()];
+            while let Some(d) = walk.pop() {
+                for e in std::fs::read_dir(&d).expect("read_dir") {
+                    let path = e.expect("entry").path();
+                    if path.is_dir() {
+                        walk.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+            assert_eq!(files, std::slice::from_ref(&prefs), "{name}: {files:?}");
+            assert_eq!(
+                std::fs::read_to_string(&prefs).expect("prefs"),
+                "networks-on = [\"threema\"]\n",
+                "{name}: the preferences were not touched"
+            );
+        } else if prepared {
+            // The profile is there (made above) and nothing was written below it; the list is
+            // still what was written, and still the only file of the keeper root.
+            let below: Vec<_> = std::fs::read_dir(&home).expect("read_dir").collect();
+            assert!(below.is_empty(), "{name}: the profile was written to");
+            assert_eq!(
+                std::fs::read_to_string(&ids_file).expect("list"),
+                ids_text,
+                "{name}: the list was touched"
+            );
+            let mut kept: Vec<_> = std::fs::read_dir(&keeper)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            kept.sort();
+            assert_eq!(kept, ["p", "threema-allowed-ids"], "{name}: {kept:?}");
+        } else {
+            assert!(!home.exists(), "{name}: the profile was made");
+        }
+    }
 }

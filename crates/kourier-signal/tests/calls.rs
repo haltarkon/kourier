@@ -23,7 +23,7 @@
     reason = "the shared support modules serve several test files"
 )]
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

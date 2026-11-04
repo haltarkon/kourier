@@ -342,18 +342,27 @@ pub(crate) fn remembered(
         MsgIdScope::Conversation => conn
             .prepare_cached(REMEMBERED_IN_CONV)?
             .query_row((account.0, local, conv_key, since), |r| r.get(0))?,
+        MsgIdScope::ConversationAuthor => conn
+            .prepare_cached(REMEMBERED_IN_CONV_BY_AUTHOR)?
+            .query_row((account.0, local, conv_key, author, since), |r| r.get(0))?,
     })
 }
 
 // Run for every new message: each must start from the local id (`expired_messages_by_key` or
 // a key of migration 14 that ends in it), never from all of an author's or a conversation's
 // expired keys (`tests::a_new_message_looks_up_its_own_expired_key`).
-const REMEMBERED_BY_AUTHOR: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
+pub(crate) const REMEMBERED_BY_AUTHOR: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
  WHERE account_id = ?1 AND net_local = ?2 AND net_scope = 0 AND net_author = ?3
    AND expired_at >= ?4)";
-const REMEMBERED_IN_CONV: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
+pub(crate) const REMEMBERED_IN_CONV: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
  WHERE account_id = ?1 AND net_local = ?2 AND net_scope = 1 AND conv_key = ?3
    AND expired_at >= ?4)";
+// Per-sender ids (K-B1): the key is the chat, the author and the id. It has three equal terms
+// on BOTH keys of migration 14 (`expired_messages_by_conv` and `_by_author`, each ending in
+// `net_local`), so whichever the planner takes starts from the local id.
+pub(crate) const REMEMBERED_IN_CONV_BY_AUTHOR: &str = "SELECT EXISTS(SELECT 1 FROM expired_messages
+ WHERE account_id = ?1 AND net_local = ?2 AND net_scope = 2 AND conv_key = ?3
+   AND net_author = ?4 AND expired_at >= ?5)";
 
 /// What a sweep changed, per account.
 type Swept = BTreeMap<AccountId, Changes>;
@@ -424,12 +433,12 @@ pub(crate) fn settle_at_start(conn: &mut Connection, now: i64, hold: &Hold) -> R
 
 /// `UiCommand::SetExpiryPolicy`: stores `policy` and, in the same transaction, hides or shows
 /// what it says about the messages that are due now in `unconfirmed` accounts. What it
-/// erases is the sweeper's next look (the caller wakes it): the rows and their files go in
-/// the sweeper's batches, not in this command. Until then, a moment later, what "erase by
-/// this computer's clock" is about to erase is hidden here, so that no read behind the
-/// command shows a message the new option does not allow (a message kept and readable under
-/// "keep" would otherwise show until the sweeper had its turn). Returns what changed per
-/// account.
+/// erases goes in the sweeper's batches ([`sweep_once`]), which the command runs itself before
+/// it returns (runtime.rs `set_expiry_policy`): a next change of the option, which waits for
+/// this command, can never show again what "erase" hid. Between this transaction and those
+/// batches, what "erase by this computer's clock" is about to erase is hidden here, so that
+/// no read in that moment shows a message the new option does not allow. Returns what changed
+/// per account.
 pub(crate) fn set_policy(
     conn: &mut Connection,
     policy: ExpiryPolicy,
@@ -452,7 +461,7 @@ pub(crate) fn set_policy(
 }
 
 /// The messages that are due at `?1` and still shown, in any account: under "erase by this
-/// computer's clock" the sweeper's next look erases every one of them.
+/// computer's clock" the command's own sweep, right after it, erases every one of them.
 const DUE_AND_SHOWN: &str = "expires_at IS NOT NULL AND expires_at <= ?1 AND expiry_hidden = 0";
 
 /// One look of the sweeper at `now`, in one transaction: hides and shows what `hold` says
@@ -542,7 +551,7 @@ pub(crate) async fn run(sh: Arc<Shared>) {
         };
         if !found.work {
             wait(&sh, found.next).await;
-        } else if !sweep_once(&sh).await {
+        } else if sweep_once(&sh).await.is_none() {
             wait(&sh, Some(retry_at(&sh))).await;
         }
     }
@@ -582,8 +591,11 @@ async fn wait(sh: &Shared, deadline: Option<i64>) {
     }
 }
 
-/// One sweep transaction and its publication; `false` when it failed.
-async fn sweep_once(sh: &Arc<Shared>) -> bool {
+/// One sweep transaction and its publication: whether expired messages are left beyond its
+/// batch, `None` when it failed. The sweeper runs it, and so does `SetExpiryPolicy` to "erase"
+/// before it returns (runtime.rs `set_expiry_policy`): the two are writes of the one writer, so
+/// whichever comes second finds only what the first left, and each file is listed once.
+pub(crate) async fn sweep_once(sh: &Arc<Shared>) -> Option<bool> {
     let state = sh.clone();
     let swept = sh
         .store
@@ -600,7 +612,7 @@ async fn sweep_once(sh: &Arc<Shared>) -> bool {
         .await;
     match swept {
         // Expired messages left beyond the batch are found by the next look at once.
-        Ok((done, _more)) => {
+        Ok((done, more)) => {
             for (account, ch) in done {
                 tracing::debug!(
                     account = account.0,
@@ -617,11 +629,11 @@ async fn sweep_once(sh: &Arc<Shared>) -> bool {
                     }
                 }
             }
-            true
+            Some(more)
         }
         Err(e) => {
             tracing::warn!(error = %e, "sweeping disappearing messages failed");
-            false
+            None
         }
     }
 }
@@ -644,16 +656,22 @@ mod tests {
             &[kourier_model::UserId::parse("aci:me").expect("user id")],
         )
         .expect("harness");
-        for sql in [REMEMBERED_BY_AUTHOR, REMEMBERED_IN_CONV] {
+        // The values of ?1.. of each statement (the last is always the time).
+        let by_author = ["1", "'1700000000000'", "'aci:carol'", "0"];
+        let in_conv = ["1", "'1700000000000'", "'d:carol'", "0"];
+        let in_conv_by_author = ["1", "'1700000000000'", "'d:carol'", "'lid:carol'", "0"];
+        for (sql, values) in [
+            (REMEMBERED_BY_AUTHOR, &by_author[..]),
+            (REMEMBERED_IN_CONV, &in_conv[..]),
+            (REMEMBERED_IN_CONV_BY_AUTHOR, &in_conv_by_author[..]),
+        ] {
+            let mut text = sql.to_owned();
+            for (i, v) in values.iter().enumerate().rev() {
+                text = text.replace(&format!("?{}", i + 1), v);
+            }
             let steps: Vec<String> = h
                 .connection()
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    sql.replace("?1", "1")
-                        .replace("?2", "'1700000000000'")
-                        .replace("?3", "'aci:carol'")
-                        .replace("?4", "0")
-                ))
+                .prepare(&format!("EXPLAIN QUERY PLAN {text}"))
                 .expect("prepare")
                 .query_map([], |r| r.get::<_, String>(3))
                 .expect("plan")

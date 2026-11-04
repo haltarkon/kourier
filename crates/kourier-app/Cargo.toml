@@ -5,12 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+# The integration tests are one binary, tests/it.rs (T3); a new tests/<name>.rs is a `mod` there.
+autotests = false
 
 [features]
-# Both are on by default during M1 development; a user build may drop `fake`.
-default = ["signal", "fake"]
+# All five are on by default; a user build may drop `fake`.
+default = ["signal", "fake", "whatsapp", "telegram", "threema"]
 # The Signal backend (libsignal).
 signal = ["dep:kourier-signal"]
+# The WhatsApp backend (whatsapp-rust). Compiled into every default build, but REGISTERED only in a
+# debug build and only while `networks-on` of `kourier.toml` names it (W2b, decision L1: a release
+# build, so every archive, cannot link a real account until the receive path and the send path have
+# landed; `app.rs` `whatsapp_registration`). Architecture §7.4.
+whatsapp = ["dep:kourier-whatsapp"]
+# The Telegram backend (TDLib in the `kourier-tdlib` helper process). Compiled into a default build,
+# but REGISTERED only in a debug build and only while `networks-on` of `kourier.toml` names it (TG-1
+# decisions D2: absent from Add Account until a login works; `app.rs` `telegram_registration`). Not
+# in `cargo xtask dist`'s features: no archive holds Telegram code. Architecture §7.5.
+telegram = ["dep:kourier-telegram"]
+# The Threema backend (libthreema). Compiled into every default build so the wiring is built and
+# tested, but REGISTERED only in a debug build while `networks-on` names it (`app.rs`
+# `threema_registration`); a release build never offers it, and `cargo xtask dist` builds without it.
+threema = ["dep:kourier-threema"]
 # The scripted test network: `--fixture`, `--fixture-link` and the "Test network" on the
 # welcome page.
 fake = ["dep:kourier-fake", "dep:tempfile"]
@@ -31,6 +47,9 @@ kourier-blob.workspace = true
 kourier-desktop.workspace = true
 kourier-fake = { workspace = true, optional = true }
 kourier-signal = { workspace = true, optional = true }
+kourier-whatsapp = { workspace = true, optional = true }
+kourier-telegram = { workspace = true, optional = true }
+kourier-threema = { workspace = true, optional = true }
 aes-gcm.workspace = true
 argon2.workspace = true
 hkdf.workspace = true
@@ -52,8 +71,16 @@ zeroize.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# app.rs's application-level tests of the real parts: the offline child (TG-1b fix G8).
+kourier-telegram = { workspace = true, features = ["test-support"] }
 # tests/desktop.rs: a private dbus-daemon with a mock notification server.
 kourier-desktop = { workspace = true, features = ["testing"] }
+# tests/logging.rs: the `log` records of upstream's crates, built by hand.
+log.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "it"
+path = "tests/it.rs"

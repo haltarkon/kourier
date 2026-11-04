@@ -1,7 +1,8 @@
-//! Storage Service, read only in M1 (§6.9): credentials, the manifest when it is newer than the
-//! local version, the missing records, their decryption and the merge of `ContactRecord`,
-//! `GroupV2Record` and `AccountRecord` into `backend.db` together with the core events they imply
-//! (one zone per ≤ [`MERGE_BATCH`] records, §5.6).
+//! Storage Service (§6.9): credentials, the manifest when it is newer than the local version, the
+//! missing records, their decryption and the merge of `ContactRecord`, `GroupV2Record` and
+//! `AccountRecord` into `backend.db` together with the core events they imply (one zone per ≤
+//! [`MERGE_BATCH`] records, §5.6). The writes (A10) live in [`write`] and [`intents`]; the write
+//! job fetches at every run and merges through the same path ([`merge_manifest`]).
 //!
 //! Desktop sources: `SD/ts/services/storage.preload.ts` (`sync`, `processManifest`,
 //! `fetchRemoteRecords`; a 404 manifest is created only by a primary, 1514), merge rules from
@@ -20,7 +21,7 @@
 //! so the chat list does not fill with empty chats. Groups are stored (master key and flags);
 //! a group never fetched gets a `group_refresh` job and joins the core with its state (S10).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +36,7 @@ use kourier_db::Tx;
 use kourier_db::rusqlite::{Connection, OptionalExtension};
 use kourier_model::{
     AccountSettingsPatch, ContactPatch, ConvKey, ConversationPatch, Identifier, IdentifierKind,
-    IdentityFingerprint, Patch, TrustLevel,
+    Patch, UserId,
 };
 use libsignal_core::{Aci, Pni, ServiceId};
 use libsignal_protocol::IdentityKey;
@@ -53,6 +54,7 @@ use crate::error::{Error, Result};
 use crate::jobs::{self, Done, JobKind};
 use crate::net::{ChatRequest, HttpsHost, HttpsRequest, SignalTransport, parse_json};
 use crate::outbox::append_events;
+use crate::peers::Roaming;
 use crate::proto::{self, manifest_record::identifier::Type as ItemType, storage_record::Record};
 use crate::service_id::{aci_user_id, service_id_from_wire, service_id_user_id, validate_e164};
 use crate::{db, features, peers};
@@ -314,7 +316,8 @@ fn mark_synced(conn: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Runs one Storage Service sync (the `storage_sync` job).
+/// Runs one Storage Service sync (the `storage_sync` job): fetches the manifest when it is newer
+/// than the local version and merges it ([`merge_manifest`]).
 pub(crate) async fn sync<T: SignalTransport>(
     shared: &Rc<Shared<T>>,
     socket: &Arc<T::Socket>,
@@ -337,6 +340,29 @@ pub(crate) async fn sync<T: SignalTransport>(
         }
         Fetched::Manifest(manifest) => manifest,
     };
+    merge_manifest(shared, &account, &local, &credentials, &manifest).await?;
+    Ok(Done::Finished)
+}
+
+/// THE MERGE PATH of a fetched manifest, the one both `storage_sync` and the write job
+/// (`write::run`, which fetches at every run, BQ7) go through: it decrypts the manifest, judges a
+/// write of ours in flight by it and, when it is newer than the local version, reads the records
+/// not stored yet and merges them. Returns the decrypted manifest (the write job plans on it).
+///
+/// A write in flight is judged in two places on purpose. One that did NOT land is resolved right
+/// after the manifest decrypts, before the items are read (review N1 (a)). One that landed is
+/// landed inside the first merge zone (review B1), and from there to the commit of the last zone
+/// nothing awaits, so no command runs between the landing and the merges of that version. A row
+/// the manifest cannot judge here (a manifest behind the row, or one that is not newer than the
+/// local version, so no merge zone runs) stays for the caller: the sync leaves it to the write
+/// job, the job judges it (`write::run`).
+async fn merge_manifest<T: SignalTransport>(
+    shared: &Rc<Shared<T>>,
+    account: &Account,
+    local: &LocalState,
+    credentials: &Credentials,
+    manifest: &proto::StorageManifest,
+) -> Result<proto::ManifestRecord> {
     let version = manifest.version;
     let record = match decrypt_manifest(&local.storage_key, version, &manifest.value) {
         Ok(record) => record,
@@ -355,10 +381,21 @@ pub(crate) async fn sync<T: SignalTransport>(
             return Err(e);
         }
     };
+    // A write of ours in flight is judged by THIS manifest at once (review N1 (a)): one that did
+    // not land (or a row this build cannot read) is resolved in a zone of its own BEFORE the items
+    // are read, so a click, a reading or an unpin made while they are read finds no row and takes
+    // the phone's value as its base. Only a landed write waits for the first merge zone (review
+    // B1, below). With no row in flight no zone is opened.
+    if shared.db.read(write::in_flight_exists)? {
+        let now = shared.now();
+        shared
+            .db
+            .zone(|tx| intents::resolve_not_landed(tx, account, &record, now, &shared.wake))?;
+    }
     if local.version.is_some_and(|local| version <= local) {
         let now = shared.now();
         shared.db.zone(|tx| mark_synced(tx, now))?;
-        return Ok(Done::Finished);
+        return Ok(record);
     }
     let stored: BTreeSet<Vec<u8>> = shared.db.read(stored_keys)?;
     let mut wanted: Vec<(Vec<u8>, i32)> = Vec::with_capacity(record.identifiers.len());
@@ -378,7 +415,7 @@ pub(crate) async fn sync<T: SignalTransport>(
         .filter(|(key, _)| !stored.contains(key))
         .collect();
     let keys: Vec<Vec<u8>> = missing.iter().map(|(key, _)| key.clone()).collect();
-    let mut items = read_items(shared, &credentials, &keys).await?;
+    let mut items = read_items(shared, credentials, &keys).await?;
     let record_ikm = Some(record.record_ikm.as_slice()).filter(|ikm| !ikm.is_empty());
     let mut decrypted = Vec::with_capacity(missing.len());
     let mut failed = 0usize;
@@ -409,6 +446,10 @@ pub(crate) async fn sync<T: SignalTransport>(
     let zones = decrypted.len().div_ceil(MERGE_BATCH).max(1);
     let mut chunks = decrypted.chunks(MERGE_BATCH);
     let mut outcome = ZoneOutcome::default();
+    // The new identifiers of the write the first zone lands: OUR records (review N6, L1).
+    let mut ours: HashSet<Vec<u8>> = HashSet::new();
+    // From here to the commit of the last zone nothing awaits: the zones are synchronous and run
+    // back to back, so no command runs between the landing below and the merges of this version.
     for index in 0..zones {
         let batch = chunks.next().unwrap_or(&[]);
         let last = (index + 1 == zones).then_some(LastZone {
@@ -417,12 +458,31 @@ pub(crate) async fn sync<T: SignalTransport>(
         });
         let now = shared.now();
         let zone = shared.db.zone(|tx| {
-            merge_zone(
+            // A write of ours that was in flight when the app stopped is judged by THIS manifest
+            // in the first merge zone, before its merge (critic X4, review B1): the records it
+            // lists would otherwise be merged as the phone's own, against intents whose base has
+            // not moved yet. It runs AFTER the items were read, inside the transaction of the
+            // merge: a click, a reading or an unpin made while they were read still found the row
+            // (and took the written value as its base), and none can come between the landing and
+            // the merge of our own records. With no row this reads one table.
+            if index == 0 {
+                let keys = write::read_in_flight(tx)?.map(|row| row.new_keys);
+                if let intents::Resolved::Found { landing, .. } =
+                    intents::resolve_in_flight(tx, account, &record, now, &shared.wake)?
+                {
+                    ours.extend(keys.into_iter().flatten());
+                    write::after_landing(tx, landing, now)?;
+                }
+            }
+            merge_zone_with(
                 tx,
-                &account,
+                account,
                 batch,
                 last.as_ref(),
-                first_sync,
+                Origin {
+                    first_sync,
+                    ours: &ours,
+                },
                 now,
                 &shared.wake,
             )
@@ -431,16 +491,17 @@ pub(crate) async fn sync<T: SignalTransport>(
         outcome.profile_fetches |= zone.profile_fetches;
         outcome.own_profile_key |= zone.own_profile_key;
         outcome.group_refreshes |= zone.group_refreshes;
+        outcome.released |= zone.released;
     }
     if outcome.own_profile_key
         && let Some(reloaded) = shared.db.read(Account::load)?
     {
         *shared.account.borrow_mut() = Some(reloaded);
     }
-    if outcome.profile_fetches || outcome.group_refreshes {
+    if outcome.profile_fetches || outcome.group_refreshes || outcome.released {
         shared.jobs_wake.notify_one();
     }
-    Ok(Done::Finished)
+    Ok(record)
 }
 
 fn stored_keys(conn: &Connection) -> Result<BTreeSet<Vec<u8>>> {
@@ -466,9 +527,13 @@ struct ZoneOutcome {
     own_profile_key: bool,
     /// Group refresh jobs were queued.
     group_refreshes: bool,
+    /// A contact's key left state 2: the jobs waiting on it are due (P5 M1).
+    released: bool,
 }
 
-/// One merge zone: the batch's records into `backend.db` and their events into `core_outbox`.
+/// One merge zone: the batch's records into `backend.db` and their events into `core_outbox`;
+/// none of them is ours ([`merge_zone_with`]). The tests' merge (the sync names our own records).
+#[cfg(test)]
 fn merge_zone(
     tx: &mut Tx<'_>,
     account: &Account,
@@ -478,14 +543,53 @@ fn merge_zone(
     now: i64,
     wake: &Rc<Notify>,
 ) -> Result<ZoneOutcome> {
+    let none = HashSet::new();
+    merge_zone_with(
+        tx,
+        account,
+        batch,
+        last,
+        Origin {
+            first_sync,
+            ours: &none,
+        },
+        now,
+        wake,
+    )
+}
+
+/// Where the records of a merge zone come from.
+struct Origin<'a> {
+    /// No manifest was merged before: the Storage Service's profile keys win over local ones.
+    first_sync: bool,
+    /// The identifiers of the write the sync just landed (review N6, L1): those records are OURS.
+    ours: &'a HashSet<Vec<u8>>,
+}
+
+/// [`merge_zone`] with OUR records named: each is stored with `ours = 1` (the automatic clear's
+/// N-C does not count it as the phone's newer mark) and states no flag of its chat (the landing
+/// right before it stated what it should: with the switch off the written values but an archive
+/// a message overtook, review L1; with the switch on the intents' rule runs as for any record).
+fn merge_zone_with(
+    tx: &mut Tx<'_>,
+    account: &Account,
+    batch: &[Decrypted],
+    last: Option<&LastZone<'_>>,
+    origin: Origin<'_>,
+    now: i64,
+    wake: &Rc<Notify>,
+) -> Result<ZoneOutcome> {
     let mut merge = Merge {
         account,
         now,
-        first_sync,
+        first_sync: origin.first_sync,
+        intents: intents::any_intent(tx)?,
+        ours: false,
         events: Vec::new(),
         outcome: ZoneOutcome::default(),
     };
     for item in batch {
+        merge.ours = origin.ours.contains(&item.key);
         let peer = match &item.record.record {
             Some(Record::Contact(contact)) => merge_contact(tx, &mut merge, &item.key, contact)?,
             Some(Record::GroupV2(group)) => {
@@ -498,13 +602,25 @@ fn merge_zone(
             }
             _ => None,
         };
+        // What the record belongs to, for the write engine (A10): decided from the record itself,
+        // by the one function `fill_targets` uses for a row from before migration 0025.
+        let target = target_of(account, &item.record);
         tx.prepare_cached(
-            "INSERT INTO storage_records(key, kind, peer, record, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO storage_records(key, kind, peer, target, record, updated_at, ours)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(key) DO UPDATE SET kind = excluded.kind, peer = excluded.peer,
-               record = excluded.record, updated_at = excluded.updated_at",
+               target = excluded.target, record = excluded.record,
+               updated_at = excluded.updated_at, ours = excluded.ours",
         )?
-        .execute((&item.key, item.kind, peer, item.raw.as_slice(), now))?;
+        .execute((
+            &item.key,
+            item.kind,
+            peer,
+            target,
+            item.raw.as_slice(),
+            now,
+            merge.ours,
+        ))?;
     }
     if let Some(last) = last {
         for key in last.removed {
@@ -529,8 +645,43 @@ struct Merge<'a> {
     now: i64,
     /// No manifest was merged before: the Storage Service's profile keys win over local ones.
     first_sync: bool,
+    /// An intent of the write engine is stored (A10): only then do the merges run the three-way
+    /// rule (`intents::three_way`); with none every merge is what it was before there were
+    /// intents.
+    intents: bool,
+    /// The record being merged is OURS (review N6, L1): the write the sync just landed put it
+    /// there. Its flags are not diffed (see [`Merge::settle`]).
+    ours: bool,
     events: Vec<BackendEvent>,
     outcome: ZoneOutcome,
+}
+
+impl Merge<'_> {
+    /// The three-way rule for the archive, mark and mute intents of `target` against the flags
+    /// of the record being merged (§3.3); nothing is settled while no intent is stored. OUR own
+    /// record (review N6, L1) runs no flag diff: a field no intent holds is held at `told` (what
+    /// the core was last told: nothing is stated, the mirror stays), because the landing right
+    /// before this merge already stated what it should (with the switch off the written values,
+    /// but not an `archived = 1` a message overtook; with the switch on the core shows ours).
+    fn settle(
+        &self,
+        conn: &Connection,
+        target: &str,
+        theirs: intents::Flags,
+        told: intents::Flags,
+    ) -> Result<intents::Settlement> {
+        let settlement = if self.intents {
+            intents::settle_flags(conn, target, theirs)?
+        } else {
+            intents::Settlement::default()
+        };
+        let our_own_record = self.ours;
+        Ok(if our_own_record {
+            settlement.quiet(told)
+        } else {
+            settlement
+        })
+    }
 }
 
 /// The stored record of `peer` other than `key` (the previous version of a changed record);
@@ -540,12 +691,21 @@ fn previous_contact(
     peer: &str,
     key: &[u8],
 ) -> Result<Option<proto::ContactRecord>> {
+    stored_contact(conn, peer, Some(key))
+}
+
+/// The newest stored record of `peer`, other than `except` when that is given.
+fn stored_contact(
+    conn: &Connection,
+    peer: &str,
+    except: Option<&[u8]>,
+) -> Result<Option<proto::ContactRecord>> {
     let raw: Option<Vec<u8>> = conn
         .prepare_cached(
-            "SELECT record FROM storage_records WHERE peer = ?1 AND key != ?2
-             ORDER BY updated_at DESC LIMIT 1",
+            "SELECT record FROM storage_records WHERE peer = ?1 AND (?2 IS NULL OR key != ?2)
+             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
         )?
-        .query_row((peer, key), |r| r.get(0))
+        .query_row((peer, except), |r| r.get(0))
         .optional()?;
     Ok(raw
         .and_then(|raw| proto::StorageRecord::decode(&raw[..]).ok())
@@ -574,14 +734,153 @@ pub(crate) fn prefer_contact_avatars(conn: &Connection) -> Result<bool> {
         }))
 }
 
+/// Signal's "Keep muted chats archived" (`AccountRecord.keepMutedChatsArchived`, field 25), as a
+/// column the receive path reads with a row it has already. Every account record merged writes
+/// it (`merge_account`). NULL (a profile from before migration 0023, whose newest account
+/// record was stored long ago and is never merged again until the phone changes an account
+/// setting) is filled ONCE here, offline, from the newest stored account record: `false` when
+/// there is none (Desktop's `?? false`). Called in a write zone, like [`fill_roaming`].
+pub(crate) fn keep_muted_chats_archived(conn: &Connection) -> Result<bool> {
+    let told: Option<Option<bool>> = conn
+        .prepare_cached("SELECT keep_muted_archived FROM account WHERE id = 1")?
+        .query_row([], |r| r.get(0))
+        .optional()?;
+    match told {
+        Some(Some(keep)) => Ok(keep),
+        Some(None) => {
+            let keep = stored_account(conn, None)?.is_some_and(|r| r.keep_muted_chats_archived);
+            conn.prepare_cached("UPDATE account SET keep_muted_archived = ?1 WHERE id = 1")?
+                .execute([keep])?;
+            Ok(keep)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The archive state and mute the phone last stated for the 1:1 chat of `sid` (Note to Self
+/// when `sid` is our own ACI), for a peer whose `peers.roaming_*` base was never written
+/// (A1, the lead's BQ1 (a): a profile from before migration 0023, or a chat no record has
+/// stated): read ONCE from the newest stored record, offline, written as the base and returned.
+/// No record at all means the phone says nothing of the chat: not archived, not muted, and
+/// that is the base too, so the decode is never repeated for the peer. A later record is
+/// diffed against the base (`merge_contact`). The flag returned beside the base is whether a
+/// stored record gave it: only then is it the phone's word the core may not have heard (the
+/// receive path states it, `receive/unarchive.rs`).
+pub(crate) fn fill_roaming(
+    conn: &Connection,
+    account: &Account,
+    sid: &str,
+    now: i64,
+) -> Result<(Roaming, bool)> {
+    let own = ServiceId::from(account.aci).service_id_string() == sid;
+    let from_record = if own {
+        stored_account(conn, None)?.map(|record| Roaming {
+            archived: record.note_to_self_archived,
+            muted_until: None,
+        })
+    } else {
+        stored_contact(conn, sid, None)?.map(|record| Roaming {
+            archived: record.archived,
+            muted_until: muted_until(record.muted_until_timestamp),
+        })
+    };
+    let recorded = from_record.is_some();
+    let roaming = from_record.unwrap_or_default();
+    peers::set_roaming(conn, sid, roaming, now)?;
+    Ok((roaming, recorded))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Targets (A10: what a stored record belongs to)
+// ---------------------------------------------------------------------------------------------
+
+/// `storage_records.target` of the account record: its pins and the Note to Self flags.
+pub(crate) const ACCOUNT_TARGET: &str = "account";
+
+/// `storage_records.target` of a record nobody can ask to change: a kind the write engine never
+/// edits (stories, chat folders, call links, ...), a contact record that names nobody Kourier can
+/// address or only ourselves, a group record without a 32-byte master key. It is the empty string
+/// and not NULL: NULL means "not filled yet" (a row from before migration 0025), and a filled row
+/// must not be decoded again by [`fill_targets`].
+pub(crate) const NO_TARGET: &str = "";
+
+/// The target of the contact record of the person with service id string `sid`.
+pub(crate) fn contact_target(sid: &str) -> String {
+    format!("contact:{sid}")
+}
+
+/// The service id string a [`contact_target`] names (`None` for any other target).
+pub(crate) fn contact_sid(target: &str) -> Option<&str> {
+    target.strip_prefix("contact:")
+}
+
+/// The target of the group record with this master key: lower-case hex, so no key is in a log by
+/// accident (a target is never logged; only counts are).
+pub(crate) fn group_target(master: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut target = String::with_capacity("group:".len() + master.len() * 2);
+    target.push_str("group:");
+    for byte in master {
+        let _ = write!(target, "{byte:02x}");
+    }
+    target
+}
+
+/// What a decoded record belongs to: `contact:<sid>`, `group:<master key hex>`, `account`, or
+/// [`NO_TARGET`]. Pure; the merge zone stores it with every record and [`fill_targets`] computes
+/// it for the rows that were stored before there was a target column.
+pub(crate) fn target_of(account: &Account, record: &proto::StorageRecord) -> String {
+    match &record.record {
+        Some(Record::Contact(contact)) => contact_ids(account, contact)
+            .map_or_else(|| NO_TARGET.to_owned(), |ids| contact_target(&ids.sid)),
+        Some(Record::GroupV2(group)) if group.master_key.len() == 32 => {
+            group_target(&group.master_key)
+        }
+        Some(Record::Account(_)) => ACCOUNT_TARGET.to_owned(),
+        _ => NO_TARGET.to_owned(),
+    }
+}
+
+/// Gives every stored record that has no target yet (`target IS NULL`: a row stored before
+/// migration 0025) its [`target_of`], decoding each such row ONCE, offline: a filled row is never
+/// read again, one that does not decode stays NULL (nothing is guessed). Returns how many rows
+/// were filled. Called in a write zone by whoever needs the records by target (the intents, the
+/// write job); with no intent and no write nothing calls it, so a profile that never turns the
+/// sync on never pays for it.
+pub(crate) fn fill_targets(conn: &Connection, account: &Account) -> Result<usize> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = conn
+        .prepare_cached("SELECT key, record FROM storage_records WHERE target IS NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let mut update =
+        conn.prepare_cached("UPDATE storage_records SET target = ?2 WHERE key = ?1")?;
+    let mut filled = 0;
+    for (key, raw) in rows {
+        let Ok(record) = proto::StorageRecord::decode(&raw[..]) else {
+            continue;
+        };
+        update.execute((&key, target_of(account, &record)))?;
+        filled += 1;
+    }
+    Ok(filled)
+}
+
 /// The stored account record other than `key`; `None` when there is none.
 fn previous_account(conn: &Connection, key: &[u8]) -> Result<Option<proto::AccountRecord>> {
+    stored_account(conn, Some(key))
+}
+
+/// The newest stored account record, other than `except` when that is given.
+fn stored_account(
+    conn: &Connection,
+    except: Option<&[u8]>,
+) -> Result<Option<proto::AccountRecord>> {
     let raw: Option<Vec<u8>> = conn
         .prepare_cached(
-            "SELECT record FROM storage_records WHERE kind = ?1 AND key != ?2
-             ORDER BY updated_at DESC LIMIT 1",
+            "SELECT record FROM storage_records WHERE kind = ?1 AND (?2 IS NULL OR key != ?2)
+             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
         )?
-        .query_row((ItemType::Account as i32, key), |r| r.get(0))
+        .query_row((ItemType::Account as i32, except), |r| r.get(0))
         .optional()?;
     Ok(raw
         .and_then(|raw| proto::StorageRecord::decode(&raw[..]).ok())
@@ -645,6 +944,41 @@ pub(crate) fn muted_until(ts: u64) -> Option<i64> {
     (ts > 0).then(|| i64::try_from(ts).unwrap_or(i64::MAX))
 }
 
+/// Who a `ContactRecord` is about.
+struct ContactIds {
+    aci: Option<Aci>,
+    pni: Option<Pni>,
+    /// The service id string of the peer rows and of the target: the ACI, else the PNI.
+    sid: String,
+    user: UserId,
+}
+
+/// The person a `ContactRecord` names; `None` for a record that names nobody Kourier can address
+/// (no id, an id that is no Signal user) or only ourselves. The ONE place that decides it: the merge
+/// and [`target_of`] both read it, so a record's `peer` and its target never disagree.
+fn contact_ids(account: &Account, record: &proto::ContactRecord) -> Option<ContactIds> {
+    let aci = uuid_field(&record.aci_binary, &record.aci).map(Aci::from);
+    let pni = uuid_field(&record.pni_binary, &record.pni).map(Pni::from);
+    let service_id: ServiceId = match (aci, pni) {
+        (Some(aci), _) => aci.into(),
+        (None, Some(pni)) => pni.into(),
+        (None, None) => return None,
+    };
+    if account.kind_of(service_id).is_some()
+        || aci.is_some_and(|aci| aci == account.aci)
+        || pni.is_some_and(|pni| pni == account.pni)
+    {
+        return None;
+    }
+    let user = service_id_user_id(service_id).ok()?;
+    Some(ContactIds {
+        aci,
+        pni,
+        sid: service_id.service_id_string(),
+        user,
+    })
+}
+
 /// `ContactRecord` → peers, identities and the contact's core events.
 fn merge_contact(
     tx: &Connection,
@@ -653,21 +987,13 @@ fn merge_contact(
     record: &proto::ContactRecord,
 ) -> Result<Option<String>> {
     let now = merge.now;
-    let aci = uuid_field(&record.aci_binary, &record.aci).map(Aci::from);
-    let pni = uuid_field(&record.pni_binary, &record.pni).map(Pni::from);
-    let service_id: ServiceId = match (aci, pni) {
-        (Some(aci), _) => aci.into(),
-        (None, Some(pni)) => pni.into(),
-        (None, None) => return Ok(None),
-    };
-    if merge.account.kind_of(service_id).is_some()
-        || aci.is_some_and(|aci| aci == merge.account.aci)
-        || pni.is_some_and(|pni| pni == merge.account.pni)
-    {
-        return Ok(None);
-    }
-    let sid = service_id.service_id_string();
-    let Ok(user) = service_id_user_id(service_id) else {
+    let Some(ContactIds {
+        aci,
+        pni,
+        sid,
+        user,
+    }) = contact_ids(merge.account, record)
+    else {
         return Ok(None);
     };
     let e164 = Some(record.e164.as_str()).filter(|n| validate_e164(n).is_ok());
@@ -743,15 +1069,24 @@ fn merge_contact(
             value: number.to_owned(),
         }]);
     }
-    if aci.is_some() {
-        merge_identity(tx, merge, &sid, record, &mut patch)?;
-    }
+    let identity_events = if aci.is_some() {
+        merge_identity(tx, merge, &sid, record, &mut patch)?
+    } else {
+        Vec::new()
+    };
 
     peers::set_profile_sharing(tx, &sid, record.whitelisted, now)?;
-    peers::set_system_contact(tx, &sid, system.is_some(), now)?;
+    // The address-book NAME (given or family) makes a system contact; a system nickname alone
+    // only names the person (Desktop's `isInSystemContacts`; P1 F5).
+    let in_address_book =
+        join_name(&record.system_given_name, &record.system_family_name).is_some();
+    peers::set_system_contact(tx, &sid, in_address_book, now)?;
     peers::set_blocked(tx, &sid, record.blocked, now)?;
     let after = peers::load(tx, &sid)?;
+    // The record may have changed any input of the number rule (the key, the address-book name).
+    patch.number_shown = Some(peers::number_shown(tx, &sid)?);
     merge.events.push(BackendEvent::ContactUpsert(patch));
+    merge.events.extend(identity_events);
 
     // The 1:1 chat: only for roaming changes, or a changed accepted state of a chat the core has.
     // The FIRST record of a contact whose chat the core has (a history import made it, D10)
@@ -760,20 +1095,65 @@ fn merge_contact(
     // has NO chat for, the flags are stated only when one differs from the default, as
     // before: a `ConversationUpsert` makes the conversation, so stating them for every
     // contact of the Storage Service (most are people with no chat) would make a chat of each.
+    // The archived flag is diffed against what the core was LAST TOLD (`peers.roaming_archived`,
+    // moved by the unarchive a new message makes), else against the previous record: with only
+    // the record to compare, a chat the phone archives again after Kourier brought it back
+    // (the record says archived, as the one before it did) would never be archived here.
+    //
+    // The three-way rule (A10, §3.3): a field the user changed here that the phone has not
+    // written yet (an intent) is not diffed and not stated while the phone's record leaves it
+    // alone, and the told base keeps OUR value; where the phone wrote something else it wins
+    // (the field is stated whether or not it differs from the base, and the base follows).
     let muted = muted_until(record.muted_until_timestamp);
-    let roaming_changed = record.archived != prev.archived
-        || record.marked_unread != prev.marked_unread
-        || muted != muted_until(prev.muted_until_timestamp)
+    let told_archived = before.roaming.map_or(prev.archived, |r| r.archived);
+    let settled = merge.settle(
+        tx,
+        &contact_target(&sid),
+        intents::Flags {
+            archived: record.archived,
+            marked_unread: record.marked_unread,
+            muted_until: muted,
+        },
+        intents::Flags {
+            archived: told_archived,
+            marked_unread: prev.marked_unread,
+            muted_until: before
+                .roaming
+                .map_or(muted_until(prev.muted_until_timestamp), |r| r.muted_until),
+        },
+    )?;
+    let roaming_changed = settled.archived.states(record.archived != told_archived)
+        || settled
+            .marked_unread
+            .states(record.marked_unread != prev.marked_unread)
+        || settled
+            .muted_until
+            .states(muted != muted_until(prev.muted_until_timestamp))
         || record.blocked != prev.blocked
         || (first_record && after.features_hash.is_some());
     let accepted_changed = before.accepted() != after.accepted() && after.features_hash.is_some();
     if roaming_changed || accepted_changed {
         let mut conv = ConversationPatch::new(ConvKey::Direct(user));
         if roaming_changed {
-            conv.archived = Some(record.archived);
-            conv.marked_unread = Some(record.marked_unread);
-            conv.muted_until = muted.map_or(Patch::Clear, Patch::Set);
+            if settled.archived.states(true) {
+                conv.archived = Some(record.archived);
+            }
+            if settled.marked_unread.states(true) {
+                conv.marked_unread = Some(record.marked_unread);
+            }
+            if settled.muted_until.states(true) {
+                conv.muted_until = muted.map_or(Patch::Clear, Patch::Set);
+            }
             conv.blocked = Some(record.blocked);
+            peers::set_roaming(
+                tx,
+                &sid,
+                Roaming {
+                    archived: settled.archived.flag(record.archived),
+                    muted_until: settled.muted_until.mute(muted),
+                },
+                now,
+            )?;
         }
         merge.events.push(BackendEvent::ConversationUpsert(conv));
     }
@@ -795,50 +1175,68 @@ const VERIFIED: i64 = 1;
 const VERIFIED_UNVERIFIED: i64 = 2;
 
 /// A contact record's identity key and verified state (Desktop: applied when we have no key or
-/// the same key; a different key waits for a profile fetch, which is authoritative).
+/// the same key; a different key waits for a profile fetch, which is authoritative), through
+/// [`crate::safety::apply_remote_state`]: a row that leaves state 2 is released and a changed
+/// state gets the quiet "... from another device" notice (P5 critic H1, M2.2-M2.4); a record
+/// while this device's own Verified sync for the same key is still queued is older than the
+/// user's click here and changes nothing. Returns the events to append after the contact's
+/// upsert.
 fn merge_identity(
     tx: &Connection,
     merge: &mut Merge<'_>,
     sid: &str,
     record: &proto::ContactRecord,
     patch: &mut ContactPatch,
-) -> Result<()> {
+) -> Result<Vec<BackendEvent>> {
     let Ok(remote) = IdentityKey::decode(&record.identity_key) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    // A10: a click here that the phone has not written yet (an identity intent of this very key)
+    // is newer than a record that still holds the state it had (`theirs == base`): the record is
+    // not applied. The phone's other state is applied like any record (an intent that it made
+    // moot is gone); another key's intent was dropped by the rule's lookup.
+    if merge.intents
+        && intents::settle_identity(
+            tx,
+            &contact_target(sid),
+            &record.identity_key,
+            record.identity_state,
+        )? == Some(intents::Verdict::Stays)
+    {
+        return Ok(Vec::new());
+    }
     let verified = match proto::contact_record::IdentityState::try_from(record.identity_state) {
         Ok(proto::contact_record::IdentityState::Verified) => VERIFIED,
         Ok(proto::contact_record::IdentityState::Unverified) => VERIFIED_UNVERIFIED,
         _ => VERIFIED_DEFAULT,
     };
-    let local = crate::store::load_identity_key(tx, sid)?;
-    match local {
-        Some(local) if local != remote => {
+    match crate::safety::apply_remote_state(
+        tx,
+        &patch.user.clone(),
+        sid,
+        &remote,
+        verified,
+        merge.now,
+        crate::safety::RemoteSource::Storage,
+    )? {
+        crate::safety::Remote::OtherKey => {
             jobs::request(tx, JobKind::ProfileFetch, sid, merge.now, None)?;
             merge.outcome.profile_fetches = true;
-            return Ok(());
+            Ok(Vec::new())
         }
-        Some(_) => {
-            tx.prepare_cached(
-                "UPDATE identities SET verified = ?2, updated_at = ?3 WHERE service_id = ?1",
-            )?
-            .execute((sid, verified, merge.now))?;
-        }
-        None => {
-            tx.prepare_cached(
-                "INSERT INTO identities(service_id, identity_key, verified, first_use, updated_at)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-            )?
-            .execute((sid, &remote.serialize()[..], verified, merge.now))?;
+        crate::safety::Remote::Kept => Ok(Vec::new()),
+        crate::safety::Remote::Applied {
+            trust,
+            fingerprint,
+            events,
+            released,
+        } => {
+            patch.identity_fingerprint = Patch::Set(fingerprint);
+            patch.trust = Some(trust);
+            merge.outcome.released |= released;
+            Ok(events)
         }
     }
-    patch.identity_fingerprint = Patch::Set(IdentityFingerprint(remote.serialize().into_vec()));
-    patch.trust = Some(if verified == VERIFIED {
-        TrustLevel::Verified
-    } else {
-        TrustLevel::Unverified
-    });
-    Ok(())
 }
 
 /// `GroupV2Record` (`mergeGroupV2Record`): the master key and the roaming flags. A group never
@@ -854,6 +1252,25 @@ fn merge_group(
     };
     let now = merge.now;
     let before = crate::groups::load_by_master(tx, &keys.master)?;
+    // The three-way rule (A10, §3.3, critic M3): the `groups` columns are the mirror of what the
+    // core was told, and the merge used to overwrite them from the record. A field with an
+    // intent that stays keeps OUR value in the column (and is not stated); where the phone wins
+    // the column takes the record's value and the field is stated.
+    let muted = muted_until(record.muted_until_timestamp);
+    let theirs = intents::Flags {
+        archived: record.archived,
+        marked_unread: record.marked_unread,
+        muted_until: muted,
+    };
+    let told = before.as_ref().map_or(theirs, |b| intents::Flags {
+        archived: b.archived,
+        marked_unread: b.marked_unread,
+        muted_until: b.muted_until,
+    });
+    let settled = merge.settle(tx, &group_target(&keys.master), theirs, told)?;
+    let archived = settled.archived.flag(record.archived);
+    let marked_unread = settled.marked_unread.flag(record.marked_unread);
+    let mirror_muted = settled.muted_until.mute(muted);
     tx.prepare_cached(
         "INSERT INTO groups(master_key, group_id, blocked, whitelisted, archived, marked_unread,
            muted_until, updated_at)
@@ -868,24 +1285,33 @@ fn merge_group(
         &keys.id[..],
         record.blocked,
         record.whitelisted,
-        record.archived,
-        record.marked_unread,
-        muted_until(record.muted_until_timestamp),
+        archived,
+        marked_unread,
+        mirror_muted,
         now,
     ))?;
     match before {
         Some(before) if before.features_hash.is_some() => {
-            let muted = muted_until(record.muted_until_timestamp);
             if before.blocked != record.blocked
-                || before.archived != record.archived
-                || before.marked_unread != record.marked_unread
-                || before.muted_until != muted
+                || settled.archived.states(before.archived != archived)
+                || settled
+                    .marked_unread
+                    .states(before.marked_unread != marked_unread)
+                || settled
+                    .muted_until
+                    .states(before.muted_until != mirror_muted)
             {
                 let mut patch = ConversationPatch::new(keys.conv_key());
                 patch.blocked = Some(record.blocked);
-                patch.archived = Some(record.archived);
-                patch.marked_unread = Some(record.marked_unread);
-                patch.muted_until = muted.map_or(Patch::Clear, Patch::Set);
+                if settled.archived.states(true) {
+                    patch.archived = Some(record.archived);
+                }
+                if settled.marked_unread.states(true) {
+                    patch.marked_unread = Some(record.marked_unread);
+                }
+                if settled.muted_until.states(true) {
+                    patch.muted_until = muted.map_or(Patch::Clear, Patch::Set);
+                }
                 merge.events.push(BackendEvent::ConversationUpsert(patch));
             }
         }
@@ -941,8 +1367,11 @@ fn merge_account(
         Some(record.typing_indicators),
     )?;
     tx.execute(
-        "UPDATE account SET phone_number_sharing = ?1 WHERE id = 1",
-        [if everybody { "everybody" } else { "nobody" }],
+        "UPDATE account SET phone_number_sharing = ?1, keep_muted_archived = ?2 WHERE id = 1",
+        (
+            if everybody { "everybody" } else { "nobody" },
+            record.keep_muted_chats_archived,
+        ),
     )?;
     merge
         .events
@@ -991,20 +1420,66 @@ fn merge_account(
     // history import made it): the sync wins over the archive (D10), as for a contact. When
     // the core has no such chat the flags are not sent for nothing: an upsert makes the chat
     // (the same reason as for a contact, where every Storage contact would become a chat).
+    // The archived flag is diffed against what the core was last told (`peers.roaming_archived`
+    // of our own row, as for a contact), else against the previous record.
+    // The three-way rule (A10, §3.3) on the archive and mark intents of the account record's
+    // target, exactly as for a contact (Note to Self has no mute).
     let own_sid = ServiceId::from(account.aci).service_id_string();
-    if record.note_to_self_archived != prev.note_to_self_archived
-        || record.note_to_self_marked_unread != prev.note_to_self_marked_unread
-        || (first_record && peers::load(tx, &own_sid)?.features_hash.is_some())
+    let own_peer = peers::load(tx, &own_sid)?;
+    let told_archived = own_peer
+        .roaming
+        .map_or(prev.note_to_self_archived, |r| r.archived);
+    let settled = merge.settle(
+        tx,
+        ACCOUNT_TARGET,
+        intents::Flags {
+            archived: record.note_to_self_archived,
+            marked_unread: record.note_to_self_marked_unread,
+            muted_until: None,
+        },
+        intents::Flags {
+            archived: told_archived,
+            marked_unread: prev.note_to_self_marked_unread,
+            muted_until: None,
+        },
+    )?;
+    if settled
+        .archived
+        .states(record.note_to_self_archived != told_archived)
+        || settled
+            .marked_unread
+            .states(record.note_to_self_marked_unread != prev.note_to_self_marked_unread)
+        || (first_record && own_peer.features_hash.is_some())
     {
         let mut conv = ConversationPatch::new(ConvKey::Direct(own.clone()));
-        conv.archived = Some(record.note_to_self_archived);
-        conv.marked_unread = Some(record.note_to_self_marked_unread);
+        if settled.archived.states(true) {
+            conv.archived = Some(record.note_to_self_archived);
+        }
+        if settled.marked_unread.states(true) {
+            conv.marked_unread = Some(record.note_to_self_marked_unread);
+        }
         merge.events.push(BackendEvent::ConversationUpsert(conv));
+        peers::set_roaming(
+            tx,
+            &own_sid,
+            Roaming {
+                archived: settled.archived.flag(record.note_to_self_archived),
+                muted_until: None,
+            },
+            merge.now,
+        )?;
     }
 
     // Pins, the record's order across kinds (`pinned_chats`). A 1:1 chat is made first with a
-    // bare upsert, so that it exists with its features (`with_features`).
-    let pinned = pinned_chats(tx, record)?;
+    // bare upsert, so that it exists with its features (`with_features`). The three-way rule
+    // (A10, §3.3) runs on the pin intents first: one that stays is applied to the list the core
+    // is told (our removals dropped, our additions last), one the phone settled is gone.
+    let held_pins = if merge.intents {
+        intents::settle_pins(tx, record)?
+    } else {
+        None
+    };
+    let pinned = pinned_chats(tx, held_pins.as_ref().unwrap_or(record))?;
     for pin in pinned.iter().filter(|pin| pin.contact) {
         merge
             .events
@@ -1097,7 +1572,9 @@ pub(crate) fn pins_with_new_group(
     else {
         return Ok(None);
     };
-    let pinned = pinned_chats(conn, &record)?;
+    // A pin or an unpin made here that has not reached the phone is still in force (A10).
+    let held = intents::with_live_pins(conn, &record)?;
+    let pinned = pinned_chats(conn, held.as_ref().unwrap_or(&record))?;
     let group = group.conv_key();
     if !pinned.iter().any(|pin| pin.conv == group) {
         return Ok(None);
@@ -1164,17 +1641,26 @@ pub(crate) fn apply_keys(
 }
 
 /// Forgets what the Storage Service gave us (a new storage key, a rebuilt `core.db`) and queues
-/// a full sync.
+/// a full sync. A write in flight is forgotten with it (critic M4): `storage_generation` moves, so
+/// the landing zone of a write planned before (`intents::land`) drops its result, and the
+/// in-flight row is deleted. The intents stay: the full sync merges the phone's records against
+/// them by the three-way rule again.
 pub(crate) fn reset(conn: &Connection, now: i64) -> Result<()> {
     conn.execute("DELETE FROM storage_records", [])?;
     conn.execute(
-        "UPDATE account SET manifest_version = NULL WHERE id = 1",
+        "UPDATE account SET manifest_version = NULL, storage_generation = storage_generation + 1
+         WHERE id = 1",
         [],
     )?;
+    write::delete_in_flight(conn)?;
     // A sync running with the old key runs again after it.
     jobs::request(conn, JobKind::StorageSync, "", now, None)?;
     Ok(())
 }
+
+pub(crate) mod intents;
+pub(crate) mod wire;
+pub(crate) mod write;
 
 #[cfg(test)]
 mod tests;

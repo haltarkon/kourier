@@ -1,0 +1,42 @@
+[package]
+name = "kourier-tdlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+# The integration tests are one binary, tests/it.rs (T3); a new tests/<name>.rs is a `mod` there.
+autotests = false
+
+# The TDLib helper (architecture §7.5, TG-1 decisions D1): the frame protocol both sides speak, the
+# serve loop, and the binary `kourier-tdlib` that dlopens the pinned libtdjson at run time. Nothing
+# here links TDLib: the Rust workspace builds without it, and only the helper process ever loads it.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kourier-tdlib"
+path = "src/main.rs"
+
+[features]
+# The scripted TDLib engine (`ScriptedTd`) for the tests of this crate and of kourier-telegram.
+scripted = []
+# Test support that must not ship (TG-1b fix G8): the trap listeners (`traps`, which bind ports and
+# send probes) and the offline-child launchers of `spawn` (`run_self_offline`, ..., which run
+# `unshare`). Enabled ONLY from `[dev-dependencies]` (this crate's own tests, `kourier-telegram`'s
+# dev-dependency on it, and `kourier-telegram`'s own `test-support`); a source check keeps every such
+# item behind it.
+test-support = []
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Its own tests use the scripted engine.
+kourier-tdlib = { path = ".", features = ["scripted", "test-support"] }
+
+[[test]]
+name = "it"
+path = "tests/it.rs"

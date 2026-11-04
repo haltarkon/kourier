@@ -19,7 +19,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kourier_backend_api::BackendEnv;
-use kourier_core::facade::{OriginKind, UiCommand, UiEvent};
+use kourier_core::facade::{OriginKind, Refusal, UiCommand, UiEvent};
 use kourier_model::{AccountId, CannotSend, ConversationId, OutgoingState, Text};
 use serde::{Deserialize, Serialize};
 use support::harness::{DeviceInfo, SendText};
@@ -97,7 +97,8 @@ async fn receipts_and_read_syncs_through_the_core() {
     let conv = app.conversation_with(account, &alice).await;
     app.wait_text(conv, "hello from Alice").await;
 
-    // Not accepted on the phone: the chat says so, a send fails, and Alice's sealed message
+    // Not accepted on the phone: the chat says so, a send is refused by the core (G4: the
+    // stored features say `cannot_send`, so no message is queued), and Alice's sealed message
     // owes no delivery receipt (accepted chats only).
     app.wait_cannot_send(conv, Some(CannotSend::NotAccepted))
         .await;
@@ -106,16 +107,21 @@ async fn receipts_and_read_syncs_through_the_core() {
         text: Text::plain("too early"),
         reply_to: None,
     });
-    app.wait_row(conv, "too early", "a refused send", |row| {
-        matches!(
-            row.out_state,
-            Some(OutgoingState::Failed {
-                retryable: false,
+    let why = app
+        .event("a refused send", |e| match e {
+            UiEvent::ActionFailed {
+                action: "SendText",
+                error,
                 ..
-            })
-        )
-    })
-    .await;
+            } => Some(error.refusal()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(why, Some(Refusal::CannotSend));
+    assert!(
+        app.rows_with_text(conv, "too early").await.is_empty(),
+        "nothing was queued"
+    );
     assert!(
         world
             .harness
@@ -468,12 +474,8 @@ async fn a_read_reaches_the_phone_across_a_kill() {
             text: text.clone(),
         };
         let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "read_child_process",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .arg(support::child_filter(module_path!(), "read_child_process"))
+            .args(["--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
             .env("KOURIER_FAILPOINT", format!("{point}:1"))
             .env(

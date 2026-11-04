@@ -15,7 +15,7 @@
     reason = "the shared support modules serve several test files"
 )]
 
-mod support;
+use crate::support;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,8 +27,8 @@ use kourier_backend_api::{
     OutgoingRequest, StartMode, TransmitOutcome,
 };
 use kourier_model::{
-    Body, ConvKey, ConversationChange, ErrorKind, LoginStepKind, MsgTarget, QuoteSnapshot, ReplyTo,
-    TargetAuthor, Text, UserId,
+    Body, CmdId, ConvKey, ConversationChange, ErrorKind, LoginStepKind, MsgTarget, QuoteSnapshot,
+    ReplyTo, TargetAuthor, Text, UserId,
 };
 use kourier_signal::SignalNetwork;
 use serde_json::{Value, json};
@@ -263,11 +263,12 @@ impl World {
         ));
         core.wait_online().await;
         self.files
-            .wait_for_i64(
+            .wait_for_i64_noting(
                 "group state with endorsements",
                 "SELECT count(*) FROM groups WHERE revision IS NOT NULL
                    AND endorsements_expire_at IS NOT NULL AND membership = 'member'",
                 |v| v == Some(1),
+                || self.files.timeout_note(self.harness.handshake().port),
             )
             .await;
         self.files
@@ -1606,5 +1607,70 @@ async fn a_one_to_one_timer_changes_both_ways() {
     let patch = patch_with_version(9).await;
     assert_eq!(patch["timer"]["Set"]["secs"], year, "{patch}");
     world.nothing_more(ada, &device).await;
+    world.shutdown(core).await;
+}
+
+/// A10c (C1): the contract's two roaming commands at the real actor. A linked Signal account states
+/// the roaming flag OFF (every account starts with the switch off); `SetRoamingWrites` is answered
+/// `Ok` and the caps say so, on and off again; with the switch off the core's own durable change of
+/// a chat (the clearing of a mark when it is read) is confirmed with `CommandPersisted` and dropped
+/// (nothing filed, so no job), and the same command sent again (the core's resend after a restart)
+/// is confirmed again. Mutants: the durable arm confirms nothing; the switch is refused; the caps
+/// state no flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_switch_is_stated_and_the_durable_clear_is_confirmed_with_it_off() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (core, _device) = world.link().await;
+    let flag = |flags: &[String]| -> Value {
+        let last: Value =
+            serde_json::from_str(flags.last().expect("the caps")).expect("the flags as JSON");
+        last["roaming_writes"].clone()
+    };
+    let flags = world.sink.wait_caps_flags(1, WAIT).await;
+    assert_eq!(
+        flag(&flags),
+        json!(false),
+        "Signal can write and the account's switch is off: {flags:?}"
+    );
+    for on in [true, false] {
+        let before = world.sink.caps_flags().len();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        core.send(Command::SetRoamingWrites { on, reply }).await;
+        answer.await.expect("answer").expect("the switch is set");
+        let flags = world.sink.wait_caps_flags(before + 1, WAIT).await;
+        assert_eq!(flag(&flags), json!(on), "{flags:?}");
+    }
+
+    let ask = |cmd: i64| Command::ChangeConversationDurable {
+        cmd: CmdId(cmd),
+        conv: World::direct(world.ada()),
+        change: ConversationChange::SetMarkedUnread {
+            marked_unread: false,
+        },
+        asked_at: 1_700_000_000_000,
+    };
+    core.send(ask(77)).await;
+    world
+        .sink
+        .wait_event_value("CommandPersisted", |v| v["cmd"] == 77)
+        .await;
+    core.send(ask(77)).await;
+    core.send(ask(78)).await;
+    world
+        .sink
+        .wait_event_value("CommandPersisted", |v| v["cmd"] == 78)
+        .await;
+    let confirmed = world
+        .sink
+        .event_values("CommandPersisted")
+        .iter()
+        .filter(|v| v["cmd"] == 77)
+        .count();
+    assert_eq!(
+        confirmed, 2,
+        "the same command is confirmed each time it is sent"
+    );
     world.shutdown(core).await;
 }

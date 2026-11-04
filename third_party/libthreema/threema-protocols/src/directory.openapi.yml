@@ -1,0 +1,1476 @@
+.references:
+  # Servers
+
+  work-servers: &work-servers
+    - url: https://ds-apip-work.threema.ch
+      description: Production server
+    - url: https://ds-apip-work.test.threema.ch
+      description: Sandbox server
+
+  # Primitives
+
+  base64: &base64
+    type: string
+    format: byte
+
+  u16: &u16
+    type: integer
+    minimum: 0
+    maximum: 65535
+
+  u32: &u32
+    type: integer
+    minimum: 0
+    maximum: 4294967295
+
+  u64: &u64
+    type: integer
+    minimum: 0
+    maximum: 18446744073709551615
+
+  # Common
+
+  identity: &identity
+    description: A Threema ID.
+    type: string
+    minLength: 8
+    maxLength: 8
+    pattern: ^[0-9A-Z*]{1}[0-9A-Z]{7}$
+    example: ECHOECHO
+
+  public-key: &public-key
+    <<: *base64
+    description: Public Key (32 bytes, base64) associated to a Threema ID.
+    example: ZWNob2VjaG9lY2hvZWNob2VjaG9lY2hvZWNob2VjaG8=
+
+  app-version: &app-version
+    description: |-
+      App version. This is the CSP `client-info` but with the following special postfix:
+
+      1. If at least one Threema-MDM parameter and at least one external MDM parameter is active, append `;me`
+      2. If at least one Threema-MDM parameter is active, append `;m`
+      3. If at least one external MDM parameter is active, append `;e`
+      4. If no MDM parameter is active, don't append. (A lone `;` is also acceptable.)
+    type: string
+    minLength: 1
+    example: 1.2.3;Q;de/DE;...
+
+  work-server-time-ms: &work-server-time-ms
+    description: |-
+      Current UNIX-ish timestamp in milliseconds of the server.
+
+      This timestamp can be used to check if a work contact change from a
+      `WorkSyncDelta` is relevant compared to the most recent full sync of that
+      work contact through this (or another) endpoint.
+    type: integer
+    minimum: 0
+
+  work-username: &work-username
+    description: Work license username.
+    type: string
+    minLength: 1
+    example: echoecho@threema.ch
+
+  work-password: &work-password
+    description: Work license password.
+    type: string
+    minLength: 1
+    example: super-secret-password
+
+  work-nickname: &work-nickname
+    description: |-
+      User's nickname sourced from the MDM parameter `th_nickname`. Empty is
+      equivalent to unset.
+    type: string
+    example: personal-🦜
+
+  work-first-name: &work-first-name
+    description: |-
+      User's first name sourced from the MDM parameter `th_firstname`. Empty is
+      equivalent to unset.
+    type: string
+    example: Aria
+
+  work-last-name: &work-last-name
+    description: |-
+      User's last name sourced from the MDM parameter `th_lastname`. Empty is
+      equivalent to unset.
+    type: string
+    example: Reverb
+
+  work-availability-status: &work-availability-status
+    <<: *base64
+    description: |-
+      User's availability status as defined by
+      `d2d_sync.WorkAvailabilityStatus`, encoded as base64.
+      `d2d_sync.WorkAvailabilityStatus` with
+      `WorkAvailabilityStatusCategory.NONE` is equivalent to unset (and vice
+      versa, no matter whether a description has been provided or not).
+
+  work-user-identifier: &work-user-identifier
+    description: |-
+      Custom unique identifier of the user (e.g. employee number), sourced from
+      the MDM parameter `th_csi`. Also known as _Customer Specific Identifier_.
+      Empty is equivalent to unset.
+    type: string
+
+  work-job-title: &work-job-title
+    description: |-
+      Job title of the user, sourced from the MDM parameter `th_job_title`.
+      Empty is equivalent to unset.
+    type: string
+
+  work-department: &work-department
+    description: |-
+      Department the user is working in, sourced from the MDM parameter
+      `th_department`. Empty is equivalent to unset.
+    type: string
+
+  work-user-category-labels-delimited: &work-user-category-labels-delimited
+    description: |-
+      Custom category labels assigned to the user (e.g. building name, room
+      number), sourced from the MDM parameter `th_category`. Empty is equivalent
+      to unset.
+
+      Note: For compatibility with the app configuration parameter
+      `th_category`, this is the delimited variant with the category label
+      separated by the category delimiter (`,` by default).
+    type: string
+    example: Building 1, Room 337
+
+  work-user-category-id: &work-user-category-id
+    description: A custom category ID.
+    type: string
+    minLength: 1
+    example: 'jNekOWhQ8B'
+
+  work-user-category-ids: &work-user-category-ids
+    description: |-
+      Custom category IDs of the user (e.g. mapping to a corresponding label
+      such as building name or room number), chosen by the Work subscription
+      administrator.
+    type: array
+    items: *work-user-category-id
+    example:
+      - '1'
+      - 'jNekOWhQ8B'
+
+  work-contacts-match: &work-contacts-match
+    type: array
+    items: *identity
+    example:
+      - ECHOECHO
+      - '*SUPPORT'
+
+  work-contact: &work-contact
+    type: object
+    required:
+      - id
+      - pk
+    properties:
+      id: *identity
+      pk: *public-key
+      first:
+        <<: *work-first-name
+        type:
+          - string
+          - 'null'
+      last:
+        <<: *work-last-name
+        type:
+          - string
+          - 'null'
+      jobTitle: *work-job-title
+      department: *work-department
+      availability: *work-availability-status
+
+  work-organisation: &work-organisation
+    type: object
+    required:
+      - name
+    properties:
+      name:
+        description: |-
+          Optional name of the organisation, translated by the `Accept-Language`
+          header (if provided).
+        type:
+          - string
+          - 'null'
+
+  work-directory-page-index: &work-directory-page-index
+    description: Page index.
+    type: integer
+    minimum: 0
+
+  work-directory-sort: &work-directory-sort
+    type: object
+    properties:
+      by:
+        description: The sort key applied to the resulting contacts.
+        type: string
+        anyOf:
+          - title: First name
+            const: firstName
+          - title: Last name
+            const: lastName
+          - {}
+        default: firstName
+      asc:
+        description: |-
+          Sort contacts ascending by `by` if `true`, sort descending if `false`.
+        type: boolean
+        default: true
+
+  work-properties: &work-properties
+    <<: *base64
+    description: |-
+      Work properties as defined by `directory.WorkProperties`, encoded as
+      base64.
+
+  remote-secret: &remote-secret
+    <<: *base64
+    description: Remote Secret (32 bytes, base64).
+
+  remote-secret-authentication-token: &remote-secret-authentication-token
+    <<: *base64
+    description: |-
+      Remote Secret Authentication Token (32 bytes, base64). Allows to retrieve
+      an associated Remote Secret.
+
+  # Authentication challenge/response
+
+  auth-challenge-request: &auth-challenge-request
+    description: Authentication required.
+    type: object
+    required:
+      - token
+      - tokenRespKeyPub
+    properties:
+      token:
+        <<: *base64
+        description: An arbitrary challenge token (base64) to be _signed_.
+      tokenRespKeyPub:
+        <<: *base64
+        description: |-
+          The public key (CPK, 32 bytes, base64) to derive a shared secret for
+          solving the challenge.
+
+  auth-challenge-response: &auth-challenge-response
+    type: object
+    required:
+      - token
+      - response
+    properties:
+      token:
+        <<: *base64
+        description: The token of the challenge request (base64).
+      response:
+        <<: *base64
+        description: |-
+          The token of the challenge request, _signed_ in the following way:
+
+          ```text
+          base64(
+            BLAKE2b(
+              key=BLAKE2b(
+                key=X25519HSalsa20(CK.secret, CPK.public),
+                salt='dir',
+                personal='3ma-csp',
+              ),
+              input=<token>
+            )
+          )
+          ```
+
+  work-auth-challenge-request: &work-auth-challenge-request
+    description: |-
+      Authentication challenge request for a Work endpoint.
+    type: object
+    required:
+      - challengePublicKey
+      - challenge
+    properties:
+      challengePublicKey:
+        <<: *base64
+        description: |-
+          The public key (CPK, 32 bytes, base64) to derive a shared secret for
+          solving the challenge.
+      challenge:
+        <<: *base64
+        description: An arbitrary challenge (base64) to be _signed_.
+
+  work-auth-challenge-response: &work-auth-challenge-response
+    description: |-
+      Authentication challenge response for a Work endpoint.
+    type: object
+    required:
+      - challenge
+      - response
+    properties:
+      challenge:
+        <<: *base64
+        description: The challenge (base64).
+      response:
+        <<: *base64
+        description: |-
+          The challenge, _signed_ in the following way:
+
+          ```text
+          base64(
+            BLAKE2b(
+              key=BLAKE2b(
+                key=X25519HSalsa20(CK.secret, CPK.public),
+                salt='wdir',
+                personal='3ma-csp',
+              ),
+              input=<token>
+            )
+          )
+          ```
+
+  work-auth-failed: &work-auth-failed
+    type: object
+    required:
+      - code
+    properties:
+      code:
+        type: string
+        anyOf:
+          - enum:
+              - invalid-credentials
+              - challenge-expired
+              - invalid-challenge-response
+          - {}
+
+  # Request/response data fragments
+
+  blob-credentials-request: &blob-credentials-request
+    type: object
+    required:
+      - identity
+    properties:
+      identity: *identity
+
+  blob-credentials-response:
+    ok: &blob-credentials-response-ok
+      description: |-
+        Blob server authentication credentials retrieved successfully.
+      type: object
+      required:
+        - success
+        - token
+        - expiration
+      properties:
+        success:
+          type: boolean
+          const: true
+        token:
+          description: |-
+            An opaque token used to authenticate against the blob server.
+
+            HTTP requests towards the the blob server must include it as a
+            header in the following way: `Authorization: ThreemaBlobToken
+            <token>`
+          type: string
+        expiration:
+          <<: *u64
+          description: |-
+            Amount of seconds until the token expires and must be discarded.
+      example:
+        success: true
+        token: givemeaccessplz
+        expiration: 600
+
+    error: &blob-credentials-response-error
+      description: |-
+        Blob server authentication credentials could not be retrieved.
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+      example:
+        success: false
+        error: Identity not found
+
+  id-revocation-request: &id-revocation-request
+    type: object
+    required:
+      - identity
+    properties:
+      identity: *identity
+
+  id-revocation-key-v1: &id-revocation-key-v1
+    <<: *base64
+    minLength: 8
+    maxLength: 8
+    description: |-
+      A legacy (v1) identity revocation key.
+
+      The revocation key is computed as follows (`[:4]` denotes the first four bytes):
+
+      ```text
+      base64(
+        SHA256(revocation-password)[:4]
+      )
+      ```
+
+  id-revocation-request-v1: &id-revocation-request-v1
+    type: object
+    required:
+      - identity
+      - revocationKey
+    properties:
+      identity: *identity
+      revocationKey: *id-revocation-key-v1
+
+  id-revocation-key-check-response:
+    found: &id-revocation-key-check-response-found
+      description: 'ID revocation key was set'
+      required:
+        - revocationKeySet
+        - lastChanged
+      properties:
+        revocationKeySet:
+          type: boolean
+          const: true
+        lastChanged:
+          type: string
+          format: date-time
+      example:
+        revocationKeySet: true
+        lastChanged: '2014-10-29T12:32:54Z'
+
+    empty: &id-revocation-key-check-response-empty
+      description: 'ID revocation key was not set'
+      required:
+        - revocationKeySet
+      properties:
+        revocationKeySet:
+          type: boolean
+          const: false
+
+  id-revocation-response:
+    ok: &id-revocation-response-ok
+      description: 'ID revocation key request was successful'
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: true
+
+    error: &id-revocation-response-error
+      description: 'ID revocation key was not successful'
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+      example:
+        success: false
+        error: 'Identity not found'
+
+  sfu-credentials-request: &sfu-credentials-request
+    type: object
+    required:
+      - identity
+    properties:
+      identity: *identity
+
+  sfu-credentials-response:
+    ok: &sfu-credentials-response-ok
+      description: SFU information retrieved successfully.
+      type: object
+      required:
+        - success
+        - sfuBaseUrl
+        - allowedSfuHostnameSuffixes
+        - sfuToken
+        - expiration
+      properties:
+        success:
+          type: boolean
+          const: true
+        sfuBaseUrl:
+          description: |-
+            Base URL used to create and distribute new calls.
+          type: string
+        allowedSfuHostnameSuffixes:
+          description: |-
+            A set of allowed hostname suffixes to be applied against a _SFU
+            Base URL_ when joining calls.
+
+            If the provided _SFU Base URL_'s hostname does not end with one of
+            the provided hostname suffixes, joining or peeking that call is
+            disallowed.
+
+            IMPORTANT: We intentionally only check if the _SFU Base URL_'s
+            hostname **ends** with one of the provided hostname suffixes to
+            allow for wildcard usage, e.g. `sfu.threema.ch` where any subdomain
+            ending with `sfu.threema.ch` would be valid. But this has the caveat
+            of being a footgun for root domains like `threema.ch` which would
+            then accept `evil-threema.ch`. Therefore, root domains must not be
+            included here!
+          type: array
+        sfuToken:
+          description: |-
+            An opaque token used to authenticate against a SFU.
+
+            HTTP requests towards the SFU must include it as a header in the
+            following way: `Authorization: ThreemaSfuToken <token>`
+          type: string
+        expiration:
+          <<: *u64
+          description: |-
+            Amount of seconds until the SFU information is considered stale and
+            must be discarded.
+      example:
+        success: true
+        sfuBaseUrl: https://ch-1-sfu.threema.ch
+        allowedSfuHostnameSuffixes:
+          - sfu.threema.ch
+        sfuToken: givemeaccessplz
+        expiration: 600
+
+    error: &sfu-credentials-response-error
+      description: SFU information could not be retrieved.
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+      example:
+        success: false
+        error: 'Identity not found'
+
+  work-properties-legacy-request: &work-properties-legacy-request
+    type: object
+    required:
+      - identity
+      - licenseUsername
+      - licensePassword
+      - version
+    properties:
+      identity: *identity
+      licenseUsername: *work-username
+      licensePassword: *work-password
+      version: *app-version
+      publicNickname: *work-nickname
+      firstName: *work-first-name
+      lastName: *work-last-name
+      csi: *work-user-identifier
+      jobTitle: *work-job-title
+      department: *work-department
+      category: *work-user-category-labels-delimited
+
+  work-properties-legacy-response:
+    ok: &work-properties-legacy-response-ok
+      description: Work properties updated successfully.
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: true
+    error: &work-properties-legacy-response-error
+      description: Updating Work properties failed.
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+      example:
+        success: false
+        error: 'Missing parameters'
+
+  work-credentials: &work-credentials
+    type: object
+    required:
+      - username
+      - password
+    properties:
+      username: *work-username
+      password: *work-password
+
+  work-credentials-with-identity: &work-credentials-with-identity
+    type: object
+    required:
+      - identity
+      - username
+      - password
+    properties:
+      identity: *identity
+      username: *work-username
+      password: *work-password
+
+  sync-work-data-request: &sync-work-data-request
+    type: object
+    required:
+      - contacts
+    properties:
+      contacts:
+        <<: *work-contacts-match
+        description: |-
+          A list of all existing contacts of the user to match against the Work
+          subscription.
+
+          Note: This is necessary to determine whether a contact is part of the
+          user's Work subscription and, in that case, get additional
+          information.
+
+          Note 2: Explicitly providing all of the user's contacts also prevents
+          having to configure **all** Work contacts of the same subscription.
+
+  sync-work-data-response: &sync-work-data-response
+    type: object
+    required:
+      - checkInterval
+      - org
+      - logo
+      - support
+      - directory
+      - mdm
+      - contacts
+    properties:
+      checkInterval:
+        <<: *u64
+        description: |-
+          Target amount of seconds until a subsequent Work sync should be
+          initiated.
+      org: *work-organisation
+      logo:
+        description: Logo to be displayed in the app.
+        type: object
+        required:
+          - light
+          - dark
+        properties:
+          light: &work-logo-url
+            description: |-
+              Optional URL to a logo to be displayed in the app. The logo must
+              be provided in PNG format.
+            type:
+              - string
+              - 'null'
+          dark: *work-logo-url
+      support:
+        description: Optional custom in-app support base URL.
+        type:
+          - string
+          - 'null'
+      directory:
+        oneOf:
+          - description: Disabled Work directory.
+            type: object
+            required:
+              - enabled
+            properties:
+              enabled:
+                type: boolean
+                const: false
+          - description: Enabled Work directory.
+            type: object
+            required:
+              - enabled
+              - cat
+            properties:
+              enabled:
+                type: boolean
+                const: true
+              cat:
+                description: |-
+                  Map of contact category IDs to their respective label.
+                type: object
+                additionalProperties: *work-user-category-id
+      mdm:
+        description: App configuration to be applied.
+        type: object
+        required:
+          - override
+          - params
+        properties:
+          override:
+            description: |-
+              Whether the app configuration parameters provided here take
+              precedence over the the externally configured MDM parameters.
+            type: boolean
+          params:
+            description: |-
+              A key/value map of app configuration / MDM parameters as defined
+              by the protocol.
+            type: object
+            additionalProperties:
+              oneOf:
+                - type: string
+                - *u64
+                - type: boolean
+      contacts:
+        description: |-
+          A list of contacts from the same Work subscription to be configured
+          on the user's device.
+        type: array
+        items:
+          <<: *work-contact
+          description: A configured Work contact.
+      time: *work-server-time-ms
+
+  work-contacts-request: &work-contacts-request
+    type: object
+    required:
+      - contacts
+    properties:
+      contacts:
+        <<: *work-contacts-match
+        description: |-
+          A list of contacts (Threema IDs) to get additional Work properties for.
+
+          Note: This is necessary to determine whether a contact is part of the
+          user's Work subscription and, in that case, get additional
+          information.
+
+  work-contacts-response: &work-contacts-response
+    type: object
+    required:
+      - contacts
+    properties:
+      contacts:
+        description: |-
+          A subset of the provided contacts that are part of the same Work
+          subscription with the associated additional Work properties.
+        type: array
+        items:
+          <<: *work-contact
+          description: A Work contact.
+      time: *work-server-time-ms
+
+  work-directory-request-wildcard: &work-directory-request-wildcard
+    type: object
+    required:
+      - query
+      - page
+      - categories
+    properties:
+      identity:
+        <<: *identity
+        description: The user's Threema ID.
+      page: *work-directory-page-index
+      query:
+        description: Wildcard search query.
+        type: string
+        const: '*'
+      categories:
+        <<: *work-user-category-ids
+        description: At least one category ID to narrow down the search with.
+        minLength: 1
+      sort: *work-directory-sort
+
+  work-directory-request-specific: &work-directory-request-specific
+    type: object
+    required:
+      - query
+      - page
+    properties:
+      identity:
+        <<: *identity
+        description: The user's Threema ID.
+      page: *work-directory-page-index
+      query:
+        description: |-
+          Search query. Matches any of Threema ID, first name, or last name.
+        type: string
+        minLength: 3
+        example: Bob
+      categories:
+        <<: *work-user-category-ids
+        description: Optional category IDs to narrow down the search with.
+      sort: *work-directory-sort
+
+  work-directory-response: &work-directory-response
+    type: object
+    required:
+      - paging
+      - contacts
+    properties:
+      paging:
+        description: Page information.
+        type: object
+        required:
+          - size
+          - total
+        properties:
+          size:
+            description: Maximum amount of results present in a single page.
+            type: integer
+            minimum: 0
+          total:
+            description: Total amount of results (spread across pages).
+            type: integer
+            minimum: 0
+          prev:
+            description: Previous page index, if any is available.
+            type: integer
+            minimum: 0
+          next:
+            description: Next page index, if any is available.
+            type: integer
+            minimum: 1
+      contacts:
+        description: |-
+          A Work contact of the same subcription that matches the search query.
+        type: array
+        items: !merge-objects
+          - *work-contact
+          - type: object
+            required:
+              - org
+            properties:
+              csi: *work-user-identifier
+              cat: *work-user-category-ids
+              org: *work-organisation
+      time: *work-server-time-ms
+
+  work-properties-request: &work-properties-request
+    type: object
+    required:
+      - properties
+    properties:
+      properties: *work-properties
+
+  remote-secret-create-request: &remote-secret-create-request
+    type: object
+    required:
+      - secret
+    properties:
+      secret: *remote-secret
+
+  remote-secret-create-response: &remote-secret-create-response
+    type: object
+    required:
+      - secretAuthenticationToken
+    properties:
+      secretAuthenticationToken: *remote-secret-authentication-token
+
+  remote-secret-delete-request: &remote-secret-delete-request
+    type: object
+    required:
+      - secretAuthenticationToken
+    properties:
+      secretAuthenticationToken: *remote-secret-authentication-token
+
+  remote-secret-fetch-request: &remote-secret-fetch-request
+    type: object
+    required:
+      - secretAuthenticationToken
+    properties:
+      secretAuthenticationToken: *remote-secret-authentication-token
+
+  remote-secret-fetch-response: &remote-secret-fetch-response
+    type: object
+    required:
+      - secret
+      - checkIntervalS
+      - nMissedChecksMax
+    properties:
+      secret: *remote-secret
+      checkIntervalS:
+        <<: *u32
+        description: |-
+          Amount of time in seconds until the Remote Secret should be fetched
+          again.
+      nMissedChecksMax:
+        <<: *u16
+        description: |-
+          The maximum number of fetches that may be missed until application
+          storage should be locked.
+
+openapi: 3.1.0
+
+info:
+  title: Directory and Work Directory Server APIs
+  description: |-
+    Maintains the directory of allocated Threema IDs and all associated
+    properties.
+  version: 1.0.0
+
+servers:
+  - url: https://ds-apip.threema.ch
+    description: Production server
+  - url: https://ds-apip.test.threema.ch
+    description: Sandbox server
+
+paths:
+  /identity/blob_cred:
+    post:
+      summary: Blob Server Credentials
+      description: |-
+        Retrieve blob server authentication credentials.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *blob-credentials-request
+                - !merge-objects
+                  - *auth-challenge-response
+                  - *blob-credentials-request
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *blob-credentials-response-ok
+                  - *blob-credentials-response-error
+        '429':
+          description: Rate limit exceeded.
+
+  /identity/revoke:
+    post:
+      summary: ID Revocation by Client Key
+      description: |-
+        Revoke a Threema ID by proofing the knowledge of the client key.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *id-revocation-request
+                - !merge-objects
+                  - *id-revocation-request
+                  - *auth-challenge-response
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *id-revocation-response-ok
+                  - *id-revocation-response-error
+
+  /identity/set_revocation_key:
+    post:
+      summary: Set ID Revocation Key
+      description: |-
+        Set the revocation key for an identity.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *id-revocation-request-v1
+                - !merge-objects
+                  - *id-revocation-request-v1
+                  - *auth-challenge-response
+
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *id-revocation-response-ok
+                  - *id-revocation-response-error
+
+  /identity/check_revocation_key:
+    post:
+      summary: Check ID Revocation Key
+      description: |-
+        Check whether a revocation key is set for a given ID
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *id-revocation-request
+                - !merge-objects
+                  - *id-revocation-request-v1
+                  - *auth-challenge-response
+
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *id-revocation-response-error
+                  - *id-revocation-key-check-response-found
+                  - *id-revocation-key-check-response-empty
+
+  /identity/ws/revoke:
+    post:
+      summary: ID Revocation by User-set Key
+      description:
+        Revoke a Threema ID with a user-set key previously derived from a
+        password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *id-revocation-request-v1
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *id-revocation-response-ok
+                  - *id-revocation-response-error
+
+  /identity/sfu_cred:
+    post:
+      summary: SFU Information
+      description: |-
+        Retrieve SFU information including URLs and authentication credentials.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *sfu-credentials-request
+                - !merge-objects
+                  - *auth-challenge-response
+                  - *sfu-credentials-request
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *sfu-credentials-response-ok
+                  - *sfu-credentials-response-error
+        '429':
+          description: Rate limit exceeded.
+
+  /identity/update_work_info:
+    post:
+      summary: Work Properties (Legacy)
+      description: |-
+        Update Work properties associated to the currently used Threema ID. Only
+        used by the _Work_, _Blue_ or _OnPrem_ flavour of Threema.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+
+        Note 1: All data of the request must be sourced **exclusively** from MDM
+        parameters. For example, the data source for `nickname` must be
+        `th_nickname` and not the custom nickname chosen by the user.
+
+        Note 2: This endpoint is intended to be replaced with the new _Work
+        Properties_ endpoint eventually, see PRD-186.
+
+        TODO(SE-368): When sending/receiving steps.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - *work-properties-legacy-request
+                - !merge-objects
+                  - *auth-challenge-response
+                  - *work-properties-legacy-request
+      responses:
+        '200':
+          description: Success... or not.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *auth-challenge-request
+                  - *work-properties-legacy-response-ok
+                  - *work-properties-legacy-response-error
+        '429':
+          description: Rate limit exceeded.
+
+  /fetch2:
+    post:
+      summary: Work Sync
+      description: |-
+        Full sync of all data associated to the Work subscription. Only used by
+        the _Work_, _Blue_ or _OnPrem_ flavour of Threema.
+
+        TODO(SE-368): When sending/receiving steps.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: !merge-objects
+              - *work-credentials
+              - *sync-work-data-request
+      responses:
+        '200':
+          description: Work subscription data.
+          content:
+            application/json:
+              schema: *sync-work-data-response
+        '400':
+          description: Invalid request.
+        '401':
+          description: Invalid username or password.
+        '429':
+          description: Rate limit exceeded.
+
+  /identities:
+    post:
+      summary: Work Contacts
+      description: |-
+        Request properties associated to a contact of the same Work subscription.
+
+        Note: This endpoint is currently buggy. See TWRK-1633 for a list of bugs.
+
+        TODO(SE-368): When sending/receiving steps. Send before adding a new
+        contact.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: !merge-objects
+              - *work-credentials
+              - *work-contacts-request
+      responses:
+        '200':
+          description: Matching Work contacts in the same Work subscription.
+          content:
+            application/json:
+              schema: *work-contacts-response
+        '400':
+          description: Invalid request.
+        '401':
+          description: Invalid username or password.
+        '429':
+          description: Rate limit exceeded.
+
+  /directory:
+    post:
+      summary: Work Directory
+      description: |-
+        Search for contacts in the same Work subscription as the user.
+
+        TODO(SE-368): When sending/receiving steps.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - !merge-objects
+                  - *work-credentials
+                  - *work-directory-request-wildcard
+                - !merge-objects
+                  - *work-credentials
+                  - *work-directory-request-specific
+      responses:
+        '200':
+          description: Queried Work contacts of the same Work subscription.
+          content:
+            application/json:
+              schema: *work-directory-response
+        '400':
+          description: Invalid request.
+        '401':
+          description: Invalid username or password.
+        '429':
+          description: Rate limit exceeded.
+
+  /api-client/v1/user-properties:
+    post:
+      summary: Work Properties
+      description: |-
+        Update Work properties associated to the currently used Threema ID. Only
+        used by the _Work_, _Blue_ or _OnPrem_ flavour of Threema.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+
+        Note 1: All data (except for the availability status) of the request
+        must be sourced **exclusively** from MDM parameters. For example, the
+        data source for `nickname` must be `th_nickname` and not the custom
+        nickname chosen by the user.
+
+        Note 2: This endpoint is intended to replace the old _Work Properties
+        (Legacy)_ endpoint eventually, see PRD-186.
+
+        When receiving this request without the challenge response:
+
+        1. If the request could not be decoded, respond with status code `400`.
+        2. Respond with an authentication challenge tied to the provided data
+           with purpose _set_.
+
+        When receiving this request with the challenge response:
+
+        1.  If the request could not be decoded, respond with status code `400`.
+        2.  If the Work `credentials` are invalid, respond with status code
+            `401` and code `invalid-credentials`.
+        3.  If the `challenge` expired, respond with status code `401` and code
+            `challenge-expired`.
+        4.  If the `challenge` is not tied to the provided data or does not have
+            the purpose _set_, respond with status code `401` and code
+            `invalid-challenge-response`.
+        5.  If the `response` is not the correctly _signed_ `challenge`, respond
+            with status code `401` and code `invalid-challenge-response`.
+        6.  Decode `properties` into a `directory.WorkProperties` message. If
+            this fails, respond with status code `400`.
+        7.  Update the work properties of the respective user and let `changes`
+            be the set of changes that were applied, including a UNIX-ish
+            timestamp in milliseconds on when the change was applied.
+        8.  If `changes` is empty, respond with status code `204`.
+        9.  For each `contact` of the work contacts in the same subscription as
+            the respective user, schedule sending a `csp_e2e.WorkSyncDelta` via
+            `*3MAW0RK` to `contact` with `changes`.
+        10. Respond with status code `204`.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *work-properties-request
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *work-auth-challenge-response
+                  - *work-properties-request
+      responses:
+        '200':
+          description: Authentication challenge.
+          content:
+            application/json:
+              schema: *work-auth-challenge-request
+        '204':
+          description: Success.
+        '400':
+          description: Invalid request.
+        '401':
+          description: Authentication failed.
+          content:
+            application/json:
+              schema: *work-auth-failed
+        '429':
+          description: Rate limit exceeded.
+
+  /api-client/v1/remote-secret:
+    put:
+      summary: Create Remote Secret
+      description: |-
+        Create a new Remote Secret.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+
+        When receiving this request without the challenge response:
+
+        1. If the request could not be decoded, respond with status code `400`.
+        2. Respond with an authentication challenge tied to the provided data
+           with purpose _create_.
+
+        When receiving this request with the challenge response:
+
+        1. If the request could not be decoded, respond with status code `400`.
+        2. If the Work `credentials` are invalid, respond with status code `401`
+           and code `invalid-credentials`.
+        3. If the `challenge` expired, respond with status code `401` and code
+           `challenge-expired`.
+        4. If the `challenge` is not tied to the provided data or does not have
+           the purpose _create_, respond with status code `401` and code
+           `invalid-challenge-response`.
+        5. If the `response` is not the correctly _signed_ `challenge`, respond
+           with status code `401` and code `invalid-challenge-response`.
+        6. Create a new random Remote Secret Authentication Token and let
+           `remote-secret-authentication-token` be the result.
+        7. Add a new entry for the Remote Secret `secret` tied to `identity` and
+           `remote-secret-authentication-token`.
+        8. Respond with status code `200` and the
+           `remote-secret-authentication-token`.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *remote-secret-create-request
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *work-auth-challenge-response
+                  - *remote-secret-create-request
+      responses:
+        '200':
+          description: Success or authentication challenge.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - *work-auth-challenge-request
+                  - *remote-secret-create-response
+        '400':
+          description: Invalid request.
+        '401':
+          description: Authentication failed.
+          content:
+            application/json:
+              schema: *work-auth-failed
+        '429':
+          description: Rate limit exceeded.
+
+    delete:
+      summary: Delete Remote Secret
+      description: |-
+        Remove an existing Remote Secret.
+
+        The first call without the challenge response properties initiates the
+        challenge request. The second call must repeat the exact same properties
+        and the challenge response.
+
+        When receiving this request without the challenge response:
+
+        1. If the request could not be decoded, respond with status code `400`.
+        2. Respond with an authentication challenge tied to the provided data
+           with purpose _delete_.
+
+        When receiving this request with the challenge response:
+
+        1. If the request could not be decoded, respond with status code `400`.
+        2. If the Work `credentials` are invalid, respond with status code `401`
+           and code `invalid-credentials`.
+        3. If the `challenge` expired, respond with status code `401` and code
+           `challenge-expired`.
+        4. If the `challenge` is not tied to the provided data or does not have
+           the purpose _delete_, respond with status code `401` and code
+           `invalid-challenge-response`.
+        5. If the `response` is not the correctly _signed_ `challenge`, respond
+           with status code `401` and code `invalid-challenge-response`.
+        6. Remove any existing Remote Secret entry tied to `identity` and
+           `remoteSecretAuthenticationToken`.
+        7. Respond with status code `204`.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *remote-secret-delete-request
+                - !merge-objects
+                  - *work-credentials-with-identity
+                  - *work-auth-challenge-response
+                  - *remote-secret-delete-request
+      responses:
+        '200':
+          description: Authentication challenge.
+          content:
+            application/json:
+              schema: *work-auth-challenge-request
+        '204':
+          description: Success.
+        '400':
+          description: Invalid request.
+        '401':
+          description: Authentication failed.
+          content:
+            application/json:
+              schema: *work-auth-failed
+        '429':
+          description: Rate limit exceeded.
+
+    post:
+      summary: Fetch Remote Secret
+      description: |-
+        Fetch an existing Remote Secret.
+
+        When receiving this request:
+
+        1. Look up a Remote Secret tied to `identity` and
+           `remoteSecretAuthenticationToken` and let `secret` be the result.
+        2. If `secret` is not defined, respond with status code `404`.
+        3. If the access to `secret` is blocked, respond with status code `403`.
+        4. Respond with status code `200` and `secret` along with the associated
+           configuration for `identity`.
+      servers: *work-servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: *remote-secret-fetch-request
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema: *remote-secret-fetch-response
+        '400':
+          description: Invalid request.
+        '403':
+          description: Access to the Remote Secret blocked.
+        '404':
+          description: Remote Secret does not exist.
+        '429':
+          description: Rate limit exceeded.

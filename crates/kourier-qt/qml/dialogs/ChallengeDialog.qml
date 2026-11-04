@@ -50,7 +50,7 @@ Kirigami.Dialog {
             icon.name: "globe"
             enabled: root.url !== ""
             Layout.alignment: Qt.AlignLeft
-            onClicked: Qt.openUrlExternally(root.url)
+            onClicked: App.openExternalUrl(root.url)
         }
         QQC2.Label {
             text: L10n.i18nc("@info", "If the browser ends on a link that does not open Kourier, copy that link and paste it here:")

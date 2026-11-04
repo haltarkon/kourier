@@ -375,9 +375,16 @@ pub fn placeholder_summary(p: Placeholder) -> Summary {
     }
 }
 
-/// Text of a tombstone.
-pub fn deleted_text(deletion: &Deletion, own: bool) -> String {
+/// Text of a tombstone. `author` is the deleted message's author (`None` = ours). A delete for everyone whose deleter is
+/// somebody other than the author is an admin's (the core stores `by` only then; WhatsApp, W6a2), also when the message
+/// was ours. A delete the network did not attribute (`Deletion::Unattributed`, KT-2) takes the plain words, own row or not.
+pub fn deleted_text(deletion: &Deletion, own: bool, author: Option<&UserId>) -> String {
     match deletion {
+        Deletion::ForEveryone { by: Some(by) } if Some(by) != author => trc(
+            "@info:preview stand-in for a deleted message",
+            "This message was deleted by an admin",
+        )
+        .into_owned(),
         Deletion::ForEveryone { .. } if own => trc(
             "@info:preview stand-in for a deleted message",
             "You deleted this message",
@@ -394,7 +401,10 @@ pub fn deleted_text(deletion: &Deletion, own: bool) -> String {
 /// Summary of a whole message for previews and quotes.
 pub fn message_summary(msg: &Message, names: &dyn Names) -> Summary {
     match &msg.deleted {
-        Some(d) => Summary::new(deleted_text(d, msg.origin.is_own()), "trash-empty"),
+        Some(d) => Summary::new(
+            deleted_text(d, msg.origin.is_own(), msg.origin.author()),
+            "trash-empty",
+        ),
         None => body_summary(&msg.body, names),
     }
 }
@@ -634,6 +644,44 @@ pub fn system_text(event: &SystemEvent, names: &dyn Names) -> String {
             "%1 changed their phone number",
             &[&names.display_name(user)],
         ),
+        // P5a: the user's own action, so each wording is its own message (i18n.md), never
+        // "You" in a name slot.
+        SystemEvent::VerifiedChanged {
+            user,
+            verified: true,
+            other_device: false,
+        } => trfc(
+            "@info:status quiet notice, %1 a name",
+            "You marked your safety number with %1 as verified",
+            &[&names.display_name(user)],
+        ),
+        SystemEvent::VerifiedChanged {
+            user,
+            verified: false,
+            other_device: false,
+        } => trfc(
+            "@info:status quiet notice, %1 a name",
+            "You marked your safety number with %1 as not verified",
+            &[&names.display_name(user)],
+        ),
+        SystemEvent::VerifiedChanged {
+            user,
+            verified: true,
+            other_device: true,
+        } => trfc(
+            "@info:status quiet notice, %1 a name",
+            "You marked your safety number with %1 as verified from another device",
+            &[&names.display_name(user)],
+        ),
+        SystemEvent::VerifiedChanged {
+            user,
+            verified: false,
+            other_device: true,
+        } => trfc(
+            "@info:status quiet notice, %1 a name",
+            "You marked your safety number with %1 as not verified from another device",
+            &[&names.display_name(user)],
+        ),
     }
 }
 
@@ -839,9 +887,9 @@ pub fn system_icon(event: &SystemEvent) -> &'static str {
         }
         SystemEvent::AvatarChanged { .. } => "photo",
         SystemEvent::TimerChanged { .. } => "clock",
-        SystemEvent::IdentityKeyChanged { .. } | SystemEvent::SessionRefreshed { .. } => {
-            "security-high"
-        }
+        SystemEvent::IdentityKeyChanged { .. }
+        | SystemEvent::SessionRefreshed { .. }
+        | SystemEvent::VerifiedChanged { .. } => "security-high",
         SystemEvent::GroupCreated { .. } => "user-group-new",
         SystemEvent::MessageRequestAccepted => "dialog-ok",
         SystemEvent::Call(line) => call_icon(line),
@@ -862,6 +910,74 @@ mod tests {
         m.insert(a.clone(), "Olena");
         m.insert(b.clone(), "Taras");
         (m, a, b)
+    }
+
+    /// W6a2 (B7b, his U4): a delete for everyone whose deleter is somebody other than the author reads "deleted by an
+    /// admin", also on our own message; the author's own delete (whoever the author is), a delete with no deleter named
+    /// and one for me keep the words they had; KT-2's `Unattributed` reads the plain words on our own row too. Mutants:
+    /// any named deleter is an admin; the author not compared.
+    #[test]
+    fn a_tombstone_says_an_admin_only_when_the_deleter_is_not_the_author() {
+        let (_, olena, taras) = names();
+        let by = |user: &UserId| Deletion::ForEveryone {
+            by: Some(user.clone()),
+        };
+        let admin = "This message was deleted by an admin";
+        assert_eq!(deleted_text(&by(&taras), false, Some(&olena)), admin);
+        assert_eq!(
+            deleted_text(&by(&taras), true, None),
+            admin,
+            "our message too"
+        );
+        assert_eq!(
+            deleted_text(&by(&olena), false, Some(&olena)),
+            "This message was deleted",
+            "her own delete"
+        );
+        let unnamed = Deletion::ForEveryone { by: None };
+        assert_eq!(
+            deleted_text(&unnamed, false, Some(&olena)),
+            "This message was deleted"
+        );
+        assert_eq!(
+            deleted_text(&unnamed, true, None),
+            "You deleted this message"
+        );
+        assert_eq!(
+            deleted_text(&Deletion::ForMe, false, Some(&olena)),
+            "This message was deleted"
+        );
+        // KT-2: where a server checks the deletes a NAMED delete of our own message reads "deleted
+        // by an admin" like any other (above); Telegram's backend names nobody, so it never shows there.
+        // A delete the network did not attribute is not "you deleted this", own row or not.
+        assert_eq!(
+            deleted_text(&Deletion::Unattributed, true, None),
+            "This message was deleted"
+        );
+        assert_eq!(
+            deleted_text(&Deletion::Unattributed, false, Some(&olena)),
+            "This message was deleted"
+        );
+        // The summary of a whole message (quotes, the list) asks with the message's own author.
+        let (n, ..) = names();
+        let mut message = crate::fixture::message(
+            kourier_model::MessageId(1),
+            kourier_model::ConversationId(1),
+            kourier_model::Origin::Remote {
+                author: olena.clone(),
+                device: None,
+            },
+            1_000,
+            Body::text("secret"),
+        );
+        message.deleted = Some(by(&taras));
+        assert_eq!(message_summary(&message, &n).text, admin);
+        message.deleted = Some(by(&olena));
+        assert_eq!(
+            message_summary(&message, &n).text,
+            "This message was deleted",
+            "her own delete, judged by the message's own author"
+        );
     }
 
     #[test]

@@ -5,8 +5,9 @@ import org.kde.kirigami as Kirigami
 import app.kourier
 
 // What the accounts shown need the user to know or do (`App.bannerKind`): a quiet line while a
-// state passes by itself (connecting, getting new messages, offline), a message with its
-// action when the user has to act (link again, solve a challenge, set the clock, restart).
+// state passes by itself (connecting, getting new messages, offline) or to say that part of
+// a pushed history did not arrive (it stays for the session), a message with its action when
+// the user has to act (link again, solve a challenge, set the clock, restart).
 //
 // The history transfer of a newly linked account shows here too (`App.bannerTransfer`): the
 // link page ends as soon as the core has the account, and the chats can be used while the
@@ -23,9 +24,12 @@ ColumnLayout {
 
     readonly property string kind: App.bannerKind
     readonly property bool passing: root.kind === "connecting" || root.kind === "syncing" || root.kind === "offline"
+    // A quiet line (no button, no colour): a passing state, or the lost part of a history.
+    readonly property bool quiet: root.passing || root.kind === "historyLost"
     readonly property bool busy: root.kind === "connecting" || root.kind === "syncing"
     // The history transfer to show: `waiting`, `downloading`, `reading`, `failed`, or empty;
-    // `updating` after it, or without one: the contacts and groups a new link still fetches.
+    // `updating` after it, or without one: the contacts and groups a new link still fetches;
+    // `history` for a network that sends its history in pieces after the link.
     readonly property string transferPhase: App.bannerTransfer.phase ?? ""
     // A history transfer: running, or failed.
     readonly property bool transfer: root.transferPhase !== ""
@@ -39,9 +43,9 @@ ColumnLayout {
     visible: root.kind !== "" || root.transfer
     spacing: 0
 
-    // Connecting, syncing, offline.
+    // Connecting, syncing, offline, and the lost part of a history.
     RowLayout {
-        visible: root.passing
+        visible: root.quiet
         spacing: Kirigami.Units.smallSpacing
         Layout.fillWidth: true
         Layout.leftMargin: Kirigami.Units.smallSpacing
@@ -56,7 +60,7 @@ ColumnLayout {
         }
         Kirigami.Icon {
             visible: !root.busy
-            source: "network-disconnect"
+            source: root.kind === "historyLost" ? "dialog-information" : "network-disconnect"
             implicitWidth: Kirigami.Units.iconSizes.small
             implicitHeight: Kirigami.Units.iconSizes.small
         }
@@ -72,8 +76,9 @@ ColumnLayout {
 
     // The user has to act.
     Kirigami.InlineMessage {
-        visible: root.kind !== "" && !root.passing
-        type: root.kind === "loggedOut" || root.kind === "error" ? Kirigami.MessageType.Error : Kirigami.MessageType.Warning
+        visible: root.kind !== "" && !root.quiet
+        // A network the person turned off himself is information, not a warning.
+        type: root.kind === "loggedOut" || root.kind === "error" ? Kirigami.MessageType.Error : (root.kind === "networkOff" ? Kirigami.MessageType.Information : Kirigami.MessageType.Warning)
         // The text can carry the account's name and a reason the network gave.
         text: Style.plain(App.bannerText)
         showCloseButton: false
@@ -89,13 +94,41 @@ ColumnLayout {
                         return "link";
                     case "challenge":
                         return "globe";
+                    case "networkOff":
+                        return "network-connect";
                     default:
                         return "view-refresh";
                     }
                 }
                 onTriggered: root.activated()
+            },
+            // The page the network offers about a ban or a logout (an `https://` address,
+            // opened after this click and nowhere else).
+            Kirigami.Action {
+                id: appealAction
+                visible: App.bannerAppealUrl !== ""
+                enabled: visible
+                text: App.bannerAppealLabel
+                icon.name: "globe"
+                onTriggered: App.openExternalUrl(App.bannerAppealUrl)
             }
         ]
+    }
+
+    // What the network itself said about a ban or a logout: plain text, one line, under
+    // Kourier's own sentence (never markup, never logged).
+    QQC2.Label {
+        id: explanation
+        visible: root.kind !== "" && !root.quiet && App.bannerExplanation !== ""
+        text: App.bannerExplanation
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+        font: Kirigami.Theme.smallFont
+        Layout.fillWidth: true
+        Layout.leftMargin: Kirigami.Units.largeSpacing
+        Layout.rightMargin: Kirigami.Units.largeSpacing
+        Layout.topMargin: Kirigami.Units.smallSpacing
     }
 
     // The history transfer. Loaded by name when one is first shown: nothing of it is made,

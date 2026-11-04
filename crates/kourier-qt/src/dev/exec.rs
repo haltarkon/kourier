@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use cxx_qt_lib::{QString, QStringList};
+use kourier_app::{AppHandle, RehearsalAct, RehearsalKind};
 use kourier_viewmodel::{AccountStatus, Receipt, RowKey, RowKind};
 use serde_json::{Value, json};
 
 use super::DevError;
+use super::guard;
 use super::protocol::{ActOn, Action, LoginValues, PageName, Until, receipt_name, receipt_rank};
 use crate::app::pinned;
 use crate::bridge::qobject::{self, QObject};
@@ -155,6 +157,14 @@ impl qobject::App {
                             "unread": c.unread,
                             "last_activity": c.last_activity,
                             "newest_own": receipt_name(c.receipt),
+                            // The phone's chat settings as the SHOWN list has them (T2,
+                            // T-1): a pinned chat, a muted one (a synced or a local mute
+                            // that has not run out), one marked unread. `archived` is not
+                            // here: this view is the inbox, so no row of it is archived;
+                            // the core's own row is `chat_facts` (M12).
+                            "pinned": c.pinned(),
+                            "muted": c.muted,
+                            "marked_unread": c.marked_unread,
                         })
                     })
                     .collect()
@@ -232,26 +242,33 @@ impl qobject::App {
 
     /// `act`: what the user does to a message of the open conversation, through the same
     /// invokables the timeline's menu and the composer use. Returns the message's id.
+    ///
+    /// `conversation` and `message` are the driver's guards (C7, [`super::guard`]): checked here, on
+    /// the Qt thread, in the call that acts, a chat that is not the open one or a message that is
+    /// not one of its live messages of the kind `on` names is refused with nothing done.
     pub(crate) fn dev_act(
         mut self: Pin<&mut Self>,
         on: ActOn,
         action: &Action,
+        conversation: Option<i64>,
+        message: Option<i64>,
     ) -> Result<Value, DevError> {
         let conv = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
-        if conv == 0 {
+        if conv == 0 && conversation.is_none() {
             return Err(DevError::NotFound("no conversation is open".into()));
         }
-        let message = pinned(self.timeline)
-            .and_then(|t| {
+        guard::the_named_chat_is_open(conv, conversation)?;
+        let live: Vec<(Option<i64>, bool)> = pinned(self.timeline)
+            .map(|t| {
                 t.store()
                     .view
                     .iter()
                     .filter(|r| r.kind == RowKind::Message && !r.deleted)
-                    .find(|r| r.own == (on == ActOn::Own))
-                    .and_then(|r| r.message_id())
+                    .map(|r| (r.message_id().map(|id| id.0), r.own))
+                    .collect()
             })
-            .ok_or_else(|| DevError::NotFound("no such message in the open conversation".into()))?
-            .0;
+            .unwrap_or_default();
+        let message = guard::the_message_to_act_on(live, on, message)?;
         let refused = |why: &str| Err(DevError::Failed(why.to_owned()));
         match action {
             Action::React { emoji, remove } => {
@@ -275,6 +292,17 @@ impl qobject::App {
                 let Some(mut composer) = pinned(self.composer) else {
                     return Err(DevError::Gone);
                 };
+                // A driver that named a chat edits from a plain composer only (F3): the user's reply, edit in
+                // progress or files are not the tool's to take over.
+                if conversation.is_some() {
+                    guard::the_composer_is_plain(
+                        *composer.edit_id(),
+                        *composer.reply_to_id(),
+                        composer
+                            .attachment_count()
+                            .saturating_add(*composer.preparing()),
+                    )?;
+                }
                 if !composer.as_mut().start_edit(conv, message) {
                     return refused("the message cannot be edited");
                 }
@@ -288,18 +316,36 @@ impl qobject::App {
 
     /// `send`: the composer's send in the open conversation. Returns the conversation and the
     /// row key of the newest own message before the send (the caller waits for a newer one).
+    ///
+    /// `conversation` is the driver's guard (C7, [`super::guard`]): when it names a chat that is
+    /// not the open one, or the composer is not plain (a reply picked, an edit in progress, files in
+    /// the strip: F3), the send is refused on this very thread, in this very call, and nothing
+    /// is sent.
     pub(crate) fn dev_send(
         self: Pin<&mut Self>,
         text: &str,
+        conversation: Option<i64>,
     ) -> Result<(i64, Option<RowKey>), DevError> {
         let conv = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
-        if conv == 0 {
+        if conv == 0 && conversation.is_none() {
             return Err(DevError::NotFound("no conversation is open".into()));
         }
+        guard::the_named_chat_is_open(conv, conversation)?;
         let before = self.dev_newest_own_key();
         let Some(mut composer) = pinned(self.composer) else {
             return Err(DevError::Gone);
         };
+        // A driver that named a chat sends from a plain composer only (F3): a reply he picked, an edit in
+        // progress or files in the strip would go out with, or instead of, the tool's text.
+        if conversation.is_some() {
+            guard::the_composer_is_plain(
+                *composer.edit_id(),
+                *composer.reply_to_id(),
+                composer
+                    .attachment_count()
+                    .saturating_add(*composer.preparing()),
+            )?;
+        }
         if composer.as_mut().send(conv, &QString::from(text)) {
             Ok((conv, before))
         } else {
@@ -386,6 +432,9 @@ impl qobject::App {
                 "planned": *c.planned(),
                 "preparing": *c.preparing(),
                 "prepared": *c.preparing_done(),
+                // A reply he picked and an edit in progress (F3: a guarded send goes from a plain composer only).
+                "replying": *c.reply_to_id() > 0,
+                "editing": *c.edit_id() > 0,
                 // Chats that are not open and have files waiting in their composer.
                 "parked": c.parked_chats(),
             }),
@@ -544,6 +593,7 @@ impl qobject::App {
             .ok()
             // SAFETY: the live root window (Qt thread).
             .map(|w| unsafe { ffi::window_visible(w) });
+        let transfer = self.dev_transfer();
         json!({
             "loaded": *self.loaded(),
             "window_visible": visible,
@@ -567,7 +617,57 @@ impl qobject::App {
             "banner": self.banner_kind().to_string(),
             "login": pinned(self.login).map(|l| l.kind().to_string()),
             "window": size,
+            // Whether the run was started with the number tail a first link is checked against
+            // (the tail itself is never shown): a run tool refuses to say "scan now" unless true.
+            "expected_number_check": self.expected_number_check(),
+            // The history the network pushes after a link, as the account banner shows it: the
+            // phase is `history` while the phone is still sending (the STATE banner never says
+            // so), `""` when nothing is shown; `progress` 0 … 1 or null when it is not known.
+            "transfer": {"phase": transfer.0, "progress": transfer.1},
+            // WhatsApp's usage-statistics counters (the real backend only, else null): a run
+            // that expects `sent == 0` must see `looked` grow, or the 0 proves nothing.
+            "wam": self.dev_app().and_then(AppHandle::wam_counts)
+                .map(|(sent, looked)| json!({"sent": sent, "looked": looked})),
+            // Whether this run plays WhatsApp with the rehearsal fake (no real client, no network).
+            "rehearsal": self.dev_app().is_some_and(AppHandle::is_rehearsal),
+            // The frames the rehearsal fake has taken (sends, reacts, edits, deletes, revokes,
+            // timer sets; T2 C3): the run tool's proof that a read-only step sent nothing.
+            // `null` outside a rehearsal: "not measured" is never a 0.
+            "frames": self.dev_app().and_then(AppHandle::rehearsal_frames),
         })
+    }
+
+    /// `rehearsal_arrive`: the rehearsal network's phone puts one text from the other member
+    /// into the first chat of `kind` of the running account, as live traffic. Refused in every
+    /// run that does not play WhatsApp with the rehearsal fake (a real run has no such door).
+    pub(crate) fn dev_rehearsal_arrive(
+        self: Pin<&mut Self>,
+        kind: RehearsalKind,
+    ) -> Result<Value, DevError> {
+        let app = self.dev_app().ok_or(DevError::Gone)?;
+        app.rehearsal_arrive(kind)
+            .map_err(|e| DevError::Failed(format!("refused: {e}")))?;
+        Ok(json!({"kind": match kind {
+            RehearsalKind::Direct => "direct",
+            RehearsalKind::Group => "group",
+        }}))
+    }
+
+    /// `rehearsal_act`: the rehearsal network's phone plays `act` in the first chat of `kind` of
+    /// the running account (T2 T-5). Refused like `rehearsal_arrive` in every run that does not
+    /// play WhatsApp with the rehearsal fake; the fake takes no frame for it.
+    pub(crate) fn dev_rehearsal_act(
+        self: Pin<&mut Self>,
+        kind: RehearsalKind,
+        act: RehearsalAct,
+    ) -> Result<Value, DevError> {
+        let app = self.dev_app().ok_or(DevError::Gone)?;
+        app.rehearsal_act(kind, act)
+            .map_err(|e| DevError::Failed(format!("refused: {e}")))?;
+        Ok(json!({"kind": match kind {
+            RehearsalKind::Direct => "direct",
+            RehearsalKind::Group => "group",
+        }, "act": act.name()}))
     }
 
     /// Resizes the window (the screenshot's `size`).

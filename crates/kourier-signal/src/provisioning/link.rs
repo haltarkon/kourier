@@ -117,6 +117,26 @@ fn failed(kind: ErrorKind, detail: impl Into<String>, user: impl Into<String>) -
     BackendError::new(kind, detail).with_user_message(user)
 }
 
+/// What the server's refusal of a device link says (K-A fix C7): 409, the app is too old;
+/// 411, the account has as many linked devices as Signal allows (the typed
+/// [`ErrorKind::TooManyDevices`], so the front-end words it in its own language; the server
+/// does not say how many that is, Signal's own apps limit it to five). `None`: another status.
+fn link_refusal(status: u16) -> Option<LoginError> {
+    match status {
+        409 => Some(failed(
+            ErrorKind::Unsupported,
+            "link refused with 409",
+            "Kourier is too old for this account.",
+        )),
+        411 => Some(failed(
+            ErrorKind::TooManyDevices { max: None },
+            "link refused with 411",
+            "This account has too many linked devices.",
+        )),
+        _ => None,
+    }
+}
+
 fn from_error(e: &Error) -> LoginError {
     e.to_backend_error()
         .with_user_message("Linking failed; check the connection and try again.")
@@ -192,6 +212,8 @@ pub(crate) async fn link<T: SignalTransport>(
                 kind: InputKind::Text,
                 default: Some(default_name.clone()),
                 required: true,
+                note: None,
+                code: None,
             }],
         },
     )
@@ -261,7 +283,7 @@ pub(crate) async fn link<T: SignalTransport>(
             "the account that scanned the code is not the expected one; nothing was linked"
         );
         return Err(failed(
-            ErrorKind::InvalidInput,
+            ErrorKind::NotTheExpectedAccount,
             "the scanned account is not the expected one",
             "This is not the account Kourier was told to link. Nothing was linked. \
              Scan the code with the other phone.",
@@ -283,8 +305,8 @@ pub(crate) async fn link<T: SignalTransport>(
     register(&shared, &provisioned, &device_name, offer, answered, &stop).await
 }
 
-/// Whether `aci` is the primary own id of one of the profile's other accounts; the answer is
-/// whether that account is logged out.
+/// Whether `aci` is an own id of one of the profile's other accounts (`taken` lists every own id of
+/// each, an ACI first); the answer is whether that account is logged out.
 fn already_here(taken: &[TakenIdentity], aci: Aci) -> Option<bool> {
     let user = crate::service_id::aci_user_id(aci).ok()?;
     taken.iter().find(|t| t.user == user).map(|t| t.logged_out)
@@ -719,24 +741,11 @@ async fn register<T: SignalTransport>(
     let requested = std::time::Instant::now();
     shared.net.disconnect(&socket).await;
     let response = response.map_err(|e| from_error(&e.into()))?;
+    if let Some(refusal) = link_refusal(response.status.as_u16()) {
+        return Err(refusal.into());
+    }
     match response.status.as_u16() {
         200..=299 => {}
-        409 => {
-            return Err(failed(
-                ErrorKind::Unsupported,
-                "link refused with 409",
-                "Kourier is too old for this account.",
-            )
-            .into());
-        }
-        411 => {
-            return Err(failed(
-                ErrorKind::InvalidInput,
-                "link refused with 411",
-                "This account has too many linked devices.",
-            )
-            .into());
-        }
         status => {
             return Err(from_error(&Error::Status {
                 what: "device link",
@@ -935,6 +944,17 @@ mod tests {
         assert!(!number_ends_with("+1234", "91234"));
         assert!(!number_ends_with("+15550101234", ""));
         assert!(!number_ends_with("+15550101234", "abcd"));
+    }
+
+    /// K-A fix C7: the server's 411 is the typed "too many devices", which the link page words
+    /// in its own language (it was `InvalidInput` with an English sentence).
+    #[test]
+    fn a_411_on_the_link_is_too_many_devices() {
+        let e = link_refusal(411).expect("411 is a refusal");
+        assert_eq!(e.kind, ErrorKind::TooManyDevices { max: None });
+        assert!(!e.kind.is_retryable());
+        assert_eq!(link_refusal(409).expect("409").kind, ErrorKind::Unsupported);
+        assert!(link_refusal(200).is_none() && link_refusal(500).is_none());
     }
 
     #[test]

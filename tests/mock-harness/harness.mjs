@@ -15,6 +15,7 @@ import assert from 'node:assert';
 import { createRequire } from 'node:module';
 import fs from 'node:fs/promises';
 import http2 from 'node:http2';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -33,6 +34,13 @@ const { Router } = require('@signalapp/mock-server/src/server/ws/router.js');
 // One websocket of the mock: patched below so a device can remove itself from its account
 // (`DELETE /v1/devices/<id>`), which the mock has no route for.
 const { Connection: MockConnection } = require('@signalapp/mock-server/src/server/ws/connection.js');
+// The Storage Service keys (`storageState` and its siblings read what the phone could read,
+// `rawStorageRecord` reads the bytes behind the decoded record).
+const {
+  deriveStorageItemKey,
+  decryptStorageManifest,
+  encryptStorageManifest,
+} = require('@signalapp/mock-server/src/crypto.js');
 
 /** Version of the JSON-lines protocol; bump on incompatible changes. */
 const PROTOCOL_VERSION = 1;
@@ -118,9 +126,16 @@ const DEFAULT_REMOTE_CONFIG = [
 
 /** `Member.Role` by name. */
 const MEMBER_ROLE = { default: 1, administrator: 2 };
-/** `AccessControl.AccessRequired`: what Desktop creates groups with. */
-const ACCESS_MEMBER = 3;
+/**
+ * `AccessControl.AccessRequired` as the protos number it (`UNKNOWN = 0; ANY = 1; MEMBER = 2;
+ * ADMINISTRATOR = 3; UNSATISFIABLE = 4`). MEMBER is what Desktop creates groups with. (Until
+ * P2 this file called 3 "member"; 3 is ADMINISTRATOR, which nothing read until the group page
+ * stated "only admins".)
+ */
+const ACCESS_MEMBER = 2;
+const ACCESS_ADMINISTRATOR = 3;
 const ACCESS_UNSATISFIABLE = 4;
+const ACCESS_BY_NAME = { member: ACCESS_MEMBER, administrator: ACCESS_ADMINISTRATOR };
 
 /** `UnidentifiedSenderMessage.Message.ContentHint` by name (libsignal's `ContentHint`). */
 const CONTENT_HINTS = { default: 0, resendable: 1, implicit: 2 };
@@ -133,6 +148,46 @@ const NUMBER_SHARING = { everybody: 1, nobody: 2 };
 const FETCH_LATEST = { localProfile: 1, storageManifest: 2, subscriptionStatus: 3 };
 /** Most synthetic contacts one `setStorageState` adds. */
 const MAX_EXTRA_CONTACTS = 5000;
+/**
+ * Records of kinds Kourier never merges, as `setStorageState`'s `others` names them (A10c, the
+ * critic's L8): a story distribution list, a chat folder, a call link and a notification profile
+ * are on his phone. Each is made with random ids and the least the phone's own client writes.
+ */
+const OTHER_RECORDS = {
+  storyDistributionList: {
+    type: 5,
+    record: () => ({
+      storyDistributionList: {
+        identifier: nodeCrypto.randomBytes(16),
+        name: 'My Story',
+        allowsReplies: true,
+      },
+    }),
+  },
+  callLink: {
+    type: 7,
+    record: () => ({
+      callLink: { rootKey: nodeCrypto.randomBytes(16), adminPasskey: nodeCrypto.randomBytes(16) },
+    }),
+  },
+  chatFolder: {
+    type: 8,
+    record: () => ({
+      chatFolder: {
+        id: nodeCrypto.randomBytes(16),
+        name: 'Climbing',
+        position: 0,
+        includeAllIndividualChats: true,
+      },
+    }),
+  },
+  notificationProfile: {
+    type: 9,
+    record: () => ({
+      notificationProfile: { id: nodeCrypto.randomBytes(16), name: 'Quiet hours', color: 1 },
+    }),
+  },
+};
 /** Desktop's padded lengths of profile fields (`SD/ts/Crypto.node.ts` `PaddedLengths`). */
 const PADDED_NAME = [53, 257];
 const PADDED_ABOUT = [128, 254, 512];
@@ -532,6 +587,112 @@ function roundTrip() {
 }
 
 /**
+ * How many requests of a kind a client had open at once (`sendStats.inFlightMax`): the most
+ * that were between their arrival and their answer together (the round trip of `setLatency`
+ * counts), since the start or `resetInFlight`. A test that says "these ran at once" reads this
+ * count, not the wall time, which a loaded machine stretches. `prekeyFetches`: `GET
+ * /v2/keys/<service id>/<device>`; `singleSends`: `PUT /v1/messages/<service id>` (the
+ * multi-recipient route is not one).
+ */
+const inFlight = {
+  prekeyFetches: { now: 0, max: 0 },
+  singleSends: { now: 0, max: 0 },
+};
+
+/** The gauge a client request counts in, if any. */
+function gaugeOf(request) {
+  const path = request.path ?? '';
+  if (request.verb === 'GET' && /^\/v2\/keys\/[^/?]+\/[^?]+/.test(path)) {
+    return inFlight.prekeyFetches;
+  }
+  if (request.verb === 'PUT' && /^\/v1\/messages\/(?!multi_recipient(\?|$))[^/?]+(\?|$)/.test(path)) {
+    return inFlight.singleSends;
+  }
+  return undefined;
+}
+
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  MockConnection.prototype.handleRequest = async function handleRequestGauged(request) {
+    const gauge = gaugeOf(request);
+    if (!gauge) {
+      return handleRequest.call(this, request);
+    }
+    gauge.now += 1;
+    gauge.max = Math.max(gauge.max, gauge.now);
+    try {
+      return await handleRequest.call(this, request);
+    } finally {
+      gauge.now -= 1;
+    }
+  };
+}
+
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  // `closeOnRequest`: the socket is closed from the server's side (with the asked code) instead
+  // of answering the request: what a client sees whose socket another client took over (4409)
+  // in the moment it asks.
+  MockConnection.prototype.handleRequest = async function handleRequestClosingTheSocket(request) {
+    const rule = activeServer?.closingRequests.find(
+      (r) =>
+        r.left !== 0 &&
+        r.verb === request.verb &&
+        (request.path ?? '').startsWith(r.pathPrefix),
+    );
+    if (!rule) {
+      return handleRequest.call(this, request);
+    }
+    if (rule.left > 0) {
+      rule.left -= 1;
+    }
+    log(`closing the socket with ${rule.code} instead of answering ${request.verb} ${request.path}`);
+    this.ws.close(rule.code);
+    // Never answered: the socket is gone.
+    return new Promise(() => {});
+  };
+}
+
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  // `holdRequest`: the request is taken up only after the asked time, so the client waits for
+  // its answer as for a dead socket: a request timeout on the client's side, with the server
+  // not having served it yet.
+  MockConnection.prototype.handleRequest = async function handleRequestHeldBack(request) {
+    const rule = activeServer?.heldRequests.find(
+      (r) =>
+        r.left !== 0 &&
+        r.verb === request.verb &&
+        (request.path ?? '').startsWith(r.pathPrefix),
+    );
+    if (rule) {
+      if (rule.left > 0) {
+        rule.left -= 1;
+      }
+      log(`holding ${request.verb} ${request.path} back for ${rule.ms} ms`);
+      await new Promise((resolve) => setTimeout(resolve, rule.ms));
+    }
+    return handleRequest.call(this, request);
+  };
+}
+
+/**
+ * Every request a client sent over a websocket, in arrival order (`requestLog`): `{verb,
+ * path}`, the query string kept. A request that `closeOnRequest` closes the socket on is in it.
+ */
+const requestLog = [];
+
+{
+  const handleRequest = MockConnection.prototype.handleRequest;
+  MockConnection.prototype.handleRequest = async function handleRequestLogging(request) {
+    if (requestLog.length < 100_000) {
+      requestLog.push({ verb: request.verb, path: request.path ?? '' });
+    }
+    return handleRequest.call(this, request);
+  };
+}
+
+/**
  * The clock the server states when it delivers an envelope: `skewMs` is added to the true
  * time (`setServerTime`).
  */
@@ -801,6 +962,18 @@ function optString(args, name) {
   return value;
 }
 
+/** An access level by name (`"member"` | `"administrator"`), `member` when absent. */
+function accessArg(args, name) {
+  const value = optString(args, name);
+  if (value === undefined) {
+    return ACCESS_MEMBER;
+  }
+  if (!Object.hasOwn(ACCESS_BY_NAME, value)) {
+    throw badRequest(`"${name}" must be "member" or "administrator"`);
+  }
+  return ACCESS_BY_NAME[value];
+}
+
 function optBool(args, name, fallback) {
   const value = args[name];
   if (value === undefined || value === null) {
@@ -942,6 +1115,99 @@ function refMatches(filter, device) {
   }
   return filter.deviceId === undefined || filter.deviceId === device.deviceId;
 }
+
+/** `ContactRecord.identityState` of a `setStorageState` contact spec (`identityState?`). */
+function identityState(spec, i) {
+  const states = { default: 0, verified: 1, unverified: 2 };
+  const name = optString(spec, 'identityState') ?? 'default';
+  if (!Object.hasOwn(states, name)) {
+    throw badRequest(`"contacts[${i}].identityState" must be default, verified or unverified`);
+  }
+  return states[name];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage Service records: the bytes behind the decoded records (A10c)
+// ---------------------------------------------------------------------------------------------
+
+/** A protobuf varint. */
+function varintBytes(value) {
+  const bytes = [];
+  let rest = value;
+  while (rest >= 0x80) {
+    bytes.push((rest % 0x80) | 0x80);
+    rest = Math.floor(rest / 0x80);
+  }
+  bytes.push(rest);
+  return Buffer.from(bytes);
+}
+
+/**
+ * An encoded `StorageRecord` (one oneof field: a contact, a group or the account) with the raw
+ * protobuf fields `extra` appended INSIDE that field's message, the length prefix following.
+ * What a newer phone's record looks like to a client that does not know the fields.
+ */
+function withUnknownFields(plaintext, extra) {
+  let at = 1; // the one-byte tag of field 1, 3 or 4
+  let length = 0;
+  let scale = 1;
+  for (;;) {
+    const byte = plaintext[at];
+    at += 1;
+    length += (byte & 0x7f) * scale;
+    scale *= 0x80;
+    if ((byte & 0x80) === 0) {
+      break;
+    }
+  }
+  assert.strictEqual(at + length, plaintext.length, 'a StorageRecord with one field');
+  return Buffer.concat([
+    plaintext.subarray(0, 1),
+    varintBytes(length + extra.length),
+    plaintext.subarray(at),
+    extra,
+  ]);
+}
+
+/** AES-256-GCM in the Storage Service's layout: IV (12) | ciphertext | tag (16). */
+function sealItem(key, plaintext) {
+  const iv = nodeCrypto.randomBytes(12);
+  const cipher = nodeCrypto.createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([iv, body, cipher.getAuthTag()]);
+}
+
+/** The inverse of `sealItem`; throws when the value is not a ciphertext of `key`. */
+function openItem(key, value) {
+  const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', key, value.subarray(0, 12));
+  decipher.setAuthTag(value.subarray(value.length - 16));
+  return Buffer.concat([decipher.update(value.subarray(12, value.length - 16)), decipher.final()]);
+}
+
+/** A mute time (ms) as the phone's record holds it: an integer or a decimal string (> 2^53). */
+function mutedArg(args, name) {
+  const value = args[name];
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return BigInt(value);
+  }
+  if (typeof value === 'string' && /^[0-9]{1,19}$/.test(value)) {
+    return BigInt(value);
+  }
+  throw badRequest(`"${name}" must be a non-negative integer or a decimal string`);
+}
+
+/** The flags of a contact or group record that the clients write and the tests judge. */
+function recordFlags(record) {
+  return {
+    archived: record.archived === true,
+    markedUnread: record.markedUnread === true,
+    // A decimal string: "Always" is i64::MAX, beyond a double.
+    mutedUntil: String(record.mutedUntilTimestamp ?? 0),
+  };
+}
+
+/** `ContactRecord.IdentityState` by number, as `setStorageState`'s `identityState` names it. */
+const IDENTITY_STATE_NAMES = ['default', 'verified', 'unverified'];
 
 /** The 16 bytes of an ACI (`<uuid>` string), as `*Binary` proto fields carry it. */
 function aciBytes(aci) {
@@ -1120,6 +1386,51 @@ class HarnessServer extends Server {
     return super.getStorageManifest(device);
   }
 
+  /** Writes a linked device's `PUT /v1/storage/` made (A10c, `storageWrites`): applied. */
+  storageWrites = 0;
+  /** Writes of a linked device the server answered 409 (a newer manifest stood). */
+  storageConflicts = 0;
+  /**
+   * Every `PUT /v1/storage/` that reached the HTTP/2 server, counted when the request arrives (the
+   * `stream` listener in `main`), whoever sent it and however it ended. `storageWrites` reports
+   * `refused` = what is neither counted in `storageWrites` nor in `storageConflicts`: a PUT the
+   * mock answered 400 (a write it refuses), 403 (credentials it does not know) or 500 (a body it
+   * cannot decode), so the oracle "nothing was written" cannot miss a PUT that left the device
+   * and was refused (A10c fix round, V4). A PUT being handled at that moment counts as refused
+   * too: ask after a quiet pause.
+   */
+  storagePutAttempts = 0;
+  /**
+   * A phone change to apply just before the next write of a linked device is looked at
+   * (`conflictNextStorageWrite`): that write meets a newer manifest and gets 409. `null` when
+   * none is armed.
+   */
+  beforeNextStorageWrite = null;
+
+  /**
+   * The ONE place every Storage Service write passes: the HTTP route (a linked device's PUT,
+   * `shouldNotify` left at its default) and the primary's own writes (`PrimaryDevice.
+   * setStorageState`, `shouldNotify` false, bound when the primary is created). Only the
+   * linked device's writes are counted and only they meet the armed phone change.
+   */
+  async applyStorageWrite(device, writeOperation, shouldNotify = true) {
+    const linked = shouldNotify !== false;
+    if (linked && this.beforeNextStorageWrite !== null) {
+      const change = this.beforeNextStorageWrite;
+      this.beforeNextStorageWrite = null;
+      await change();
+    }
+    const result = await super.applyStorageWrite(device, writeOperation, shouldNotify);
+    if (linked && result.error === undefined) {
+      if (result.updated) {
+        this.storageWrites += 1;
+      } else {
+        this.storageConflicts += 1;
+      }
+    }
+    return result;
+  }
+
   /** Storage Service group requests by group (base64 public params), for `sendStats`. */
   groupFetches = new Map();
 
@@ -1246,6 +1557,18 @@ class HarnessServer extends Server {
   forcedAuth = new Map();
   /** Authenticated websocket upgrades asked for, by username (refused ones included). */
   connects = new Map();
+  /** Upgrades answered late (`holdUpgrade`): username -> `{ms, left}` (`left` < 0 = until stopped). */
+  heldUpgrades = new Map();
+  /**
+   * Requests that close the socket instead of being answered (`closeOnRequest`): `{verb,
+   * pathPrefix, code, left}` entries, the first that matches takes the request.
+   */
+  closingRequests = [];
+  /**
+   * Requests taken up late (`holdRequest`): `{verb, pathPrefix, ms, left}` entries, the first
+   * that matches takes the request.
+   */
+  heldRequests = [];
   /** What each client key upload carried, by `"<device ref>|<kind>"`. */
   keyUploads = new Map();
   /** Called with a device the server removed (the harness tells its primary). */
@@ -1280,11 +1603,50 @@ class HarnessServer extends Server {
           return;
         }
       }
-      this.setWebsocketUpgradeResponseHeaders(timestamp);
-      for (const listener of listeners) {
-        listener.call(server, req, res);
+      const proceed = () => {
+        this.setWebsocketUpgradeResponseHeaders(timestamp);
+        for (const listener of listeners) {
+          listener.call(server, req, res);
+        }
+      };
+      const held = this.#heldUpgrade(req.method === 'CONNECT' && pathname === '/v1/websocket/' ? req.headers.authorization : undefined);
+      if (held > 0) {
+        log(`websocket upgrade held for ${held} ms`);
+        setTimeout(() => {
+          // A client that gave up while the answer was held (its attempt was dropped: the
+          // stream or the connection is closed) is not answered: a server that sees the reset
+          // does not complete the upgrade, and a socket registered for a client that is gone
+          // would take the connection from the device's live one (4409).
+          const stream = res.stream ?? req.stream;
+          if (stream?.destroyed || stream?.closed || req.socket?.destroyed) {
+            log('websocket upgrade dropped: the client is gone');
+            return;
+          }
+          proceed();
+        }, held);
+        return;
       }
+      proceed();
     });
+  }
+
+  /** How long to hold the answer of an upgrade with this `Authorization` header (`holdUpgrade`), ms. */
+  #heldUpgrade(authorization) {
+    const match = typeof authorization === 'string' ? /^Basic\s+(\S+)$/i.exec(authorization) : null;
+    if (!match) {
+      return 0;
+    }
+    const decoded = Buffer.from(match[1], 'base64').toString();
+    const colon = decoded.indexOf(':');
+    const username = colon === -1 ? decoded : decoded.slice(0, colon);
+    const held = this.heldUpgrades.get(username);
+    if (!held || held.left === 0) {
+      return 0;
+    }
+    if (held.left > 0) {
+      held.left -= 1;
+    }
+    return held.ms;
   }
 
   /** The status of an upgrade with this `Authorization` header (none: an unauthenticated socket). */
@@ -1445,7 +1807,7 @@ class HarnessServer extends Server {
     try {
       return await super.handleMessage(source, serviceIdKind, envelopeType, target, encrypted, timestamp);
     } catch (error) {
-      if (target.deviceId === PRIMARY_DEVICE_ID && this.onDecryptFailure({ target, timestamp: toNumber(timestamp), error })) {
+      if (target.deviceId === PRIMARY_DEVICE_ID && this.onDecryptFailure({ target, timestamp: toNumber(timestamp), error, envelopeType })) {
         return undefined;
       }
       throw error;
@@ -1715,9 +2077,17 @@ class Harness {
    * (a `DecryptionErrorMessage` for the original). Returns false when the failure did not come
    * from a decrypt (the error then fails the client's request as before).
    */
-  #onDecryptFailure({ target, timestamp, error }) {
+  #onDecryptFailure({ target, timestamp, error, envelopeType: outerType }) {
     const state = this.#primaries.get(target.aci);
     const failure = state?.lastFailure;
+    if (state?.replacedIdentity && !failure) {
+      // Encrypted to her new install's key (`replaceIdentityKey`), which the harness does not
+      // hold: a sealed envelope does not even unseal, so its sender is unknown (`source`
+      // null). The envelope reached her queue; it is recorded and nothing is asked again.
+      log(`${deviceRef(target)} (a replaced identity) could not unseal ${timestamp}`);
+      state.inbox.decryptFailure.push({ source: null, timestamp, envelopeType: outerType });
+      return true;
+    }
     if (!state || !failure) {
       return false;
     }
@@ -1733,6 +2103,10 @@ class Harness {
     log(`${deviceRef(target)} could not decrypt ${timestamp} from ${deviceRef(source)}:`, error?.message ?? error);
     state.inbox.decryptFailure.push({ source, timestamp, envelopeType });
     emitEvent('decryptFailed', { primary: deviceRef(target), from: deviceRef(source), timestamp, envelopeType });
+    if (state.replacedIdentity) {
+      // Her keys are a new install's (`replaceIdentityKey`): the old device asks for nothing.
+      return true;
+    }
     // Off the delivery's call stack: the primary's lock is free again once this returns.
     setImmediate(() => {
       this.#sendRetryRequestFor(state, source, timestamp, type, encrypted).catch((e) =>
@@ -1893,6 +2267,118 @@ class Harness {
     // `serverTimestamp`: what the envelope was stamped with, when the caller chose it. A
     // client that takes the server's time for a message shows this one, not `timestamp`.
     return { timestamp, to: deviceRef(target), ...(serverTimestamp === undefined ? {} : { serverTimestamp }) };
+  }
+
+  /**
+   * Changes what the server holds behind the item of `written` (a `StorageState`) that
+   * `matches`, as a spec's options say (`setStorageState`): `undecryptable` puts bytes there
+   * that are no ciphertext; `unknownFields` (base64) re-seals the record with those protobuf
+   * fields appended inside its message. The manifest and the item's identifier stay as written.
+   */
+  #tamper(state, written, matches, spec, what) {
+    const unknown = optString(spec, 'unknownFields');
+    const broken = optBool(spec, 'undecryptable', false);
+    if (unknown === undefined && !broken) {
+      return;
+    }
+    const item = written.items.find(matches);
+    if (!item) {
+      throw badRequest(`"${what}" names no record to change`);
+    }
+    if (broken) {
+      this.server.setStorageItem(state.device, item.key, nodeCrypto.randomBytes(64));
+      return;
+    }
+    const { primary } = state;
+    const key = deriveStorageItemKey({
+      storageKey: primary.storageKey,
+      recordIkm: primary.storageRecordIkm,
+      key: item.key,
+    });
+    const plaintext = Buffer.from(Proto.StorageRecord.encode({ record: item.record }));
+    const sealed = sealItem(key, withUnknownFields(plaintext, Buffer.from(unknown, 'base64')));
+    this.server.setStorageItem(state.device, item.key, sealed);
+  }
+
+  /**
+   * Every item the manifest lists that the phone can open, as `{type, id, key, plaintext,
+   * record}` (the raw bytes and their decoded record), and the identifiers it cannot (a
+   * missing item, a value that is no ciphertext): `{opened, unreadable}`. Never throws for a
+   * broken item, unlike `getStorageState()`.
+   */
+  #openItems(state) {
+    const manifest = this.server.getStorageManifest(state.device);
+    const opened = [];
+    const unreadable = [];
+    if (!manifest) {
+      return { version: null, opened, unreadable, listed: [] };
+    }
+    const decrypted = decryptStorageManifest(state.primary.storageKey, manifest);
+    const ikm = decrypted.recordIkm?.length ? Buffer.from(decrypted.recordIkm) : undefined;
+    const listed = decrypted.identifiers.map(({ type, raw }) => ({ type, key: Buffer.from(raw) }));
+    for (const { type, key } of listed) {
+      const value = this.server.getStorageItem(state.device, key);
+      try {
+        const itemKey = deriveStorageItemKey({ storageKey: state.primary.storageKey, recordIkm: ikm, key });
+        const plaintext = openItem(itemKey, value);
+        opened.push({ type, key, plaintext, record: Proto.StorageRecord.decode(plaintext).record ?? {} });
+      } catch {
+        unreadable.push({ type, key });
+      }
+    }
+    return { version: decrypted.version, opened, unreadable, listed };
+  }
+
+  /**
+   * A change the PHONE makes to one record (`updateStorageRecord`, `conflictNextStorageWrite`):
+   * the record is replaced under a NEW identifier and the manifest moves one version on, as
+   * the phone's client writes it. Args: `primary` and one of `contact` (a primary ref),
+   * `group` (a group id) or `account: true`, with `archived?`, `markedUnread?`, `mutedUntil?`
+   * (ms; integer or decimal string), `pinned?` (contact and group) and, for the account,
+   * `noteToSelfArchived?`, `noteToSelfMarkedUnread?`. Result: `{version}`.
+   */
+  async #phoneChange(args) {
+    const { primary } = this.resolvePrimary(args.primary, 'primary');
+    const previous = await primary.getStorageState();
+    if (!previous) {
+      throw badRequest('the phone has no storage state yet');
+    }
+    const diff = {};
+    for (const name of ['archived', 'markedUnread']) {
+      if (args[name] !== undefined && args[name] !== null) {
+        diff[name] = optBool(args, name, false);
+      }
+    }
+    if (args.mutedUntil !== undefined && args.mutedUntil !== null) {
+      diff.mutedUntilTimestamp = mutedArg(args, 'mutedUntil');
+    }
+    const pinned = args.pinned === undefined || args.pinned === null ? undefined : optBool(args, 'pinned', false);
+    let next = previous;
+    if (args.contact !== undefined) {
+      const { primary: contact } = this.resolvePrimary(args.contact, 'contact');
+      next = next.updateContact(contact, diff);
+      if (pinned !== undefined) {
+        next = pinned ? next.pin(contact) : next.unpin(contact);
+      }
+    } else if (args.group !== undefined) {
+      const group = this.resolveGroup(args.group);
+      next = next.updateGroup(group, diff);
+      if (pinned !== undefined) {
+        next = pinned ? next.pinGroup(group) : next.unpinGroup(group);
+      }
+    } else if (args.account === true) {
+      const account = {};
+      for (const name of ['noteToSelfArchived', 'noteToSelfMarkedUnread']) {
+        if (args[name] !== undefined && args[name] !== null) {
+          account[name] = optBool(args, name, false);
+        }
+      }
+      next = next.updateAccount(account);
+    } else {
+      throw badRequest('one of "contact", "group" or "account" is needed');
+    }
+    const written = await primary.setStorageState(next, previous);
+    return { version: toNumber(written.version) };
   }
 
   /** `from` (a primary) and `to` (one of its linked devices) for sync messages. */
@@ -2089,7 +2575,8 @@ class Harness {
 
     /**
      * Registers a scripted account with a primary device ("phone").
-     * Args: `profileName`, `contacts?` (refs of earlier primaries; served as contact sync),
+     * Args: `profileName`, `aboutEmoji?`, `phoneNumberSharing?` (a bool: the profile carries that
+     * field, encrypted; absent = no field), `contacts?` (refs of earlier primaries; served as contact sync),
      * `groups?` (`[{title, members?}]`, created by this primary with itself as a member),
      * `hasE164?` (default true), `linkedDevices?` (extra mock secondary devices, default 0).
      */
@@ -2098,6 +2585,7 @@ class Harness {
       const avatar = optString(args, 'avatar');
       const about = optString(args, 'about');
       const aboutEmoji = optString(args, 'aboutEmoji');
+      const phoneNumberSharing = optBool(args, 'phoneNumberSharing', null);
       const contacts = optArray(args, 'contacts').map((ref, i) => this.resolvePrimary(ref, `contacts[${i}]`));
       const hasE164 = optBool(args, 'hasE164', true);
       const linkedDevices = optInt(args, 'linkedDevices', 0);
@@ -2136,6 +2624,14 @@ class Harness {
       }
       if (aboutEmoji !== undefined) {
         extras.aboutEmoji = encryptPadded(profileKey, aboutEmoji, PADDED_EMOJI).toString('base64');
+      }
+      if (phoneNumberSharing !== null) {
+        // The profile's `phoneNumberSharing` is one byte, 0x01 = shares (Desktop
+        // `profiles.preload.ts`), encrypted with the profile key; without it the field is absent.
+        extras.phoneNumberSharing = encryptProfileValue(
+          profileKey,
+          Buffer.from([phoneNumberSharing ? 1 : 0]),
+        ).toString('base64');
       }
       profileExtras.set(primary.device.aci, extras);
 
@@ -2585,6 +3081,95 @@ class Harness {
       const count = optInt(args, 'count', -1, { min: -1 });
       this.server.forcedAuth.set(username, { status, left: count });
       return {};
+    },
+
+    /**
+     * Holds the answer to the next `count?` (default until `stop: true`) authenticated websocket
+     * upgrades with `device`'s credentials (`username` `"<aci>.<deviceId>"` instead of `device`
+     * names a device that is not linked yet) back by `ms` (default 500): the server has the
+     * connection attempt in hand and the client waits for it, as for a slow network. Result: `{}`.
+     */
+    holdUpgrade: async (args) => {
+      let username;
+      if (args.username !== undefined && args.username !== null) {
+        const { aci, deviceId } = parseRef(reqString(args, 'username'), 'username');
+        if (deviceId === undefined) {
+          throw badRequest('"username" must name a device: "<aci>.<deviceId>"');
+        }
+        username = `${aci}.${deviceId}`;
+      } else {
+        const device = await this.resolveDevice(args.device, 'device');
+        const credentials = this.server.credentials(device);
+        if (!credentials) {
+          throw notFound(`${deviceRef(device)} has no credentials (it is a scripted device)`);
+        }
+        username = credentials.username;
+      }
+      if (optBool(args, 'stop', false)) {
+        this.server.heldUpgrades.delete(username);
+        return {};
+      }
+      const ms = optInt(args, 'ms', 500, { min: 0, max: 60_000 });
+      const count = optInt(args, 'count', -1, { min: -1 });
+      this.server.heldUpgrades.set(username, { ms, left: count });
+      return {};
+    },
+
+    /**
+     * The next `count?` (default 1) requests with `verb` whose path starts with `pathPrefix`
+     * close the websocket they came on with `code?` (default 4409, connected elsewhere) instead
+     * of being answered. `stop: true` removes the rules. Result: `{}`.
+     */
+    closeOnRequest: async (args) => {
+      if (optBool(args, 'stop', false)) {
+        this.server.closingRequests.length = 0;
+        return {};
+      }
+      const verb = reqString(args, 'verb');
+      const pathPrefix = reqString(args, 'pathPrefix');
+      const code = optInt(args, 'code', 4409, { min: 1000, max: 4999 });
+      const count = optInt(args, 'count', 1, { min: -1 });
+      this.server.closingRequests.push({ verb, pathPrefix, code, left: count });
+      return {};
+    },
+
+    /**
+     * The next `count?` (default 1; -1 = until stopped) requests with `verb` whose path starts
+     * with `pathPrefix` are taken up only after `ms` (default 6000), the server serving them
+     * then: the client's request times out first, and a request it asks again on a new
+     * connection is served at once. `stop: true` removes the rules. Result: `{}`.
+     */
+    holdRequest: async (args) => {
+      if (optBool(args, 'stop', false)) {
+        this.server.heldRequests.length = 0;
+        return {};
+      }
+      const verb = reqString(args, 'verb');
+      const pathPrefix = reqString(args, 'pathPrefix');
+      const ms = optInt(args, 'ms', 6000, { min: 0, max: 60_000 });
+      const count = optInt(args, 'count', 1, { min: -1 });
+      this.server.heldRequests.push({ verb, pathPrefix, ms, left: count });
+      return {};
+    },
+
+    /**
+     * The requests clients sent over their websockets so far, in arrival order, as `{requests:
+     * [{verb, path}]}`; `verb?` and `pathPrefix?` keep only those that match. `clear: true`
+     * forgets the log first. A test that says "the client asked nothing more" compares the
+     * list before and after.
+     */
+    requestLog: async (args) => {
+      if (optBool(args, 'clear', false)) {
+        requestLog.length = 0;
+      }
+      const verb = optString(args, 'verb');
+      const pathPrefix = optString(args, 'pathPrefix');
+      return {
+        requests: requestLog.filter(
+          (r) => (verb === undefined || verb === null || r.verb === verb) &&
+            (pathPrefix === undefined || pathPrefix === null || r.path.startsWith(pathPrefix)),
+        ),
+      };
     },
 
     /**
@@ -3158,14 +3743,24 @@ class Harness {
      * archived?, markedUnread?, mutedUntil? (ms), pinned?, identityKey? (true), byPni? (the
      * record names the contact's PNI and number only: no ACI, profile key, identity key or
      * profile name unless asked for), withPni? (the record carries the PNI beside the ACI:
-     * the phone joined the two)}]` (refs of
+     * the phone joined the two), identityState? (default|verified|unverified: the phone's
+     * verification of the record's key, default `default`)}]` (refs of
      * primaries); `groups?` `[{id, blocked?, whitelisted? (true), archived?, markedUnread?,
      * mutedUntil? (ms), pinned?}]` (`GroupV2Record`s of harness groups); `extraContacts?`
      * (synthetic contacts "Contact <n>" with random ACIs);
      * `account?` `{readReceipts?, typingIndicators?, linkPreviews?, sealedSenderIndicators?,
      * phoneNumberSharing? (everybody|nobody), universalExpireTimer? (s), noteToSelfArchived?,
-     * noteToSelfMarkedUnread?}`; `recordIkm?` (true; false = legacy record keys). Result:
-     * `{version, records}`.
+     * noteToSelfMarkedUnread?, unknownFields?}`; `recordIkm?` (true; false = legacy record
+     * keys); `others?` (names of records of kinds a linked device never merges, one record
+     * each: `storyDistributionList`, `callLink`, `chatFolder`, `notificationProfile`; A10c).
+     * Result: `{version, records}`.
+     *
+     * A contact, a group and the account may carry `unknownFields` (A10c: raw protobuf fields,
+     * base64, appended inside that record's message by the harness itself, so a client that
+     * re-encodes the record loses them) and a contact or a group `undecryptable` (true: the
+     * listed item's value on the server is not a ciphertext, so the phone's own
+     * `getStorageState()` throws for that state; `storageIdentifiers` and `rawStorageRecord`
+     * still work).
      */
     setStorageState: async (args) => {
       const state = this.resolvePrimary(args.primary, 'primary');
@@ -3209,7 +3804,7 @@ class Harness {
         noteToSelfArchived: optBool(account, 'noteToSelfArchived', false),
         noteToSelfMarkedUnread: optBool(account, 'noteToSelfMarkedUnread', false),
       });
-      for (const { spec, contact } of specs) {
+      for (const [i, { spec, contact }] of specs.entries()) {
         const theirs = contact.primary;
         // A contact the phone knows by number only has a PNI and no ACI, no profile and no
         // identity key; once it learned the account, the record carries both ids.
@@ -3217,9 +3812,13 @@ class Harness {
         const record = {
           profileKey:
             optBool(spec, 'profileKey', !byPni) ? Buffer.from(theirs.profileKey.serialize()) : null,
+          // A key replaced by `replaceIdentityKey` is the one the phone learned since.
           identityKey: optBool(spec, 'identityKey', !byPni)
-            ? Buffer.from(theirs.getPublicKey(ServiceIdKind.ACI).serialize())
+            ? Buffer.from(
+                (contact.replacedIdentity?.publicKey ?? theirs.getPublicKey(ServiceIdKind.ACI)).serialize(),
+              )
             : null,
+          identityState: identityState(spec, i),
           givenName: optString(spec, 'givenName') ?? (byPni ? null : theirs.profileName),
           familyName: optString(spec, 'familyName') ?? null,
           systemGivenName: optString(spec, 'systemGivenName') ?? null,
@@ -3250,6 +3849,13 @@ class Harness {
           next = next.pinGroup(group);
         }
       }
+      for (const [i, name] of optArray(args, 'others').entries()) {
+        const made = Object.hasOwn(OTHER_RECORDS, name) ? OTHER_RECORDS[name] : undefined;
+        if (made === undefined) {
+          throw badRequest(`"others[${i}]" must be one of ${Object.keys(OTHER_RECORDS).join(', ')}`);
+        }
+        next = next.addRecord({ type: made.type, record: made.record() });
+      }
       for (let i = 0; i < extra; i += 1) {
         next = next.addRecord({
           type: STORAGE_CONTACT,
@@ -3263,6 +3869,14 @@ class Harness {
         });
       }
       const written = await primary.setStorageState(next, previous);
+      for (const [i, { spec, contact }] of specs.entries()) {
+        const kind = optBool(spec, 'byPni', false) ? ServiceIdKind.PNI : ServiceIdKind.ACI;
+        this.#tamper(state, written, (item) => item.isContact(contact.device, kind), spec, `contacts[${i}]`);
+      }
+      for (const [i, { spec, group }] of groupSpecs.entries()) {
+        this.#tamper(state, written, (item) => item.isGroup(group), spec, `groups[${i}]`);
+      }
+      this.#tamper(state, written, (item) => item.isAccount(), account, 'account');
       return { version: toNumber(written.version), records: written.items.length };
     },
 
@@ -3459,6 +4073,243 @@ class Harness {
     },
 
     /**
+     * What the primary's Storage Service state says, decoded the way the phone reads it
+     * (`getStorageState()`: it decrypts the manifest and EVERY listed item, so a state that is
+     * not readable throws). Args: `primary`. Result: `{version, records, contacts, groups,
+     * pins, noteToSelf, orphans}`: `contacts` by ref of the harness primaries and `groups` by
+     * group id, each `{archived, markedUnread, mutedUntil (decimal string, ms)}`; `identityStates`
+     * the contacts' `ContactRecord.identityState` by ref (default, verified or unverified:
+     * P5a's safety number state); `pins` in
+     * order, `contact:<ref>`, `group:<id>` or `other`; `noteToSelf` `{archived, markedUnread}`;
+     * `orphans` the items on the server no identifier lists.
+     */
+    storageState: async (args) => {
+      const state = this.resolvePrimary(args.primary, 'primary');
+      const view = await state.primary.getStorageState();
+      if (!view) {
+        return { version: null };
+      }
+      const contacts = {};
+      const identityStates = {};
+      for (const known of this.#primaries.values()) {
+        const record = view.getContact(known.primary);
+        if (record) {
+          contacts[deviceRef(known.device)] = recordFlags(record);
+          identityStates[deviceRef(known.device)] =
+            IDENTITY_STATE_NAMES[Number(record.identityState ?? 0)] ?? 'unknown';
+        }
+      }
+      const groups = {};
+      for (const [id, group] of this.#groups) {
+        const record = view.getGroup(group);
+        if (record) {
+          groups[id] = recordFlags(record);
+        }
+      }
+      const account = view.getAccountRecord() ?? {};
+      const pins = (account.pinnedConversations ?? []).map((pin) => {
+        const identifier = pin.identifier;
+        if (identifier?.contact?.serviceIdBinary) {
+          const known = [...this.#primaries.values()].find(
+            (candidate) => Buffer.compare(identifier.contact.serviceIdBinary, candidate.device.aciRawUuid) === 0,
+          );
+          return known ? `contact:${deviceRef(known.device)}` : 'other';
+        }
+        if (identifier?.groupMasterKey) {
+          for (const [id, group] of this.#groups) {
+            if (group.masterKey.equals(identifier.groupMasterKey)) {
+              return `group:${id}`;
+            }
+          }
+        }
+        return 'other';
+      });
+      const orphans = await state.primary.getOrphanedStorageKeys();
+      return {
+        version: toNumber(view.version),
+        records: view.items.length,
+        contacts,
+        identityStates,
+        groups,
+        pins,
+        noteToSelf: {
+          archived: account.noteToSelfArchived === true,
+          markedUnread: account.noteToSelfMarkedUnread === true,
+        },
+        orphans: orphans.length,
+      };
+    },
+
+    /**
+     * The manifest alone: its version and every identifier it lists with its type (the
+     * ManifestRecord's: 1 contact, 2 groupv1, 3 groupv2, 4 account, anything else unknown), and
+     * how many items the server holds, how many of them no identifier lists (`orphans`) and how
+     * many identifiers have no item (`missing`). Works when `storageState` throws (an item that
+     * cannot be decrypted). Args: `primary`. Result: `{version, ids: [{type, id}], items,
+     * orphans, missing, unreadable}` (`unreadable`: identifiers whose item does not open).
+     */
+    storageIdentifiers: async (args) => {
+      const state = this.resolvePrimary(args.primary, 'primary');
+      const { version, listed, unreadable } = this.#openItems(state);
+      if (version === null) {
+        return { version: null, ids: [], items: 0, orphans: 0, missing: 0, unreadable: 0 };
+      }
+      const held = this.server.getAllStorageKeys(state.device);
+      const listedKeys = new Set(listed.map(({ key }) => key.toString('hex')));
+      const heldKeys = new Set(held.map((key) => key.toString('hex')));
+      return {
+        version: toNumber(version),
+        ids: listed.map(({ type, key }) => ({ type, id: b64(key) })),
+        items: held.length,
+        orphans: held.filter((key) => !listedKeys.has(key.toString('hex'))).length,
+        missing: listed.filter(({ key }) => !heldKeys.has(key.toString('hex'))).length,
+        unreadable: unreadable.length,
+      };
+    },
+
+    /**
+     * The decrypted bytes of one record, not re-encoded (so a field this harness's proto does
+     * not know is still there). Args: `primary` and one of `contact` (a primary ref), `group`
+     * (a group id) or `account: true`. Result: `{id, raw (base64), flags}`; `flags` is
+     * `{archived, markedUnread, mutedUntil}` of a contact or a group and `{archived,
+     * markedUnread}` (Note to Self) of the account. Works while another item is unreadable.
+     */
+    rawStorageRecord: async (args) => {
+      const state = this.resolvePrimary(args.primary, 'primary');
+      const { opened } = this.#openItems(state);
+      let found;
+      if (args.contact !== undefined) {
+        const { device } = this.resolvePrimary(args.contact, 'contact');
+        found = opened.find(
+          ({ record }) => record.contact?.aciBinary?.length && Buffer.compare(record.contact.aciBinary, device.aciRawUuid) === 0,
+        );
+      } else if (args.group !== undefined) {
+        const group = this.resolveGroup(args.group);
+        found = opened.find(({ record }) => record.groupV2?.masterKey && group.masterKey.equals(record.groupV2.masterKey));
+      } else if (args.account === true) {
+        found = opened.find(({ record }) => record.account);
+      } else {
+        throw badRequest('one of "contact", "group" or "account" is needed');
+      }
+      if (!found) {
+        throw notFound('no readable record for that chat');
+      }
+      const { record } = found;
+      const flags = record.account
+        ? {
+            archived: record.account.noteToSelfArchived === true,
+            markedUnread: record.account.noteToSelfMarkedUnread === true,
+          }
+        : recordFlags(record.contact ?? record.groupV2);
+      return { id: b64(found.key), raw: b64(found.plaintext), flags };
+    },
+
+    /**
+     * How many writes of a linked device (Kourier's `PUT /v1/storage/`) the server applied
+     * (`writes`), how many it answered 409 (`conflicts`) and how many PUTs reached it and were
+     * neither (`refused`: answered 400, 403 or 500, or still being handled) since the harness
+     * started. The primary's own writes are in none. Result: `{writes, conflicts, refused}`.
+     */
+    storageWrites: async () => ({
+      writes: this.server.storageWrites,
+      conflicts: this.server.storageConflicts,
+      refused: Math.max(
+        0,
+        this.server.storagePutAttempts - this.server.storageWrites - this.server.storageConflicts,
+      ),
+    }),
+
+    /**
+     * A write of a LINKED device, made by the harness itself over the real route (`PUT
+     * /storageService/v1/storage/` with the account's storage credentials), so the smoke tests
+     * of `storageWrites` and `conflictNextStorageWrite` need no Kourier: the primary's manifest
+     * again, re-sealed under `version` (default: the server's version + 1) with `sourceDevice`
+     * 2, and `orphans?` (default 0) random items inserted that no identifier lists. Args:
+     * `primary`, `version?`, `orphans?`. Result: `{status, version}`: 200 and the written
+     * version, or 409 and the version of the manifest the server answered with. `version: 0` is
+     * a write the mock REFUSES (a manifest without a version: 400); the command then fails and
+     * `storageWrites` counts it as `refused` (the smoke case of that counter).
+     */
+    storagePut: async (args) => {
+      const state = this.resolvePrimary(args.primary, 'primary');
+      const current = this.server.getStorageManifest(state.device);
+      if (!current) {
+        throw badRequest('the phone has no storage state yet');
+      }
+      const decrypted = decryptStorageManifest(state.primary.storageKey, current);
+      const asked = optInt(args, 'version', null, { min: 0 });
+      const version = asked === null ? decrypted.version + 1n : BigInt(asked);
+      const orphans = optInt(args, 'orphans', 0, { max: 64 });
+      // `version: 0` cannot be sealed (the helper refuses it): seal version 1 and send the manifest
+      // with no version, which the server answers 400.
+      const sealed = encryptStorageManifest(state.primary.storageKey, {
+        ...decrypted,
+        version: version === 0n ? 1n : version,
+        sourceDevice: 2,
+      });
+      const body = Buffer.from(
+        Proto.WriteOperation.encode({
+          manifest: version === 0n ? { ...sealed, version: 0n } : sealed,
+          insertItem: Array.from({ length: orphans }, () => ({
+            key: nodeCrypto.randomBytes(16),
+            value: nodeCrypto.randomBytes(48),
+          })),
+          deleteKey: [],
+          clearAll: false,
+        }),
+      );
+      const credentials = await this.server.getStorageAuth(state.device);
+      const basic = Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64');
+      const answer = await new Promise((resolve, reject) => {
+        const session = http2.connect(this.handshake.urls.chat, { ca: this.handshake.caPem });
+        session.on('error', reject);
+        const stream = session.request({
+          ':method': 'PUT',
+          ':path': '/storageService/v1/storage/',
+          authorization: `Basic ${basic}`,
+          'content-type': 'application/x-protobuf',
+        });
+        const chunks = [];
+        let status = 0;
+        stream.on('response', (headers) => {
+          status = headers[':status'];
+        });
+        stream.on('data', (chunk) => chunks.push(chunk));
+        stream.on('end', () => {
+          session.close();
+          resolve({ status, body: Buffer.concat(chunks) });
+        });
+        stream.on('error', reject);
+        stream.end(body);
+      });
+      if (answer.status === 200) {
+        return { status: 200, version: toNumber(version) };
+      }
+      if (answer.status === 409) {
+        return { status: 409, version: toNumber(Proto.StorageManifest.decode(answer.body).version) };
+      }
+      throw new Error(`PUT /v1/storage/ answered ${answer.status}`);
+    },
+
+    /**
+     * The phone changes one record, now: `#phoneChange`'s arguments. Result: `{version}`.
+     */
+    updateStorageRecord: async (args) => this.#phoneChange(args),
+
+    /**
+     * Arms one phone change (`#phoneChange`'s arguments) to be applied just before the NEXT
+     * write of a linked device is looked at: that write was made against the old manifest and
+     * the server answers 409 with the new one. One change at a time. Result: `{armed: true}`.
+     */
+    conflictNextStorageWrite: async (args) => {
+      if (this.server.beforeNextStorageWrite !== null) {
+        throw badRequest('a phone change is armed already');
+      }
+      this.server.beforeNextStorageWrite = () => this.#phoneChange(args);
+      return { armed: true };
+    },
+
+    /**
      * The primary tells its linked device to fetch something again (`SyncMessage.FetchLatest`).
      * Args: `from`, `to` (its linked device), `type` (`storageManifest`, `localProfile`,
      * `subscriptionStatus`), `awaitDelivery?`, `timeout?`. Result: `{timestamp, to}`.
@@ -3481,11 +4332,13 @@ class Harness {
     /**
      * Creates a group on the mock's Storage Service as `from`'s phone would (Desktop's group
      * state: title, description, timer and avatar as encrypted `GroupAttributeBlob`s, members
-     * with encrypted ids and profile keys, member-level access). `from` is an administrator.
-     * Args: `from`, `title`, `members?` (refs of other primaries), `admins?` (refs among them),
-     * `description?`, `timer?` (seconds), `avatar?` (image bytes, base64; stored on CDN0
-     * encrypted with the group's blob key), `announcementsOnly?`. Result: the group
-     * (`{id, title, masterKey, revision, members, avatarKey}`).
+     * with encrypted ids and profile keys, member-level access unless told). `from` is an
+     * administrator. Args: `from`, `title`, `members?` (refs of other primaries), `admins?`
+     * (refs among them), `description?`, `timer?` (seconds), `avatar?` (image bytes, base64;
+     * stored on CDN0 encrypted with the group's blob key), `announcementsOnly?`,
+     * `attributesAccess?` and `membersAccess?` (`"member"` (default) or `"administrator"`: who
+     * may change the title, picture, timer and description, and who may add members). Result:
+     * the group (`{id, title, masterKey, revision, members, avatarKey}`).
      */
     createGroup: async (args) => {
       const creator = this.resolvePrimary(args.from, 'from');
@@ -3496,6 +4349,8 @@ class Harness {
       const timer = optInt(args, 'timer', 0, { max: 2 ** 32 - 1 });
       const avatar = optString(args, 'avatar');
       const announcementsOnly = optBool(args, 'announcementsOnly', false);
+      const attributesAccess = accessArg(args, 'attributesAccess');
+      const membersAccess = accessArg(args, 'membersAccess');
 
       const secretParams = zkgroup.GroupSecretParams.generate();
       const all = [creator, ...members.filter((m) => m !== creator)];
@@ -3512,8 +4367,8 @@ class Harness {
         avatarUrl,
         disappearingMessagesTimer: timer > 0 ? groupBlob(secretParams, { disappearingMessagesDuration: timer }) : null,
         accessControl: {
-          attributes: ACCESS_MEMBER,
-          members: ACCESS_MEMBER,
+          attributes: attributesAccess,
+          members: membersAccess,
           addFromInviteLink: ACCESS_UNSATISFIABLE,
           memberLabel: ACCESS_MEMBER,
         },
@@ -4391,6 +5246,73 @@ class Harness {
       return { refused: profileLimit.refused };
     },
 
+    /**
+     * The safety number as `primary`'s phone shows it for `peer` (P5a, critic H4: an oracle
+     * independent of Kourier's code): `Fingerprint.new(5200, 2, <primary's ACI 16 bytes>, <its
+     * current ACI identity key>, <peer's ACI 16 bytes>, <peer's ACI identity key>)` with the
+     * harness's libsignal-client. Args: `primary`, `peer` (refs of primaries; a linked device
+     * shares its primary's ACI and ACI identity key), `scannable?` (base64: the bytes the
+     * other side's QR code carries). Result: `{digits, scannable, matches?}` (`matches`:
+     * `ScannableFingerprint.compare` of ours against the given bytes).
+     */
+    safetyNumber: async (args) => {
+      const { primary } = this.resolvePrimary(reqString(args, 'primary'), 'primary');
+      const peer = this.resolvePrimary(reqString(args, 'peer'), 'peer');
+      const fingerprint = SignalClient.Fingerprint.new(
+        5200,
+        2,
+        aciBytes(primary.device.aci),
+        await primary.device.getIdentityKey(ServiceIdKind.ACI),
+        aciBytes(peer.primary.device.aci),
+        await peer.primary.device.getIdentityKey(ServiceIdKind.ACI),
+      );
+      const ours = fingerprint.scannableFingerprint();
+      const result = {
+        digits: fingerprint.displayableFingerprint().toString(),
+        scannable: b64(ours.toBuffer()),
+      };
+      const theirs = optString(args, 'scannable');
+      if (theirs !== undefined) {
+        result.matches = ours.compare(
+          SignalClient.ScannableFingerprint._fromBuffer(Buffer.from(theirs, 'base64')),
+        );
+      }
+      return result;
+    },
+
+    /**
+     * A new install of `primary` as the server sees it (P5a, critic B5 b): a new ACI identity
+     * key with a signed prekey and a last-resort Kyber key signed by it, through the public
+     * `Device.setKeys` (NOT `server.updateDeviceKeys`, which restores the primary's own key).
+     * Profile and prekey requests answer the new key from now on; the harness primary keeps
+     * its old keys, so it cannot decrypt what is encrypted to the new one, and its decrypt
+     * failures send no retry request (the old device is gone). `setStorageState` records of
+     * this primary carry the new key. Args: `primary`. Result: `{identityKey}` (base64, 33
+     * bytes with the type byte).
+     */
+    replaceIdentityKey: async (args) => {
+      const state = this.resolvePrimary(reqString(args, 'primary'), 'primary');
+      const { device } = state.primary;
+      const identity = SignalClient.PrivateKey.generate();
+      const signed = SignalClient.PrivateKey.generate();
+      const kyber = SignalClient.KEMKeyPair.generate();
+      await device.setKeys(ServiceIdKind.ACI, {
+        identityKey: identity.getPublicKey(),
+        signedPreKey: {
+          keyId: 7001,
+          publicKey: signed.getPublicKey(),
+          signature: Buffer.from(identity.sign(signed.getPublicKey().serialize())),
+        },
+        lastResortKey: {
+          keyId: 7002,
+          publicKey: kyber.getPublicKey(),
+          signature: Buffer.from(identity.sign(kyber.getPublicKey().serialize())),
+        },
+      });
+      state.replacedIdentity = { publicKey: identity.getPublicKey() };
+      return { identityKey: b64(identity.getPublicKey().serialize()) };
+    },
+
     /** Sets one remote-config entry served by `/v2/config`. Args: `key`, `enabled?`, `value?`. */
     setRemoteConfig: async (args) => {
       const key = reqString(args, 'key');
@@ -4485,7 +5407,9 @@ class Harness {
      * anybody, answered with success or not: the 1:1 route (`PUT /v1/messages/<service id>`:
      * messages, receipts, typing, call signalling, sync messages to its own account) plus
      * every multi-recipient send on either route. A test that says "the client sent nothing"
-     * compares it before and after.
+     * compares it before and after. `inFlightMax: {prekeyFetches, singleSends}` is the most
+     * requests of each kind a client had open at once since the start or `resetInFlight` (the
+     * round trip of `setLatency` counts as open): "the setups ran at once" is this count.
      */
     sendStats: async () => {
       const groupFetches = {};
@@ -4506,7 +5430,22 @@ class Harness {
         // `PUT /v1/devices/link` requests served: one per device a client linked (or tried).
         linkRequests: sends.linkRequests.length,
         certificateRequests: [...sends.certificateRequests],
+        inFlightMax: {
+          prekeyFetches: inFlight.prekeyFetches.max,
+          singleSends: inFlight.singleSends.max,
+        },
       };
+    },
+
+    /**
+     * Starts the count of requests open at once (`sendStats.inFlightMax`) anew: the maxima go
+     * back to what is open right now. Result: `{}`.
+     */
+    resetInFlight: async () => {
+      for (const gauge of Object.values(inFlight)) {
+        gauge.max = gauge.now;
+      }
+      return {};
     },
 
     /**
@@ -4537,11 +5476,15 @@ class Harness {
       const state = this.resolvePrimary(args.primary, 'primary');
       const from = args.from === undefined || args.from === null ? undefined : parseRef(args.from, 'from');
       const entry = await state.inbox.decryptFailure.take(
-        (item) => from === undefined || refMatches(from, item.source),
+        (item) => from === undefined || (item.source != null && refMatches(from, item.source)),
         timeoutArg(args),
         'waitForDecryptFailure',
       );
-      return { source: deviceRef(entry.source), timestamp: entry.timestamp, envelopeType: entry.envelopeType };
+      return {
+        source: entry.source == null ? null : deviceRef(entry.source),
+        timestamp: entry.timestamp,
+        envelopeType: entry.envelopeType,
+      };
     },
 
     /** Answers, then stops the server and exits with status 0. */
@@ -4610,12 +5553,76 @@ function pemToDer(pem) {
   return Buffer.from(body, 'base64');
 }
 
+/** How many ports `listenAvoidingTakenTwins` tries before it gives up. */
+const LISTEN_ATTEMPTS = 20;
+
+/** Listens `srv` as `options` ask: resolves with null, or with the error code if it cannot. */
+function tryListen(srv, options) {
+  return new Promise((resolve) => {
+    srv.once('error', (error) => resolve(error.code ?? 'error'));
+    srv.listen(options, () => resolve(null));
+  });
+}
+
+function closeServer(srv) {
+  return new Promise((resolve) => srv.close(() => resolve()));
+}
+
+/**
+ * Listens on 127.0.0.1:P for a P whose IPv6 twin `[::1]:P` nobody holds.
+ *
+ * The clients dial `localhost:P` (`TLS_HOST`) and try `::1` first. A program that holds `[::1]:P`
+ * or a v6-only `[::]:P` (this PC's NFS daemons do, on random ports) would get every HTTPS request
+ * of Kourier: reqwest moves on to 127.0.0.1 only when the TCP connect fails, not when the TLS
+ * hello is reset (libsignal's chat connect does move on). The setup then waits out its 60 s
+ * twice (target/next/mock-endorsements-flake.md). So the port is taken from the kernel on `[::1]`
+ * (IPv6 only, which also sees a v6-only wildcard), released, tried on 127.0.0.1 with a throwaway
+ * (the mock's own `listen` has no error handler and refuses a second call), and only then given
+ * to the mock server. `[::1]:P` stays unanswered: a client's `::1` attempt is refused at once
+ * and it goes on to 127.0.0.1, as on a machine with no such program. Answering there too makes
+ * libsignal-net try both addresses, which breaks tests that count upgrades.
+ *
+ * `firstPort` (`--first-port`, for tests) is the first candidate instead of the kernel's pick, so
+ * a test can hold `[::1]:P` itself and see the harness move on. What is left is a window of
+ * microseconds in which a program could take the port again (a startup failure, loud) and one in
+ * which it could bind `[::1]:P` while the test runs (the NFS daemons bind theirs at boot).
+ * Without an IPv6 loopback there is nothing to collide with, and the check is skipped.
+ */
+async function listenAvoidingTakenTwins(server, firstPort) {
+  for (let attempt = 0; attempt < LISTEN_ATTEMPTS; attempt += 1) {
+    const candidate = attempt === 0 ? firstPort : 0;
+    const v6 = net.createServer();
+    const v6Error = await tryListen(v6, { port: candidate, host: '::1', ipv6Only: true });
+    if (v6Error !== null && v6Error !== 'EADDRINUSE') {
+      // No IPv6 loopback here (EADDRNOTAVAIL, EAFNOSUPPORT) or no way to ask: nothing to avoid.
+      return server.listen(candidate, '127.0.0.1');
+    }
+    const held = v6Error === 'EADDRINUSE';
+    const port = held ? candidate : v6.address().port;
+    if (!held) {
+      await closeServer(v6);
+    }
+    if (held) {
+      log(`[::1]:${port} is held by another program; another port`);
+      continue;
+    }
+    const v4 = net.createServer();
+    if ((await tryListen(v4, { port, host: '127.0.0.1' })) !== null) {
+      continue;
+    }
+    await closeServer(v4);
+    return server.listen(port, '127.0.0.1');
+  }
+  throw new Error('no port free on both loopback addresses');
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
       host: { type: 'string', default: '127.0.0.1' },
       'state-dir': { type: 'string' },
       'api-timeout': { type: 'string' },
+      'first-port': { type: 'string' },
     },
     strict: true,
   });
@@ -4636,16 +5643,31 @@ async function main() {
     config.timeout = apiTimeout;
   }
 
+  // Test-only: the first port tried, instead of the kernel's pick (0).
+  const firstPort = values['first-port'] === undefined ? 0 : Number(values['first-port']);
+  if (!Number.isInteger(firstPort) || firstPort < 0 || firstPort > 65_535) {
+    throw new Error('--first-port must be a port number (0 for the kernel\'s pick)');
+  }
+
   const server = new HarnessServer(config);
   activeServer = server;
-  await server.listen(0, values.host);
+  if (values.host === '127.0.0.1') {
+    await listenAvoidingTakenTwins(server, firstPort);
+  } else {
+    await server.listen(firstPort, values.host);
+  }
   server.installUpgradeGate();
   server.installCdnGate(cdn3Path);
   // Counts the uploads clients start (the mock's TUS server has no hook for it); the compat
   // request listener the mock installed keeps handling the stream.
   server.https.on('stream', (_stream, headers) => {
-    if (headers[':method'] === 'POST' && String(headers[':path'] ?? '').startsWith('/cdn3/attachments/')) {
+    const requestPath = String(headers[':path'] ?? '');
+    if (headers[':method'] === 'POST' && requestPath.startsWith('/cdn3/attachments/')) {
       server.cdn3Uploads += 1;
+    }
+    // Every write to the Storage Service, refused ones too (V4): see `storagePutAttempts`.
+    if (headers[':method'] === 'PUT' && requestPath.split('?')[0] === '/storageService/v1/storage/') {
+      server.storagePutAttempts += 1;
     }
   });
   const { port } = server.address();

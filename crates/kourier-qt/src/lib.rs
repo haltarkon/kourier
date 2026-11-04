@@ -36,7 +36,7 @@ use kourier_app::AppHandle;
 
 pub use bridge::qobject::{
     AccountListModel, App, ComposerController, ConversationListModel, LoginController,
-    SettingsController, TimelineModel,
+    MediaListModel, MemberListModel, SettingsController, ShareTargetListModel, TimelineModel,
 };
 
 /// Desktop file name, Wayland `app_id` and D-Bus name.
@@ -88,6 +88,11 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// had: a picture, a file, a sticker and an album of four "Not available on this device", a
 /// picture and a file "No longer available", and a picture that downloads on a click.
 ///
+/// People pages (P1): `person` = the chat of one contact with the details panel open: her
+/// picture, name, about text, number, disappearing timer and the groups she shares; P2: `group` =
+/// a group chat with the details panel open on the group's page: picture, name, description,
+/// disappearing timer (read-only, with its reason), the members and the group's rules.
+///
 /// History transfer (architecture §14.2 item 14): `transferwait`, `transferdownload` and
 /// `transferread` = the main window right after a link, its transfer in the account banner
 /// while the phone is asked, while the history downloads and while it is read, with its
@@ -98,7 +103,28 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// download, the transfer in the account banner; `transferfailed` = the main window with
 /// the banner of a failed transfer; `transferask` = the settings page with the question
 /// "Remove and Link Again?" of "Transfer History from Phone…".
-pub const PAGES: [&str; 49] = [
+///
+/// Archived chats (A1): `archive` = the chat list opened on "Archived Chats" (the Back arrow, the
+/// line that says these chats come back, the fixture's one archived chat), once the entry of
+/// the list has said that there is one.
+///
+/// Location in sent files (LOC): `location` = the question before a located video is sent,
+/// over the composer (Send was pressed); `locationmany` = the same question for two located
+/// videos with a plain file beside them; `locationnever` = "Never send" set: a located video
+/// kept in the list (its reason names the setting) and a plain file that goes.
+///
+/// Telegram (KT-1b, on the fake that plays Telegram; nothing of Telegram is contacted): `tgwarn` =
+/// the warning page of Telegram while it is off ("Before You Add Telegram"), opened from the
+/// Welcome list; `tgqr` = the link page at its QR code with the other way offered; `tgcode` = the
+/// phone-number way at its code step (explained by the viewmodel, with "Send a New Code");
+/// `tgpassword` = the step after the code, the two-step password with its hint. The last three
+/// exist on a fixture only (`kourier`'s argument parser refuses them without `--fixture`).
+///
+/// Blended chats: `accounts` = the list with three accounts (the fixture account, a second one
+/// of the test network and one that plays WhatsApp) of which the second is hidden and has unread
+/// messages; `accountsdrawer` = the side panel (wide: expanded, one account unticked; narrow: the
+/// open drawer with only the first account shown, its box greyed).
+pub const PAGES: [&str; 82] = [
     "welcome",
     "link",
     "qr",
@@ -148,6 +174,39 @@ pub const PAGES: [&str; 49] = [
     "transferbanner",
     "transferfailed",
     "transferask",
+    "networks",
+    "warisk",
+    "waqr",
+    "waphone",
+    "wacode",
+    "thqr",
+    "themoji",
+    "tgwarn",
+    "tgqr",
+    "tgcode",
+    "tgpassword",
+    "wahistory",
+    "waban",
+    "walock",
+    "waoff",
+    "wafailed",
+    "walost",
+    "uploading",
+    "uploadfile",
+    "archive",
+    "person",
+    "group",
+    "chatmedia",
+    "safety",
+    "safetychanged",
+    "share",
+    "timerpending",
+    "save",
+    "location",
+    "locationmany",
+    "locationnever",
+    "accounts",
+    "accountsdrawer",
 ];
 
 /// Registers the `image://kourier` provider on `engine` (before it loads QML; §8.6). [`run`]
@@ -208,6 +267,60 @@ pub fn set_session_ending(ending: bool) {
 /// Hands the running app to the `App` singleton the QML engine creates next.
 pub fn set_context(ctx: UiContext) {
     *CONTEXT.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx);
+}
+
+/// Variables Qt reads that Kourier sets before Qt starts, unless the person set them (to any
+/// value, the empty one included). Qt's FFmpeg backend otherwise probes every hardware VIDEO
+/// device at the first `MediaPlayer` (vdpau, cuda, vaapi, qsv, vulkan: 1.4 s on the GUI thread
+/// and 300 MB more on an NVIDIA machine, measured 2026-10-14), and the only player is the voice
+/// note's, which plays audio. The empty list means "none" to Qt (the media research of
+/// 2026-10-09 wrote `,`, which does the same); both lists are probed, so both names are needed.
+/// A later in-app video player takes its device types from a setting instead.
+pub const QT_ENV_DEFAULTS: [(&str, &str); 2] = [
+    ("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ""),
+    ("QT_FFMPEG_ENCODING_HW_DEVICE_TYPES", ""),
+];
+
+/// The defaults of [`QT_ENV_DEFAULTS`] whose name `is_set` does not know.
+pub fn env_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    QT_ENV_DEFAULTS
+        .iter()
+        .copied()
+        .filter(|(name, _)| !is_set(name))
+        .collect()
+}
+
+/// The names [`prepare_environment`] set (a variable the person set is not among them).
+static ENV_SET_BY_KOURIER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Sets [`QT_ENV_DEFAULTS`] in the process environment (a variable that is set stays as it is)
+/// and remembers which it set, for [`env_set_by_kourier`].
+///
+/// # Safety
+///
+/// No other thread may read or write the environment while this runs (`std::env::set_var` is
+/// unsafe since edition 2024): call it first in `main`, before the runtime or Qt start a thread.
+/// It is the only change Kourier makes to its environment; nothing changes it afterwards.
+pub unsafe fn prepare_environment() {
+    let mut ours = ENV_SET_BY_KOURIER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for (name, value) in env_defaults(|name| std::env::var_os(name).is_some()) {
+        // SAFETY: the caller's promise above.
+        unsafe { std::env::set_var(name, value) };
+        ours.push(name);
+    }
+}
+
+/// The names [`prepare_environment`] set. A program Kourier starts for the person (their
+/// browser, the application a file opens in) gets its environment WITHOUT these
+/// (`kourier_app::opener`: the child's own copy, the process's is not touched): a player built
+/// on Qt Multimedia would decode in software with the empty lists.
+pub fn env_set_by_kourier() -> Vec<&'static str> {
+    ENV_SET_BY_KOURIER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Takes the context (once, when `App` initializes).
@@ -415,5 +528,30 @@ mod qml_rules {
             offenders.is_empty(),
             "menu items that hide themselves but stay enabled: {offenders:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod qt_environment {
+    use super::*;
+
+    const DECODING: &str = "QT_FFMPEG_DECODING_HW_DEVICE_TYPES";
+    const ENCODING: &str = "QT_FFMPEG_ENCODING_HW_DEVICE_TYPES";
+
+    /// Both lists of hardware device types are set empty when nothing set them.
+    #[test]
+    fn both_lists_are_set_empty_when_nobody_set_them() {
+        assert_eq!(
+            env_defaults(|_| false),
+            vec![(DECODING, ""), (ENCODING, "")]
+        );
+    }
+
+    /// A variable the person set stays theirs, the empty value included: only the other one is set.
+    #[test]
+    fn a_variable_that_is_set_is_left_alone() {
+        assert_eq!(env_defaults(|name| name == DECODING), vec![(ENCODING, "")]);
+        assert_eq!(env_defaults(|name| name == ENCODING), vec![(DECODING, "")]);
+        assert!(env_defaults(|_| true).is_empty());
     }
 }

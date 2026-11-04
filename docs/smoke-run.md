@@ -516,9 +516,11 @@ cargo xtask smoke step link --profile transfer --wait 1800
   says "Not available on this device" and comes after a click with the phone online
   (an iPhone was never tried: expect "did not answer"), and the log line "the import
   judges the age of attachments" says whether the server's queue time was known.
-  `backend.db` becomes schema 22 (21 added `number_links`, 22 the name a device was linked with) and `core.db` schema 14 (the kept smoke profile needs
-  `smoke backup` first and `start --allow-schema-change`: the first start builds ten
-  indexes of `core.db`, and a link's `Done` no longer waits for the first Storage Service
+  `backend.db` becomes schema 24 (21 added `number_links`, 22 the name a device was linked with, 23 the archive base columns of A1, 24 `peers.phone_sharing` of the people pages) and `core.db` schema 20 (14 added ten indexes, 15 the column `messages.quiet`, 16 the partial index
+  `messages_key_conv_author` and the table `conversation_cuts` of K-B1, 17 the column `outbox.cancel_state` of upload progress, 18 the contact columns `about`, `about_emoji`, `number_shown` of the people pages, no row converted, 19 the column `conversations.description` of the group page, no row converted, 20 the columns `messages.media_visual` / `media_files`, three triggers on `attachments` that keep them and the two partial indexes `messages_media_visual` / `messages_media_files` of the gallery of a chat (people pages P4), built over the media rows only, no text converted; the kept smoke profile needs
+  `smoke backup` first and `start --allow-schema-change`: the first start builds the ten
+  indexes of `core.db`, moves every chat that ended in a quiet notice down once, and builds the empty
+  index and table of 16 (a Signal profile holds no row of the new scope, and none is converted), and a link's `Done` no longer waits for the first Storage Service
   sync after an imported history, so the note of `step link` says "unless the history was
   imported", and the groups the Storage Service names may still be arriving when the list
   opens).

@@ -35,6 +35,9 @@ zeroize.workspace = true
 kourier-app = { path = "../kourier-app", default-features = false, features = ["fake"] }
 # `tests/folder_ui.rs` reads back the archive a folder was sent as.
 zip.workspace = true
+# `tests/chat_ui.rs` `svQr` decodes the grabbed QR code of a safety number (P5a critic F11).
+image.workspace = true
+quircs.workspace = true
 
 [build-dependencies]
 cxx-qt-build.workspace = true
@@ -48,11 +51,23 @@ name = "wait_ui"
 harness = false
 
 [[test]]
+name = "accounts_pages_ui"
+harness = false
+
+[[test]]
+name = "accounts_shown_ui"
+harness = false
+
+[[test]]
 name = "link_actions_ui"
 harness = false
 
 [[test]]
 name = "account_actions_ui"
+harness = false
+
+[[test]]
+name = "drawer_layout_ui"
 harness = false
 
 [[test]]
@@ -100,7 +115,19 @@ name = "folder_ui"
 harness = false
 
 [[test]]
+name = "location_ui"
+harness = false
+
+[[test]]
+name = "group_load_ui"
+harness = false
+
+[[test]]
 name = "settings_ui"
+harness = false
+
+[[test]]
+name = "networks_ui"
 harness = false
 
 [[test]]
@@ -113,6 +140,12 @@ harness = false
 
 [[test]]
 name = "readmore_ui"
+harness = false
+
+# The timeline is in place in EVERY frame when the composer or the window changes height (F2, the
+# edit jump): two tests for nextest, scale 1 and 1.25.
+[[test]]
+name = "edit_jump_ui"
 harness = false
 
 [[test]]
@@ -136,6 +169,17 @@ harness = false
 # A picture keeps its pixels while its URL changes, and only for the same picture (P1/S1 fix F2, F3).
 [[test]]
 name = "retain_ui"
+harness = false
+
+# The archive of the conversation list (A1): the entry, the view, the way back.
+[[test]]
+name = "archive_ui"
+harness = false
+
+# Save As, Save All and Show in Folder through the real main window (F3b): the dialog is a stand-in
+# the test names in KOURIER_DEV_SAVE_DIALOG (debug builds only), the files are looked at afterwards.
+[[test]]
+name = "save_ui"
 harness = false
 
 [[test]]

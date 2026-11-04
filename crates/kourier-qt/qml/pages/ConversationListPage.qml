@@ -4,10 +4,14 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+import org.kde.kirigamiaddons.delegates as Delegates
 import app.kourier
 
 // The conversation list: search, the account banner (offline, logged out, a challenge, a wrong
-// clock), a notice the chat's composer cannot show, and the chats.
+// clock), a notice the chat's composer cannot show, and the chats. The last row of the list is
+// the way into the archive ("Archived Chats (N)", only when there are archived chats); the
+// archive view is this same page, titled "Archived Chats", with a Back arrow before its title,
+// one line that says what the archive is, and no search field (Ctrl+K goes back to the chats).
 Kirigami.ScrollablePage {
     id: page
 
@@ -39,6 +43,16 @@ Kirigami.ScrollablePage {
     // The keys that put the keyboard in the search field, as the platform writes them (for
     // the tooltip).
     property string searchKeys: ""
+    // The way into the archive shows as the list's last row: there are archived chats, the
+    // archive is not shown already and nothing is searched (a search looks in both). Not shown
+    // means no footer at all, so the list keeps no empty band at its end.
+    readonly property bool entryShown: !App.archiveShown && App.archivedCount > 0 && search.text.trim() === ""
+    // The Back arrow of the archive view's title (null while that title is not shown).
+    property Item archiveBack: null
+    // Kirigami's own title delegate, taken at completion (see `titleDelegate` below).
+    property Component kirigamiTitle: null
+    // The list's last row, the way into the archive (null while it is not shown; tests read it).
+    property Item archiveEntry: null
 
     signal openConversation(real id)
     // The quick switch chose a chat: it opens and the composer takes the keyboard.
@@ -47,10 +61,33 @@ Kirigami.ScrollablePage {
     // whether a link in progress must be asked about first.
     signal bannerActivated
 
-    // The keyboard goes to the search field, with what is typed there selected.
+    // The keyboard goes to the search field, with what is typed there selected. The archive
+    // view has no search field: the chats come back first (Ctrl+K in the archive searches
+    // the chats).
     function focusSearch(): void {
+        if (App.archiveShown) {
+            App.showArchive(false);
+        }
         search.forceActiveFocus();
         search.selectAll();
+    }
+
+    // The archive view opens (its chats, no search) and the keyboard stays in the list, with no
+    // row current or focused until it moves (the focus frame would sit on a row nobody chose,
+    // and Space would open it). The current row goes BEFORE the model changes: the view makes
+    // row 0 current when its rows are replaced and gives that row the scope's focus, which a
+    // later `currentIndex = -1` does not take away again.
+    function openArchive(): void {
+        list.currentIndex = -1;
+        App.showArchive(true);
+        list.forceActiveFocus();
+    }
+
+    // The chats again; the keyboard stays in the list, no row current (as above).
+    function closeArchive(): void {
+        list.currentIndex = -1;
+        App.showArchive(false);
+        list.forceActiveFocus();
     }
 
     // The menu of the chat `row` shows, at (`x`, `y`) of the row; with a negative `x` (the
@@ -82,8 +119,28 @@ Kirigami.ScrollablePage {
     }
 
     onVisibleChanged: page.showRowsSoon()
+    // The title: `chatsHeading` for the chats, `archiveTitle` (a Back arrow before it) for the
+    // archive view, but Kirigami's OWN delegate while the page has no page row (its toolbar
+    // style is None). Kirigami's page keeps its toolbar loaded whenever the delegate is not its
+    // own; when the list leaves the row (`pageStack.clear()`, the last account gone) the row is
+    // set to null first, and a ToolBarPageHeader left without its `pageRow` prints "Unable to
+    // assign [undefined] to bool" (its line 61, `visible: root.pageRow?.separatorVisible && …`;
+    // `link_actions_ui` case `drawer`, UI-2). With its own delegate the toolbar unloads with the
+    // style, as on every Kirigami page.
+    Component.onCompleted: {
+        page.kirigamiTitle = page.titleDelegate;
+        page.titleDelegate = Qt.binding(() => page.globalToolBarStyle === Kirigami.ApplicationHeaderStyle.None ? page.kirigamiTitle : (App.archiveShown ? archiveTitle : chatsHeading));
+    }
 
     title: App.currentTitle
+    Connections {
+        target: App
+        function onArchiveShownChanged(): void {
+            if (App.archiveShown) {
+                search.text = "";
+            }
+        }
+    }
     leftPadding: 0
     rightPadding: 0
     topPadding: 0
@@ -101,14 +158,35 @@ Kirigami.ScrollablePage {
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.smallSpacing
 
+            // What the archive is (the view has no search field).
+            QQC2.Label {
+                id: archiveHelp
+
+                objectName: "archive-help"
+                // (Only over chats: an empty archive says "No archived chats" and no more.)
+                visible: App.archiveShown && list.count > 0
+                text: L10n.i18nc("@info", "These chats are archived. They come back to your chats when a new message arrives.")
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
+            }
+
             Kirigami.SearchField {
                 id: search
 
+                visible: !App.archiveShown
                 placeholderText: L10n.i18nc("@info:placeholder", "Search")
                 // Find (like Ctrl+K) is the window's key, so that it also works in a narrow
                 // window where the chat covers the list; the field's own Find key would
                 // make the two ambiguous, and neither would act.
                 focusSequences: []
+                // Only Enter accepts: Kirigami's field accepts by itself a moment after every
+                // change by default, and accepting is the quick switch below, so the first
+                // letter typed opened a chat and took the keyboard away (his report,
+                // 2026-10-16). The list filters on `onTextChanged`.
+                autoAccept: false
                 Accessible.name: L10n.i18nc("@info accessible", "Search conversations")
                 QQC2.ToolTip.visible: search.hovered && search.text === ""
                 QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
@@ -155,6 +233,12 @@ Kirigami.ScrollablePage {
         // and End move the current row, Enter or Space opens it. No row is current until
         // the keyboard moves into the list.
         function openCurrent(): void {
+            // Only the list's own keyboard: the Return that the search field passes on after
+            // the quick switch opened its chat is not the list's, and must not open the
+            // current row as well.
+            if (!list.activeFocus) {
+                return;
+            }
             const row = list.currentItem as ConversationDelegate;
             if (row !== null) {
                 page.openConversation(row.conversationId);
@@ -176,9 +260,26 @@ Kirigami.ScrollablePage {
         Keys.onEnterPressed: list.openCurrent()
         Keys.onSpacePressed: list.openCurrent()
         Keys.onMenuPressed: list.currentMenu()
+        // Esc and Alt+Left leave the archive view while the list has the keyboard.
+        Keys.onEscapePressed: event => {
+            event.accepted = App.archiveShown;
+            if (App.archiveShown) {
+                page.closeArchive();
+            }
+        }
+        // (Alt+Left is the page stack's Back shortcut, which would take it first: the list, in
+        // the archive view, keeps it.)
+        Keys.onShortcutOverride: event => {
+            if (App.archiveShown && event.key === Qt.Key_Left && (event.modifiers & Qt.AltModifier)) {
+                event.accepted = true;
+            }
+        }
         Keys.onPressed: event => {
             if (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
                 list.currentMenu();
+                event.accepted = true;
+            } else if (event.key === Qt.Key_Left && (event.modifiers & Qt.AltModifier) && App.archiveShown) {
+                page.closeArchive();
                 event.accepted = true;
             }
         }
@@ -188,6 +289,9 @@ Kirigami.ScrollablePage {
         cacheBuffer: Kirigami.Units.gridUnit * 20
         topMargin: Kirigami.Units.smallSpacing
         bottomMargin: Kirigami.Units.smallSpacing
+
+        // The way into the archive: the last row, its own stop of the keyboard (below).
+        footer: page.entryShown ? archiveEntryComponent : null
 
         delegate: ConversationDelegate {
             id: row
@@ -205,16 +309,24 @@ Kirigami.ScrollablePage {
         Kirigami.PlaceholderMessage {
             id: emptyList
 
-            readonly property string phase: App.bannerTransfer.phase ?? ""
+            // A SHOWN account's transfer only: a hidden account's banner may show, but its history
+            // does not come into this list (M2).
+            readonly property string phase: App.bannerShownTransfer.phase ?? ""
             // What the user searches for (the filter ignores the space around it): a search
             // that matches nothing says so, whatever else goes on with the account.
             readonly property string query: search.text.trim()
 
+            objectName: "empty-list"
             anchors.centerIn: parent
             width: parent.width - Kirigami.Units.gridUnit * 2
-            visible: page.rowsShown && list.count === 0
-            icon.name: "dialog-messages"
+            // Not while the list's only row is the way into the archive: every chat is archived,
+            // which is no reason to say there is no conversation.
+            visible: page.rowsShown && list.count === 0 && !page.entryShown
+            icon.name: App.archiveShown ? "archive-insert" : "dialog-messages"
             text: {
+                if (App.archiveShown) {
+                    return L10n.i18nc("@info:placeholder", "No archived chats");
+                }
                 if (emptyList.query !== "") {
                     return L10n.i18nc("@info:placeholder, %1 what was searched for", "No chats match “%1”", Style.plain(emptyList.query));
                 }
@@ -226,12 +338,14 @@ Kirigami.ScrollablePage {
                     return L10n.i18nc("@info:placeholder", "Importing your message history");
                 case "updating":
                     return L10n.i18nc("@info:placeholder", "Getting your chats");
+                case "history":
+                    return L10n.i18nc("@info:placeholder", "Getting your message history");
                 default:
                     return L10n.i18nc("@info:placeholder", "No conversations");
                 }
             }
             explanation: {
-                if (emptyList.query !== "") {
+                if (App.archiveShown || emptyList.query !== "") {
                     return "";
                 }
                 switch (emptyList.phase) {
@@ -242,8 +356,231 @@ Kirigami.ScrollablePage {
                     return L10n.i18nc("@info:placeholder", "Chats appear here as they are imported.");
                 case "updating":
                     return L10n.i18nc("@info:placeholder", "Chats appear here as contacts and groups arrive.");
+                case "history":
+                    return L10n.i18nc("@info:placeholder", "Chats appear here as your phone sends them.");
                 default:
                     return L10n.i18nc("@info:placeholder", "Chats from your phone appear here once they sync.");
+                }
+            }
+        }
+    }
+
+    // The footer of the list.
+    Component {
+        id: archiveEntryComponent
+
+        Delegates.RoundedItemDelegate {
+            id: entry
+
+            width: list.width
+            focusPolicy: Qt.StrongFocus
+            Accessible.role: Accessible.Button
+            Accessible.name: L10n.i18ncp("@info accessible, %1 how many", "Archived Chats, %1 chat", "Archived Chats, %1 chats", App.archivedCount)
+            Accessible.onPressAction: entry.clicked()
+            onClicked: page.openArchive()
+            // Shift+Tab goes back to the list: the entry sits inside the list, which is a focus
+            // scope, so it lets go of the keyboard (the scope then has it) rather than
+            // handing it to its own scope.
+            Keys.onBacktabPressed: event => {
+                entry.focus = false;
+                list.forceActiveFocus(Qt.BacktabFocusReason);
+                event.accepted = true;
+            }
+            // (Enter opens it as Space does; the delegate takes Space itself.)
+            Keys.onReturnPressed: event => {
+                entry.clicked();
+                event.accepted = true;
+            }
+            Keys.onEnterPressed: event => {
+                entry.clicked();
+                event.accepted = true;
+            }
+            Component.onCompleted: page.archiveEntry = entry
+            Component.onDestruction: {
+                if (page.archiveEntry === entry) {
+                    page.archiveEntry = null;
+                }
+            }
+
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+
+                Kirigami.Icon {
+                    source: "archive-insert"
+                    implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                    implicitHeight: Kirigami.Units.iconSizes.smallMedium
+                    Layout.alignment: Qt.AlignVCenter
+                }
+                QQC2.Label {
+                    text: L10n.i18nc("@action:button, %1 how many archived chats there are", "Archived Chats (%1)", App.archivedCount)
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                }
+            }
+        }
+    }
+
+    // The narrow window's "Dot with count" (UI-1): the unread messages of hidden accounts on the
+    // CLOSED menu button. That button is Kirigami's private `HandleButton` of the toolbar, right
+    // before the page's title delegate (the drawer's own handle is invisible while the toolbar
+    // holds its place); the pill sits over its top end corner (anchored to the title's start, so
+    // it mirrors in RTL), only while the drawer is modal and closed, and is made on first need.
+    // One for both titles, the chats' and the archive's (NEW-3): a holder of no size inside the
+    // title, the pill a child of that title.
+    component MenuButtonPill: Item {
+        id: pillHost
+
+        // The title item the pill stands before (its start edge, its vertical centre).
+        required property Item title
+        readonly property Kirigami.GlobalDrawer drawer: ((QQC2.ApplicationWindow.window as Kirigami.ApplicationWindow)?.globalDrawer as Kirigami.GlobalDrawer) ?? null
+        readonly property bool handleShown: pillHost.drawer !== null && pillHost.drawer.modal && pillHost.drawer.handleVisible && pillHost.drawer.enabled
+        readonly property bool wanted: pillHost.drawer !== null && pillHost.drawer.modal && App.hiddenUnread > 0
+        // The pill (null until first needed; tests read it through the title).
+        property Item pill: null
+        onWantedChanged: pillHost.make()
+        Component.onCompleted: pillHost.make()
+        function make(): void {
+            if (pillHost.wanted && pillHost.pill === null) {
+                pillHost.pill = handlePill.createObject(pillHost.title) as Item;
+            }
+        }
+        Component {
+            id: handlePill
+
+            UnreadPill {
+                objectName: "menu-button-pill"
+                compact: true
+                count: App.hiddenUnread
+                visible: pillHost.wanted && pillHost.handleShown && !pillHost.drawer.drawerOpen
+                anchors.right: pillHost.title.left
+                // (Like the rail's pill: over the corner, standing out by a few pixels.)
+                anchors.bottom: pillHost.title.verticalCenter
+                anchors.bottomMargin: -Kirigami.Units.smallSpacing / 2
+                z: 1
+                // Orca: Kirigami's menu button has no accessible name of its own.
+                Accessible.role: Accessible.StaticText
+                Accessible.name: pillHost.drawer?.handleClosedToolTip ?? ""
+            }
+        }
+    }
+
+    // The chats' title: Kirigami's default (a heading that shrinks and elides), but with several
+    // accounts shown it names them while the names fit ("Andrii · Work") and says how many
+    // otherwise ("3 accounts", `App.currentTitleShort`, M7). `title` stays the full text for the
+    // window and the accessible name. It carries the menu button's pill (`MenuButtonPill`).
+    Component {
+        id: chatsHeading
+
+        Item {
+            id: chatsTitleItem
+            objectName: "chatsTitle"
+            // The text shown (tests read it).
+            readonly property string shownText: chatsHeadingText.text
+            // The width the full title needs (tests read it).
+            readonly property real fullWidth: chatsFull.advanceWidth + chatsTitleItem.lead
+            // The menu button's pill (null until first needed; tests read it).
+            readonly property Item pill: chatsPill.pill
+
+            MenuButtonPill {
+                id: chatsPill
+                title: chatsTitleItem
+            }
+
+            // Kirigami gives ITS default title the toolbar's title padding when no menu button
+            // stands before it (`ToolBarPageHeader` `titleLoader.Layout.leftMargin`, only for a
+            // `DefaultPageTitleDelegate`): the same room here, so the wide title stays where it was.
+            readonly property real lead: chatsTitleItem.handleShown ? 0 : Math.max(0, ((QQC2.ApplicationWindow.window as Kirigami.ApplicationWindow)?.pageStack.globalToolBar.titleLeftPadding ?? Kirigami.Units.gridUnit) - Kirigami.Units.mediumSpacing)
+            readonly property bool handleShown: chatsPill.handleShown
+
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            Layout.maximumWidth: implicitWidth
+            implicitWidth: Math.ceil(chatsFull.advanceWidth + chatsTitleItem.lead)
+            implicitHeight: Math.ceil(chatsHeadingText.implicitHeight)
+
+            TextMetrics {
+                id: chatsFull
+                font: chatsHeadingText.font
+                text: page.title
+            }
+            Kirigami.Heading {
+                id: chatsHeadingText
+                objectName: "chatsHeadingText"
+                anchors.fill: parent
+                anchors.leftMargin: chatsTitleItem.lead
+                maximumLineCount: 1
+                elide: Text.ElideRight
+                textFormat: Text.PlainText
+                text: App.currentTitleShort !== "" && chatsTitleItem.width - chatsTitleItem.lead < chatsFull.advanceWidth ? App.currentTitleShort : page.title
+            }
+        }
+    }
+
+    // The title of the archive view: a Back arrow and the heading, and the menu button's pill
+    // as on the chats' title (NEW-3: hidden accounts' unread messages stay counted here too).
+    Component {
+        id: archiveTitle
+
+        // (An item around the row: the pill is a child of the title, outside the row's layout.)
+        Item {
+            id: archiveTitleItem
+            objectName: "archiveTitle"
+            Layout.fillWidth: true
+            implicitWidth: archiveRow.implicitWidth
+            implicitHeight: archiveRow.implicitHeight
+            // The menu button's pill (null until first needed; tests read it).
+            readonly property Item pill: archivePill.pill
+
+            MenuButtonPill {
+                id: archivePill
+                title: archiveTitleItem
+            }
+
+            RowLayout {
+                id: archiveRow
+                anchors.fill: parent
+                spacing: Kirigami.Units.smallSpacing
+
+                QQC2.ToolButton {
+                    id: back
+
+                    icon.name: LayoutMirroring.enabled ? "go-next" : "go-previous"
+                    display: QQC2.AbstractButton.IconOnly
+                    Accessible.name: L10n.i18nc("@info accessible", "Back to Chats")
+                    QQC2.ToolTip.visible: back.hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    QQC2.ToolTip.text: L10n.i18nc("@info:tooltip", "Back to Chats")
+                    onClicked: page.closeArchive()
+                    Keys.onEscapePressed: event => {
+                        page.closeArchive();
+                        event.accepted = true;
+                    }
+                    Keys.onShortcutOverride: event => {
+                        if (event.key === Qt.Key_Left && (event.modifiers & Qt.AltModifier)) {
+                            event.accepted = true;
+                        }
+                    }
+                    Keys.onPressed: event => {
+                        if (event.key === Qt.Key_Left && (event.modifiers & Qt.AltModifier)) {
+                            page.closeArchive();
+                            event.accepted = true;
+                        }
+                    }
+                    Component.onCompleted: page.archiveBack = back
+                    Component.onDestruction: {
+                        if (page.archiveBack === back) {
+                            page.archiveBack = null;
+                        }
+                    }
+                }
+                Kirigami.Heading {
+                    text: page.title
+                    maximumLineCount: 1
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
                 }
             }
         }

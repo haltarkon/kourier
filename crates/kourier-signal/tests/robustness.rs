@@ -18,7 +18,7 @@
     reason = "the shared support modules serve several test files"
 )]
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -447,7 +447,7 @@ async fn an_unlink_from_the_phone_ends_the_device_with_logged_out() {
     let state = core
         .wait_conn("LoggedOut", |s| matches!(s, ConnState::LoggedOut { .. }))
         .await;
-    let ConnState::LoggedOut { reason } = &state else {
+    let ConnState::LoggedOut { reason, .. } = &state else {
         unreachable!()
     };
     assert_eq!(reason, "device is not registered");
@@ -502,7 +502,7 @@ async fn a_login_refused_with_401_ends_the_device_with_logged_out() {
     let state = core
         .wait_conn("LoggedOut", |s| matches!(s, ConnState::LoggedOut { .. }))
         .await;
-    let ConnState::LoggedOut { reason } = state else {
+    let ConnState::LoggedOut { reason, .. } = state else {
         unreachable!()
     };
     assert!(reason.contains("401"), "{reason}");
@@ -1272,6 +1272,9 @@ async fn a_number_change_from_the_phone_is_applied() {
 /// device (`DELETE /v1/devices/<id>`, Desktop's `unlink`) and ends the actor `LoggedOut`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logout_removes_the_device_from_the_account() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1322,6 +1325,475 @@ fn logged_out() -> Exit {
     }
 }
 
+/// A link finished on the server and the connection task is still opening its authenticated
+/// socket when `Logout` arrives (a relink that proved to be another account, a Remove Account
+/// right after a link): `Logout` waits for THAT attempt and removes the device over its socket.
+/// It must not give the attempt up and open a second socket (F1, `target/next/f1-build.md`):
+/// the connect runs on in Kourier's network runtime after the future that waits for it is
+/// dropped (`Net::run` spawns it; dropping the `JoinHandle` detaches it; `Net::run_aborting`
+/// aborts it since the F1 fix round), so the old attempt could reach the server after the new
+/// one, the server closes the older of two sockets of a device with 4409, and the `DELETE`
+/// rode on the closed one. The account was gone here and its device stayed on the phone's
+/// list (3 of 54 runs of the e2e test
+/// `an_account_made_between_a_logins_start_and_its_scan_is_still_refused`, 9 of 108 at 6
+/// side by side). The harness holds the answer to the first upgrade, which makes the order
+/// certain: the device has ONE authenticated upgrade in all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_while_the_connect_of_a_finished_link_is_under_way_waits_for_it() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    // The device this link creates is the account's second.
+    let username = format!("{}.2", world.phone.aci);
+    harness
+        .hold_upgrade_named(&username, 1200, 1)
+        .await
+        .expect("holdUpgrade");
+    let mut core = world.actor(
+        SignalNetwork::new(),
+        StartMode::Fresh,
+        &ShiftClock::default(),
+    );
+    let (url, _steps) = core.begin_login(None).await;
+    scanned_until(
+        &world,
+        &url,
+        "the connection attempt reached the server",
+        async || {
+            harness
+                .connection_stats(&username)
+                .await
+                .expect("connectionStats")
+                .connects
+                >= 1
+        },
+    )
+    .await;
+    let stats = harness
+        .connection_stats(&username)
+        .await
+        .expect("connectionStats");
+    assert!(!stats.open, "the attempt is held: {stats:?}");
+
+    let started = Instant::now();
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports.len(), 1, "told once: {reports:?}");
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "within the core's 10 s: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        devices_of_the_phone(&world).await,
+        1,
+        "the device left the account"
+    );
+    let stats = harness
+        .connection_stats(&username)
+        .await
+        .expect("connectionStats");
+    assert_eq!(
+        stats.connects, 1,
+        "the removal used the attempt under way, no second one: {stats:?}"
+    );
+    assert_eq!(logout_warnings(), Vec::<String>::new());
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The removal rides on the socket of the connection task's attempt, and that task must not use
+/// the same socket for the work of a device that is about to be gone: no `GET`/`PUT /v2/keys`
+/// (one-time keys) and nothing else after the `DELETE` (F1 fix round, P2; the debug log of
+/// the e2e test of a refused link showed `GET /v2/keys` right behind the `DELETE`). The log
+/// of requests the clients sent over their websockets (the harness's `requestLog`) holds the
+/// `DELETE` and no other request of the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_under_removal_starts_no_post_connect_work_on_the_attempts_socket() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let username = format!("{}.2", world.phone.aci);
+    harness
+        .hold_upgrade_named(&username, 800, 1)
+        .await
+        .expect("holdUpgrade");
+    let mut core = world.actor(
+        SignalNetwork::new(),
+        StartMode::Fresh,
+        &ShiftClock::default(),
+    );
+    let (url, _steps) = core.begin_login(None).await;
+    scanned_until(
+        &world,
+        &url,
+        "the connection attempt reached the server",
+        async || {
+            harness
+                .connection_stats(&username)
+                .await
+                .expect("connectionStats")
+                .connects
+                >= 1
+        },
+    )
+    .await;
+    harness
+        .request_log(None, None, true)
+        .await
+        .expect("requestLog: clear");
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    // The task would have started its work at once; give a late request time to arrive.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let log = harness
+        .request_log(None, None, false)
+        .await
+        .expect("requestLog");
+    let seen: Vec<String> = log
+        .iter()
+        .map(|request| format!("{} {}", request.verb, request.path))
+        .collect();
+    assert_eq!(
+        seen.len(),
+        1,
+        "only the DELETE rode on the socket, the log is {seen:?}"
+    );
+    assert!(seen[0].starts_with("DELETE /v1/devices/"), "{seen:?}");
+    assert_eq!(logout_warnings(), Vec::<String>::new());
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The same with the history transfer's offer ON (R1, N2): a link whose phone chose "Transfer
+/// message history" starts the transfer at the link's end, and its long poll
+/// (`GET /v1/devices/transfer_archive`) took the socket of the connection task's attempt as
+/// soon as the task published it, beside the `DELETE`. The socket of a device under removal
+/// carries the `DELETE` and nothing else: the log of requests holds no poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_under_removal_starts_no_history_transfer_poll_on_the_attempts_socket() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let username = format!("{}.2", world.phone.aci);
+    harness
+        .set_ephemeral_backup_key(&world.phone.device_ref)
+        .await
+        .expect("setEphemeralBackupKey");
+    harness
+        .hold_upgrade_named(&username, 800, 1)
+        .await
+        .expect("holdUpgrade");
+    let network = SignalNetwork::new()
+        .with_history_transfer_offer(true)
+        .with_history_transfer_wait(Duration::from_secs(120), Duration::from_secs(1));
+    let mut core = world.actor(network, StartMode::Fresh, &ShiftClock::default());
+    let (url, _steps) = core.begin_login(None).await;
+    scanned_until(
+        &world,
+        &url,
+        "the connection attempt reached the server",
+        async || {
+            harness
+                .connection_stats(&username)
+                .await
+                .expect("connectionStats")
+                .connects
+                >= 1
+        },
+    )
+    .await;
+    harness
+        .request_log(None, None, true)
+        .await
+        .expect("requestLog: clear");
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    // The poll would have gone out as soon as the socket stood; give a late one time to arrive.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let log = harness
+        .request_log(None, None, false)
+        .await
+        .expect("requestLog");
+    let seen: Vec<String> = log
+        .iter()
+        .map(|request| format!("{} {}", request.verb, request.path))
+        .collect();
+    assert_eq!(
+        seen.len(),
+        1,
+        "only the DELETE rode on the socket, the log is {seen:?}"
+    );
+    assert!(seen[0].starts_with("DELETE /v1/devices/"), "{seen:?}");
+    assert_eq!(logout_warnings(), Vec::<String>::new());
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// After a logout the last state the core sees is `LoggedOut` (R1, N6): the connection task,
+/// still running when `unlinked` writes it, stops after that and wrote `Offline` over it (or
+/// `Connecting` first, after a stale reconnect), which took the banner's "logged out" back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_logout_the_last_state_the_core_sees_is_logged_out() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (mut core, _device) = world.link().await;
+    core.wait_online().await;
+    let conn = core.conn_watch();
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    assert!(
+        matches!(*conn.borrow(), ConnState::LoggedOut { .. }),
+        "the state the core saw last: {}",
+        conn.borrow().name()
+    );
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The attempt of the connection task does not come before the removal's time is up (the
+/// server holds the answer to its upgrade for 9 s, the removal has 7): `Logout` ends
+/// `NotReached` and then NO connect of the device is started, the task's own or one of the
+/// removal's. Before, the removal opened its own connect with an expired deadline (tokio
+/// polls the inner future of a `timeout_at` first, `Net::run` spawned it), which reached the
+/// server after the actor had given up and wiped the keys: `connects` went 1 to 2 four seconds
+/// later (F1 review, F-3; F1 fix round, P3). The task's held connect is aborted with the task
+/// (`Net::run_aborting`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_that_runs_out_of_time_starts_no_connect_of_its_own() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let harness = &world.harness;
+    let username = format!("{}.2", world.phone.aci);
+    harness
+        .hold_upgrade_named(&username, 9000, 5)
+        .await
+        .expect("holdUpgrade");
+    let mut core = world.actor(
+        SignalNetwork::new(),
+        StartMode::Fresh,
+        &ShiftClock::default(),
+    );
+    let (url, _steps) = core.begin_login(None).await;
+    scanned_until(
+        &world,
+        &url,
+        "the connection attempt reached the server",
+        async || {
+            harness
+                .connection_stats(&username)
+                .await
+                .expect("connectionStats")
+                .connects
+                >= 1
+        },
+    )
+    .await;
+    let started = Instant::now();
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports.len(), 1, "told once: {reports:?}");
+    assert_eq!(reports[0].outcome, DeviceLogout::NotReached);
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "the removal gave up at its own deadline: {:?}",
+        started.elapsed()
+    );
+    // The phone's list still has the device: the removal could not tell the server.
+    assert_eq!(devices_of_the_phone(&world).await, 2);
+    let at_the_end = harness
+        .connection_stats(&username)
+        .await
+        .expect("connectionStats")
+        .connects;
+    assert_eq!(at_the_end, 1, "only the task's own attempt was ever made");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let later = harness
+        .connection_stats(&username)
+        .await
+        .expect("connectionStats")
+        .connects;
+    assert_eq!(
+        later, 1,
+        "no connect of the device reached the server after the removal gave up"
+    );
+    assert_eq!(
+        logout_warnings().len(),
+        1,
+        "the user is told once to unlink it on the phone: {:?}",
+        logout_warnings()
+    );
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The socket of the removal closes under its request (4409: another client took the
+/// credentials in that moment): the request is asked once more on a connection of its own, and
+/// the device leaves the account (F1; before, the user was told to remove it on the phone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_whose_socket_closes_under_the_request_asks_again_on_a_new_connection() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (core, device) = world.link().await;
+    world
+        .harness
+        .close_on_request("DELETE", "/v1/devices/", 4409, 1)
+        .await
+        .expect("closeOnRequest");
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports.len(), 1, "told once: {reports:?}");
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    let devices = world
+        .harness
+        .list_devices(&world.phone.device_ref)
+        .await
+        .expect("listDevices");
+    assert_eq!(devices.len(), 1, "only the phone is left: {devices:?}");
+    assert_ne!(devices[0].device_ref, device.device_ref);
+    assert_eq!(logout_warnings(), Vec::<String>::new());
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// The socket of the removal is dead but nobody noticed yet (the seconds after a resume behind a
+/// NAT that dropped the mapping): the server takes the `DELETE` up only after the request's
+/// own 5 s are over (`holdRequest`), so the request ends with a timeout. It is asked once more
+/// on a new connection while time is left, and the device leaves the account (R1, N3; before, a
+/// timeout was not retried and the user was told to unlink the device on the phone with 2 s of
+/// the 7 unused). A request the server did serve in the end is safe to ask again: the new
+/// connection is refused at the door (401 or 403), which counts as removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logout_whose_request_times_out_asks_again_on_a_new_connection() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (mut core, device) = world.link().await;
+    core.wait_online().await;
+    world
+        .harness
+        .hold_request("DELETE", "/v1/devices/", 6500, 1)
+        .await
+        .expect("holdRequest");
+    let started = Instant::now();
+    let (exit, reports) = core.logout().await;
+    assert_eq!(exit, logged_out());
+    assert_eq!(reports.len(), 1, "told once: {reports:?}");
+    assert_eq!(reports[0].outcome, DeviceLogout::Removed);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(8),
+        "the first request waited its 5 s, the second one fitted in the 7 s: {took:?}"
+    );
+    let devices = world
+        .harness
+        .list_devices(&world.phone.device_ref)
+        .await
+        .expect("listDevices");
+    assert_eq!(devices.len(), 1, "only the phone is left: {devices:?}");
+    assert_ne!(devices[0].device_ref, device.device_ref);
+    assert_eq!(logout_warnings(), Vec::<String>::new());
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// A `Disconnect` and a `Connect` right behind it while the connection task's attempt is still
+/// on its way to the server (F1 fix round, P1; the builder's note 4 in
+/// `target/next/f1-build.md`): the attempt that `Disconnect` dropped must STOP. Before, the
+/// connect ran on in the network runtime, reached the server after the new one, and the server
+/// closes the older of two sockets of a device with 4409, so the new socket was closed and the
+/// account sat in `NeedsUserAction(Reconnect)` (§6.4: no automatic reconnect).
+///
+/// The harness holds the answer to the first upgrade (R1, N4), so the first attempt is certainly
+/// at the server and certainly unanswered when the second `Disconnect` lands; the test no longer
+/// depends on the ~300 ms libsignal takes to dial localhost (IPv6, then IPv4), which a host whose
+/// first route answers at once would shorten until the attempt completed before it was dropped.
+/// (An attempt the server has already answered is not recalled by the client dropping it, see
+/// `Net::run_aborting`; the held upgrade here is answered after the client is gone.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disconnect_and_a_connect_while_an_attempt_is_on_its_way_end_with_one_socket() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (mut core, device) = world.link().await;
+    core.wait_online().await;
+    let before = world.connects(&device).await;
+    // The first attempt after the disconnect is held at the server for 1.5 s.
+    world
+        .harness
+        .hold_upgrade_named(&device.device_ref, 1500, 1)
+        .await
+        .expect("holdUpgrade");
+    core.send(Command::Disconnect).await;
+    core.send(Command::Connect).await;
+    let deadline = Instant::now() + WAIT;
+    while world.connects(&device).await < before + 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the first attempt never reached the server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stats = world
+        .harness
+        .connection_stats(&device.device_ref)
+        .await
+        .expect("connectionStats");
+    assert!(!stats.open, "the first attempt is held: {stats:?}");
+    // The second `Disconnect` drops the attempt that is under way (a task stopped before its
+    // first poll never starts a connect at all, which
+    // `connection::tests::a_task_stopped_before_it_connects_never_polls_the_connect` covers).
+    core.send(Command::Disconnect).await;
+    core.send(Command::Connect).await;
+    world.reconnected(&mut core, &device, before, 2).await;
+    // The dropped attempt's time passes: it must not take the new socket.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let stats = world
+        .harness
+        .connection_stats(&device.device_ref)
+        .await
+        .expect("connectionStats");
+    assert_eq!(
+        stats.connects,
+        before + 2,
+        "the held attempt and the one that was waited for: {stats:?}"
+    );
+    assert!(stats.open, "the new socket still stands: {stats:?}");
+    assert!(
+        core.conn_state().is_online(),
+        "no 4409 on the new socket: {}",
+        core.conn_state().name()
+    );
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
 /// How many devices the server has for our phone's account (the phone included).
 async fn devices_of_the_phone(world: &World) -> usize {
     world
@@ -1359,6 +1831,9 @@ async fn scanned_until(world: &World, url: &str, what: &str, linked: impl AsyncF
 /// the server, and nothing to warn about (no device stays on the phone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logout_at_the_qr_code_has_no_device_to_remove() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1405,6 +1880,9 @@ async fn a_logout_at_the_qr_code_has_no_device_to_remove() {
 /// leaves the account, instead of staying on the user's phone with nobody behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logout_right_after_the_link_removes_the_device_without_a_socket() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1465,6 +1943,9 @@ async fn a_logout_right_after_the_link_removes_the_device_without_a_socket() {
 /// device is removed from the account, with the `Logout` the core sends and without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_login_cancelled_during_its_link_request_removes_the_device_it_created() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1534,6 +2015,9 @@ async fn a_login_cancelled_during_its_link_request_removes_the_device_it_created
 /// on the phone's list with nobody behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shutdown_during_the_link_request_removes_the_device_it_created() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1595,6 +2079,9 @@ async fn a_shutdown_during_the_link_request_removes_the_device_it_created() {
 /// account), then the new login runs and shows its own QR code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_login_started_while_a_cancelled_one_ends_is_not_lost() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1642,6 +2129,9 @@ async fn a_login_started_while_a_cancelled_one_ends_is_not_lost() {
 /// user to unlink on the phone a device the phone has unlinked already.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logout_of_a_device_the_phone_removed_already_warns_about_nothing() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1805,7 +2295,8 @@ async fn a_first_link_by_another_account_than_the_expected_one_registers_nothing
             error = failed => error,
         }
     };
-    assert_eq!(error.kind, ErrorKind::InvalidInput, "{error:?}");
+    // One cause for both networks: the same typed kind, so the UI words are the same.
+    assert_eq!(error.kind, ErrorKind::NotTheExpectedAccount, "{error:?}");
     assert_eq!(error.detail, "the scanned account is not the expected one");
     assert_eq!(devices_of_the_phone(&world).await, 1, "only the phone");
     // The core turns such a login away with `Logout`: there is no device to remove.

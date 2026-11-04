@@ -102,6 +102,33 @@ fn dbus_daemon() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("dbus-daemon"))
 }
 
+/// A new connection to `bus_address` that serves `iface` at `path` and owns `name`, the name
+/// taken only once the connection's object server listens for calls.
+///
+/// Not `object_server().at(…)` and then `request_name(…)`: zbus starts the object server's
+/// dispatch task lazily, in a task of its own, and a call that reaches the connection before
+/// that task has subscribed is dropped without a reply (and zbus bounds no call by default, so
+/// the caller waits for ever). A client that sees the name appear and calls at once could hit
+/// that window: the `notifications` case of `tests/dbus.rs` did, in about 1 run of 1,300 to
+/// 4,000 with eight copies side by side, its `GetCapabilities` never reaching the mock. The
+/// builder (`serve_at` + `name`) waits for the dispatcher before it requests the name.
+async fn serving<I: zbus::object_server::Interface>(
+    bus_address: &str,
+    path: &str,
+    iface: I,
+    name: &str,
+) -> Result<Bus, DesktopError> {
+    let no_bus = |e: zbus::Error| DesktopError::NoBus(e.to_string());
+    zbus::connection::Builder::address(bus_address)
+        .map_err(no_bus)?
+        .serve_at(path, iface)?
+        .name(name)?
+        .build()
+        .await
+        .map(Bus)
+        .map_err(Into::into)
+}
+
 /// One `Notify` call the mock server received.
 #[derive(Clone, Debug)]
 pub struct NotifyCall {
@@ -283,24 +310,21 @@ pub const PLASMA_CAPS: [&str; 8] = [
 impl MockNotifications {
     /// Serves the mock on a new connection to `bus_address` with `caps` and takes the name.
     pub async fn start(bus_address: &str, caps: &[&str]) -> Result<Self, DesktopError> {
-        let bus = Bus::at(bus_address).await?;
         let log = Arc::new(Mutex::new(NotificationLog::default()));
         let changed = Arc::new(Notify::new());
-        bus.connection()
-            .object_server()
-            .at(
-                crate::notifications::PATH,
-                Server {
-                    log: log.clone(),
-                    changed: changed.clone(),
-                    next: 0,
-                    caps: caps.iter().map(|c| (*c).to_owned()).collect(),
-                },
-            )
-            .await?;
-        bus.connection()
-            .request_name(crate::notifications::SERVICE)
-            .await?;
+        let server = Server {
+            log: log.clone(),
+            changed: changed.clone(),
+            next: 0,
+            caps: caps.iter().map(|c| (*c).to_owned()).collect(),
+        };
+        let bus = serving(
+            bus_address,
+            crate::notifications::PATH,
+            server,
+            crate::notifications::SERVICE,
+        )
+        .await?;
         Ok(Self { bus, log, changed })
     }
 
@@ -362,6 +386,19 @@ impl MockNotifications {
             .connection()
             .release_name(crate::notifications::SERVICE)
             .await?;
+        Ok(())
+    }
+
+    /// A notification expired (its timeout ran out): `NotificationClosed(id, 1)`. Plasma keeps
+    /// such a notification in its history; a client's own `CloseNotification` is another reason.
+    pub async fn expire(&self, id: u32) -> Result<(), DesktopError> {
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .open
+            .retain(|o| *o != id);
+        let emitter = self.emitter().await?;
+        Server::notification_closed(&emitter, id, 1).await?;
         Ok(())
     }
 
@@ -444,22 +481,19 @@ pub struct MockWatcher {
 impl MockWatcher {
     /// Serves the watcher on a new connection to `bus_address` and takes its name.
     pub async fn start(bus_address: &str) -> Result<Self, DesktopError> {
-        let bus = Bus::at(bus_address).await?;
         let log = Arc::new(Mutex::new(WatcherLog::default()));
         let changed = Arc::new(Notify::new());
-        bus.connection()
-            .object_server()
-            .at(
-                "/StatusNotifierWatcher",
-                Watcher {
-                    log: log.clone(),
-                    changed: changed.clone(),
-                },
-            )
-            .await?;
-        bus.connection()
-            .request_name("org.kde.StatusNotifierWatcher")
-            .await?;
+        let watcher = Watcher {
+            log: log.clone(),
+            changed: changed.clone(),
+        };
+        let bus = serving(
+            bus_address,
+            "/StatusNotifierWatcher",
+            watcher,
+            "org.kde.StatusNotifierWatcher",
+        )
+        .await?;
         Ok(Self { bus, log, changed })
     }
 

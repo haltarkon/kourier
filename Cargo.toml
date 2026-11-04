@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
+# The vendored libthreema is its own workspace (third_party/libthreema/VENDORED.md): its lock, its
+# lints and its own test suite stay as upstream's; Kourier builds it only as a path dependency.
+exclude = ["third_party/libthreema"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +23,10 @@ kourier-media = { path = "crates/kourier-media" }
 kourier-core = { path = "crates/kourier-core" }
 kourier-fake = { path = "crates/kourier-fake" }
 kourier-signal = { path = "crates/kourier-signal" }
+kourier-whatsapp = { path = "crates/kourier-whatsapp" }
+kourier-telegram = { path = "crates/kourier-telegram" }
+kourier-tdlib = { path = "crates/kourier-tdlib" }
+kourier-threema = { path = "crates/kourier-threema" }
 kourier-desktop = { path = "crates/kourier-desktop" }
 kourier-app = { path = "crates/kourier-app" }
 kourier-viewmodel = { path = "crates/kourier-viewmodel" }
@@ -46,6 +53,40 @@ signal-media = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0
 # The reader of Signal's history-transfer archive: only its public `frame` and `key` modules are
 # used (kourier-signal `archive`, docs/architecture.md §14.2 item 14); its typed model is closed.
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.104.0" }
+# WhatsApp (kourier-whatsapp, architecture §7): ONE git revision for every whatsapp-rust crate, bumped
+# together (like the libsignal tag; re-run W0 REPORT §6's trait count, re-copy the contract tests in
+# crates/kourier-whatsapp/tests/support/upstream, re-compute the about.toml checksum; re-read
+# upstream's new `warn!`/`error!` format strings, because `kourier-whatsapp`'s `logs.rs` hides by
+# shape and a new line may print a name or a key in a shape it does not know (add it to the corpus in
+# `logs/tests.rs`); and upstream's `tracing` feature stays OFF: its span fields carry the account's
+# LID and number past the message-only redaction). Kourier owns
+# the runtime and the database: no `sqlite-storage` (diesel), `signal`, `voip` or `tokio-native`.
+# `passkey` IS on (W2, decision L3; it has no dependencies): without it the server's passkey request
+# is not understood at all and the honest refusal of a passkey account could not happen; W9 builds
+# the flow on it. `async-channel` is what the copied repro test and whatsapp-rust re-export.
+# OFFLINE BY CONSTRUCTION (W1 fix F1): whatsapp-rust gets NEITHER `tokio-transport` NOR `ureq-client`.
+# With them its builder pre-fills the transport and the HTTP client with the real WebSocket and HTTPS
+# client, and `Bot::builder().with_backend(store).build()` would compile and could dial without
+# naming either. Without them the builder's typestate REQUIRES both slots (a test holds that at
+# compile time). The two crates are direct dependencies of kourier-whatsapp (and only of it), which
+# keeps the licences and the lock complete; no code names them before W2.
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743", default-features = false, features = ["tokio-runtime", "passkey"] }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743", default-features = false }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743", default-features = false }
+# Kourier's own HTTPS client over upstream's (kourier-whatsapp `src/real.rs`, W5b decision G13): an agent with
+# timeouts, no proxy and no redirect. The version upstream's ureq client resolves (the `Agent` type must be
+# the same), its `rustls` feature and no default ones.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743", default-features = false }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743", default-features = false }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "50a723d46fee6216f20d4daba9cd834a39261743" }
+# Threema (kourier-threema, architecture §7.4): libthreema vendored from threema-ios at one commit with
+# Kourier's patches P1-P4, P6, P9, P10 and P11 (third_party/libthreema/VENDORED.md). NEVER its `cli` (tokio-tungstenite,
+# reqwest: real connections), `uniffi` or `wasm` features: Kourier brings its own transports, and the
+# crate builds offline by construction. Its blake2 is the patched copy under its own name
+# (`libthreema-blake2`, patch P3), so no `[patch.crates-io]` is needed here.
+libthreema = { path = "third_party/libthreema/lib", default-features = false }
+async-channel = { version = "2.5", default-features = false, features = ["std"] }
 prost = "0.14"
 prost-build = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -77,6 +118,8 @@ thiserror = "2"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
 tokio-util = "0.7"
 tracing = "0.1"
+# The records of a `log` caller (kourier-app's test of the log filter builds what whatsapp-rust writes).
+log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -110,6 +153,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # `cargo xtask shots` decodes its pictures to compare them with the stored ones, and writes the
 # side-by-side diff pictures (xtask): the PNG codec the image crate uses.
 png = "0.18"
+# The QR check of the safety-number level (kourier-qt `tests/chat_ui.rs` `svQr`, P5a critic F11): a
+# pure-Rust QR decoder (a port of quirc), a dev-dependency only, fed the grab's grey pixels decoded by
+# `image`. Licence MIT, accepted by deny.toml. (rqrr was tried first: through `lru` it turns on
+# features of `hashbrown`, so it changed a package block of the lock file and `ci --quick` would take it
+# for a full run.)
+quircs = "0.10"
 blurhash = "0.2"
 
 [patch.crates-io]
@@ -120,6 +169,29 @@ boring-sys = { git = "https://github.com/signalapp/boring", tag = "signal-v5.2.0
 # the rev gurk-rs ships.
 libsqlite3-sys = { git = "https://github.com/boxdot/rusqlite", rev = "a2f393913d9994645c94810498bef07b2183b3dc" }
 
+# Dependencies (every package that is not a workspace member) are optimised in dev and test
+# builds (T2, 2026-10-14): libsignal, SQLCipher, BoringSSL and the image codecs at opt-level 0
+# were most of the CPU of a test or a screenshot (a chat screenshot: 9.5 CPU-s, 8.7 of them Rust
+# at opt-level 0). Only the optimiser changes: debug assertions and overflow checks stay on. The
+# Rust dependencies' debug info is cut to line tables: at opt-level 2 their variables are
+# optimised out anyway and a backtrace keeps file:line. (The C and C++ dependencies keep full
+# DWARF: cc and cmake map debug to -g.) Measured: the app binary -19 %, the `chat_ui` test binary
+# -12 %, small test binaries more (a 61 MB one to 25 MB). To step through one of them add
+# `[profile.dev.package.<name>] opt-level = 0` and `debug = true` to a local copy of this file
+# (CLAUDE.md, Traps).
+[profile.dev.package."*"]
+opt-level = 2
+debug = "line-tables-only"
+# Workspace crates in which the hot GENERIC code of those dependencies is instantiated, so "*"
+# does not reach it (a generic function is compiled at the opt-level of the crate that names the
+# concrete types): the JPEG encoder, the fixture's pictures and the blurhash input in
+# kourier-media, the AES-GCM stream of every attachment file in kourier-blob. They keep their
+# full debug info. `xtask` checks this list (workspace.rs, `DEV_OPTIMISED`).
+[profile.dev.package.kourier-media]
+opt-level = 2
+[profile.dev.package.kourier-blob]
+opt-level = 2
+# Named packages win over "*": the database's crypto stays at 3 (architecture §5.3).
 [profile.dev.package.sqlcipher-crypto-provider]
 opt-level = 3
 [profile.dev.package.sha2]
@@ -131,7 +203,170 @@ codegen-units = 4
 # No DWARF in the release binary. With `debug = "line-tables-only"` the C and C++ parts
 # (BoringSSL, SQLCipher, the cxx-qt glue) were still compiled with full `-g` (the cc crate
 # knows only on and off) and the binary was 260 MB, 210 MB of it debug sections. The symbol
-# table stays (`strip = "debuginfo"`, not "symbols"): a panic backtrace in a bug report names
-# its functions, and the table is not loaded into memory. Measured in S16 (architecture §13).
+# table stays in the BUILD (`strip = "debuginfo"`, not "symbols"): every build by hand, `perf`,
+# `install` and a Flatpak's own `.Debug` split keep their function names, and the table is not
+# loaded into memory. `cargo xtask dist` splits it off afterwards (`xtask/src/names.rs`): the
+# shipped binary has no symbol table, the names go into a names archive per release. Measured
+# in S16 (architecture §13).
 debug = false
 strip = "debuginfo"
+
+# The WhatsApp crates are optimised for size in release builds (his decision of 2026-10-15: the
+# binary budget is 80 MiB, one archive holds the WhatsApp backend). W0 measured -2.03 MiB (-9 %) on
+# the linked client with exactly these 13 packages; `wacore-derive` is a proc-macro and needs none.
+# Cargo warns about a name that matches no package, so a rename after a bump shows up at once.
+[profile.release.package.whatsapp-rust]
+opt-level = "s"
+[profile.release.package.wacore]
+opt-level = "s"
+[profile.release.package.waproto]
+opt-level = "s"
+[profile.release.package.wacore-binary]
+opt-level = "s"
+[profile.release.package.wacore-appstate]
+opt-level = "s"
+[profile.release.package.wacore-libsignal]
+opt-level = "s"
+[profile.release.package.wacore-noise]
+opt-level = "s"
+[profile.release.package.buffa]
+opt-level = "s"
+[profile.release.package.ureq]
+opt-level = "s"
+[profile.release.package.ureq-proto]
+opt-level = "s"
+[profile.release.package.tokio-websockets]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-tokio-transport]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-ureq-http-client]
+opt-level = "s"
+
+# The network and protocol half of the program is optimised for size too (W5 chunk C0, the binary
+# room: the tree was 2.12 MiB over the 80 MiB budget at 38fa453; measured in
+# `target/wa/briefs/w5/binary-room.md` C, -3.28 MB with these 43 packages). None of them is a hot
+# path of the core: what one of the budgets of architecture §1.3 runs through is the catch-up
+# ingest (kourier-signal stage 1); `perf --quick` does not measure that row and the build server
+# cannot judge it, so it is measured on the PC before this lands on main. Left at
+# 3 on purpose: libsignal-protocol, signal-crypto, curve25519-dalek, aes, sha2, hmac, hkdf, ring,
+# boring and the hot path (attachment crypto, SQLCipher, the image codecs, zlib-rs); the core half
+# (kourier-core, -model, -backend-api, -app, -desktop) only after a full `cargo xtask perf`.
+[profile.release.package.kourier-signal]
+opt-level = "s"
+[profile.release.package.kourier-whatsapp]
+opt-level = "s"
+# The Telegram backend and the TDLib helper's protocol crate (the lane's landing, 2026-10-26):
+# network code, no hot path of the budgets; TDLib itself is a separate file, not in the binary.
+[profile.release.package.kourier-telegram]
+opt-level = "s"
+[profile.release.package.kourier-tdlib]
+opt-level = "s"
+[profile.release.package.kourier-fake]
+opt-level = "s"
+[profile.release.package.libsignal-net]
+opt-level = "s"
+[profile.release.package.libsignal-net-infra]
+opt-level = "s"
+[profile.release.package.libsignal-net-chat]
+opt-level = "s"
+[profile.release.package.libsignal-net-grpc]
+opt-level = "s"
+[profile.release.package.libsignal-message-backup]
+opt-level = "s"
+[profile.release.package.libsignal-keytrans]
+opt-level = "s"
+[profile.release.package.libsignal-svrb]
+opt-level = "s"
+[profile.release.package.libsignal-account-keys]
+opt-level = "s"
+[profile.release.package.zkgroup]
+opt-level = "s"
+[profile.release.package.libcrux-ml-kem]
+opt-level = "s"
+[profile.release.package.libcrux-sha3]
+opt-level = "s"
+[profile.release.package.libcrux-hacl-rs]
+opt-level = "s"
+[profile.release.package.libcrux-hmac]
+opt-level = "s"
+[profile.release.package.libcrux-sha2]
+opt-level = "s"
+[profile.release.package.spqr]
+opt-level = "s"
+[profile.release.package.zbus]
+opt-level = "s"
+[profile.release.package.zvariant]
+opt-level = "s"
+[profile.release.package.zbus_names]
+opt-level = "s"
+[profile.release.package.ksni]
+opt-level = "s"
+[profile.release.package.oo7]
+opt-level = "s"
+[profile.release.package.hyper]
+opt-level = "s"
+[profile.release.package.hyper-util]
+opt-level = "s"
+[profile.release.package.hyper-rustls]
+opt-level = "s"
+[profile.release.package.h2]
+opt-level = "s"
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.rustls-webpki]
+opt-level = "s"
+[profile.release.package.tokio-rustls]
+opt-level = "s"
+[profile.release.package.reqwest]
+opt-level = "s"
+[profile.release.package.tonic]
+opt-level = "s"
+[profile.release.package.tonic-prost]
+opt-level = "s"
+[profile.release.package.tokio-tungstenite]
+opt-level = "s"
+[profile.release.package.tungstenite]
+opt-level = "s"
+[profile.release.package.prost]
+opt-level = "s"
+[profile.release.package.prost-types]
+opt-level = "s"
+[profile.release.package.regex-automata]
+opt-level = "s"
+[profile.release.package.regex-syntax]
+opt-level = "s"
+[profile.release.package.tracing-subscriber]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+[profile.release.package.chrono]
+opt-level = "s"
+[profile.release.package.url]
+opt-level = "s"
+# The Threema crates are optimised for size in release builds, like the WhatsApp ones (his rule of
+# 2026-10-15: the binary budget is 80 MiB; savings first, raise to 90 only if a measured build is
+# over). libthreema brings a second line of the dalek crates and a few ciphers only it uses; those
+# are named with their version so the rows never reach the first line Signal uses (cargo warns about
+# a name that matches nothing, but NOT about a `name@version` whose version is not in the graph:
+# after a bump, `cargo check --release -p kourier-threema -v` must show `opt-level=s` for each). The release
+# archive is built without Threema (`signal,whatsapp`), so these rows change only the default build.
+[profile.release.package.kourier-threema]
+opt-level = "s"
+[profile.release.package.libthreema]
+opt-level = "s"
+[profile.release.package.libthreema-dependencies]
+opt-level = "s"
+[profile.release.package.libthreema-blake2]
+opt-level = "s"
+[profile.release.package."curve25519-dalek@4.1.3"]
+opt-level = "s"
+[profile.release.package."x25519-dalek@2.0.1"]
+opt-level = "s"
+[profile.release.package."ed25519-dalek@2.2.0"]
+opt-level = "s"
+[profile.release.package.crypto_secretbox]
+opt-level = "s"
+[profile.release.package.salsa20]
+opt-level = "s"
+[profile.release.package.scrypt]
+opt-level = "s"

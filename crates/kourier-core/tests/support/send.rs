@@ -69,7 +69,7 @@ pub fn unregistered() -> BackendError {
     BackendError::new(ErrorKind::PeerUnregistered, "not registered")
 }
 
-fn conversation(key: ConvKey, members: Option<Vec<Member>>) -> BackendEvent {
+pub fn conversation(key: ConvKey, members: Option<Vec<Member>>) -> BackendEvent {
     let mut p = ConversationPatch::new(key);
     p.members = members.map(MemberList::snapshot);
     p.features = Some(signal_features(p.members.is_some()));
@@ -107,6 +107,18 @@ pub fn setup() -> Vec<BackendEvent> {
             "are you there?",
         )),
     ]
+}
+
+/// The account's statement (an `AccountCaps` event) that its network writes the settings it keeps
+/// for the account's other devices (archive, pin, mute, marked unread) and that the account's
+/// switch is `on` (A10a): the core refuses such a click for an account that does not state it on.
+pub fn roaming_caps(on: bool) -> BackendEvent {
+    let mut caps = kourier_model::AccountCaps::default();
+    caps.flags.insert(
+        kourier_model::AccountCaps::FLAG_ROAMING_WRITES.to_owned(),
+        on,
+    );
+    BackendEvent::AccountCaps(caps)
 }
 
 /// A Signal-like account whose script only delivers [`setup`].

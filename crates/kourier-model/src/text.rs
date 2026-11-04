@@ -48,6 +48,24 @@ impl Text {
         before - self.ranges.len()
     }
 
+    /// The mention ranges that count, in the order of the text: of the valid ones ONE per
+    /// placeholder, the LAST in `ranges` (ranges "may overlap", and two valid mention ranges lie on
+    /// the same placeholder; the one stored last is the one a renderer draws). A
+    /// [`RangeKind::MentionAll`] counts too, as the one on its placeholder: it stands for nobody, a
+    /// caller that wants people skips it. THE rule of "who is mentioned": the renderer
+    /// (`kourier-viewmodel`) and the menu's pages of people (`kourier-core`) both ask it, so a menu
+    /// never offers a person the text does not show.
+    pub fn shown_mentions(&self) -> Vec<&TextRange> {
+        let mut by_start: std::collections::BTreeMap<u32, &TextRange> =
+            std::collections::BTreeMap::new();
+        for r in &self.ranges {
+            if r.kind.is_mention() && validate_range(&self.body, r).is_ok() {
+                by_start.insert(r.start, r);
+            }
+        }
+        by_start.into_values().collect()
+    }
+
     /// The UTF-16 offset map of the body.
     pub fn utf16_map(&self) -> Utf16Map {
         Utf16Map::new(&self.body)
@@ -533,5 +551,67 @@ mod tests {
         };
         let s = format!("{t:?} {:?}", t.ranges);
         assert!(!s.contains("secret"), "{s}");
+    }
+
+    /// One mention per placeholder, as the text is shown (people pages P3): of the valid mention
+    /// ranges on a placeholder the LAST stored one counts, "everyone" is one of them, an invalid range
+    /// does not count, and the result follows the text.
+    #[test]
+    fn one_mention_counts_per_placeholder() {
+        let user = |s: &str| UserId::parse(s).expect("id");
+        let p = MENTION_PLACEHOLDER.len_utf8() as u32;
+        let range = |start: u32, kind: RangeKind| TextRange {
+            start,
+            len: p,
+            kind,
+        };
+        let body = format!("a{MENTION_PLACEHOLDER}b{MENTION_PLACEHOLDER}c{MENTION_PLACEHOLDER}");
+        let (one, two, three) = (1, 1 + p + 1, 1 + 2 * (p + 1));
+        let text = Text {
+            body,
+            ranges: vec![
+                // The third placeholder first (stored out of order), alice then bob on the first,
+                // bob then "everyone" on the second, a Bold range, and a mention that is no
+                // placeholder.
+                range(three, RangeKind::Mention(user("aci:carol"))),
+                range(one, RangeKind::Mention(user("aci:alice"))),
+                range(one, RangeKind::Mention(user("aci:bob"))),
+                range(two, RangeKind::Mention(user("aci:bob"))),
+                range(two, RangeKind::MentionAll),
+                TextRange {
+                    start: one,
+                    len: p,
+                    kind: RangeKind::Bold,
+                },
+                TextRange {
+                    start: 0,
+                    len: 1,
+                    kind: RangeKind::Mention(user("aci:nobody")),
+                },
+            ],
+        };
+        let shown = text.shown_mentions();
+        let kinds: Vec<(u32, String)> = shown
+            .iter()
+            .map(|r| {
+                (
+                    r.start,
+                    match &r.kind {
+                        RangeKind::Mention(u) => u.as_str().to_owned(),
+                        _ => "everyone".to_owned(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (one, "aci:bob".to_owned()),
+                (two, "everyone".to_owned()),
+                (three, "aci:carol".to_owned()),
+            ],
+            "the last on each placeholder, in the order of the text"
+        );
+        assert!(Text::plain("none").shown_mentions().is_empty());
     }
 }

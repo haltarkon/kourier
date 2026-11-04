@@ -44,6 +44,13 @@ pub(crate) struct Fixture {
     pni_bundle: PreKeyBundle,
 }
 
+impl Fixture {
+    /// The `backend.db` file of the fixture (for a test that starts an actor over it).
+    pub(crate) fn backend_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("backend.db")
+    }
+}
+
 /// A linked account with a signed prekey and a Kyber last-resort key per identity, and their
 /// bundles.
 pub(crate) fn fixture() -> Fixture {
@@ -776,6 +783,7 @@ fn an_identity_change_leaves_a_notice_where_the_core_has_the_conversation() {
     let change = |identity: &IdentityKeyPair| IdentityChangeRecord {
         service_id: sid.clone(),
         identity: *identity.identity_key(),
+        verified: 0,
     };
     let first = IdentityKeyPair::generate(&mut rand::rng());
     let second = IdentityKeyPair::generate(&mut rand::rng());
@@ -1010,13 +1018,31 @@ fn a_pni_signature_merges_the_pni_into_the_aci_only_when_it_verifies() {
     );
     let valid = phone.envelope(&fixture, &signed(&pni_identity, T + 2), T + 2);
     stage1_all(&fixture, &[], &[forged, valid]);
+    let mut stated = kourier_model::ContactPatch::new(aci_user(phone.aci));
+    // The ACI has a `peers` row and its verdict is stated (P1 F2b): no key yet, so shown; the
+    // key that stage 2 may store later is then a change the core is told about.
+    stated.number_shown = Some(true);
     assert_eq!(
         outbox_events(&fixture.db),
-        [BackendEvent::IdentityMerged {
-            from: crate::service_id::pni_user_id(pni).unwrap(),
-            into: aci_user(phone.aci),
-        }],
-        "only the valid signature merges"
+        [
+            BackendEvent::IdentityMerged {
+                from: crate::service_id::pni_user_id(pni).unwrap(),
+                into: aci_user(phone.aci),
+            },
+            BackendEvent::ContactUpsert(stated),
+        ],
+        "only the valid signature merges, and the ACI's verdict follows it"
+    );
+    assert_eq!(
+        fixture
+            .db
+            .read(|c| crate::peers::number_shown_before(
+                c,
+                &ServiceId::from(phone.aci).service_id_string()
+            ))
+            .unwrap(),
+        Some(true),
+        "the ACI has a peers row after the merge"
     );
     assert_eq!(
         count(&fixture.db, "inbox"),
@@ -2351,6 +2377,49 @@ mod mapping {
         assert_eq!(kept(T + 3), None, "only our own replies");
     }
 
+    /// Re-check N3 (the last step of F2): a profile key that arrives for a person a `peers` row
+    /// already knew (a PNI signature makes the ACI's row) hides a number they do not share, and
+    /// stage 2 tells the core so in the same outcome, before the message's own events. A person
+    /// no row knew (the test above) states nothing: whatever brings the number states it.
+    #[test]
+    fn a_profile_key_that_arrives_late_states_the_hidden_verdict() {
+        let fixture = fixture();
+        let sender: ServiceId = peer().into();
+        let sid = sender.service_id_string();
+        fixture
+            .db
+            .zone(|tx| crate::peers::ensure(tx, &sid, 1))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .db
+                .read(|c| crate::peers::number_shown_before(c, &sid))
+                .unwrap(),
+            Some(true),
+            "no key yet: shown"
+        );
+        let update = |key: u8, t: u64| {
+            data(proto::DataMessage {
+                timestamp: Some(t),
+                flags: Some(4),
+                profile_key: Some(vec![key; 32]),
+                ..Default::default()
+            })
+        };
+        let events = events_of(map(&fixture, &row(sender, 1, T, &update(8, T)), false));
+        let mut hidden =
+            kourier_model::ContactPatch::new(crate::service_id::aci_user_id(peer()).unwrap());
+        hidden.number_shown = Some(false);
+        assert_eq!(events, [BackendEvent::ContactUpsert(hidden)]);
+        // The same key again changes nothing.
+        let again = events_of(map(
+            &fixture,
+            &row(sender, 1, T + 1, &update(8, T + 1)),
+            false,
+        ));
+        assert!(again.is_empty(), "{again:?}");
+    }
+
     /// `PROFILE_KEY_UPDATE`: the key is stored (a new access key, sealed sender unknown again)
     /// and the profile is fetched again; nothing shows in the timeline.
     #[test]
@@ -2892,18 +2961,21 @@ mod mapping {
                         anchor(&chat, them_user(), "29"),
                     ],
                     remove: true,
+                    before_ms: None,
                     at,
                 },
                 BackendEvent::ConversationCleared {
                     conv: group.clone(),
                     up_to: vec![anchor(&group, them_user(), "33")],
                     remove: false,
+                    before_ms: None,
                     at,
                 },
                 BackendEvent::ConversationCleared {
                     conv: ConvKey::Direct(aci_user(fixture.account.aci)),
                     up_to: Vec::new(),
                     remove: true,
+                    before_ms: None,
                     at,
                 },
                 BackendEvent::AttachmentDeleted {
@@ -4531,3 +4603,7 @@ async fn network_failures_park_the_lane_and_never_count() {
 mod number_change;
 
 mod calls_attack;
+
+mod verified_sync;
+
+pub(crate) mod unarchive;

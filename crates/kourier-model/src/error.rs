@@ -128,6 +128,24 @@ pub enum ErrorKind {
         #[serde(default)]
         logged_out: bool,
     },
+    /// A link was refused because the phone that scanned the code (or whose number was typed)
+    /// belongs to another account than the one the run expects (a development run states the
+    /// last digits of the number it means to link, `BackendConfig::expect_number_suffix`). Kourier
+    /// did not link it; both networks use this one cause.
+    NotTheExpectedAccount,
+    /// A link was refused because the account already has as many linked devices as the
+    /// network allows (WhatsApp: four). `max` is that number when the network says.
+    TooManyDevices {
+        /// The most linked devices the network allows, when known.
+        #[serde(default)]
+        max: Option<u8>,
+    },
+    /// The network refused a message because its recipient has not written to this account
+    /// (WhatsApp's 463, a first contact from a companion device). Never retried: a retry is
+    /// one more reach-out, which counts against the account. The core fails the message with
+    /// [`FailReason::ReachOutRefused`], refuses `RetryMessage` for it and fails the chat's
+    /// other waiting messages the same way.
+    ReachOutRefused,
     /// A bug.
     Internal,
 }
@@ -163,6 +181,9 @@ impl ErrorKind {
             Self::Unsupported => "Unsupported",
             Self::Expired => "Expired",
             Self::AlreadyAdded { .. } => "AlreadyAdded",
+            Self::NotTheExpectedAccount => "NotTheExpectedAccount",
+            Self::TooManyDevices { .. } => "TooManyDevices",
+            Self::ReachOutRefused => "ReachOutRefused",
             Self::Internal => "Internal",
         }
     }

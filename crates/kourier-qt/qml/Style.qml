@@ -17,6 +17,13 @@ QtObject {
     readonly property real avatarSize: Kirigami.Units.gridUnit * 1.8
     readonly property real listAvatarSize: Kirigami.Units.gridUnit * 2.6
     readonly property real imageMaxWidth: Kirigami.Units.gridUnit * 16
+    // A picture or video is shown whole (§8.6), as large as fits the box between these: at most
+    // `imageMaxWidth` wide and `imageMaxHeight` (1.5 x the width limit) tall; a picture thinner
+    // than the minimum sits whole in a box of the minimum on the bubble's own color. The
+    // minimum height holds the round badge.
+    readonly property real imageMaxHeight: Kirigami.Units.gridUnit * 24
+    readonly property real imageMinWidth: Kirigami.Units.gridUnit * 7
+    readonly property real imageMinHeight: Kirigami.Units.gridUnit * 3
     readonly property real stickerSize: Kirigami.Units.gridUnit * 8
     // The conversation list in compact mode (Settings → General).
     readonly property real compactAvatarSize: Kirigami.Units.gridUnit * 1.8
@@ -38,6 +45,18 @@ QtObject {
     readonly property real overlayOpacity: 0.6
 
     // URL of a bundled icon (`icons/<name>.svg`).
+    // Whether the PREFERENCE has the experimental network `kind` on (what the next start does;
+    // a network switched off in Settings stays registered until Kourier restarts).
+    function networkWanted(kind: string): bool {
+        const on = App.settings.networksOn;
+        for (let i = 0; i < on.length; ++i) {
+            if (on[i].toLowerCase() === kind.toLowerCase()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function icon(name: string): string {
         return iconBase + name + ".svg";
     }
@@ -59,6 +78,17 @@ QtObject {
             h = (h * 31 + text.charCodeAt(i)) % 360;
         }
         return h / 360;
+    }
+
+    // A person's or chat's `name` without the "~" mark: WhatsApp's own apps (and so the core,
+    // `query.rs` `shown_name`) put one "~" in front of a name the person chose for themself, as
+    // part of the shown string. The mark belongs to LABELS only: whatever hashes, splits or speaks
+    // the name (the monogram's letters and glyph check, every colour taken from a name, the
+    // accessible names: a screen reader says "tilde") takes this, one leading "~" dropped and no
+    // more, so the monogram and the colour of a push-named person are those of the name itself
+    // (W6a2 PRIV-1). Rust's twin is `kourier_viewmodel::notify::unmarked_name`.
+    function unmarked(name: string): string {
+        return name.charAt(0) === "~" ? name.slice(1) : name;
     }
 
     // `text` for a label that guesses its format (Kirigami's InlineMessage, tooltips, any

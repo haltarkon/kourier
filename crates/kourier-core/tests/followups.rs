@@ -2,7 +2,8 @@
 //! side, on the fake backend with the fake clock:
 //!
 //! - an edit typed behind an edit the network then refuses targets the latest revision the
-//!   network has (§3.5.3);
+//!   network has (§3.5.3), where the network names the original message in an edit (WhatsApp,
+//!   Threema) every edit names it, refused one before it or not;
 //! - nothing about a message goes to people who never got it: a message whose send failed for
 //!   everyone is edited in place, and its reactions and queued edits wait for its retry (§4.8);
 //! - a `Failed` outbox row of a message deleted from another device does not stay;
@@ -12,7 +13,7 @@
 //! - a merge keeps the disappearing timer of whichever copy carried one;
 //! - a remote delete and an expiry both withdraw the message's notification (§8.7).
 
-mod support;
+use crate::support;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -26,7 +27,8 @@ use kourier_fake::scripts::{T0, own, remote, signal_features, target};
 use kourier_fake::{Flavor, Step, TransmitRecord, TransmitRule};
 use kourier_model::{
     AccountId, AccountUuid, BackendError, Body, ConvKey, ConversationId, ConversationPatch,
-    DisappearKind, ErrorKind, Expiry, MessageId, MsgIdScope, NetworkKind, OutgoingState, Text,
+    DisappearKind, ErrorKind, Expiry, MessageId, MsgIdScope, NetworkKind, OutgoingState,
+    TargetAuthor, Text,
 };
 use support::send::*;
 use support::{Env, WAIT, add_linked, eventually};
@@ -34,7 +36,11 @@ use support::{Env, WAIT, add_linked, eventually};
 const DAY: i64 = 24 * 3600 * 1000;
 
 async fn linked(script: kourier_fake::Script) -> (Env, AccountId, AccountUuid) {
-    let mut env = Env::new(Flavor::SignalLike, script).await;
+    linked_on(Flavor::SignalLike, script).await
+}
+
+async fn linked_on(flavor: Flavor, script: kourier_fake::Script) -> (Env, AccountId, AccountUuid) {
+    let mut env = Env::new(flavor, script).await;
     env.handle.send(UiCommand::UiReady).expect("send");
     let account = add_linked(&mut env).await;
     let uuid = env.account(account).await.expect("account").uuid;
@@ -246,6 +252,151 @@ async fn an_edit_behind_a_refused_edit_targets_what_the_network_has() {
         original,
         "the latest revision the network has is the original"
     );
+    assert_eq!(body, &Body::text("third version"));
+    assert_eq!(sent[1].req.local, stored.local, "its own id is unchanged");
+
+    env.clock.advance(Duration::from_secs(5));
+    until(&env, "the second edit is done", |c| {
+        count(c, "SELECT count(*) FROM outbox") == 0
+    })
+    .await;
+    let r = row(&env, conv, mine).await.expect("row");
+    assert_eq!((r.revision, text(&r.body)), (1, "third version"));
+    let revisions: Vec<String> = core_db(&env.core_db(), |c| {
+        let mut s = c
+            .prepare("SELECT net_local FROM message_revisions ORDER BY revision")
+            .expect("prepare");
+        s.query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    });
+    assert_eq!(revisions, [original, stored.local.to_string()]);
+    env.stop().await;
+}
+
+/// Where the network names the ORIGINAL message in an edit (WhatsApp and Threema: a protocol
+/// message whose key is the original; `EditTarget::Original`), every edit names the message's
+/// own key, not the id of the edit before it; Signal names the latest revision (the twin
+/// above). The edits are still revisions under their own ids, so the history, the "edited"
+/// mark and a reference to any revision keep working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_edit_names_the_original_where_the_network_says_so() {
+    for flavor in [Flavor::WhatsAppLike, Flavor::ThreemaLike] {
+        let original = (T0 - 90_000).to_string();
+        let s = script("edit-original").deliver(vec![own_at(&d_alice(), 90_000)]);
+        let (env, account, uuid) = linked_on(flavor, s).await;
+        env.wait_finished(account).await;
+        let (_conv, mine) = message(&env, &original).await;
+
+        for (n, body) in ["second version", "third version"].into_iter().enumerate() {
+            env.clock.advance(Duration::from_secs(60));
+            edit(&env, mine, body);
+            // Stored (the row's revision moved) and sent (nothing waits in the outbox).
+            let want = i64::try_from(n).expect("small") + 1;
+            until(&env, "the edit is stored and sent", move |c| {
+                count(c, "SELECT count(*) FROM outbox") == 0
+                    && count(
+                        c,
+                        &format!(
+                            "SELECT count(*) FROM messages WHERE id = {} AND revision = {want}",
+                            mine.0
+                        ),
+                    ) == 1
+            })
+            .await;
+        }
+        let sent = transmits(&env, uuid, 2).await;
+        let edits: Vec<_> = sent
+            .iter()
+            .filter(|t| t.req.kind.name() == "Edit")
+            .collect();
+        assert_eq!(edits.len(), 2, "{flavor:?}: two edits were sent");
+        for e in &edits {
+            let OutgoingKind::Edit { target, .. } = &e.req.kind else {
+                unreachable!("filtered on the kind")
+            };
+            assert_eq!(
+                target.local.as_ref(),
+                original,
+                "{flavor:?}: an edit names the original, whatever was edited since"
+            );
+            assert_eq!(target.author, TargetAuthor::Own, "{flavor:?}");
+        }
+        assert_ne!(
+            edits[0].req.local, edits[1].req.local,
+            "{flavor:?}: each edit has an id of its own"
+        );
+        // The revisions are the original and the two edits under their own ids.
+        let revisions: Vec<String> = core_db(&env.core_db(), |c| {
+            let mut s = c
+                .prepare("SELECT net_local FROM message_revisions ORDER BY revision")
+                .expect("prepare");
+            s.query_map([], |r| r.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        });
+        assert_eq!(
+            revisions,
+            [
+                original,
+                edits[0].req.local.to_string(),
+                edits[1].req.local.to_string()
+            ],
+            "{flavor:?}"
+        );
+        let mut env = env;
+        env.stop().await;
+    }
+}
+
+/// The twin of the test above where the network names the original: an edit typed behind an
+/// edit the network refuses for good names the original from the start (as typed, not the
+/// edit before it) and still does when it is sent; the refused edit's revision is rolled back,
+/// so the history holds the original and the second edit only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_queued_behind_a_refused_one_still_names_the_original() {
+    let original = (T0 - 90_000).to_string();
+    let s = script("edit-chain-original")
+        .deliver(vec![own_at(&d_alice(), 90_000)])
+        .delay_reply(d_alice(), Duration::from_secs(5))
+        .fail_transmit(TransmitRule::attempts(refused(), 1).of_kind("Edit"));
+    let (mut env, account, uuid) = linked_on(Flavor::WhatsAppLike, s).await;
+    env.wait_finished(account).await;
+    let (conv, mine) = message(&env, &original).await;
+
+    edit(&env, mine, "second version");
+    let first = transmits(&env, uuid, 1).await[0].req.clone();
+    edit(&env, mine, "third version");
+    until(&env, "both edits are in the outbox", |c| {
+        count(c, "SELECT count(*) FROM outbox") == 2
+    })
+    .await;
+    // As typed, the second edit names the original too: the first is no message there.
+    let stored: String = core_db(&env.core_db(), |c| {
+        c.query_row(
+            "SELECT request FROM outbox WHERE state = 'Queued'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the queued edit")
+    });
+    let stored: OutgoingRequest = serde_json::from_str(&stored).expect("request");
+    let OutgoingKind::Edit { target, .. } = &stored.kind else {
+        panic!("not an edit: {stored:?}");
+    };
+    assert_eq!(target.local.as_ref(), original);
+    assert_ne!(stored.local, first.local);
+
+    // The answer to the first edit arrives: refused. The second goes out, naming the original.
+    env.clock.advance(Duration::from_secs(5));
+    assert!(failed(&mut env, "EditMessage").await.contains("refused"));
+    let sent = transmits(&env, uuid, 2).await;
+    let OutgoingKind::Edit { target, body } = &sent[1].req.kind else {
+        panic!("not an edit: {:?}", sent[1].req);
+    };
+    assert_eq!(target.local.as_ref(), original, "the original, as before");
     assert_eq!(body, &Body::text("third version"));
     assert_eq!(sent[1].req.local, stored.local, "its own id is unchanged");
 
@@ -1059,9 +1210,13 @@ fn expired_keys_are_remembered_for_a_bounded_time() {
 /// identities are merged: the remembered key follows the merge.
 #[test]
 fn a_remembered_key_follows_an_identity_merge() {
-    // Account-wide keys name the author, per-conversation keys the conversation: both are
-    // rewritten by the merge.
-    for scope in [MsgIdScope::AccountAuthor, MsgIdScope::Conversation] {
+    // Account-wide keys name the author, per-conversation keys the conversation, per-sender
+    // keys both: all are rewritten by the merge.
+    for scope in [
+        MsgIdScope::AccountAuthor,
+        MsgIdScope::Conversation,
+        MsgIdScope::ConversationAuthor,
+    ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut h = harness(&dir, scope);
         let pni = uid("pni:00000000-0000-4000-8000-0000000a11ce");

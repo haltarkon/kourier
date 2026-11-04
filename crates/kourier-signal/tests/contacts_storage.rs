@@ -8,7 +8,7 @@
 //! (`support::fake_core`). Skips without Node ≥ 24 or the harness's `node_modules`
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeSet;
 use std::os::unix::process::ExitStatusExt as _;
@@ -18,12 +18,14 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use kourier_backend_api::{BackendEnv, Command, Exit, InitialSync, StartMode};
-use kourier_model::LoginStepKind;
+use kourier_backend_api::{
+    BackendEnv, Command, Exit, InitialSync, OutgoingKind, StartMode, TransmitOutcome,
+};
+use kourier_model::{ConvKey, LoginStepKind, MsgTarget, TargetAuthor, UserId};
 use kourier_signal::SignalNetwork;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use support::fake_core::{AccountFiles, FakeCore, Sink, WAIT, local_env};
+use support::fake_core::{AccountFiles, FakeCore, Sink, WAIT, local_env, text_request};
 use support::harness::{
     CreatePrimary, DeviceInfo, Harness, Primary, StorageAccount, StorageContact, StorageSpec,
 };
@@ -93,6 +95,7 @@ impl World {
                     bruno.device_ref.clone(),
                     chiara.device_ref.clone(),
                 ],
+                about: Some("Calls only".to_owned()),
                 ..CreatePrimary::named("Demo Phone")
             })
             .await
@@ -182,10 +185,14 @@ impl World {
 
     /// The contact patches the core got for `primary`, merged field by field in order.
     fn contact(&self, primary: &Primary) -> serde_json::Map<String, Value> {
-        let user = Self::user(primary);
+        self.contact_of(&Self::user(primary))
+    }
+
+    /// The same for a user id.
+    fn contact_of(&self, user: &str) -> serde_json::Map<String, Value> {
         let mut merged = serde_json::Map::new();
         for patch in self.sink.event_values("ContactUpsert") {
-            if patch["user"] == user.as_str()
+            if patch["user"] == user
                 && let Value::Object(fields) = patch
             {
                 merged.extend(fields);
@@ -334,16 +341,20 @@ async fn contacts_storage_and_profiles_reach_the_core_and_fetch_latest_resyncs()
         world.contact(&world.chiara).get("avatar").is_none(),
         "no avatar, none set"
     );
-    let meta = world.contact(&world.ada)["meta"]["Set"]["bytes"].clone();
-    let meta: Value = serde_json::from_slice(
-        &STANDARD
-            .decode(meta.as_str().expect("meta bytes"))
-            .expect("base64"),
-    )
-    .expect("profile meta JSON");
+    // P1: the about text and its emoji have fields of their own; the v1 blob is gone.
+    let ada = world.contact(&world.ada);
     assert_eq!(
-        meta,
-        serde_json::json!({"about": "Out hiking", "about_emoji": "🥾"})
+        ada.get("about").and_then(set).and_then(Value::as_str),
+        Some("Out hiking")
+    );
+    assert_eq!(
+        ada.get("about_emoji").and_then(set).and_then(Value::as_str),
+        Some("🥾")
+    );
+    assert_eq!(
+        ada.get("meta"),
+        Some(&Value::String("Clear".to_owned())),
+        "the old profile blob is cleared by the fetch, not written again"
     );
     world
         .files
@@ -425,6 +436,146 @@ async fn contacts_storage_and_profiles_reach_the_core_and_fetch_latest_resyncs()
     world.harness.shutdown().await.expect("harness shutdown");
 }
 
+/// People pages P1, the number rule (Desktop's `getE164`): a number is SHOWN when the person shares
+/// it, or is a system contact, or when we hold no profile key for them; a profile never fetched
+/// counts as not sharing. The verdict `number_shown` reaches the core with the Storage Service
+/// record (before any fetch), with the profile fetch (the field `phoneNumberSharing`), and again
+/// when a record gives the person an address-book name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_number_is_shown_by_signals_rule_and_the_verdict_follows_every_change() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let person = |name: &str, sharing: Option<bool>| {
+        let world = &world;
+        let name = name.to_owned();
+        async move {
+            world
+                .harness
+                .create_primary(&CreatePrimary {
+                    phone_number_sharing: sharing,
+                    ..CreatePrimary::named(name)
+                })
+                .await
+                .expect("person")
+        }
+    };
+    let dora = person("Dora Hidden", Some(false)).await;
+    let eli = person("Eli Sharing", Some(true)).await;
+    let fay = person("Fay Silent", None).await;
+    let gus = person("Gus Booked", Some(false)).await;
+    let hal = person("Hal Keyless", Some(false)).await;
+    let spec = |dora_system: Option<&str>| StorageSpec {
+        primary: world.phone.device_ref.clone(),
+        contacts: vec![
+            StorageContact {
+                system_given_name: dora_system.map(str::to_owned),
+                ..StorageContact::of(&dora.device_ref)
+            },
+            StorageContact::of(&eli.device_ref),
+            StorageContact::of(&fay.device_ref),
+            StorageContact {
+                system_given_name: Some("Gus Gray".to_owned()),
+                ..StorageContact::of(&gus.device_ref)
+            },
+            StorageContact {
+                profile_key: Some(false),
+                ..StorageContact::of(&hal.device_ref)
+            },
+        ],
+        ..StorageSpec::default()
+    };
+    // Profile fetches are refused for now: nobody's profile is fetched.
+    world
+        .harness
+        .limit_profile_fetches(Some(2))
+        .await
+        .expect("limit");
+    world
+        .harness
+        .set_storage_state(&spec(None))
+        .await
+        .expect("storage state");
+    let (core, device) = world.link(InitialSync::ContactsAndStorage).await;
+    let shown = |w: &World, p: &Primary| -> Option<bool> {
+        w.contact(p).get("number_shown").and_then(Value::as_bool)
+    };
+    world
+        .wait_for("every verdict from the records", |w| {
+            [&dora, &eli, &fay, &gus, &hal]
+                .iter()
+                .all(|p| shown(w, p).is_some())
+        })
+        .await;
+    assert_eq!(
+        shown(&world, &dora),
+        Some(false),
+        "a key, not fetched, not a system contact"
+    );
+    assert_eq!(
+        shown(&world, &eli),
+        Some(false),
+        "sharing is not known before the fetch"
+    );
+    assert_eq!(shown(&world, &fay), Some(false));
+    assert_eq!(shown(&world, &gus), Some(true), "a system contact shows");
+    assert_eq!(shown(&world, &hal), Some(true), "no profile key: shows");
+
+    // The profiles come: Eli says he shares, Dora and Fay (no field) do not, Gus is a system
+    // contact whatever his profile says.
+    world
+        .harness
+        .limit_profile_fetches(None)
+        .await
+        .expect("lift");
+    for p in [&dora, &eli, &fay, &gus] {
+        core.send(Command::RefreshContact {
+            user: UserId::parse(&World::user(p)).expect("user id"),
+        })
+        .await;
+    }
+    world
+        .wait_for("Eli's profile", |w| shown(w, &eli) == Some(true))
+        .await;
+    world
+        .files
+        .wait_for_i64(
+            "the four profiles fetched",
+            "SELECT count(*) FROM peers WHERE profile_key IS NOT NULL AND profile_fetched_at IS NOT NULL",
+            |n| n.is_some_and(|n| n >= 4),
+        )
+        .await;
+    assert_eq!(shown(&world, &dora), Some(false), "does not share");
+    assert_eq!(shown(&world, &fay), Some(false), "no field is not sharing");
+    assert_eq!(
+        shown(&world, &gus),
+        Some(true),
+        "address book beats the flag"
+    );
+
+    // A record that gives Dora an address-book name states the verdict again.
+    world
+        .harness
+        .set_storage_state(&spec(Some("Dora D")))
+        .await
+        .expect("storage state 2");
+    world
+        .harness
+        .send_fetch_latest(
+            &world.phone.device_ref,
+            &device.device_ref,
+            "storageManifest",
+        )
+        .await
+        .expect("fetch latest");
+    world
+        .wait_for("Dora in the address book", |w| {
+            shown(w, &dora) == Some(true)
+        })
+        .await;
+    drop(core);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_manifest_creates_nothing() {
     let Some(world) = World::start().await else {
@@ -470,8 +621,202 @@ async fn a_missing_manifest_creates_nothing() {
     world.harness.shutdown().await.expect("harness shutdown");
 }
 
+/// People pages P1: the page asks for a fresh profile when it opens (`RefreshContact`), and the
+/// backend answers at most once a day per person, whatever the page does (his "no mass fetch"
+/// rule); the first fetch after the link also brought OUR OWN about text (BQ3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_refresh_is_one_profile_request_a_day_and_our_own_about_comes_too() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    world
+        .harness
+        .set_storage_state(&world.storage())
+        .await
+        .expect("storage state");
+    let (core, device) = world.link(InitialSync::ContactsAndStorage).await;
+    // Everyone's first fetch is done, ours too (the routine refresh queues it).
+    world
+        .files
+        .wait_for_i64(
+            "the three contacts' profiles",
+            "SELECT count(*) FROM peers WHERE profile_key IS NOT NULL AND profile_fetched_at IS NOT NULL",
+            |n| n.is_some_and(|n| n >= 3),
+        )
+        .await;
+    let own = format!("aci:{}", device.aci);
+    world
+        .wait_for("our own about text", |w| {
+            w.contact_of(&own).get("about").and_then(set).is_some()
+        })
+        .await;
+    assert_eq!(
+        world.contact_of(&own)["about"]["Set"],
+        serde_json::json!("Calls only"),
+        "our own profile's about text"
+    );
+    assert!(
+        world.contact_of(&own).get("avatar").is_none(),
+        "our own picture is the account's, not a contact's"
+    );
+
+    // From now on every request that reaches the server is counted (and refused, so a job that
+    // does run shows).
+    assert_eq!(
+        world
+            .harness
+            .limit_profile_fetches(Some(600))
+            .await
+            .expect("limit"),
+        0
+    );
+    let ada = UserId::parse(&World::user(&world.ada)).expect("user id");
+    core.send(Command::RefreshContact { user: ada.clone() })
+        .await;
+    core.send(Command::RefreshContact { user: ada.clone() })
+        .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        world
+            .files
+            .peek_i64("SELECT count(*) FROM jobs WHERE kind = 'profile_fetch'")
+            .unwrap(),
+        Some(0),
+        "no job for a profile fetched a moment ago"
+    );
+    assert_eq!(
+        world
+            .harness
+            .limit_profile_fetches(Some(600))
+            .await
+            .expect("count"),
+        0,
+        "and no request reached the server"
+    );
+
+    // A day later the page's ask goes through, once, however often it is repeated.
+    world
+        .files
+        .execute(&format!(
+            "UPDATE peers SET profile_fetched_at = 1 WHERE service_id = '{}'",
+            world.ada.aci
+        ))
+        .expect("an old fetch");
+    core.send(Command::RefreshContact { user: ada.clone() })
+        .await;
+    core.send(Command::RefreshContact { user: ada }).await;
+    let harness = &world.harness;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if harness
+            .limit_profile_fetches(Some(600))
+            .await
+            .expect("count")
+            >= 1
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the due request never reached the server"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Encodes the `AttachmentPointer` fields the backend reads (field numbers of
 /// `SignalService.proto`): `cdnKey` 15, `key` 3, `size` 4, `digest` 6, `contentType` 2.
+/// A1 (BQ5): a message of Kourier's own to a chat the phone archived (and muted: its "Keep
+/// muted chats archived" is off) brings the chat back to the inbox, once, in the one zone that
+/// moves the diff base; a second message finds it there. The send is the real one, to the mock
+/// server; the rule itself is tested over one `backend.db` in `storage/tests.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_message_brings_an_archived_chat_back() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    world
+        .harness
+        .set_storage_state(&world.storage())
+        .await
+        .expect("storage state");
+    let (mut core, _device) = world.link(InitialSync::ContactsAndStorage).await;
+    core.wait_online().await;
+    let chiara = UserId::parse(&World::user(&world.chiara)).expect("user id");
+    let key = format!("direct:{}", World::user(&world.chiara));
+    assert_eq!(
+        world.chat(&world.chiara).get("archived"),
+        Some(&Value::Bool(true)),
+        "the phone archived the chat"
+    );
+    let unarchives = |world: &World| {
+        world
+            .sink
+            .event_values("ConversationUpsert")
+            .iter()
+            .filter(|p| p["key"] == key.as_str() && p["archived"] == Value::Bool(false))
+            .count()
+    };
+    assert_eq!(unarchives(&world), 0);
+    let (first_at, outcome) = core.transmit_text(&chiara, "hello from Kourier").await;
+    assert!(
+        matches!(outcome, TransmitOutcome::Sent { .. }),
+        "{outcome:?}"
+    );
+    world
+        .wait_for("the chat to come back", |w| unarchives(w) == 1)
+        .await;
+    let (_, outcome) = core.transmit_text(&chiara, "and again").await;
+    assert!(
+        matches!(outcome, TransmitOutcome::Sent { .. }),
+        "{outcome:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(unarchives(&world), 1, "the second message says nothing");
+    // Archived again on the phone (its base, as the Storage merge writes it): a reaction is
+    // no new message, so the chat stays where the phone put it.
+    let archived_peers = format!(
+        "UPDATE peers SET roaming_archived = 1 WHERE service_id = '{}'",
+        world.chiara.aci
+    );
+    world.files.execute(&archived_peers).expect("archive again");
+    let mut react = text_request(&chiara, "unused");
+    react.kind = OutgoingKind::React {
+        target: MsgTarget {
+            conv: Some(ConvKey::Direct(chiara.clone())),
+            author: TargetAuthor::Own,
+            local: first_at.to_string().into(),
+            alternates: Vec::new(),
+        },
+        emoji: "👍".to_owned(),
+        remove: false,
+    };
+    let outcome = core.transmit(react).await;
+    assert!(
+        matches!(outcome, TransmitOutcome::Sent { .. }),
+        "{outcome:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(unarchives(&world), 1, "a reaction brings nothing back");
+    assert_eq!(
+        world
+            .files
+            .peek_i64(&format!(
+                "SELECT roaming_archived FROM peers WHERE service_id = '{}'",
+                world.chiara.aci
+            ))
+            .unwrap(),
+        Some(1),
+        "and leaves the base as the phone has it"
+    );
+    assert_eq!(
+        world.chat(&world.chiara).get("archived"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
 fn pointer_bytes(stored: &Value, digest: &[u8]) -> Vec<u8> {
     fn varint(out: &mut Vec<u8>, mut v: u64) {
         while v >= 0x80 {
@@ -623,12 +968,8 @@ async fn a_kill_between_merge_zones_loses_no_record() {
         kourier_signal::failpoints::AFTER_STORAGE_MERGE_COMMIT
     );
     let mut process = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "child_actor_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .arg(support::child_filter(module_path!(), "child_actor_process"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(&child).expect("spec"))
         .env("KOURIER_FAILPOINT", &failpoint)
         .stdin(Stdio::null())

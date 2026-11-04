@@ -28,8 +28,23 @@ fn check(cond: bool, what: &str) -> TestResult {
     if cond { Ok(()) } else { Err(what.to_owned()) }
 }
 
-fn err(e: DesktopError) -> String {
-    e.to_string()
+/// Runs one step of a case under its own bound ([`WAIT`]), so a hang names the step instead of
+/// running into the case's outer 30 s bound. zbus bounds no method call by default (the
+/// connection's `method_timeout` is `None`), so every D-Bus await of a case is wrapped.
+async fn step<T>(name: &str, fut: impl std::future::Future<Output = T>) -> Result<T, String> {
+    tokio::time::timeout(WAIT, fut)
+        .await
+        .map_err(|_| format!("step `{name}` timed out after {} s", WAIT.as_secs()))
+}
+
+/// [`step`] for a step whose result is a `DesktopError`: either failure names the step.
+async fn step_ok<T>(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<T, DesktopError>>,
+) -> Result<T, String> {
+    step(name, fut)
+        .await?
+        .map_err(|e| format!("step `{name}`: {e}"))
 }
 
 async fn next<T>(rx: &mut mpsc::UnboundedReceiver<T>, what: &str) -> Result<T, String> {
@@ -61,23 +76,34 @@ fn message(replaces: u32) -> Notification {
 }
 
 async fn notifications(bus: &PrivateBus) -> TestResult {
-    let client_bus = bus.connect().await.map_err(err)?;
+    let client_bus = step_ok("connect the client's bus", bus.connect()).await?;
     // No server yet: a clear error, no auto-activation.
-    match NotificationClient::connect(&client_bus).await {
+    match step(
+        "connect without a server",
+        NotificationClient::connect(&client_bus),
+    )
+    .await?
+    {
         Err(DesktopError::NoService(_)) => {}
         other => return Err(format!("expected NoService, got {other:?}")),
     }
     // A server that appears later (plasmashell after an autostarted Kourier) is announced.
-    let mut appeared = notifications::watch_server(&client_bus)
-        .await
-        .map_err(err)?;
-    let server = MockNotifications::start(bus.address(), &PLASMA_CAPS)
-        .await
-        .map_err(err)?;
+    let mut appeared = step_ok(
+        "watch the server's name",
+        notifications::watch_server(&client_bus),
+    )
+    .await?;
+    let server = step_ok(
+        "start the mock server",
+        MockNotifications::start(bus.address(), &PLASMA_CAPS),
+    )
+    .await?;
     let owner = next(&mut appeared, "the server's appearance").await?;
-    let client = NotificationClient::connect(&client_bus)
-        .await
-        .map_err(err)?;
+    let client = step_ok(
+        "connect to the server",
+        NotificationClient::connect(&client_bus),
+    )
+    .await?;
     check(
         client.owner() == Some(owner.as_str()),
         "the client knows the server it connected to",
@@ -86,9 +112,9 @@ async fn notifications(bus: &PrivateBus) -> TestResult {
         client.capabilities().inline_reply(),
         "inline-reply capability",
     )?;
-    let mut events = client.subscribe().await.map_err(err)?;
+    let mut events = step_ok("subscribe to the signals", client.subscribe()).await?;
 
-    let id = client.notify(&message(0)).await.map_err(err)?;
+    let id = step_ok("notify", client.notify(&message(0))).await?;
     check(id != 0, "an id")?;
     let call = server
         .with_log(|l| l.calls.last().cloned())
@@ -143,14 +169,15 @@ async fn notifications(bus: &PrivateBus) -> TestResult {
     )?;
 
     // Replacing keeps the id.
-    let again = client.notify(&message(id)).await.map_err(err)?;
+    let again = step_ok("notify again (replace)", client.notify(&message(id))).await?;
     check(again == id, "replaces_id keeps the notification")?;
 
     // A click: token first, then the action.
-    server
-        .invoke(id, "default", Some("tok-1"))
-        .await
-        .map_err(err)?;
+    step_ok(
+        "the server invokes the default action",
+        server.invoke(id, "default", Some("tok-1")),
+    )
+    .await?;
     match next(&mut events, "activation token").await? {
         NotificationEvent::ActivationToken { id: i, token } if i == id && token == "tok-1" => {}
         other => return Err(format!("expected the token, got {other:?}")),
@@ -159,12 +186,12 @@ async fn notifications(bus: &PrivateBus) -> TestResult {
         NotificationEvent::Action { id: i, key } if i == id && key == "default" => {}
         other => return Err(format!("expected the action, got {other:?}")),
     }
-    server.reply(id, "on my way").await.map_err(err)?;
+    step_ok("the server sends a reply", server.reply(id, "on my way")).await?;
     match next(&mut events, "reply").await? {
         NotificationEvent::Replied { id: i, text } if i == id && text == "on my way" => {}
         other => return Err(format!("expected the reply, got {other:?}")),
     }
-    client.close(id).await.map_err(err)?;
+    step_ok("close", client.close(id)).await?;
     match next(&mut events, "closed").await? {
         NotificationEvent::Closed {
             id: i,
@@ -180,15 +207,77 @@ async fn notifications(bus: &PrivateBus) -> TestResult {
     Ok(())
 }
 
+/// A short name of an event, for comparing orders.
+fn kind_of(e: &NotificationEvent) -> (&'static str, u32) {
+    match e {
+        NotificationEvent::ActivationToken { id, .. } => ("token", *id),
+        NotificationEvent::Action { id, .. } => ("action", *id),
+        NotificationEvent::Replied { id, .. } => ("reply", *id),
+        NotificationEvent::Closed { id, .. } => ("closed", *id),
+    }
+}
+
+/// The client hands on the server's signals in the order the server sent them: the token
+/// before its action (the app raises its window with the token the action then uses), across
+/// the four signals, also when they come in a burst.
+async fn signal_order(bus: &PrivateBus) -> TestResult {
+    let server = step_ok(
+        "start the mock server",
+        MockNotifications::start(bus.address(), &PLASMA_CAPS),
+    )
+    .await?;
+    let client_bus = step_ok("connect the client's bus", bus.connect()).await?;
+    let client = step_ok(
+        "connect to the server",
+        NotificationClient::connect(&client_bus),
+    )
+    .await?;
+    let mut events = step_ok("subscribe to the signals", client.subscribe()).await?;
+    let mut sent = Vec::new();
+    for id in 1..=60u32 {
+        if id % 3 == 0 {
+            step_ok("the server sends a reply", server.reply(id, "r")).await?;
+            sent.push(("reply", id));
+        }
+        step_ok(
+            "the server invokes an action",
+            server.invoke(id, "default", Some("t")),
+        )
+        .await?;
+        sent.extend([("token", id), ("action", id)]);
+        if id % 4 == 0 {
+            step_ok("the server closes one", server.dismiss(id)).await?;
+            sent.push(("closed", id));
+        }
+    }
+    let mut got = Vec::with_capacity(sent.len());
+    for _ in 0..sent.len() {
+        got.push(kind_of(&next(&mut events, "the next signal").await?));
+    }
+    match sent.iter().zip(&got).position(|(s, g)| s != g) {
+        None => Ok(()),
+        Some(at) => Err(format!(
+            "signals out of order at {at} of {}: sent {:?}, got {:?}",
+            sent.len(),
+            &sent[at..sent.len().min(at + 4)],
+            &got[at..got.len().min(at + 4)]
+        )),
+    }
+}
+
 async fn plain_server(bus: &PrivateBus) -> TestResult {
-    let server = MockNotifications::start(bus.address(), &["body", "actions"])
-        .await
-        .map_err(err)?;
-    let client_bus = bus.connect().await.map_err(err)?;
-    let client = NotificationClient::connect(&client_bus)
-        .await
-        .map_err(err)?;
-    client.notify(&message(0)).await.map_err(err)?;
+    let server = step_ok(
+        "start the mock server",
+        MockNotifications::start(bus.address(), &["body", "actions"]),
+    )
+    .await?;
+    let client_bus = step_ok("connect the client's bus", bus.connect()).await?;
+    let client = step_ok(
+        "connect to the server",
+        NotificationClient::connect(&client_bus),
+    )
+    .await?;
+    step_ok("notify", client.notify(&message(0))).await?;
     let call = server
         .with_log(|l| l.calls.last().cloned())
         .ok_or("no call")?;
@@ -203,40 +292,44 @@ async fn plain_server(bus: &PrivateBus) -> TestResult {
 
 async fn single_instance(bus: &PrivateBus) -> TestResult {
     let name = "app.kourier.Kourier.test";
-    let first = bus.connect().await.map_err(err)?;
-    let mut primary = match instance::claim(first, name).await.map_err(err)? {
+    let first = step_ok("connect the first bus", bus.connect()).await?;
+    let mut primary = match step_ok("the first claim", instance::claim(first, name)).await? {
         Claim::Primary(p) => p,
         Claim::Secondary(_) => return Err("the first claim must win".into()),
     };
     let mut requests = primary.take_requests().ok_or("requests")?;
-    let second = bus.connect().await.map_err(err)?;
-    let second = match instance::claim(second, name).await.map_err(err)? {
+    let second = step_ok("connect the second bus", bus.connect()).await?;
+    let second = match step_ok("the second claim", instance::claim(second, name)).await? {
         Claim::Secondary(bus) => bus,
         Claim::Primary(_) => return Err("the second claim must lose".into()),
     };
-    instance::forward(
-        &second,
-        name,
-        &InstanceRequest::Activate {
-            token: Some("xdg-token".into()),
-        },
+    step_ok(
+        "forward Activate",
+        instance::forward(
+            &second,
+            name,
+            &InstanceRequest::Activate {
+                token: Some("xdg-token".into()),
+            },
+        ),
     )
-    .await
-    .map_err(err)?;
+    .await?;
     match next(&mut requests, "activate").await? {
         InstanceRequest::Activate { token } if token.as_deref() == Some("xdg-token") => {}
         other => return Err(format!("expected Activate, got {other:?}")),
     }
-    instance::forward(
-        &second,
-        name,
-        &InstanceRequest::Open {
-            uris: vec!["sgnl://signal.me/#p/+15550001".into()],
-            token: None,
-        },
+    step_ok(
+        "forward Open",
+        instance::forward(
+            &second,
+            name,
+            &InstanceRequest::Open {
+                uris: vec!["sgnl://signal.me/#p/+15550001".into()],
+                token: None,
+            },
+        ),
     )
-    .await
-    .map_err(err)?;
+    .await?;
     match next(&mut requests, "open").await? {
         InstanceRequest::Open { uris, token } if uris.len() == 1 && token.is_none() => {}
         other => return Err(format!("expected Open, got {other:?}")),
@@ -244,10 +337,15 @@ async fn single_instance(bus: &PrivateBus) -> TestResult {
     // The name is free again once the first instance is gone.
     drop(requests);
     drop(primary);
-    let third = bus.connect().await.map_err(err)?;
+    let third = step_ok("connect the third bus", bus.connect()).await?;
     let mut owned = false;
     for _ in 0..50 {
-        if let Claim::Primary(_) = instance::claim(third.clone(), name).await.map_err(err)? {
+        if let Claim::Primary(_) = step_ok(
+            "a claim after the release",
+            instance::claim(third.clone(), name),
+        )
+        .await?
+        {
             owned = true;
             break;
         }
@@ -271,50 +369,61 @@ async fn tray(bus: &PrivateBus) -> TestResult {
         ..TrayConfig::default()
     };
     // No watcher: no tray.
-    match Tray::spawn(config.clone(), tx.clone()).await {
+    match step(
+        "spawn without a watcher",
+        Tray::spawn(config.clone(), tx.clone()),
+    )
+    .await?
+    {
         Err(DesktopError::NoTray(_)) => {}
         Ok(_) => return Err("a tray without a watcher".into()),
         Err(e) => return Err(format!("expected NoTray, got {e}")),
     }
-    let watcher = MockWatcher::start(bus.address()).await.map_err(err)?;
-    let tray = Tray::spawn(config, tx).await.map_err(err)?;
+    let watcher = step_ok("start the mock watcher", MockWatcher::start(bus.address())).await?;
+    let tray = step_ok("spawn the tray", Tray::spawn(config, tx)).await?;
     let item = watcher
         .wait_for_item(WAIT)
         .await
         .ok_or("no item registered")?;
     let sni = "org.kde.StatusNotifierItem";
     check(
-        watcher.item_property(&item, "Status").await.map_err(err)? == "Active",
+        step_ok("read Status", watcher.item_property(&item, "Status")).await? == "Active",
         "status Active",
     )?;
     check(
-        watcher.item_property(&item, "Id").await.map_err(err)? == APP_ID,
+        step_ok("read Id", watcher.item_property(&item, "Id")).await? == APP_ID,
         "item id",
     )?;
-    tray.set_state(TrayState {
-        unread: 3,
-        tooltip: "3 unread".into(),
-    })
-    .await;
+    step(
+        "set the tray's state",
+        tray.set_state(TrayState {
+            unread: 3,
+            tooltip: "3 unread".into(),
+        }),
+    )
+    .await?;
     check(
-        watcher.item_property(&item, "Status").await.map_err(err)? == "NeedsAttention",
+        step_ok("read Status again", watcher.item_property(&item, "Status")).await?
+            == "NeedsAttention",
         "attention while unread",
     )?;
     // A click with an activation token.
-    watcher
-        .call_item(
+    step_ok(
+        "call ProvideXdgActivationToken",
+        watcher.call_item(
             &item,
             "/StatusNotifierItem",
             sni,
             "ProvideXdgActivationToken",
             &("tray-tok",),
-        )
-        .await
-        .map_err(err)?;
-    watcher
-        .call_item(&item, "/StatusNotifierItem", sni, "Activate", &(0i32, 0i32))
-        .await
-        .map_err(err)?;
+        ),
+    )
+    .await?;
+    step_ok(
+        "call Activate",
+        watcher.call_item(&item, "/StatusNotifierItem", sni, "Activate", &(0i32, 0i32)),
+    )
+    .await?;
     match next(&mut rx, "activate").await? {
         TrayEvent::Activate { token } if token.as_deref() == Some("tray-tok") => {}
         other => return Err(format!("expected Activate, got {other:?}")),
@@ -322,35 +431,37 @@ async fn tray(bus: &PrivateBus) -> TestResult {
     // Menu: Show (id 1), separator (2), Quit (3).
     let menu = "com.canonical.dbusmenu";
     let empty = OwnedValue::from(0i32);
-    watcher
-        .call_item(
+    step_ok(
+        "click Show",
+        watcher.call_item(
             &item,
             "/MenuBar",
             menu,
             "Event",
             &(1i32, "clicked", &empty, 0u32),
-        )
-        .await
-        .map_err(err)?;
+        ),
+    )
+    .await?;
     match next(&mut rx, "show").await? {
         TrayEvent::Show { token: None } => {}
         other => return Err(format!("expected Show, got {other:?}")),
     }
-    watcher
-        .call_item(
+    step_ok(
+        "click Quit",
+        watcher.call_item(
             &item,
             "/MenuBar",
             menu,
             "Event",
             &(3i32, "clicked", &empty, 0u32),
-        )
-        .await
-        .map_err(err)?;
+        ),
+    )
+    .await?;
     match next(&mut rx, "quit").await? {
         TrayEvent::Quit => {}
         other => return Err(format!("expected Quit, got {other:?}")),
     }
-    tray.shutdown().await;
+    step("shut the tray down", tray.shutdown()).await?;
     Ok(())
 }
 
@@ -402,8 +513,11 @@ fn main() {
     let filter: Option<String> = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with('-') && a != LISTED_AS);
-    let tests: [(&str, TestFn); 4] = [
+    let tests: [(&str, TestFn); 5] = [
         ("notifications", |b| Box::pin(notifications(b))),
+        ("notification_signals_in_order", |b| {
+            Box::pin(signal_order(b))
+        }),
         ("notifications_plain_server", |b| Box::pin(plain_server(b))),
         ("single_instance", |b| Box::pin(single_instance(b))),
         ("tray", |b| Box::pin(tray(b))),

@@ -77,6 +77,9 @@ pub enum FailReason {
     Unsupported,
     /// The account was logged out.
     LoggedOut,
+    /// The network refused the message because its recipient has not written to this account
+    /// (WhatsApp's 463). Never retried by Kourier: [`ErrorKind::ReachOutRefused`].
+    ReachOutRefused,
     /// Anything else; log-safe detail.
     Other(String),
 }
@@ -92,9 +95,12 @@ impl From<&ErrorKind> for FailReason {
             ErrorKind::UntrustedIdentity { .. } => Self::UntrustedIdentity,
             ErrorKind::TooLarge => Self::TooLarge,
             ErrorKind::Unsupported => Self::Unsupported,
+            ErrorKind::ReachOutRefused => Self::ReachOutRefused,
+            ErrorKind::TooManyDevices { .. } => Self::Other("too many devices".into()),
             ErrorKind::InvalidInput => Self::Other("invalid input".into()),
             ErrorKind::Expired => Self::Other("expired".into()),
             ErrorKind::AlreadyAdded { .. } => Self::Other("already added".into()),
+            ErrorKind::NotTheExpectedAccount => Self::Other("not the expected account".into()),
             ErrorKind::Internal => Self::Other("internal error".into()),
         }
     }
@@ -155,6 +161,14 @@ impl RecipientState {
 /// the phases come again. Counts only, log-safe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendPhase {
+    /// Getting the files ready before the first byte goes up: the pictures are re-encoded (and
+    /// a recent upload looked up), so that every file's size, and with it the share, is known
+    /// before the first byte (upload progress, fix U3). A backend that prepares its files first
+    /// reports it from the start of the attempt until the preparation is done (the per-file
+    /// reports at 0 and [`Self::Uploading`] follow); one that does not may skip it. The core
+    /// counts a report of it as "an upload of this message is reported": the stop (the X) is
+    /// offered from then on, and a backend that reports it must be able to stop in this phase.
+    Preparing,
     /// Uploading the attachments (the share is `TransmitProgress::progress`).
     Uploading,
     /// Fetching the group's current state before sending.

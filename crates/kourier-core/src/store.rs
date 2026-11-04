@@ -31,6 +31,17 @@ pub const MIGRATIONS: Migrations = Migrations::new(
         migration!(12, "0012_unread_history"),
         migration!(13, "0013_attachment_requests"),
         migration!(14, "0014_merge_indexes"),
+        migration!(15, "0015_quiet_notices"),
+        migration!(16, "0016_message_key_author"),
+        migration!(17, "0017_outbox_cancel"),
+        migration!(18, "0018_people"),
+        migration!(19, "0019_group_page"),
+        migration!(20, "0020_chat_media"),
+        migration!(21, "0021_verified_notice"),
+        // (S-P, protected chats; the number is final, the next step takes 23.)
+        migration!(22, "0022_protected_chats"),
+        // (KT-2, cloud ids and read positions; the number is settled at the landing.)
+        migration!(23, "0023_cloud_ids"),
     ],
 );
 

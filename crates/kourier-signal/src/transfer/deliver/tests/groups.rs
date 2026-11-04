@@ -51,6 +51,7 @@ fn stage_of_groups(dir: &std::path::Path, groups: &[(StagedGroup, ChatFrame, boo
         profile_name: None,
         system_name: None,
         nickname: None,
+        system_nickname_only: false,
     };
     writer.contact(0, &contact).unwrap();
     let mut counters = Vec::new();

@@ -51,6 +51,7 @@ fn stage(dir: &std::path::Path, sizes: &[u64], len: usize) -> Recorded {
             profile_name: None,
             system_name: None,
             nickname: None,
+            system_nickname_only: false,
         };
         writer.contact(i, &contact).unwrap();
         let chat = StagedChat::direct(i);
@@ -634,3 +635,40 @@ mod frames;
 mod groups;
 /// Probes of the independent review of step S2.
 mod review;
+
+/// P1 F5: the archive's address-book NICKNAME alone does not make a system contact for the
+/// number rule (Desktop's `isInSystemContacts`); a given or family name does.
+#[test]
+fn an_address_book_nickname_alone_is_no_system_contact_in_the_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = reading_db(dir.path());
+    let contact = |i: u32, nickname_only: bool| StagedContact {
+        user: peer(i),
+        aci: Some(uuid::Uuid::from_u128(u128::from(i))),
+        pni: None,
+        e164: Some(format!("+1555010{i:04}")),
+        profile_key: Some([0x45; 32]),
+        profile_sharing: true,
+        blocked: false,
+        hidden: false,
+        unregistered_at: None,
+        profile_name: None,
+        system_name: Some("Name".to_owned()),
+        system_nickname_only: nickname_only,
+        nickname: None,
+    };
+    let shown = |event: BackendEvent| match event {
+        BackendEvent::ContactUpsert(patch) => patch.number_shown,
+        other => panic!("{other:?}"),
+    };
+    let events = db
+        .zone(|tx| -> crate::error::Result<_> {
+            Ok((
+                contact_event(tx, &contact(1, true), NOW)?,
+                contact_event(tx, &contact(2, false), NOW)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(shown(events.0), Some(false), "a nickname alone: hidden");
+    assert_eq!(shown(events.1), Some(true), "a given or family name: shown");
+}

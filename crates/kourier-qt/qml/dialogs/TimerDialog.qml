@@ -21,6 +21,9 @@ Kirigami.Dialog {
     property int step: 1
     // The timer that is set now (0 = off): where the fields start.
     property int current: 0
+    // The conversation the time is for when it is not the open one (a page of the details panel
+    // names its own chat); 0: the open conversation.
+    property real conversation: 0
 
     readonly property var units: {
         const all = [
@@ -103,7 +106,11 @@ Kirigami.Dialog {
         if (!root.valid) {
             return;
         }
-        App.setTimer(root.seconds);
+        if (root.conversation > 0) {
+            App.setTimerOf(root.conversation, root.seconds);
+        } else {
+            App.setTimer(root.seconds);
+        }
         root.close();
     }
 

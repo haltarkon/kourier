@@ -57,6 +57,12 @@ pub enum CoreError {
     /// The blob store (encrypted attachment files) failed.
     #[error("attachment file: {0}")]
     Blob(#[from] kourier_blob::BlobError),
+    /// Saving a copy of an attachment into the user's folder failed
+    /// ([`UiCommand::SaveAttachment`](crate::facade::UiCommand::SaveAttachment)): the
+    /// writer's typed answer, which the UI words (the name is taken, the folder is not
+    /// writable, the disk is full).
+    #[error("saving a copy: {0}")]
+    Save(#[from] kourier_blob::SaveError),
     /// A link brought an identity that another account of this profile already has (the
     /// same primary own id, on the same network): two devices of one account in one profile
     /// would show every chat twice. `logged_out`: that account is logged out.
@@ -127,6 +133,14 @@ pub enum Refusal {
     /// The message, the attachment or the quoted message is not there (any more): deleted
     /// for good, expired, or never in this conversation.
     Gone,
+    /// "Send Again" of a message the network refused because its recipient has not written to
+    /// this account ([`kourier_model::FailReason::ReachOutRefused`]): a second try is one more
+    /// reach-out, which counts against the account. The message can only be taken back.
+    ReachOutRefused,
+    /// The account's network holds back what the user sends for now ([`kourier_model::AccountHold`])
+    /// and this action would be one more message to it (a change of the disappearing-message
+    /// timer is a message of its own on some networks): refused until the hold ends.
+    Held,
 }
 
 impl CoreError {

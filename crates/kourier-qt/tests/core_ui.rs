@@ -149,6 +149,13 @@ Item {
                 return;
             case "qr":
                 if (App.login.kind === "failed") return fail(App.login.error);
+                // The page's data from the viewmodel (K-A): a network with one way of linking
+                // offers no other, has no numbered steps of its own and names its icon.
+                if (App.login.kind === "qr" && (App.login.flow !== "qr" || App.login.otherFlow !== ""
+                        || App.login.otherFlowLabel !== "" || App.login.steps.length !== 0
+                        || App.login.explain !== "" || App.login.icon !== "fake"))
+                    return fail("the QR step's page data: flow '" + App.login.flow + "', other '" + App.login.otherFlow
+                        + "', steps " + App.login.steps.length + ", icon '" + App.login.icon + "'");
                 if (App.login.kind !== "done") return;
                 if (test.codeCount < 2) return fail("QR codes rotate: saw " + test.codeCount);
                 test.step = "list";

@@ -4,16 +4,17 @@
 //! fake clock, rebuilding a deleted `core.db`, durable read commands, roaming changes, the
 //! catch-up summary, and the per-network scripts end to end.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, Clock, StartMode};
-use kourier_core::facade::{UiCommand, UiEvent};
+use kourier_core::facade::{ActionSubject, UiCommand, UiEvent};
 use kourier_core::testing::{DumpMode, IngestHarness};
 use kourier_fake::{Flavor, LoginScript, Script, Step, scripts};
 use kourier_model::{
-    AccountState, ConnState, ConversationChange, LoginStepKind, NetworkKind, Redacted, UserId,
+    AccountId, AccountState, ConnState, ConversationChange, LoginStepKind, NetworkKind, Redacted,
+    UserId,
 };
 use support::{Env, WAIT, add_linked, eventually};
 
@@ -40,6 +41,12 @@ fn small_script(name: &str) -> Script {
             scripts::T0 + 2000,
             "second",
         ))])
+}
+
+/// [`small_script`] whose account also states that its network writes roaming settings (A10a):
+/// the core refuses an archive, a pin, a mute or a mark of an account that does not state it on.
+fn roaming_script(name: &str) -> Script {
+    small_script(name).deliver(vec![support::send::roaming_caps(true)])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -460,7 +467,15 @@ async fn a_failed_shred_keeps_the_removal_pending_until_the_next_start() {
     })
     .await;
     assert!(env.accounts().await.is_empty());
-    assert!(!env.account_dir(uuid).exists());
+    // The row goes in its zone and the directory after it (the same order as in
+    // `remove_unlink.rs`, `dir_is_gone`): wait for the directory, never assert at once (the
+    // quick ci run of 2026-10-14 failed here, 0.05 s into the test).
+    let dir = env.account_dir(uuid);
+    eventually("the account directory is removed", WAIT, || {
+        let dir = dir.clone();
+        async move { !dir.exists() }
+    })
+    .await;
     env.stop().await;
 }
 
@@ -915,10 +930,53 @@ async fn mark_read_queues_a_durable_command_until_the_backend_persists_it() {
     env.stop().await;
 }
 
+/// The screenshot hold "read" (strike 2 of the open-chat flake, 2026-10-27): a `MarkRead`
+/// counts in `reads_in_flight` from its send until the core has emitted what the reading
+/// changed, so a grab that waits for no read in flight and no event unseen never catches the
+/// open chat still unread. A read that fails (an unknown chat) is counted down too, or a page
+/// would wait for it until its 30 s cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_is_in_flight_until_its_events_are_out() {
+    let mut env = Env::new(Flavor::SignalLike, small_script("read")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
+    assert_eq!(env.conversations().await[0].unread, 2);
+    assert_eq!(env.handle.reads_in_flight(), 0);
+    let mut events = env.handle.subscribe();
+    env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+    let handle = &env.handle;
+    eventually("the read finished", WAIT, || async move {
+        handle.reads_in_flight() == 0
+    })
+    .await;
+    // Not awaited: the events are out by the time the count is down.
+    let mut told = false;
+    while let Ok(e) = events.try_recv() {
+        told |= matches!(&e, UiEvent::ConversationsChanged { ids } if ids.contains(&conv));
+    }
+    assert!(
+        told,
+        "the reading's events went out before the count went down"
+    );
+    assert_eq!(env.conversations().await[0].unread, 0);
+    env.handle
+        .send(UiCommand::MarkRead {
+            conv: kourier_model::ConversationId(9_999_999),
+        })
+        .expect("send");
+    eventually("a failed read is counted down", WAIT, || async move {
+        handle.reads_in_flight() == 0
+    })
+    .await;
+    env.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roaming_changes_are_confirmed_by_events_or_rejected() {
     // Signal-like: accepted, confirmed through a ConversationUpsert from the backend.
-    let mut env = Env::new(Flavor::SignalLike, small_script("archive")).await;
+    let mut env = Env::new(Flavor::SignalLike, roaming_script("archive")).await;
     env.handle.send(UiCommand::UiReady).expect("send");
     let account = add_linked(&mut env).await;
     env.wait_finished(account).await;
@@ -943,7 +1001,11 @@ async fn roaming_changes_are_confirmed_by_events_or_rejected() {
     // Threema-like: the transaction is rejected; nothing changes.
     let mut env = Env::new(
         Flavor::ThreemaLike,
-        scripts::threema_like().expect("script"),
+        // (the transaction is refused by the network: the account states that it writes roaming
+        // settings, or the core would refuse the click first)
+        scripts::threema_like()
+            .expect("script")
+            .deliver(vec![support::send::roaming_caps(true)]),
     )
     .await;
     env.handle.send(UiCommand::UiReady).expect("send");
@@ -968,12 +1030,138 @@ async fn roaming_changes_are_confirmed_by_events_or_rejected() {
     env.stop().await;
 }
 
+/// A10a: the switch for writing roaming settings is handed to the account's backend (a fake that states
+/// no roaming flag, `roaming_writes: None`, refuses it), and a refusal comes back as `ActionFailed { action:
+/// "SetRoamingWrites" }` about no subject; an account the core does not know fails the same way and nothing
+/// else happens. The core keeps no copy of the switch. Mutant: the arm sends nothing to the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_roaming_switch_reaches_the_backend_and_a_refusal_is_told() {
+    let script = small_script("roaming-switch").with_roaming_writes(None);
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    env.handle
+        .send(UiCommand::SetRoamingWrites { account, on: true })
+        .expect("send");
+    let failed = env
+        .event("ActionFailed", |e| match e {
+            UiEvent::ActionFailed {
+                action,
+                error,
+                subject,
+                account: from,
+            } if *action == "SetRoamingWrites" => Some((*from, error.to_string(), subject.clone())),
+            _ => None,
+        })
+        .await;
+    assert_eq!(failed.0, Some(account));
+    assert!(
+        failed.1.contains("not scripted"),
+        "the backend's refusal: {}",
+        failed.1
+    );
+    assert_eq!(failed.2, ActionSubject::None);
+
+    env.handle
+        .send(UiCommand::SetRoamingWrites {
+            account: AccountId(9_999),
+            on: false,
+        })
+        .expect("send");
+    let unknown = env
+        .event("ActionFailed", |e| match e {
+            UiEvent::ActionFailed {
+                action,
+                account: from,
+                ..
+            } if *action == "SetRoamingWrites" && *from == Some(AccountId(9_999)) => Some(()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(unknown, ());
+    env.stop().await;
+}
+
+/// N4: the fake plays the account's switch. It states the flag OFF (`Script::roaming_writes`), so the core's
+/// account row says off and refuses a click on a chat; `SetRoamingWrites` turns the fake's flag on, the fake
+/// states its caps again and the row follows; the click is then taken. Off again: refused again. The core
+/// keeps no copy of the switch (the row is what the network last stated). Mutant: the fake does not state
+/// the caps again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_roaming_switch_turns_the_flag_the_network_states() {
+    let script = small_script("switch-plays").with_roaming_writes(Some(false));
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
+    async fn flag(env: &Env, account: AccountId) -> Option<bool> {
+        env.account(account).await.expect("account").roaming_writes
+    }
+    async fn refused(env: &mut Env) {
+        env.event("a refused ChangeConversation", |e| {
+            matches!(
+                e,
+                UiEvent::ActionFailed {
+                    action: "ChangeConversation",
+                    ..
+                }
+            )
+            .then_some(())
+        })
+        .await;
+    }
+    let env_ref = &env;
+    eventually("the fake states the switch off", WAIT, || async move {
+        flag(env_ref, account).await == Some(false)
+    })
+    .await;
+    let archive = |archived| UiCommand::ChangeConversation {
+        conv,
+        change: ConversationChange::SetArchived { archived },
+    };
+    env.handle.send(archive(true)).expect("send");
+    refused(&mut env).await;
+
+    env.handle
+        .send(UiCommand::SetRoamingWrites { account, on: true })
+        .expect("send");
+    let env_ref = &env;
+    eventually("the account's flag is on", WAIT, || async move {
+        flag(env_ref, account).await == Some(true)
+    })
+    .await;
+    env.handle.send(archive(true)).expect("send");
+    let env_ref = &env;
+    eventually("archived", WAIT, || async move {
+        env_ref
+            .conversations()
+            .await
+            .iter()
+            .any(|c| c.id == conv && c.archived)
+    })
+    .await;
+
+    env.handle
+        .send(UiCommand::SetRoamingWrites { account, on: false })
+        .expect("send");
+    let env_ref = &env;
+    eventually("the account's flag is off again", WAIT, || async move {
+        flag(env_ref, account).await == Some(false)
+    })
+    .await;
+    env.handle.send(archive(false)).expect("send");
+    refused(&mut env).await;
+    env.stop().await;
+}
+
 /// A chat another device marked unread is read when the user reads it: the mark goes with the
 /// unread messages, and again when only the mark was there; the network is told each time
 /// (Signal Desktop clears the mark when a chat is read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reading_a_chat_clears_the_mark_of_another_device() {
-    let mut env = Env::new(Flavor::SignalLike, small_script("marked")).await;
+    let mut env = Env::new(Flavor::SignalLike, roaming_script("marked")).await;
     env.handle.send(UiCommand::UiReady).expect("send");
     let account = add_linked(&mut env).await;
     env.wait_finished(account).await;
@@ -1000,6 +1188,22 @@ async fn reading_a_chat_clears_the_mark_of_another_device() {
         .await;
     };
 
+    let uuid = env.account(account).await.expect("account").uuid;
+    // How many roaming changes the network has heard (the mark and its clearing each count; the
+    // account states the flag, so the clearing is the durable `ChangeConversationDurable`).
+    let told = |n: usize, what: &'static str| async move {
+        eventually(what, WAIT, || async move {
+            env_ref
+                .control
+                .commands(uuid)
+                .iter()
+                .filter(|c| c.starts_with("ChangeConversation"))
+                .count()
+                == n
+        })
+        .await;
+    };
+
     // With unread messages.
     mark(&env);
     marked(true, "marked unread").await;
@@ -1007,6 +1211,11 @@ async fn reading_a_chat_clears_the_mark_of_another_device() {
     env.handle.send(UiCommand::MarkRead { conv }).expect("send");
     marked(false, "the mark goes with the unread messages").await;
     assert_eq!(env.conversations().await[0].unread, 0);
+    // The row changes first and the network is told after it, from the same task. A second mark
+    // sent as soon as the row shows the clearing can reach the network before the clearing does;
+    // the network confirms in the order it hears, so it would end on `false` and the chat would
+    // never show the new mark. A user's two clicks are never so close; the test waits for the clearing.
+    told(2, "the network heard the first mark and its clearing").await;
 
     // Only the mark.
     mark(&env);
@@ -1015,18 +1224,418 @@ async fn reading_a_chat_clears_the_mark_of_another_device() {
     marked(false, "the mark alone goes too").await;
 
     // The network heard the two marks and the two times the mark was cleared.
+    told(4, "the network is told").await;
+    env.stop().await;
+}
+
+/// R1 (t3 11e): the network hears the changes of one conversation in the order the UI asked for
+/// them. The chat is read (the clearing of the mark another device set is told to the network
+/// from a task of its own, after the row changed) and the user marks it unread again with no
+/// pause: the second mark must not reach the network before the clearing. The network
+/// applies what it hears in the order it hears it, so it would end on the clearing: the phone
+/// unmarked while this side shows the mark. Without the order, the second command's task (a
+/// read of the conversation, then the telling) is quicker than the first's (a write of the
+/// row, then the telling) in nearly every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_set_right_after_reading_is_the_last_word_the_network_hears() {
+    let mut env = Env::new(Flavor::SignalLike, roaming_script("marked")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
+    let mark = |env: &Env| {
+        env.handle
+            .send(UiCommand::ChangeConversation {
+                conv,
+                change: ConversationChange::SetMarkedUnread {
+                    marked_unread: true,
+                },
+            })
+            .expect("send");
+    };
+    let env_ref = &env;
+    let marked = |want: bool, what: &'static str| async move {
+        eventually(what, WAIT, || async move {
+            env_ref
+                .conversations()
+                .await
+                .iter()
+                .any(|c| c.id == conv && c.marked_unread == want)
+        })
+        .await;
+    };
+    let uuid = env.account(account).await.expect("account").uuid;
+    let told = |n: usize, what: &'static str| async move {
+        eventually(what, WAIT, || async move {
+            env_ref
+                .control
+                .commands(uuid)
+                .iter()
+                .filter(|c| c.starts_with("ChangeConversation"))
+                .count()
+                == n
+        })
+        .await;
+    };
+
+    // The mark of another device, then twice: read the chat and mark it again at once.
+    mark(&env);
+    marked(true, "marked unread").await;
+    told(1, "the network heard the first mark").await;
+    for round in 1..=2 {
+        env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+        mark(&env);
+        told(
+            1 + 2 * round,
+            "the network heard the clearing and the new mark",
+        )
+        .await;
+        // Settled: the fake confirmed both, in the order it heard them.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        marked(true, "the new mark is the last word").await;
+    }
+    // The order the network heard them in, the plain mark and the durable clearing alike: the
+    // mark of the other device, then per round the clearing and the new mark.
+    let heard: Vec<&str> = env
+        .control
+        .commands(uuid)
+        .into_iter()
+        .filter(|c| c.starts_with("ChangeConversation"))
+        .collect();
+    assert_eq!(
+        heard,
+        [
+            "ChangeConversation",
+            "ChangeConversationDurable",
+            "ChangeConversation",
+            "ChangeConversationDurable",
+            "ChangeConversation",
+        ]
+    );
+    env.stop().await;
+}
+
+/// `small_script` whose chat takes disappearing timers (a timer change is the slow change: it
+/// allocates the id of its own update before it is told to the network).
+fn script_with_timers(name: &str) -> Script {
+    let alice = uid("aci:00000000-0000-4000-8000-0000000a11ce");
+    let mut patch = kourier_model::ConversationPatch::new(kourier_model::ConvKey::Direct(alice));
+    patch.features = Some(scripts::signal_features(false));
+    roaming_script(name).deliver(vec![BackendEvent::ConversationUpsert(patch)])
+}
+
+/// R1 fix (review MEDIUM-1): the order of what the UI changed in one conversation holds
+/// across a command between two changes that tells the network nothing. Such a command used to
+/// release the turn after it at once, so a quick change behind it passed a slow one before it.
+/// The slow change comes first (a timer: reads, an allocation, then the telling), then the
+/// command in between, then the quick one (a mute: one read, then the telling); the network
+/// must hear the two in that order, round after round. In the odd rounds the command in
+/// between is a reading (the first round reads a chat with unread messages, the others one
+/// that has none and no mark to clear), in the even rounds a timer the chat refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_between_two_changes_does_not_let_the_second_pass_the_first() {
+    let mut env = Env::new(Flavor::SignalLike, script_with_timers("between")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
     let uuid = env.account(account).await.expect("account").uuid;
     let env_ref = &env;
-    eventually("the network is told", WAIT, || async move {
-        env_ref
-            .control
+    let mut expected = Vec::new();
+    for round in 1..=8u64 {
+        let timer = Duration::from_secs(300 + round * 60);
+        let until = 5_000_000_000_000 + round as i64;
+        env.handle
+            .send(UiCommand::SetConversationTimer {
+                conv,
+                timer: Some(timer),
+            })
+            .expect("send");
+        if round % 2 == 1 {
+            env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+        } else {
+            // Longer than the range the chat states: refused, nothing reaches the network.
+            env.handle
+                .send(UiCommand::SetConversationTimer {
+                    conv,
+                    timer: Some(Duration::from_secs(u64::from(scripts::TIMER_MAX_SECS) + 1)),
+                })
+                .expect("send");
+        }
+        env.handle
+            .send(UiCommand::ChangeConversation {
+                conv,
+                change: ConversationChange::SetMuted { until: Some(until) },
+            })
+            .expect("send");
+        expected.push(ConversationChange::SetTimer { timer: Some(timer) });
+        expected.push(ConversationChange::SetMuted { until: Some(until) });
+        let n = expected.len();
+        eventually("the network heard both changes", WAIT, || async move {
+            env_ref.control.changes(uuid).len() >= n
+        })
+        .await;
+        assert_eq!(
+            env.control.changes(uuid),
+            expected,
+            "round {round} ({}): the network heard the changes out of the UI's order",
+            if round % 2 == 1 {
+                "reading"
+            } else {
+                "refused timer"
+            }
+        );
+    }
+    env.stop().await;
+}
+
+/// R1 fix (review LOW-1): a mark the UI sets and a reading right behind it end UNMARKED, and the
+/// network hears the mark and then the clearing. The row turns marked only when the backend's
+/// echo of the mark is ingested; the reading used to look at the row first, find no mark and
+/// tell the network nothing, so the echo then marked the chat that was open and read. Round 1
+/// reads a chat with unread messages, round 2 one that has none (only the mark was there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mark_and_a_reading_right_behind_it_end_unmarked() {
+    let mut env = Env::new(Flavor::SignalLike, roaming_script("mark-then-read")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
+    let uuid = env.account(account).await.expect("account").uuid;
+    let env_ref = &env;
+    let mark = |on: bool| ConversationChange::SetMarkedUnread { marked_unread: on };
+    // (The account states the flag, so the clearing is the durable command: the plain changes the
+    // network hears are the marks, and the order of the two forms is that of `commands`.)
+    let heard = |env: &Env| -> Vec<&'static str> {
+        env.control
             .commands(uuid)
-            .iter()
-            .filter(|c| **c == "ChangeConversation")
-            .count()
-            == 4
+            .into_iter()
+            .filter(|c| c.starts_with("ChangeConversation"))
+            .collect()
+    };
+    let mut expected = Vec::new();
+    for round in 1..=2usize {
+        env.handle
+            .send(UiCommand::ChangeConversation {
+                conv,
+                change: mark(true),
+            })
+            .expect("send");
+        env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+        expected.push("ChangeConversation");
+        expected.push("ChangeConversationDurable");
+        let n = expected.len();
+        eventually(
+            "the network heard the mark and the clearing",
+            WAIT,
+            || async move {
+                env_ref
+                    .control
+                    .commands(uuid)
+                    .iter()
+                    .filter(|c| c.starts_with("ChangeConversation"))
+                    .count()
+                    >= n
+            },
+        )
+        .await;
+        assert_eq!(
+            heard(&env),
+            expected,
+            "round {round}: the mark and then the clearing"
+        );
+        assert_eq!(env.control.changes(uuid), vec![mark(true); round]);
+        // Settled: the fake confirmed both in the order it heard them (and applied the durable
+        // clearing, N4: its echo of the clearing follows its echo of the mark). The chat is read
+        // and unmarked.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rows = env.conversations().await;
+        let row = rows.iter().find(|c| c.id == conv).expect("the chat");
+        assert_eq!(row.unread, 0, "round {round}: the chat is read");
+        assert!(!row.marked_unread, "round {round}: and unmarked");
+    }
+    env.stop().await;
+}
+
+/// F5 (A10a review): a mark the backend ACCEPTED stays counted for the reading behind it until
+/// the reading takes it, also when the reading comes after the backend's answer but BEFORE the
+/// echo of the mark is ingested (the forwarder's batch, a busy ingest lane). The fake's echo is
+/// held back (`Script::forward_delay` waits on the ACCOUNT clock, which the test owns): mark ->
+/// the fake has it and has answered `Ok` -> `MarkRead` -> the durable clear reaches the backend
+/// (the row shows no mark yet, so only the counted mark can have asked for it) -> the clock lets
+/// the echoes through -> the row ends read and unmarked.
+/// Mutant: the ticket is not marked as sent (`mark.sent()` removed): the mark is forgotten when
+/// the backend answers, the reading finds no mark, sends no clear, and the echo then marks the
+/// chat the user has open and read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reading_between_the_answer_and_the_echo_of_a_mark_clears_it() {
+    let mut script = roaming_script("echo-held");
+    script.forward_delay = Some(Duration::from_secs(5));
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = support::add_account(&mut env).await;
+    // Every forwarded batch waits on the clock: drive it until both messages are in.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let conv = loop {
+        let stated = env
+            .account(account)
+            .await
+            .is_some_and(|a| a.roaming_writes == Some(true));
+        let convs = env.conversations().await;
+        // (both messages are in: the fake's own statement comes with the first delivery)
+        if stated
+            && let Some(c) = convs.first()
+            && env.timeline(c.id).await.len() == 2
+        {
+            break c.id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "slow forwarding stalled"
+        );
+        if env.clock.sleepers() > 0 {
+            env.clock.advance_to_next();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let uuid = env.account(account).await.expect("account").uuid;
+    let env_ref = &env;
+
+    // From here the clock stands still: the echo of anything the fake does is held back.
+    let mark = ConversationChange::SetMarkedUnread {
+        marked_unread: true,
+    };
+    env.handle
+        .send(UiCommand::ChangeConversation {
+            conv,
+            change: mark.clone(),
+        })
+        .expect("send");
+    eventually("the fake took the mark", WAIT, || {
+        let want = vec![mark.clone()];
+        async move { env_ref.control.changes(uuid) == want }
     })
     .await;
+    // (the fake answers `Ok` right behind taking it; the core's task then returns)
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !env.conversations().await[0].marked_unread,
+        "the echo is held back: the row shows no mark"
+    );
+
+    env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+    eventually(
+        "the durable clear reached the backend",
+        WAIT,
+        || async move {
+            env_ref.control.durable_commands(uuid).iter().any(|c| {
+                matches!(
+                    c,
+                    kourier_backend_api::DurableCommand::ChangeConversation { .. }
+                )
+            })
+        },
+    )
+    .await;
+
+    // Let the echoes through, in order: the mark's, then the clear's. At least 3 s of driving
+    // the clock, then on (up to WAIT) while the row still shows the mark: under load the
+    // clear's echo can come well after the mark's.
+    let start = tokio::time::Instant::now();
+    loop {
+        if env.clock.sleepers() > 0 {
+            env.clock.advance_to_next();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let elapsed = start.elapsed();
+        if elapsed >= WAIT
+            || (elapsed >= Duration::from_secs(3)
+                && env
+                    .conversations()
+                    .await
+                    .iter()
+                    .any(|c| c.id == conv && !c.marked_unread && c.unread == 0))
+        {
+            break;
+        }
+    }
+    let rows = env.conversations().await;
+    let row = rows.iter().find(|c| c.id == conv).expect("the chat");
+    assert!(
+        !row.marked_unread && row.unread == 0,
+        "the chat ends read and unmarked: marked {} unread {} heard {:?} durable {:?}",
+        row.marked_unread,
+        row.unread,
+        env.control.changes(uuid),
+        env.control.commands(uuid)
+    );
+    env.stop().await;
+}
+
+/// N-D (A10a): a mark the backend REFUSED is forgotten. The UI's mark is counted for the reading
+/// behind it because the row turns marked only when the backend's echo is ingested; if the
+/// backend refuses the mark no echo ever comes, and the next reading must not tell the network
+/// "unmarked" for a mark it never took. The fake refuses every change here
+/// (`Script::reject_changes`): the mark is refused (`ActionFailed`), then the chat is read, then
+/// a mute is sent. The network hears the changes in the UI's order, so when the mute has
+/// arrived anything the reading told came before it: the mark and the mute, nothing between.
+/// Mutant: the refusal keeps the mark (the reading then clears it: mark, clearing, mute).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_mark_is_forgotten() {
+    let mut script = roaming_script("refused-mark");
+    script.reject_changes = true;
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let account = add_linked(&mut env).await;
+    env.wait_finished(account).await;
+    let conv = env.conversations().await[0].id;
+    let uuid = env.account(account).await.expect("account").uuid;
+    let mark = ConversationChange::SetMarkedUnread {
+        marked_unread: true,
+    };
+    env.handle
+        .send(UiCommand::ChangeConversation {
+            conv,
+            change: mark.clone(),
+        })
+        .expect("send");
+    env.event("the refusal of the mark", |e| match e {
+        UiEvent::ActionFailed { action, .. } if *action == "ChangeConversation" => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        !env.conversations().await[0].marked_unread,
+        "a refused mark never marks the row"
+    );
+
+    env.handle.send(UiCommand::MarkRead { conv }).expect("send");
+    let mute = ConversationChange::SetMuted {
+        until: Some(5_000_000_000_000),
+    };
+    env.handle
+        .send(UiCommand::ChangeConversation {
+            conv,
+            change: mute.clone(),
+        })
+        .expect("send");
+    let env_ref = &env;
+    eventually("the network heard the mute", WAIT, || async move {
+        env_ref.control.changes(uuid).len() >= 2
+    })
+    .await;
+    // Settled: nothing the reading told is still on its way (it comes before the mute).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(env.control.changes(uuid), vec![mark, mute]);
+    // (The account states the flag, so a clearing would be the durable command: it was not sent.)
+    assert!(
+        !env.control.durable_commands(uuid).iter().any(|c| matches!(
+            c,
+            kourier_backend_api::DurableCommand::ChangeConversation { .. }
+        )),
+        "the reading did not tell \"unmarked\" for a mark the network refused"
+    );
+    assert_eq!(env.conversations().await[0].unread, 0, "the chat is read");
     env.stop().await;
 }
 

@@ -19,8 +19,8 @@ use std::sync::Arc;
 use kourier_backend_api::BackendEvent;
 use kourier_db::rusqlite::{OptionalExtension, params};
 use kourier_model::{
-    Body, ConvKey, ConversationFeatures, MemberRole, MessageId, MsgIdScope, MsgTarget, ReadState,
-    ReceiptKind, RecipientState, TargetAuthor, Text, UserId,
+    Body, ConvKey, ConversationFeatures, ConversationId, MemberRole, MessageId, MsgIdScope,
+    MsgTarget, ReadState, ReceiptKind, RecipientState, TargetAuthor, Text, UserId,
 };
 
 use super::message::{MsgRow, recipient_rank};
@@ -42,6 +42,61 @@ const MAX_CHAIN: u8 = 16;
 /// bytes), so nothing a client sends as a reaction is cut off; it keeps a peer from storing an
 /// arbitrarily long text in every reaction row and showing it in the reaction chips.
 pub(crate) const MAX_EMOJI_BYTES: usize = 64;
+
+/// SQL: the time of the removal with no emoji of user `?2` on message `?1` (the row of the empty
+/// emoji, a primary-key look-up). See [`Apply::merge_reaction`].
+pub(crate) const REMOVAL_ALL_AT: &str =
+    "SELECT at FROM reactions WHERE message_id = ?1 AND user_id = ?2 AND emoji = ''";
+/// SQL: stores that removal (`?3` its time); the later removal stands.
+pub(crate) const REMOVAL_ALL_STORE: &str =
+    "INSERT INTO reactions(message_id, user_id, emoji, at, removed)
+ VALUES (?1, ?2, '', ?3, 1)
+ ON CONFLICT(message_id, user_id, emoji) DO UPDATE SET at = excluded.at
+ WHERE excluded.at > reactions.at";
+/// SQL: how many reactions of the user on the message a removal at `?3` takes away from view.
+pub(crate) const REMOVAL_ALL_COUNT: &str = "SELECT count(*) FROM reactions
+ WHERE message_id = ?1 AND user_id = ?2 AND emoji <> '' AND removed = 0 AND at <= ?3";
+/// SQL: takes them away: each row becomes a removal at the removal's time (a removal that is
+/// already newer, or as new, is left; one with an older time moves up, so the rows end the same
+/// in any order of arrival).
+pub(crate) const REMOVAL_ALL_SWEEP: &str = "UPDATE reactions SET at = ?3, removed = 1
+ WHERE message_id = ?1 AND user_id = ?2 AND emoji <> '' AND at <= ?3 AND (at < ?3 OR removed = 0)";
+
+/// SQL: the message the reference `(?2, ?3)` of account `?1` points at under `AccountAuthor`: its
+/// key, the key of one of its revisions, and for an own reference an id it had before the server
+/// named it (KT-2: `?2 = ''` keeps a non-own reference from paying for that arm).
+pub(crate) const RESOLVE_BY_AUTHOR: &str = "SELECT id FROM messages WHERE account_id = ?1
+   AND net_author = ?2 AND net_local = ?3 AND net_scope = 0
+ UNION ALL
+ SELECT message_id FROM message_revisions WHERE account_id = ?1
+   AND net_local = ?3 AND net_author = ?2
+ UNION ALL
+ SELECT message_id FROM message_aliases WHERE account_id = ?1
+   AND net_local = ?3 AND ?2 = ''
+ LIMIT 1";
+
+/// SQL: the messages (with their authors) the id `?2` of account `?1` can point at, in the
+/// conversation `?3` when one is bound: their key, a revision's key, an earlier name (KT-2).
+pub(crate) const RESOLVE_BY_LOCAL: &str = "SELECT id, net_author FROM messages
+ WHERE account_id = ?1 AND net_local = ?2 AND (?3 IS NULL OR conversation_id = ?3)
+ UNION
+ SELECT r.message_id, r.net_author FROM message_revisions r
+   JOIN messages m ON m.id = r.message_id
+ WHERE r.account_id = ?1 AND r.net_local = ?2 AND (?3 IS NULL OR m.conversation_id = ?3)
+ UNION
+ SELECT a.message_id, m.net_author FROM message_aliases a
+   CROSS JOIN messages m ON m.id = a.message_id
+ WHERE a.account_id = ?1 AND a.net_local = ?2 AND (?3 IS NULL OR m.conversation_id = ?3)";
+
+/// SQL: the messages of the conversation `?3` that have the id `?2`: the same three names.
+pub(crate) const MESSAGES_WITH_LOCAL: &str = "SELECT id FROM messages
+ WHERE account_id = ?1 AND net_local = ?2 AND conversation_id = ?3
+ UNION
+ SELECT r.message_id FROM message_revisions r JOIN messages m ON m.id = r.message_id
+ WHERE r.account_id = ?1 AND r.net_local = ?2 AND m.conversation_id = ?3
+ UNION
+ SELECT a.message_id FROM message_aliases a CROSS JOIN messages m ON m.id = a.message_id
+ WHERE a.account_id = ?1 AND a.net_local = ?2 AND m.conversation_id = ?3";
 
 /// A target with canonical conversation key and author column.
 #[derive(Clone, Debug)]
@@ -153,6 +208,14 @@ impl Apply<'_> {
     /// A call line is keyed by its conversation on every network ([`super::call`]): only a
     /// reference that names its conversation finds it.
     ///
+    /// Under `ConversationAuthor` scope (ids unique per sender in a chat) a reference WITHOUT
+    /// an author (`TargetAuthor::Unknown`: an own read sync names none) resolves only when
+    /// exactly one message of the conversation has that id, else it is parked like a missing
+    /// target: two members may use one id, and the first row found would be a pick by chance.
+    /// (A call line is a row of the conversation with that id too, so an author-less
+    /// reference to an id a line and a peer's message share is ambiguous as well.) Under
+    /// `Conversation` scope (Threema, no author on the wire at all) the first match stays.
+    ///
     /// A reference that names a conversation only ever resolves to a message of that
     /// conversation. Under `AccountAuthor` scope the key alone would find the message in any
     /// chat, so a member of one chat (or somebody who left a group) could edit, delete or
@@ -168,14 +231,7 @@ impl Apply<'_> {
             for local in &t.locals {
                 let id: Option<i64> = self
                     .conn
-                    .prepare_cached(
-                        "SELECT id FROM messages WHERE account_id = ?1 AND net_author = ?2
-                           AND net_local = ?3 AND net_scope = 0
-                         UNION ALL
-                         SELECT message_id FROM message_revisions WHERE account_id = ?1
-                           AND net_local = ?3 AND net_author = ?2
-                         LIMIT 1",
-                    )?
+                    .prepare_cached(RESOLVE_BY_AUTHOR)?
                     .query_row((self.acc.id.0, author, local.as_ref()), |r| r.get(0))
                     .optional()?;
                 if let Some(id) = id
@@ -211,26 +267,29 @@ impl Apply<'_> {
         for local in &t.locals {
             let candidates: Vec<(i64, String)> = self
                 .conn
-                .prepare_cached(
-                    "SELECT id, net_author FROM messages WHERE account_id = ?1 AND net_local = ?2
-                       AND (?3 IS NULL OR conversation_id = ?3)
-                     UNION
-                     SELECT r.message_id, r.net_author FROM message_revisions r
-                       JOIN messages m ON m.id = r.message_id
-                     WHERE r.account_id = ?1 AND r.net_local = ?2
-                       AND (?3 IS NULL OR m.conversation_id = ?3)",
-                )?
+                .prepare_cached(RESOLVE_BY_LOCAL)?
                 .query_map((self.acc.id.0, local.as_ref(), conv_id), |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?
                 .collect::<kourier_db::rusqlite::Result<_>>()?;
-            let matching: Vec<i64> = candidates
+            let mut matching: Vec<i64> = candidates
                 .into_iter()
                 .filter(|(_, a)| t.author.as_ref().is_none_or(|ta| ta == a))
                 .map(|(id, _)| id)
                 .collect();
+            // Per-sender ids: no author, no pick among several messages (see above).
+            let author_less_per_sender =
+                self.scope == MsgIdScope::ConversationAuthor && t.author.is_none();
+            if author_less_per_sender {
+                matching.sort_unstable();
+                matching.dedup();
+            }
             // Account-wide lookups by local alone must be unambiguous.
-            let unique = conv_id.is_some() || matching.len() == 1;
+            let unique = if author_less_per_sender {
+                matching.len() == 1
+            } else {
+                conv_id.is_some() || matching.len() == 1
+            };
             if let (Some(id), true) = (matching.first(), unique) {
                 let row = self.msg_row(MessageId(*id))?;
                 // A call line is found by its conversation and its id, never account-wide.
@@ -355,6 +414,15 @@ impl Apply<'_> {
         // modifier that names this conversation waited for it.
         let call_line =
             row.is_own() && row.body_kind == "System" && super::is_call_line(self.conn, row.id)?;
+        // Under per-sender ids a parked reference WITHOUT an author is applied here only when it
+        // is a receipt or a read marker (an own read sync names none) and only to a message that
+        // is the only one of its conversation with this id (as `resolve_target` resolves it):
+        // otherwise it would land on whichever member's message came first, or last, and for a
+        // receipt a wrong pick costs a read mark. An edit, a delete or a reaction without an author
+        // (a fault of the backend's mapping) stays parked until it expires: a pick by chance would
+        // change or delete another member's message, and the result would depend on the order.
+        // Counted once, and only when there is such a reference.
+        let mut alone = None;
         for p in parked {
             // Same rules as `resolve_target`: a reference that names a conversation is about
             // a message of that conversation only, also under AccountAuthor scope. One that
@@ -368,6 +436,22 @@ impl Apply<'_> {
             let scope_ok = p.conv.is_some() || p.author.is_some();
             if !(conv_ok && author_ok && scope_ok) {
                 continue;
+            }
+            if self.scope == MsgIdScope::ConversationAuthor && p.author.is_none() {
+                if !matches!(p.kind.as_str(), "Receipts" | "ReadMarker") {
+                    continue;
+                }
+                let only_one = match alone {
+                    Some(known) => known,
+                    None => {
+                        let known = self.messages_with_local(row.conv, local)? == 1;
+                        alone = Some(known);
+                        known
+                    }
+                };
+                if !only_one {
+                    continue;
+                }
             }
             self.conn
                 .prepare_cached("DELETE FROM pending_modifiers WHERE id = ?1")?
@@ -384,6 +468,17 @@ impl Apply<'_> {
             self.apply_modifier(&fresh, e, depth)?;
         }
         Ok(())
+    }
+
+    /// How many messages of `conv` have the id `local`, as their own id, as the id of one of
+    /// their revisions or as an earlier name (the keys `resolve_target` looks at; `messages_local`).
+    fn messages_with_local(&self, conv: ConversationId, local: &str) -> Result<usize> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare_cached(MESSAGES_WITH_LOCAL)?
+            .query_map((self.acc.id.0, local, conv.0), |r| r.get(0))?
+            .collect::<kourier_db::rusqlite::Result<_>>()?;
+        Ok(ids.len())
     }
 
     /// Looks again at the modifiers that wait for a message of the conversation `conv_key`
@@ -535,15 +630,18 @@ impl Apply<'_> {
     fn apply_modifier(&mut self, row: &MsgRow, e: BackendEvent, depth: u8) -> Result<()> {
         // A call line is no message we sent, although it has no author: it takes no receipt,
         // no send state, no reaction and no edit. Only our own devices' delete of the call
-        // entry and their read marker apply to it.
+        // entry and their read marker apply to it, and a delete for everyone that a server
+        // that checks deletes has checked (KT-2: a call is a message there).
         if row.is_own() && row.body_kind == "System" && super::is_call_line(self.conn, row.id)? {
             return match e {
                 BackendEvent::Deleted {
                     by,
-                    for_everyone: false,
+                    for_everyone,
                     at,
                     ..
-                } => self.delete(row, by.as_ref(), false, at),
+                } if !for_everyone || self.server.validates_deletes => {
+                    self.delete(row, by.as_ref(), for_everyone, at)
+                }
                 BackendEvent::ReadMarker { .. } => self.read_marker(row),
                 _ => Ok(()),
             };
@@ -733,7 +831,9 @@ impl Apply<'_> {
     /// Desktop checks it for its own account (`SD/ts/util/canDeleteForEveryone.preload.ts`
     /// `canReceiveDeleteForEveryone`: `isMemberGroupAdmin(targetConversation,
     /// deleteSentByAci)`). A tombstone keeps the row and its keys (§3.5.2); delete-for-me wins
-    /// over delete-for-everyone.
+    /// over delete-for-everyone. On a network whose server checks deletes (KT-2) a delete for
+    /// everyone is applied as it comes, and with nobody named its tombstone names nobody
+    /// (`deleted_by` NULL, `Deletion::Unattributed`): it could be ours or the peer's.
     fn delete(
         &mut self,
         row: &MsgRow,
@@ -743,22 +843,26 @@ impl Apply<'_> {
     ) -> Result<()> {
         let by_col = self.author_col(by)?;
         let kind = if for_everyone {
-            let features = self.features(row)?;
-            let by_admin = by_col != row.net_author
-                && features.as_ref().is_some_and(|f| f.admin_delete)
-                && if by_col.is_empty() {
-                    self.own_admin(row)?
-                } else {
-                    self.is_admin(row, &by_col)?
-                };
-            if by_col != row.net_author && !by_admin {
-                return Ok(());
-            }
-            if let Some(f) = &features {
-                match f.delete_receive {
-                    None => return Ok(()),
-                    Some(w) if !w.allows(age_secs(row.dated_at(), at), 0) => return Ok(()),
-                    Some(_) => {}
+            // A server that checks the deletes has checked this one (KT-2): nothing here can say
+            // better, and a delete that waited for the re-key would be consumed and lost.
+            if !self.server.validates_deletes {
+                let features = self.features(row)?;
+                let by_admin = by_col != row.net_author
+                    && features.as_ref().is_some_and(|f| f.admin_delete)
+                    && if by_col.is_empty() {
+                        self.own_admin(row)?
+                    } else {
+                        self.is_admin(row, &by_col)?
+                    };
+                if by_col != row.net_author && !by_admin {
+                    return Ok(());
+                }
+                if let Some(f) = &features {
+                    match f.delete_receive {
+                        None => return Ok(()),
+                        Some(w) if !w.allows(age_secs(row.dated_at(), at), 0) => return Ok(()),
+                        Some(_) => {}
+                    }
                 }
             }
             "ForEveryone"
@@ -773,15 +877,22 @@ impl Apply<'_> {
             Some("ForEveryone") if kind == "ForEveryone" => return Ok(()),
             _ => {}
         }
-        self.tombstone(row, kind, &by_col)
+        let unnamed = by.is_none() && for_everyone && self.server.validates_deletes;
+        self.tombstone(row, kind, (!unnamed).then_some(by_col.as_str()))
     }
 
     /// Turns `row` into a tombstone (§3.5.2): `kind` is `ForEveryone` or `ForMe`, `by_col` the
-    /// deleter's author column. The row and its keys stay, so later modifiers still resolve;
+    /// deleter's author column (`None`: the network named nobody). The row and its keys stay, so
+    /// later modifiers still resolve;
     /// the body, revision bodies, quote, raw content and reactions go, the attachments are
     /// deleted with their files (unlinked after the commit), and so are its outbox rows other
     /// than deletes.
-    pub(crate) fn tombstone(&mut self, row: &MsgRow, kind: &str, by_col: &str) -> Result<()> {
+    pub(crate) fn tombstone(
+        &mut self,
+        row: &MsgRow,
+        kind: &str,
+        by_col: Option<&str>,
+    ) -> Result<()> {
         let empty = sql::to_json(&Body::Text(Text::default()))?;
         // A call line that is deleted rings no more and has no read state left: what is
         // left of it is the same row whatever the line was when its delete arrived (also its
@@ -841,7 +952,11 @@ impl Apply<'_> {
     }
 
     /// A reaction: last writer wins per (user, emoji) by `at`, removals stay as tombstones.
-    /// One longer than any emoji ([`MAX_EMOJI_BYTES`]) is not a reaction and is dropped.
+    /// One longer than any emoji ([`MAX_EMOJI_BYTES`]) is not a reaction and is dropped. A
+    /// REMOVAL WITH NO EMOJI takes away every reaction the sender has on the message
+    /// ([`Self::merge_reaction`]; WhatsApp allows one per sender and message and takes it back
+    /// with an empty one); a removal with an emoji takes away that emoji only (Signal's). An
+    /// empty emoji that does not remove is no reaction.
     pub(crate) fn reaction(
         &mut self,
         row: &MsgRow,
@@ -850,7 +965,7 @@ impl Apply<'_> {
         remove: bool,
         at: i64,
     ) -> Result<()> {
-        if row.deleted.is_some() || emoji.is_empty() || emoji.len() > MAX_EMOJI_BYTES {
+        if row.deleted.is_some() || (emoji.is_empty() && !remove) || emoji.len() > MAX_EMOJI_BYTES {
             return Ok(());
         }
         let user = self.author_col(by)?;
@@ -861,7 +976,16 @@ impl Apply<'_> {
         Ok(())
     }
 
-    /// LWW upsert of one reaction row; returns the number of rows written.
+    /// LWW upsert of one reaction row; returns the number of rows written (for a removal with
+    /// no emoji: the number of reactions that were showing and are gone).
+    ///
+    /// A removal with NO emoji (`emoji` empty, `removed`) is stored as the tombstone of the empty
+    /// emoji ([`REMOVAL_ALL_STORE`]; the later removal stands) and takes away every reaction of
+    /// the user on the message that is not newer than it ([`REMOVAL_ALL_SWEEP`]: its row becomes a
+    /// removal at the removal's time). A reaction that comes afterwards, or later in the order of
+    /// arrival, and is not newer than that removal arrives as a removal at the removal's time
+    /// ([`REMOVAL_ALL_AT`]): the rows end the same whatever the order. A newer reaction stands, as
+    /// it does after a removal with an emoji. An empty emoji that does not remove writes nothing.
     pub(crate) fn merge_reaction(
         &self,
         id: MessageId,
@@ -870,6 +994,17 @@ impl Apply<'_> {
         at: i64,
         removed: bool,
     ) -> Result<usize> {
+        if emoji.is_empty() {
+            return if removed {
+                self.remove_all_reactions(id, user, at)
+            } else {
+                Ok(0)
+            };
+        }
+        let (at, removed) = match self.removal_all_at(id, user)? {
+            Some(cover) if at <= cover => (cover, true),
+            _ => (at, removed),
+        };
         Ok(self
             .conn
             .prepare_cached(
@@ -881,6 +1016,31 @@ impl Apply<'_> {
                     OR (excluded.at = reactions.at AND excluded.removed > reactions.removed)",
             )?
             .execute((id.0, user, emoji, at, removed))?)
+    }
+
+    /// The time of the user's removal with no emoji on the message, when there is one.
+    pub(crate) fn removal_all_at(&self, id: MessageId, user: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .prepare_cached(REMOVAL_ALL_AT)?
+            .query_row((id.0, user), |r| r.get(0))
+            .optional()?)
+    }
+
+    /// A removal with no emoji at `at`: the tombstone, then every reaction of `user` not newer
+    /// than it. Returns how many showing reactions went.
+    fn remove_all_reactions(&self, id: MessageId, user: &str, at: i64) -> Result<usize> {
+        self.conn
+            .prepare_cached(REMOVAL_ALL_STORE)?
+            .execute((id.0, user, at))?;
+        let showing: i64 = self
+            .conn
+            .prepare_cached(REMOVAL_ALL_COUNT)?
+            .query_row((id.0, user, at), |r| r.get(0))?;
+        self.conn
+            .prepare_cached(REMOVAL_ALL_SWEEP)?
+            .execute((id.0, user, at))?;
+        Ok(usize::try_from(showing).unwrap_or(0))
     }
 
     /// Earliest-wins upsert of one receipt row; returns the number of rows written.
@@ -1020,8 +1180,13 @@ impl Apply<'_> {
     }
 
     /// A read marker from another own device: everything up to the target's `sent_at` is read,
-    /// including messages that arrive later with an older `sent_at`.
+    /// including messages that arrive later with an older `sent_at`. A target with a position is
+    /// read up to that position instead, and the watermark stays: the time rule would mark a
+    /// neighbour of the same second read ([`super::position`]).
     fn read_marker(&mut self, row: &MsgRow) -> Result<()> {
+        if let Some(seq) = row.net_seq {
+            return self.read_at_position(row.conv, seq);
+        }
         self.conn
             .prepare_cached(
                 "UPDATE conversations SET
@@ -1139,5 +1304,68 @@ impl super::Changes {
     /// Marks a conversation's counters for recomputation.
     pub(crate) fn recount_conv(&mut self, conv: kourier_model::ConversationId) {
         self.recount.insert(conv);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kourier_model::{MsgIdScope, NetworkKind, UserId};
+
+    /// The statements of a removal with no emoji, and the look-up every other reaction makes
+    /// for it, work on the rows of ONE message and user through the primary key: no scan of
+    /// `reactions` and no walk of all of a user's reactions (`reactions_by_user`, core.db has no
+    /// planner statistics).
+    #[test]
+    fn a_removal_without_an_emoji_touches_the_rows_of_one_message_and_user() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([5u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::ConversationAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        for (sql, key) in [
+            (
+                super::REMOVAL_ALL_AT,
+                "message_id=? AND user_id=? AND emoji=?",
+            ),
+            (super::REMOVAL_ALL_COUNT, "message_id=? AND user_id=?"),
+            (super::REMOVAL_ALL_SWEEP, "message_id=? AND user_id=?"),
+            (super::REMOVAL_ALL_STORE, ""),
+        ] {
+            let steps: Vec<String> = h
+                .connection()
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    sql.replace("?1", "1")
+                        .replace("?2", "'lid:7'")
+                        .replace("?3", "5")
+                ))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(3))
+                .expect("plan")
+                .collect::<kourier_db::rusqlite::Result<_>>()
+                .expect("rows");
+            assert!(
+                steps
+                    .iter()
+                    .all(|s| !s.starts_with("SCAN") || s == "SCAN CONSTANT ROW"),
+                "{sql}\n{steps:#?}"
+            );
+            assert!(
+                steps.iter().all(|s| !s.contains("reactions_by_user")),
+                "{sql}\n{steps:#?}"
+            );
+            if !key.is_empty() {
+                assert!(
+                    steps
+                        .iter()
+                        .any(|s| s.starts_with("SEARCH reactions USING") && s.contains(key)),
+                    "{sql}\n{steps:#?}"
+                );
+            }
+        }
     }
 }

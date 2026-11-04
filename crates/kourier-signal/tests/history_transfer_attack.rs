@@ -25,7 +25,7 @@
 //!
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -497,12 +497,11 @@ async fn a_start_after_a_kill_at_the_end_removes_the_key_from_the_database_files
         sink: world.tmp.path().join("sink.db"),
     };
     let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
+        .arg(support::child_filter(
+            module_path!(),
             "attack_child_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -809,12 +808,11 @@ async fn nothing_of_an_aborted_import_is_readable() {
         sink: world.tmp.path().join("sink.db"),
     };
     let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
+        .arg(support::child_filter(
+            module_path!(),
             "import_attack_child_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(
             IMPORT_CHILD_ENV,
             serde_json::to_string(&spec).expect("spec"),

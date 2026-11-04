@@ -1,3 +1,5 @@
 # Left out of the source archive (`git archive`, `cargo xtask dist`) and of the exported
 # public tree: the working notes for the AI assistant, which name the maintainer's machine.
 CLAUDE.md export-ignore
+# The same for the rules Claude Code loads by path (`.claude/rules/*.md`, split out of CLAUDE.md).
+.claude/** export-ignore

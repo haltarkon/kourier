@@ -5,7 +5,7 @@
 //! answers that name their request; downloads resumed only after the catch-up boundary; the
 //! conversation timer.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -1719,7 +1719,7 @@ fn message_ids_are_never_reused() {
     )
     .expect("rows");
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (2, 14));
+    assert_eq!((out.from, out.to), (2, kourier_core::MIGRATIONS.latest()));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
     assert_eq!(count("SELECT count(*) FROM messages"), 2);
     for table in [
@@ -1854,7 +1854,7 @@ fn the_accounts_rebuild_keeps_every_row_and_never_reuses_an_id() {
     assert_eq!(before.len(), 2);
 
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (7, 14));
+    assert_eq!((out.from, out.to), (7, kourier_core::MIGRATIONS.latest()));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
     assert_eq!(rows(&conn), before, "every column of every account");
     for table in [
@@ -1931,7 +1931,8 @@ fn the_accounts_rebuild_keeps_every_row_and_never_reuses_an_id() {
     // A database that is already at the newest version opens as it is.
     let mut again = kourier_db::open(&path, &key).expect("open");
     let out = kourier_db::migrate(&mut again, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (14, 14));
+    let latest = kourier_core::MIGRATIONS.latest();
+    assert_eq!((out.from, out.to), (latest, latest));
 }
 
 /// Migration 4 alone, as a schema-3 `core.db` gets it (a plain step, foreign keys enforced):
@@ -2001,9 +2002,12 @@ fn the_outbox_rebuild_keeps_its_rows_and_shape() {
     assert_eq!(count("PRAGMA foreign_keys"), 1, "enforced during the step");
 
     let out = kourier_db::migrate(&mut conn, &kourier_core::MIGRATIONS).expect("migrate");
-    assert_eq!((out.from, out.to), (3, 14));
+    assert_eq!((out.from, out.to), (3, kourier_core::MIGRATIONS.latest()));
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
-    assert_eq!(shape(&conn), shape_before);
+    // Migration 17 (upload progress) added the one column `cancel_state`; nothing else moved.
+    let mut shape_after = shape_before.clone();
+    shape_after[0].push("cancel_state INTEGER 1 0 0".to_string());
+    assert_eq!(shape(&conn), shape_after);
     assert_eq!(rows(&conn), rows_before);
     assert_eq!(
         count(
@@ -2065,4 +2069,363 @@ fn the_outbox_rebuild_keeps_its_rows_and_shape() {
         11,
         "not even after every row went"
     );
+}
+
+// ---------- references under per-sender ids (K-B1, C7) ----------
+
+const WA_ALICE: &str = "lid:1111";
+const WA_BOB: &str = "lid:2222";
+const WA_CAROL: &str = "lid:3333";
+
+fn wa_group() -> ConvKey {
+    ConvKey::Group("wa:120363000000000001@g.us".into())
+}
+
+/// A core whose network keys messages per sender in a chat (WhatsApp).
+fn per_sender() -> (tempfile::TempDir, IngestHarness) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = IngestHarness::open(
+        &dir.path().join("core.db"),
+        &kourier_db::DbKey::from([4; 32]),
+        NetworkKind::Fake,
+        MsgIdScope::ConversationAuthor,
+        &[uid(ME)],
+    )
+    .expect("harness");
+    (dir, h)
+}
+
+fn wa_msg(who: &str, local: &str, at: i64) -> BackendEvent {
+    BackendEvent::Message(remote(&wa_group(), &uid(who), local, at, "hello"))
+}
+
+/// A reaction by carol to the message `local` of the group, with no author on it.
+fn author_less_reaction(local: &str) -> BackendEvent {
+    BackendEvent::Reaction {
+        target: kourier_fake::scripts::unknown_target(&wa_group(), local),
+        by: Some(uid(WA_CAROL)),
+        emoji: "👍".into(),
+        remove: false,
+        at: T0 + 9_000,
+    }
+}
+
+/// Who the reactions of the rows hang on: (author of the message, its id).
+fn reacted(h: &IngestHarness) -> Vec<(String, String)> {
+    h.connection()
+        .prepare(
+            "SELECT m.net_author, m.net_local FROM reactions r JOIN messages m ON m.id = r.message_id
+             ORDER BY m.id",
+        )
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+fn parked(h: &IngestHarness) -> i64 {
+    h.connection()
+        .query_row("SELECT count(*) FROM pending_modifiers", [], |r| r.get(0))
+        .expect("count")
+}
+
+/// T5: under per-sender ids two members may use one id, and a reference with no author (an
+/// own read sync names none) must not pick one of them by chance: with two messages it is
+/// parked and neither is changed; with exactly one it finds that one. A reference WITH an
+/// author finds its message whatever the other members used.
+#[test]
+fn an_author_less_reference_under_per_sender_ids_needs_a_unique_match() {
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    h.apply(vec![
+        wa_msg(WA_ALICE, "3EB0X1", T0),
+        wa_msg(WA_BOB, "3EB0X1", T0 + 1),
+        wa_msg(WA_ALICE, "3EB0Y1", T0 + 2),
+    ])
+    .expect("messages");
+    h.apply(vec![author_less_reaction("3EB0X1")])
+        .expect("reaction");
+    assert_eq!(
+        reacted(&h),
+        [],
+        "two messages have the id: neither is picked"
+    );
+    assert_eq!(
+        parked(&h),
+        1,
+        "it waits like a reference to a missing message"
+    );
+    h.apply(vec![author_less_reaction("3EB0Y1")])
+        .expect("reaction");
+    assert_eq!(
+        reacted(&h),
+        [(WA_ALICE.to_owned(), "3EB0Y1".to_owned())],
+        "one message has the id: that one"
+    );
+    // With the author the reference is exact.
+    h.apply(vec![BackendEvent::Reaction {
+        target: kourier_fake::scripts::target(Some(&wa_group()), Some(&uid(WA_BOB)), "3EB0X1"),
+        by: Some(uid(WA_CAROL)),
+        emoji: "❤".into(),
+        remove: false,
+        at: T0 + 9_000,
+    }])
+    .expect("reaction");
+    assert_eq!(
+        reacted(&h),
+        [
+            (WA_BOB.to_owned(), "3EB0X1".to_owned()),
+            (WA_ALICE.to_owned(), "3EB0Y1".to_owned())
+        ]
+    );
+}
+
+/// T5b (critic M1, contract review F3): a parked reference with no author is not applied to
+/// whichever message of the chat arrives with its id. A reaction (so an edit or a delete) parked
+/// while two messages had the id must not land on the third member's message when that arrives,
+/// and one parked before any message does not land on the first one either: it keeps waiting
+/// until it expires, whatever the order. (A receipt or a read marker is applied to a message that
+/// is the only one with the id: `an_own_read_sync_without_an_author_marks_the_only_message_with_the_id`.)
+#[test]
+fn a_parked_author_less_reference_waits_for_a_unique_message() {
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    h.apply(vec![
+        wa_msg(WA_ALICE, "3EB0X1", T0),
+        wa_msg(WA_BOB, "3EB0X1", T0 + 1),
+    ])
+    .expect("messages");
+    h.apply(vec![author_less_reaction("3EB0X1")])
+        .expect("reaction");
+    assert_eq!(parked(&h), 1);
+    // A third member uses the id too: three messages, so still no pick.
+    h.apply(vec![wa_msg(WA_CAROL, "3EB0X1", T0 + 2)])
+        .expect("third");
+    assert_eq!(reacted(&h), [], "not by chance onto the one that came last");
+    assert_eq!(parked(&h), 1, "it keeps waiting");
+
+    // Parked before its message: the message that arrives is not the one it names, as far as
+    // anyone can tell (the first, the second or the third member's: three orders, three
+    // different results had it been applied).
+    h.apply(vec![author_less_reaction("3EB0Z1")])
+        .expect("reaction first");
+    assert_eq!(parked(&h), 2);
+    h.apply(vec![wa_msg(WA_BOB, "3EB0Z1", T0 + 3)])
+        .expect("the message");
+    assert_eq!(
+        reacted(&h),
+        [],
+        "a reaction without an author is never applied by arrival"
+    );
+    assert_eq!(parked(&h), 2, "both keep waiting");
+    // The same reference once the message is there is the one case that resolves: exactly one
+    // message has the id.
+    h.apply(vec![author_less_reaction("3EB0Z1")])
+        .expect("reaction again");
+    assert_eq!(
+        reacted(&h),
+        [(WA_BOB.to_owned(), "3EB0Z1".to_owned())],
+        "one message has the id: that one"
+    );
+}
+
+/// T5c (critic M1, W3b's mapping): an own read sync names its messages with no author. For an
+/// id only one message has it marks that message read, also when it arrives before the
+/// message; it is not applied to a message of ours.
+#[test]
+fn an_own_read_sync_without_an_author_marks_the_only_message_with_the_id() {
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    let read_sync = |local: &str| BackendEvent::Receipts {
+        targets: vec![kourier_fake::scripts::unknown_target(&wa_group(), local)],
+        by: uid(ME),
+        kind: kourier_model::ReceiptKind::Read,
+        at: T0 + 5_000,
+    };
+    let read_state = |h: &IngestHarness, author: &str, local: &str| -> Option<String> {
+        h.connection()
+            .query_row(
+                "SELECT read_state FROM messages WHERE net_author = ?1 AND net_local = ?2",
+                [author, local],
+                |r| r.get(0),
+            )
+            .expect("the message")
+    };
+    h.apply(vec![wa_msg(WA_ALICE, "3EB0X1", T0)])
+        .expect("message");
+    assert_eq!(
+        read_state(&h, WA_ALICE, "3EB0X1").as_deref(),
+        Some("Unread")
+    );
+    h.apply(vec![read_sync("3EB0X1")]).expect("read sync");
+    assert_eq!(read_state(&h, WA_ALICE, "3EB0X1").as_deref(), Some("Read"));
+    // Before its message.
+    h.apply(vec![read_sync("3EB0Y1")]).expect("read sync first");
+    h.apply(vec![wa_msg(WA_BOB, "3EB0Y1", T0 + 1)])
+        .expect("message");
+    assert_eq!(read_state(&h, WA_BOB, "3EB0Y1").as_deref(), Some("Read"));
+}
+
+/// Follow-up of the K-B1 re-check (M7b): the unique-at-arrival rule for a parked author-less
+/// reference has TWO kinds, the receipt (above) and the read marker. An own device's read marker
+/// that names its message by id alone, parked before the message, marks the chat read up to it
+/// when exactly one message has the id at the arrival, and not when the id is already used by
+/// other members (it keeps waiting then, whoever arrives).
+#[test]
+fn a_parked_author_less_read_marker_resolves_at_a_unique_arrival() {
+    let marker = |local: &str| BackendEvent::ReadMarker {
+        conv: Some(wa_group()),
+        up_to: kourier_fake::scripts::unknown_target(&wa_group(), local),
+    };
+    let read_states = |h: &IngestHarness| -> Vec<(String, String, String)> {
+        h.connection()
+            .prepare("SELECT net_author, net_local, read_state FROM messages ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    };
+    let row = |author: &str, local: &str, state: &str| {
+        (author.to_owned(), local.to_owned(), state.to_owned())
+    };
+
+    // No message has the id yet: the marker is parked; the message that arrives is the only one
+    // with the id, so the marker applies to it, and the older message before it is read too.
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    h.apply(vec![wa_msg(WA_ALICE, "3EB0X1", T0)])
+        .expect("an older message");
+    h.apply(vec![marker("3EB0Y1")]).expect("marker first");
+    assert_eq!(parked(&h), 1, "the marker waits for its message");
+    h.apply(vec![wa_msg(WA_BOB, "3EB0Y1", T0 + 1)])
+        .expect("the message");
+    assert_eq!(
+        read_states(&h),
+        [
+            row(WA_ALICE, "3EB0X1", "Read"),
+            row(WA_BOB, "3EB0Y1", "Read")
+        ],
+        "the marker resolved at the unique arrival"
+    );
+    assert_eq!(parked(&h), 0, "and is no longer parked");
+
+    // Two members already use the id when the marker comes: it is parked, and a third member's
+    // message with the id does not take it (three messages have the id).
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    h.apply(vec![
+        wa_msg(WA_ALICE, "3EB0Z1", T0),
+        wa_msg(WA_BOB, "3EB0Z1", T0 + 1),
+    ])
+    .expect("two members use the id");
+    h.apply(vec![marker("3EB0Z1")]).expect("marker");
+    assert_eq!(parked(&h), 1, "two messages have the id: it waits");
+    h.apply(vec![wa_msg(WA_CAROL, "3EB0Z1", T0 + 2)])
+        .expect("a third");
+    assert_eq!(
+        parked(&h),
+        1,
+        "three messages have the id: it keeps waiting"
+    );
+    assert_eq!(
+        read_states(&h),
+        [
+            row(WA_ALICE, "3EB0Z1", "Unread"),
+            row(WA_BOB, "3EB0Z1", "Unread"),
+            row(WA_CAROL, "3EB0Z1", "Unread")
+        ],
+        "nobody's message was marked by chance"
+    );
+}
+
+/// F12: a quote WITHOUT an author names its original by the id alone, and under per-sender ids two
+/// members may share an id: the quote shows the original (a row to jump to, its text) only when
+/// exactly one message of the chat has the id, else it shows what its sender's snapshot says, as
+/// for a missing original. A quote with an author finds the row of that author.
+#[test]
+fn a_quote_without_an_author_shows_the_original_only_when_one_message_has_the_id() {
+    use kourier_core::facade::{TimelineAnchor, TimelineQuery};
+    use kourier_model::{QuoteSnapshot, ReplyTo};
+    let (_dir, mut h) = per_sender();
+    h.set_now(T0);
+    h.apply(vec![
+        wa_msg(WA_ALICE, "3EB0X1", T0),
+        wa_msg(WA_BOB, "3EB0X1", T0 + 1),
+        wa_msg(WA_ALICE, "3EB0Y1", T0 + 2),
+    ])
+    .expect("messages");
+    let quoting = |local: &str, quoted: &str, author: Option<&str>| {
+        let mut m = remote(&wa_group(), &uid(WA_CAROL), local, T0 + 10, "reply");
+        m.reply_to = Some(ReplyTo {
+            target: match author {
+                Some(a) => kourier_fake::scripts::target(Some(&wa_group()), Some(&uid(a)), quoted),
+                None => kourier_fake::scripts::unknown_target(&wa_group(), quoted),
+            },
+            author: author.map(uid),
+            snapshot: Some(QuoteSnapshot {
+                text: Some(Text::plain("what the sender saw")),
+                ..QuoteSnapshot::default()
+            }),
+        });
+        BackendEvent::Message(m)
+    };
+    h.apply(vec![
+        quoting("R1", "3EB0X1", None),
+        quoting("R2", "3EB0Y1", None),
+        quoting("R3", "3EB0X1", Some(WA_BOB)),
+    ])
+    .expect("replies");
+    let conv: i64 = h
+        .connection()
+        .query_row("SELECT id FROM conversations", [], |r| r.get(0))
+        .expect("the group");
+    let rows = h
+        .timeline(&TimelineQuery {
+            conv: ConversationId(conv),
+            anchor: TimelineAnchor::Newest,
+            limit: 50,
+        })
+        .expect("timeline")
+        .rows;
+    let quote_of = |local: &str| {
+        let id: i64 = h
+            .connection()
+            .query_row(
+                "SELECT id FROM messages WHERE net_local = ?1",
+                [local],
+                |r| r.get(0),
+            )
+            .expect("the reply");
+        rows.iter()
+            .find(|r| r.id.0 == id)
+            .and_then(|r| r.reply.clone())
+            .expect("a quote")
+    };
+    let row_id = |author: &str, local: &str| -> i64 {
+        h.connection()
+            .query_row(
+                "SELECT id FROM messages WHERE net_author = ?1 AND net_local = ?2",
+                [author, local],
+                |r| r.get(0),
+            )
+            .expect("the message")
+    };
+    // Two members used the id and the quote names none: no pick.
+    let ambiguous = quote_of("R1");
+    assert_eq!(ambiguous.state, kourier_core::facade::QuoteState::Missing);
+    assert_eq!(ambiguous.target, None);
+    assert_eq!(
+        ambiguous.text.as_ref().map(|t| t.body.as_str()),
+        Some("what the sender saw")
+    );
+    // One message has the id: that one.
+    let alone = quote_of("R2");
+    assert_eq!(alone.state, kourier_core::facade::QuoteState::Known);
+    assert_eq!(alone.target, Some(MessageId(row_id(WA_ALICE, "3EB0Y1"))));
+    // With an author: the row of that author.
+    let exact = quote_of("R3");
+    assert_eq!(exact.state, kourier_core::facade::QuoteState::Known);
+    assert_eq!(exact.target, Some(MessageId(row_id(WA_BOB, "3EB0X1"))));
 }

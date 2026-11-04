@@ -184,7 +184,7 @@ pub(crate) async fn inputs<T: SignalTransport>(
     let Some(account) = shared.account() else {
         return Ok(LaneInputs::default());
     };
-    let socket = shared.socket.borrow().clone();
+    let socket = shared.work_socket();
     let fetched = match socket {
         Some(socket) => tokio::time::timeout(
             NETWORK_STEP_TIMEOUT,

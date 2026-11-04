@@ -9,16 +9,19 @@ use std::sync::{Mutex, PoisonError};
 use cxx_qt::{CxxQtThread, CxxQtType, Threading};
 use cxx_qt_lib::{QList, QMap, QMapPair_QString_QVariant, QString, QStringList, QUrl, QVariant};
 use kourier_app::desktop::DesktopHandle;
+use kourier_app::facade::FileRefusal;
 use kourier_app::folders::{self, Cancel, FolderError, FolderSummary, Packed};
-use kourier_app::{AppHandle, NotificationContent, Prefs};
-use kourier_model::{ConversationId, MessageId, NetworkKind};
+use kourier_app::{AppHandle, LocationFiles, NotificationContent, Prefs};
+use kourier_model::{ConversationId, MessageId, NetworkKind, RESEND_FIELD};
 use kourier_viewmodel::files::{
     Counted, FileFacts, FileStrip, FolderCount, FolderJob, FolderQuestion, HandedFile, ListedFile,
-    PlanAnswer, StripFile, folder_added_notice, folder_empty_notice, folder_packed_notice,
-    folder_unpacked_notice, folder_unreadable_notice, refused_notice,
+    LocationAnswer, LocationOutcome, LocationPref, LocationQuestion, LocationSend,
+    LocationSnapshot, PlanAnswer, StripFile, folder_added_notice, folder_empty_notice,
+    folder_packed_notice, folder_unpacked_notice, folder_unreadable_notice, located_stayed_notice,
+    refused_notice,
 };
 use kourier_viewmodel::i18n::{trc, trnc};
-use kourier_viewmodel::source::{FinishedSend, RefusedSend, SendOutcome};
+use kourier_viewmodel::source::{FinishedSend, RefusedSend, ReturnedFile, SendOutcome};
 use kourier_viewmodel::{Changes, LoginView, LoginViewKind, SourceError};
 
 use crate::app::pinned;
@@ -40,6 +43,48 @@ pub(crate) fn defer(shared: &Shared, app: Option<&CxxQtThread<App>>, changes: Ch
     }
 }
 
+/// How many files a press of Send would take now under `pref`. Files held by the answer
+/// [Don't Send] count under "Ask each time" (the press asks about them again) and "Always
+/// send" (the press lets them go), or Send would be dead for a lone held file with no text
+/// (U3); under "Never send" the located files (held or not) are out, and so is a press with
+/// nothing else to send.
+fn sendable_count(strip: &FileStrip, pref: LocationPref) -> usize {
+    let leaving = strip.sendable().len();
+    let held = strip.held_going();
+    match pref {
+        LocationPref::Never => {
+            let unheld = strip.located().len().saturating_sub(held);
+            leaving.saturating_sub(unheld)
+        }
+        LocationPref::Ask | LocationPref::Always => leaving + held,
+    }
+}
+
+/// The files of a refused send as the strip takes them back: the ones the core named with
+/// their reasons, and the others whole. `archive` says which are the archives Kourier made of
+/// folders and whether one holds where it was taken (P1).
+fn hand_back(
+    files: Vec<ReturnedFile>,
+    pasted: impl Fn(&PathBuf) -> bool,
+    archive: impl Fn(&PathBuf) -> Option<bool>,
+) -> (Vec<(HandedFile, FileRefusal)>, Vec<HandedFile>) {
+    let mut marked = Vec::new();
+    let mut whole = Vec::new();
+    for file in files {
+        let handed = HandedFile {
+            pasted: pasted(&file.path),
+            as_file: file.as_file,
+            archive: archive(&file.path),
+            path: file.path,
+        };
+        match file.reason {
+            Some(reason) => marked.push((handed, reason)),
+            None => whole.push(handed),
+        }
+    }
+    (marked, whole)
+}
+
 /// The pasted files of sends the core has not answered yet. A pasted file (a clipboard image
 /// written to the tmpfs paste directory) is Kourier's own copy: it must stay until the core
 /// has copied it, and should not stay longer. The core says when: every `SendFiles` carries a
@@ -48,12 +93,51 @@ pub(crate) fn defer(shared: &Shared, app: Option<&CxxQtThread<App>>, changes: Ch
 pub(crate) struct PastedOut {
     /// `(request, file)`, in sending order.
     files: Vec<(u64, PathBuf)>,
+    /// The archives Kourier made of folders among them, with whether a file packed inside
+    /// holds where it was taken (`StripFile::archive_made`). The core cannot look inside an
+    /// archive and a refusal hands back only paths: this is what the file carries back into
+    /// the strip, or the returned archive would leave unasked (P1).
+    archives: HashMap<PathBuf, bool>,
 }
 
 impl PastedOut {
     /// Pasted files went out with `request`.
     pub(crate) fn sent(&mut self, request: u64, files: impl IntoIterator<Item = PathBuf>) {
         self.files.extend(files.into_iter().map(|f| (request, f)));
+    }
+
+    /// `request` took `sent`, the files that left the strip: the pasted ones (the archives of
+    /// folders are among them) are tracked, and an archive keeps what its look found inside
+    /// it, which a refusal of the request must hand back to the strip (P1).
+    pub(crate) fn sent_from_strip(&mut self, request: u64, sent: &[StripFile]) {
+        self.sent(
+            request,
+            sent.iter().filter(|f| f.pasted).map(|f| f.path.clone()),
+        );
+        for file in sent.iter().filter(|f| f.pasted) {
+            if let Some(located) = file.archive_made() {
+                self.archive(file.path.clone(), located);
+            }
+        }
+    }
+
+    /// `path`, a file of a request above, is the archive of a folder: `located` says a file
+    /// packed inside holds where it was taken.
+    fn archive(&mut self, path: PathBuf, located: bool) {
+        self.archives.insert(path, located);
+    }
+
+    /// `Some(located)` when `path` is an archive of a folder that went out and is not over
+    /// yet (ask before [`Self::refused`] forgets it).
+    pub(crate) fn archive_of(&self, path: &PathBuf) -> Option<bool> {
+        self.archives.get(path).copied()
+    }
+
+    /// Forgets archives whose files are no longer tracked.
+    fn forget_archives(&mut self) {
+        let files = &self.files;
+        self.archives
+            .retain(|path, _| files.iter().any(|(_, f)| f == path));
     }
 
     /// The core refused `request`. The files in `returning` go back to the composer, which
@@ -85,6 +169,7 @@ impl PastedOut {
                 }
             }
         });
+        self.forget_archives();
         gone
     }
 
@@ -103,6 +188,7 @@ impl PastedOut {
             }
             false
         });
+        self.forget_archives();
         gone
     }
 
@@ -146,6 +232,11 @@ pub struct ComposerRust {
     pub(crate) folder_question: QVariant,
     /// There is such a question.
     pub(crate) folder_asking: bool,
+    /// The question Send asked about files that would leave with where they were taken (a
+    /// map of what the dialog says, [`LocationQuestion`]; empty while there is none).
+    pub(crate) location_question: QVariant,
+    /// There is such a question: a Send meanwhile does nothing (critic F6).
+    pub(crate) location_asking: bool,
     pub(crate) shared: Option<Shared>,
     pub(crate) app: Option<Box<CxxQtThread<App>>>,
     /// The running app (pasted files, the worker threads); `None` in pure UI tests.
@@ -178,6 +269,39 @@ pub struct ComposerRust {
     confirming: bool,
     /// The step that is shown with `asked` (what `folder_question` says now).
     shown_confirming: bool,
+    /// What the open location question was asked about, with the text of the press (F3,
+    /// BQ-R1); `None` while none is open.
+    location_asked: Option<LocationSnapshot>,
+}
+
+/// What a press of Send does with the files of the open list (decided by
+/// [`ComposerRust::files_send`], the part of Send that needs no Qt).
+#[derive(Debug)]
+pub(crate) enum FilesSend {
+    /// No file goes and none is held for its location: the text goes by itself (files the
+    /// network cannot take hold nothing back).
+    Text,
+    /// The location question is open: the press does nothing (F6; Return repeats).
+    Busy,
+    /// A verdict is pending, or a quote cannot go with the files: the hint says why.
+    Wait,
+    /// "Ask each time" and files would leave with their location: the question is asked,
+    /// nothing goes yet.
+    Ask(LocationQuestion),
+    /// Every file that would go is held for its location ("Never send"): NOTHING goes, the
+    /// text stays (a caption written for that photo must not leave alone; BQ2, F7(1)).
+    Held,
+    /// Send these.
+    Files(LocationSend),
+}
+
+/// The strip's form of the setting "Files with location data".
+pub(crate) fn location_pref(files: LocationFiles) -> LocationPref {
+    match files {
+        LocationFiles::Ask => LocationPref::Ask,
+        LocationFiles::Always => LocationPref::Always,
+        LocationFiles::Never => LocationPref::Never,
+    }
 }
 
 impl Default for ComposerRust {
@@ -205,6 +329,8 @@ impl Default for ComposerRust {
             preparing_done: 0,
             folder_question: QVariant::from(&QMap::<QMapPair_QString_QVariant>::default()),
             folder_asking: false,
+            location_question: QVariant::from(&QMap::<QMapPair_QString_QVariant>::default()),
+            location_asking: false,
             shared: None,
             app: None,
             handle: None,
@@ -220,6 +346,7 @@ impl Default for ComposerRust {
             asked: None,
             confirming: false,
             shown_confirming: false,
+            location_asked: None,
         }
     }
 }
@@ -230,7 +357,7 @@ impl Default for ComposerRust {
 static PASTE: Mutex<Option<(AppHandle, CxxQtThread<ComposerController>, i64)>> = Mutex::new(None);
 
 /// The local path of a `file://` URL or a plain absolute path.
-fn local_path(url: &QString) -> Option<PathBuf> {
+pub(crate) fn local_path(url: &QString) -> Option<PathBuf> {
     let text = url.to_string();
     if text.starts_with('/') {
         return Some(PathBuf::from(text));
@@ -387,7 +514,67 @@ impl ComposerRust {
         self.conversation = conversation;
         // The text area tells what it holds for the new chat.
         self.long_caption = None;
+        // The location question was about the chat that is left: it closes with nothing
+        // sent, and the text stays there as its draft (F6).
+        self.location_asked = None;
         dropped
+    }
+
+    /// The setting "Files with location data" as it is now (Settings keep the one copy, F1);
+    /// without a running app, "Ask each time".
+    fn location_pref(&self) -> LocationPref {
+        self.handle
+            .as_ref()
+            .map(|h| location_pref(h.desktop().prefs().location_files))
+            .unwrap_or_default()
+    }
+
+    /// What a press of Send with `text` in `conversation` does with the open list's files
+    /// under `pref`. Holding files for their location ("Never send") or letting held ones go
+    /// ("Always send") is done here; nothing is sent.
+    pub(crate) fn files_send(
+        &mut self,
+        conversation: i64,
+        text: &str,
+        pref: LocationPref,
+    ) -> FilesSend {
+        if self.location_asked.is_some() {
+            return FilesSend::Busy;
+        }
+        if self.strip.sendable().is_empty() && self.strip.located().is_empty() {
+            return FilesSend::Text;
+        }
+        if !self.strip.can_send() {
+            return FilesSend::Wait;
+        }
+        let reply = (self.reply_to_id > 0).then_some(self.reply_to_id);
+        let located = self.strip.located();
+        match pref {
+            LocationPref::Ask => {
+                if let Some((question, asked)) =
+                    self.strip.location_question(conversation, text, reply)
+                {
+                    self.location_asked = Some(asked);
+                    return FilesSend::Ask(question);
+                }
+            }
+            LocationPref::Never => {
+                self.strip.hold(&located);
+            }
+            LocationPref::Always => {
+                self.strip.release(&located);
+            }
+        }
+        let paths = self.strip.sendable();
+        if paths.is_empty() {
+            return FilesSend::Held;
+        }
+        FilesSend::Files(LocationSend {
+            paths,
+            as_file: self.strip.sendable_as_file(),
+            with_location: self.strip.sendable_with_location(pref),
+            text: text.to_owned(),
+        })
     }
 
     /// The list of `conversation`: the open one, or the one that waits for a chat that is
@@ -471,9 +658,12 @@ impl ComposerRust {
 impl qobject::ComposerController {
     /// Shows the strip as it is: the list, the counts, the summary line.
     fn publish(mut self: Pin<&mut Self>) {
+        // (The rows say what the setting does with a located file.)
+        let pref = self.location_pref();
+        self.as_mut().rust_mut().strip.set_location_pref(pref);
         let rows = self.strip.rows();
         let summary = self.strip.summary();
-        let sendable = self.strip.files().len() - summary.folders - summary.refused;
+        let sendable = sendable_count(&self.strip, pref);
         let planned = self.strip.planned();
         let can_send = self.strip.can_send();
         self.as_mut().rust_mut().generation += 1;
@@ -825,7 +1015,7 @@ impl qobject::ComposerController {
                     true
                 }
                 FolderDone::Packed(path, Ok(packed)) => {
-                    if strip.folder_packed(id, path.clone(), packed.bytes_out) {
+                    if strip.folder_packed(id, path.clone(), packed.bytes_out, packed.located) {
                         let text = folder_packed_notice(&folder, packed.missing);
                         notice = (!text.is_empty()).then_some(text);
                         true
@@ -966,6 +1156,8 @@ impl qobject::ComposerController {
             return;
         }
         let dropped = self.as_mut().rust_mut().switch_to(conversation);
+        // (`switch_to` dropped the location question with the chat.)
+        self.as_mut().show_location(None);
         self.as_mut().rust_mut().stop_jobs(&dropped);
         if let Some(h) = &self.handle {
             for f in dropped.iter().filter(|f| f.pasted) {
@@ -1235,28 +1427,27 @@ impl qobject::ComposerController {
         }
     }
 
-    /// Queues the strip's files that can be sent with `text` as their caption. The files the
-    /// network cannot take stay in the strip with their reasons.
-    fn send_files(
+    /// Queues `send` (files of the open list with their caption) to `conversation`. The files
+    /// the network cannot take, and those held for their location, stay in the strip.
+    fn dispatch_files(
         mut self: Pin<&mut Self>,
         shared: &Shared,
         conversation: i64,
-        text: &str,
+        send: LocationSend,
     ) -> bool {
-        if !self.strip.can_send() {
-            // A quote the files cannot carry and no text for it: the strip's hint says so.
-            let hint = self.strip.summary().hint;
-            self.as_mut().set_notice(QString::from(hint.as_str()));
-            return false;
-        }
-        let paths = self.strip.sendable();
-        let as_file = self.strip.sendable_as_file();
+        let LocationSend {
+            paths,
+            as_file,
+            with_location,
+            text,
+        } = send;
         let reply = (*self.reply_to_id() > 0).then(|| MessageId(*self.reply_to_id()));
         let result = shared.borrow_mut().source.send_files(
             ConversationId(conversation),
             paths,
             as_file,
-            text,
+            with_location,
+            &text,
             reply,
         );
         match result {
@@ -1264,21 +1455,27 @@ impl qobject::ComposerController {
                 let sent = self.as_mut().rust_mut().strip.take_sendable();
                 // (Folders that are not files or an archive yet stay too; they were not
                 // refused, and their rows say where they stand.)
-                let left = self.strip.summary().refused;
+                let summary = self.strip.summary();
                 // The core copies the pasted ones first: they are deleted when it says the
                 // request is over (`sends_finished`).
-                self.as_mut().rust_mut().pasted_out.sent(
-                    request,
-                    sent.iter().filter(|f| f.pasted).map(|f| f.path.clone()),
-                );
+                self.as_mut()
+                    .rust_mut()
+                    .pasted_out
+                    .sent_from_strip(request, &sent);
                 self.as_mut().cancel_reply();
                 self.as_mut().strip_changed();
                 self.as_mut().refresh_preparing();
                 self.as_mut().set_error(QString::default());
                 // What stayed behind is said once more where the user looks after a send.
-                self.as_mut().set_notice(QString::from(
-                    refused_notice(left, sent.len(), true).as_str(),
-                ));
+                let notice = [
+                    refused_notice(summary.refused, sent.len(), true),
+                    located_stayed_notice(summary.held),
+                ]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+                self.as_mut().set_notice(QString::from(notice.as_str()));
                 defer(
                     shared,
                     self.app.as_deref(),
@@ -1299,8 +1496,125 @@ impl qobject::ComposerController {
         }
     }
 
+    /// The setting "Files with location data" changed (Settings, the one owner): the list
+    /// is shown again under it, its rows' notes and its counts.
+    pub fn refresh_location_pref(self: Pin<&mut Self>) {
+        self.publish();
+    }
+
+    /// Shows the location question (`None`: closes it).
+    fn show_location(mut self: Pin<&mut Self>, question: Option<&LocationQuestion>) {
+        if question.is_none() && !*self.location_asking() {
+            return;
+        }
+        let mut map = QMap::<QMapPair_QString_QVariant>::default();
+        if let Some(q) = question {
+            let mut text = |key: &str, value: &str| {
+                map.insert(QString::from(key), QVariant::from(&QString::from(value)));
+            };
+            text("title", &q.title);
+            text("text", &q.text);
+            text("more", &q.more);
+            text("stillGoes", &q.still_goes);
+            text("accessible", &q.accessible);
+            text("sendLabel", &q.send_label);
+            text("holdLabel", &q.hold_label);
+            text("rememberLabel", &q.remember_label);
+            text("settingsHint", &q.settings_hint);
+            let mut names = QList::<QString>::default();
+            for name in &q.names {
+                names.append(QString::from(name.as_str()));
+            }
+            map.insert(
+                QString::from("names"),
+                QVariant::from(&QStringList::from(&names)),
+            );
+            map.insert(
+                QString::from("focusDontSend"),
+                QVariant::from(&q.focus_dont_send),
+            );
+            map.insert(
+                QString::from("count"),
+                QVariant::from(&i32::try_from(q.count).unwrap_or(i32::MAX)),
+            );
+        }
+        self.as_mut().set_location_question(QVariant::from(&map));
+        let asking = question.is_some();
+        if *self.location_asking() != asking {
+            self.as_mut().set_location_asking(asking);
+        }
+    }
+
+    /// The answer to the location question: `send` (Send with Location) or `hold` (Don't
+    /// Send). It applies to what the question was asked about: when that moved meanwhile,
+    /// nothing goes and the question is asked again about what stands now. Returns whether
+    /// the answer APPLIED: `false` when it was stale (or no question stood), so the dialog
+    /// stores "Remember my choice" only for an answer that did something (U1). When files
+    /// were sent, `sentFromQuestion` follows and clears the text area.
+    pub fn answer_location(mut self: Pin<&mut Self>, answer: &QString) -> bool {
+        let answer = match answer.to_string().as_str() {
+            "send" => LocationAnswer::Send,
+            "hold" => LocationAnswer::Hold,
+            // The dialog was closed without an answer and Send is pressed again: the question
+            // no longer stands. Nothing is sent, held or remembered; the next Send asks anew
+            // about what stands then (with the text of that press).
+            "dismiss" => {
+                if self.as_mut().rust_mut().location_asked.take().is_some() {
+                    self.as_mut().show_location(None);
+                }
+                return false;
+            }
+            _ => return false,
+        };
+        let Some(asked) = self.as_mut().rust_mut().location_asked.take() else {
+            return false;
+        };
+        self.as_mut().show_location(None);
+        let conversation = self.conversation;
+        let reply = (*self.reply_to_id() > 0).then_some(*self.reply_to_id());
+        // ("Remember my choice" is stored by the dialog through Settings, F1.)
+        let outcome = self.as_mut().rust_mut().strip.answer_location(
+            &asked,
+            conversation,
+            reply,
+            answer,
+            false,
+        );
+        match outcome {
+            LocationOutcome::Stale => {
+                self.as_mut().publish();
+                let again = self
+                    .strip
+                    .location_question(conversation, asked.text(), reply);
+                if let Some((question, snapshot)) = again {
+                    self.as_mut().rust_mut().location_asked = Some(snapshot);
+                    self.show_location(Some(&question));
+                }
+                false
+            }
+            LocationOutcome::Nothing { .. } => {
+                self.as_mut().publish();
+                let held = self.strip.summary().held;
+                self.set_notice(QString::from(located_stayed_notice(held).as_str()));
+                true
+            }
+            LocationOutcome::Send { send, .. } => {
+                let Some(shared) = self.shared.clone() else {
+                    return false;
+                };
+                if self.as_mut().dispatch_files(&shared, conversation, send) {
+                    self.sent_from_question();
+                }
+                true
+            }
+        }
+    }
+
     /// Sends `text` to `conversation` (or the strip's files with `text` as their caption);
-    /// `true` when the source accepted it.
+    /// `true` when the source accepted it. Files that would leave with where they were taken
+    /// go as the setting "Files with location data" says: asked about first (`false`, the
+    /// question is open; `answerLocation` sends), always, or never (they stay in the list,
+    /// and when no file would go, nothing goes and the text stays).
     pub fn send(mut self: Pin<&mut Self>, conversation: i64, text: &QString) -> bool {
         let Some(shared) = self.shared.clone() else {
             return false;
@@ -1308,25 +1622,52 @@ impl qobject::ComposerController {
         if *self.edit_id() > 0 {
             return self.send_edit(&shared, conversation, &text.to_string());
         }
-        // Files that can go are sent with the text as their caption. When none can, the
-        // text goes by itself: files the network cannot take hold nothing back.
-        if !self.strip.sendable().is_empty() {
-            return self.send_files(&shared, conversation, &text.to_string());
-        }
-        let reply = (*self.reply_to_id() > 0).then(|| MessageId(*self.reply_to_id()));
         let body = text.to_string();
+        let pref = self.location_pref();
+        match self
+            .as_mut()
+            .rust_mut()
+            .files_send(conversation, &body, pref)
+        {
+            FilesSend::Busy => false,
+            FilesSend::Wait => {
+                // A verdict pending, or a quote the files cannot carry and no text for it:
+                // the strip's hint says so.
+                let hint = self.strip.summary().hint;
+                self.as_mut().set_notice(QString::from(hint.as_str()));
+                false
+            }
+            FilesSend::Ask(question) => {
+                self.as_mut().publish();
+                self.show_location(Some(&question));
+                false
+            }
+            FilesSend::Held => {
+                self.as_mut().publish();
+                let held = self.strip.summary().held;
+                self.set_notice(QString::from(located_stayed_notice(held).as_str()));
+                false
+            }
+            FilesSend::Files(send) => self.dispatch_files(&shared, conversation, send),
+            FilesSend::Text => self.send_text(&shared, conversation, &body),
+        }
+    }
+
+    /// Sends `body` by itself.
+    fn send_text(mut self: Pin<&mut Self>, shared: &Shared, conversation: i64, body: &str) -> bool {
+        let reply = (*self.reply_to_id() > 0).then(|| MessageId(*self.reply_to_id()));
         let result =
             shared
                 .borrow_mut()
                 .source
-                .send_text(ConversationId(conversation), &body, reply);
+                .send_text(ConversationId(conversation), body, reply);
         match result {
             Ok(_) => {
                 self.as_mut().cancel_reply();
                 self.as_mut().set_error(QString::default());
                 self.as_mut().set_notice(QString::default());
                 defer(
-                    &shared,
+                    shared,
                     self.app.as_deref(),
                     Changes {
                         timeline: true,
@@ -1491,6 +1832,15 @@ impl qobject::ComposerController {
         };
         // The pasted files of the request: what comes back belongs to a list again, what
         // went out again waits for that request, anything else is no longer needed.
+        // (Asked before `refused` forgets them.)
+        let archives: HashMap<PathBuf, bool> = refused
+            .paths()
+            .filter_map(|p| {
+                self.pasted_out
+                    .archive_of(p)
+                    .map(|located| (p.clone(), located))
+            })
+            .collect();
         let mut gone = self.as_mut().rust_mut().pasted_out.refused(
             refused.request,
             &returning,
@@ -1509,19 +1859,7 @@ impl qobject::ComposerController {
             return;
         }
         let is_pasted = |path: &PathBuf| self.handle.as_ref().is_some_and(|h| h.is_pasted(path));
-        let mut marked = Vec::new();
-        let mut whole = Vec::new();
-        for file in refused.files {
-            let handed = HandedFile {
-                pasted: is_pasted(&file.path),
-                as_file: file.as_file,
-                path: file.path,
-            };
-            match file.reason {
-                Some(reason) => marked.push((handed, reason)),
-                None => whole.push(handed),
-            }
-        }
+        let (marked, whole) = hand_back(refused.files, is_pasted, |p| archives.get(p).copied());
         {
             let mut rust = self.as_mut().rust_mut();
             let strip = if here {
@@ -1613,6 +1951,26 @@ pub struct LoginRust {
     pub(crate) retry: bool,
     pub(crate) leave: QString,
     pub(crate) fields: QVariant,
+    /// The emoji of the emoji step as a list of `{glyph, name}` maps (empty at every other
+    /// step), and whether the QR code is replaced by a new one while the page waits (the
+    /// page says so only then): both written by the viewmodel.
+    pub(crate) emoji: QVariant,
+    pub(crate) rotates: bool,
+    /// The way that runs (`qr`, `pair-code`), the other way the page offers (empty: none) and
+    /// its button's label, the numbered instructions, the line above input fields and the
+    /// network's icon key: all written by the viewmodel, none by the backend.
+    pub(crate) flow: QString,
+    pub(crate) other_flow: QString,
+    pub(crate) other_flow_label: QString,
+    pub(crate) steps: QStringList,
+    pub(crate) explain: QString,
+    pub(crate) icon: QString,
+    /// The label of the button that asks for a new login code (empty: the step offers none) and
+    /// the wait that REMAINS before it may be used, in ms (0: at once): both written by the
+    /// viewmodel from the code field's delivery, set BEFORE `kind` so the page reads them when
+    /// the step turns up (the page restarts its timer at every `input` step).
+    pub(crate) resend_label: QString,
+    pub(crate) resend_after_ms: i32,
     pub(crate) shared: Option<Shared>,
     pub(crate) app: Option<Box<CxxQtThread<App>>>,
     /// Values typed into the current input step, by field id.
@@ -1635,6 +1993,16 @@ impl Default for LoginRust {
             retry: false,
             leave: QString::default(),
             fields: QVariant::default(),
+            emoji: QVariant::default(),
+            rotates: false,
+            flow: QString::default(),
+            other_flow: QString::default(),
+            other_flow_label: QString::default(),
+            steps: QStringList::default(),
+            explain: QString::default(),
+            icon: QString::default(),
+            resend_label: QString::default(),
+            resend_after_ms: 0,
             shared: None,
             app: None,
             values: Vec::new(),
@@ -1653,6 +2021,22 @@ fn fields_variant(v: &LoginView) -> QVariant {
         m.insert(QString::from("kind"), s(&f.kind));
         m.insert(QString::from("value"), s(&f.value));
         m.insert(QString::from("required"), QVariant::from(&f.required));
+        // The viewmodel's one line of plain text beside the field (a password's hint, an SMS
+        // code's first word); empty: none.
+        m.insert(QString::from("note"), s(&f.note));
+        list.append(QVariant::from(&m));
+    }
+    QVariant::from(&list)
+}
+
+/// The emoji of a login step as the list QML reads: one `{glyph, name}` map each.
+fn emoji_variant(v: &LoginView) -> QVariant {
+    let mut list = QList::<QVariant>::default();
+    for e in &v.emoji {
+        let mut m = QMap::<QMapPair_QString_QVariant>::default();
+        let s = |t: &str| QVariant::from(&QString::from(t));
+        m.insert(QString::from("glyph"), s(&e.glyph));
+        m.insert(QString::from("name"), s(&e.name));
         list.append(QVariant::from(&m));
     }
     QVariant::from(&list)
@@ -1690,6 +2074,23 @@ impl qobject::LoginController {
         }
     }
 
+    /// Switches to the other way of linking the same network: the page offered it with
+    /// `other_flow`. The running login stops and the other starts at once; a refusal (no such
+    /// flow, a step without the switch) changes nothing on the page.
+    pub fn switch_flow(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let flow = self.other_flow().to_string();
+        if flow.is_empty() {
+            return;
+        }
+        let view = shared.borrow_mut().source.switch_login_flow(&flow);
+        if let Ok(v) = view {
+            self.as_mut().show(&v);
+        }
+    }
+
     /// Sets the value of an input field of the current step.
     pub fn set_field(mut self: Pin<&mut Self>, id: &QString, value: &QString) {
         let (id, value) = (id.to_string(), value.to_string());
@@ -1701,11 +2102,24 @@ impl qobject::LoginController {
     }
 
     /// Answers the current input step with the field values.
-    pub fn submit(mut self: Pin<&mut Self>) {
+    pub fn submit(self: Pin<&mut Self>) {
+        let values = self.values.clone();
+        self.answer(values);
+    }
+
+    /// Asks the network for a new login code: the request alone ([`RESEND_FIELD`]), never with the
+    /// typed fields (a half-typed code stays on the page's field and is not sent). The step that
+    /// follows (the same code step, now without the button when the network allows no more) is
+    /// shown like any other.
+    pub fn resend(self: Pin<&mut Self>) {
+        self.answer(vec![(RESEND_FIELD.to_owned(), "1".to_owned())]);
+    }
+
+    /// Hands `values` to the core as the answer to the current step.
+    fn answer(mut self: Pin<&mut Self>, values: Vec<(String, String)>) {
         let Some(shared) = self.shared.clone() else {
             return;
         };
-        let values = self.values.clone();
         let result = shared.borrow_mut().source.submit_login(values);
         match result {
             Ok(()) => {
@@ -1724,12 +2138,14 @@ impl qobject::LoginController {
         if let Some(shared) = self.shared.clone() {
             shared.borrow_mut().source.cancel_login();
             // The link page no longer shows a history transfer of the account: the banner
-            // takes it over.
+            // takes it over. A replace whose announced account this was ended: the accounts
+            // are read so the choice of shown accounts lets its slot go at once.
             defer(
                 &shared,
                 self.app.as_deref(),
                 Changes {
                     transfer: true,
+                    accounts: true,
                     ..Changes::default()
                 },
             );
@@ -1761,6 +2177,24 @@ impl qobject::LoginController {
         self.as_mut().set_retry(v.retry);
         self.as_mut().set_leave(QString::from(v.leave.as_str()));
         self.as_mut().set_fields(fields_variant(v));
+        self.as_mut().set_emoji(emoji_variant(v));
+        self.as_mut().set_rotates(v.rotates);
+        self.as_mut().set_flow(QString::from(v.flow.as_str()));
+        self.as_mut()
+            .set_other_flow(QString::from(v.other_flow.as_str()));
+        self.as_mut()
+            .set_other_flow_label(QString::from(v.other_flow_label.as_str()));
+        let mut steps = QStringList::default();
+        for step in &v.steps {
+            steps.append(QString::from(step.as_str()));
+        }
+        self.as_mut().set_steps(steps);
+        self.as_mut().set_explain(QString::from(v.explain.as_str()));
+        self.as_mut().set_icon(QString::from(v.icon.as_str()));
+        self.as_mut()
+            .set_resend_label(QString::from(v.resend.as_str()));
+        self.as_mut()
+            .set_resend_after_ms(i32::try_from(v.resend_after_ms).unwrap_or(i32::MAX));
         // `kind` last: QML switches on it and then reads the fields above.
         self.set_kind(QString::from(v.kind.as_str()));
     }
@@ -1815,21 +2249,41 @@ impl qobject::LoginController {
     }
 }
 
+/// `names` as the list QML reads.
+fn names_list(names: &[String]) -> QStringList {
+    let mut list = QStringList::default();
+    for n in names {
+        list.append(QString::from(n.as_str()));
+    }
+    list
+}
+
 /// Rust side of `SettingsController`.
 pub struct SettingsRust {
     pub(crate) tray: bool,
     pub(crate) autostart: bool,
     pub(crate) start_hidden: bool,
     pub(crate) compact: bool,
+    /// "Show chats of several accounts together" (`blend-accounts`). The App's choice of
+    /// shown accounts follows it; the hidden accounts themselves are the App's to save.
+    pub(crate) blend_accounts: bool,
     pub(crate) round_avatars: bool,
     /// The theme's avatar corner as a share of a list avatar's side, as QML last said (not
     /// saved: the theme is the front-end's).
     pub(crate) avatar_corner: f64,
     pub(crate) notification_content: i32,
+    /// "Files with location data" as the combo's index (0 ask, 1 always send, 2 never send).
+    pub(crate) location_files: i32,
     /// What happens to disappearing messages whose time has come while this computer's
     /// clock is unconfirmed: the core's name of the option (`hide`, `keep`, `erase`); empty
     /// until the core has said.
     pub(crate) expiry_policy: QString,
+    /// Whether quiet notices count for the conversation list: the core's name of the choice
+    /// (`hide`, `show`); empty until the core has said.
+    pub(crate) quiet_notices: QString,
+    /// The experimental networks the person turned on (the preference; a change takes effect
+    /// when Kourier starts again).
+    pub(crate) networks_on: QStringList,
     /// Where changes are saved and applied (none in pure UI tests).
     pub(crate) desktop: Option<DesktopHandle>,
     /// The core's own settings are read and changed through the source.
@@ -1851,24 +2305,40 @@ impl SettingsRust {
             autostart: prefs.autostart,
             start_hidden: prefs.start_hidden,
             compact: prefs.compact,
+            blend_accounts: prefs.blend_accounts,
             round_avatars: prefs.round_avatars,
             avatar_corner: 0.0,
             notification_content: prefs.notification_content.index(),
+            location_files: prefs.location_files.index(),
             expiry_policy: QString::default(),
+            quiet_notices: QString::default(),
+            networks_on: names_list(&prefs.networks_on),
             desktop,
             shared: None,
             app: None,
         }
     }
 
+    /// The preferences this page holds, on top of the stored ones: what the page has no
+    /// control for (the experimental networks that are turned on, the one-shot link request,
+    /// the accounts the list hides, which the App writes) stays as the file has it. A field
+    /// listed here is this page's alone: another writer's change of it would be undone by the
+    /// next toggle.
     fn prefs(&self) -> Prefs {
         Prefs {
             tray: self.tray,
             autostart: self.autostart,
             start_hidden: self.start_hidden,
             compact: self.compact,
+            blend_accounts: self.blend_accounts,
             round_avatars: self.round_avatars,
             notification_content: NotificationContent::from_index(self.notification_content),
+            location_files: LocationFiles::from_index(self.location_files),
+            ..self
+                .desktop
+                .as_ref()
+                .map(DesktopHandle::prefs)
+                .unwrap_or_default()
         }
     }
 }
@@ -1905,6 +2375,64 @@ impl qobject::SettingsController {
         self.update(|s| std::mem::replace(&mut s.compact, value) != value);
     }
 
+    /// `blendAccounts`: saved, then the App's choice of shown accounts follows it (after the
+    /// current call returned: the re-entrancy rule).
+    pub fn set_blend_accounts_pref(mut self: Pin<&mut Self>, value: bool) {
+        if self.blend_accounts == value {
+            return;
+        }
+        self.as_mut().update(|s| {
+            s.blend_accounts = value;
+            true
+        });
+        if let Some(app) = self.app.as_deref()
+            && app
+                .queue(move |app| app.blend_setting_changed(value))
+                .is_err()
+        {
+            tracing::debug!("App destroyed before the blend setting was applied");
+        }
+    }
+
+    /// `setNetworkOn`: the preference of an experimental network. The change is saved at once
+    /// and read back from the stored file's state, so another change that happens at the same
+    /// time is not undone.
+    pub fn set_network_on(mut self: Pin<&mut Self>, kind: &QString, on: bool) {
+        let kind = kind.to_string();
+        let Some(kind) = kourier_model::NetworkKind::ALL
+            .into_iter()
+            .find(|k| k.as_str() == kind)
+        else {
+            return;
+        };
+        let Some(desktop) = self.desktop.clone() else {
+            return;
+        };
+        desktop.update_prefs(|p| p.set_network_on(kind, on));
+        let list = names_list(&desktop.prefs().networks_on);
+        if self.networks_on == list {
+            return;
+        }
+        self.as_mut().rust_mut().networks_on = list;
+        self.changed();
+    }
+
+    /// `accountsOf`: how many accounts of the network `kind` exist now.
+    pub fn accounts_of(&self, kind: &QString) -> i32 {
+        let kind = kind.to_string();
+        let Some(shared) = &self.shared else {
+            return 0;
+        };
+        let count = shared
+            .borrow()
+            .source
+            .accounts()
+            .iter()
+            .filter(|a| a.network.as_str() == kind)
+            .count();
+        i32::try_from(count).unwrap_or(i32::MAX)
+    }
+
     /// `roundAvatars`. Notification avatars read it from the preferences at each use.
     pub fn set_round_avatars_pref(self: Pin<&mut Self>, value: bool) {
         self.update(|s| std::mem::replace(&mut s.round_avatars, value) != value);
@@ -1925,6 +2453,12 @@ impl qobject::SettingsController {
     pub fn set_notification_content_pref(self: Pin<&mut Self>, value: i32) {
         let value = NotificationContent::from_index(value).index();
         self.update(|s| std::mem::replace(&mut s.notification_content, value) != value);
+    }
+
+    /// `locationFiles` (0 ask each time, 1 always send, 2 never send; out of range = ask).
+    pub fn set_location_files_pref(self: Pin<&mut Self>, value: i32) {
+        let value = LocationFiles::from_index(value).index();
+        self.update(|s| std::mem::replace(&mut s.location_files, value) != value);
     }
 
     /// The settings page is shown: what the core keeps is asked for (`expiryPolicy` follows
@@ -1967,6 +2501,46 @@ impl qobject::SettingsController {
         );
     }
 
+    /// `quietNotices`: chooses by the core's name (`hide`, `show`). It holds at once and the
+    /// core stores it; the list is read again behind the command (the source does that, and
+    /// the new order comes with the answer). A name the core does not know changes nothing.
+    pub fn set_quiet_notices_pref(mut self: Pin<&mut Self>, value: &QString) {
+        if *value == self.quiet_notices {
+            return;
+        }
+        let shown = match value.to_string().as_str() {
+            "show" => true,
+            "hide" => false,
+            _ => {
+                self.changed();
+                return;
+            }
+        };
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        if !shared.borrow_mut().source.set_quiet_notices(shown) {
+            // Not taken: the page shows what holds.
+            self.changed();
+            return;
+        }
+        self.as_mut().rust_mut().quiet_notices = value.clone();
+        self.as_mut().changed();
+    }
+
+    /// What the core says the choice is (its answer, or its word after a change failed).
+    pub(crate) fn show_quiet_notices(mut self: Pin<&mut Self>, shown: Option<bool>) {
+        let name = QString::from(match shown {
+            None => "",
+            Some(true) => "show",
+            Some(false) => "hide",
+        });
+        if self.quiet_notices != name {
+            self.as_mut().rust_mut().quiet_notices = name;
+            self.changed();
+        }
+    }
+
     /// What the core says the option is (its answer, or its word after a change failed).
     pub(crate) fn show_expiry_policy(mut self: Pin<&mut Self>, name: Option<&'static str>) {
         let name = QString::from(name.unwrap_or_default());
@@ -1980,6 +2554,168 @@ impl qobject::SettingsController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use kourier_app::facade::FilesPreview;
+    use kourier_model::{AttachmentKind, FilePlan};
+
+    /// The core's plan for the open list: each file its own message, `location` its verdicts.
+    fn plan_located(c: &mut ComposerRust, kinds: &[AttachmentKind], location: &[bool]) {
+        let preview = FilesPreview {
+            kinds: kinds.iter().map(|k| Some(*k)).collect(),
+            refused: Vec::new(),
+            plan: FilePlan {
+                lead_text: false,
+                caption_messages: 0,
+                messages: (0..kinds.len()).map(|i| vec![i]).collect(),
+                reply_unsendable: false,
+            },
+            location: location.to_vec(),
+        };
+        let serial = c.strip.serial();
+        assert!(c.strip.apply_plan(&PlanAnswer { serial, preview }));
+    }
+
+    /// A composer for chat 7 whose list holds `names`, planned with `location`.
+    fn composer_with(names: &[&str], kinds: &[AttachmentKind], location: &[bool]) -> ComposerRust {
+        let mut c = ComposerRust::default();
+        c.switch_to(7);
+        c.strip.add(
+            names.iter().map(|n| PathBuf::from(format!("/t/{n}"))),
+            false,
+        );
+        plan_located(&mut c, kinds, location);
+        c
+    }
+
+    use AttachmentKind::{File as Doc, Image, Video};
+
+    #[test]
+    fn a_send_while_the_location_question_is_open_does_nothing() {
+        let mut c = composer_with(&["trip.mp4", "notes.pdf"], &[Video, Doc], &[true, false]);
+        let FilesSend::Ask(question) = c.files_send(7, "Look", LocationPref::Ask) else {
+            panic!("Ask each time asks first");
+        };
+        assert_eq!(question.title, "Send It Anyway?");
+        assert!(c.location_asked.is_some());
+        // Return repeats, a second click: nothing goes, nothing changes, the question stays.
+        for pref in [LocationPref::Ask, LocationPref::Always, LocationPref::Never] {
+            assert!(matches!(c.files_send(7, "Look", pref), FilesSend::Busy));
+        }
+        assert!(c.location_asked.is_some());
+        assert_eq!(c.strip.len(), 2);
+        assert!(c.strip.files().iter().all(|f| !f.held));
+        // The answer applies to the snapshot; after it, Send works again.
+        let asked = c.location_asked.take().unwrap();
+        let LocationOutcome::Send { send, .. } =
+            c.strip
+                .answer_location(&asked, 7, None, LocationAnswer::Send, false)
+        else {
+            panic!("Send with Location sends");
+        };
+        assert_eq!(send.with_location, [true, false]);
+        assert_eq!(send.text, "Look");
+    }
+
+    #[test]
+    fn another_chat_drops_the_location_question() {
+        let mut c = composer_with(&["trip.mp4"], &[Video], &[true]);
+        assert!(matches!(
+            c.files_send(7, "Look", LocationPref::Ask),
+            FilesSend::Ask(_)
+        ));
+        c.switch_to(9);
+        assert!(
+            c.location_asked.is_none(),
+            "the question closes with its chat"
+        );
+        // Back in chat 7 the file waits as it was (nothing sent, nothing held), and Send asks
+        // again.
+        c.switch_to(7);
+        assert_eq!(c.strip.len(), 1);
+        assert!(!c.strip.files()[0].held);
+        assert!(matches!(
+            c.files_send(7, "Look", LocationPref::Ask),
+            FilesSend::Ask(_)
+        ));
+    }
+
+    #[test]
+    fn never_send_keeps_a_lone_located_file_and_its_caption() {
+        let mut c = composer_with(&["IMG_0001.jpg"], &[Image], &[true]);
+        // Nothing goes: not the photo, and not the caption written for it (BQ2, F7(1)).
+        assert!(matches!(
+            c.files_send(7, "Our street", LocationPref::Never),
+            FilesSend::Held
+        ));
+        assert!(c.strip.files()[0].held);
+        // Pressed again with the photo held: still nothing, never the text alone.
+        assert!(matches!(
+            c.files_send(7, "Our street", LocationPref::Never),
+            FilesSend::Held
+        ));
+        assert_eq!(c.strip.summary().held, 1);
+        // With another file the rest goes and the photo stays.
+        let mut c = composer_with(
+            &["IMG_0001.jpg", "notes.pdf"],
+            &[Image, Doc],
+            &[true, false],
+        );
+        let FilesSend::Files(send) = c.files_send(7, "Our street", LocationPref::Never) else {
+            panic!("the other file goes");
+        };
+        assert_eq!(send.paths, [PathBuf::from("/t/notes.pdf")]);
+        assert_eq!(send.with_location, [false]);
+        assert_eq!(send.text, "Our street");
+        // A list of files the network refused only (none goes, none held): the text goes.
+        let mut c = ComposerRust::default();
+        c.switch_to(7);
+        assert!(matches!(
+            c.files_send(7, "Hi", LocationPref::Never),
+            FilesSend::Text
+        ));
+    }
+
+    #[test]
+    fn always_send_flags_every_file_that_goes() {
+        let mut c = composer_with(
+            &["trip.mp4", "notes.pdf", "IMG_0001.jpg"],
+            &[Video, Doc, Image],
+            &[true, false, true],
+        );
+        // A file held by an earlier Don't Send goes too once the setting says always.
+        let first = c.strip.files()[2].id;
+        c.strip.hold(&[first]);
+        let FilesSend::Files(send) = c.files_send(7, "", LocationPref::Always) else {
+            panic!("Always send sends without a question");
+        };
+        assert_eq!(send.paths.len(), 3);
+        assert_eq!(send.with_location, [true, true, true], "F16: every file");
+        assert!(c.location_asked.is_none());
+        // Under Ask nothing is flagged without the answer; a list without located files does
+        // not ask.
+        let mut c = composer_with(&["notes.pdf"], &[Doc], &[false]);
+        let FilesSend::Files(send) = c.files_send(7, "", LocationPref::Ask) else {
+            panic!("nothing to ask about");
+        };
+        assert_eq!(send.with_location, [false]);
+        // A verdict not in yet: Send waits.
+        let mut c = ComposerRust::default();
+        c.switch_to(7);
+        c.strip.add([PathBuf::from("/t/new.mp4")], false);
+        assert!(matches!(
+            c.files_send(7, "", LocationPref::Always),
+            FilesSend::Wait
+        ));
+    }
+
+    #[test]
+    fn the_setting_reaches_the_strips_form() {
+        assert_eq!(location_pref(LocationFiles::Ask), LocationPref::Ask);
+        assert_eq!(location_pref(LocationFiles::Always), LocationPref::Always);
+        assert_eq!(location_pref(LocationFiles::Never), LocationPref::Never);
+        // Without a running app: Ask each time.
+        assert_eq!(ComposerRust::default().location_pref(), LocationPref::Ask);
+    }
 
     #[test]
     fn a_pasted_file_stays_until_the_core_answers_its_send() {
@@ -2184,5 +2920,119 @@ mod tests {
         out.sent(4, [p("y.png")]);
         assert_eq!(out.refused(4, &HashSet::new(), None), vec![p("y.png")]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_held_file_counts_under_ask_and_always_but_not_under_never() {
+        // U3: a lone located video, no text, answered Don't Send: Send must stay possible.
+        let mut c = composer_with(&["trip.mp4"], &[Video], &[true]);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Ask), 1);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Never), 0);
+        let ids = c.strip.located();
+        c.strip.hold(&ids);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Ask), 1);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Always), 1);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Never), 0);
+        // The next press asks again under Ask, and under Always lets it go, flagged.
+        assert!(matches!(
+            c.files_send(7, "", LocationPref::Ask),
+            FilesSend::Ask(_)
+        ));
+        c.location_asked = None;
+        let FilesSend::Files(send) = c.files_send(7, "", LocationPref::Always) else {
+            panic!("Always lets the held file go");
+        };
+        assert_eq!(send.with_location, [true]);
+        // Under Never it stays and nothing goes.
+        let mut c = composer_with(&["trip.mp4"], &[Video], &[true]);
+        let ids = c.strip.located();
+        c.strip.hold(&ids);
+        assert!(matches!(
+            c.files_send(7, "", LocationPref::Never),
+            FilesSend::Held
+        ));
+        // Next to a plain file: both count under Ask.
+        let mut c = composer_with(&["trip.mp4", "b.pdf"], &[Video, Doc], &[true, false]);
+        let ids = c.strip.located();
+        c.strip.hold(&ids);
+        assert_eq!(sendable_count(&c.strip, LocationPref::Ask), 2);
+    }
+
+    #[test]
+    fn a_refused_archive_comes_back_saying_what_is_inside_it() {
+        // P1: through the strip, the returned archive's next plan says true and Send asks.
+        let archives: HashMap<PathBuf, bool> = [(PathBuf::from("/t/Raw footage.zip"), true)].into();
+        let returned = |name: &str, reason| ReturnedFile {
+            path: PathBuf::from(format!("/t/{name}")),
+            as_file: false,
+            reason,
+        };
+        let (marked, whole) = hand_back(
+            vec![
+                returned("Raw footage.zip", None),
+                returned("notes.pdf", None),
+                returned("other.zip", Some(FileRefusal::Unreadable)),
+            ],
+            |_| false,
+            |p| archives.get(p).copied(),
+        );
+        assert_eq!(whole.len(), 2);
+        assert_eq!(whole[0].archive, Some(true));
+        assert_eq!(whole[1].archive, None);
+        assert_eq!(marked[0].0.archive, None);
+        let mut c = ComposerRust::default();
+        c.switch_to(7);
+        c.strip.add_handed(whole);
+        plan_located(&mut c, &[Doc, Doc], &[false, false]);
+        assert_eq!(c.strip.located().len(), 1, "the archive is asked about");
+        assert!(matches!(
+            c.files_send(7, "", LocationPref::Ask),
+            FilesSend::Ask(_)
+        ));
+        // Under Never it is held; the PDF goes alone.
+        c.location_asked = None;
+        let FilesSend::Files(send) = c.files_send(7, "", LocationPref::Never) else {
+            panic!("the other file goes");
+        };
+        assert_eq!(send.paths, [PathBuf::from("/t/notes.pdf")]);
+        assert!(c.strip.files().iter().any(|f| f.archive && f.held));
+    }
+
+    #[test]
+    fn an_archive_of_a_folder_is_remembered_until_its_request_is_over() {
+        // P1: the core hands back paths only; the archive's "location inside" is kept here.
+        let p = |name: &str| PathBuf::from(format!("/run/paste/{name}"));
+        let mut out = PastedOut::default();
+        let mut strip = FileStrip::new();
+        let handed = |name: &str, archive| HandedFile {
+            path: p(name),
+            pasted: true,
+            as_file: false,
+            archive,
+        };
+        strip.add_handed([
+            handed("a.zip", Some(true)),
+            handed("b.zip", Some(false)),
+            handed("c.png", None),
+        ]);
+        out.sent_from_strip(1, &strip.take_sendable());
+        assert_eq!(out.archive_of(&p("a.zip")), Some(true));
+        assert_eq!(out.archive_of(&p("b.zip")), Some(false));
+        assert_eq!(out.archive_of(&p("c.png")), None);
+        // Refused, `a.zip` comes back (asked before `refused`); `b.zip` went out again as
+        // request 2 and stays known until that is over, even if that one is refused too.
+        let back: HashSet<PathBuf> = [p("a.zip")].into();
+        assert_eq!(out.refused(1, &back, Some(2)), Vec::<PathBuf>::new());
+        assert_eq!(out.archive_of(&p("a.zip")), None, "it is the strip's now");
+        assert_eq!(out.archive_of(&p("b.zip")), Some(false));
+        let back: HashSet<PathBuf> = [p("b.zip"), p("c.png")].into();
+        assert_eq!(out.archive_of(&p("b.zip")), Some(false));
+        assert_eq!(out.refused(2, &back, None), Vec::<PathBuf>::new());
+        assert_eq!(out.archive_of(&p("b.zip")), None);
+        // A finished request forgets its archives.
+        strip.add_handed([handed("d.zip", Some(true))]);
+        out.sent_from_strip(3, &strip.take_sendable());
+        assert_eq!(out.finished(3, SendOutcome::Stored), vec![p("d.zip")]);
+        assert_eq!(out.archive_of(&p("d.zip")), None);
     }
 }

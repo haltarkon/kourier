@@ -1,0 +1,33 @@
+[package]
+# Kourier patch P3: renamed so that it is not a [patch.crates-io] of `blake2` (see VENDORED.md); the
+# library keeps the name `blake2`.
+name = "libthreema-blake2"
+version = "0.10.6"
+description = "BLAKE2 hash functions"
+authors = ["RustCrypto Developers"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+edition = "2018"
+documentation = "https://docs.rs/blake2"
+repository = "https://github.com/RustCrypto/hashes"
+keywords = ["blake2", "crypto", "digest", "hash"]
+categories = ["cryptography", "no-std"]
+
+[lib]
+name = "blake2"
+
+[dependencies]
+digest = { version = "0.10.3", features = ["mac"] }
+
+[dev-dependencies]
+digest = { version = "0.10.3", features = ["dev"] }
+hex-literal = "0.2.2"
+
+[features]
+default = ["std"]
+reset = [] # Enable reset functionality
+simd = []
+simd_asm = ["simd_opt"]
+simd_opt = ["simd"]
+size_opt = [] # Optimize for code size. Removes some `inline(always)`
+std = ["digest/std"]

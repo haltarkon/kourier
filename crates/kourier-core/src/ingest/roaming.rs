@@ -100,10 +100,34 @@ impl Apply<'_> {
 
     /// Server limits and flags.
     pub(crate) fn account_caps(&mut self, caps: &AccountCaps) -> Result<()> {
+        // What the account's chats offer of the roaming settings follows the account's statement
+        // (`ConversationRow::roaming`): when the statement moves (stated for the first time, the
+        // switch turned on or off), every chat of the account is announced as changed. A stored
+        // statement that cannot be read counts as none.
+        let before: Option<String> = self
+            .conn
+            .prepare_cached("SELECT caps FROM accounts WHERE id = ?1")?
+            .query_row([self.acc.id.0], |r| r.get(0))?;
+        let before = sql::from_json_opt::<AccountCaps>(before)
+            .ok()
+            .flatten()
+            .and_then(|c| c.roaming_writes());
         self.conn
             .prepare_cached("UPDATE accounts SET caps = ?2 WHERE id = ?1")?
             .execute((self.acc.id.0, sql::to_json(caps)?))?;
         self.ch.accounts = true;
+        if before != caps.roaming_writes() {
+            let ids: Vec<i64> = self
+                .conn
+                .prepare_cached(
+                    "SELECT id FROM conversations WHERE account_id = ?1 AND hidden = 0",
+                )?
+                .query_map([self.acc.id.0], |r| r.get(0))?
+                .collect::<kourier_db::rusqlite::Result<_>>()?;
+            self.ch
+                .conversations
+                .extend(ids.into_iter().map(ConversationId));
+        }
         Ok(())
     }
 
@@ -177,12 +201,16 @@ impl Apply<'_> {
             Option<i64>,
             String,
             Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
         );
         let row: Option<Row> = self
             .conn
             .prepare_cached(
                 "SELECT id, profile_name, system_name, nickname, avatar_file, trust, fingerprint,
-                   blocked, hidden, unregistered_at, identifiers, meta
+                   blocked, hidden, unregistered_at, identifiers, meta, about, about_emoji,
+                   number_shown
                  FROM contacts WHERE account_id = ?1 AND user_id = ?2",
             )?
             .query_row((self.acc.id.0, user.as_str()), |r| {
@@ -199,6 +227,9 @@ impl Apply<'_> {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                    r.get(14)?,
                 ))
             })
             .optional()?;
@@ -218,6 +249,9 @@ impl Apply<'_> {
             unregistered_at: r.9,
             identifiers: sql::from_json(&r.10)?,
             meta: sql::blob_from_sql(r.11),
+            about: r.12,
+            about_emoji: r.13,
+            number_shown: r.14,
         };
         Ok(Some((contact, r.4)))
     }
@@ -228,15 +262,17 @@ impl Apply<'_> {
             .prepare_cached(
                 "INSERT INTO contacts(account_id, user_id, profile_name, system_name, nickname,
                    avatar_file, trust, fingerprint, blocked, hidden, unregistered_at, identifiers,
-                   meta, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                   meta, updated_at, about, about_emoji, number_shown)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(account_id, user_id) DO UPDATE SET
                    profile_name = excluded.profile_name, system_name = excluded.system_name,
                    nickname = excluded.nickname, avatar_file = excluded.avatar_file,
                    trust = excluded.trust, fingerprint = excluded.fingerprint,
                    blocked = excluded.blocked, hidden = excluded.hidden,
                    unregistered_at = excluded.unregistered_at, identifiers = excluded.identifiers,
-                   meta = excluded.meta, updated_at = excluded.updated_at",
+                   meta = excluded.meta, updated_at = excluded.updated_at,
+                   about = excluded.about, about_emoji = excluded.about_emoji,
+                   number_shown = excluded.number_shown",
             )?
             .execute(params![
                 self.acc.id.0,
@@ -253,6 +289,9 @@ impl Apply<'_> {
                 sql::to_json(&c.identifiers)?,
                 c.meta.as_ref().map(sql::blob_to_sql),
                 self.now,
+                c.about,
+                c.about_emoji,
+                c.number_shown,
             ])?;
         Ok(())
     }
@@ -273,6 +312,9 @@ impl Apply<'_> {
             unregistered_at: None,
             identifiers: Vec::new(),
             meta: None,
+            about: None,
+            about_emoji: None,
+            number_shown: None,
         }
     }
 
@@ -317,12 +359,15 @@ impl Apply<'_> {
             Option<i64>,
             Option<String>,
             Option<Vec<u8>>,
+            Option<String>,
+            bool,
         );
         let r: Row = self
             .conn
             .prepare_cached(
                 "SELECT is_self, title, avatar_file, muted_until, archived, pinned_order, blocked,
-                   request_pending, marked_unread, timer_secs, features, meta
+                   request_pending, marked_unread, timer_secs, features, meta, description,
+                   protected
                  FROM conversations WHERE id = ?1",
             )?
             .query_row([id.0], |r| {
@@ -339,6 +384,8 @@ impl Apply<'_> {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
                 ))
             })?;
         let members: Vec<Member> = self
@@ -367,6 +414,7 @@ impl Apply<'_> {
             key,
             is_self: r.0,
             title: r.1,
+            description: r.12,
             avatar: self.load_file(r.2)?,
             members,
             muted_until: r.3,
@@ -387,6 +435,7 @@ impl Apply<'_> {
             read_up_to: None,
             last_activity: 0,
             meta: sql::blob_from_sql(r.11),
+            protected: r.13,
         };
         Ok((conv, features_known))
     }
@@ -434,6 +483,7 @@ impl Apply<'_> {
         }
         let parent = std::mem::take(&mut p.parent);
         let unread_hint = p.unread_hint.take();
+        let stated = (p.server_unread.take(), p.server_mentions.take());
         let features_set = p.features.is_some();
         let members_set = p.members.is_some();
         let avatar_touched = !p.avatar.is_unchanged();
@@ -472,7 +522,8 @@ impl Apply<'_> {
                    muted_until = ?5, archived = ?6, pinned_order = ?7, blocked = ?8,
                    request_pending = ?9, marked_unread = ?10, timer_secs = ?11, features = ?12,
                    features_hash = ?13, meta = ?14,
-                   parent_id = CASE WHEN ?15 THEN ?16 ELSE parent_id END, timer_version = ?17
+                   parent_id = CASE WHEN ?15 THEN ?16 ELSE parent_id END, timer_version = ?17,
+                   description = ?18, protected = ?19
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -494,6 +545,8 @@ impl Apply<'_> {
                 parent_id.is_some(),
                 parent_id.flatten(),
                 timer_version,
+                conv.description,
+                conv.protected,
             ])?;
         if members_set {
             self.conn
@@ -521,6 +574,24 @@ impl Apply<'_> {
                 .prepare_cached("UPDATE conversations SET unread_hint = ?2 WHERE id = ?1")?
                 .execute((id.0, i64::from(hint)))?;
             self.ch.recount_conv(id);
+        }
+        // What the server counts (KT-2). A count of a network whose server owns none has no reader:
+        // `unread_hint` is what such a network states.
+        if stated != (None, None) {
+            if self.server.owns_unread {
+                self.conn
+                    .prepare_cached(
+                        "UPDATE conversations SET unread_server = coalesce(?2, unread_server),
+                           mentions_server = coalesce(?3, mentions_server) WHERE id = ?1",
+                    )?
+                    .execute((id.0, stated.0, stated.1))?;
+                self.ch.recount_conv(id);
+            } else {
+                tracing::debug!(
+                    account = self.acc.id.0,
+                    "a count from a network whose server owns none was ignored"
+                );
+            }
         }
         self.ch.conversations.insert(id);
         // New features, a block or a change of our role change what the user may do with the
@@ -610,35 +681,60 @@ impl From<kourier_model::IdError> for CoreError {
     }
 }
 
-/// The primary own ids of the other accounts of `id`'s network that are not being removed,
-/// each with whether that account is logged out, in the order of their ids. An account that
-/// has no own id yet (a link in progress) has none to name.
-pub(crate) fn other_identities(
+/// The other accounts of `id`'s network that are not being removed, each with ALL its own ids
+/// (the primary first) and whether it is logged out, in the order of their account ids. An
+/// account that has no own id yet (a link in progress) is left out. `leaving` are accounts whose
+/// removal was asked for but whose row does not say `Removing` yet (their supervisor has not got
+/// to it: `Shared::removing`); they are left out as well.
+fn other_accounts(
     conn: &kourier_db::rusqlite::Connection,
     id: kourier_model::AccountId,
-) -> Result<Vec<(UserId, bool)>> {
-    let rows: Vec<(String, String)> = conn
+    leaving: &[kourier_model::AccountId],
+) -> Result<Vec<(Vec<UserId>, bool)>> {
+    let rows: Vec<(i64, String, String)> = conn
         .prepare_cached(
-            "SELECT state, own_ids FROM accounts
+            "SELECT id, state, own_ids FROM accounts
              WHERE id <> ?1 AND state <> 'Removing'
                AND network = (SELECT network FROM accounts WHERE id = ?1)
              ORDER BY id",
         )?
-        .query_map([id.0], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([id.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     let mut out = Vec::new();
-    for (state, own) in rows {
+    for (other, state, own) in rows {
+        if leaving.contains(&kourier_model::AccountId(other)) {
+            continue;
+        }
         let own: Vec<UserId> = sql::from_json(&own)?;
-        if let Some(primary) = own.into_iter().next() {
-            out.push((primary, state == "LoggedOut"));
+        if !own.is_empty() {
+            out.push((own, state == "LoggedOut"));
         }
     }
     Ok(out)
 }
 
+/// EVERY own id of the other accounts of `id`'s network that are not being removed, each with
+/// whether its account is logged out: the list a login is handed as `StartLogin::taken` (W2b). A
+/// WhatsApp account has two (its LID and its phone number), and a login that is given a typed
+/// number must see the number to refuse it before the code is asked for; Signal's accounts name
+/// their ACI first and the check by ACI is unchanged. The order is the accounts' ids, and within
+/// an account the order of its own ids.
+pub(crate) fn other_identities(
+    conn: &kourier_db::rusqlite::Connection,
+    id: kourier_model::AccountId,
+    leaving: &[kourier_model::AccountId],
+) -> Result<Vec<(UserId, bool)>> {
+    Ok(other_accounts(conn, id, leaving)?
+        .into_iter()
+        .flat_map(|(own, logged_out)| own.into_iter().map(move |user| (user, logged_out)))
+        .collect())
+}
+
 /// Whether another account of `id`'s network, not being removed, has `primary` as its primary
-/// own id; `Some(logged_out)` of the first such account.
-fn same_identity(
+/// own id; `Some(logged_out)` of the first such account. THE rule for "the same identity" (the
+/// core's check at `AccountReady`, and the account label's `twin`): the PRIMARY own ids are
+/// compared, never an account's other ids (W2b review F3).
+pub(crate) fn same_identity(
     conn: &kourier_db::rusqlite::Connection,
     id: kourier_model::AccountId,
     primary: Option<&UserId>,
@@ -646,8 +742,9 @@ fn same_identity(
     let Some(primary) = primary else {
         return Ok(None);
     };
-    Ok(other_identities(conn, id)?
+    // The primary only: the core's own check at `AccountReady` stays what it was.
+    Ok(other_accounts(conn, id, &[])?
         .into_iter()
-        .find(|(user, _)| user == primary)
+        .find(|(own, _)| own.first() == Some(primary))
         .map(|(_, logged_out)| logged_out))
 }

@@ -1534,7 +1534,7 @@ async fn wait_for_phone<T: SignalTransport>(shared: &Rc<Shared<T>>, stored: &Sto
             // By this device's clock. The server has the last word.
             return last_ask(shared, &mut conn).await;
         }
-        let socket = shared.socket.borrow().clone();
+        let socket = shared.work_socket();
         let Some(socket) = socket else {
             // Not connected: the wait goes on, and so does its deadline.
             tokio::select! {
@@ -1624,7 +1624,7 @@ async fn last_ask<T: SignalTransport>(
 ) -> Step {
     let mut failures = 0;
     loop {
-        let socket = shared.socket.borrow().clone();
+        let socket = shared.work_socket();
         let Some(socket) = socket else {
             tokio::select! {
                 () = shared.transfer.skip.notified() => return Step::UserSkipped,

@@ -56,7 +56,8 @@ Kirigami.PromptDialog {
     footer: QQC2.Control {
         id: footerBar
 
-        readonly property real sideBySide: stopButton.implicitWidth + keepButton.implicitWidth + buttons.columnSpacing
+        // The side-by-side row has THREE cells (the spacer, then the two buttons): two spacings (RF2).
+        readonly property real sideBySide: stopButton.implicitWidth + keepButton.implicitWidth + 2 * buttons.columnSpacing
         readonly property bool stacked: footerBar.availableWidth < footerBar.sideBySide
 
         padding: Kirigami.Units.largeSpacing
@@ -67,8 +68,9 @@ Kirigami.PromptDialog {
             id: buttons
 
             columns: footerBar.stacked ? 1 : 3
-            columnSpacing: Kirigami.Units.smallSpacing
-            rowSpacing: Kirigami.Units.smallSpacing
+            // The desktop DialogButtonBox's spacing (UR2).
+            columnSpacing: Kirigami.Units.mediumSpacing
+            rowSpacing: Kirigami.Units.mediumSpacing
             enabled: root.opened
 
             Item {

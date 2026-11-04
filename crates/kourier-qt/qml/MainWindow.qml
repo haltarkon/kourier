@@ -25,7 +25,7 @@ Kirigami.ApplicationWindow {
     // Closing without a tray, or the Quit key: the application should quit.
     signal closedForGood()
     // The chat column is on screen with a conversation (read markers, notifications).
-    readonly property bool chatShown: App.timeline.conversationId !== 0 && root.chatPage !== null && root.chatPage.Kirigami.ColumnView.inViewport && (root.wideScreen || root.pageStack.currentItem === root.chatPage)
+    readonly property bool chatShown: App.timeline.conversationId !== 0 && root.chatPage !== null && root.chatPage.Kirigami.ColumnView.inViewport && !root.chatPage.panelCovers && (root.wideScreen || root.pageStack.currentItem === root.chatPage)
     // The first frame was presented.
     property bool framed: false
     // The chat page takes its column right after the first frame (see `showListWith`).
@@ -61,7 +61,8 @@ Kirigami.ApplicationWindow {
     globalDrawer: AccountsDrawer {
         id: accountsDrawer
         window: root
-        // A moment late when the last account goes (see `accountsShown`).
+        // Follows the drawer's `accountsShown`: a moment late when the last account goes
+        // (a UI choice, see there).
         enabled: accountsDrawer.accountsShown
         settingsKeys: root.settingsKeys
         onOpenSettings: root.leavingLink(root.openSettings)
@@ -79,7 +80,7 @@ Kirigami.ApplicationWindow {
         // In a narrow window the list is on screen only while the chat is not.
         showsNotice: !root.wideScreen || App.timeline.conversationId === 0 || App.timeline.cannotSend !== ""
         searchKeys: root.searchKeys
-        onOpenConversation: id => root.openingChat(id)
+        onOpenConversation: id => root.pickedChat(id)
         onSwitchedByKeyboard: id => root.switchTo(id)
         onBannerActivated: root.bannerPressed()
     }
@@ -88,11 +89,15 @@ Kirigami.ApplicationWindow {
     property WelcomePage welcomePage: null
     property LinkAccountPage linkPage: null
     property SettingsPage settingsPage: null
+    // The warning before a new account of an experimental network (made anew each time).
+    property RiskNoticePage riskPage: null
 
     Component {
         id: chatComponent
         ChatPage {
             visible: false
+            // A group in common (or "Message") on the details panel opens that chat.
+            onConversationRequested: id => root.pickedChat(id)
         }
     }
     // The chat column of the first frame: the chat page's empty state without the chat page
@@ -129,6 +134,14 @@ Kirigami.ApplicationWindow {
         LinkAccountPage {
             visible: false
             onCancelled: root.leaveLink()
+        }
+    }
+    Component {
+        id: riskComponent
+        RiskNoticePage {
+            visible: false
+            onCancelled: root.leaveRisk()
+            onAccepted: network => root.acceptRisk(network)
         }
     }
     Component {
@@ -335,6 +348,14 @@ Kirigami.ApplicationWindow {
         });
     }
 
+    // A chat of the list was picked (a click, Enter on a row): an archived chat that a search
+    // found brings the archive view with it, with the chat highlighted in it (Signal
+    // Desktop's rule). A notification does not (`openFromActivation`): it opens its chat and
+    // leaves the list as it is.
+    function pickedChat(id: real): void {
+        root.openingChat(id, () => App.revealChat(id));
+    }
+
     // A notification click or a link: open `id` now, or once the start page is up.
     function openFromActivation(id: real): void {
         if (id <= 0) {
@@ -362,8 +383,57 @@ Kirigami.ApplicationWindow {
         root.pushWelcome();
     }
 
+    // `network` was chosen on the welcome page. A network that asks first (WhatsApp) shows its
+    // warning page; the link starts when the person accepts it. The window's one entry for a
+    // link with the network alone: the welcome page, the tests and the dev control (which
+    // invokes it by its signature, `openLink(QString)`) call it.
     function openLink(network: string): void {
+        root.openLinkAs(network, false);
+    }
+
+    // `warned`: the tick of the warning counted for this link already (a restart that turned
+    // the network on opens its link page by itself, "Turn On and Restart").
+    function openLinkAs(network: string, warned: bool): void {
         // Pop an open link page first: that abandons its login (onPageRemoved below).
+        root.popAfter(root.ensureWelcome());
+        const risk = warned ? ({}) : App.networkRisk(network);
+        if (risk.title !== undefined) {
+            root.pushRisk(network, risk);
+            return;
+        }
+        App.login.start(network);
+        root.pushLink();
+    }
+
+    // The warning page, made anew (its tick box starts unticked every time).
+    function pushRisk(network: string, risk: var): void {
+        // (The caller popped every page after the welcome page, the old warning included.)
+        if (root.riskPage !== null && !root.inStack(root.riskPage)) {
+            root.riskPage.destroy();
+            root.riskPage = null;
+        }
+        root.riskPage = riskComponent.createObject(root, {
+            "network": network,
+            "view": risk
+        }) as RiskNoticePage;
+        pageStack.push(root.riskPage);
+    }
+
+    // Back from the warning: the welcome page again; nothing was started, so nothing is asked.
+    function leaveRisk(): void {
+        root.popAfter(root.ensureWelcome());
+    }
+
+    // The person ticked the box and went on. A network that is off is turned on first and
+    // Kourier starts again (the warning counts for the link that opens by itself after the
+    // restart); one that is on starts its link now.
+    function acceptRisk(network: string): void {
+        for (let i = 0; i < App.networks.length; ++i) {
+            if (App.networks[i].kind === network && (!App.networks[i].on || (App.networks[i].experimental && !Style.networkWanted(network)))) {
+                root.restartAsking(() => App.turnOnNetworkAndRestart(network, true));
+                return;
+            }
+        }
         root.popAfter(root.ensureWelcome());
         App.login.start(network);
         root.pushLink();
@@ -396,11 +466,26 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // A restart that turned a network on asked for its link page, once ("Turn On and
+    // Restart"): the warning's tick counted for it.
+    function openPendingLink(): void {
+        const network = App.takePendingLink();
+        if (network === "") {
+            return;
+        }
+        if (root.welcomePage === null || !root.inStack(root.welcomePage)) {
+            root.openWelcome();
+        }
+        root.openLinkAs(network, true);
+    }
+
     function start(): void {
         if (root.started) {
             return;
         }
         root.started = true;
+        // After the first page is up.
+        Qt.callLater(root.openPendingLink);
         const page = App.startPage;
         // The pages that walk a link: the link page, its QR code, and its states of a
         // history transfer.
@@ -413,10 +498,36 @@ Kirigami.ApplicationWindow {
             }
             if (root.transferLinkPages.indexOf(page) >= 0) {
                 pageSetup.start();
+            } else if (page === "warisk") {
+                // The warning of a network that is off: the page a click on its row opens.
+                root.openLink("WhatsApp");
+            } else if (page === "tgwarn") {
+                // The same for Telegram, off (`FixtureOptions::telegramOff`: the one page that
+                // lists it).
+                root.openLink("Telegram");
+            } else if (App.fixture && root.whatsappLinkPages.indexOf(page) >= 0) {
+                // WhatsApp's link page at its QR code, at the phone-number question or at the
+                // code (the warning counted: the person ticked it for this link). Only on the
+                // throwaway fixture profile: the counted warning would start a real link
+                // without the warning (the argument parser refuses these pages without
+                // --fixture too).
+                root.openLinkAs("WhatsApp", true);
+                whatsappLinkSetup.start();
+            } else if (App.fixture && root.threemaLinkPages.indexOf(page) >= 0) {
+                // Threema's link page at its QR code or at the emoji (the warning counted, as for
+                // WhatsApp's; fixture only for the same reason).
+                root.openLinkAs("Threema", true);
+                threemaLinkSetup.start();
+            } else if (App.fixture && root.telegramLinkPages.indexOf(page) >= 0) {
+                // Telegram's link page at its QR code, at the code of the phone-number way or at
+                // its password (the warning counted, as for the others; fixture only for the same
+                // reason).
+                root.openLinkAs("Telegram", true);
+                telegramLinkSetup.start();
             }
             return;
         }
-        const chatPages = ["chat", "history", "media", "viewer", "compose", "files", "originals", "folder", "folderfiles", "folderzip"].concat(root.actionPages);
+        const chatPages = ["chat", "history", "media", "viewer", "compose", "files", "originals", "folder", "folderfiles", "folderzip", "location", "locationmany", "locationnever"].concat(root.actionPages);
         const showsChat = chatPages.indexOf(page) >= 0 && App.timeline.conversationId !== 0;
         // An ordinary start opens no chat: the chat column can wait for the first frame.
         root.showListWith(!showsChat && root.pendingConversation <= 0);
@@ -444,20 +555,28 @@ Kirigami.ApplicationWindow {
             App.settings.compact = true;
         } else if (page === "settings") {
             root.openSettings();
-        } else if (page === "expiry") {
-            // The settings page at "Disappearing messages", once the core has said what holds.
+        } else if (page === "expiry" || page === "networks") {
+            // The settings page at "Disappearing messages" or at "Networks", once the core has
+            // said what holds.
             root.openSettings();
             expirySetup.start();
         } else if (page === "about") {
             // The page Settings > "About Kourier" opens, on top of the settings page.
             root.openSettings();
             root.openAbout();
-        } else if (page === "transferbanner" || page === "transferfailed" || page === "transferupdate") {
+        } else if (page === "transferbanner" || page === "transferfailed" || page === "transferupdate" || page === "wahistory" || page === "walost") {
             // The backend says where the transfer stands once it may connect.
             pageSetup.start();
         } else if (page === "transferask") {
             // The settings page at "Accounts", with the question of its action open.
             root.openSettings();
+            pageSetup.start();
+        } else if (page === "archive") {
+            // The list at "Archived Chats", once it says there is one.
+            archiveSetup.start();
+        } else if (root.accountsPages.indexOf(page) >= 0) {
+            // Blended chats: the fixture's three accounts, the second hidden by the page (the
+            // choice goes through `App.toggleAccount`, as a click does); `pageSetup` waits for it.
             pageSetup.start();
         } else if (page === "drawer") {
             // The drawer as a sidebar (wide) or opened over the list (narrow).
@@ -523,8 +642,9 @@ Kirigami.ApplicationWindow {
         return false;
     }
 
-    // The keyboard goes to the conversation list's search field. A narrow window shows the
-    // chat or a page over the list: the list comes back first.
+    // The keyboard goes to the conversation list's search field (the archive view has none:
+    // the chats come back first, as in Signal Desktop). A narrow window shows the chat or a
+    // page over the list: the list comes back first.
     function focusSearch(): void {
         if (pageStack.depth > 0 && pageStack.get(0) === listPage) {
             pageStack.currentIndex = 0;
@@ -544,6 +664,9 @@ Kirigami.ApplicationWindow {
     // The quick switch opened `id`: the composer takes the keyboard once the chat is there.
     function switchTo(id: real): void {
         root.openingChat(id, () => {
+            // (An archived chat that the search found opens in the archive view. Before the
+            // field is emptied: the search is what lists it.)
+            App.revealChat(id);
             listPage.searchField.text = "";
             Qt.callLater(() => root.chatPage?.composer.focusInput());
         });
@@ -555,6 +678,9 @@ Kirigami.ApplicationWindow {
     function bannerPressed(): void {
         if (App.bannerKind === "loggedOut") {
             root.leavingLink(() => App.bannerActivate());
+        } else if (App.bannerKind === "networkOff") {
+            // "Turn On and Restart": the preference is written and Kourier starts again.
+            root.restartAsking(() => App.bannerActivate());
         } else {
             App.bannerActivate();
         }
@@ -594,8 +720,9 @@ Kirigami.ApplicationWindow {
         onActivated: root.quitAsking()
     }
 
-    // Tab walks a wide window the way the eye does: the search field, the conversations, the
-    // timeline, the composer (Shift+Tab the other way). Kirigami's own order puts the chat's
+    // Tab walks a wide window the way the eye does: the search field, the conversations (and the
+    // way into the archive after them), the timeline, the composer (Shift+Tab the other way).
+    // Kirigami's own order puts the chat's
     // footer and toolbar ahead of the list. While the account banner shows a button the
     // search field keeps the natural order, so that the button stays in reach.
     readonly property Item timelineStop: root.wideScreen && root.chatPage !== null && root.chatPage.open ? root.chatPage.timeline.rowList : null
@@ -605,20 +732,68 @@ Kirigami.ApplicationWindow {
         property: "tab"
         value: listPage.bannerShown ? null : listPage.conversations
     }
+    // The side panel beside the list comes before it (the eye's order: panel, search, chats):
+    // Shift+Tab from the search field reaches the panel's one Tab stop (UI-4). A modal drawer
+    // over the list is not in that order: there Shift+Tab reaches the toolbar's menu button, and
+    // Space on it opens the panel with the keyboard on that stop (V5).
+    Binding {
+        target: listPage.searchField.KeyNavigation
+        property: "backtab"
+        value: accountsDrawer.modal ? root.menuButton : accountsDrawer.tabEntry
+    }
+    // Kirigami's closed menu button of a narrow window: the list page toolbar's private
+    // `HandleButton`, the one item there whose `drawer` is ours (null when there is none).
+    readonly property Item menuButton: accountsDrawer.modal ? root.handleIn(listPage.globalToolBarItem) : null
+    // (`var`: the button's `drawer` is a member of Kirigami's private type, not of `Item`.)
+    function handleIn(item: var): Item {
+        if (item === null) {
+            return null;
+        }
+        if (item.drawer === accountsDrawer) {
+            return item;
+        }
+        for (const child of item.children) {
+            const found = root.handleIn(child);
+            if (found !== null) {
+                return found;
+            }
+        }
+        return null;
+    }
+    Connections {
+        target: accountsDrawer
+        // The keyboard that opened the modal panel goes into it, not behind its dim.
+        function onOpened(): void {
+            if (accountsDrawer.modal && root.menuButton !== null && root.menuButton.activeFocus) {
+                accountsDrawer.tabEntry.forceActiveFocus(Qt.TabFocusReason);
+            }
+        }
+    }
+    // (The archive view has no search field: Shift+Tab from its list goes to the Back arrow.)
     Binding {
         target: listPage.conversations.KeyNavigation
         property: "backtab"
-        value: listPage.searchField
+        value: App.archiveShown ? listPage.archiveBack : listPage.searchField
     }
+    // The list's last row, the way into the archive, is a stop of its own after the list (Down
+    // stops at the last chat) while it shows; the timeline's Shift+Tab lands on it. (Its own
+    // Shift+Tab, to the list, is the entry's: the list is the focus scope the entry sits in, and
+    // a focus scope cannot be given the keyboard from inside.)
+    readonly property Item archiveStop: listPage.archiveEntry
     Binding {
         target: listPage.conversations.KeyNavigation
+        property: "tab"
+        value: root.archiveStop !== null ? root.archiveStop : root.timelineStop
+    }
+    Binding {
+        target: root.archiveStop ? root.archiveStop.KeyNavigation : null
         property: "tab"
         value: root.timelineStop
     }
     Binding {
         target: root.timelineStop ? root.timelineStop.KeyNavigation : null
         property: "backtab"
-        value: listPage.conversations
+        value: root.archiveStop !== null ? root.archiveStop : listPage.conversations
     }
     Binding {
         target: root.timelineStop ? root.timelineStop.KeyNavigation : null
@@ -649,6 +824,17 @@ Kirigami.ApplicationWindow {
             if (root.started && !App.hasAccounts && (root.linkPage === null || root.pageStack.lastItem !== root.linkPage)) {
                 Qt.callLater(root.openWelcome);
             }
+        }
+    }
+
+    // "Restart Now", "Turn On and Restart" and the banner's "Turn On" ask for a start again: the
+    // window quits like a quit that was agreed to, and `main` starts the process anew once the
+    // core is down.
+    Connections {
+        target: App
+        function onRestartRequested(): void {
+            root.quitAgreed = true;
+            root.closedForGood();
         }
     }
 
@@ -755,7 +941,16 @@ Kirigami.ApplicationWindow {
     Component {
         id: viewerComponent
         ImageViewer {
-            onClosed: destroy()
+            id: viewerItem
+            onClosed: {
+                // A viewer opened from a gallery has its own query (the slot "viewer"): it ends with the
+                // viewer, unless another viewer took the slot meanwhile (this one closes after its
+                // transition, and the new one may have been opened already).
+                if (viewerItem.gallery !== "" && root.imageViewer === viewerItem) {
+                    App.closeChatMedia("viewer");
+                }
+                destroy();
+            }
         }
     }
 
@@ -795,18 +990,33 @@ Kirigami.ApplicationWindow {
 
     // The viewer that was opened last (fixture pages and tests step through it).
     property ImageViewer imageViewer: null
+    // How many viewers were opened (a test counts them: one click opens one).
+    property int viewersOpened: 0
 
     // Opens the viewer on `items` (one picture, or the pictures of an album) at `index`;
     // returns it. With `message` (the message they belong to) the viewer follows that
     // message's row from then on: a download that finishes, a picture that is deleted.
-    function openAlbumViewer(items: var, index: int, message: real): ImageViewer {
+    // With `gallery` (the slot of "Media and Files" the picture came from: "group", "person" or
+    // "media") the viewer follows the message through its OWN query (`App.showGalleryViewer`, made by
+    // the caller before: the whole album, read at the message) instead of the open timeline's rows.
+    function openAlbumViewer(items: var, index: int, message: real, gallery: var): ImageViewer {
+        // One viewer at a time: one that is still open is closed before the new one opens.
+        if (root.imageViewer !== null && root.imageViewer.visible) {
+            root.imageViewer.close();
+        }
+        if (typeof gallery !== "string" || gallery === "") {
+            // (A viewer of the timeline's: nothing of a gallery's own query is left behind.)
+            App.closeChatMedia("viewer");
+        }
         const viewer = viewerComponent.createObject(root, {
             "items": items,
             "index": index,
-            "message": message
+            "message": message,
+            "gallery": typeof gallery === "string" ? gallery : ""
         }) as ImageViewer;
         viewer?.open();
         root.imageViewer = viewer;
+        root.viewersOpened += 1;
         return viewer;
     }
 
@@ -842,6 +1052,19 @@ Kirigami.ApplicationWindow {
         function onAlbumRequested(items: var, index: int, message: real): void {
             root.openAlbumViewer(items, index, message);
         }
+        // A square of "Media and Files": the viewer opens at once with the slot's rows of the message
+        // (the open timeline need not hold it), and its own query of the message (the whole album: a
+        // section holds six squares, a level the pages it loaded) takes over when it answers.
+        function onGalleryRequested(slot: string, attachment: real, message: real): void {
+            const items = App.galleryViewerItems(slot, message);
+            for (let i = 0; i < items.length; ++i) {
+                if (items[i].attachment === attachment) {
+                    App.showGalleryViewer(slot, message);
+                    root.openAlbumViewer(items, i, message, slot);
+                    return;
+                }
+            }
+        }
         function onOpenRequested(attachment: real, name: string, media: bool): void {
             if (media) {
                 App.openExternally(attachment);
@@ -859,7 +1082,203 @@ Kirigami.ApplicationWindow {
     Connections {
         target: App
         function onExternalReady(attachment: real, url: string): void {
-            Qt.openUrlExternally(url);
+            App.openExternalUrl(url);
+        }
+    }
+
+    // A passing notice with, when `actionText` is not empty, one button (`callback` runs on a click):
+    // THE way the window tells the user something that ended ("Saved …", F3b; the undo of an archive,
+    // A10d, comes through it too). The text goes through `Style.plain` (it can hold a name or a file
+    // name from the network), is announced to a screen reader politely (a confirmation needs no
+    // interruption; Kirigami's passive notification has no announcement of its own), and is recorded
+    // for the tests.
+    function notify(text: string, actionText: string, callback: var): void {
+        const plain = Style.plain(text);
+        root.noticeCount += 1;
+        root.noticeText = plain;
+        root.noticeAction = actionText;
+        root.noticeCallback = callback ?? null;
+        root.showPassiveNotification(plain, "long", actionText, callback ?? (() => {}));
+        root.announce(plain);
+    }
+
+    // Tells a screen reader `text`, politely, and records what was told.
+    function announce(text: string): void {
+        root.noticeAnnounced = text;
+        root.noticeAnnouncedPoliteness = Accessible.Polite;
+        noticeSpeaker.Accessible.announce(text, Accessible.Polite);
+    }
+
+    // How many notices `notify` showed, the last one's text and button, what was announced and how.
+    property int noticeCount: 0
+    property string noticeText: ""
+    property string noticeAction: ""
+    property var noticeCallback: null
+    property string noticeAnnounced: ""
+    property int noticeAnnouncedPoliteness: -1
+
+    // (Not hidden: an item that is not visible has no accessible object to announce from.)
+    Item {
+        id: noticeSpeaker
+        width: 0
+        height: 0
+        Accessible.role: Accessible.StaticText
+        Accessible.name: root.noticeText
+    }
+
+    // Save As… and Save All… (F3b): the dialog is made on first use, from the file that
+    // `App.saveDialogSource()` names (empty: the built-in one), so the dialogs module is not loaded
+    // by the start. One attachment asks Rust for the name it is offered under (`App.askSave`), then
+    // the dialog starts there; several ask for a folder.
+    Loader {
+        id: saveDialogLoader
+        objectName: "saveDialogLoader"
+    }
+
+    // What the dialog says (the real one or a test's stand-in with the same signals): the file or the
+    // folder it was given, and that it is over (it is made anew the next time). The answer belongs
+    // to the attachments the DIALOG was opened for (`attachments`), not to `saveWanted`, which
+    // may have been set for another Save meanwhile.
+    Connections {
+        target: saveDialogLoader.item
+        ignoreUnknownSignals: true
+        function onPicked(chosen: url): void {
+            root.savePicked(root.saveDialog.attachments, chosen);
+        }
+        function onClosed(): void {
+            // Only the dialog that closed goes: another Save may have made a new one by the time
+            // the call runs.
+            const closed = saveDialogLoader.item;
+            Qt.callLater(() => {
+                if (saveDialogLoader.item === closed) {
+                    saveDialogLoader.source = "";
+                }
+            });
+        }
+    }
+
+    // The attachments the next dialog saves (their numbers): the Save that was asked last, until
+    // its dialog is made.
+    property var saveWanted: []
+    // The start folder of a folder dialog ("Save All…") is being looked for.
+    property bool saveFolderAsked: false
+    // How many dialogs were opened (a test counts them).
+    property int saveDialogsOpened: 0
+
+    // The dialog the window made (null while none stands).
+    readonly property var saveDialog: saveDialogLoader.item
+
+    function startSave(attachments: var): void {
+        if (!attachments || attachments.length === 0) {
+            return;
+        }
+        root.saveWanted = attachments;
+        if (attachments.length === 1) {
+            App.askSave(attachments[0]);
+        } else if (!root.saveFolderAsked) {
+            // The folder is looked for off the Qt thread; `saveFolderReady` opens the dialog.
+            root.saveFolderAsked = true;
+            App.askSaveFolder();
+        }
+    }
+
+    function openSaveDialog(properties: var): void {
+        const override = App.saveDialogSource();
+        root.saveDialogsOpened += 1;
+        saveDialogLoader.setSource(override !== "" ? override : Qt.resolvedUrl("dialogs/SaveDialog.qml"), properties);
+    }
+
+    function sameNumbers(a: var, b: var): bool {
+        return a.length === b.length && a.every((n, i) => n === b[i]);
+    }
+
+    // A dialog answered with a file (one attachment) or a folder (several): `attachments` are the
+    // ones that dialog was opened for. A Save asked meanwhile (`saveWanted` is another list) keeps
+    // its place.
+    function savePicked(attachments: var, target: url): void {
+        if (attachments.length === 1) {
+            App.saveTo(attachments[0], target);
+        } else if (attachments.length > 1) {
+            App.saveAll(attachments.join(","), target);
+        }
+        if (root.sameNumbers(root.saveWanted, attachments)) {
+            root.saveWanted = [];
+        }
+    }
+
+    // What a save or a batch ended in, in words (the same form for a failure: nothing but the class
+    // of the reason, never a path).
+    function saveNoticeText(saved: int, failed: int, name: string, reason: string): string {
+        if (failed === 0) {
+            return saved === 1 ? L10n.i18nc("@info:status, %1 the name of the saved file", "Saved “%1”", name) : L10n.i18ncp("@info:status, %1 how many files", "Saved %1 file", "Saved %1 files", saved);
+        }
+        if (saved > 0) {
+            return L10n.i18nc("@info:status, %1 how many files were saved, %2 how many were to be", "Some files could not be saved (%1 of %2 saved).", saved, saved + failed);
+        }
+        const what = failed === 1 ? L10n.i18nc("@info:status", "Could not save the file") : L10n.i18ncp("@info:status", "Could not save %1 file", "Could not save %1 files", failed);
+        let why = "";
+        switch (reason) {
+        case "nospace":
+            why = L10n.i18nc("@info:status why a file could not be saved", "there is no space left on the disk");
+            break;
+        case "notwritable":
+            why = L10n.i18nc("@info:status why a file could not be saved", "the folder is not writable");
+            break;
+        case "nofolder":
+            why = L10n.i18nc("@info:status why a file could not be saved", "the folder is gone");
+            break;
+        case "gone":
+            why = L10n.i18nc("@info:status why a file could not be saved", "the message is gone");
+            break;
+        case "nothere":
+            why = L10n.i18nc("@info:status why a file could not be saved", "the file is not on this computer");
+            break;
+        default:
+            return L10n.i18nc("@info:status, %1 what could not be saved", "%1.", what);
+        }
+        return L10n.i18nc("@info:status, %1 what could not be saved, %2 why", "%1: %2.", what, why);
+    }
+
+    Connections {
+        target: MediaActions
+        function onSaveRequested(attachments: var): void {
+            root.startSave(attachments);
+        }
+    }
+
+    Connections {
+        target: App
+        // The name is here: the dialog starts at the folder and the name Rust built.
+        function onSaveSuggested(attachment: real, url: string): void {
+            if (root.saveWanted.length === 1 && root.saveWanted[0] === attachment) {
+                root.openSaveDialog({
+                    "folder": false,
+                    "suggested": url,
+                    "attachments": root.saveWanted
+                });
+            }
+        }
+        // The folder is here: the folder dialog of "Save All…" starts there.
+        function onSaveFolderReady(url: string): void {
+            if (!root.saveFolderAsked) {
+                return;
+            }
+            root.saveFolderAsked = false;
+            if (root.saveWanted.length > 1) {
+                root.openSaveDialog({
+                    "folder": true,
+                    "startFolder": url,
+                    "attachments": root.saveWanted
+                });
+            }
+        }
+        function onSaveFinished(saved: int, failed: int, name: string, url: string, reason: string): void {
+            const text = root.saveNoticeText(saved, failed, name, reason);
+            if (saved > 0) {
+                root.notify(text, L10n.i18nc("@action:button", "Show in Folder"), () => App.showInFolder(url));
+            } else {
+                root.notify(text, "", null);
+            }
         }
     }
 
@@ -1048,10 +1467,11 @@ Kirigami.ApplicationWindow {
     // The user agreed to quit: the close that follows asks nothing more.
     property bool quitAgreed: false
 
-    // Quits (`closedForGood`): at once, or after the user agreed when a history transfer or
-    // the update after a new link still runs (they go on at the next start). The default
-    // answer keeps the application open. (The tray's own Quit asks nothing: the window may
-    // be hidden or not exist then.)
+    // Quits (`closedForGood`): at once, or after the user agreed when a network is still
+    // pushing the history of a new link (WhatsApp: what a quit cuts off may never arrive), a
+    // history transfer or the update after a new link still runs (those two go on at the next
+    // start). The default answer keeps the application open. (The tray's
+    // own Quit asks nothing: the window may be hidden or not exist then.)
     function quitAsking(): void {
         const question = root.quitAgreed ? undefined : App.quitQuestion();
         if (question === undefined || question === null) {
@@ -1080,6 +1500,50 @@ Kirigami.ApplicationWindow {
         root.quitDialog = dialog;
         dialog.closed.connect(() => {
             root.quitDialog = null;
+        });
+        dialog.open();
+    }
+
+    // The question "Restart Kourier?" while it is open (tests read it).
+    property Kirigami.PromptDialog restartDialog: null
+
+    // Runs `action`, which restarts Kourier ("Restart Now", "Turn On and Restart", the banner's
+    // button of a turned-off network), after the user agreed when work still runs: a restart
+    // ends the application like a quit (K-A fix U4), so the same question about the history a
+    // network is pushing (it does not go on at the next start), a history transfer or the update
+    // after a link comes first, with "Restart" as its answer. Nothing is
+    // written before the answer: `action` writes the preference and the one-shot link, and a
+    // "Cancel" leaves no trace of the restart.
+    function restartAsking(action: var): void {
+        const question = root.quitAgreed ? undefined : App.quitQuestion();
+        if (question === undefined || question === null) {
+            action();
+            return;
+        }
+        if (root.restartDialog !== null) {
+            return;
+        }
+        const component = Qt.createComponent(Qt.resolvedUrl("dialogs/StopLinkingDialog.qml"));
+        if (component.status !== Component.Ready) {
+            console.error("the question could not be made: " + component.errorString());
+            return;
+        }
+        const dialog = component.createObject(root, {
+            "question": {
+                "title": L10n.i18nc("@title:window question before the application restarts while work runs", "Restart Kourier?"),
+                "text": question.text,
+                "confirm": L10n.i18nc("@action:button restart the application", "Restart"),
+                "cancel": question.cancel
+            },
+            "confirmIcon": "view-refresh",
+            "action": action
+        }) as Kirigami.PromptDialog;
+        if (dialog === null) {
+            return;
+        }
+        root.restartDialog = dialog;
+        dialog.closed.connect(() => {
+            root.restartDialog = null;
         });
         dialog.open();
     }
@@ -1128,11 +1592,21 @@ Kirigami.ApplicationWindow {
 
     // The fixture pages of the message actions: each opens a chat (`App` does that) and, for
     // `setupPages`, one of its popups or composer modes once the rows are there.
-    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment"]
-    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask"]
+    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save"]
+    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media"]
+    // The fixture pages of blended chats: no chat opens, the list stands with its accounts.
+    readonly property list<string> accountsPages: ["accounts", "accountsdrawer"]
     // The fixture pages of a link in a state of a history transfer, with that state.
     readonly property list<string> transferLinkPages: ["transferwait", "transferdownload", "transferread"]
-    readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask"]
+    readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "wahistory", "walost"]
+    // The fixture pages at a step of WhatsApp's link page (K-A): the link walks to the step.
+    readonly property list<string> whatsappLinkPages: ["waqr", "waphone", "wacode"]
+    // The fixture pages at a step of Threema's link page (TH4 KH1c): the QR code, and the three emoji
+    // after the scan.
+    readonly property list<string> threemaLinkPages: ["thqr", "themoji"]
+    // The fixture pages at a step of Telegram's link page (KT-1b): the QR code, the code of the
+    // phone-number way, and the two-step password after it.
+    readonly property list<string> telegramLinkPages: ["tgqr", "tgcode", "tgpassword"]
     property bool pageReady: false
     // The page `transferask` asked its question (once).
     property bool transferAsked: false
@@ -1154,6 +1628,12 @@ Kirigami.ApplicationWindow {
             return App.bannerTransfer.phase === "downloading";
         case "transferfailed":
             return App.bannerTransfer.phase === "failed";
+        case "wahistory":
+            // (The phone's history still comes: the quiet line of the account banner.)
+            return App.bannerTransfer.phase === "history";
+        case "walost":
+            // (Part of it never arrived: the quiet line that stays, in the state banner.)
+            return App.bannerKind === "historyLost";
         case "transferask":
             if (!root.transferAsked) {
                 if (root.settingsPage !== null && App.historyAccounts.length > 0) {
@@ -1169,6 +1649,10 @@ Kirigami.ApplicationWindow {
     }
     // The folder pages answered the question (once).
     property bool folderAnswered: false
+    // The location pages pressed Send (once).
+    property bool locationPressed: false
+    // The media page sent its photo (once), when the timeline had this many rows.
+    property int mediaSentAt: -1
     Timer {
         id: expirySetup
         property int tries: 0
@@ -1177,16 +1661,139 @@ Kirigami.ApplicationWindow {
         onTriggered: {
             expirySetup.tries += 1;
             if (expirySetup.tries > 80) {
-                console.error("page expiry: the core never said what holds");
+                console.error("page " + App.startPage + ": the core never said what holds");
                 Qt.exit(1);
                 return;
             }
             if (root.settingsPage === null || App.settings.expiryPolicy === "") {
                 return;
             }
-            root.settingsPage.showExpiry();
+            if (App.startPage === "networks") {
+                root.settingsPage.showNetworks();
+            } else {
+                root.settingsPage.showExpiry();
+            }
             expirySetup.stop();
             root.pageReady = true;
+        }
+    }
+    // The pages `waqr`, `waphone` and `wacode`: the link of WhatsApp stands at its QR code, takes
+    // the phone-number way (the button the page offers) and types a number; each stops at its
+    // step and the picture is taken there.
+    Timer {
+        id: whatsappLinkSetup
+        property int tries: 0
+        interval: 150
+        repeat: true
+        onTriggered: {
+            whatsappLinkSetup.tries += 1;
+            if (whatsappLinkSetup.tries > 80) {
+                console.error("page " + App.startPage + ": the link never got there (" + App.login.kind + ")");
+                Qt.exit(1);
+                return;
+            }
+            const kind = App.login.kind;
+            if (App.startPage === "waqr") {
+                if (kind === "qr") {
+                    whatsappLinkSetup.stop();
+                    root.pageReady = true;
+                }
+                return;
+            }
+            if (kind === "qr" && App.login.otherFlow !== "") {
+                // (A second call while the new login is starting is ignored by the core's
+                // debounce.)
+                App.login.switchFlow();
+                return;
+            }
+            if (kind === "input" && App.login.flow === "pair-code") {
+                if (App.startPage === "waphone") {
+                    whatsappLinkSetup.stop();
+                    root.pageReady = true;
+                    return;
+                }
+                App.login.setField("phone", "+380501234567");
+                App.login.submit();
+                return;
+            }
+            if (kind === "code" && App.startPage === "wacode") {
+                whatsappLinkSetup.stop();
+                root.pageReady = true;
+            }
+        }
+    }
+    // The pages `thqr` and `themoji`: the link of Threema stands at its QR code, or one step on at the
+    // three emoji the fake's phone shows after the scan; the picture is taken there.
+    Timer {
+        id: threemaLinkSetup
+        property int tries: 0
+        interval: 150
+        repeat: true
+        onTriggered: {
+            threemaLinkSetup.tries += 1;
+            if (threemaLinkSetup.tries > 80) {
+                console.error("page " + App.startPage + ": the link never got there (" + App.login.kind + ")");
+                Qt.exit(1);
+                return;
+            }
+            if (App.login.kind === (App.startPage === "thqr" ? "qr" : "emoji")) {
+                threemaLinkSetup.stop();
+                root.pageReady = true;
+            }
+        }
+    }
+    // The pages `tgqr`, `tgcode` and `tgpassword`: the link of Telegram stands at its QR code,
+    // takes the phone-number way (the button the page offers), types the fixture's number
+    // (`FixtureOptions::TELEGRAM_NUMBER`) and, for the password page, the fixture's code
+    // (`FixtureOptions::TELEGRAM_CODE`); each stops at its step and the picture is taken there.
+    Timer {
+        id: telegramLinkSetup
+        property int tries: 0
+        interval: 150
+        repeat: true
+        onTriggered: {
+            telegramLinkSetup.tries += 1;
+            if (telegramLinkSetup.tries > 80) {
+                console.error("page " + App.startPage + ": the link never got there (" + App.login.kind + ")");
+                Qt.exit(1);
+                return;
+            }
+            const kind = App.login.kind;
+            if (App.startPage === "tgqr") {
+                if (kind === "qr") {
+                    telegramLinkSetup.stop();
+                    root.pageReady = true;
+                }
+                return;
+            }
+            if (kind === "qr" && App.login.otherFlow !== "") {
+                // (A second call while the new login is starting is ignored by the core's
+                // debounce.)
+                App.login.switchFlow();
+                return;
+            }
+            if (kind !== "input" || App.login.fields.length === 0) {
+                return;
+            }
+            const field = App.login.fields[0].id;
+            if (field === "phone") {
+                App.login.setField("phone", "+999000510284");
+                App.login.submit();
+            } else if (field === "code") {
+                if (App.startPage === "tgcode") {
+                    // (With the button the page offers for a new code: the picture shows it.)
+                    if (App.login.resendLabel !== "") {
+                        telegramLinkSetup.stop();
+                        root.pageReady = true;
+                    }
+                    return;
+                }
+                App.login.setField("code", "12345");
+                App.login.submit();
+            } else if (field === "password" && App.startPage === "tgpassword") {
+                telegramLinkSetup.stop();
+                root.pageReady = true;
+            }
         }
     }
     // The fixture page `about`: the About page on the page stack. Created by URL, when asked.
@@ -1199,6 +1806,39 @@ Kirigami.ApplicationWindow {
         }
         pageStack.push(component.createObject(root));
     }
+    // The pages `accounts` and `accountsdrawer`: waits for the three accounts and their chats,
+    // hides the second account once (the same call a click on its checkbox makes), waits for
+    // the list to follow and for its unread count on the panel; `accountsdrawer` then shows the
+    // side panel (wide: expanded; narrow: opened over the list). True when the page is final.
+    function accountsPageReady(): bool {
+        const actions = App.accountActions;
+        if (actions.length < 3 || App.conversations.count === 0 || App.shownCount === 0) {
+            return false;
+        }
+        if (actions[1].shown) {
+            App.toggleAccount(actions[1].account);
+            return false;
+        }
+        // The narrow open drawer leaves ONE account shown, so its greyed last box is in the
+        // pictures (UI-12).
+        const oneLeft = App.startPage === "accountsdrawer" && !root.wideScreen;
+        if (oneLeft && actions[2].shown) {
+            App.toggleAccount(actions[2].account);
+            return false;
+        }
+        if (App.shownCount !== (oneLeft ? 1 : actions.length - 1) || App.hiddenUnread <= 0) {
+            return false;
+        }
+        if (App.startPage === "accountsdrawer") {
+            if (root.wideScreen) {
+                accountsDrawer.collapsed = false;
+                return !accountsDrawer.collapsed;
+            }
+            accountsDrawer.open();
+            return accountsDrawer.drawerOpen;
+        }
+        return true;
+    }
     Timer {
         id: pageSetup
         property int tries: 0
@@ -1210,6 +1850,16 @@ Kirigami.ApplicationWindow {
                 // The fixture lacks what the page shows: fail loudly, not with a wrong picture.
                 console.error("page " + App.startPage + ": nothing to show it on");
                 Qt.exit(1);
+                return;
+            }
+            // The pages of blended chats need no chat either: three accounts and their chats
+            // are there, the second account is hidden (its unread count is on its entry), and
+            // for `accountsdrawer` the side panel is shown.
+            if (root.accountsPages.indexOf(App.startPage) >= 0) {
+                if (root.accountsPageReady()) {
+                    pageSetup.stop();
+                    root.pageReady = true;
+                }
                 return;
             }
             // The pages of the history transfer need no chat.
@@ -1291,6 +1941,47 @@ Kirigami.ApplicationWindow {
                     done = !App.composer.folderAsking && App.composer.sendableCount === 2 && App.composer.planned;
                 }
                 break;
+            case "media":
+                // A photo with a caption, sent once the core has looked at it (Send waits for
+                // that); done when the message stands in the timeline, the list is empty and the
+                // newest own message has left the outbox (the server took it): a picture taken
+                // while it is queued or sending would show the clock icon and "Sending...".
+                // A send that never ends is the page's own limit (80 tries) and fails loudly.
+                if (root.mediaSentAt < 0) {
+                    if (App.composer.attachmentCount > 0 && App.composer.planned) {
+                        const before = App.timeline.count;
+                        if (App.composer.send(conv, "Sent from Kourier")) {
+                            root.mediaSentAt = before;
+                        }
+                    }
+                    done = false;
+                } else {
+                    done = App.composer.attachmentCount === 0 && App.timeline.count > root.mediaSentAt && App.timeline.newestOwnLeftTheOutbox();
+                }
+                break;
+            case "location":
+            case "locationmany":
+                // Send, once the core has looked at the files (Send waits for that): the
+                // question about the located files is on screen.
+                if (!root.locationPressed) {
+                    if (App.composer.attachmentCount > 0 && App.composer.planned && chatPage.composer.canSend) {
+                        root.locationPressed = true;
+                        chatPage.composer.send();
+                    }
+                    done = false;
+                } else {
+                    done = App.composer.locationAsking && chatPage.composer.locationDialog !== null && chatPage.composer.locationDialog.opened;
+                }
+                break;
+            case "locationnever":
+                // "Never send" set (through Settings, its one owner): the located video stays
+                // in the list with the reason that names the setting; the plain file goes.
+                // Only on the throwaway fixture profile: the setting is saved (like "compact").
+                if (App.fixture && App.settings.locationFiles !== 2) {
+                    App.settings.locationFiles = 2;
+                }
+                done = App.composer.attachmentCount === 2 && App.composer.planned && App.composer.sendableCount === 1;
+                break;
             case "timercustom":
                 done = App.timeline.timerCustomMax > 0;
                 if (done) {
@@ -1307,9 +1998,125 @@ Kirigami.ApplicationWindow {
             case "deleteattachment":
                 done = view.albumsShown() && view.attachmentFor(App.findMessage("removable"));
                 break;
+            case "save":
+                // The menu of an album message whose pictures are downloaded: "Save All…" beside the
+                // toolbar that stays open under it, with its Save button.
+                done = view.albumsShown() && view.menuFor(App.findMessage("removable"));
+                break;
+            case "person":
+                // The details panel, once the core has answered with the person's page.
+                if (!chatPage.panelOpen) {
+                    chatPage.openPerson();
+                    done = false;
+                } else {
+                    done = chatPage.panel !== null && chatPage.panel.loaded;
+                }
+                break;
+            case "group":
+                // The details panel on the group's page, once the core has answered: the group
+                // level's own flag (`App.group`), not the person's.
+                if (!chatPage.panelOpen) {
+                    chatPage.openDetails();
+                    done = false;
+                } else {
+                    done = chatPage.panel !== null && chatPage.panel.level === "group" && chatPage.panel.loaded;
+                }
+                break;
+            case "chatmedia":
+                // The details panel at "All Media and Files": the person's page first (the level opens on
+                // top of it), then both lists of the level, once the core has answered.
+                if (!chatPage.panelOpen) {
+                    chatPage.openPerson();
+                    done = false;
+                } else if (chatPage.panel !== null && chatPage.panel.level === "person") {
+                    if (chatPage.panel.loaded) {
+                        chatPage.panel.showMedia(App.person.account ?? 0, App.person.chat ?? 0);
+                    }
+                    done = false;
+                } else {
+                    done = chatPage.panel !== null && chatPage.panel.level === "media" && chatPage.panel.loaded && App.mediaGrid.count > 0;
+                }
+                break;
+            case "safety":
+            case "safetychanged":
+                // The level of the person's safety number (P5a): her page first (the level opens on
+                // top of it, as "View Safety Number" does), then the backend's answer.
+                if (!chatPage.panelOpen) {
+                    chatPage.openPerson();
+                    done = false;
+                } else if (chatPage.panel !== null && chatPage.panel.level === "person") {
+                    if (chatPage.panel.loaded && (App.person.safetyShown ?? false)) {
+                        chatPage.panel.showSafety();
+                    }
+                    done = false;
+                } else {
+                    // (The buttons are dead for a second after the number appeared, X1: the picture waits for them.)
+                    done = chatPage.panel !== null && chatPage.panel.level === "safety" && chatPage.panel.loaded && !chatPage.panel.safetyCooling;
+                }
+                break;
+            case "timerpending":
+                // Her page with a choice made in the Disappearing Messages selector (F4): "Apply" and "Cancel" stand
+                // under the combo, nothing is sent.
+                if (!chatPage.panelOpen) {
+                    chatPage.openPerson();
+                    done = false;
+                } else if (chatPage.panel !== null && chatPage.panel.level === "person" && chatPage.panel.loaded) {
+                    const other = (App.person.timers ?? []).find(t => t.secs > 0 && t.secs !== (App.person.timerSecs ?? 0));
+                    done = other !== undefined && chatPage.panel.chooseTime(other.secs);
+                } else {
+                    done = false;
+                }
+                break;
+            case "share":
+                // The share picker of the person's page (P5c), over her page, once its rows have come, with the third row
+                // chosen (SD8: the one cue of where the card goes is in the picture, also under the high-contrast looks).
+                if (!chatPage.panelOpen) {
+                    chatPage.openPerson();
+                    done = false;
+                } else if (chatPage.panel !== null && chatPage.panel.level === "person" && chatPage.panel.shareDialog === null) {
+                    if (chatPage.panel.loaded && (App.person.shareShown ?? false)) {
+                        chatPage.panel.openShare();
+                    }
+                    done = false;
+                } else {
+                    const picker = chatPage.panel?.shareDialog ?? null;
+                    if (picker !== null && picker.opened && App.shareTargets.count > 2 && !picker.chosen) {
+                        picker.choose(2);
+                    }
+                    done = picker !== null && picker.opened && picker.chosen;
+                }
+                break;
             }
             if (done) {
                 pageSetup.stop();
+                root.pageReady = true;
+            }
+        }
+    }
+
+    // `--page=archive`: open "Archived Chats" once the list says there is an archived chat, and
+    // wait for its row. The fixture seeds its archived chat with the rest, so a list that never
+    // says so fails loudly (no wrong picture).
+    Timer {
+        id: archiveSetup
+        property int tries: 0
+        interval: 150
+        repeat: true
+        onTriggered: {
+            archiveSetup.tries += 1;
+            if (archiveSetup.tries > 80) {
+                console.error("page archive: the list never had an archived chat");
+                Qt.exit(1);
+                return;
+            }
+            if (!App.archiveShown) {
+                if (App.archivedCount > 0 && listPage.rowsShown) {
+                    listPage.openArchive();
+                }
+                return;
+            }
+            if (App.conversations.count > 0) {
+                archiveSetup.stop();
                 root.pageReady = true;
             }
         }
@@ -1383,6 +2190,11 @@ Kirigami.ApplicationWindow {
             }
             if (root.pageStack.columnView.moving) {
                 holds.push("moving");
+            }
+            // The upload pages: the fake says the shares once a second; the picture waits for the
+            // first figure to be on a ring.
+            if ((App.startPage === "uploading" || App.startPage === "uploadfile") && App.timeline.uploadsReported() === 0) {
+                holds.push("upload figures");
             }
             if (root.transferLinkPages.indexOf(App.startPage) >= 0 && root.linkPage !== null && root.inStack(root.linkPage)) {
                 holds.push("link page");

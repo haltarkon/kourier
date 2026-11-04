@@ -33,6 +33,7 @@ fn stage_of_people(dir: &std::path::Path, sizes: &[u64]) -> Recorded {
             profile_name: None,
             system_name: None,
             nickname: None,
+            system_nickname_only: false,
         };
         writer.contact(i, &contact).unwrap();
         let chat = StagedChat::direct(i);
@@ -300,6 +301,7 @@ async fn review_a_chat_whose_last_row_is_dropped_still_hears_that_nothing_follow
             profile_name: None,
             system_name: None,
             nickname: None,
+            system_nickname_only: false,
         };
         writer.contact(0, &contact).unwrap();
         let chat = StagedChat::direct(0);

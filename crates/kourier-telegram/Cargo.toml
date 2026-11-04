@@ -1,0 +1,62 @@
+[package]
+name = "kourier-telegram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+# The integration tests are one binary, tests/it.rs (T3); a new tests/<name>.rs is a `mod` there.
+autotests = false
+
+# The Telegram backend (architecture §7.5) on TDLib, which runs in a helper process per account
+# (`kourier-tdlib`); this crate never loads TDLib itself. Debug builds only, behind `networks-on`.
+[dependencies]
+kourier-model.workspace = true
+kourier-backend-api.workspace = true
+kourier-db.workspace = true
+kourier-tdlib.workspace = true
+
+# The key of TDLib's database: HKDF-SHA256 of the account's backend key (src/keys.rs).
+base64.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# net, io-util, time: the SOCKS5 gate (src/gate), its loopback listener, relays and timeouts.
+tokio = { workspace = true, features = ["rt", "sync", "macros", "net", "io-util", "time"] }
+# The type of `AccountContext::cancel`.
+tokio-util.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[features]
+# `kourier_telegram::offline`, the offline child of the real-library tests, for `kourier-app`'s ONE
+# application-level test of them (TG-1b fix G8). Enabled ONLY from `[dev-dependencies]`.
+# `test-support` also arms the TCP dialer's tripwire (`gate/dialer.rs` `tcp_permission`): enabled from
+# the crate's own `[dev-dependencies]` (a self entry) so its integration binary has it under
+# `-p kourier-telegram` too, and from kourier-app's, so any test binary that links the crate refuses
+# a dial outside the offline child.
+test-support = ["kourier-tdlib/test-support"]
+
+[dev-dependencies]
+# This crate with its own `test-support` (as `kourier-tdlib` does for itself): the integration binary
+# `it` links the crate with the feature on, so the dialer's tripwire and the `offline` door exist in
+# every way it is built (`-p kourier-telegram` alone, the lane line, ci).
+kourier-telegram = { path = ".", features = ["test-support"] }
+# The fake that plays Telegram, for the twin tests that compare the descriptor and the features it
+# copies with this crate's (KT-1b; deps-check allows a dev edge to the fake).
+kourier-fake.workspace = true
+# The real-library tests' helper (`_exit`, `setrlimit`) of the offline child (TG-1b B-5).
+libc.workspace = true
+# The scripted TDLib engine (in-process and as the fake helper process).
+kourier-tdlib = { workspace = true, features = ["scripted", "test-support"] }
+# The kill tests need their failpoints in release test builds too (§10.4).
+kourier-db = { workspace = true, features = ["failpoints"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[[test]]
+name = "it"
+path = "tests/it.rs"

@@ -116,12 +116,23 @@ fn expired_and_parked(h: &IngestHarness, days: usize, per_day: usize, parked: us
 /// times that in a debug build.
 #[test]
 fn merges_cost_what_the_alias_owns() {
+    merges_cost_what_the_alias_owns_under(MsgIdScope::AccountAuthor);
+}
+
+/// The same under per-sender ids (K-B1): the conflict pass of a merge looks for the other copy
+/// of each of the alias's rows by the partial key, so it costs what the alias owns too.
+#[test]
+fn merges_cost_what_the_alias_owns_under_per_sender_ids() {
+    merges_cost_what_the_alias_owns_under(MsgIdScope::ConversationAuthor);
+}
+
+fn merges_cost_what_the_alias_owns_under(scope: MsgIdScope) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut h = IngestHarness::open(
         &dir.path().join("core.db"),
         &kourier_db::DbKey::from([7; 32]),
         NetworkKind::Fake,
-        MsgIdScope::AccountAuthor,
+        scope,
         &[uid(ME)],
     )
     .expect("harness");
@@ -160,7 +171,7 @@ fn merges_cost_what_the_alias_owns() {
     };
     assert!(
         took < budget,
-        "300 merges over 20,000 messages and 45 days of expired keys took {took:?} (budget {budget:?})"
+        "300 merges over 20,000 messages and 45 days of expired keys took {took:?} (budget {budget:?}, {scope:?})"
     );
     // The three chats were re-keyed to their ACI, with their messages.
     let moved: i64 = h

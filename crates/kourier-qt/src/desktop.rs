@@ -162,6 +162,8 @@ impl Presenter for QtPresenter {
             return None;
         }
         let size = i32::try_from(AVATAR_SIZE).ok()?;
+        // The monogram and its colour come from the name without the "~" mark (PRIV-1).
+        let title = notify::unmarked_name(title);
         let rgba = qobject::render_avatar_rgba(
             &QString::from(title),
             notify::is_anonymous_title(title),

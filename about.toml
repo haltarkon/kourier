@@ -17,6 +17,8 @@ accepted = [
     "Unlicense",
     "Zlib",
     "0BSD",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
 ]
 
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
@@ -36,3 +38,15 @@ license = "MIT"
 path = "../LICENSE"
 license = "MIT"
 checksum = "c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f"
+
+# whatsapp-rust's Signal fork has `license = "MIT"` in its manifest, but 31 of its 49 .rs files carry
+# an AGPL-3.0-only SPDX header (Signal Messenger, LLC). cargo-about honours this
+# clarification (the crate is then listed under both licenses); the checksum is the sha256 of the
+# repository LICENSE at the pinned revision. W0 spike.
+[wacore-libsignal.clarify]
+license = "MIT AND AGPL-3.0-only"
+
+[[wacore-libsignal.clarify.files]]
+path = "../../LICENSE"
+license = "MIT"
+checksum = "6613c7e94b361fdd87fbfe7f03e0344f926066f51f37936ec09a55dd4328dc23"

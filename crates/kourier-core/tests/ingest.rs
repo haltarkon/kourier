@@ -7,8 +7,8 @@ use kourier_core::facade::{ConversationListQuery, TimelineAnchor, TimelineQuery}
 use kourier_core::testing::{DumpMode, IngestHarness};
 use kourier_fake::{Flavor, Script, scripts};
 use kourier_model::{
-    Body, ConvKey, ConversationId, MsgTarget, NetMsgId, NetworkKind, OutgoingState, ReadState,
-    ReceiptKind, UserId,
+    Body, ConvKey, ConversationId, DisappearKind, Expiry, MsgIdScope, MsgTarget, NetMsgId,
+    NetworkKind, OutgoingState, ReadState, ReceiptKind, UserId,
 };
 use proptest::prelude::*;
 
@@ -393,6 +393,17 @@ fn whatsapp_like_script_ends_in_the_expected_rows() {
     assert_eq!(row.unread, 3);
     let group = conv_id(&h, &ConvKey::Group("wag:120363000000000001".into()));
     assert_eq!(timeline(&h, group).len(), scripts::WHATSAPP_GROUP_HISTORY);
+    // The group message the script reports again under Alice's phone-number address is one row
+    // after the merge, under the LID (ids are unique per sender: the two copies were two rows).
+    let copies: Vec<String> = h
+        .connection()
+        .prepare("SELECT net_author FROM messages WHERE conversation_id = ?1 AND net_local = ?2")
+        .expect("prepare")
+        .query_map((group.0, scripts::WHATSAPP_GROUP_PN_COPY.1), |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(copies, [alice.as_str()]);
     // Keyset paging walks the whole group history without gaps or repeats.
     let mut seen = Vec::new();
     let mut anchor = TimelineAnchor::Newest;
@@ -673,4 +684,464 @@ fn dropped_duplicate_creates_no_conversation_and_extreme_timestamps_saturate() {
     let page = timeline(&h, conv_id(&h, &direct));
     assert_eq!(page.len(), 2);
     assert_eq!(page.last().map(|r| r.sort_key), Some(i64::MAX));
+}
+
+// ---------- per-sender ids (K-B1, C7) ----------
+
+const PS_ME: &str = "aci:00000000-0000-4000-8000-0000000000aa";
+const PS_ALICE: &str = "lid:1111";
+const PS_BOB: &str = "lid:2222";
+
+/// A core whose network keys messages as `scope` says, with one group.
+fn scoped(scope: MsgIdScope) -> (tempfile::TempDir, IngestHarness) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = IngestHarness::open(
+        &dir.path().join("core.db"),
+        &kourier_db::DbKey::from([7; 32]),
+        NetworkKind::Fake,
+        scope,
+        &[uid(PS_ME)],
+    )
+    .expect("harness");
+    (dir, h)
+}
+
+fn ps_group() -> ConvKey {
+    ConvKey::Group("wa:120363000000000001@g.us".into())
+}
+
+/// (author, id, scope) of every stored message, in the order they were stored.
+fn stored(h: &IngestHarness) -> Vec<(String, String, i64)> {
+    h.connection()
+        .prepare("SELECT net_author, net_local, net_scope FROM messages ORDER BY id")
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+fn from(who: &str, local: &str, at: i64, text: &str) -> BackendEvent {
+    BackendEvent::Message(scripts::remote(&ps_group(), &uid(who), local, at, text))
+}
+
+/// T1: WhatsApp's ids are unique per SENDER in a chat, so two members of a group may use one
+/// id (and so may we): three messages, three rows, and a redelivery of any of them changes
+/// nothing. Under the old per-conversation key the second and third were dropped as
+/// collisions.
+#[test]
+fn two_members_of_a_group_may_use_one_message_id() {
+    let (_dir, mut h) = scoped(MsgIdScope::ConversationAuthor);
+    let events = vec![
+        from(PS_ALICE, "3EB0X1", 1_000, "from alice"),
+        from(PS_BOB, "3EB0X1", 2_000, "from bob"),
+        BackendEvent::Message(scripts::own(&ps_group(), "3EB0X1", 3_000, "from us")),
+    ];
+    h.apply(events.clone()).expect("apply");
+    let expected = vec![
+        (PS_ALICE.to_owned(), "3EB0X1".to_owned(), 2),
+        (PS_BOB.to_owned(), "3EB0X1".to_owned(), 2),
+        (String::new(), "3EB0X1".to_owned(), 2),
+    ];
+    assert_eq!(stored(&h), expected);
+    h.apply(events).expect("redelivery");
+    assert_eq!(stored(&h), expected, "a redelivery is a no-op");
+    let texts: Vec<String> = timeline(&h, conv_id(&h, &ps_group()))
+        .iter()
+        .map(|r| text(&r.body).to_owned())
+        .collect();
+    assert_eq!(texts, ["from alice", "from bob", "from us"]);
+}
+
+/// T2: Threema's ids are unique per conversation and its references carry no sender, so there
+/// "same chat, same id, another author" stays a collision: the first row keeps the key. This
+/// pins that the per-sender key did not change the defence of the per-conversation scope.
+#[test]
+fn a_threema_like_id_another_member_reuses_is_still_ignored() {
+    let (_dir, mut h) = scoped(MsgIdScope::Conversation);
+    h.apply(vec![
+        from(PS_ALICE, "3EB0X1", 1_000, "from alice"),
+        from(PS_BOB, "3EB0X1", 2_000, "from bob"),
+    ])
+    .expect("apply");
+    assert_eq!(
+        stored(&h),
+        vec![(PS_ALICE.to_owned(), "3EB0X1".to_owned(), 1)],
+        "the second author's copy is ignored"
+    );
+}
+
+/// T6: the memory of an expired message names its author under per-sender ids: when alice's
+/// `3EB0X1` timer ran out, bob's `3EB0X1` is another message and is stored, and a late copy of
+/// alice's stays gone.
+#[test]
+fn an_expired_message_of_one_member_does_not_drop_another_members_id() {
+    let (_dir, mut h) = scoped(MsgIdScope::ConversationAuthor);
+    let start = 1_700_000_000_000;
+    let mut secret = scripts::remote(&ps_group(), &uid(PS_ALICE), "3EB0X1", start, "gone");
+    secret.expiry = Some(Expiry {
+        kind: DisappearKind::AfterSend,
+        timer: std::time::Duration::from_secs(60),
+        started_at: None,
+    });
+    h.set_now(start);
+    h.apply(vec![BackendEvent::Message(secret.clone())])
+        .expect("apply");
+    h.set_now(start + 60_000);
+    h.sweep().expect("sweep");
+    assert!(stored(&h).is_empty(), "alice's message expired");
+    h.apply(vec![from(PS_BOB, "3EB0X1", start + 61_000, "from bob")])
+        .expect("apply");
+    assert_eq!(
+        stored(&h),
+        vec![(PS_BOB.to_owned(), "3EB0X1".to_owned(), 2)],
+        "bob's message with the same id is not the expired one"
+    );
+    h.apply(vec![BackendEvent::Message(secret)])
+        .expect("a late copy");
+    assert_eq!(
+        stored(&h),
+        vec![(PS_BOB.to_owned(), "3EB0X1".to_owned(), 2)],
+        "a late copy of alice's message stays gone"
+    );
+}
+
+/// Every order of `events` (Heap's algorithm is not needed for three or four items: a plain
+/// recursive permutation).
+fn orders<T: Clone>(events: &[T]) -> Vec<Vec<T>> {
+    if events.len() <= 1 {
+        return vec![events.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..events.len() {
+        let mut rest = events.to_vec();
+        let first = rest.remove(i);
+        for mut tail in orders(&rest) {
+            tail.insert(0, first.clone());
+            out.push(tail);
+        }
+    }
+    out
+}
+
+const PS_ALICE_PN: &str = "pn:15550000111";
+
+/// T3: a group message seen under both identities of its author (the PN form in a history
+/// chunk, the LID form live) is two rows until the backend says the identities are one person
+/// and ONE row after, whatever the order of the three events and wherever a redelivery falls.
+/// Under the per-sender key the merge must join the two rows BEFORE it re-authors them, or the
+/// re-authoring breaks the unique key and the whole envelope fails (and goes to the poison
+/// table). Which copy's `history` flag, `received_at` and sort key survive depends on the
+/// order, so only what does not depend on it is asserted: one row, under the LID, with the
+/// body, and no envelope refused. A message that has no twin is only re-authored, never lost.
+#[test]
+fn a_group_message_under_both_identities_of_its_author_is_one_message_after_the_merge() {
+    let at = 1_700_000_000_000;
+    let mut history = scripts::remote(&ps_group(), &uid(PS_ALICE_PN), "3EB0X1", at, "same message");
+    history.read = true;
+    history.silent = true;
+    // A message with no twin: it only has to be re-authored, never lost.
+    let mut lone = scripts::remote(
+        &ps_group(),
+        &uid(PS_ALICE_PN),
+        "3EB0X2",
+        at + 1,
+        "only under the phone number",
+    );
+    lone.read = true;
+    lone.silent = true;
+    let events = vec![
+        BackendEvent::HistoryBatch {
+            conv: ps_group(),
+            messages: vec![history, lone],
+            has_more: false,
+            progress: None,
+        },
+        BackendEvent::Message(scripts::remote(
+            &ps_group(),
+            &uid(PS_ALICE),
+            "3EB0X1",
+            at,
+            "same message",
+        )),
+        BackendEvent::IdentityMerged {
+            from: uid(PS_ALICE_PN),
+            into: uid(PS_ALICE),
+        },
+    ];
+    // What must hold once the stream has been applied, and again after a redelivery of it (a
+    // redelivery of the history chunk would bring back a message the merge had lost, so the
+    // first pass is judged alone).
+    let judge = |h: &IngestHarness, kinds: &[&str], when: &str| {
+        assert_eq!(
+            stored(h),
+            vec![
+                (PS_ALICE.to_owned(), "3EB0X1".to_owned(), 2),
+                (PS_ALICE.to_owned(), "3EB0X2".to_owned(), 2),
+            ],
+            "{when}, order {kinds:?}"
+        );
+        // (Which row comes first depends on which copy of the twin survived.)
+        let mut texts: Vec<String> = timeline(h, conv_id(h, &ps_group()))
+            .iter()
+            .map(|r| text(&r.body).to_owned())
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            ["only under the phone number", "same message"],
+            "{when}, order {kinds:?}"
+        );
+    };
+    for order in orders(&events) {
+        let (_dir, mut h) = scoped(MsgIdScope::ConversationAuthor);
+        let kinds: Vec<&str> = order
+            .iter()
+            .map(|e| match e {
+                BackendEvent::HistoryBatch { .. } => "history",
+                BackendEvent::Message(_) => "live",
+                _ => "merge",
+            })
+            .collect();
+        // Each event twice in place, then the whole stream once more (a forwarder crash).
+        for e in order.iter().flat_map(|e| [e.clone(), e.clone()]) {
+            h.apply(vec![e]).expect("an envelope must not be refused");
+        }
+        judge(&h, &kinds, "first pass");
+        for e in &order {
+            h.apply(vec![e.clone()]).expect("redelivery");
+        }
+        judge(&h, &kinds, "after a redelivery");
+    }
+}
+
+/// F1 (storage review F7, HIGH): a merge never brings back a message that was REMOVED. A message
+/// removed under its LID (a clear up to it, a delete for me) is remembered by key; its copy under
+/// the phone number (an older history chunk) is another key under per-sender ids, so it is stored;
+/// the merge then re-authors it to exactly the removed key. The merge removes it instead, wherever
+/// the merge falls: after the copy or before it (then the copy resolves to the LID and is dropped
+/// at once). The same for the direct chat's form (the chats of the two identities are joined) and
+/// for per-conversation ids (Threema). A twin-less row that was NOT removed only moves. The same
+/// for account-wide ids (Signal, `AccountAuthor`): the key is `(author, id)` whatever the chat, and
+/// the number's copy re-authored to the LID's is the removed key (follow-up of the K-B1 fix round).
+#[test]
+fn a_merge_does_not_bring_back_a_message_removed_under_the_canonical_identity() {
+    let at = 1_700_000_000_000;
+    let merge = BackendEvent::IdentityMerged {
+        from: uid(PS_ALICE_PN),
+        into: uid(PS_ALICE),
+    };
+    let group = ps_group();
+    let lid_chat = ConvKey::Direct(uid(PS_ALICE));
+    let pn_chat = ConvKey::Direct(uid(PS_ALICE_PN));
+    // (name, scope, the chat of the LID copy, the chat of the number's copy)
+    let cases = [
+        ("group", MsgIdScope::ConversationAuthor, &group, &group),
+        (
+            "direct",
+            MsgIdScope::ConversationAuthor,
+            &lid_chat,
+            &pn_chat,
+        ),
+        (
+            "direct, per-conversation ids",
+            MsgIdScope::Conversation,
+            &lid_chat,
+            &pn_chat,
+        ),
+        (
+            "group, account-wide ids",
+            MsgIdScope::AccountAuthor,
+            &group,
+            &group,
+        ),
+        (
+            "direct, account-wide ids",
+            MsgIdScope::AccountAuthor,
+            &lid_chat,
+            &pn_chat,
+        ),
+    ];
+    for (name, scope, lid_in, pn_in) in cases {
+        for merge_first in [false, true] {
+            let (_dir, mut h) = scoped(scope);
+            let live =
+                BackendEvent::Message(scripts::remote(lid_in, &uid(PS_ALICE), "X1", at, "gone"));
+            let cleared = BackendEvent::ConversationCleared {
+                conv: lid_in.clone(),
+                up_to: vec![scripts::target(Some(lid_in), Some(&uid(PS_ALICE)), "X1")],
+                remove: false,
+                before_ms: None,
+                at,
+            };
+            let copy = BackendEvent::HistoryBatch {
+                conv: pn_in.clone(),
+                messages: vec![
+                    // The message that was removed, under the number.
+                    scripts::remote(pn_in, &uid(PS_ALICE_PN), "X1", at, "gone"),
+                    // One nobody removed: it only moves.
+                    scripts::remote(pn_in, &uid(PS_ALICE_PN), "X2", at + 1, "stays"),
+                ],
+                has_more: false,
+                progress: None,
+            };
+            let mut events = vec![live, cleared];
+            if merge_first {
+                events.extend([merge.clone(), copy]);
+            } else {
+                events.extend([copy, merge.clone()]);
+            }
+            for e in events {
+                h.apply(vec![e])
+                    .unwrap_or_else(|e| panic!("{name}, merge first {merge_first}: {e}"));
+            }
+            let kept: Vec<String> = stored(&h).into_iter().map(|(_, local, _)| local).collect();
+            assert_eq!(
+                kept,
+                ["X2"],
+                "{name}, merge first {merge_first}: the removed message stays removed"
+            );
+            let author: String = h
+                .connection()
+                .query_row("SELECT net_author FROM messages", [], |r| r.get(0))
+                .expect("the row");
+            assert_eq!(author, PS_ALICE, "{name}, merge first {merge_first}");
+            // And a later copy of the removed message is still dropped.
+            h.apply(vec![BackendEvent::Message(scripts::remote(
+                lid_in,
+                &uid(PS_ALICE),
+                "X1",
+                at,
+                "gone",
+            ))])
+            .expect("a late copy");
+            assert_eq!(
+                stored(&h).len(),
+                1,
+                "{name}, merge first {merge_first}: late copy"
+            );
+        }
+    }
+}
+
+/// Follow-up of the K-B1 re-check (M1b): the per-sender pass of `merge_conversation` is the only
+/// one that sees OUR OWN rows (`identity_merged` has re-authored and checked every row of the
+/// alias before the chats are joined, and our own rows carry no author). An own message removed in
+/// the LID's chat (a clear up to it), with its copy in the number's chat (the same own message,
+/// which WhatsApp reports in both chats), is not brought back by the join of the chats, wherever
+/// the merge falls: after the copy or before it. The message nobody removed stays.
+#[test]
+fn an_own_removed_message_is_not_brought_back_by_the_chat_merge() {
+    let at = 1_700_000_000_000;
+    let merge = BackendEvent::IdentityMerged {
+        from: uid(PS_ALICE_PN),
+        into: uid(PS_ALICE),
+    };
+    let lid_chat = ConvKey::Direct(uid(PS_ALICE));
+    let pn_chat = ConvKey::Direct(uid(PS_ALICE_PN));
+    for merge_first in [false, true] {
+        let (_dir, mut h) = scoped(MsgIdScope::ConversationAuthor);
+        let live = BackendEvent::Message(scripts::own(&lid_chat, "X1", at, "gone"));
+        let cleared = BackendEvent::ConversationCleared {
+            conv: lid_chat.clone(),
+            up_to: vec![scripts::target(Some(&lid_chat), None, "X1")],
+            remove: false,
+            before_ms: None,
+            at,
+        };
+        let copy = BackendEvent::HistoryBatch {
+            conv: pn_chat.clone(),
+            messages: vec![
+                // The message that was removed, as the number's chat holds it.
+                scripts::own(&pn_chat, "X1", at, "gone"),
+                // One nobody removed.
+                scripts::own(&pn_chat, "X2", at + 1, "stays"),
+            ],
+            has_more: false,
+            progress: None,
+        };
+        let mut events = vec![live, cleared];
+        if merge_first {
+            events.extend([merge.clone(), copy]);
+        } else {
+            events.extend([copy, merge.clone()]);
+        }
+        for e in events {
+            h.apply(vec![e])
+                .unwrap_or_else(|e| panic!("merge first {merge_first}: {e}"));
+        }
+        let kept: Vec<(String, String, i64)> = stored(&h);
+        assert_eq!(
+            kept,
+            [(String::new(), "X2".to_owned(), 2)],
+            "merge first {merge_first}: the removed own message stays removed"
+        );
+        let chats: i64 = h
+            .connection()
+            .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(chats, 1, "merge first {merge_first}: one chat");
+    }
+}
+
+/// T4: the same person's two direct chats (under the PN and the LID) each hold the peer's
+/// `3EB0Y1` and our own `3EB0Y2` (WhatsApp reports an own message in both while the chats are
+/// two): the merge joins the chats and, per key, the rows: one chat, one row of each, wherever
+/// the merge falls among the messages. Without the scope-2 pass of `merge_conversation` moving
+/// the rows of one chat into the other breaks the unique key.
+#[test]
+fn a_direct_chat_merge_joins_the_rows_of_one_author_and_id() {
+    let pn_chat = ConvKey::Direct(uid(PS_ALICE_PN));
+    let lid_chat = ConvKey::Direct(uid(PS_ALICE));
+    let at = 1_700_000_000_000;
+    let messages = vec![
+        BackendEvent::Message(scripts::remote(
+            &pn_chat,
+            &uid(PS_ALICE_PN),
+            "3EB0Y1",
+            at,
+            "peer",
+        )),
+        BackendEvent::Message(scripts::remote(
+            &lid_chat,
+            &uid(PS_ALICE),
+            "3EB0Y1",
+            at,
+            "peer",
+        )),
+        BackendEvent::Message(scripts::own(&pn_chat, "3EB0Y2", at + 1, "mine")),
+        BackendEvent::Message(scripts::own(&lid_chat, "3EB0Y2", at + 1, "mine")),
+    ];
+    let merge = BackendEvent::IdentityMerged {
+        from: uid(PS_ALICE_PN),
+        into: uid(PS_ALICE),
+    };
+    for pos in 0..=messages.len() {
+        let (_dir, mut h) = scoped(MsgIdScope::ConversationAuthor);
+        let mut order = messages.clone();
+        order.insert(pos, merge.clone());
+        for e in order {
+            h.apply(vec![e]).expect("an envelope must not be refused");
+        }
+        let chats: i64 = h
+            .connection()
+            .query_row("SELECT count(*) FROM conversations", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(chats, 1, "merge at {pos}: one chat");
+        let mut rows = stored(&h);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (String::new(), "3EB0Y2".to_owned(), 2),
+                (PS_ALICE.to_owned(), "3EB0Y1".to_owned(), 2),
+            ],
+            "merge at {pos}: one row of each key"
+        );
+        let texts: Vec<String> = timeline(&h, conv_id(&h, &lid_chat))
+            .iter()
+            .map(|r| text(&r.body).to_owned())
+            .collect();
+        assert_eq!(texts, ["peer", "mine"], "merge at {pos}");
+    }
 }

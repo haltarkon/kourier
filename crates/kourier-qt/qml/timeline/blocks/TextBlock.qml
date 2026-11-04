@@ -27,6 +27,16 @@ Item {
 
     property bool revealed: false
     property bool recoloring: false
+    // The text of a page (a description, an about text: `DescriptionText`) keeps its selection while a menu of the
+    // page takes the keyboard (and is centred, one Tab stop and selectable by the keyboard: `DescriptionText` binds
+    // that on the TextEdit, so a message's row pays for none of it). A message's text keeps none.
+    property bool keepSelection: false
+    // What a screen reader calls the text of a page; a message's text is named by its row.
+    property string accessibleName
+    // The TextEdit itself: the page's menu reads the selection and the links from it.
+    readonly property alias edit: edit
+    // The "Open Link?" dialog while one asks (tests hand its key filters stand-in events).
+    property var question: null
     // The text goes on beyond what is shown.
     readonly property bool hasMore: root.block.more === true
     // How many words of it are not shown (the hint in "Read more").
@@ -35,9 +45,34 @@ Item {
     readonly property color linkInk: Style.readable(Kirigami.Theme.linkColor, root.surface)
 
     onLinkInkChanged: Qt.callLater(root.recolor)
+    onInkChanged: Qt.callLater(root.recolor)
 
     implicitWidth: Math.max(Math.ceil(edit.contentWidth), root.hasMore ? Math.ceil(readMore.implicitWidth) : 0)
     implicitHeight: Math.ceil(edit.contentHeight) + (root.hasMore ? Kirigami.Units.smallSpacing + Math.ceil(readMore.implicitHeight) : 0)
+
+    // A mention (`kourier:mention/<i>`, made by the viewmodel; a message cannot make one) opens
+    // that person's page. Not while a spoiler hides it: the spoiler's rectangle takes the click that
+    // reveals it (the text never sees that click), but the rectangle is one pixel short above and
+    // below, and a click on those rows reaches the text's link while the spoiler is still on. Not
+    // outside the timeline either (the list of earlier versions has no `message`).
+    function openMention(link: string): void {
+        const m = root.block.mentions ? root.block.mentions[parseInt(link.slice(16))] : undefined;
+        if (m === undefined || root.message <= 0 || (m.spoiler && !root.revealed)) {
+            return;
+        }
+        TimelineActions.person(m.user);
+    }
+
+    // Asks whether to open `link` (the one question of the timeline and of the pages' texts): the
+    // address opens only when the dialog is answered "Open".
+    function openLink(link: string): void {
+        const dialog = linkDialogComponent.createObject(root, {
+            url: link
+        }) as QQC2.Dialog;
+        // (Kept for the tests: the question that is asking now; null once it is gone.)
+        root.question = dialog;
+        dialog?.open();
+    }
 
     // Shows the next step of the text.
     function readMoreText(): void {
@@ -54,8 +89,9 @@ Item {
         textFormat: TextEdit.RichText
         readOnly: true
         selectByMouse: true
-        persistentSelection: false
+        persistentSelection: root.keepSelection
         wrapMode: TextEdit.Wrap
+        Accessible.name: root.accessibleName
         color: root.ink
         // Selected text is read on the selection color, which in Breeze is white on blue at 2.5 : 1.
         selectionColor: Kirigami.Theme.highlightColor
@@ -71,14 +107,17 @@ Item {
         Component.onCompleted: root.recolor()
 
         onLinkActivated: link => {
-            const dialog = linkDialogComponent.createObject(root, {
-                url: link
-            }) as QQC2.Dialog;
-            dialog?.open();
+            if (link.indexOf("kourier:mention/") === 0) {
+                root.openMention(link);
+                return;
+            }
+            root.openLink(link);
         }
 
         HoverHandler {
-            cursorShape: edit.hoveredLink !== "" ? Qt.PointingHandCursor : Qt.IBeamCursor
+            // (A mention opens the person only in the timeline: in the list of earlier versions,
+            // which has no `message`, it is no button, so no hand.)
+            cursorShape: edit.hoveredLink !== "" && (root.message > 0 || edit.hoveredLink.indexOf("kourier:mention/") !== 0) ? Qt.PointingHandCursor : Qt.IBeamCursor
         }
     }
 
@@ -115,7 +154,7 @@ Item {
             return;
         }
         root.recoloring = true;
-        App.colorLinks(edit.textDocument, root.linkInk);
+        App.colorLinks(edit.textDocument, root.linkInk, root.ink);
         root.recoloring = false;
     }
 
@@ -191,17 +230,68 @@ Item {
             id: linkDialog
 
             property string url
+            // Keys pressed while the dialog was open (their release may act).
+            property var pressedKeys: ({})
+
+            // Lets through what the dialog's buttons may act on: a key pressed while it is open, never an
+            // auto-repeat, never a release whose press came before (the key that chose "Open Link…" in a
+            // menu opens this dialog inside its own press). Tab and Backtab always go on: an accepted repeat
+            // of a held Tab would stop the focus chain here. `event` is a KeyEvent or, in tests, a stand-in.
+            function filterPress(event: var): void {
+                if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                    return;
+                }
+                if (!linkDialog.opened || event.isAutoRepeat) {
+                    event.accepted = true;
+                    return;
+                }
+                const seen = linkDialog.pressedKeys;
+                seen[event.key] = true;
+                linkDialog.pressedKeys = seen;
+            }
+
+            function filterRelease(event: var): void {
+                if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                    return;
+                }
+                const seen = linkDialog.pressedKeys;
+                if (!linkDialog.opened || event.isAutoRepeat || seen[event.key] !== true) {
+                    event.accepted = true;
+                    return;
+                }
+                delete seen[event.key];
+                linkDialog.pressedKeys = seen;
+            }
 
             parent: QQC2.Overlay.overlay
             anchors.centerIn: parent
             modal: true
             title: L10n.i18nc("@title:dialog", "Open Link?")
             standardButtons: QQC2.Dialog.Open | QQC2.Dialog.Cancel
-            onAccepted: Qt.openUrlExternally(linkDialog.url)
-            onClosed: linkDialog.destroy()
+            onAccepted: App.openExternalUrl(linkDialog.url)
+            onOpened: linkDialog.pressedKeys = ({})
+            onClosed: {
+                root.question = null;
+                linkDialog.destroy();
+            }
+
+            footer: QQC2.DialogButtonBox {
+                standardButtons: linkDialog.standardButtons
+                // The buttons filter the keys (the held-key and press/release guard above).
+                delegate: QQC2.Button {
+                    Keys.onPressed: event => linkDialog.filterPress(event)
+                    Keys.onReleased: event => linkDialog.filterRelease(event)
+                }
+            }
 
             contentItem: QQC2.Label {
-                text: linkDialog.url
+                // The address between a left-to-right isolate (U+2066) and its pop (U+2069): it
+                // reads left to right whatever it holds, and nothing in it reorders anything outside
+                // it. Qt lays even a plain text out with the bidi algorithm, so a right-to-left
+                // character in an address would read as another address (the dialog is the guard
+                // that shows what opens). `richtext` ends a link before such a character; this is
+                // for the one that gets through.
+                text: "\u2066" + linkDialog.url + "\u2069"
                 wrapMode: Text.WrapAnywhere
                 textFormat: Text.PlainText
             }

@@ -66,6 +66,8 @@ Window {
     property real edited: 0
     property real notice: 0
     property var viewer: null
+    // The viewer step loads the second-next picture ahead (an `Image` of its own); see there.
+    property var preload: null
 
     function fail(msg: string): void {
         console.error("FAIL [" + step + "]: " + msg);
@@ -176,6 +178,25 @@ Window {
         return null;
     }
 
+    // The items of `root` and everything below it (the objects a row costs; upload progress
+    // decision U4: an album at rest makes no item for a ring nobody sees).
+    function items(root: Item): int {
+        let n = 1;
+        for (const child of root.children) {
+            n += test.items(child);
+        }
+        return n;
+    }
+
+    // The Loaders (active or not) below `root`.
+    function countLoaders(root: Item): int {
+        let n = root instanceof Loader ? 1 : 0;
+        for (const child of root.children) {
+            n += test.countLoaders(child);
+        }
+        return n;
+    }
+
     // The newest album whose pictures are all downloaded, with at least `count` of them.
     function albumRow(count: int): var {
         return test.rowWith(r => r.blocks.some(b => b.type === "album" && b.count >= count && b.items.every(i => i.state === "local" && i.fullUrl !== "")));
@@ -224,11 +245,38 @@ Window {
         }
     }
 
+    // An input event spins the event loop while it is delivered (`TestEvent` runs `processEvents`
+    // after a key or a click), and a tick that is due by then runs INSIDE the tick that sent the
+    // event, at the same step, on whatever the event has just changed. That was the failure
+    // "the viewer opened at 2 of 9" (found 2026-10-27, the server at load 64): the viewer WAS at
+    // 1 when the step checked it, the first Right key moved it to 2, and the tick nested in that
+    // key's event loop ran the step again, found the next picture already on screen (`shown`) and
+    // read the 2. A nested tick is dropped and counted (`nested`; the viewer step makes one on
+    // purpose, with the next picture loaded ahead so that a nested tick that ran would find it on screen,
+    // and asserts the drop). The siblings of this binary have the same guard (`input_ui`,
+    // `folder_ui`, `retain_ui` ...).
+    property bool busy: false
+    property int nested: 0
     Timer {
         interval: 25
         repeat: true
         running: true
         onTriggered: {
+            if (test.busy) {
+                test.nested += 1;
+                return;
+            }
+            test.busy = true;
+            try {
+                test.tick();
+            } finally {
+                test.busy = false;
+            }
+        }
+    }
+
+    function tick(): void {
+        {
             switch (test.step) {
             case "start":
                 test.ev = Qt.createQmlObject("import QtTest\nTestEvent {}", holder, "files_ui_events.qml");
@@ -257,6 +305,12 @@ Window {
                 // The list is a view on a model: rows off screen have no delegate.
                 const list = composerItem.fileList;
                 if (list.count !== 300) return later("the list");
+                // The model reports its 300 rows at once, but the list is laid out in the
+                // next polish, a frame later: until then it has one delegate and no height
+                // (found 2026-10-15: a tick that came before that frame under load counted
+                // 1). The step asserts the laid-out state, so it waits for it: the list has
+                // its height and the rows at both ends of its viewport have delegates.
+                if (list.height <= 0 || !list.itemAt(list.width / 2, list.contentY + 1) || !list.itemAt(list.width / 2, list.contentY + list.height - 2)) return later("the list laid out (height " + list.height + ")");
                 let delegates = 0;
                 for (const child of list.contentItem.children) {
                     delegates += child.hasOwnProperty("partFirst") ? 1 : 0;
@@ -350,6 +404,13 @@ Window {
                 if (!grid) return later("the grid");
                 if (grid.tiles !== 5 || grid.hidden !== 4) return fail("tiles " + grid.tiles + ", hidden " + grid.hidden);
                 if (grid.implicitHeight <= 0 || grid.implicitHeight >= grid.implicitWidth) return fail("the grid of five is wider than tall: " + grid.implicitWidth + "x" + grid.implicitHeight);
+                // (Upload progress, decision U4: the objects of an album at rest, the whole row
+                // when it has a delegate and the grid alone; a number for the report.)
+                const albumRowItem = view.delegateFor(test.album);
+                // The album's ring is ONE Loader (made active only while pictures go up): the five
+                // stand-in Loaders of the tiles' pictures and that one, not a Loader per tile.
+                if (test.countLoaders(grid) > 6) return fail("an album at rest has " + test.countLoaders(grid) + " Loaders");
+                console.warn("objects: album row at rest has " + (albumRowItem ? test.items(albumRowItem) : "(no delegate)") + " items, its grid " + test.items(grid) + ", Loaders in the grid " + test.countLoaders(grid));
                 // A tap on the second tile opens the viewer on the second of all nine.
                 grid.openAt(1);
                 test.next("viewer");
@@ -361,8 +422,35 @@ Window {
                 if (v.count !== 9 || v.index !== 1) return fail("the viewer opened at " + v.index + " of " + v.count);
                 const second = v.url;
                 if (second === "" || second !== v.items[1].url) return fail("the second picture");
-                // The keyboard steps: Right, Right, Left.
+                // The next picture is loaded AHEAD with the very request the viewer's own `Image` will make: the
+                // same URL, `sourceSize` and `fillMode` (Qt's cache key holds the provider options that the fill
+                // mode sets: with the default fill mode the viewer's request is a miss and its picture still loads).
+                // Qt's pixmap cache then hands the viewer that picture at once, so the viewer is `shown` in the
+                // turn of the key. A tick nested in the key's event loop (below) then finds the moved viewer ON
+                // SCREEN, as it did on the loaded server, and a step timer without its guard fails with "the viewer
+                // opened at 2 of 9". Without this the picture is still loading in that turn and a nested tick only
+                // waits: the mutant that kept the count and dropped the guard's `return` passed 3 of 3 runs
+                // (2026-10-28).
+                if (!test.preload) {
+                    const still = test.find(v.contentItem, c => c.objectName === "still");
+                    if (!still || still.width <= 0 || still.height <= 0) return later("the viewer's picture item");
+                    test.preload = Qt.createQmlObject("import QtQuick\nImage { visible: false; asynchronous: true; fillMode: Image.PreserveAspectFit }", holder, "files_ui_preload.qml");
+                    test.preload.sourceSize = Qt.size(Math.ceil(still.width), Math.ceil(still.height));
+                    test.preload.source = v.items[2].url;
+                }
+                if (test.preload.status === Image.Error) return fail("the next picture could not be loaded ahead");
+                if (test.preload.status !== Image.Ready) return later("the next picture loaded ahead");
+                // The keyboard steps: Right, Right, Left. The tick works for longer than the timer's
+                // interval right before the first key, as any tick does on a loaded machine, so the
+                // key's event loop finds the next tick due: the guard of the timer must drop it, and
+                // this asserts that it did (a tick that was not dropped would read this step again with
+                // the viewer one picture on, and fail with "the viewer opened at 2 of 9").
+                const nestedBefore = test.nested;
+                const heldSince = Date.now();
+                while (Date.now() - heldSince < 60) {
+                }
                 test.key(Qt.Key_Right);
+                if (test.nested === nestedBefore) return fail("Qt ran no timer tick inside keyClick: the 60 ms hold no longer proves the step timer's guard (a Qt detail, not a product fault)");
                 if (v.index !== 2 || v.url !== v.items[2].url || v.url === second) return fail("Right: " + v.index);
                 test.key(Qt.Key_Right);
                 test.key(Qt.Key_Left);
@@ -375,6 +463,8 @@ Window {
                 test.key(Qt.Key_Home);
                 test.key(Qt.Key_Left);
                 if (v.index !== 0) return fail("Home, Left: " + v.index);
+                test.preload.destroy();
+                test.preload = null;
                 test.next("buttons");
                 return;
             }

@@ -43,33 +43,46 @@
 //! ranges the core showed, and the first quoted attachment with its thumbnail uploaded as an
 //! attachment of its own (`SD/ts/jobs/helpers/sendNormalMessage.preload.ts` `uploadMessageQuote`).
 //!
-//! Reading and re-encoding run on the blocking pool. While uploads run, `TransmitProgress`
-//! reports the share of blob bytes sent (below 1), and 1 once every upload is done; a body
-//! without uploads reports nothing.
+//! Reading and re-encoding run on the blocking pool. Every upload of a message is made ready
+//! FIRST (a recent pointer looked up, a still picture re-encoded), so the size of each is final
+//! before the first byte goes up; then they go one after another. While uploads run, the
+//! ticker ([`report_progress`]) reports each attachment's own `AttachmentProgress` (plaintext
+//! bytes, `done == total` only once its upload is over) and `TransmitProgress`, the share of
+//! blob bytes sent weighted by those final sizes (below 1, never down), and 1 once every upload
+//! is done; a file whose upload was over before a tick says so when they are all done
+//! ([`Uploader::report_files_full`]), so every file that uploaded ends with `done == total`; a
+//! body without uploads reports nothing. A re-encoded picture waits for its upload in
+//! a temporary encrypted file ([`tmp`]), never in memory all at once: an album of 31 would hold
+//! ~93 MiB.
 
+use std::cell::RefCell;
 use std::path::{Component, Path};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use kourier_backend_api::BackendEvent;
 use kourier_model::{
     Attachment, AttachmentKind, BackendError, BlobRef, Body, ErrorKind, LocalMsgId, ReplyTo,
-    TargetAuthor, Text,
+    SendPhase, TargetAuthor, Text,
 };
 use libsignal_core::Aci;
 use prost::Message as _;
 use zeroize::Zeroizing;
 
 use super::content::{self, QuotedFile};
+use super::stop::{Stop, stopped};
 use crate::actor::Shared;
 use crate::attachment::{POINTER_BLOB_V, Pointer, max_blob_len};
 use crate::features::MAX_INLINE_BODY_BYTES;
-use crate::net::SignalTransport;
+use crate::net::{AbortOnDrop, SignalTransport};
 use crate::proto;
 use crate::service_id::{SignalUser, parse_user_id};
 use crate::upload::{self, Plaintext, Spec, UploadError};
+
+pub(crate) mod tmp;
+use tmp::TempFiles;
 
 /// Longest text sent at all (`MAX_BODY_ATTACHMENT_BYTE_LENGTH`).
 pub(crate) const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -99,8 +112,9 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// known to show it. The re-encode itself stays: it drops EXIF, GPS and XMP.
 pub(crate) const PICTURE_LEVEL: kourier_media::ScaleLevel = kourier_media::ScaleLevel::THREE;
 /// The name of that transform in the key of the upload cache ([`upload::source_key`]): a
-/// pointer cached for another level is not reused.
-const PICTURE_TRANSFORM: &str = "image-level-3";
+/// pointer cached for another level is not reused. "-clean" since LOC (N6): a pointer made
+/// before `clean_still`, when a picture that did not clean left as it came, is not reused.
+const PICTURE_TRANSFORM: &str = "image-level-3-clean";
 
 /// The parts of a `DataMessage` an outgoing body becomes.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -111,6 +125,8 @@ pub(crate) struct PreparedBody {
     pub(crate) ranges: Vec<proto::BodyRange>,
     /// The uploaded attachments (the long text first).
     pub(crate) attachments: Vec<proto::AttachmentPointer>,
+    /// The shared contact card (`DataMessage.contact`; at most one, P5c).
+    pub(crate) contact: Vec<proto::data_message::Contact>,
 }
 
 impl PreparedBody {
@@ -122,8 +138,64 @@ impl PreparedBody {
             text: Some(inline),
             ranges: super::content::body_ranges(text),
             attachments: Vec::new(),
+            contact: Vec::new(),
         }
     }
+}
+
+/// The largest name of a card Kourier sends, in bytes: Kourier's own cap (architecture §13;
+/// no Signal client states one), so a card stays far below the message size limit.
+pub(crate) const MAX_CARD_NAME_BYTES: usize = 512;
+
+/// The `DataMessage.Contact` of a card Kourier sends (P5c, the narrow send of BQ-10): the name
+/// as `givenName` and each phone number as a MOBILE `Phone`; nothing else (no avatar, no
+/// `aciBinary`, BQ-7). The core builds the card (the profile name, the SHOWN number); this only
+/// encodes it and refuses one without a name (Android shares no card without one) or without
+/// exactly one phone number.
+pub(crate) fn contact_card(
+    card: &kourier_model::ContactCard,
+) -> Result<proto::data_message::Contact, BackendError> {
+    use proto::data_message::contact;
+    let name = card
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| {
+            BackendError::new(ErrorKind::InvalidInput, "a contact card without a name")
+        })?;
+    if name.len() > MAX_CARD_NAME_BYTES {
+        return Err(BackendError::new(
+            ErrorKind::TooLarge,
+            "the name of the contact card is too long",
+        ));
+    }
+    let number: Vec<_> = card
+        .identifiers
+        .iter()
+        .filter(|i| i.kind == kourier_model::IdentifierKind::Phone)
+        .map(|i| contact::Phone {
+            value: Some(i.value.clone()),
+            r#type: Some(contact::phone::Type::Mobile as i32),
+            label: None,
+        })
+        .collect();
+    // ONE number (SC3, SD3): the core builds a card with exactly the shown number; a card with
+    // none or several is not one Kourier sends.
+    if number.len() != 1 {
+        return Err(BackendError::new(
+            ErrorKind::InvalidInput,
+            "a contact card carries exactly one phone number",
+        ));
+    }
+    Ok(proto::data_message::Contact {
+        name: Some(contact::Name {
+            given_name: Some(name.to_owned()),
+            ..Default::default()
+        }),
+        number,
+        ..Default::default()
+    })
 }
 
 /// The first at most [`MAX_INLINE_BODY_BYTES`] bytes of `text` (at a character boundary), and
@@ -157,6 +229,9 @@ pub(crate) struct Uploader<'a, T: SignalTransport> {
     pub(crate) local: LocalMsgId,
     /// The network id of the message (stable per message: client uuids derive from it).
     pub(crate) net_local: &'a str,
+    /// The attempt's stop state: the preparations end when an abort is accepted, and the send
+    /// passes its point of no return through it ([`Self::pass_point_of_no_return`]).
+    pub(crate) stop: &'a Stop,
 }
 
 /// One attachment of a message, before the uploads ran.
@@ -174,23 +249,127 @@ struct Job {
     fields: proto::AttachmentPointer,
     /// A still image: re-encoded before its upload.
     reencode: bool,
+    /// The attachment's position in the request's `Body::Media.attachments` (what
+    /// `AttachmentProgress.index` names); `None` for a long text's file, which is not reported.
+    index: Option<u16>,
+}
+
+/// One upload as the progress reports see it, once its size is final.
+struct Track {
+    /// The position of the attachment in the request, `None`: only counted in the share.
+    index: Option<u16>,
+    /// Plaintext bytes this attempt uploads for it: after the re-encode, or the size of the
+    /// pointer a recent upload left.
+    plain: u64,
+    /// The blob length those bytes make ([`max_blob_len`]): the unit of `sent`.
+    blob: u64,
+    /// Blob bytes the requests took ([`upload::upload`] adds to it; a resumed request adds the
+    /// resent part again, so it can pass `blob`).
+    sent: Arc<AtomicU64>,
+    /// The upload is over, or never had to run: only then `done == total`.
+    over: AtomicBool,
+    /// The `done` of this file the last report said ([`NOT_REPORTED`] before the first): the
+    /// ticker reports a change only, and the report that ends the uploads says the files it
+    /// has not told full yet.
+    reported: AtomicU64,
+}
+
+/// [`Track::reported`] before the first report of a file.
+const NOT_REPORTED: u64 = u64::MAX;
+
+impl Track {
+    fn new(index: Option<u16>, plain: u64, over: bool) -> Self {
+        Self {
+            index,
+            plain,
+            blob: max_blob_len(plain),
+            sent: Arc::new(AtomicU64::new(0)),
+            over: AtomicBool::new(over),
+            reported: AtomicU64::new(NOT_REPORTED),
+        }
+    }
+
+    /// Blob bytes done, never past the blob.
+    fn blob_done(&self) -> u64 {
+        if self.over.load(Ordering::Acquire) {
+            self.blob
+        } else {
+            self.sent.load(Ordering::Relaxed).min(self.blob)
+        }
+    }
+
+    /// Plaintext bytes done: the blob's share scaled to the plaintext, and `plain` itself only
+    /// once the upload is over (the last chunk is queued for the request before the CDN has
+    /// it).
+    fn plain_done(&self) -> u64 {
+        if self.over.load(Ordering::Acquire) {
+            return self.plain;
+        }
+        let scaled =
+            u128::from(self.blob_done()) * u128::from(self.plain) / u128::from(self.blob.max(1));
+        u64::try_from(scaled)
+            .unwrap_or(self.plain)
+            .min(self.plain.saturating_sub(1))
+    }
+}
+
+/// The uploads of one attempt, in the order they run; filled when every size is final.
+type Tracks = Rc<RefCell<Vec<Arc<Track>>>>;
+
+/// One slot after the preparation: its size is final.
+enum Ready {
+    /// The pointer it arrived with.
+    Pointer(Box<proto::AttachmentPointer>),
+    /// To upload (or to reuse a recent pointer for).
+    Upload(Box<ReadyUpload>),
+}
+
+/// An upload whose size is final.
+struct ReadyUpload {
+    spec: Spec,
+    fields: proto::AttachmentPointer,
+    /// The look-up's clock: the upload re-reads the cache with the same value.
+    now: i64,
+    track: Arc<Track>,
 }
 
 impl<T: SignalTransport> Uploader<'_, T> {
-    /// The `DataMessage` parts of `body`, uploading what needs uploading.
+    /// The `DataMessage` parts of `body`, uploading what needs uploading. Ends with `Err` when
+    /// an abort is accepted meanwhile: the uploads in progress are dropped where they stand.
     pub(crate) async fn prepare(&self, body: &Body) -> Result<PreparedBody, BackendError> {
-        self.prepare_body(body, false).await
+        self.stop
+            .until_stopped(self.prepare_body(body, false))
+            .await
     }
 
     /// [`Self::prepare`] for the new revision of an edited message: its attachments are the
     /// message's own, so one that has the pointer it arrived with is sent with it.
     pub(crate) async fn prepare_edit(&self, body: &Body) -> Result<PreparedBody, BackendError> {
-        self.prepare_body(body, true).await
+        self.stop.until_stopped(self.prepare_body(body, true)).await
+    }
+
+    /// The send is built and goes on the wire next: an abort is too late from here. `Err` when
+    /// one was accepted first (nothing may be sent then).
+    pub(crate) fn pass_point_of_no_return(&self) -> Result<(), BackendError> {
+        if self.stop.close() {
+            Ok(())
+        } else {
+            Err(stopped())
+        }
     }
 
     /// `DataMessage.quote` for `reply`: the quoted message's id and author, the snapshot's text
-    /// with its ranges, and the quoted attachment with its thumbnail uploaded.
+    /// with its ranges, and the quoted attachment with its thumbnail uploaded. Ends with `Err`
+    /// when an abort is accepted meanwhile.
     pub(crate) async fn quote(
+        &self,
+        reply: &ReplyTo,
+        own: Aci,
+    ) -> Result<proto::data_message::Quote, BackendError> {
+        self.stop.until_stopped(self.quote_of(reply, own)).await
+    }
+
+    async fn quote_of(
         &self,
         reply: &ReplyTo,
         own: Aci,
@@ -312,6 +491,13 @@ impl<T: SignalTransport> Uploader<'_, T> {
                 return Err(BackendError::unsupported(
                     "sending stickers is not available",
                 ));
+            }
+            // A card is never a revision of another message.
+            Body::Contact(card) if !edit => {
+                return Ok(PreparedBody {
+                    contact: vec![contact_card(card)?],
+                    ..PreparedBody::default()
+                });
             }
             _ => {
                 return Err(BackendError::unsupported(
@@ -445,11 +631,12 @@ impl<T: SignalTransport> Uploader<'_, T> {
             },
             fields,
             reencode: still_image,
+            index: u16::try_from(index).ok(),
         })
     }
 
-    /// Uploads every job (re-encoding still images first, unless a recent upload is reused) and
-    /// reports progress meanwhile; pointers that came with the message keep their place.
+    /// Uploads every job and reports progress meanwhile; pointers that came with the message
+    /// keep their place.
     async fn run(&self, slots: Vec<Slot>) -> Result<Vec<proto::AttachmentPointer>, BackendError> {
         if !slots.iter().any(|slot| matches!(slot, Slot::Upload(_))) {
             return Ok(slots
@@ -460,23 +647,27 @@ impl<T: SignalTransport> Uploader<'_, T> {
                 })
                 .collect());
         }
-        let total: u64 = slots
-            .iter()
-            .map(|slot| match slot {
-                Slot::Upload(job) => max_blob_len(job.spec.plain.len()),
-                Slot::Pointer(_) => 0,
-            })
-            .sum();
-        let sent = Arc::new(AtomicU64::new(0));
-        let ticker = tokio::task::spawn_local(report_progress(
+        // The ticker runs from the start and says `Preparing` (share 0, nothing to report per
+        // file yet) until every picture is re-encoded and the uploads are shown to it: the line
+        // under the message reads "Preparing files" and the X is there while that goes on.
+        let tracks: Tracks = Rc::new(RefCell::new(Vec::new()));
+        // The ticker ends with this future: an upload that is dropped (the attempt was stopped)
+        // must not leave a task waking four times a second for as long as the actor lives.
+        let ticker = AbortOnDrop(tokio::task::spawn_local(report_progress(
             self.shared.clone(),
             self.local,
-            sent.clone(),
-            total.max(1),
-        ));
-        let result = self.upload_all(slots, &sent).await;
-        ticker.abort();
+            tracks.clone(),
+        )));
+        // The re-encoded pictures wait in files of this attempt, removed when it ends, whatever
+        // way (a dropped future runs the destructor too).
+        let temp = Arc::new(TempFiles::new(self.shared.upload_tmp.clone()));
+        let result = self.upload_all(slots, &tracks, &temp).await;
+        // Before the final report below: a late tick must not report 0.99 after it.
+        drop(ticker);
         if result.is_ok() {
+            // An upload that was over before a tick, or since the last one, is told full now:
+            // every file that uploaded ends with `done == total`.
+            self.report_files_full(&tracks).await;
             // The uploads are over: no step. A 1:1 send reports none after this (the sealed
             // send, the sync transcript), and the line under the message would go on saying
             // "Uploading files"; a group send reports its own next step.
@@ -492,22 +683,47 @@ impl<T: SignalTransport> Uploader<'_, T> {
         result
     }
 
+    /// Reports every file whose last report was not "full" as full (the uploads are over).
+    async fn report_files_full(&self, tracks: &Tracks) {
+        let uploads: Vec<Arc<Track>> = tracks.borrow().clone();
+        for track in uploads {
+            let Some(index) = track.index else { continue };
+            if track.reported.swap(track.plain, Ordering::Relaxed) == track.plain {
+                continue;
+            }
+            let _ = self
+                .shared
+                .emit(BackendEvent::AttachmentProgress {
+                    local: self.local,
+                    index,
+                    done: track.plain,
+                    total: track.plain,
+                })
+                .await;
+        }
+    }
+
+    /// Makes every slot ready (a recent pointer looked up, a still picture re-encoded: the
+    /// size of each is final then), shows the uploads to the ticker, and uploads them one after
+    /// another.
     async fn upload_all(
         &self,
         slots: Vec<Slot>,
-        sent: &Arc<AtomicU64>,
+        tracks: &Tracks,
+        temp: &Arc<TempFiles>,
     ) -> Result<Vec<proto::AttachmentPointer>, BackendError> {
         let shared = self.shared;
-        let mut pointers = Vec::with_capacity(slots.len());
+        let mut ready = Vec::with_capacity(slots.len());
         for slot in slots {
             let Job {
                 mut spec,
                 fields,
                 reencode,
+                index,
             } = match slot {
                 Slot::Upload(job) => *job,
                 Slot::Pointer(pointer) => {
-                    pointers.push(*pointer);
+                    ready.push(Ready::Pointer(pointer));
                     continue;
                 }
             };
@@ -516,16 +732,54 @@ impl<T: SignalTransport> Uploader<'_, T> {
                 .db
                 .read(|c| upload::cached(c, &spec.source, now))
                 .map_err(|e| e.to_backend_error())?;
-            if reencode && reused.is_none() {
-                spec = reencoded(spec).await?;
-            }
+            let track = match &reused {
+                // Nothing to upload: the pointer's own size is the file's, full at once.
+                Some(pointer) => Track::new(
+                    index,
+                    pointer.size.map_or_else(|| spec.plain.len(), u64::from),
+                    true,
+                ),
+                None => {
+                    if reencode {
+                        spec = reencoded(spec, temp.clone()).await?;
+                    }
+                    Track::new(index, spec.plain.len(), false)
+                }
+            };
+            ready.push(Ready::Upload(Box::new(ReadyUpload {
+                spec,
+                fields,
+                now,
+                track: Arc::new(track),
+            })));
+        }
+        tracks
+            .borrow_mut()
+            .extend(ready.iter().filter_map(|r| match r {
+                Ready::Upload(upload) => Some(upload.track.clone()),
+                Ready::Pointer(_) => None,
+            }));
+        let mut pointers = Vec::with_capacity(ready.len());
+        for slot in ready {
+            let ReadyUpload {
+                spec,
+                fields,
+                now,
+                track,
+            } = match slot {
+                Ready::Pointer(pointer) => {
+                    pointers.push(*pointer);
+                    continue;
+                }
+                Ready::Upload(upload) => *upload,
+            };
             let uploaded = upload::upload(
                 &shared.net,
                 self.socket,
                 &shared.db,
                 spec,
                 now,
-                sent,
+                &track.sent,
                 shared.tuning.upload_stall,
             )
             .await
@@ -533,6 +787,7 @@ impl<T: SignalTransport> Uploader<'_, T> {
                 tracing::warn!(error = %e, "attachment upload failed");
                 e.to_backend_error()
             })?;
+            track.over.store(true, Ordering::Release);
             pointers.push(merge(uploaded, fields));
         }
         Ok(pointers)
@@ -588,6 +843,7 @@ fn long_text_job(text: &Text) -> Job {
             ..Default::default()
         },
         reencode: false,
+        index: None,
     }
 }
 
@@ -613,34 +869,41 @@ fn merge(
     }
 }
 
-/// What a still picture is sent as: its bytes, MIME type and size in pixels. The picture is
-/// re-encoded at [`PICTURE_LEVEL`] without any metadata block; one that does not decode here
-/// (HEIC, a damaged file) keeps its bytes, without metadata where the format allows, and the
-/// `mime` and `dims` the core gave it.
+/// A still picture as it is sent: its bytes, MIME type and size in pixels.
+type Still = (Vec<u8>, String, Option<(u32, u32)>);
+
+/// What a still picture is sent as: its bytes, MIME type and size in pixels, through
+/// [`kourier_media::clean_still`] (LOC, F14: the reason Signal states `cleaned_pictures`): the
+/// picture is re-encoded at [`PICTURE_LEVEL`] without any metadata block, or stripped when it
+/// does not re-encode. A type that function does not clean (HEIC, by its magic) keeps its bytes
+/// and the `mime` and `dims` the core gave it: the core's verdict asked for exactly those. A
+/// picture of a cleaned type that cannot be cleaned fails its attachment (log-safe).
 fn encode_still(
     original: &[u8],
     mime: &str,
     dims: Option<(u32, u32)>,
-) -> (Vec<u8>, String, Option<(u32, u32)>) {
-    match kourier_media::scale_to_level(original, PICTURE_LEVEL) {
-        Ok(encoded) => (
+) -> Result<Still, BackendError> {
+    match kourier_media::clean_still(original, PICTURE_LEVEL) {
+        Ok(encoded) => Ok((
             encoded.bytes,
             encoded.mime.to_owned(),
             Some((encoded.width, encoded.height)),
-        ),
-        Err(e) => {
-            tracing::info!(error = %e, "image not re-encoded; sent as it is");
-            match kourier_media::strip_metadata(original) {
-                Ok(stripped) => (stripped.bytes, stripped.mime.to_owned(), dims),
-                Err(_) => (original.to_vec(), mime.to_owned(), dims),
-            }
+        )),
+        Err(kourier_media::NotCleaned::NotMine) => {
+            tracing::info!("picture of a type not cleaned here; sent as it is");
+            Ok((original.to_vec(), mime.to_owned(), dims))
+        }
+        Err(e @ kourier_media::NotCleaned::Refused) => {
+            tracing::warn!(error = %e, "picture not sent");
+            Err(BackendError::new(ErrorKind::InvalidInput, e.to_string()))
         }
     }
 }
 
-/// Re-encodes a still image ([`encode_still`]; blocking pool); the plaintext then lives in
-/// memory.
-async fn reencoded(spec: Spec) -> Result<Spec, BackendError> {
+/// Re-encodes a still image ([`encode_still`]; blocking pool); the result waits for its upload
+/// in a temporary encrypted file of `temp` (never plaintext on disk, and one picture in memory
+/// at a time).
+async fn reencoded(spec: Spec, temp: Arc<TempFiles>) -> Result<Spec, BackendError> {
     tokio::task::spawn_blocking(move || {
         let Plaintext::Blob { path, key, .. } = &spec.plain else {
             return Ok(spec);
@@ -653,9 +916,13 @@ async fn reencoded(spec: Spec) -> Result<Spec, BackendError> {
                         "the image to send could not be read",
                     )
                 })?;
-        let (bytes, mime, dims) = encode_still(&original, &spec.mime, spec.dims);
+        let encoded = encode_still(&original, &spec.mime, spec.dims);
+        drop(original);
+        let (bytes, mime, dims) = encoded?;
+        let bytes = Zeroizing::new(bytes);
+        let (path, key, size) = temp.write(&bytes)?;
         Ok(Spec {
-            plain: Plaintext::Memory(Arc::new(Zeroizing::new(bytes))),
+            plain: Plaintext::Blob { path, key, size },
             mime,
             dims,
             source: spec.source,
@@ -713,28 +980,75 @@ pub(crate) fn attachment_net_ids(net_local: &str, index: usize) -> Vec<String> {
         .collect()
 }
 
-/// Sends `TransmitProgress` every [`PROGRESS_EVERY`] while it changes (aborted when done).
+/// Reports the uploads of an attempt every [`PROGRESS_EVERY`] while they move (aborted when
+/// done): each attachment's `AttachmentProgress` (the first report of every upload comes at the
+/// first tick after its size is final; later ones only when its bytes moved; an upload that is
+/// over before a tick is told full by [`Uploader::report_files_full`]), then
+/// `TransmitProgress` with the share of blob bytes sent over all blob bytes, never 1.0 from
+/// here: `run` reports that once every upload is done.
 async fn report_progress<T: SignalTransport>(
     shared: Rc<Shared<T>>,
     local: LocalMsgId,
-    sent: Arc<AtomicU64>,
-    total: u64,
+    tracks: Tracks,
 ) {
-    let mut last = u64::MAX;
+    // The files are being made ready from the attempt's start: said at once, not after a tick.
+    let mut last: Option<(f32, SendPhase)> = None;
+    if tracks.borrow().is_empty() {
+        last = Some((0.0, SendPhase::Preparing));
+        if shared
+            .emit(BackendEvent::TransmitProgress {
+                local,
+                progress: 0.0,
+                phase: Some(SendPhase::Preparing),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     loop {
         tokio::time::sleep(PROGRESS_EVERY).await;
-        let now = sent.load(Ordering::Relaxed).min(total);
-        if now == last {
+        let uploads: Vec<Arc<Track>> = tracks.borrow().clone();
+        for track in &uploads {
+            let Some(index) = track.index else { continue };
+            let done = track.plain_done();
+            if track.reported.swap(done, Ordering::Relaxed) == done {
+                continue;
+            }
+            let event = BackendEvent::AttachmentProgress {
+                local,
+                index,
+                done,
+                total: track.plain,
+            };
+            if shared.emit(event).await.is_err() {
+                return;
+            }
+        }
+        let (done, total) = uploads.iter().fold((0u64, 0u64), |(done, total), track| {
+            (done + track.blob_done(), total + track.blob)
+        });
+        let progress = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).min(0.99)
+        };
+        // The phase ends with the preparation: the uploads are known when `tracks` holds them.
+        let phase = if uploads.is_empty() {
+            SendPhase::Preparing
+        } else {
+            SendPhase::Uploading
+        };
+        if last == Some((progress, phase)) {
             continue;
         }
-        last = now;
-        // Never 1.0 from here: `run` reports that once every upload is done.
-        let progress = (now as f32 / total as f32).min(0.99);
+        last = Some((progress, phase));
         if shared
             .emit(BackendEvent::TransmitProgress {
                 local,
                 progress,
-                phase: Some(kourier_model::SendPhase::Uploading),
+                phase: Some(phase),
             })
             .await
             .is_err()
@@ -747,6 +1061,10 @@ async fn report_progress<T: SignalTransport>(
 #[cfg(test)]
 mod tests {
     use kourier_model::{RangeKind, TextRange};
+
+    use std::path::PathBuf;
+
+    use kourier_model::BlobKey;
 
     use super::*;
 
@@ -821,8 +1139,73 @@ mod tests {
         );
     }
 
+    /// The ticker's events from `core`: `(AttachmentProgress { index, done, total }, share)`
+    /// pairs flattened into two lists, in arrival order.
+    fn drain(
+        core: &mut tokio::sync::mpsc::Receiver<kourier_backend_api::Envelope>,
+        local: LocalMsgId,
+        files: &mut Vec<(u16, u64, u64)>,
+        shares: &mut Vec<f32>,
+    ) {
+        let mut phases = Vec::new();
+        drain_phases(core, local, files, shares, &mut phases);
+    }
+
+    /// [`drain`], and the phase of each `TransmitProgress` in `phases`, in the same order as
+    /// `shares`.
+    fn drain_phases(
+        core: &mut tokio::sync::mpsc::Receiver<kourier_backend_api::Envelope>,
+        local: LocalMsgId,
+        files: &mut Vec<(u16, u64, u64)>,
+        shares: &mut Vec<f32>,
+        phases: &mut Vec<Option<SendPhase>>,
+    ) {
+        while let Ok(envelope) = core.try_recv() {
+            assert!(envelope.ack.is_none(), "progress is ephemeral");
+            for event in envelope.events {
+                match event {
+                    BackendEvent::AttachmentProgress {
+                        local: l,
+                        index,
+                        done,
+                        total,
+                    } => {
+                        assert_eq!(l, local);
+                        files.push((index, done, total));
+                    }
+                    BackendEvent::TransmitProgress {
+                        local: l,
+                        progress,
+                        phase,
+                    } => {
+                        assert_eq!(l, local);
+                        shares.push(progress);
+                        phases.push(phase);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A track by hand: `plain` plaintext bytes that make a blob of `blob` bytes.
+    fn track(index: Option<u16>, plain: u64, blob: u64, over: bool) -> Arc<Track> {
+        Arc::new(Track {
+            index,
+            plain,
+            blob,
+            sent: Arc::new(AtomicU64::new(0)),
+            over: AtomicBool::new(over),
+            reported: AtomicU64::new(NOT_REPORTED),
+        })
+    }
+
     /// `TransmitProgress` follows the blob bytes sent: one event per change, as a share of the
-    /// total, and never 1.0 from the ticker (that one marks the finished uploads).
+    /// total, and never 1.0 from the ticker (that one marks the finished uploads). Before the
+    /// uploads are known (the pictures are being re-encoded) it says `Preparing` at 0 (once, at
+    /// the start: the line "Preparing files" and the X wait for it) and no file; the phase
+    /// turns to `Uploading` in the very tick in which the per-file reports at 0 begin (upload
+    /// progress, fix U3).
     #[tokio::test(flavor = "current_thread")]
     async fn progress_events_follow_the_bytes_sent() {
         tokio::task::LocalSet::new()
@@ -836,31 +1219,658 @@ mod tests {
                 let mut core = test.core;
                 let shared = Rc::new(test.shared);
                 let local = kourier_model::MessageId(7);
-                let sent = Arc::new(AtomicU64::new(0));
+                let tracks: Tracks = Rc::new(RefCell::new(Vec::new()));
                 let ticker =
-                    tokio::task::spawn_local(report_progress(shared, local, sent.clone(), 1000));
-                let mut seen = Vec::new();
+                    tokio::task::spawn_local(report_progress(shared, local, tracks.clone()));
+                let (mut files, mut shares, mut phases) = (Vec::new(), Vec::new(), Vec::new());
+                let tick = PROGRESS_EVERY + Duration::from_millis(60);
+                // Preparing: no upload known yet. The phase is said at once and not repeated.
+                tokio::task::yield_now().await;
+                drain_phases(&mut core, local, &mut files, &mut shares, &mut phases);
+                assert_eq!(
+                    (shares.as_slice(), phases.as_slice()),
+                    ([0.0].as_slice(), [Some(SendPhase::Preparing)].as_slice()),
+                    "said before the first tick"
+                );
+                tokio::time::sleep(tick * 2).await;
+                drain_phases(&mut core, local, &mut files, &mut shares, &mut phases);
+                assert!(files.is_empty(), "{files:?}");
+                assert_eq!(shares, [0.0], "and not said again");
+                // A blob of 1000 bytes for 800 plaintext bytes.
+                let upload = track(Some(0), 800, 1000, false);
+                tracks.borrow_mut().push(upload.clone());
                 // Unchanged (250 twice) is not reported again; past the total is capped.
                 for bytes in [0u64, 250, 250, 900, 5000] {
-                    sent.store(bytes, Ordering::Relaxed);
-                    tokio::time::sleep(PROGRESS_EVERY + Duration::from_millis(60)).await;
-                    while let Ok(envelope) = core.try_recv() {
-                        assert!(envelope.ack.is_none(), "progress is ephemeral");
-                        for event in envelope.events {
-                            match event {
-                                BackendEvent::TransmitProgress {
-                                    local: l, progress, ..
-                                } => {
-                                    assert_eq!(l, local);
-                                    seen.push(progress);
-                                }
-                                other => panic!("{other:?}"),
-                            }
-                        }
+                    upload.sent.store(bytes, Ordering::Relaxed);
+                    tokio::time::sleep(tick).await;
+                    drain_phases(&mut core, local, &mut files, &mut shares, &mut phases);
+                    if bytes == 0 {
+                        assert_eq!(
+                            (files.as_slice(), phases.last()),
+                            ([(0, 0, 800)].as_slice(), Some(&Some(SendPhase::Uploading))),
+                            "the file's first report and the phase turn in one tick"
+                        );
                     }
                 }
                 ticker.abort();
-                assert_eq!(seen, [0.0, 0.25, 0.9, 0.99]);
+                assert_eq!(shares, [0.0, 0.0, 0.25, 0.9, 0.99]);
+                assert_eq!(
+                    phases,
+                    [
+                        Some(SendPhase::Preparing),
+                        Some(SendPhase::Uploading),
+                        Some(SendPhase::Uploading),
+                        Some(SendPhase::Uploading),
+                        Some(SendPhase::Uploading)
+                    ]
+                );
+                assert_eq!(
+                    files,
+                    [(0, 0, 800), (0, 200, 800), (0, 720, 800), (0, 799, 800)],
+                    "the plaintext share of the blob; the last byte only when the upload is over"
+                );
+            })
+            .await;
+    }
+
+    /// Each attachment reports itself: its position, its own bytes, a total that is final from
+    /// the first report; a reused pointer is full in its first report; the long text's file is
+    /// never reported but counts in the share; `done == total` only once an upload is over; the
+    /// share never goes down and stays below 1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_upload_reports_its_own_file_and_ends_full() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = crate::receive::tests::fixture();
+                let test = crate::actor::testing::shared(
+                    fixture.db.clone(),
+                    fixture.account.clone(),
+                    Vec::new(),
+                );
+                let mut core = test.core;
+                let shared = Rc::new(test.shared);
+                let local = kourier_model::MessageId(9);
+                let tracks: Tracks = Rc::new(RefCell::new(Vec::new()));
+                let (text, picture, reused, file) = (
+                    track(None, 600, 1000, false),
+                    track(Some(0), 4000, 5000, false),
+                    track(Some(1), 3000, 4000, true),
+                    track(Some(2), 7000, 8000, false),
+                );
+                // Every size is final when the uploads are shown to the ticker.
+                tracks.borrow_mut().extend([
+                    text.clone(),
+                    picture.clone(),
+                    reused.clone(),
+                    file.clone(),
+                ]);
+                let ticker =
+                    tokio::task::spawn_local(report_progress(shared, local, tracks.clone()));
+                let (mut files, mut shares) = (Vec::new(), Vec::new());
+                let tick = PROGRESS_EVERY + Duration::from_millis(60);
+                tokio::time::sleep(tick).await;
+                drain(&mut core, local, &mut files, &mut shares);
+                assert_eq!(
+                    files,
+                    [(0, 0, 4000), (1, 3000, 3000), (2, 0, 7000)],
+                    "every upload at once; the reused pointer is full; the text is not reported"
+                );
+                // The text, then the picture, then the file go up one after another.
+                for (upload, bytes) in [
+                    (&text, 1000),
+                    (&picture, 2500),
+                    (&picture, 5000),
+                    (&file, 6000),
+                    (&file, 8000),
+                ] {
+                    upload.sent.store(bytes, Ordering::Relaxed);
+                    tokio::time::sleep(tick).await;
+                    drain(&mut core, local, &mut files, &mut shares);
+                }
+                // The blob of the last upload is queued; its pointer is not there yet.
+                assert_eq!(files.last(), Some(&(2, 6999, 7000)));
+                for upload in [&text, &picture, &file] {
+                    upload.over.store(true, Ordering::Release);
+                }
+                tokio::time::sleep(tick).await;
+                drain(&mut core, local, &mut files, &mut shares);
+                ticker.abort();
+                for index in 0..3u16 {
+                    let mine: Vec<(u64, u64)> = files
+                        .iter()
+                        .filter(|(i, ..)| *i == index)
+                        .map(|(_, done, total)| (*done, *total))
+                        .collect();
+                    let total = mine[0].1;
+                    assert!(
+                        mine.iter().all(|(_, t)| *t == total),
+                        "{index}: the total is final from the first report: {mine:?}"
+                    );
+                    assert!(
+                        mine.windows(2).all(|w| w[0].0 <= w[1].0),
+                        "{index}: never down: {mine:?}"
+                    );
+                    assert_eq!(mine.last(), Some(&(total, total)), "{index}: ends full");
+                    assert!(
+                        mine[..mine.len() - 1].iter().all(|(done, _)| *done < total),
+                        "{index}: full only at its end: {mine:?}"
+                    );
+                }
+                assert!(
+                    shares.windows(2).all(|w| w[0] <= w[1]),
+                    "never down: {shares:?}"
+                );
+                assert!(shares.iter().all(|share| *share < 1.0), "{shares:?}");
+                assert_eq!(
+                    shares.first(),
+                    Some(&(4000.0_f32 / 18000.0)),
+                    "the reused pointer's blob is 4000 of the 18000 bytes"
+                );
+                assert_eq!(shares.last(), Some(&0.99));
+            })
+            .await;
+    }
+
+    /// A transport whose chat socket hands out a TUS upload form and whose CDN takes every body,
+    /// holding each upload for `hold` after its body was read; it notes what the account's
+    /// temporary directory holds when an upload arrives.
+    struct StubCdn {
+        hold: Duration,
+        tmp: PathBuf,
+        /// Per upload request: the files of `tmp` as `(length, starts as a kourier-blob)`.
+        seen: std::sync::Mutex<Vec<Vec<(u64, bool)>>>,
+        /// Told when an upload request has its body and holds.
+        arrived: tokio::sync::Notify,
+    }
+
+    struct StubSocket;
+
+    impl crate::net::ChatSocket for StubSocket {
+        async fn request(
+            &self,
+            _request: crate::net::ChatRequest,
+        ) -> Result<crate::net::ChatResponse, crate::net::TransportError> {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn send_multi_recipient(
+            &self,
+            _send: crate::net::MultiRecipientSend,
+        ) -> Result<crate::net::MultiRecipientOutcome, crate::net::TransportError> {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn get_upload_form(
+            &self,
+            _upload_length: u64,
+        ) -> Result<
+            Result<crate::net::UploadForm, crate::net::UploadTooLarge>,
+            crate::net::TransportError,
+        > {
+            Ok(Ok(crate::net::UploadForm {
+                cdn: 3,
+                key: "the-cdn-key".to_owned(),
+                headers: Vec::new(),
+                signed_upload_url: "https://cdn.example/attachments/".to_owned(),
+            }))
+        }
+
+        async fn disconnect(&self) {}
+    }
+
+    impl SignalTransport for StubCdn {
+        type Socket = StubSocket;
+
+        async fn connect_auth(
+            &self,
+            _credentials: &crate::net::AuthCredentials,
+        ) -> Result<
+            crate::net::Connected<StubSocket, crate::net::ChatEvent>,
+            crate::net::TransportError,
+        > {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn connect_unauth(
+            &self,
+        ) -> Result<
+            crate::net::Connected<StubSocket, crate::net::ChatEvent>,
+            crate::net::TransportError,
+        > {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn connect_provisioning(
+            &self,
+        ) -> Result<
+            crate::net::Connected<StubSocket, crate::net::ProvisioningEvent>,
+            crate::net::TransportError,
+        > {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn https(
+            &self,
+            _request: crate::net::HttpsRequest,
+        ) -> Result<crate::net::HttpsResponse, crate::net::TransportError> {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn https_download(
+            &self,
+            _request: crate::net::HttpsRequest,
+            _sink: crate::net::DownloadSink,
+        ) -> Result<http::StatusCode, crate::net::TransportError> {
+            Err(crate::net::TransportError::Disconnected)
+        }
+
+        async fn https_upload(
+            &self,
+            request: crate::net::UploadRequest,
+        ) -> Result<crate::net::HttpsResponse, crate::net::TransportError> {
+            if let Some(mut body) = request.body {
+                while let Some(chunk) = body.chunks.recv().await {
+                    chunk.map_err(|_| crate::net::TransportError::Disconnected)?;
+                }
+            }
+            let held: Vec<(u64, bool)> = std::fs::read_dir(&self.tmp)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| {
+                            let bytes = std::fs::read(entry.path()).unwrap_or_default();
+                            (bytes.len() as u64, bytes.starts_with(&kourier_blob::MAGIC))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(held);
+            self.arrived.notify_one();
+            tokio::time::sleep(self.hold).await;
+            Ok(crate::net::HttpsResponse {
+                status: http::StatusCode::CREATED,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::new(),
+            })
+        }
+
+        fn network_changed(&self) {}
+    }
+
+    /// What an `Uploader` test stands on: the account's shared state over the stub CDN with
+    /// directories of its own, the core's end of the channel, and the files of the message.
+    struct UploadWorld {
+        _fixture: crate::receive::tests::Fixture,
+        _dir: tempfile::TempDir,
+        shared: Rc<Shared<StubCdn>>,
+        core: tokio::sync::mpsc::Receiver<kourier_backend_api::Envelope>,
+        cdn: Arc<StubCdn>,
+        tmp: PathBuf,
+    }
+
+    fn upload_world(hold: Duration) -> UploadWorld {
+        let fixture = crate::receive::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("upload-tmp");
+        let cdn = Arc::new(StubCdn {
+            hold,
+            tmp: tmp.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+            arrived: tokio::sync::Notify::new(),
+        });
+        let mut test = crate::actor::testing::shared_over(
+            cdn.clone(),
+            fixture.db.clone(),
+            fixture.account.clone(),
+            Vec::new(),
+        );
+        test.shared.blob_dir = dir.path().join("blobs");
+        test.shared.upload_tmp = tmp.clone();
+        UploadWorld {
+            _fixture: fixture,
+            _dir: dir,
+            shared: Rc::new(test.shared),
+            core: test.core,
+            cdn,
+            tmp,
+        }
+    }
+
+    /// A core attachment: a sealed file of `bytes` in the account's blob directory.
+    fn core_attachment(
+        world: &UploadWorld,
+        rel: &str,
+        kind: AttachmentKind,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Attachment {
+        let key = kourier_blob::FileKey::generate();
+        let path = world.shared.blob_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        kourier_blob::write_all(&path, &key, bytes).unwrap();
+        Attachment {
+            kind,
+            mime: mime.to_owned(),
+            size: bytes.len() as u64,
+            local: Some(BlobRef {
+                path: rel.into(),
+                key: BlobKey::new(*key.as_bytes()),
+            }),
+            ..Attachment::default()
+        }
+    }
+
+    /// The files of the account's temporary directory.
+    fn tmp_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    /// A message of a picture to re-encode, a picture a recent upload left a pointer for, and a
+    /// file: every size is final before the first byte goes up, the re-encoded picture waits in a
+    /// sealed temporary file (the only file of the directory when its upload starts), the files
+    /// are gone when the attempt ends, and the picture's first report already carries its
+    /// RE-ENCODED size (not the size of the file it came from).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_picture_is_re_encoded_first_into_a_temporary_sealed_file() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut world = upload_world(Duration::from_millis(400));
+                let original =
+                    kourier_media::sample_image(2400, 1800, 3, kourier_media::SampleFormat::Png)
+                        .unwrap();
+                let re_encoded = encode_still(&original, "image/png", None).unwrap().0.len() as u64;
+                assert_ne!(re_encoded, original.len() as u64);
+                let picture = core_attachment(
+                    &world,
+                    "core/aa/pic",
+                    AttachmentKind::Image,
+                    "image/png",
+                    &original,
+                );
+                let file = core_attachment(
+                    &world,
+                    "core/aa/doc",
+                    AttachmentKind::File,
+                    "application/pdf",
+                    &vec![7u8; 90_000],
+                );
+                // A picture a recent upload left a pointer for: nothing to re-encode or upload.
+                let mut reused = core_attachment(
+                    &world,
+                    "core/aa/old",
+                    AttachmentKind::Image,
+                    "image/png",
+                    &[1; 10],
+                );
+                let local = reused.local.as_ref().unwrap();
+                let source = upload::source_key(
+                    PICTURE_TRANSFORM,
+                    &[
+                        local.path.as_os_str().as_encoded_bytes(),
+                        &local.key.expose()[..],
+                    ],
+                );
+                let remembered = proto::AttachmentPointer {
+                    size: Some(123_456),
+                    cdn_number: Some(3),
+                    digest: Some(vec![5; 32]),
+                    key: Some(vec![6; 64]),
+                    ..Default::default()
+                };
+                let now = world.shared.now();
+                world
+                    .shared
+                    .db
+                    .zone(|tx| upload::remember(tx, &source, &remembered, now))
+                    .unwrap();
+                reused.size = 10;
+                let body = Body::Media {
+                    attachments: vec![picture, reused, file],
+                    caption: None,
+                };
+                let local_id = kourier_model::MessageId(11);
+                let socket = Arc::new(StubSocket);
+                let stop = Stop::open();
+                let uploader = Uploader {
+                    shared: &world.shared,
+                    socket: &socket,
+                    local: local_id,
+                    net_local: "1700000000000",
+                    stop: &stop,
+                };
+                let prepared = uploader.prepare(&body).await.expect("prepare");
+                assert_eq!(prepared.attachments.len(), 3);
+                assert_eq!(
+                    prepared.attachments[0].size,
+                    Some(re_encoded as u32),
+                    "the picture went up as re-encoded"
+                );
+                assert_eq!(
+                    prepared.attachments[1].size,
+                    Some(123_456),
+                    "the reused pointer"
+                );
+                assert_eq!(tmp_files(&world.tmp), 0, "the attempt's files went with it");
+
+                // What the CDN saw when the picture's upload arrived: ONE sealed file, the
+                // re-encoded picture (the file is read in place and the reused one not at all).
+                let seen = world.cdn.seen.lock().unwrap().clone();
+                assert_eq!(seen.len(), 2, "two uploads: the picture and the file");
+                assert_eq!(
+                    seen[0],
+                    [(kourier_blob::sealed_len(re_encoded), true)],
+                    "a sealed temporary file of the re-encoded picture"
+                );
+                assert_eq!(seen[1], [(kourier_blob::sealed_len(re_encoded), true)]);
+
+                let mut firsts: Vec<Option<(u64, u64)>> = vec![None; 3];
+                let mut ended = None;
+                while let Ok(envelope) = world.core.try_recv() {
+                    for event in envelope.events {
+                        match event {
+                            BackendEvent::AttachmentProgress {
+                                index, done, total, ..
+                            } => {
+                                firsts[usize::from(index)].get_or_insert((done, total));
+                            }
+                            BackendEvent::TransmitProgress {
+                                progress, phase, ..
+                            } => {
+                                ended = Some((progress, phase));
+                            }
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                }
+                // The first report comes at the first tick, when the picture's bytes may be
+                // under way already: its TOTAL is what must be final.
+                assert_eq!(
+                    firsts[0].map(|(_, total)| total),
+                    Some(re_encoded),
+                    "the picture's total is its re-encoded size from the first report"
+                );
+                assert_eq!(
+                    firsts[1],
+                    Some((123_456, 123_456)),
+                    "the reused pointer is full at once"
+                );
+                assert_eq!(firsts[2].map(|(_, total)| total), Some(90_000));
+                assert_eq!(ended, Some((1.0, None)), "the uploads are over");
+            })
+            .await;
+    }
+
+    /// An upload that is over before the first tick (250 ms) is still reported: every file that
+    /// uploaded ends with `done == total`, said before the uploads are reported over. (The
+    /// ticker alone says nothing for a quick upload, and the UI would hear of no file.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_quick_upload_is_told_full_before_the_uploads_are_over() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut world = upload_world(Duration::ZERO);
+                let picture = core_attachment(
+                    &world,
+                    "core/aa/pic",
+                    AttachmentKind::Image,
+                    "image/png",
+                    &kourier_media::sample_image(300, 200, 4, kourier_media::SampleFormat::Png)
+                        .unwrap(),
+                );
+                let file = core_attachment(
+                    &world,
+                    "core/aa/doc",
+                    AttachmentKind::File,
+                    "application/pdf",
+                    &vec![9u8; 5_000],
+                );
+                let body = Body::Media {
+                    attachments: vec![picture, file],
+                    caption: None,
+                };
+                let socket = Arc::new(StubSocket);
+                let stop = Stop::open();
+                let uploader = Uploader {
+                    shared: &world.shared,
+                    socket: &socket,
+                    local: kourier_model::MessageId(13),
+                    net_local: "1700000000002",
+                    stop: &stop,
+                };
+                let started = tokio::time::Instant::now();
+                uploader.prepare(&body).await.expect("prepare");
+                assert!(
+                    started.elapsed() < PROGRESS_EVERY,
+                    "the ticker never ticked"
+                );
+                let mut events = Vec::new();
+                while let Ok(envelope) = world.core.try_recv() {
+                    events.extend(envelope.events);
+                }
+                let full: Vec<(usize, u16, u64, u64)> = events
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, e)| match e {
+                        BackendEvent::AttachmentProgress {
+                            index, done, total, ..
+                        } => Some((at, *index, *done, *total)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    full.iter().map(|f| (f.1, f.2 == f.3)).collect::<Vec<_>>(),
+                    [(0, true), (1, true)],
+                    "each file once, full: {events:?}"
+                );
+                assert_eq!(full[1].3, 5_000, "the file's total is its size");
+                let over = events
+                    .iter()
+                    .position(|e| {
+                        matches!(
+                            e,
+                            BackendEvent::TransmitProgress {
+                                progress, phase: None, ..
+                            } if *progress == 1.0
+                        )
+                    })
+                    .expect("the uploads are reported over");
+                assert!(
+                    full.iter().all(|f| f.0 < over),
+                    "the files are told full before the uploads are over: {events:?}"
+                );
+            })
+            .await;
+    }
+
+    /// An attempt that is dropped in the middle of an upload (the task is aborted) leaves no
+    /// temporary file behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_attempt_leaves_no_temporary_file() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let world = upload_world(Duration::from_secs(60));
+                let original =
+                    kourier_media::sample_image(1200, 900, 5, kourier_media::SampleFormat::Png)
+                        .unwrap();
+                let picture = core_attachment(
+                    &world,
+                    "core/aa/pic",
+                    AttachmentKind::Image,
+                    "image/png",
+                    &original,
+                );
+                let body = Body::Media {
+                    attachments: vec![picture],
+                    caption: None,
+                };
+                let socket = Arc::new(StubSocket);
+                let stop = Stop::open();
+                let uploader = Uploader {
+                    shared: &world.shared,
+                    socket: &socket,
+                    local: kourier_model::MessageId(12),
+                    net_local: "1700000000001",
+                    stop: &stop,
+                };
+                let attempt = Box::pin(uploader.prepare(&body));
+                let mut attempt = Some(attempt);
+                tokio::select! {
+                    _ = attempt.as_mut().unwrap() => panic!("the held upload ended"),
+                    () = world.cdn.arrived.notified() => {}
+                }
+                assert_eq!(tmp_files(&world.tmp), 1, "the picture waits for its upload");
+                drop(attempt.take());
+                assert_eq!(tmp_files(&world.tmp), 0, "dropped with its attempt");
+            })
+            .await;
+    }
+
+    /// The progress ticker ends with the upload it reports: an upload that is dropped (the
+    /// attempt was stopped by the user) leaves no task that wakes four times a second for as
+    /// long as the actor lives. The ticker holds the actor's shared state, so it is seen there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_ticker_survives_a_dropped_upload() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let world = upload_world(Duration::from_secs(60));
+                let doc = core_attachment(
+                    &world,
+                    "core/aa/doc",
+                    AttachmentKind::File,
+                    "application/pdf",
+                    &[3u8; 90_000],
+                );
+                let body = Body::Media {
+                    attachments: vec![doc],
+                    caption: None,
+                };
+                let socket = Arc::new(StubSocket);
+                let stop = Stop::open();
+                let uploader = Uploader {
+                    shared: &world.shared,
+                    socket: &socket,
+                    local: kourier_model::MessageId(13),
+                    net_local: "1700000000002",
+                    stop: &stop,
+                };
+                assert_eq!(Rc::strong_count(&world.shared), 1);
+                let mut attempt = Some(Box::pin(uploader.prepare(&body)));
+                tokio::select! {
+                    _ = attempt.as_mut().unwrap() => panic!("the held upload ended"),
+                    () = world.cdn.arrived.notified() => {}
+                }
+                assert_eq!(
+                    Rc::strong_count(&world.shared),
+                    2,
+                    "the ticker of the running upload holds the state"
+                );
+                drop(attempt.take());
+                // The aborted task is dropped when the set polls it next.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(
+                    Rc::strong_count(&world.shared),
+                    1,
+                    "no ticker is left behind by the dropped upload"
+                );
             })
             .await;
     }
@@ -884,7 +1894,7 @@ mod tests {
                 size_of(&photo) > level.threshold_size,
                 "{width} × {height}: large enough to be re-encoded as a JPEG"
             );
-            let (bytes, mime, dims) = encode_still(&photo, "image/png", None);
+            let (bytes, mime, dims) = encode_still(&photo, "image/png", None).unwrap();
             assert_eq!(mime, "image/jpeg");
             assert!(size_of(&bytes) <= level.target_size);
             let decoded = kourier_media::decode(&bytes).unwrap();
@@ -898,16 +1908,25 @@ mod tests {
         );
         // A small picture keeps its size and kind.
         let small = sample_image(320, 200, 4, SampleFormat::Png).unwrap();
-        let (bytes, mime, dims) = encode_still(&small, "image/png", None);
+        let (bytes, mime, dims) = encode_still(&small, "image/png", None).unwrap();
         assert_eq!((mime.as_str(), dims), ("image/png", Some((320, 200))));
         assert!(kourier_media::decode(&bytes).is_ok());
         // Not a picture Kourier decodes: the bytes, MIME type and size it came with.
         let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic not really a picture".to_vec();
-        let (bytes, mime, dims) = encode_still(&heic, "image/heic", Some((4032, 3024)));
+        let (bytes, mime, dims) = encode_still(&heic, "image/heic", Some((4032, 3024))).unwrap();
         assert_eq!(bytes, heic);
         assert_eq!((mime.as_str(), dims), ("image/heic", Some((4032, 3024))));
-        // The upload cache keeps levels apart.
-        assert_eq!(PICTURE_TRANSFORM, "image-level-3");
+        // A located HEIC too: `clean_still` does not clean it, the core asked (LOC N7).
+        let located = kourier_media::sample_located(kourier_media::SampleLocated::Heic);
+        let (bytes, _, _) = encode_still(&located, "image/heic", None).unwrap();
+        assert_eq!(bytes, located);
+        // A JPEG that neither re-encodes nor strips fails its attachment, log-safe.
+        let broken = b"\xff\xd8\xff\xe1\0\x08Exif\0\0not a marker".to_vec();
+        let e = encode_still(&broken, "image/jpeg", None).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::InvalidInput);
+        assert!(!format!("{e:?}").contains("not a marker"));
+        // The upload cache keeps levels apart, and pointers from before `clean_still` (N6).
+        assert_eq!(PICTURE_TRANSFORM, "image-level-3-clean");
     }
 
     /// A message of many videos (an album our phone sent, edited here): ten keep their

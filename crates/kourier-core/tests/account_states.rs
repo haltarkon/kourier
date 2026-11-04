@@ -4,7 +4,7 @@
 //! connection, clock-skew and logged-out states reach the UI, also after a restart, and a
 //! relink keeps the history; the fixture's showcase chats and account states.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -403,6 +403,8 @@ async fn connection_clock_and_logged_out_states_reach_the_ui() {
     // Unlinked: logged out, with the reason, and the history stays.
     let logged_out = ConnState::LoggedOut {
         reason: "unlinked on the phone".into(),
+        cause: Default::default(),
+        note: Default::default(),
     };
     let h = env.handle.clone();
     eventually("logged out", WAIT, || {

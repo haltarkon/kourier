@@ -14,12 +14,25 @@ QtObject {
     // `attachment`, `url` (full size), `animated`, `media`, `kind`, `state`, `progress` and
     // `placeholder`; `message` is the message they belong to (0 for none).
     signal albumRequested(var items, int index, real message)
+    // Show the picture `attachment` of `message` in the viewer, starting with the rows of the gallery
+    // slot `slot` ("group", "person" or "media": the squares of "Media and Files"): the viewer then
+    // reads the whole album of that message with a query of its own (`App.showGalleryViewer`) and
+    // follows the message, not the slot's rows and not the open timeline (the message may belong to
+    // another chat).
+    signal galleryRequested(string slot, real attachment, real message)
     // Open a downloaded file with the desktop's default application; `media` = a well-known
     // picture, sound or video type (no confirmation), else the window asks first.
     signal openRequested(real attachment, string name, bool media)
+    // Save these attachments (their numbers) to a folder: one asks where, several ask for a folder
+    // (the window asks, `App.askSave` / `App.saveAll`); only ones the core listed as savable.
+    signal saveRequested(var attachments)
 
     function view(attachment: real, url: string, animated: bool, media: bool, message: real): void {
         viewRequested(attachment, url, animated, media, message);
+    }
+
+    function viewGallery(slot: string, attachment: real, message: real): void {
+        galleryRequested(slot, attachment, message);
     }
 
     function viewAlbum(items: var, index: int, message: real): void {
@@ -59,5 +72,9 @@ QtObject {
 
     function open(attachment: real, name: string, media: bool): void {
         openRequested(attachment, name, media);
+    }
+
+    function save(attachments: var): void {
+        saveRequested(attachments);
     }
 }

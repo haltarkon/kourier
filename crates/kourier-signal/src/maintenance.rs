@@ -17,7 +17,8 @@ use kourier_backend_api::BackendEvent;
 use kourier_backend_api::clock::duration_ms;
 use kourier_db::rusqlite::{Connection, OptionalExtension};
 use kourier_db::{Tx, ZoneDb};
-use kourier_model::AccountCaps;
+use kourier_model::{AccountCaps, ContactPatch};
+use libsignal_core::ServiceId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -153,6 +154,10 @@ pub(crate) fn account_caps(config: &BTreeMap<String, String>) -> AccountCaps {
         // Both are part of every chat's features (`crate::features::Limits`): a change sends
         // the features again.
         delete_for_everyone_max_age_secs: Some(crate::features::delete_max_age(config)),
+        // The pin limit and the roaming flag are the account's own, not the config's alone:
+        // [`account_caps_of`] adds both (A10c, critic Y2). This function is for the callers that
+        // read a limit only.
+        max_pinned_chats: None,
         flags: BTreeMap::from([
             (
                 "admin_delete".to_owned(),
@@ -167,15 +172,48 @@ pub(crate) fn account_caps(config: &BTreeMap<String, String>) -> AccountCaps {
     }
 }
 
+/// What the account can do, for the core, as the backend STATES it: [`account_caps`] of `config`
+/// plus the two facts the config does not hold (A10c, critic Y2, A10a's F1) and that the core
+/// reads TOGETHER: [`AccountCaps::FLAG_ROAMING_WRITES`] from `account.roaming_writes` (Signal CAN
+/// write the chat settings, so a linked account always states it: `false` = its switch is off,
+/// the entries are shown greyed with the reason; `true` = on) and `max_pinned_chats` from
+/// `global.pinnedChatLimit` (`intents::pin_limit_of`: 4 when the config states none; the core
+/// assumes NO limit while none is stated). The core REPLACES the stored caps with every
+/// `AccountCaps` event (`ingest/roaming.rs`), so every place that emits caps (the start, a
+/// rebuild, a remote-config refresh, the switch) goes through here: a statement built from the
+/// config alone would hide every roaming entry of an account until the next start. The limits-only
+/// callers (`features`, `attachment`, `import_media_config`) keep [`account_caps`].
+pub(crate) fn account_caps_over(
+    conn: &Connection,
+    config: &BTreeMap<String, String>,
+) -> Result<AccountCaps> {
+    let mut caps = account_caps(config);
+    caps.max_pinned_chats = Some(crate::storage::intents::pin_limit_of(
+        config
+            .get(crate::storage::intents::PIN_LIMIT_CONFIG)
+            .map(String::as_str),
+    ));
+    caps.flags.insert(
+        AccountCaps::FLAG_ROAMING_WRITES.to_owned(),
+        crate::storage::intents::switch_is_on(conn)?,
+    );
+    Ok(caps)
+}
+
+/// [`account_caps_over`] the stored remote config.
+pub(crate) fn account_caps_of(conn: &Connection) -> Result<AccountCaps> {
+    account_caps_over(conn, &load_remote_config(conn)?)
+}
+
 /// The backend's own statement of what the account can do, for the core: written at EVERY
 /// start (`actor.rs`), after a rebuild too. The limits come from the stored remote config when
 /// there is one; the flags that are the backend's own (the one for asking the phone,
-/// [`AccountCaps::FLAG_ATTACHMENT_RESTORE`]) do not depend on it. Stated only when a config
-/// had been fetched, they would be missing from an account whose config never arrived (the
-/// first start offline) and from a `core.db` made before the flag existed (the comparison
-/// that sends a changed config's caps sees no change in them).
+/// [`AccountCaps::FLAG_ATTACHMENT_RESTORE`], and the roaming switch) do not depend on it. Stated
+/// only when a config had been fetched, they would be missing from an account whose config never
+/// arrived (the first start offline) and from a `core.db` made before the flag existed (the
+/// comparison that sends a changed config's caps sees no change in them).
 pub(crate) fn append_account_caps(tx: &mut Tx<'_>, now: i64, wake: &Rc<Notify>) -> Result<()> {
-    let caps = account_caps(&load_remote_config(tx)?);
+    let caps = account_caps_of(tx)?;
     crate::outbox::append_events(tx, &[BackendEvent::AccountCaps(caps)], now, wake).map(drop)
 }
 
@@ -242,8 +280,10 @@ pub(crate) fn store_remote_config(
                 "UPDATE account SET remote_config_at = ?1, remote_config_etag = ?2 WHERE id = 1",
                 (now, etag),
             )?;
-            let caps = account_caps(entries);
-            let caps_changed = first || caps != account_caps(&old);
+            // Both sides carry the account's own facts (the switch, the pin limit of THAT
+            // config), so a refresh that changes a limit still states `roaming_writes` (Y2).
+            let caps = account_caps_over(tx, entries)?;
+            let caps_changed = first || caps != account_caps_over(tx, &old)?;
             // What every chat's features state (the attachment limit, the delete window, the
             // album size) may change without the caps changing.
             let limits_changed =
@@ -358,6 +398,9 @@ pub(crate) fn enqueue_at_start(conn: &Connection, now: i64) -> Result<()> {
     jobs::schedule_now(conn, JobKind::MslPurge, "", now)?;
     // The Storage Service at every start (§6.9), and the routine profile refresh (§6.10).
     jobs::enqueue(conn, JobKind::StorageSync, "", now, None)?;
+    // Changes made here that the phone has not been told (critic Y3): their write job is queued
+    // again when its row is gone. With no intent stored this does nothing.
+    crate::storage::intents::schedule_write(conn, now)?;
     jobs::schedule_now(conn, JobKind::ProfileRefresh, "", now)?;
     enqueue_stranded_group_refreshes(conn, now)?;
     let version: Option<String> =
@@ -372,6 +415,63 @@ pub(crate) fn enqueue_at_start(conn: &Connection, now: i64) -> Result<()> {
     }
     Ok(())
 }
+
+/// People pages P1 (F7): ONE restatement after the upgrade to backend.db 24. States the number
+/// verdict (`peers::number_shown`) of EVERY `peers` row (ACI or PNI) to the core, with or without
+/// `peers.e164`: Storage, the contact sync and an import keep a number only in the core, so an
+/// `e164` filter would skip nearly everyone (re-check N1). In rows of at most
+/// [`VERDICTS_PER_ROW`], and marks the pass done in the same zone (`account.number_verdicts_stated`),
+/// so it runs once: the contacts of an older profile have no verdict in core.db 18 (not shown),
+/// and a person with no profile key is shown by the rule yet never fetched, so no later event
+/// would state it. Offline (no network); returns how many people were stated.
+pub(crate) fn restate_number_verdicts(
+    tx: &mut Tx<'_>,
+    now: i64,
+    wake: &Rc<Notify>,
+) -> Result<usize> {
+    let done: bool = tx.query_row(
+        "SELECT number_verdicts_stated FROM account WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    if done {
+        return Ok(0);
+    }
+    let sids: Vec<String> = tx
+        .prepare("SELECT service_id FROM peers ORDER BY service_id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let mut events = Vec::with_capacity(sids.len());
+    for sid in &sids {
+        let Some(user) = ServiceId::parse_from_service_id_string(sid)
+            .and_then(|s| crate::service_id::service_id_user_id(s).ok())
+        else {
+            continue;
+        };
+        let mut patch = ContactPatch::new(user);
+        patch.number_shown = Some(crate::peers::number_shown(tx, sid)?);
+        events.push(BackendEvent::ContactUpsert(patch));
+    }
+    let rows: Vec<Vec<BackendEvent>> = events
+        .chunks(VERDICTS_PER_ROW)
+        .map(<[BackendEvent]>::to_vec)
+        .collect();
+    crate::outbox::append_event_rows(tx, &rows, now, wake)?;
+    tx.execute(
+        "UPDATE account SET number_verdicts_stated = 1 WHERE id = 1",
+        [],
+    )?;
+    if !events.is_empty() {
+        tracing::info!(
+            people = events.len(),
+            "number verdicts stated once after the upgrade"
+        );
+    }
+    Ok(events.len())
+}
+
+/// People per `core_outbox` row of [`restate_number_verdicts`].
+const VERDICTS_PER_ROW: usize = 500;
 
 /// A refresh for every group the core has from a history import that was never fetched
 /// (`groups.state` NULL with `features_hash` set, and not left or gone): its refresh job may
@@ -473,16 +573,26 @@ pub(crate) fn rebuild_events(
             number: account.number(),
         }];
         // (Stated without a fetched config too: the backend's own flags do not depend on it.)
-        events.push(BackendEvent::AccountCaps(account_caps(&config)));
+        events.push(BackendEvent::AccountCaps(account_caps_over(tx, &config)?));
         // The new core.db has no conversation features: send them again with the next event
-        // that touches each chat (§6.7, `crate::features`).
-        tx.execute("UPDATE peers SET features_hash = NULL", [])?;
+        // that touches each chat (§6.7, `crate::features`). It has no archived chat either: the
+        // base of what the core was told of a 1:1 chat's archive state goes with it (the next
+        // record, or the receive path's one-time fill from the records, states it again).
+        tx.execute(
+            "UPDATE peers SET features_hash = NULL, roaming_archived = NULL,
+               roaming_muted_until = NULL",
+            [],
+        )?;
         // The new core.db has lost its aliases: every PNI to ACI and number to ACI pair this
         // device learned, from whichever source, is told again here (`identity_links` and
         // `number_links` hold them; the Storage Service sync below tells none of them a
         // second time, because `links::learn` and `links::learn_number` stay silent about a
         // pair that is known).
         events.extend(crate::links::all(tx)?);
+        // What he changed here that the phone has not been told yet (A10): the merges of the full
+        // sync below leave a field an intent holds unstated, the new core shows ours from here.
+        // Before `storage::reset` empties the records the told bases are learned from.
+        events.extend(crate::storage::intents::restate_live(tx, account, now)?);
         append_events(tx, &events, now, wake)?;
         // Contacts and settings again (the old avatar files belong to the lost core.db rows).
         crate::storage::reset(tx, now)?;
@@ -506,7 +616,7 @@ pub(crate) fn rebuild_events(
             }
         });
         tx.execute(
-            "UPDATE peers SET profile_fetched_at = NULL, profile_avatar = NULL,
+            "UPDATE peers SET profile_fetched_at = NULL, profile_tried_at = NULL, profile_avatar = NULL,
                avatar_blob = NULL, avatar_source = NULL, avatar_hash = NULL",
             [],
         )?;
@@ -553,6 +663,17 @@ pub(crate) async fn run_job<T: SignalTransport>(
     socket: &Arc<T::Socket>,
     job: &Job,
 ) -> Result<Done> {
+    // P5a R4: a job that sends to one person looks at their stored state before it makes any
+    // request. In state 2 (verified, then the key changed) every attempt would fetch their
+    // prekeys and be refused again; the job waits for the user instead, without an attempt
+    // counted. The jobs that send to several people (receipts) check each of them themselves.
+    if let Some(person) = job.kind.recipient(&job.key)
+        && shared
+            .db
+            .read(|c| crate::store::identity_is_changed(c, person))?
+    {
+        return Ok(Done::WaitUntrusted);
+    }
     match job.kind {
         JobKind::RemoteConfig => remote_config(shared, socket).await,
         JobKind::Capabilities => register_capabilities(shared, socket).await,
@@ -573,6 +694,9 @@ pub(crate) async fn run_job<T: SignalTransport>(
         JobKind::KeyMaintenance => key_maintenance(shared, socket, job).await,
         JobKind::DeleteSync => crate::delete_sync::run(shared, socket, job).await,
         JobKind::BackfillRequest => crate::backfill::run(shared, socket, job).await,
+        JobKind::VerifiedSync => crate::safety::run_verified_sync(shared, socket, job).await,
+        JobKind::StorageWrite => crate::storage::write::run(shared, socket, job).await,
+        JobKind::FetchLatestSync => crate::storage::write::run_fetch_latest(shared, socket).await,
         JobKind::ProfileRefresh => {
             let account = shared.account().ok_or(Error::NotLinked)?;
             crate::profile::refresh(shared, account.aci)
@@ -1052,6 +1176,10 @@ mod tests {
             "no config, and the flag is stated"
         );
         assert_eq!(first[0].max_receive_attachment_bytes, None);
+        // The two facts of the account itself (A10c): Signal CAN write its chat settings and the
+        // switch is off until he turns it on; the pin limit is the default, stated with it.
+        assert_eq!(first[0].roaming_writes(), Some(false));
+        assert_eq!(first[0].max_pinned_chats, Some(4));
         db.zone(|tx| -> Result<()> {
             tx.execute(
                 "INSERT INTO remote_config(name, value) VALUES ('global.attachments.maxBytes', '1000')",
@@ -1288,6 +1416,101 @@ mod tests {
         assert_eq!(version(&db), None);
     }
 
+    /// The two facts of the caps that are the account's own and not the config's (A10c, critic Y2):
+    /// the roaming switch (Signal CAN write, so a linked account always states the flag: `Some(false)`
+    /// off, `Some(true)` on) and the pin limit, stated TOGETHER by `account_caps_of`; the limits-only
+    /// `account_caps` states neither.
+    #[test]
+    fn the_caps_state_the_switch_and_the_pin_limit_together() {
+        let (_dir, db) = linked_db(Some("aep"));
+        let caps = db.read(account_caps_of).unwrap();
+        assert_eq!(
+            caps.roaming_writes(),
+            Some(false),
+            "off: stated, not absent"
+        );
+        assert_eq!(caps.max_pinned_chats, Some(4), "the default limit");
+        db.zone(|tx| -> Result<()> {
+            tx.execute("UPDATE account SET roaming_writes = 1", [])?;
+            tx.execute(
+                "INSERT INTO remote_config(name, value) VALUES ('global.pinnedChatLimit', '7')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let caps = db.read(account_caps_of).unwrap();
+        assert_eq!(caps.roaming_writes(), Some(true));
+        assert_eq!(caps.max_pinned_chats, Some(7), "the config's limit");
+        db.zone(|tx| -> Result<()> {
+            tx.execute(
+                "UPDATE remote_config SET value = 'many' WHERE name = 'global.pinnedChatLimit'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.read(account_caps_of).unwrap().max_pinned_chats,
+            Some(4),
+            "a limit that is no number is the default"
+        );
+        let config = db.read(load_remote_config).unwrap();
+        assert_eq!(account_caps(&config).roaming_writes(), None);
+        assert_eq!(account_caps(&config).max_pinned_chats, None);
+    }
+
+    /// Critic Y2: a remote-config refresh that changes a limit (or only the pin limit) states the
+    /// caps again WITH the switch: the core replaces its caps with every event, so a statement
+    /// built from the config alone would hide every roaming entry of an account that turned the
+    /// switch on.
+    #[test]
+    fn a_config_refresh_states_the_switch_with_the_new_limits() {
+        let (_dir, db) = linked_db(Some("aep"));
+        db.zone(|tx| -> Result<()> {
+            tx.execute("UPDATE account SET roaming_writes = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let wake = Rc::new(Notify::new());
+        let config = |max: &str, pins: &str| Fetched::Config {
+            etag: Some(format!("etag-{max}-{pins}")),
+            entries: BTreeMap::from([
+                ("global.attachments.maxBytes".to_owned(), max.to_owned()),
+                ("global.pinnedChatLimit".to_owned(), pins.to_owned()),
+            ]),
+        };
+        for (fetched, now) in [
+            (config("100", "4"), 1),
+            (config("200", "4"), 2),
+            (config("200", "6"), 3),
+        ] {
+            db.zone(|tx| store_remote_config(tx, &fetched, now, &wake))
+                .map(drop)
+                .unwrap();
+        }
+        let caps: Vec<(Option<u64>, Option<u32>, Option<bool>)> = outbox_events(&db)
+            .into_iter()
+            .map(|e| match e {
+                BackendEvent::AccountCaps(caps) => (
+                    caps.max_attachment_bytes,
+                    caps.max_pinned_chats,
+                    caps.roaming_writes(),
+                ),
+                other => panic!("unexpected {}", other.name()),
+            })
+            .collect();
+        assert_eq!(
+            caps,
+            [
+                (Some(100), Some(4), Some(true)),
+                (Some(200), Some(4), Some(true)),
+                (Some(200), Some(6), Some(true)),
+            ],
+            "first config, a changed limit, a changed pin limit: each states the switch"
+        );
+    }
+
     #[test]
     fn rebuild_reemits_account_ready_and_stored_caps() {
         let (_dir, db) = linked_db(Some("aep"));
@@ -1322,6 +1545,8 @@ mod tests {
         };
         assert!(caps.restores_attachments(), "the backend's own flag");
         assert_eq!(caps.max_attachment_bytes, None, "and no limits yet");
+        assert_eq!(caps.roaming_writes(), Some(false), "the switch is stated");
+        assert_eq!(caps.max_pinned_chats, Some(4), "and the pin limit with it");
         db.zone(|tx| {
             store_remote_config(
                 tx,
@@ -1375,5 +1600,74 @@ mod tests {
         );
         // Exactly Desktop's four keys: an extra one is something Desktop never claims.
         assert_eq!(json.as_object().map(serde_json::Map::len), Some(4));
+    }
+    /// P1 F7/N1: the first start on a backend.db that was of schema 23 states the number verdict
+    /// of every person, once, whether or not `peers.e164` is set (Storage, the contact sync and
+    /// an import put the number only into the core): a person with no profile key is shown (and
+    /// never fetched), one with a key and no sharing is hidden; a second start states nothing.
+    #[test]
+    fn the_first_start_after_the_upgrade_states_every_number_verdict_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.db");
+        let aci = |n: u128| libsignal_core::Aci::from(uuid::Uuid::from_u128(n));
+        let sid = |n: u128| ServiceId::from(aci(n)).service_id_string();
+        {
+            let mut conn =
+                kourier_db::open(&path, &kourier_db::DbKey::from_bytes([6; 32])).unwrap();
+            kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).unwrap();
+            let v23 =
+                kourier_db::Migrations::new(db::MIGRATIONS.component, &db::MIGRATIONS.steps[..23]);
+            kourier_db::migrate(&mut conn, &v23).unwrap();
+            conn.execute(
+                "INSERT INTO account(id, aci, pni, e164, device_id, password, aci_registration_id,
+                   pni_registration_id, profile_key, master_key, storage_key, linked_at)
+                 VALUES (1, 'a', 'p', '+15550100', 2, 'pw', 1, 2, x'00', x'00', x'00', 0)",
+                [],
+            )
+            .unwrap();
+            for n in [1u128, 2, 3] {
+                conn.execute(
+                    "INSERT INTO peers(service_id, e164, updated_at) VALUES (?1, ?2, 5)",
+                    // Person 1 has an `e164` (a sealed-sender certificate), 2 and 3 have none
+                    // (their number lives in the core only).
+                    (sid(n), (n == 1).then(|| format!("+1555010{n}"))),
+                )
+                .unwrap();
+            }
+            // Person 2 holds a profile key (never fetched, not sharing): hidden by the rule.
+            conn.execute(
+                "UPDATE peers SET profile_key = x'0101010101010101010101010101010101010101010101010101010101010101' WHERE service_id = ?1",
+                [sid(2)],
+            )
+            .unwrap();
+        }
+        let db = db::open(&path, &kourier_backend_api::DbKey::new([6; 32])).unwrap();
+        let wake = Rc::new(Notify::new());
+        let stated = db
+            .zone(|tx| restate_number_verdicts(tx, 10, &wake))
+            .unwrap();
+        assert_eq!(stated, 3, "every peer row, with or without an e164");
+        let verdicts: Vec<(String, Option<bool>)> = outbox_events(&db)
+            .into_iter()
+            .map(|e| match e {
+                BackendEvent::ContactUpsert(p) => (p.user.as_str().to_owned(), p.number_shown),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let user = |n: u128| format!("aci:{}", uuid::Uuid::from_u128(n));
+        assert_eq!(
+            verdicts,
+            [
+                (user(1), Some(true)),
+                (user(2), Some(false)),
+                (user(3), Some(true))
+            ],
+            "shown without a key, hidden with one, whether or not an e164 is stored"
+        );
+        let again = db
+            .zone(|tx| restate_number_verdicts(tx, 20, &wake))
+            .unwrap();
+        assert_eq!(again, 0, "once");
+        assert_eq!(outbox_events(&db).len(), 3, "nothing more was written");
     }
 }

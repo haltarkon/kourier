@@ -29,7 +29,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (set `KOURIER_REQUIRE_MOCK_HARNESS=1` to fail instead). Tests print counts only.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -833,12 +833,11 @@ fn spawn_child_with(
     };
     let mut command = tokio::process::Command::new(std::env::current_exe().expect("test binary"));
     command
-        .args([
+        .arg(support::child_filter(
+            module_path!(),
             "import_child_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        ))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1499,6 +1498,9 @@ fn conv_of(name: &str, value: &serde_json::Value) -> Option<String> {
 /// the import is logged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_stage_is_delivered_people_first_then_the_chats_then_their_rows() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };
@@ -1848,6 +1850,25 @@ async fn direct_chats_take_the_archives_pins_archive_mute_marks_and_timer() {
     let b = merged_upserts(&world, &ben);
     assert_eq!(b["marked_unread"], true);
     assert!(b.get("archived").is_none() && b.get("timer").is_none());
+    // A1: what the upsert told the core of the archive and the mute is the base the Storage
+    // diff and the unarchive rule use; a chat the frame does not archive states, and writes,
+    // nothing.
+    let base = |column: &str, who: Uuid| {
+        world
+            .files
+            .peek_i64(&format!(
+                "SELECT {column} FROM peers WHERE service_id = '{}'",
+                who.hyphenated()
+            ))
+            .expect("peers")
+    };
+    assert_eq!(base("roaming_archived", ANN), Some(1));
+    assert_eq!(base("roaming_muted_until", ANN), Some(i64::MAX));
+    assert_eq!(
+        base("roaming_archived", DAN),
+        None,
+        "Dan's chat is not archived"
+    );
     assert!(
         merged_upserts(&world, &dan).contains_key("features"),
         "Dan's chat is listed"
@@ -2023,11 +2044,14 @@ async fn the_storage_sync_wins_over_the_archive_where_they_differ() {
         ],
         ..HistorySpec::default()
     };
-    let (mut linked, _, held) = linked_with_an_archive(&world, &spec).await;
+    let (mut linked, _, _) = linked_with_an_archive(&world, &spec).await;
     let alice = format!("direct:aci:{}", world.alice.aci);
     let own = format!("direct:aci:{}", linked.device.aci);
     until(&mut linked.core, "Done", |s| *s == HistoryTransfer::Done).await;
-    world.expect_arrival(held).await;
+    // No wait for the message held during the transfer: the archive says Alice is blocked
+    // and the Storage Service says she is not, so it is dropped as "from a blocked contact"
+    // when it lands before the sync unblocks her and kept when it lands after. Both orders
+    // are right; the test checks the flags, not that message (a flake at load, 2026-10-16).
     // The sync follows the transfer.
     world
         .files
@@ -2286,6 +2310,15 @@ async fn backend_db_stays_small_while_twenty_thousand_messages_are_delivered() {
         key: world.files.key,
     };
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A failed assertion below must stop the watcher too, or the runtime waits for its
+    // blocking task and the test hangs until nextest kills it.
+    struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _stop_on_drop = StopOnDrop(stop.clone());
     let watcher = {
         let stop = stop.clone();
         let sink = world.sink.clone();
@@ -2914,6 +2947,9 @@ async fn messages_the_core_cannot_store_one_after_another_end_the_transfer_at_th
 /// the queue is empty at the end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_profiles_of_an_import_are_fetched_several_at_a_time() {
+    if support::in_own_process!() {
+        return;
+    }
     use base64::Engine as _;
     const PEOPLE: usize = 30;
     let Some(world) = World::start().await else {
@@ -3209,6 +3245,9 @@ fn contact_of(primary: &Primary, name: &str) -> ContactSpec {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_imported_group_comes_from_the_archive_and_its_first_fetch_replaces_title_members_and_timer()
  {
+    if support::in_own_process!() {
+        return;
+    }
     use kourier_signal::archive_testing::{GroupSpec, Party, SnapshotSpec, Who};
     use support::harness::{CreateGroup, SendGroupText};
     let Some(world) = World::start().await else {
@@ -3991,6 +4030,9 @@ fn attachments_of(msg: &kourier_backend_api::IncomingMessage) -> Vec<kourier_mod
 /// once, without a pointer, and is never asked for. Nothing of a pointer is logged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_imported_picture_downloads_on_a_click_and_the_import_asks_the_cdn_nothing() {
+    if support::in_own_process!() {
+        return;
+    }
     use kourier_signal::archive_testing::{
         AttachmentSpec, LocatorSpec, PointerSpec, encrypt_attachment,
     };

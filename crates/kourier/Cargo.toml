@@ -7,9 +7,18 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["signal", "fake"]
+default = ["signal", "fake", "whatsapp", "telegram", "threema"]
 # The Signal backend.
 signal = ["kourier-app/signal"]
+# The WhatsApp backend: compiled in, registered only in a debug build while its switch is on
+# (kourier-app `whatsapp_registration`).
+whatsapp = ["kourier-app/whatsapp"]
+# The Telegram backend: compiled in, registered only in a debug build while its switch is on
+# (kourier-app `telegram_registration`); `cargo xtask dist` leaves it out.
+telegram = ["kourier-app/telegram"]
+# The Threema backend: compiled in, registered only in a debug build while its switch is on
+# (kourier-app `threema_registration`).
+threema = ["kourier-app/threema"]
 # The scripted test network: `--fixture`, `--fixture-link`, `cargo xtask shots` and the
 # "Test network" on the welcome page. A user build may leave it out.
 fake = ["kourier-app/fake"]

@@ -10,11 +10,11 @@
 //! input (an empty text, an emoji, a text above the size limit, a caption a file kind does not
 //! take) is checked by the command after these.
 
-use kourier_model::{ConversationFeatures, MessageId, Window};
+use kourier_model::{ConversationFeatures, FailReason, MessageId, OutgoingState, UserId, Window};
 
 use crate::attachments::policy;
 use crate::error::{CoreError, Refusal, Result};
-use crate::facade::MessageActions;
+use crate::facade::{MessageActions, ShownPerson};
 
 /// Where the message's own send stands, for the delete rules (§4.8 step 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +22,12 @@ pub(crate) enum Sending {
     /// Not an own message that still waits in the outbox with nobody having it.
     Settled,
     /// Its transmit is in flight: it cannot be deleted until the answer is there.
-    InFlight,
+    /// `stoppable`: it may be stopped all the same ([`stoppable`]): the stop is a cancel
+    /// ([`cancel_sending`]), never a delete.
+    InFlight {
+        /// [`stoppable`] holds.
+        stoppable: bool,
+    },
     /// An own message that no recipient is known to have: a delete takes it back.
     /// `attempted`: an attempt may have reached the server all the same. It waits for a retry
     /// after an attempt without an answer or with a temporary failure, or its send gave up
@@ -51,6 +56,10 @@ pub(crate) struct Media {
 pub(crate) struct Facts<'a> {
     /// The account is linked (`AccountState::Active`).
     pub active: bool,
+    /// The account's network has a backend in this run. An account whose network is turned off
+    /// is readable only: nothing that would go to the network is offered, and a take-back of a
+    /// message that reached nobody (a local delete) still is (K-A fix C2).
+    pub registered: bool,
     /// The conversation is blocked.
     pub blocked: bool,
     /// The conversation's reported features; `None` until the backend sent them (then only
@@ -118,13 +127,28 @@ pub(crate) fn may_send(f: &Facts<'_>) -> Result<()> {
     if !f.active {
         return Err(CoreError::InvalidState("the account is not linked"));
     }
+    if !f.registered {
+        return Err(CoreError::InvalidState(
+            "the account's network is turned off",
+        ));
+    }
     if f.blocked {
         return Err(CoreError::refused(
             Refusal::Blocked,
             "the conversation is blocked",
         ));
     }
-    if f.features.is_some_and(|x| x.cannot_send.is_some()) {
+    cannot_send(f.features)
+}
+
+/// THE rule of "the chat's features say we cannot send in it" (a group we left, announcements
+/// only, a chat the phone has not accepted, ...): used by [`may_send`] (edit, delete, react),
+/// by "Send Again" ([`retry`]) and by a change of the disappearing timer (the runtime), so that
+/// everything that puts a message on the wire for the chat has one answer. NULL features (the
+/// network has stated none) are sendable, as the flag `ConversationRow.can_send` and the gate
+/// of a new send (`outbox::Target::read`, G4) say.
+pub(crate) fn cannot_send(features: Option<&ConversationFeatures>) -> Result<()> {
+    if features.is_some_and(|x| x.cannot_send.is_some()) {
         return Err(CoreError::refused(
             Refusal::CannotSend,
             "you cannot send in this chat",
@@ -225,7 +249,9 @@ pub(crate) fn delete(f: &Facts<'_>, for_everyone: bool, now: i64) -> Result<(Del
         ));
     }
     match f.sending {
-        Sending::InFlight => {
+        // Whatever a stop could do (`stoppable`), a DELETE of a message in flight is refused:
+        // it would take the row away while the transmit goes on and reaches the recipients.
+        Sending::InFlight { .. } => {
             return Err(CoreError::refused(
                 Refusal::BeingSent,
                 "the message is being sent",
@@ -387,6 +413,156 @@ pub(crate) fn ask_attachments(
         .collect()
 }
 
+/// Whether the files of a message may be saved to a folder at all
+/// ([`MessageActions::save_attachments`], [`UiCommand::SaveAttachment`]
+/// (crate::facade::UiCommand::SaveAttachment)): the message is not a tombstone, not hidden
+/// because its time has come on a clock nobody confirmed (`expiry_hidden`: gone for the user,
+/// like a deleted one), and not view-once. A view-once message is never saved, in any form
+/// (his "Show once, then remove"); the clause is load-bearing on WhatsApp, whose view-once
+/// media keeps an attachment (Signal maps one with none). A message that disappears (a timer)
+/// may be saved: the copy is the user's own act.
+pub(crate) fn may_save_message(
+    deleted: Option<&str>,
+    view_once: bool,
+    expiry_hidden: bool,
+) -> Result<()> {
+    if deleted.is_some() {
+        return Err(CoreError::refused(
+            Refusal::Deleted,
+            "the message is deleted",
+        ));
+    }
+    if expiry_hidden {
+        return Err(CoreError::refused(Refusal::Gone, "the message is gone"));
+    }
+    if view_once {
+        return Err(CoreError::refused(
+            Refusal::WrongKind,
+            "a view-once message is never saved",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether one file of such a message may be saved: it is on this PC (`Local`), and it is a
+/// file, not the rest of a long text. A file that is not here has Download (a save never
+/// fetches: his answer "Only once downloaded"); the networks that cannot download yet
+/// (WhatsApp before W7, Telegram, Threema) never show a `Local` one, so nothing is offered
+/// that does nothing.
+pub(crate) fn may_save_file(state: kourier_model::AttachmentState, long_text: bool) -> Result<()> {
+    if long_text {
+        return Err(CoreError::refused(
+            Refusal::WrongKind,
+            "the rest of a text is not a file",
+        ));
+    }
+    if state != kourier_model::AttachmentState::Local {
+        return Err(CoreError::InvalidInput("the attachment is not downloaded"));
+    }
+    Ok(())
+}
+
+/// The attachments of a message that "Save As…" accepts ([`MessageActions::save_attachments`]):
+/// [`may_save_message`] on the message, [`may_save_file`] on each file of `body`. THE one rule
+/// for the flag and the command (which asks both functions again on the attachment's row, so a
+/// message deleted while the dialog was open writes nothing). Stickers count: Desktop's and
+/// Android's refusal to save them is their own UI choice, not a limit of the network.
+pub(crate) fn save_attachments(
+    deleted: Option<&str>,
+    view_once: bool,
+    expiry_hidden: bool,
+    body: &kourier_model::Body,
+) -> Vec<kourier_model::AttachmentId> {
+    use kourier_model::Body;
+    if may_save_message(deleted, view_once, expiry_hidden).is_err() {
+        return Vec::new();
+    }
+    let files: Vec<&kourier_model::Attachment> = match body {
+        Body::Media { attachments, .. } => attachments.iter().collect(),
+        Body::Sticker(a) => vec![a.as_ref()],
+        _ => return Vec::new(),
+    };
+    files
+        .into_iter()
+        .filter(|a| may_save_file(a.state, a.long_text).is_ok())
+        .filter_map(|a| a.id)
+        .collect()
+}
+
+/// Whether "Send Again" ([`UiCommand::RetryMessage`](crate::facade::UiCommand::RetryMessage))
+/// is accepted for an own message whose send ended in `floor` (the message's stored send floor,
+/// [`crate::outbox::floor`]). THE one rule for the flag ([`MessageActions::retry`]) and the
+/// command ([`crate::outbox::retry`]): a message the network refused because its recipient has
+/// not written to this account ([`FailReason::ReachOutRefused`]) is never sent again by
+/// Kourier, because a second try is one more reach-out and every one counts against the
+/// account (research §5.5: after a 463 stop, explain, never retry). It can be taken back. The
+/// conversation's other waiting messages share that end ([`crate::outbox`]
+/// `fail_waiting_of`). Everything else a message can fail with may be tried again.
+///
+/// A chat whose `features` say we cannot send in it (it lost the right after the message
+/// failed: we left the group, the phone un-accepted the chat) takes no second try either
+/// ([`Refusal::CannotSend`], [`cannot_send`]): the network would only fail it again. NULL
+/// features are sendable.
+pub(crate) fn retry(
+    floor: Option<&OutgoingState>,
+    features: Option<&ConversationFeatures>,
+) -> Result<()> {
+    if matches!(
+        floor,
+        Some(OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            ..
+        })
+    ) {
+        return Err(CoreError::refused(
+            Refusal::ReachOutRefused,
+            "the network refused the message as a first contact; sending it again would be one more",
+        ));
+    }
+    cannot_send(features)
+}
+
+/// What the stop rule looks at: one own message's `Message` outbox row and the core's set of
+/// messages whose upload is reported ([`crate::runtime::Shared::uploading`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StopFacts {
+    /// The row is `Transmitting`: its attempt is in flight.
+    pub transmitting: bool,
+    /// The backend reports an upload of the message that is still moving.
+    pub uploading: bool,
+    /// How many attempts of the row started (`outbox.attempts`, this one included).
+    pub attempts: i64,
+    /// Some recipient has the message (a `send_state` that needs no send).
+    pub reached: bool,
+    /// The stop was asked already (`outbox.cancel_state` is not 0: the X was pressed and the
+    /// backend's answer is on its way, or it said `Stopping`): it is asked once.
+    pub asked: bool,
+}
+
+/// Whether the message in flight may be STOPPED now: THE rule for the flag
+/// ([`MessageActions::cancel_sending`]) and the command
+/// ([`UiCommand::CancelMessage`](crate::facade::UiCommand::CancelMessage)), call 1 of the
+/// upload-progress step. A stop takes the message back, so it is offered only for a message
+/// that nobody can have:
+/// - its attempt is in flight,
+/// - the backend reports an upload of it ("an upload of it is reported": a backend that sends
+///   no `AttachmentProgress` cannot answer an abort, so it never gets one),
+/// - it is the FIRST attempt (`attempts == 1`): an earlier one may have reached the server (a
+///   retry after a dropped reply, a temporary failure, a restart in the middle of an upload),
+/// - no recipient has it (a `Partial` group send that uploads again for the members that
+///   failed),
+/// - the stop was not asked yet (the X greys out once it is pressed).
+pub(crate) fn stoppable(f: StopFacts) -> bool {
+    f.transmitting && f.uploading && f.attempts == 1 && !f.reached && !f.asked
+}
+
+/// Whether "Cancel Sending" ([`UiCommand::CancelMessage`](crate::facade::UiCommand::CancelMessage))
+/// is offered: `take_back` (nothing was ever handed to the network: it is simply removed) or a
+/// stop of the message in flight ([`stoppable`]).
+pub(crate) fn cancel_sending(f: &Facts<'_>, take_back: bool) -> bool {
+    take_back || matches!(f.sending, Sending::InFlight { stoppable: true })
+}
+
 /// Every flag of one message at `now` (the core clock).
 pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
     let edit = edit(f, now);
@@ -403,6 +579,7 @@ pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
     if let Ok((_, at)) = &for_everyone {
         ends(*at);
     }
+    let take_back = matches!(for_everyone, Ok((Delete::TakeBack, _)));
     MessageActions {
         reply: reply(f).is_ok(),
         react: react(f).is_ok(),
@@ -411,35 +588,131 @@ pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
         delete_for_me: delete(f, false, now).is_ok(),
         delete_attachment: delete_attachment(f).is_ok(),
         copy: copy(f),
-        take_back: matches!(for_everyone, Ok((Delete::TakeBack, _))),
+        take_back,
+        cancel_sending: cancel_sending(f, take_back),
         // Needs the attachments' rows: the timeline query sets it ([`ask_attachments`]).
         ask_attachments: Vec::new(),
+        // Needs the attachments' rows too: the timeline query sets it ([`save_attachments`]).
+        save_attachments: Vec::new(),
+        // Needs the outbox row and the stored floor: the timeline query sets it ([`retry`]).
+        retry: false,
+        // Need the body and the conversation's kind: the timeline query sets them
+        // ([`show_sender`], [`show_people`]).
+        show_sender: false,
+        show_people: Vec::new(),
+        // Needs the dispatcher's pauses: the timeline query sets it.
+        safety_number: None,
         until,
     }
 }
 
+/// Whether "Show Sender's Page" is offered ([`MessageActions::show_sender`]): another person's
+/// message in a group. A message of the user's own account (a call line without an author
+/// counts as one: no author, nothing to show) and a message of a chat that is no group have no
+/// such entry.
+pub(crate) fn show_sender(own: bool, group: bool) -> bool {
+    group && !own
+}
+
+/// The people a message's menu offers a page of ([`MessageActions::show_people`]): the
+/// distinct mentions of its text or caption in the order of their first mention, our own ids
+/// as ONE entry. A deleted message has none, and neither has a mention under a spoiler (the
+/// core cannot know whether the spoiler was revealed, so it states none: what a spoiler hides
+/// is not listed by a menu).
+pub(crate) fn show_people(
+    deleted: bool,
+    body: &kourier_model::Body,
+    own_ids: &[UserId],
+) -> Vec<ShownPerson> {
+    use kourier_model::text::validate_range;
+    use kourier_model::{Body, RangeKind};
+    let text = match body {
+        Body::Text(t) => Some(t),
+        Body::Media { caption, .. } => caption.as_ref(),
+        Body::Sticker(a) => a.caption.as_ref(),
+        _ => None,
+    };
+    let Some(text) = text.filter(|_| !deleted) else {
+        return Vec::new();
+    };
+    let valid: Vec<&kourier_model::TextRange> = text
+        .ranges
+        .iter()
+        .filter(|r| validate_range(&text.body, r).is_ok())
+        .collect();
+    let spoiled = |at: &kourier_model::TextRange| {
+        valid.iter().any(|s| {
+            matches!(s.kind, RangeKind::Spoiler)
+                && s.start <= at.start
+                && at.end().is_some_and(|e| s.end().is_some_and(|se| e <= se))
+        })
+    };
+    // One mention per placeholder, as the text shows it (`Text::shown_mentions`, the renderer's rule
+    // too): "everyone" and a person on one placeholder is "everyone", two persons the last.
+    let mut out: Vec<ShownPerson> = Vec::new();
+    for r in text.shown_mentions() {
+        let RangeKind::Mention(user) = &r.kind else {
+            continue;
+        };
+        if spoiled(r) {
+            continue;
+        }
+        let own = own_ids.contains(user);
+        let seen = out
+            .iter()
+            .any(|p| if own { p.own } else { p.user == *user });
+        if !seen {
+            out.push(ShownPerson {
+                user: user.clone(),
+                own,
+            });
+        }
+    }
+    out
+}
+
 /// The send facts of own messages of one conversation that still have their `Message` row in
 /// the outbox: message → [`Sending`]. Messages without an entry are [`Sending::Settled`].
+///
+/// `uploading`: the backend reports an upload of the message that is still moving (the
+/// timeline query reads it from [`crate::runtime::Shared::uploading`]; a caller that cannot
+/// stop anything, the delete commands, passes `false`: they refuse an in-flight message
+/// whatever its uploads are).
 pub(crate) fn sending_of(
     conn: &kourier_db::rusqlite::Connection,
     message: MessageId,
+    uploading: bool,
 ) -> Result<Sending> {
     use kourier_db::rusqlite::OptionalExtension;
-    let row: Option<(String, i64)> = conn
+    let row: Option<(String, i64, i64)> = conn
         .prepare_cached(
-            "SELECT state, attempts FROM outbox WHERE message_id = ?1 AND kind = 'Message'",
+            "SELECT state, attempts, cancel_state FROM outbox
+             WHERE message_id = ?1 AND kind = 'Message'",
         )?
-        .query_row([message.0], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row([message.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    let Some((state, attempts)) = row else {
+    let Some((state, attempts, cancel_state)) = row else {
         return Ok(Sending::Settled);
     };
+    let reached_by_anyone = || -> Result<bool> {
+        Ok(crate::outbox::send_states(conn, message)?
+            .values()
+            .any(|s| !s.needs_send()))
+    };
     if state == crate::outbox::TRANSMITTING {
-        return Ok(Sending::InFlight);
+        // The terms of the stop are read BEFORE this shortcut: an in-flight row that is a
+        // retry or a resend to the members that failed is not stoppable. The recipients are
+        // looked at only when the other terms hold (the answer is `false` otherwise).
+        let stoppable = stoppable(StopFacts {
+            transmitting: true,
+            uploading,
+            attempts,
+            reached: uploading && attempts == 1 && reached_by_anyone()?,
+            asked: cancel_state != 0,
+        });
+        return Ok(Sending::InFlight { stoppable });
     }
-    let reached = crate::outbox::send_states(conn, message)?
-        .values()
-        .any(|s| !s.needs_send());
+    let reached = reached_by_anyone()?;
     if reached {
         return Ok(Sending::Settled);
     }
@@ -511,7 +784,7 @@ pub(crate) fn has_text(body: &kourier_model::Body) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kourier_model::Support;
+    use kourier_model::{CannotSend, Support};
 
     const DAY: i64 = 24 * 3600 * 1000;
 
@@ -537,6 +810,7 @@ mod tests {
     fn own<'a>(features: &'a ConversationFeatures) -> Facts<'a> {
         Facts {
             active: true,
+            registered: true,
             blocked: false,
             features: Some(features),
             admin: false,
@@ -652,6 +926,93 @@ mod tests {
         assert!(!a.reply && !a.react && !a.edit && !a.delete_for_everyone && !a.copy);
     }
 
+    /// The stop rule is the AND of its terms (call 1 of the upload-progress step, and the
+    /// mark of a stop that was asked, which greys the X out), and
+    /// "Cancel Sending" is a take-back or a stop: a message in flight that is stoppable offers
+    /// it and still no delete.
+    #[test]
+    fn a_stop_needs_all_its_terms_and_cancel_sending_is_a_take_back_or_a_stop() {
+        let first = StopFacts {
+            transmitting: true,
+            uploading: true,
+            attempts: 1,
+            reached: false,
+            asked: false,
+        };
+        assert!(stoppable(first));
+        for (name, no) in [
+            (
+                "not in flight",
+                StopFacts {
+                    transmitting: false,
+                    ..first
+                },
+            ),
+            (
+                "no upload reported",
+                StopFacts {
+                    uploading: false,
+                    ..first
+                },
+            ),
+            (
+                "a retry",
+                StopFacts {
+                    attempts: 2,
+                    ..first
+                },
+            ),
+            (
+                "no attempt on record",
+                StopFacts {
+                    attempts: 0,
+                    ..first
+                },
+            ),
+            (
+                "a recipient has it",
+                StopFacts {
+                    reached: true,
+                    ..first
+                },
+            ),
+            (
+                "the stop was asked already",
+                StopFacts {
+                    asked: true,
+                    ..first
+                },
+            ),
+        ] {
+            assert!(!stoppable(no), "{name}");
+        }
+
+        let f = features();
+        let flying = |stoppable| Facts {
+            sending: Sending::InFlight { stoppable },
+            ..own(&f)
+        };
+        let a = all(&flying(true), 0);
+        assert!(a.cancel_sending, "a stop");
+        assert!(
+            !a.take_back && !a.delete_for_me && !a.delete_for_everyone,
+            "a delete of a message in flight is refused whatever a stop could do"
+        );
+        assert!(!all(&flying(false), 0).cancel_sending);
+        let unsent = |attempted| Facts {
+            sending: Sending::Unsent { attempted },
+            ..own(&f)
+        };
+        let a = all(&unsent(false), 0);
+        assert!(a.cancel_sending && a.take_back, "a take-back");
+        let a = all(&unsent(true), 0);
+        assert!(
+            !a.cancel_sending && !a.take_back,
+            "a retry wait may be with the server"
+        );
+        assert!(!all(&own(&f), 0).cancel_sending, "a settled message");
+    }
+
     #[test]
     fn chats_that_cannot_send_and_unknown_features() {
         let f = features();
@@ -715,7 +1076,7 @@ mod tests {
             "an attempt may have reached the server"
         );
         let in_flight = Facts {
-            sending: Sending::InFlight,
+            sending: Sending::InFlight { stoppable: false },
             ..queued
         };
         let a = all(&in_flight, 0);
@@ -881,7 +1242,7 @@ mod tests {
             Some(Refusal::Deleted)
         );
         let flying = Facts {
-            sending: Sending::InFlight,
+            sending: Sending::InFlight { stoppable: false },
             ..own(&f)
         };
         assert_eq!(
@@ -1036,5 +1397,367 @@ mod tests {
         let sticker = Body::Sticker(Box::new(file(1, AttachmentState::Unavailable, 10, false)));
         assert_eq!(ask_attachments(true, None, &sticker, None), ids(&[1]));
         assert!(ask_attachments(true, None, &Body::Text(Default::default()), None).is_empty());
+    }
+
+    /// "Save As…" is offered for the files that are on this PC and for nothing else: a file
+    /// that is not here has Download (his answer "Only once downloaded"), the rest of a long
+    /// text is no file, and a message that is deleted, hidden on an unconfirmed clock or
+    /// view-once (never saved, in any form) has none. One function answers the flag and the
+    /// command; the command asks its two halves again on the attachment's row.
+    #[test]
+    fn save_offers_what_is_here_and_never_a_view_once_deleted_or_hidden_file() {
+        use kourier_model::{AskFailure, Attachment, AttachmentId, AttachmentState, Body};
+        let file = |id, state, long_text| Attachment {
+            id: Some(AttachmentId(id)),
+            state,
+            long_text,
+            ..Attachment::default()
+        };
+        let media = |atts: Vec<Attachment>| Body::Media {
+            attachments: atts,
+            caption: None,
+        };
+        let ids = |v: &[i64]| v.iter().map(|n| AttachmentId(*n)).collect::<Vec<_>>();
+        let here = media(vec![file(1, AttachmentState::Local, false)]);
+        assert_eq!(save_attachments(None, false, false, &here), ids(&[1]));
+        // Every state but `Local`.
+        for state in [
+            AttachmentState::Remote,
+            AttachmentState::Downloading { done: 1, total: 2 },
+            AttachmentState::Failed { retryable: true },
+            AttachmentState::Failed { retryable: false },
+            AttachmentState::Expired,
+            AttachmentState::Unavailable,
+            AttachmentState::Asking,
+            AttachmentState::AskFailed {
+                why: AskFailure::NoAnswer,
+            },
+        ] {
+            let body = media(vec![file(1, state, false)]);
+            assert!(
+                save_attachments(None, false, false, &body).is_empty(),
+                "{state:?}"
+            );
+            assert!(may_save_file(state, false).is_err(), "{state:?}");
+        }
+        assert!(may_save_file(AttachmentState::Local, false).is_ok());
+        // The message: view-once, a tombstone, hidden on an unconfirmed clock.
+        assert!(
+            save_attachments(None, true, false, &here).is_empty(),
+            "view-once"
+        );
+        assert!(save_attachments(Some("ForEveryone"), false, false, &here).is_empty());
+        assert!(save_attachments(Some("ForMe"), false, false, &here).is_empty());
+        assert!(
+            save_attachments(None, false, true, &here).is_empty(),
+            "hidden"
+        );
+        let refusal = |r: Result<()>| r.expect_err("refused").refusal();
+        assert_eq!(
+            refusal(may_save_message(None, true, false)),
+            Some(Refusal::WrongKind)
+        );
+        assert_eq!(
+            refusal(may_save_message(Some("ForEveryone"), false, false)),
+            Some(Refusal::Deleted)
+        );
+        assert_eq!(
+            refusal(may_save_message(None, false, true)),
+            Some(Refusal::Gone)
+        );
+        assert!(may_save_message(None, false, false).is_ok());
+        // The rest of a long text is no file, a text has none, a sticker is one.
+        let long = media(vec![file(1, AttachmentState::Local, true)]);
+        assert!(save_attachments(None, false, false, &long).is_empty());
+        assert_eq!(
+            refusal(may_save_file(AttachmentState::Local, true)),
+            Some(Refusal::WrongKind)
+        );
+        assert!(save_attachments(None, false, false, &Body::Text(Default::default())).is_empty());
+        let sticker = Body::Sticker(Box::new(file(1, AttachmentState::Local, false)));
+        assert_eq!(save_attachments(None, false, false, &sticker), ids(&[1]));
+        // An album offers the pictures that are here, in order.
+        let album = media(vec![
+            file(1, AttachmentState::Local, false),
+            file(2, AttachmentState::Remote, false),
+            file(3, AttachmentState::Local, false),
+            file(4, AttachmentState::Local, true),
+        ]);
+        assert_eq!(save_attachments(None, false, false, &album), ids(&[1, 3]));
+        // An attachment without a row id cannot be named by a command.
+        let nameless = media(vec![Attachment {
+            state: AttachmentState::Local,
+            ..Attachment::default()
+        }]);
+        assert!(save_attachments(None, false, false, &nameless).is_empty());
+    }
+
+    /// "Send Again" has one rule for the flag and the command: a reach-out refusal stops it,
+    /// and so does a chat that cannot send (it lost the right after the message failed).
+    #[test]
+    fn a_reach_out_refusal_is_never_sent_again() {
+        let refused = OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            retryable: false,
+        };
+        let err = retry(Some(&refused), None).expect_err("refused");
+        assert_eq!(err.refusal(), Some(Refusal::ReachOutRefused));
+        // Whatever else a send can end in is tried again on request.
+        for other in [
+            OutgoingState::Failed {
+                reason: FailReason::Network,
+                retryable: true,
+            },
+            OutgoingState::Failed {
+                reason: FailReason::Other("x".into()),
+                retryable: false,
+            },
+            OutgoingState::Queued,
+            OutgoingState::PartiallyFailed { failed: vec![] },
+        ] {
+            assert!(retry(Some(&other), None).is_ok(), "{other:?}");
+        }
+        assert!(retry(None, None).is_ok());
+    }
+
+    /// The one rule for "we cannot send in this chat" answers `may_send` (edit, delete, react),
+    /// "Send Again" and a timer change alike: every reason refuses with `CannotSend`, no reason
+    /// and no stated features do not, and the reach-out rule keeps its own refusal.
+    #[test]
+    fn a_chat_that_cannot_send_takes_no_send_again() {
+        let failed = OutgoingState::Failed {
+            reason: FailReason::Network,
+            retryable: true,
+        };
+        let open = features();
+        assert!(open.cannot_send.is_none());
+        assert!(retry(Some(&failed), Some(&open)).is_ok());
+        assert!(retry(Some(&failed), None).is_ok(), "NULL features send");
+        assert!(cannot_send(Some(&open)).is_ok());
+        assert!(cannot_send(None).is_ok());
+        for why in [
+            CannotSend::NotMember,
+            CannotSend::AdminsOnly,
+            CannotSend::NotAccepted,
+        ] {
+            let closed = ConversationFeatures {
+                cannot_send: Some(why.clone()),
+                ..features()
+            };
+            for floor in [Some(&failed), None] {
+                let err = retry(floor, Some(&closed)).expect_err("refused");
+                assert_eq!(err.refusal(), Some(Refusal::CannotSend), "{why:?}");
+            }
+            let err = cannot_send(Some(&closed)).expect_err("refused");
+            assert_eq!(err.refusal(), Some(Refusal::CannotSend), "{why:?}");
+        }
+        // Both reasons at once: the network's refusal of a reach-out is the one that is told.
+        let refused = OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            retryable: false,
+        };
+        let closed = ConversationFeatures {
+            cannot_send: Some(CannotSend::NotMember),
+            ..features()
+        };
+        let err = retry(Some(&refused), Some(&closed)).expect_err("refused");
+        assert_eq!(err.refusal(), Some(Refusal::ReachOutRefused));
+    }
+
+    // ---- the menu's pages of people (people pages P3) ----
+
+    fn uid(s: &str) -> UserId {
+        UserId::parse(s).expect("id")
+    }
+
+    /// A text of `parts`: a piece of text, or a mention (None: the user's own placeholder).
+    fn mention_text(
+        parts: &[(&str, Option<&str>)],
+        more: Vec<kourier_model::TextRange>,
+    ) -> kourier_model::Body {
+        use kourier_model::text::MENTION_PLACEHOLDER;
+        use kourier_model::{RangeKind, Text, TextRange};
+        let mut body = String::new();
+        let mut ranges = Vec::new();
+        for (text, mention) in parts {
+            body.push_str(text);
+            if let Some(user) = mention {
+                ranges.push(TextRange {
+                    start: u32::try_from(body.len()).expect("len"),
+                    len: u32::try_from(MENTION_PLACEHOLDER.len_utf8()).expect("len"),
+                    kind: RangeKind::Mention(uid(user)),
+                });
+                body.push(MENTION_PLACEHOLDER);
+            }
+        }
+        ranges.extend(more);
+        kourier_model::Body::Text(Text { body, ranges })
+    }
+
+    const ME: &str = "aci:00000000-0000-4000-8000-0000000000aa";
+    const ME_PNI: &str = "pni:00000000-0000-4000-8000-0000000000ab";
+    const ALICE: &str = "aci:00000000-0000-4000-8000-0000000a11ce";
+    const BOB: &str = "aci:00000000-0000-4000-8000-000000000b0b";
+
+    /// "Show Sender's Page": another person's message in a group, nothing else.
+    #[test]
+    fn the_sender_has_a_page_in_a_group_only_for_others() {
+        assert!(
+            show_sender(false, true),
+            "another person's message in a group"
+        );
+        assert!(!show_sender(true, true), "the user's own message");
+        assert!(
+            !show_sender(false, false),
+            "a message of a chat that is no group"
+        );
+        assert!(!show_sender(true, false));
+    }
+
+    /// One entry per distinct person, in the order of the first mention; the user's own ids
+    /// are one entry; a text without a mention has none.
+    #[test]
+    fn a_menu_offers_each_mentioned_person_once() {
+        let own = [uid(ME), uid(ME_PNI)];
+        let none = mention_text(&[("nobody here", None)], Vec::new());
+        assert!(show_people(false, &none, &own).is_empty());
+        let body = mention_text(
+            &[
+                ("a ", Some(ALICE)),
+                (" b ", Some(ME)),
+                (" c ", Some(ALICE)),
+                (" d ", Some(ME_PNI)),
+                (" e ", Some(BOB)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            show_people(false, &body, &own),
+            vec![
+                ShownPerson {
+                    user: uid(ALICE),
+                    own: false
+                },
+                ShownPerson {
+                    user: uid(ME),
+                    own: true
+                },
+                ShownPerson {
+                    user: uid(BOB),
+                    own: false
+                },
+            ],
+            "alice once, the user once (both his ids), bob"
+        );
+        // The ranges of a stored text need not be in order.
+        let mut sorted = mention_text(&[("x ", Some(BOB)), (" y ", Some(ALICE))], Vec::new());
+        if let kourier_model::Body::Text(t) = &mut sorted {
+            t.ranges.reverse();
+        }
+        let people = show_people(false, &sorted, &own);
+        assert_eq!(people[0].user, uid(BOB));
+        assert_eq!(people[1].user, uid(ALICE));
+    }
+
+    /// A deleted message, a mention under a spoiler and a range that is no mention have no entry;
+    /// a caption has its mentions like a text.
+    #[test]
+    fn a_menu_leaves_out_what_is_deleted_hidden_or_invalid() {
+        use kourier_model::text::MENTION_PLACEHOLDER;
+        use kourier_model::{RangeKind, TextRange};
+        let own = [uid(ME)];
+        let plain = mention_text(&[("hi ", Some(ALICE))], Vec::new());
+        assert_eq!(show_people(false, &plain, &own).len(), 1);
+        assert!(
+            show_people(true, &plain, &own).is_empty(),
+            "a deleted message"
+        );
+        // Bob's mention lies under a spoiler (the whole placeholder is inside it): no entry,
+        // whatever the user saw; alice's, beside it, has one.
+        let at =
+            u32::try_from("a ".len() + MENTION_PLACEHOLDER.len_utf8() + " b ".len()).expect("len");
+        let len = u32::try_from(MENTION_PLACEHOLDER.len_utf8()).expect("len");
+        let hidden = mention_text(
+            &[("a ", Some(ALICE)), (" b ", Some(BOB))],
+            vec![TextRange {
+                start: at - 1,
+                len: len + 1,
+                kind: RangeKind::Spoiler,
+            }],
+        );
+        let people = show_people(false, &hidden, &own);
+        assert_eq!(people.len(), 1, "{people:?}");
+        assert_eq!(people[0].user, uid(ALICE));
+        // A spoiler that only touches the mention does not hide it.
+        let touching = mention_text(
+            &[("a ", Some(ALICE)), (" b ", Some(BOB))],
+            vec![TextRange {
+                start: at + len,
+                len: 1,
+                kind: RangeKind::Spoiler,
+            }],
+        );
+        assert_eq!(show_people(false, &touching, &own).len(), 2);
+        // A mention range that is not exactly one placeholder is no mention.
+        let invalid = kourier_model::Body::Text(kourier_model::Text {
+            body: "no placeholder here".into(),
+            ranges: vec![TextRange {
+                start: 0,
+                len: 2,
+                kind: RangeKind::Mention(uid(ALICE)),
+            }],
+        });
+        assert!(show_people(false, &invalid, &own).is_empty());
+        // A caption of a media message has its mentions.
+        let kourier_model::Body::Text(caption) = plain.clone() else {
+            panic!("a text");
+        };
+        let media = kourier_model::Body::Media {
+            attachments: Vec::new(),
+            caption: Some(caption),
+        };
+        assert_eq!(show_people(false, &media, &own).len(), 1);
+    }
+
+    /// One person per placeholder, as the text shows it: two persons on one placeholder are the
+    /// LAST one, "everyone" with a person is "everyone" (nobody) or the person by which comes last.
+    #[test]
+    fn a_menu_offers_the_one_person_the_text_shows_per_placeholder() {
+        use kourier_model::text::MENTION_PLACEHOLDER;
+        use kourier_model::{RangeKind, Text, TextRange};
+        let own = [uid(ME)];
+        let range = |kind| TextRange {
+            start: 2,
+            len: u32::try_from(MENTION_PLACEHOLDER.len_utf8()).expect("len"),
+            kind,
+        };
+        let with = |kinds: Vec<RangeKind>| {
+            kourier_model::Body::Text(Text {
+                body: format!("a {MENTION_PLACEHOLDER}"),
+                ranges: kinds.into_iter().map(range).collect(),
+            })
+        };
+        let people = |kinds: Vec<RangeKind>| -> Vec<UserId> {
+            show_people(false, &with(kinds), &own)
+                .into_iter()
+                .map(|p| p.user)
+                .collect()
+        };
+        let (alice, bob) = (RangeKind::Mention(uid(ALICE)), RangeKind::Mention(uid(BOB)));
+        assert_eq!(
+            people(vec![alice.clone(), bob.clone()]),
+            vec![uid(BOB)],
+            "two ranges on one placeholder: the text shows the last, so the menu offers it"
+        );
+        assert_eq!(people(vec![bob.clone(), alice.clone()]), vec![uid(ALICE)]);
+        assert!(
+            people(vec![alice.clone(), RangeKind::MentionAll]).is_empty(),
+            "\"everyone\" last: the text says @everyone, the menu lists nobody"
+        );
+        assert_eq!(
+            people(vec![RangeKind::MentionAll, alice]),
+            vec![uid(ALICE)],
+            "a person last: the person"
+        );
     }
 }

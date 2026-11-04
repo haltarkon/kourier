@@ -10,16 +10,29 @@ use std::time::Duration;
 
 use kourier_model::ids::validate_local;
 use kourier_model::{
-    AccountCaps, AccountProgress, AccountSettingsPatch, AttachmentId, AttachmentMeta, BackendBlob,
-    BackendError, Body, CmdId, ContactPatch, ConvKey, ConversationPatch, DownloadId, Expiry,
-    HistoryTransfer, IdError, LocalMsgId, LoginStep, LogoutReport, MsgTarget, NetMsgId, Origin,
-    OutgoingState, PersistError, ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
+    AccountCaps, AccountHold, AccountProgress, AccountSettingsPatch, AttachmentId, AttachmentMeta,
+    BackendBlob, BackendError, Body, CmdId, ContactPatch, ConvKey, ConversationPatch, DownloadId,
+    Expiry, HistoryTransfer, IdError, LocalMsgId, LoginStep, LogoutReport, MsgTarget, NetMsgId,
+    Origin, OutgoingState, PersistError, ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 /// Most messages in one [`BackendEvent::HistoryBatch`] (one bounded core transaction, §4.10).
 pub const MAX_HISTORY_BATCH: usize = 500;
+
+/// The highest position a network may state (KT-2): 2^53, TDLib's `int53`, the largest integer a
+/// JSON number carries exactly. A position ([`IncomingMessage::net_seq`], [`BackendEvent::ReadUpTo`],
+/// [`BackendEvent::PeerReadUpTo`], [`AssignedId::seq`](crate::AssignedId::seq)) is in
+/// `0..=MAX_NET_SEQ`. Positions only rise, so one bogus number would read a chat for good:
+/// [`Envelope::validate`] refuses an envelope that states another, as it refuses a bad id, and the
+/// core takes an answer's id without a position out of range.
+pub const MAX_NET_SEQ: i64 = 1 << 53;
+
+/// Whether `seq` is a position a network may state ([`MAX_NET_SEQ`]).
+pub fn is_net_seq(seq: i64) -> bool {
+    (0..=MAX_NET_SEQ).contains(&seq)
+}
 
 /// An event from a backend. Serde by variant name: durable events are stored in the
 /// backend's `core_outbox` (see [`encode_outbox_row`]).
@@ -35,7 +48,9 @@ pub enum BackendEvent {
     /// [`Envelope::validate_linking`]): the core checks the linked identity only on that event
     /// (§4.3 step 6). Ephemeral `Login` steps may come before it.
     AccountReady {
-        /// Our ids (Signal: `[aci, pni]`).
+        /// Our ids, the PRIMARY one first (Signal: `[aci, pni]`, the ACI; WhatsApp: `[lid, pn]`,
+        /// the LID). The primary id never changes for the account: the core's one-identity
+        /// rule compares it, and a link that brings another one is refused.
         own_ids: Vec<UserId>,
         /// Our device id.
         #[serde(default)]
@@ -58,6 +73,11 @@ pub enum BackendEvent {
     ContactUpsert(ContactPatch),
     /// `from` is an alias of `into` (PNI→ACI, E164→ACI, PN→LID); the core rewrites and merges
     /// (§3.3).
+    ///
+    /// A backend sends it only for a pair the server vouches for (an authenticated sync, a
+    /// server-signed mapping): a merge is final, nothing moves back. Until it comes, messages
+    /// seen under the two ids are two authors' messages (under per-sender ids, two rows); the
+    /// merge joins them.
     IdentityMerged {
         /// The alias.
         from: UserId,
@@ -107,6 +127,23 @@ pub enum BackendEvent {
         /// Desktop's `deleteLocalOnlyConversation`).
         #[serde(default)]
         remove: bool,
+        /// A clear by TIME (WhatsApp: the `lastMessageTimestamp` of the sync action's range,
+        /// times 1000): every message of the conversation whose `sent_at` is at or below
+        /// this goes too (the same exceptions as `up_to`: an own message nobody has, the row
+        /// of a queued delete), and a HISTORY row of this conversation at or below it is
+        /// dropped from then on (a chunk of history arriving after the clear does not fill
+        /// the chat up again; live and catch-up messages are never refused by it). The core
+        /// keeps the time per conversation key, also when the conversation is not here yet,
+        /// and never lowers it. In the clock of the network's `sent_at`; the core reads a time
+        /// more than [`CLEAR_CLOCK_TOLERANCE`](crate::CLEAR_CLOCK_TOLERANCE) after its own clock
+        /// as that bound (a clear cannot name the far future; a few minutes of a clock that runs
+        /// behind the network's are not that). The time is the clear's CLAIM: the core keeps the
+        /// largest claim it has seen per conversation, and an event whose claim is not larger
+        /// than that changes nothing (so it is applied once, however often it is delivered: an
+        /// app-state resync or a redelivery after a crash replays it, and a live message that
+        /// came between must not go with the replay). Anchors (`up_to`) apply on every delivery.
+        #[serde(default)]
+        before_ms: Option<i64>,
         /// When (ms).
         at: i64,
     },
@@ -201,6 +238,21 @@ pub enum BackendEvent {
     /// - A call line of the past ([`IncomingMessage::call`]) honours `read` and `expiry` as
     ///   a message does: a missed call the phone had not seen is unread and counts.
     ///
+    /// A network that pushes history after the link (`HistorySource::PushedOnLink`) ends the
+    /// push with `has_more: false` for every conversation it touched. Later batches (an
+    /// on-demand `FetchHistory`, small chunks the network sends for weeks) say `has_more`
+    /// only while they run: the UI shows "getting your history" while any conversation of
+    /// the account has more, and holds Clear and Delete of it, so a `has_more` that is never
+    /// cleared would show that for good.
+    ///
+    /// A row at or below the CUT of its conversation (the time of a clear by time,
+    /// [`ConversationCleared::before_ms`](Self::ConversationCleared), or of the user's own clear
+    /// here) is dropped, and its key is remembered like that of a message a clear removed (a later
+    /// copy of it is dropped too): history that keeps coming after a clear must not fill the chat
+    /// up again. The core looks the cut up once per batch, which names one conversation; only
+    /// history rows are refused, never a live or a catch-up message. A network that clears by
+    /// time must therefore state the batch's rows in the same clock as `before_ms`.
+    ///
     /// An empty batch is allowed: it says where the conversation's import stands
     /// (`has_more`, `progress`) and nothing else.
     HistoryBatch {
@@ -269,10 +321,21 @@ pub enum BackendEvent {
     /// delete, synced from another own device: it counts when one of our own ids is an admin.
     /// `delete_receive` is measured like `edit_receive`, from the target's `server_at` to
     /// `at`. The target must be a message of the conversation `target.conv` names.
+    ///
+    /// On a network whose server checks a delete itself (`NetworkDescriptor::server`,
+    /// `validates_deletes`, KT-2) none of that is checked again: the core applies a delete for
+    /// everyone of any message of the conversation, and `by: None` means the network did NOT
+    /// say who deleted it (the row reads `Deletion::Unattributed`), not our own account; a
+    /// named `by` is stored as the deleter. A delete for a message that is not here yet waits
+    /// for it as on every network. Such a network names the target's author when it knows it,
+    /// and `TargetAuthor::Unknown` for an id it never saw (a server says only which ids went):
+    /// under ids unique in the conversation the id alone finds the message, ours or theirs, and
+    /// a delete that waits for it applies to whoever's message comes under it.
     Deleted {
         /// The message.
         target: MsgTarget,
-        /// Who deleted; `None` = own account.
+        /// Who deleted; `None` = own account (on a network that validates deletes: nobody
+        /// named).
         #[serde(default)]
         by: Option<UserId>,
         /// For everyone (else a delete-for-me sync from another own device).
@@ -281,13 +344,22 @@ pub enum BackendEvent {
         at: i64,
     },
     /// A reaction was added or removed.
+    ///
+    /// A removal WITH an emoji takes away that emoji of `by` on the message and nothing else
+    /// (Signal, Threema). A removal with NO emoji (`emoji` empty, `remove` true) takes away every
+    /// reaction `by` has on the message that is not newer than `at`: WhatsApp allows one per
+    /// sender and message and takes it back with an empty one. It is a removal in its own right
+    /// and keeps its place in time: a reaction that arrives afterwards and is not newer than it
+    /// is a removed one too, so the order of arrival does not matter; a newer reaction stands.
+    /// With nothing to remove it changes nothing the user sees. An empty `emoji` with `remove`
+    /// false is no reaction and is dropped.
     Reaction {
         /// The message.
         target: MsgTarget,
         /// Who reacted; `None` = own account.
         #[serde(default)]
         by: Option<UserId>,
-        /// The emoji.
+        /// The emoji; empty only in a removal that names none (see above).
         emoji: String,
         /// Removed instead of added.
         #[serde(default)]
@@ -324,12 +396,41 @@ pub enum BackendEvent {
         at: i64,
     },
     /// We read up to here on another own device.
+    ///
+    /// A message that has a [`net_seq`](IncomingMessage::net_seq) is read by position, as
+    /// [`ReadUpTo`](Self::ReadUpTo) at that number (a neighbour of the same second stays
+    /// unread); one that has none by the time rule.
     ReadMarker {
         /// The conversation, when the network says.
         #[serde(default)]
         conv: Option<ConvKey>,
         /// Newest message read.
         up_to: MsgTarget,
+    },
+    /// Our own read position moved on another own device (KT-2): every message of `conv` that
+    /// has a [`net_seq`](IncomingMessage::net_seq) at or below `seq` is read. The network's own
+    /// number, not a message: there need be no row at `seq`, but it is in `0..=`[`MAX_NET_SEQ`]
+    /// ([`Envelope::validate`]). The position only rises: one at or below the one the core has
+    /// moves it nowhere, and reads only what is still unread at or below it. A message that
+    /// arrives later at or below it is stored read and does not notify. A conversation the core
+    /// does not know is not made by a position: state the chat first (`ConversationUpsert`).
+    ReadUpTo {
+        /// The conversation.
+        conv: ConvKey,
+        /// The position, in the numbers of [`IncomingMessage::net_seq`].
+        seq: i64,
+    },
+    /// The other side read our messages (KT-2): every OWN message of `conv` that has a
+    /// [`net_seq`](IncomingMessage::net_seq) at or below `seq` is read. No per-member fact: in
+    /// a group it says that someone did, not who ([`Receipts`](Self::Receipts) says who). The
+    /// same rules as [`ReadUpTo`](Self::ReadUpTo): in `0..=`[`MAX_NET_SEQ`], only rises, an own
+    /// message that arrives or is re-keyed later at or below it is read too, and a conversation
+    /// the core does not know is dropped.
+    PeerReadUpTo {
+        /// The conversation.
+        conv: ConvKey,
+        /// The position, in the numbers of [`IncomingMessage::net_seq`].
+        seq: i64,
     },
     /// Per-recipient send state of an own message (sync transcripts, late outcomes).
     OwnSendState {
@@ -360,15 +461,39 @@ pub enum BackendEvent {
         /// Clear after this long without a refresh.
         ttl: Duration,
     },
-    /// Ephemeral: upload progress of attachment `index` of an own message.
+    /// Ephemeral: upload progress of one attachment of an own message, while an attempt of
+    /// `Command::Transmit` uploads it. A backend that sends it promises (the UI draws a ring
+    /// and an X from it):
+    /// - `index` is the attachment's position in the attempt's `Body::Media.attachments` (the
+    ///   request the core handed over, not a database column);
+    /// - `done` and `total` are PLAINTEXT bytes of what THIS attempt uploads for it. `total` is
+    ///   final from the first report on (after any re-encode the backend does, which it does
+    ///   for every attachment before the first byte goes up), `done` never goes down within an
+    ///   attempt, and `done == total` is reported only once the upload is over (a pointer
+    ///   reused from an earlier upload: in its first report);
+    /// - the first report of every attachment that uploads comes with the first tick (250 ms)
+    ///   after the attempt starts uploading (`done` may be 0), then at most every 250 ms while
+    ///   the numbers move; an attachment whose upload is over before then is reported once, full;
+    ///   every attachment that uploaded ends with `done == total` before the attempt's uploads
+    ///   are reported over (`TransmitProgress` with `progress` 1);
+    /// - an attachment that has its pointer already (an edit re-sends it) and a long text's
+    ///   file are never reported;
+    /// - the share of [`Self::TransmitProgress`] is weighted by the same final sizes and never
+    ///   goes down within an attempt;
+    /// - it MUST answer [`Command::AbortTransmit`](crate::Command::AbortTransmit) for the
+    ///   message at once, from its stop state: `Stopping` only when nothing of the message can
+    ///   go out any more (the attempt then ends `Failed`, having sent nothing to anyone), else
+    ///   `TooLate`. A dropped reply is read as `TooLate`.
+    ///
+    /// A restart starts the attempt over; the numbers are never stored.
     AttachmentProgress {
         /// The message row.
         local: LocalMsgId,
-        /// Attachment index.
+        /// The attachment's position in the request's `Body::Media.attachments`.
         index: u16,
-        /// Bytes done.
+        /// Plaintext bytes uploaded.
         done: u64,
-        /// Total bytes.
+        /// Plaintext bytes this attempt uploads for the attachment.
         total: u64,
     },
     /// Ephemeral: download progress of a `DownloadAttachment`.
@@ -428,6 +553,23 @@ pub enum BackendEvent {
     /// nothing is left. Never stored: after a restart the backend reports again if work is
     /// left. A backend that has no such work never sends it.
     AccountProgress(AccountProgress),
+    /// Ephemeral STATE: the account may not send for a while though its connection is up
+    /// (WhatsApp's reach-out time lock, [`AccountHold`]). `Some` states or changes the hold,
+    /// `None` lifts it. A backend that can hold sends states it, `Some` or `None`, at EVERY
+    /// connect and BEFORE its first `Syncing` or `Online` of that connection (K-A fix C1): the
+    /// core can send from `Syncing` on, and nothing else orders the statement before the
+    /// first transmit. The core also keeps the hold in `core.db` and takes it up at its own
+    /// start, before anything is sent, so a restart of Kourier does not send into a lock the
+    /// backend has not stated yet; it keeps it across an actor's restart too, and drops it only
+    /// on `None`, at its time, or with the account (trying a send too early costs more than
+    /// holding it a moment too long). The event itself is never stored by ingest. A hold is no
+    /// wait that counts against a message's retry budget. While it stands the core keeps
+    /// messages, reactions, edits and deletes made in Kourier in the outbox, and refuses a
+    /// change of a conversation's disappearing-message timer (`Refusal::Held`: on some networks
+    /// it is a message of its own, one more reach-out); receiving, downloads, read receipts, the
+    /// missed-call summary and the other conversation changes (`Leave`, `AcceptRequest`,
+    /// archive, pin, mute) go on.
+    AccountHold(Option<AccountHold>),
     /// Ephemeral: what became of this device on the network after `Command::Logout` (removed,
     /// none to remove, the network not reached) and the name it was linked with. Sent once,
     /// right before the actor exits `LoggedOut` for that command; the core tells the user,
@@ -458,6 +600,8 @@ impl BackendEvent {
             Self::Reaction { .. } => "Reaction",
             Self::Receipts { .. } => "Receipts",
             Self::ReadMarker { .. } => "ReadMarker",
+            Self::ReadUpTo { .. } => "ReadUpTo",
+            Self::PeerReadUpTo { .. } => "PeerReadUpTo",
             Self::OwnSendState { .. } => "OwnSendState",
             Self::CommandPersisted { .. } => "CommandPersisted",
             Self::Typing { .. } => "Typing",
@@ -468,6 +612,7 @@ impl BackendEvent {
             Self::Notice(_) => "Notice",
             Self::HistoryTransfer(_) => "HistoryTransfer",
             Self::AccountProgress(_) => "AccountProgress",
+            Self::AccountHold(_) => "AccountHold",
             Self::Logout(_) => "Logout",
         }
     }
@@ -484,6 +629,7 @@ impl BackendEvent {
                 | Self::TransmitProgress { .. }
                 | Self::HistoryTransfer(_)
                 | Self::AccountProgress(_)
+                | Self::AccountHold(_)
                 | Self::Logout(_)
         )
     }
@@ -495,7 +641,10 @@ impl BackendEvent {
         match self {
             Self::ConversationUpsert(p) => p.key.validate(),
             Self::PinnedConversations(keys) => keys.iter().try_for_each(ConvKey::validate),
-            Self::ConversationRemoved { conv } | Self::Typing { conv, .. } => conv.validate(),
+            Self::ConversationRemoved { conv }
+            | Self::Typing { conv, .. }
+            | Self::ReadUpTo { conv, .. }
+            | Self::PeerReadUpTo { conv, .. } => conv.validate(),
             Self::Message(m) => m.validate_ids(),
             Self::HistoryBatch { conv, messages, .. } => {
                 conv.validate()?;
@@ -538,8 +687,48 @@ impl BackendEvent {
             | Self::TransmitProgress { .. }
             | Self::HistoryTransfer(_)
             | Self::AccountProgress(_)
+            | Self::AccountHold(_)
             | Self::Logout(_)
             | Self::Notice(_) => Ok(()),
+        }
+    }
+
+    /// Whether every position inside is one a network may state ([`MAX_NET_SEQ`]).
+    pub fn positions_in_range(&self) -> bool {
+        let stated = |m: &IncomingMessage| m.net_seq.is_none_or(is_net_seq);
+        match self {
+            Self::Message(m) => stated(m),
+            Self::HistoryBatch { messages, .. } => messages.iter().all(stated),
+            Self::ReadUpTo { seq, .. } | Self::PeerReadUpTo { seq, .. } => is_net_seq(*seq),
+            Self::Login(_)
+            | Self::AccountReady { .. }
+            | Self::AccountSettings(_)
+            | Self::AccountCaps(_)
+            | Self::ContactUpsert(_)
+            | Self::IdentityMerged { .. }
+            | Self::ConversationUpsert(_)
+            | Self::PinnedConversations(_)
+            | Self::ConversationRemoved { .. }
+            | Self::ConversationCleared { .. }
+            | Self::AttachmentDeleted { .. }
+            | Self::AttachmentRestore { .. }
+            | Self::Edited { .. }
+            | Self::Deleted { .. }
+            | Self::Reaction { .. }
+            | Self::Receipts { .. }
+            | Self::ReadMarker { .. }
+            | Self::OwnSendState { .. }
+            | Self::CommandPersisted { .. }
+            | Self::Typing { .. }
+            | Self::AttachmentProgress { .. }
+            | Self::DownloadProgress { .. }
+            | Self::AttachmentDone { .. }
+            | Self::TransmitProgress { .. }
+            | Self::Notice(_)
+            | Self::HistoryTransfer(_)
+            | Self::AccountProgress(_)
+            | Self::AccountHold(_)
+            | Self::Logout(_) => true,
         }
     }
 }
@@ -626,6 +815,10 @@ pub const MAX_HISTORY_EDITS: usize = 100;
 
 /// A message from the network (live or history). Its id is `(origin author, local)`; own
 /// messages (`Origin::Own*`) have no author.
+///
+/// `local` names the message and orders nothing: the core never reads a position out of it.
+/// A network whose server numbers the messages of a conversation says where this one stands
+/// in [`net_seq`](Self::net_seq).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncomingMessage {
     /// The conversation.
@@ -649,6 +842,24 @@ pub struct IncomingMessage {
     /// The backend's stage-1 arrival counter (ties in `sort_key`, §3.9).
     #[serde(default)]
     pub arrival: Option<u64>,
+    /// The message's position in its conversation, where the network's server numbers them
+    /// (KT-2): higher is newer, and positions compare only within one conversation and with the
+    /// numbers of [`BackendEvent::ReadUpTo`] and [`BackendEvent::PeerReadUpTo`]. In
+    /// `0..=`[`MAX_NET_SEQ`] ([`Envelope::validate`] refuses another). The backend states it;
+    /// the core never derives it from `local`. `None`: the network numbers nothing and the core
+    /// reads and counts by time. A message that is here without one takes it from a later copy.
+    /// The echo of an own message states it as well
+    /// ([`TransmitOutcome::SentAs`](crate::TransmitOutcome::SentAs) says it as `assigned.seq`).
+    ///
+    /// A network that numbers states it on EVERY message it delivers, live, history and echo,
+    /// call lines included: a row without one is read by time, and a read position passes it by.
+    ///
+    /// It decides what is READ, never where a row stands: the timeline sorts by time (§3.9: a
+    /// live row by its arrival, a history row by `sent_at`, and rows of one millisecond by a hash
+    /// of their id). A network whose dates are whole seconds and that needs the order within a
+    /// second (a Telegram album in a history batch) states it in the milliseconds of `sent_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_seq: Option<i64>,
     /// Disappearing timer. `started_at` is honoured as given, live and in a history batch
     /// (the timer goes on from where the network had it). Without a start the core decides:
     ///
@@ -684,9 +895,21 @@ pub struct IncomingMessage {
     /// Arrived before the catch-up boundary: summarized, not notified one by one (§4.5).
     #[serde(default)]
     pub catch_up: bool,
-    /// Own messages in history imports: their state.
+    /// Own messages, live and imported: their state. The core reads it for every echo of an
+    /// own message, not only for a history row.
     #[serde(default)]
     pub initial_out_state: Option<OutgoingState>,
+    /// The echo of an own message of this device, on a network whose server gave it an id of
+    /// its own (KT-2): the id this device allocated it under before the send
+    /// ([`Network::allocate_message_id`](crate::Network::allocate_message_id)), while
+    /// [`local`](Self::local) is the server's. It lets the core join the echo to the message it
+    /// queued whichever of this and the
+    /// [`TransmitOutcome::SentAs`](crate::TransmitOutcome::SentAs) comes first. Read only for
+    /// an own message of THIS device (`Origin::OwnThisDevice`): another device cannot know what
+    /// this one allocated. `None`: the echo knows no binding (the core joins the two when the
+    /// outcome comes), a message of another device, or a network that assigns nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_as: Option<Arc<str>>,
     /// Already read elsewhere. Read for a message somebody else wrote (and for a call line
     /// that counts as unread); an own message and a notice have no read state.
     ///
@@ -756,12 +979,14 @@ impl IncomingMessage {
             server_at: None,
             received_at,
             arrival: None,
+            net_seq: None,
             expiry: None,
             view_once: false,
             mentions_me: false,
             silent: false,
             catch_up: false,
             initial_out_state: None,
+            allocated_as: None,
             read: false,
             reactions: Vec::new(),
             edits: Vec::new(),
@@ -938,6 +1163,9 @@ impl IncomingMessage {
     fn validate_ids(&self) -> Result<(), IdError> {
         self.conv.validate()?;
         validate_local(&self.local)?;
+        if let Some(allocated) = &self.allocated_as {
+            validate_local(allocated)?;
+        }
         self.edits
             .iter()
             .try_for_each(|edit| validate_local(&edit.local))?;
@@ -952,6 +1180,14 @@ impl IncomingMessage {
 pub enum BackendNotice {
     /// A contact's safety number changed; sends to them pause until `ConfirmIdentity`.
     IdentityChanged {
+        /// Whose identity.
+        user: UserId,
+    },
+    /// A person's identity left the "changed since you verified" state (P5a, critic H1) by a
+    /// way that did not start at this device's page: a Verified sync from another device, a
+    /// Storage Service record. The core resumes the sends paused on `user`, as after
+    /// `UiCommand::SetVerified` (which releases by itself and needs no notice).
+    IdentityTrusted {
         /// Whose identity.
         user: UserId,
     },
@@ -970,6 +1206,14 @@ pub enum BackendNotice {
         /// then. `None`: until one of the other ends.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after: Option<Duration>,
+    },
+    /// Part of the history the network pushed after the link did not arrive (WhatsApp: the phone announced
+    /// chunks this computer never received, and the phone sends each one once). `count` is how many chunks are
+    /// lost since the person was last told, always more than 0 (a UI ignores 0). The core takes it like any
+    /// notice; the UI shows it as a quiet line of the account's banner.
+    HistoryLost {
+        /// The lost chunks not yet told of.
+        count: u32,
     },
     /// Any other problem; `user_message` is the banner text.
     Error(BackendError),
@@ -1028,7 +1272,11 @@ impl Envelope {
     /// when its `read` flag says so (a line that still "rings" when it is imported is the
     /// exception, [`IncomingMessage::call`]), and one that still "rings" is settled by its
     /// deadline like any other); the ids of a history message's
-    /// [`edits`](IncomingMessage::edits).
+    /// [`edits`](IncomingMessage::edits); positions in `0..=`[`MAX_NET_SEQ`].
+    ///
+    /// A refused envelope is refused for good: the core acks it with a `PersistError` that is not
+    /// retryable and goes on with the account, and the backend quarantines the row that carried it
+    /// and ships the next ([`Ack`]). What the row said is never applied.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         if self.events.is_empty() {
             return Err(ContractViolation::Empty);
@@ -1052,6 +1300,9 @@ impl Envelope {
                     event: e.name(),
                     error,
                 })?;
+            if !e.positions_in_range() {
+                return Err(ContractViolation::PositionOutOfRange(e.name()));
+            }
             match e {
                 BackendEvent::Message(m) => m.validate_call(),
                 BackendEvent::HistoryBatch { messages, .. } => {
@@ -1095,6 +1346,9 @@ pub enum ContractViolation {
     /// other side of a call that says more than it may ([`IncomingMessage::call`]).
     #[error("call line: {0}")]
     CallLine(&'static str),
+    /// A position outside `0..=`[`MAX_NET_SEQ`] in the named event (KT-2).
+    #[error("position out of range in {0}")]
+    PositionOutOfRange(&'static str),
     /// During a link, a durable envelope that does not start with `AccountReady` (the named
     /// event came first). `AccountReady` is the first durable event of every link.
     #[error("durable event {0} before AccountReady while linking")]

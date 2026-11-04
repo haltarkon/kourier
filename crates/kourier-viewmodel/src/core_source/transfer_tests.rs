@@ -8,7 +8,7 @@ use kourier_model::{
     LoginStep, LoginStepKind, NetworkKind, UserAction,
 };
 
-use super::tests::{Sent, Store, account, result, settle, source, take_queries};
+use super::tests::{Sent, Store, account, result, settle, source, source_with, take_queries};
 use super::*;
 use crate::conversations::BannerKind;
 use crate::transfer::{TransferPhase, TransferView};
@@ -473,6 +473,8 @@ fn which_banner_wins_beside_a_transfer() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     assert_eq!(kind(&src), Some(BannerKind::LoggedOut));
@@ -496,6 +498,8 @@ fn which_banner_wins_beside_a_transfer() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     assert_eq!(kind(&src), Some(BannerKind::LoggedOut));
@@ -782,6 +786,8 @@ fn the_question_tells_accounts_apart_by_name_and_number() {
 fn logged_out() -> ConnState {
     ConnState::LoggedOut {
         reason: "unlinked".into(),
+        cause: Default::default(),
+        note: Default::default(),
     }
 }
 
@@ -1593,6 +1599,100 @@ fn quitting_asks_while_a_transfer_or_the_update_after_a_link_runs() {
     assert!(src.quit_question().is_none(), "logged out");
 }
 
+/// W4 (D2): a history the network PUSHES is sent by the phone once, so closing the window (and
+/// "Restart Now", which asks the same question) while it arrives asks first, with words of its
+/// own: the other two kinds of work say "It goes on at the next start", and this one does not.
+/// It is the banner's own condition: nothing is asked before the first batch, once the last chat
+/// has its history, after five quiet minutes, with the connection gone or the account logged out.
+#[test]
+fn a_pushed_history_asks_before_quitting() {
+    use super::network_tests::{conn, fill, online, with_clock};
+    use super::tests::NOW;
+
+    let (mut src, _sent, clock) = with_clock();
+    online(&mut src);
+    assert!(src.quit_question().is_none(), "nothing arrives yet");
+
+    fill(&mut src, 1, Some(0.4), true);
+    let q = src.quit_question().expect("a pushed history arrives");
+    assert_eq!(q.title, "Quit While History Arrives?");
+    assert_eq!(
+        q.text,
+        "Your phone is still sending your message history. If Kourier closes now, part of it may not arrive."
+    );
+    assert!(
+        !q.text.contains("next start"),
+        "the push does not go on at the next start"
+    );
+    assert_eq!((q.confirm.as_str(), q.cancel.as_str()), ("Quit", "Cancel"));
+
+    // Another chat starts and the first one ends: the push goes on.
+    fill(&mut src, 2, None, true);
+    fill(&mut src, 1, None, false);
+    assert!(src.quit_question().is_some(), "chat 2 still fills");
+    // The last chat has its history: nothing to lose.
+    fill(&mut src, 2, None, false);
+    assert!(src.quit_question().is_none(), "the push is over");
+
+    // A phone that goes quiet for five minutes leaves nothing to wait for.
+    fill(&mut src, 1, Some(0.5), true);
+    assert!(src.quit_question().is_some());
+    clock.set(NOW + HISTORY_FILL_IDLE_MS + 1);
+    src.tick();
+    assert!(src.quit_question().is_none(), "five quiet minutes");
+
+    // The connection that carried it is gone, or the account is logged out.
+    fill(&mut src, 1, Some(0.6), true);
+    assert!(src.quit_question().is_some());
+    conn(&mut src, ConnState::Offline { retry_at_ms: None });
+    assert!(src.quit_question().is_none(), "offline");
+    online(&mut src);
+    fill(&mut src, 1, Some(0.7), true);
+    assert!(src.quit_question().is_some());
+    conn(&mut src, logged_out());
+    assert!(src.quit_question().is_none(), "logged out");
+}
+
+/// W4 (D2): when a pushed history and a transfer of another account run together, the question
+/// is the pushed history's: it is the only work that quitting can lose, and the transfer's
+/// words ("It goes on at the next start") would hide that.
+#[test]
+fn a_pushed_history_is_asked_before_a_transfer_that_goes_on_at_the_next_start() {
+    use super::network_tests::{fill, networks, online, whatsapp_store};
+
+    let (mut src, sent) = source_with(networks(true));
+    let mut store = whatsapp_store();
+    store.accounts.push(kourier_core::facade::AccountRow {
+        id: AccountId(2),
+        uuid: AccountUuid::new_random(),
+        network: NetworkKind::Fake,
+        conn: ConnState::Online { detail: None },
+        ..account()
+    });
+    src.reload();
+    settle(&mut src, &sent, &store);
+    online(&mut src);
+
+    // Only the transfer of the second account runs: its own question, as ever.
+    src.on_event(&transfer(AccountId(2), HistoryTransfer::Reading));
+    assert_eq!(
+        src.quit_question().map(|q| q.title),
+        Some("Quit While Importing History?".to_owned())
+    );
+    // The first account's phone starts pushing: that question goes first.
+    fill(&mut src, 1, Some(0.1), true);
+    assert_eq!(
+        src.quit_question().map(|q| q.title),
+        Some("Quit While History Arrives?".to_owned())
+    );
+    // It ends: the transfer's question is back.
+    fill(&mut src, 1, None, false);
+    assert_eq!(
+        src.quit_question().map(|q| q.title),
+        Some("Quit While Importing History?".to_owned())
+    );
+}
+
 // ---------- "Remove Account…" and "Unlink…" (link feedback L4) ----------
 
 #[test]
@@ -1653,6 +1753,8 @@ fn a_logged_out_account_offers_removal_but_no_unlink() {
         account: ME,
         state: ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     });
     assert!(src.accounts().iter().all(|a| !a.offers_unlink));
@@ -1672,6 +1774,8 @@ fn an_unlink_asked_before_a_logout_sends_nothing_after_it() {
         account: ME,
         state: ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     });
     assert!(!src.confirm_account_action(ME, AccountAction::Unlink));
@@ -1896,6 +2000,8 @@ fn removing_a_logged_out_account_does_not_claim_to_unlink() {
         account: ME,
         state: ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     });
     let q = src
@@ -1923,6 +2029,76 @@ fn the_replace_question_is_not_asked_while_a_transfer_runs() {
     assert!(src.ask_replace(ME).is_none(), "and not to be asked");
 }
 
+/// K-A: "Transfer History from Phone…" keys on the descriptor's `history_transfer`, the archive
+/// of Signal's link, and on no other thing. WhatsApp's descriptor says
+/// `HistorySource::PushedOnLink` as well (the phone pushes history in pieces), and for its
+/// account the action would be a link/unlink cycle, itself a ban risk: it is never offered, and
+/// the question "Remove and Link Again?" is never asked.
+#[test]
+fn an_account_of_a_network_that_pushes_history_in_pieces_offers_no_transfer() {
+    use crate::login::{NetworkEntry, network_choices};
+    let whatsapp = NetworkEntry {
+        kind: NetworkKind::WhatsApp,
+        flows: vec![
+            ("qr".into(), "QR code".into()),
+            ("pair-code".into(), "Phone number".into()),
+        ],
+        experimental: true,
+        risk_notice: None,
+        history_transfer: false,
+        history: kourier_model::HistorySource::PushedOnLink,
+        on: true,
+        receipts_always_sent: false,
+        missing: None,
+    };
+    let signal_like = NetworkEntry {
+        history_transfer: true,
+        ..NetworkEntry::plain(NetworkKind::Fake)
+    };
+    let (mut src, sent) = super::tests::source_with(network_choices(
+        &[
+            NetworkEntry::plain(NetworkKind::Signal),
+            whatsapp,
+            signal_like,
+        ],
+        false,
+    ));
+    src.reload();
+    let (mut wa, mut sl) = (super::tests::account(), super::tests::account());
+    wa.id = AccountId(1);
+    wa.network = NetworkKind::WhatsApp;
+    sl.id = AccountId(2);
+    sl.network = NetworkKind::Fake;
+    let store = Store::new(&[(1, 2)]);
+    for (t, q) in take_queries(&sent) {
+        let data = match q {
+            Query::Accounts => QueryData::Accounts(vec![wa.clone(), sl.clone()]),
+            other => store.answer(&other),
+        };
+        src.on_event(&result(t, data));
+    }
+    for id in [1, 2] {
+        src.on_event(&UiEvent::ConnState {
+            account: AccountId(id),
+            state: ConnState::Online { detail: None },
+        });
+    }
+    let offers: Vec<(i64, bool)> = src
+        .accounts()
+        .iter()
+        .map(|a| (a.id.0, a.offers_history))
+        .collect();
+    assert_eq!(offers, [(1, false), (2, true)]);
+    assert!(
+        src.ask_replace(AccountId(1)).is_none(),
+        "WhatsApp: not asked"
+    );
+    assert!(
+        src.ask_replace(AccountId(2)).is_some(),
+        "a Signal-like account still is"
+    );
+}
+
 /// L5 (`buttons.md` §3): "Continue Without History" pressed twice (a double click, or a
 /// press and a key) sends ONE skip; the backend's next report (the same state again after a
 /// restart that lost the skip) lets the user press it again, and so does the time (the
@@ -1946,4 +2122,193 @@ fn a_skip_pressed_twice_is_sent_once() {
     src.on_event(&transfer(ME, HistoryTransfer::Skipped));
     assert!(src.take_transfer_notices().is_empty(), "our own skip");
     assert_eq!(commands(&sent), [("dismiss", 1)]);
+}
+
+// ---------- the replace's own login (blended chats) ----------
+
+#[test]
+fn the_login_of_a_replace_tells_its_own_new_account() {
+    let (mut src, _sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    assert!(
+        src.take_replace_news().is_empty(),
+        "the core has not answered"
+    );
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(2),
+    });
+    assert_eq!(
+        src.take_replace_news(),
+        [ReplaceNews::Answered {
+            old: ME,
+            new: AccountId(2)
+        }]
+    );
+    assert!(src.take_replace_news().is_empty(), "told once");
+    // A later link of the same network is nobody's replace. Starting it cancels the replace's
+    // login, whose account was announced: that ends the replace (state HIGH 1).
+    src.start_login(NetworkKind::Fake).expect("login");
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(3),
+    });
+    assert!(src.take_replace_news().is_empty());
+}
+
+#[test]
+fn a_replace_whose_link_is_cancelled_or_fails_ends_and_a_later_link_takes_no_carry() {
+    // Cancelled before the core announced the account.
+    let (mut src, _sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    src.cancel_login();
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(2),
+    });
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    src.start_login(NetworkKind::Fake).expect("login");
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(3),
+    });
+    assert!(src.take_replace_news().is_empty());
+    // The add failed.
+    let (mut src, _sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    src.on_event(&UiEvent::ActionFailed {
+        account: None,
+        action: "AddAccount",
+        subject: kourier_core::facade::ActionSubject::None,
+        error: std::sync::Arc::new(kourier_core::facade::CoreError::Stopped),
+    });
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    // A lagged channel loses the announcement: the replace ends too.
+    let (mut src, _sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    src.reload();
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+}
+
+/// A source with a confirmed replace of [`ME`] whose account the core announced as `2`.
+fn announced_replace() -> (CoreSource, Sent) {
+    let (mut src, sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    let ch = src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(2),
+    });
+    assert!(ch.accounts, "news is read with the accounts");
+    assert_eq!(
+        src.take_replace_news(),
+        [ReplaceNews::Answered {
+            old: ME,
+            new: AccountId(2)
+        }]
+    );
+    // The queries stay to be answered; the commands are forgotten.
+    sent.borrow_mut()
+        .retain(|c| matches!(c, UiCommand::Query { .. }));
+    (src, sent)
+}
+
+/// The account `id` as the core lists it while it links (or, `linking: false`, once taken).
+fn new_account(id: i64, linking: bool) -> kourier_core::facade::AccountRow {
+    kourier_core::facade::AccountRow {
+        id: AccountId(id),
+        uuid: AccountUuid::new_random(),
+        state: if linking {
+            AccountState::Linking
+        } else {
+            AccountState::Active
+        },
+        conn: ConnState::Online { detail: None },
+        ..account()
+    }
+}
+
+#[test]
+fn a_replace_cancelled_or_failed_after_its_announcement_ends() {
+    // Cancelled at the QR code after the core announced the account (state HIGH 1).
+    let (mut src, sent) = announced_replace();
+    src.cancel_login();
+    assert_eq!(commands(&sent), [("cancel-login", 2)]);
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    // Said once: the account's later failure and its going add nothing.
+    src.on_event(&failed_step(AccountId(2)));
+    assert!(src.take_replace_news().is_empty());
+    // The link failed after the announcement: the replace ends, and the accounts are read.
+    let (mut src, _sent) = announced_replace();
+    let ch = src.on_event(&failed_step(AccountId(2)));
+    assert!(ch.accounts, "the choice is pruned at once");
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    // The failure of ANOTHER account's login is not this replace's.
+    let (mut src, _sent) = announced_replace();
+    src.on_event(&failed_step(AccountId(7)));
+    assert!(src.take_replace_news().is_empty());
+    // A failed `AddAccount` returns the accounts with its end (it used to wait for the next
+    // unrelated accounts change).
+    let (mut src, _sent) = loaded();
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    let ch = src.on_event(&UiEvent::ActionFailed {
+        account: None,
+        action: "AddAccount",
+        subject: kourier_core::facade::ActionSubject::None,
+        error: std::sync::Arc::new(kourier_core::facade::CoreError::Stopped),
+    });
+    assert!(ch.accounts);
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+}
+
+#[test]
+fn an_announced_replace_account_that_goes_before_it_shows_ends_the_replace() {
+    // An answer read before the announcement (without the account) ends nothing; one that
+    // listed it (still linking) and then one without it do.
+    let (mut src, sent) = announced_replace();
+    // (the answer to the query sent at the announcement)
+    answer_accounts(&mut src, &sent, &[]);
+    assert!(src.take_replace_news().is_empty(), "not listed yet");
+    src.on_event(&UiEvent::AccountsChanged);
+    answer_accounts(&mut src, &sent, &[new_account(2, true)]);
+    assert!(src.take_replace_news().is_empty(), "still linking");
+    src.on_event(&UiEvent::AccountsChanged);
+    answer_accounts(&mut src, &sent, &[]);
+    assert_eq!(src.take_replace_news(), [ReplaceNews::Ended { old: ME }]);
+    // Once visible, the account is the choice's: a later end of it is no news of the replace.
+    let (mut src, sent) = announced_replace();
+    src.on_event(&UiEvent::AccountsChanged);
+    answer_accounts(&mut src, &sent, &[new_account(2, false)]);
+    src.on_event(&UiEvent::AccountsChanged);
+    answer_accounts(&mut src, &sent, &[]);
+    src.on_event(&failed_step(AccountId(2)));
+    assert!(src.take_replace_news().is_empty());
+}
+
+#[test]
+fn a_login_announced_ahead_of_the_replaces_is_not_the_replaces() {
+    // An earlier login still waits for its `AccountAdded` when the replace is confirmed (the
+    // core answers in order): the first announcement is that one's, the second the replace's.
+    let (mut src, _sent) = loaded();
+    src.start_login(NetworkKind::Fake).expect("login");
+    src.ask_replace(ME).expect("question");
+    src.confirm_replace(ME).expect("link page");
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(2),
+    });
+    assert!(
+        src.take_replace_news().is_empty(),
+        "the earlier login's account"
+    );
+    src.on_event(&UiEvent::AccountAdded {
+        account: AccountId(3),
+    });
+    assert_eq!(
+        src.take_replace_news(),
+        [ReplaceNews::Answered {
+            old: ME,
+            new: AccountId(3)
+        }]
+    );
 }

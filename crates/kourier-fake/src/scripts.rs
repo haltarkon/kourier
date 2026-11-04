@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, HistoryEdit, HistoryReaction, IncomingMessage};
 use kourier_model::{
-    AccountSettingsPatch, AttachmentKind, Body, ContactPatch, ConvKey, ConversationFeatures,
-    ConversationPatch, DisappearKind, FileAlbum, FileLimits, FilePacking, FormatKind,
-    HistorySource, Member, MemberList, MemberRole, MsgTarget, NetMsgId, Origin, OutgoingState,
-    Patch, Placeholder, QuoteSnapshot, RangeKind, ReceiptKind, RecipientState, ReplyTo, Support,
-    SystemEvent, TargetAuthor, Text, TextRange, TimerRange, UserId, Window,
+    AccountSettingsPatch, AttachmentKind, Body, CleanedPictures, ContactPatch, ConvKey,
+    ConversationFeatures, ConversationPatch, DisappearKind, FileAlbum, FileLimits, FilePacking,
+    FormatKind, GroupInfo, HistorySource, Member, MemberList, MemberRole, MsgTarget, NetMsgId,
+    Origin, OutgoingState, Patch, Placeholder, QuoteSnapshot, RangeKind, ReceiptKind,
+    RecipientState, ReplyTo, Support, SystemEvent, TargetAuthor, Text, TextRange, TimerRange,
+    UserId, Window,
 };
 
 use crate::flavor::Flavor;
@@ -77,7 +78,7 @@ pub fn unknown_target(conv: &ConvKey, local: &str) -> MsgTarget {
     }
 }
 
-fn contact(user: &UserId, profile: Option<&str>, system: Option<&str>) -> BackendEvent {
+pub(crate) fn contact(user: &UserId, profile: Option<&str>, system: Option<&str>) -> BackendEvent {
     let mut p = ContactPatch::new(user.clone());
     if let Some(n) = profile {
         p.profile_name = Patch::Set(n.into());
@@ -88,7 +89,7 @@ fn contact(user: &UserId, profile: Option<&str>, system: Option<&str>) -> Backen
     BackendEvent::ContactUpsert(p)
 }
 
-fn conversation(
+pub(crate) fn conversation(
     key: &ConvKey,
     title: Option<&str>,
     members: Option<Vec<Member>>,
@@ -103,7 +104,7 @@ fn conversation(
     p
 }
 
-fn member(user: &UserId, role: MemberRole) -> Member {
+pub(crate) fn member(user: &UserId, role: MemberRole) -> Member {
     Member {
         user: user.clone(),
         role,
@@ -207,7 +208,12 @@ pub fn signal_features(group: bool) -> ConversationFeatures {
         hard_to_save: ["apk".to_owned(), "exe".to_owned()].into(),
         history: HistorySource::None,
         group_actions: Default::default(),
+        // A group of the fake states its rules: everyone may change everything, nothing ended
+        // (a chat with one person has no rules to state).
+        group_info: group.then(GroupInfo::default),
         cannot_send: None,
+        // Listed: the fake states the roaming fact only when N4 plays an unlisted chat.
+        roaming_listed: None,
     }
 }
 
@@ -418,7 +424,131 @@ pub fn signal_like() -> Result<Script, ScriptError> {
     Ok(s)
 }
 
-fn whatsapp_features() -> ConversationFeatures {
+/// The features the WhatsApp backend states for a chat the phone started (`kourier-whatsapp` `features::of`,
+/// W5a decision D16): the SAME numbers, one source for what the fake playing WhatsApp offers (the rehearsal's
+/// chats); `kourier-whatsapp`'s `features::tests::fake_and_backend_state_the_same_features` compares the two, so
+/// a change of either fails there. Bold, italic, strikethrough and monospace; a mention in groups only; a quote of
+/// any message; edits within 15 minutes and deletes for everyone within 60 hours of own messages; received edits
+/// within 20 minutes and received deletes at any age (the core drops them with no window); one reaction per
+/// person; typing and both receipts; files of five kinds (pictures, videos, GIFs, audio, any file) up to
+/// [`WHATSAPP_FILE_LIMIT`] with a caption on every kind but audio, one file per message (W5b); a group's admin may delete
+/// another member's message for everyone (`admin_delete`, W6a2; a direct chat has none); a direct chat's disappearing timer
+/// of 24 hours, 7 days or 90 days from the send (W6a2; a group states none); no delete for me; the history pushed after
+/// the link. The limits and who enforces each are in that module's docs.
+pub fn whatsapp_features(group: bool) -> ConversationFeatures {
+    let mut formatting: BTreeMap<FormatKind, Support> = [
+        FormatKind::Bold,
+        FormatKind::Italic,
+        FormatKind::Strike,
+        FormatKind::Mono,
+    ]
+    .into_iter()
+    .map(|k| (k, Support::Full))
+    .collect();
+    if group {
+        formatting.insert(FormatKind::Mention, Support::Full);
+    }
+    ConversationFeatures {
+        max_text_bytes: Some(65_536),
+        formatting,
+        reply: Support::Full,
+        edit: Some(Window {
+            max_age_secs: Some(900),
+            max_count: None,
+        }),
+        delete_for_everyone: Some(Window {
+            max_age_secs: Some(216_000),
+            max_count: None,
+        }),
+        delete_for_me: false,
+        edit_receive: Some(Window {
+            max_age_secs: Some(1200),
+            max_count: None,
+        }),
+        delete_receive: Some(Window {
+            max_age_secs: None,
+            max_count: None,
+        }),
+        admin_delete: group,
+        reactions: Support::Full,
+        reactions_per_user: Some(1),
+        // A direct chat's timer is set by a frame of the backend's own (W6a2): 24 hours, 7 days, 90 days from the send,
+        // no custom range; a group's timer is an admin's group change (K8c) and is not stated.
+        disappearing: if group {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(DisappearKind::AfterSend, vec![86_400, 604_800, 7_776_000])])
+        },
+        typing: true,
+        read_receipts: true,
+        delivery_receipts: true,
+        history: HistorySource::PushedOnLink,
+        cannot_send: None,
+        files: [
+            AttachmentKind::Image,
+            AttachmentKind::Video,
+            AttachmentKind::Gif,
+            AttachmentKind::Audio,
+            AttachmentKind::File,
+        ]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                FileLimits {
+                    max_size: WHATSAPP_FILE_LIMIT,
+                    caption: kind != AttachmentKind::Audio,
+                },
+            )
+        })
+        .collect(),
+        ..ConversationFeatures::default()
+    }
+}
+
+/// The largest file the WhatsApp backend sends (its `send::route::FILE_LIMIT`; the backend's features test compares).
+pub const WHATSAPP_FILE_LIMIT: u64 = 2_000_000_000;
+
+/// What the WhatsApp backend states it cleans of the location (its `send::upload::stated_cleaning`, W5b G7b; the
+/// backend's descriptor test compares): every type `kourier_media::clean_still` cleans, up to 64 MiB.
+pub fn whatsapp_cleaned_pictures() -> CleanedPictures {
+    CleanedPictures {
+        max_bytes: Some(64 * 1024 * 1024),
+        ..CleanedPictures::stills(kourier_media::CLEANED_TYPES)
+    }
+}
+
+/// The script with every feature statement made WhatsApp's ([`whatsapp_features`] of a group or a direct chat): the
+/// fixture's account when the fake plays WhatsApp (W5b, lane decision L8: the same chats, row for row, with the
+/// features the backend states, so its composer offers what WhatsApp's does). It states no roaming setting either
+/// (`roaming_writes = None`, like [`whatsapp_like`]: WhatsApp writes none yet, W6): a fixture account that plays
+/// WhatsApp, whatever script it was made from, is an account whose chats are not `Roaming::On`.
+pub fn as_whatsapp(mut script: Script) -> Script {
+    script.roaming_writes = None;
+    let restate = |event: &mut BackendEvent| {
+        if let BackendEvent::ConversationUpsert(patch) = event
+            && patch.features.is_some()
+        {
+            patch.features = Some(whatsapp_features(matches!(patch.key, ConvKey::Group(_))));
+        }
+    };
+    for step in &mut script.steps {
+        if let Step::Deliver(delivery) = step {
+            delivery.events.iter_mut().for_each(restate);
+        }
+    }
+    script.early_events.iter_mut().for_each(restate);
+    script
+        .after_connect
+        .iter_mut()
+        .for_each(|(_, event)| restate(event));
+    script
+}
+
+/// The K-B1 test flavour's features ([`whatsapp_like`]): Signal's, with an edit window of 15 minutes, a receive
+/// window of 20 and the pushed history. Test values of the core's conformance cases, not WhatsApp's statement
+/// ([`whatsapp_features`]).
+fn whatsapp_like_features() -> ConversationFeatures {
     let mut f = signal_features(false);
     f.edit = Some(Window {
         max_age_secs: Some(15 * 60),
@@ -439,7 +569,12 @@ pub const WHATSAPP_GROUP_HISTORY: usize = 120;
 /// index), and the id of its newest version.
 pub const WHATSAPP_EDITED_HISTORY: (usize, &str) = (7, "3EB0G00007E2");
 
-/// WhatsApp-like (per-conversation ids, pushed history): history imports with own messages and
+/// The message of the WhatsApp-like group history (its index and id) that a second batch
+/// reports again under its author's phone-number address; it is one message after the script's
+/// `IdentityMerged`.
+pub const WHATSAPP_GROUP_PN_COPY: (i64, &str) = (1, "3EB0G00001");
+
+/// WhatsApp-like (ids unique per sender in a chat, pushed history): history imports with own messages and
 /// their states, reactions and an unread hint; a history message that was edited before the
 /// import, and a live reaction that names its newest version; the same own message in the PN
 /// and the LID chat; a PN→LID merge with both chats populated; live traffic after it, an edit
@@ -457,7 +592,7 @@ pub fn whatsapp_like() -> Result<Script, ScriptError> {
     let group = ConvKey::Group("wag:120363000000000001".into());
     let d_alice = ConvKey::Direct(alice.clone());
     let d_alice_pn = ConvKey::Direct(alice_pn.clone());
-    let f = whatsapp_features();
+    let f = whatsapp_like_features();
     let ts = |n: i64| T0 + n * 1000;
 
     let mut lid_conv = conversation(&d_alice, None, None, &f);
@@ -527,8 +662,18 @@ pub fn whatsapp_like() -> Result<Script, ScriptError> {
         })
         .collect();
 
+    let group_pn_copy = {
+        let (i, local) = WHATSAPP_GROUP_PN_COPY;
+        let mut m = remote(&group, &alice_pn, local, ts(1000 + i), "group history");
+        m.silent = true;
+        m.read = true;
+        m
+    };
+
     let mut s = Script::new("whatsapp-like", vec![me.clone(), me_pn]);
     s.login = LoginScript::Auto;
+    // WhatsApp writes no roaming setting yet (W6): the fake states none.
+    s.roaming_writes = None;
     let s = s
         .deliver(vec![
             BackendEvent::ConversationUpsert(conversation(
@@ -561,6 +706,16 @@ pub fn whatsapp_like() -> Result<Script, ScriptError> {
             messages: group_history,
             has_more: false,
             progress: Some(1.0),
+        }])
+        // The same group message once more, reported under Alice's PHONE-NUMBER address (an
+        // older chunk): per-sender ids key it by that address, so it is a second row until the
+        // merge below joins them. Two history copies that differ only by author, as `h2` and
+        // `h2_lid` are in the direct chats, so the any-order tests agree on one dump.
+        .deliver(vec![BackendEvent::HistoryBatch {
+            conv: group.clone(),
+            messages: vec![group_pn_copy],
+            has_more: false,
+            progress: None,
         }])
         // A reaction to the edited history message that names its newest version: it finds
         // the row through the version's key, also when it comes before the import.
@@ -658,6 +813,8 @@ pub fn threema_like() -> Result<Script, ScriptError> {
 
     let mut s = Script::new("threema-like", vec![me.clone()]);
     s.reject_changes = true;
+    // Threema writes no roaming setting yet: the fake states none.
+    s.roaming_writes = None;
     let s = s
         .deliver(vec![
             BackendEvent::ConversationUpsert(conversation(
@@ -887,12 +1044,14 @@ pub fn delete_for_me() -> Result<Script, ScriptError> {
                 target(Some(&dana_chat), Some(&dana), &ts(5).to_string()),
             ],
             remove: false,
+            before_ms: None,
             at: ts(40),
         }])
         .deliver_ordered(vec![BackendEvent::ConversationCleared {
             conv: eli_chat.clone(),
             up_to: vec![target(Some(&eli_chat), None, &ts(21).to_string())],
             remove: true,
+            before_ms: None,
             at: ts(41),
         }])
         .deliver_ordered(vec![
@@ -919,11 +1078,90 @@ pub fn delete_for_me() -> Result<Script, ScriptError> {
     Ok(s)
 }
 
-/// Every per-network script with its flavor.
+/// Every per-network script with its flavor. (Not `Flavor::TelegramLike`: its promises are the server's ids and
+/// positions, which these scripts state none of; the Telegram-like section of `tests/conformance.rs` plays them.)
 pub fn all() -> Result<Vec<(Flavor, Script)>, ScriptError> {
     Ok(vec![
         (Flavor::SignalLike, signal_like()?),
         (Flavor::WhatsAppLike, whatsapp_like()?),
         (Flavor::ThreemaLike, threema_like()?),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W5b (L8): the fixture's account played as WhatsApp states WhatsApp's features in every chat that states any,
+    /// a group's as a group's, and touches no other event. Mutant: the group's features stated as a direct chat's.
+    #[test]
+    fn the_fixture_as_whatsapp_states_whatsapps_features_in_every_chat() {
+        let spec = crate::fixture::FixtureSpec {
+            contacts: 3,
+            groups: 2,
+            messages_per_conversation: 2,
+            ..crate::fixture::FixtureSpec::default()
+        };
+        let plain = crate::fixture::fixture(&spec).expect("fixture");
+        let played = as_whatsapp(crate::fixture::fixture(&spec).expect("fixture"));
+        let events = |script: &Script| -> Vec<BackendEvent> {
+            script
+                .steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Deliver(delivery) => Some(delivery.events.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        let (plain, played) = (events(&plain), events(&played));
+        assert_eq!(plain.len(), played.len());
+        let (mut groups, mut directs) = (0, 0);
+        for (before, after) in plain.iter().zip(&played) {
+            match (before, after) {
+                (BackendEvent::ConversationUpsert(b), BackendEvent::ConversationUpsert(a))
+                    if b.features.is_some() =>
+                {
+                    let group = matches!(a.key, ConvKey::Group(_));
+                    if group {
+                        groups += 1;
+                    } else {
+                        directs += 1;
+                    }
+                    assert_eq!(a.features, Some(whatsapp_features(group)));
+                    let mut rest = a.clone();
+                    rest.features.clone_from(&b.features);
+                    assert_eq!(&rest, b, "nothing else of the chat changes");
+                }
+                _ => assert_eq!(before, after),
+            }
+        }
+        assert!(
+            groups >= 2 && directs >= 3,
+            "{groups} groups, {directs} direct chats"
+        );
+    }
+
+    /// A10a fix round (F2): a script that is made WhatsApp's states no roaming setting, whatever the
+    /// script said before (the plain fixture's default is `Some(true)`, and so is any `Script::new`): the
+    /// 3-account fixture's WhatsApp account is made from such a script. Everything else of the script is
+    /// as it was. Mutant: `as_whatsapp` keeps the flag.
+    #[test]
+    fn a_script_made_whatsapps_states_no_roaming_setting() {
+        let spec = crate::fixture::FixtureSpec::default();
+        let plain = crate::fixture::fixture(&spec).expect("fixture");
+        assert_eq!(
+            plain.roaming_writes,
+            Some(true),
+            "the default the fix is about"
+        );
+        for before in [Some(true), Some(false), None] {
+            let played = as_whatsapp(plain.clone().with_roaming_writes(before));
+            assert_eq!(played.roaming_writes, None, "was {before:?}");
+        }
+        let played = as_whatsapp(plain.clone());
+        assert_eq!(played.name, plain.name);
+        assert_eq!(played.steps.len(), plain.steps.len(), "no step is added");
+    }
 }

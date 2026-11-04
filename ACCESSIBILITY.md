@@ -32,6 +32,21 @@ Keyboard use, without a mouse:
   of waiting files, Delete removes the file.
 - In the picture viewer: Left and Right step through the pictures. In the emoji grid: Enter or
   Space picks.
+- In the side panel: the panel is one Tab stop (Shift+Tab from the search field reaches it in a wide
+  window; in a narrow window Shift+Tab from the search field reaches the menu button, and Space on it
+  opens the panel with the keyboard on that stop, Escape closes it): the entry the list follows, else "All Chats". Up and Down move between "All Chats", the
+  accounts, "Add Account" and "Settings", and the focused entry shows a focus frame. Space, Enter or
+  Return on an account shows only that account's chats (on "All Chats": every account's); Ctrl+Space
+  (or Shift+click, Ctrl+click) shows or hides it next to the others, and a check box at the end of its
+  entry and the entry's menu (the Menu key or Shift+F10: "Show in List") do the same. With one
+  account, or with the several-accounts setting off, these are the plain click. The entry's
+  description says "Shown in the list" or "Hidden from the list", and the check box is named "Show
+  <account> in the list". The last shown account cannot be hidden: its box is greyed out, says why
+  when the pointer is on it, and a click on it or a notice says "At least one account stays in the
+  list". A chat row whose account name shows starts its description with "Account <name>". In a
+  narrow window the menu button carries a count of the unread messages in hidden accounts; Kirigami's
+  button has no name of its own, so a screen reader finds the count as a text beside it ("Open the
+  side panel · N unread messages in hidden accounts").
 
 The interface follows the system's color scheme and font through Qt and Kirigami, and has a narrow
 layout for small windows.
@@ -42,6 +57,10 @@ layout for small windows.
   and the amount of speech are unchecked.
 - **No announcement of new messages.** A message that arrives is not announced to a screen reader.
 - **Focus order and focus visibility have not been audited** across all dialogs.
+- **Ctrl+Space and input methods.** fcitx5 and IBus take Ctrl+Space by default (to switch the input
+  language), so with an input method running the key never reaches Kourier. The check box, the menu
+  and Shift+click or Ctrl+click on an account in the side panel do the same, and Settings > General has
+  a switch that turns the several-accounts choice off.
 - **No shortcuts yet** for switching chats, searching, or marking a chat read, and they cannot be
   configured.
 - **Contrast.** A review of the theme on 2026-10-06 found text that is below the WCAG AA ratio of

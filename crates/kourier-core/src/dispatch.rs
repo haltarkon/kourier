@@ -54,18 +54,21 @@
 //! from suspend the armed sleep is stale ([`Dispatcher::rearm`]); when the clock was set back,
 //! the stored waits are cleared ([`outbox::clear_waits`]) so no row waits for the old time.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kourier_backend_api::{BackendNotice, Command, Sleep, TransmitOutcome};
+use kourier_backend_api::{AbortAnswer, BackendNotice, Command, Sleep, TransmitOutcome};
 use kourier_db::Priority;
-use kourier_model::{AccountId, ConnState, ConversationId, MsgIdScope, UserId};
+use kourier_model::{
+    AccountHold, AccountId, AttachmentId, ConnState, ConversationId, MessageId, UserId,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::Result;
 use crate::ingest::Changes;
 use crate::outbox::{self, Attempt, Pause, Skip, StoredChallenge, Wait};
+use crate::rules::NetRules;
 use crate::runtime::Shared;
 use crate::store::lane;
 
@@ -87,6 +90,10 @@ pub(crate) enum Signal {
     },
     /// The network accepted the user's answer to the challenge: lift the account's pause.
     ChallengeSolved,
+    /// The user pressed the X of `message` ([`outbox::cancel`] wrote the mark): ask the backend
+    /// to stop it. Handled by the supervisor ([`Dispatcher::abort`], an async handshake that
+    /// must not interleave with the recording of an outcome), not by [`Dispatcher::signal`].
+    Abort(MessageId),
 }
 
 /// One finished attempt, posted by the task that awaited the backend's reply.
@@ -117,6 +124,9 @@ pub(crate) struct Kicked {
     /// Edits, deletes and reactions that ran out of budget while the account waited for a
     /// challenge (rolled back), reported as `ActionFailed`.
     pub failed: Vec<outbox::FailedChange>,
+    /// The send hold ran out by its own time at this look ([`Dispatcher::set_hold`] states
+    /// the other ways it ends): the UI is told there is none now.
+    pub hold_lifted: bool,
 }
 
 /// What the supervisor does after an outcome.
@@ -131,18 +141,60 @@ pub(crate) struct Effect {
     /// An edit, delete or reaction the network refused for good (rolled back), reported as
     /// `ActionFailed`.
     pub failed: Option<outbox::FailedChange>,
+    /// The user's X came too late (the backend had answered `TooLate`) and this attempt went
+    /// out: the message was sent. The UI tells the user ([`crate::facade::UiEvent::CancelTooLate`]).
+    pub too_late: Option<(MessageId, ConversationId)>,
+}
+
+/// What [`Dispatcher::abort`] found.
+#[derive(Debug)]
+pub(crate) struct Aborted {
+    /// The message and its conversation, when its attempt was in flight.
+    pub target: Option<(MessageId, ConversationId)>,
+    /// The backend said `Stopping`: nothing of the message goes out any more.
+    pub stopping: bool,
+}
+
+/// Asks the backend to stop the attempt of `message` and waits for its answer. The caller keeps
+/// reading the account's events while it waits ([`crate::supervisor`]): a backend whose command
+/// loop is inside an emit on a full event queue (the queue holds [`kourier_backend_api::EVENT_QUEUE`] envelopes) can only answer
+/// after the core read, and an answer that waits for that would come too late. Nothing here
+/// borrows the dispatcher, so the future can be polled beside the event channel. A command the
+/// backend does not take, a dropped reply (the contract's rule for a backend that cannot abort,
+/// or whose actor went) and a reply that does not come in time ([`SEND_TIMEOUT`] each way) are
+/// `TooLate`.
+pub(crate) async fn ask_to_stop(
+    commands: mpsc::Sender<Command>,
+    message: MessageId,
+) -> AbortAnswer {
+    let (reply, rx) = oneshot::channel();
+    let cmd = Command::AbortTransmit {
+        local: message,
+        reply,
+    };
+    match tokio::time::timeout(SEND_TIMEOUT, commands.send(cmd)).await {
+        Ok(Ok(())) => match tokio::time::timeout(SEND_TIMEOUT, rx).await {
+            Ok(Ok(answer)) => answer,
+            _ => AbortAnswer::TooLate,
+        },
+        _ => AbortAnswer::TooLate,
+    }
 }
 
 /// The scheduler state of one account.
 pub(crate) struct Dispatcher {
     account: AccountId,
-    scope: MsgIdScope,
+    /// The network's rules (id scope, edit target, outbox numbers), from its descriptor.
+    rules: NetRules,
     /// Bumped at every actor start: replies of an earlier actor are ignored.
     generation: u64,
     /// The attempts in flight by outbox row. Row ids are never reused, so the answer to an
     /// attempt whose row went meanwhile (an echo, an expired or removed message) finds no
     /// newer row under its id.
     in_flight: HashMap<i64, Attempt>,
+    /// The attempts (outbox rows) whose stop the backend answered `TooLate`: if they end sent,
+    /// the user is told his X came after the message went out.
+    too_late: HashSet<i64>,
     done_tx: mpsc::UnboundedSender<Done>,
     done_rx: mpsc::UnboundedReceiver<Done>,
     /// The armed backoff timer: deadline (ms) and the clock's sleep. In a `Mutex` only so the
@@ -195,6 +247,22 @@ pub(crate) struct Dispatcher {
     linked: bool,
     /// The clock at the last look at the outbox, to notice that it was set back.
     last_now: Option<i64>,
+    /// The account's send hold ([`AccountHold`]): while it stands nothing the user makes
+    /// (messages, reactions, edits, deletes, a timer change) leaves the outbox; the connection
+    /// is up and everything else goes on. It outlives an actor and a restart of the core (it is
+    /// kept in `core.db`, [`outbox::store_hold`], and taken up at the first start of a run,
+    /// before anything is sent: a backend states it again at its connect, but nothing orders
+    /// that before its first `Syncing`), and ends by the backend's `None`, by its own time, or
+    /// with the account. It is no wait that counts against a row's retry budget: a row held
+    /// through a lock of days is sent when the lock ends, and the time the hold stood is given
+    /// back to the waiting rows' deadlines at the lift ([`Self::sync_hold`]).
+    hold: Option<AccountHold>,
+    /// When the hold began (ms on the core's clock): the time it stands does not count against
+    /// the rows' retry budgets, so [`Self::sync_hold`] gives it back at the lift. Kept with the
+    /// stored hold, so a restart during the hold does not forget it.
+    hold_since: Option<i64>,
+    /// The hold as `core.db` has it ([`Self::sync_hold`] writes what differs).
+    stored_hold: Option<outbox::StoredHold>,
 }
 
 /// A clock that reads this much less than at the last look was set back (smaller steps are
@@ -202,13 +270,14 @@ pub(crate) struct Dispatcher {
 const CLOCK_WENT_BACK: Duration = Duration::from_secs(10);
 
 impl Dispatcher {
-    pub(crate) fn new(account: AccountId, scope: MsgIdScope) -> Self {
+    pub(crate) fn new(account: AccountId, rules: NetRules) -> Self {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
             account,
-            scope,
+            rules,
             generation: 0,
             in_flight: HashMap::new(),
+            too_late: HashSet::new(),
             done_tx,
             done_rx,
             timer: None,
@@ -230,7 +299,83 @@ impl Dispatcher {
             started: false,
             linked: false,
             last_now: None,
+            hold: None,
+            hold_since: None,
+            stored_hold: None,
         }
+    }
+
+    /// The backend states the account's send hold (`BackendEvent::AccountHold`): `Some` sets
+    /// or changes it, `None` lifts it. `true` when it changed; the outbox then needs a look
+    /// (a lift frees what waited). `now` (ms) is when a new hold begins.
+    pub(crate) fn set_hold(&mut self, hold: Option<AccountHold>, now: i64) -> bool {
+        if self.hold == hold {
+            return false;
+        }
+        self.hold = hold;
+        // A hold stated again right behind a lift that [`Self::sync_hold`] has not written yet
+        // is the same hold: its time goes on from where it began.
+        if hold.is_some() && self.hold_since.is_none() {
+            self.hold_since = Some(now);
+        }
+        true
+    }
+
+    /// The hold that stands (as restored from `core.db` at the first start, or as stated).
+    pub(crate) fn hold(&self) -> Option<AccountHold> {
+        self.hold
+    }
+
+    /// Brings what `core.db` keeps of the hold in line with the state here: stored (with when
+    /// it began) when the backend states one, forgotten when it lifts it or its time has
+    /// passed, and then the time it stood is given back to the rows that waited through it
+    /// ([`outbox::give_back_held_time`], in the same transaction as the forgetting, so a kill
+    /// between the two loses neither). A write that fails is tried again at the next look; a
+    /// hold that should be gone is taken up at the next start only while its time has not
+    /// passed.
+    pub(crate) async fn sync_hold(&mut self, sh: &Arc<Shared>) {
+        let want = self.hold.map(|hold| outbox::StoredHold {
+            hold,
+            since_ms: self.hold_since,
+        });
+        if want == self.stored_hold {
+            return;
+        }
+        let (account, now, policy) = (self.account, sh.now(), self.rules.outbox);
+        let res = sh
+            .store
+            .write(Priority::High, lane(account), move |c| {
+                let tx = c.transaction()?;
+                let old = outbox::stored_hold(&tx, account)?;
+                outbox::store_hold(&tx, account, want.as_ref())?;
+                if want.is_none()
+                    && let Some(old) = old
+                {
+                    outbox::give_back_held_time(&tx, account, &old, now, policy)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        match res {
+            Ok(()) => {
+                self.stored_hold = want;
+                if want.is_none() {
+                    self.hold_since = None;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(account = account.0, error = %e, "storing the send hold failed")
+            }
+        }
+    }
+
+    /// Whether the hold keeps the outbox shut at `now` (ms).
+    fn held(&self, now: i64) -> bool {
+        self.hold.is_some_and(|h| {
+            h.until_ms
+                .is_none_or(|until| u64::try_from(now.max(0)).unwrap_or(0) < until)
+        })
     }
 
     /// Forgets the challenge (answered, timed out, or the actor it came from is gone); `true`
@@ -359,34 +504,75 @@ impl Dispatcher {
     /// The first actor of a run takes up the challenge the account waited on when the last
     /// run ended (module docs). A later actor of the same run, and a login, start without
     /// one: the stored challenge is forgotten.
-    pub(crate) async fn start(&mut self, sh: &Arc<Shared>, linked: bool) {
+    /// Returns what the reset changed beyond queueing (messages whose stop the backend had
+    /// accepted are taken back, [`outbox::reset_transmitting`]): the supervisor publishes it.
+    pub(crate) async fn start(&mut self, sh: &Arc<Shared>, linked: bool) -> Changes {
         self.linked = linked;
         self.generation = self.generation.wrapping_add(1);
         self.in_flight.clear();
+        self.too_late.clear();
         self.timer = None;
         self.online = false;
         self.up = false;
         self.backend_conn = ConnState::default();
         self.clear_challenge();
-        let account = self.account;
+        let (account, policy, scope) = (self.account, self.rules.outbox, self.rules.scope);
         let first = !std::mem::replace(&mut self.started, true);
         let now = sh.now();
         let reset = sh
             .store
             .write(Priority::High, lane(account), move |c| {
-                let rows = outbox::reset_transmitting(c, account)?;
+                let (rows, taken_back) = outbox::reset_transmitting(c, account, scope, now)?;
                 let stored = outbox::stored_challenge(c, account)?;
-                let kept = stored.filter(|s| first && linked && s.is_fresh(now));
+                let kept = stored.filter(|s| first && linked && s.is_fresh(now, policy));
                 if kept.is_none() {
                     outbox::store_challenge(c, account, None)?;
                 }
-                Ok((rows, kept))
+                // The send hold of the last run stands until the backend states otherwise
+                // or its time passes (a later actor of this run keeps the one in memory).
+                let hold = if first {
+                    let stored = outbox::stored_hold(c, account)?;
+                    let hold = stored.filter(|s| {
+                        linked
+                            && s.hold
+                                .until_ms
+                                .is_none_or(|u| u64::try_from(now.max(0)).unwrap_or(0) < u)
+                    });
+                    if hold.is_none() {
+                        // A hold that ended while Kourier was closed (its date passed) or that
+                        // no account can use: its time is given back like at a lift.
+                        let tx = c.transaction()?;
+                        outbox::store_hold(&tx, account, None)?;
+                        if let Some(old) = stored {
+                            outbox::give_back_held_time(&tx, account, &old, now, policy)?;
+                        }
+                        tx.commit()?;
+                    }
+                    Some(hold)
+                } else {
+                    None
+                };
+                Ok((rows, taken_back, kept, hold))
             })
             .await;
+        let mut changes = Changes::default();
         match reset {
-            Ok((rows, kept)) => {
+            Ok((rows, taken_back, kept, hold)) => {
+                changes = taken_back;
                 if rows > 0 {
                     tracing::info!(account = account.0, rows, "resuming interrupted sends");
+                }
+                if let Some(hold) = hold {
+                    if hold.is_some() {
+                        tracing::info!(
+                            account = account.0,
+                            "the account still has a send hold from the last run"
+                        );
+                    }
+                    self.hold = hold.map(|s| s.hold);
+                    // A row an older build wrote has no start: this run's start will do.
+                    self.hold_since = hold.map(|s| s.since_ms.unwrap_or(now));
+                    self.stored_hold = hold;
                 }
                 self.stored = None;
                 if let Some(stored) = kept {
@@ -397,6 +583,7 @@ impl Dispatcher {
                 tracing::warn!(account = account.0, error = %e, "resetting the outbox failed")
             }
         }
+        changes
     }
 
     /// Takes up a challenge that was stored when the last run ended.
@@ -509,15 +696,44 @@ impl Dispatcher {
                 }
             }
             Signal::ChallengeSolved => self.clear_challenge(),
+            // The supervisor runs the handshake ([`Self::abort`]) before it comes here.
+            Signal::Abort(_) => false,
         }
     }
 
-    /// `ConfirmIdentity` for `user`: the conversations paused on that user continue. Returns the
-    /// heads that were paused (their messages show `Queued` again).
-    pub(crate) fn confirmed(&mut self, user: &UserId) -> Vec<i64> {
+    /// The paused conversations whose pause names another user than `user`: the candidates
+    /// for a group whose member `user` was confirmed (the supervisor reads which are groups
+    /// with that member, critic F19).
+    pub(crate) fn paused_on_others(&self, user: &UserId) -> Vec<ConversationId> {
+        self.paused
+            .iter()
+            .filter(|(_, (_, u, _))| u != user)
+            .map(|(conv, _)| *conv)
+            .collect()
+    }
+
+    /// The identity pauses now: each paused conversation, its head's outbox row and whose
+    /// safety number it waits for (shared for the UI, `Supervisor::share_pauses`).
+    pub(crate) fn pauses(&self) -> Vec<(ConversationId, i64, UserId)> {
+        self.paused
+            .iter()
+            .map(|(conv, (outbox, user, _))| (*conv, *outbox, user.clone()))
+            .collect()
+    }
+
+    /// `user`'s identity was confirmed: the conversations paused on that user continue, and so
+    /// do the paused `groups` (the supervisor's read: groups with `user` as a member, M4): their
+    /// head retries, and the backend decides what holds (the lead's R1, TOFU). A member in
+    /// state 2 (Signal: verified, then the key changed) is refused again and the head pauses
+    /// again on them: that is the guarantee. A member whose key changed but who was never
+    /// verified is trusted at the retry (the backend archived their sessions at the first
+    /// refusal and builds a new one with the stored key), as Desktop's "send anyway" dialog is
+    /// a stop and not a guarantee: another member's confirm can release a group send to them.
+    /// Returns the heads that were paused (their messages show `Queued` again).
+    pub(crate) fn confirmed_in(&mut self, user: &UserId, groups: &[ConversationId]) -> Vec<i64> {
         let (resumed, kept): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.paused)
             .into_iter()
-            .partition(|(_, (_, u, _))| u == user);
+            .partition(|(conv, (_, u, _))| u == user || groups.contains(conv));
         self.paused = kept;
         resumed.into_values().map(|(outbox, _, _)| outbox).collect()
     }
@@ -614,7 +830,7 @@ impl Dispatcher {
         sh: &Arc<Shared>,
         waits: Vec<Wait>,
     ) -> Result<(Kicked, Option<i64>)> {
-        let (account, scope) = (self.account, self.scope);
+        let (account, scope) = (self.account, self.rules.scope);
         let now = i64::try_from(sh.clock.now_ms()).unwrap_or(i64::MAX);
         let gave = sh
             .store
@@ -632,6 +848,7 @@ impl Dispatcher {
             Kicked {
                 changes: gave.changes,
                 failed: gave.failed,
+                hold_lifted: false,
             },
             gave.next_deadline,
         ))
@@ -647,6 +864,7 @@ impl Dispatcher {
         commands: &mpsc::Sender<kourier_backend_api::Command>,
     ) -> Result<Kicked> {
         self.sync_challenge(sh).await;
+        self.sync_hold(sh).await;
         // After a resume from suspend the end of a challenge is armed anew for what is left.
         if let Some((at, sleep @ None)) = &mut self.challenge_end {
             let deadline = u64::try_from((*at).max(0)).unwrap_or(0);
@@ -663,6 +881,29 @@ impl Dispatcher {
             return Ok(Kicked::default());
         }
         let now = i64::try_from(sh.clock.now_ms()).unwrap_or(i64::MAX);
+        // A hold that ran out by its time is over: the UI is told, and the rows go on.
+        let mut hold_lifted = false;
+        if self.hold.is_some() && !self.held(now) {
+            self.hold = None;
+            hold_lifted = true;
+            self.sync_hold(sh).await;
+        }
+        // The account's send hold: nothing leaves the outbox, and the timer wakes the look at
+        // the hold's end. The hold is no wait that counts against a row's retry budget (K-A
+        // fix C4): a row held through a lock of a day or more is sent when the lock ends, and
+        // never fails as a "Challenge" the account did not have. The waits for the user that
+        // stand beside it (a safety number) still give up their rows.
+        if let Some(hold) = self.hold {
+            let waits = self.waits();
+            let (kicked, next) = if waits.is_empty() {
+                (Kicked::default(), None)
+            } else {
+                self.give_up_overdue(sh, waits).await?
+            };
+            let end = hold.until_ms.map(|u| i64::try_from(u).unwrap_or(i64::MAX));
+            self.arm(sh, [next, end].into_iter().flatten().min());
+            return Ok(kicked);
+        }
         let back = i64::try_from(CLOCK_WENT_BACK.as_millis()).unwrap_or(i64::MAX);
         if self
             .last_now
@@ -694,11 +935,11 @@ impl Dispatcher {
             in_flight: self.in_flight.values().map(|a| a.conv).collect(),
             paused: self.paused.iter().map(|(c, (o, _, _))| (*c, *o)).collect(),
         };
-        let (account, scope) = (self.account, self.scope);
+        let (account, rules) = (self.account, self.rules);
         let due = sh
             .store
             .write(Priority::High, lane(account), move |c| {
-                outbox::take_due(c, account, scope, now, &skip, free)
+                outbox::take_due(c, account, rules, now, &skip, free)
             })
             .await?;
         // A pause ends when its head is gone (cancelled, given up, or echoed from another
@@ -717,7 +958,103 @@ impl Dispatcher {
             self.transmit(commands, attempt).await;
         }
         kicked.changes.absorb(due.changes);
+        kicked.hold_lifted = hold_lifted;
         Ok(kicked)
+    }
+
+    /// The attachment row that attachment `index` of `message`'s attempt in flight names (the
+    /// backend's `AttachmentProgress.index`, a position in the attempt's request): `None` when
+    /// no attempt of that message is in flight, or the position names no file of it. An
+    /// event for anything else is dropped, never guessed.
+    pub(crate) fn attachment_of(&self, message: MessageId, index: u16) -> Option<AttachmentId> {
+        self.in_flight
+            .values()
+            .find(|a| a.message == message)?
+            .attachments
+            .get(usize::from(index))
+            .copied()
+            .flatten()
+    }
+
+    /// The conversation of `message`'s attempt in flight (`None`: no attempt of it is in
+    /// flight, so a progress report for it is stale and is dropped).
+    pub(crate) fn in_flight_conv(&self, message: MessageId) -> Option<ConversationId> {
+        self.in_flight
+            .values()
+            .find(|a| a.message == message)
+            .map(|a| a.conv)
+    }
+
+    /// The message of the attempt in flight that `done` answers (`None`: it belongs to an
+    /// earlier actor or was recorded already).
+    pub(crate) fn message_of(&self, done: &Done) -> Option<MessageId> {
+        if done.generation != self.generation {
+            return None;
+        }
+        self.in_flight.get(&done.outbox).map(|a| a.message)
+    }
+
+    /// The attempt of `message` in flight (its outbox row and conversation), when it has one: the
+    /// X on a message whose attempt ended meanwhile has nothing to stop (the outcome cleared the
+    /// mark).
+    pub(crate) fn abort_target(&self, message: MessageId) -> Option<(i64, ConversationId)> {
+        self.in_flight
+            .iter()
+            .find(|(_, a)| a.message == message)
+            .map(|(row, a)| (*row, a.conv))
+    }
+
+    /// The backend answered the stop of `message` (asked with [`ask_to_stop`]; the user's X has
+    /// written the mark with [`outbox::cancel`]): records the answer, DURABLY, before anything
+    /// else of this account is recorded (the supervisor takes no attempt's outcome while it
+    /// asks, so the outcome of the same attempt is read after the mark is written, never
+    /// before it):
+    /// - `Stopping`: nothing of the message goes out any more; the mark says so
+    ///   ([`outbox::CANCEL_STOPPING`]) and the attempt's `Failed` outcome (or no reply, or a
+    ///   restart) takes the message back,
+    /// - `TooLate`, a dropped reply or a reply that does not come in time ([`SEND_TIMEOUT`]; a
+    ///   backend that cannot abort drops it): the message may be out, the mark is cleared and
+    ///   the attempt is remembered, so that its `Sent` outcome tells the user his X came late.
+    pub(crate) async fn abort_answered(
+        &mut self,
+        sh: &Arc<Shared>,
+        message: MessageId,
+        target: (i64, ConversationId),
+        answer: AbortAnswer,
+    ) -> Aborted {
+        let (outbox_row, conv) = target;
+        let stopping = answer == AbortAnswer::Stopping;
+        let account = self.account;
+        let written = sh
+            .store
+            .write(Priority::High, lane(account), move |c| {
+                outbox::answer_cancel(c, message, stopping)
+            })
+            .await;
+        match written {
+            Ok(true) => {}
+            // No row was asked any more: the outcome got in first (cleared the mark).
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(account = account.0, msg = message.0, error = %e,
+                    "recording the answer to a stop failed");
+                // The mark stays `asked`: the outcome of the attempt (a stopped one ends
+                // `Failed`, which then shows as failed, never as sent) decides.
+            }
+        }
+        if !stopping {
+            self.too_late.insert(outbox_row);
+        }
+        tracing::info!(
+            account = account.0,
+            msg = message.0,
+            answer = if stopping { "Stopping" } else { "TooLate" },
+            "stop asked"
+        );
+        Aborted {
+            target: Some((message, conv)),
+            stopping,
+        }
     }
 
     /// Sends one attempt; a task awaits the reply and posts it back.
@@ -772,42 +1109,68 @@ impl Dispatcher {
         let Some(attempt) = self.in_flight.remove(&done.outbox) else {
             return Ok(Effect::default());
         };
-        let (account, scope) = (self.account, self.scope);
+        // The user's X came too late for this attempt: if it went out, he is told.
+        let was_too_late = self.too_late.remove(&done.outbox);
+        let went = matches!(
+            &done.outcome,
+            Some(
+                TransmitOutcome::Sent { .. }
+                    | TransmitOutcome::SentAs { .. }
+                    | TransmitOutcome::Partial { .. }
+            )
+        );
+        let (account, rules) = (self.account, self.rules);
         let now = i64::try_from(sh.clock.now_ms()).unwrap_or(i64::MAX);
         let name = match &done.outcome {
             Some(TransmitOutcome::Sent { .. }) => "Sent",
+            Some(TransmitOutcome::SentAs { .. }) => "SentAs",
             Some(TransmitOutcome::Partial { .. }) => "Partial",
             Some(TransmitOutcome::Failed(e)) => e.kind.name(),
             None => "no reply",
         };
-        let (message, number, took_ms) = (
+        let (message, number, took_ms, conv) = (
             attempt.message.0,
             attempt.number,
             now.saturating_sub(attempt.started_at),
+            attempt.conv,
         );
         let outcome = done.outcome;
         let recorded = match sh
             .store
             .write(Priority::High, lane(account), move |c| {
-                outbox::record_outcome(c, account, scope, now, &attempt, outcome)
+                outbox::record_outcome(c, account, rules, now, &attempt, outcome)
             })
             .await
         {
             Ok(r) => r,
             Err(e) => {
                 // Not left `Transmitting` (that would hold the conversation's FIFO until the next
-                // actor start): queued again after a backoff with the same id.
+                // actor start): queued again after a backoff with the same id. A message whose
+                // stop the backend had accepted is taken back in the same write instead
+                // ([`outbox::release`]): the stop mark never outlives its attempt.
                 let outbox_row = done.outbox;
                 let released = sh
                     .store
                     .write(Priority::High, lane(account), move |c| {
-                        outbox::release(c, outbox_row, now)
+                        outbox::release(c, account, rules, outbox_row, now)
                     })
                     .await;
-                if let Err(e2) = released {
-                    tracing::warn!(account = account.0, error = %e2, "requeueing an unrecorded attempt failed");
-                }
-                return Err(e);
+                return match released {
+                    // The take-back's changes are published like the start's (the error is
+                    // logged here: the supervisor sees an effect, not the failure).
+                    Ok(r) => {
+                        tracing::warn!(account = account.0, error = %e, requeued = r.released,
+                            "recording a transmit outcome failed");
+                        Ok(Effect {
+                            changes: r.changes,
+                            ..Effect::default()
+                        })
+                    }
+                    Err(e2) => {
+                        tracing::warn!(account = account.0, error = %e2, "requeueing an unrecorded attempt failed");
+                        Err(e)
+                    }
+                };
             }
         };
         // At the end, with the next try the outcome chose (diagnosis §2 item 2).
@@ -824,6 +1187,7 @@ impl Dispatcher {
         let mut effect = Effect {
             changes: recorded.changes,
             failed: recorded.failed,
+            too_late: (was_too_late && went).then_some((MessageId(message), conv)),
             ..Effect::default()
         };
         match recorded.pause {

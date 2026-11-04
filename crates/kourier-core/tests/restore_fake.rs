@@ -3,7 +3,7 @@
 //! ends the wait: the file downloads, or the note says why not. An automatic download's 404
 //! asks nothing; an account without the capability is refused.
 
-mod support;
+use crate::support;
 
 use kourier_backend_api::BackendEvent;
 use kourier_core::facade::UiCommand;

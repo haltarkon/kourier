@@ -4,6 +4,9 @@
 pub mod accounts;
 pub mod attachments;
 pub mod conversations;
+pub mod media;
+pub mod members;
+pub mod share;
 pub mod timeline;
 
 use std::pin::Pin;

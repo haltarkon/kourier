@@ -30,6 +30,17 @@
 //! scale 2); the test logs the requests (`log_image_requests`) and checks the last one of each
 //! picture against the grab's size.
 //!
+//! Since "pictures shown whole" (`target/next/nocrop-brief.md`) the test grabs the block's
+//! `picture` child, not the block: a thin picture sits whole in a box that is larger than it
+//! (the bubble's own color around it), and the probe's reference is cut to the grab's size "as
+//! `PreserveAspectCrop` does", which is a no-op only because the grab has the picture's own
+//! shape within a pixel. The same script judges the geometry of every picture in logical
+//! pixels (`judge`: `Image.PreserveAspectFit`, the rect within one pixel of the picture's
+//! shape, the box within the limits, the picture centred, and the pinned sizes of the phone
+//! screenshot, the strip, the panorama, the tiny and the narrow one) and `picture_ui` checks
+//! that the provider is asked for the rect's physical size and that it is answered with it
+//! (the cover within a pixel of the request is the request: `imageprovider.cpp`).
+//!
 //! `harness = false`: the parent runs one child per display scale (a process has one scale),
 //! each a real core over the fake network, the real `ImageBlock` and the real provider on the
 //! offscreen platform. `KOURIER_PICTURE_UI_SHOTS=<dir>` keeps the grabs for a look,
@@ -49,6 +60,7 @@ use kourier_app::{App, AppHandle, FixtureOptions, Launch, StartOptions};
 use kourier_model::{AttachmentId, Body, ConversationId};
 use kourier_qt::media::{Codec, Image, resolve};
 use kourier_qt::{UiContext, UiOptions};
+use kourier_viewmodel::media_layout::{TOTAL_HARD, album_rows, tile_aspect};
 
 /// The display scales that are judged: 1 (where only the tall pictures need the file) and 2
 /// (the picture-quality.md table's worst column).
@@ -82,10 +94,31 @@ const PICTURES: [(&str, u32, u32); 3] = [
     ("landscape", 2000, 1500),
 ];
 
+/// Shapes the box and the picture rect are judged on (a picture is shown whole, never cropped:
+/// `ImageBlock.qml`), not the sharpness: a thin strip, a panorama, a tiny picture and a tiny
+/// tall one (40 x 400, which is raised to 43 x 432, not to the minimum width). What the
+/// provider is asked for is judged for them as for the others.
+const SHAPES: [(&str, u32, u32); 4] = [
+    ("strip", 300, 6000),
+    ("panorama", 6000, 300),
+    ("tiny", 40, 40),
+    ("narrow", 40, 400),
+];
+
+/// Every picture of the test with whether its sharpness is judged: the three of `PICTURES`.
+fn all_pictures() -> Vec<(&'static str, u32, u32, bool)> {
+    PICTURES
+        .iter()
+        .map(|p| (p.0, p.1, p.2, true))
+        .chain(SHAPES.iter().map(|p| (p.0, p.1, p.2, false)))
+        .collect()
+}
+
 const SCRIPT: &str = r##"
 import QtQuick
 import QtQuick.Window
 import QtQml
+import org.kde.kirigami as Kirigami
 import app.kourier
 
 // The window is the root (a Window inside an Item that has no window never shows, and a window
@@ -106,10 +139,198 @@ Window {
     property int settle: 0
     readonly property var wanted: [IDS]
     readonly property var names: [NAMES]
+    readonly property var dims: [DIMS]
+    // The rows `kourier_viewmodel::media_layout` chose for the first five of them.
+    readonly property var albumRows: [ALBUMROWS]
+    // The album is shown three times: the pictures here, the same not downloaded, and not
+    // downloaded in the narrowest bubble (`avail` 0 is the width limit).
+    readonly property var variants: [{ "remote": false, "avail": 0 }, { "remote": true, "avail": 0 }, { "remote": true, "avail": 120 }]
+    property int variant: 0
 
     function fail(msg: string): void {
         console.error("FAIL [" + step + "]: " + msg);
         Qt.exit(1);
+    }
+
+    // The first descendant of `item` with this objectName (the block's `picture` child).
+    function child(item: Item, name: string): var {
+        for (let i = 0; i < item.children.length; ++i) {
+            const c = item.children[i];
+            if (c.objectName === name) {
+                return c;
+            }
+            const d = child(c, name);
+            if (d) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    // Whether `w` x `h` is within one pixel of a box of the ratio `a` = width / height: some
+    // height in [h - 1, h + 1] has |a * height - w| <= 1 (rounding a side to a pixel costs
+    // up to a pixel on each side; a thin picture's rounding costs more in the other axis).
+    function nearShape(w: real, h: real, a: real): bool {
+        return a * (h - 1) <= w + 1 && a * (h + 1) >= w - 1;
+    }
+
+    function near(a: real, b: real, tolerance: real): bool {
+        return Math.abs(a - b) <= tolerance;
+    }
+
+    // The block of picture `index` in logical pixels: the picture is shown whole (fitted,
+    // never cropped) in a box within the limits, centred in it; what the user's words and
+    // the brief pin for the special shapes.
+    function judge(item: Item, pic: Item, index: int) {
+        const name = names[index];
+        const a = dims[index][0] / dims[index][1];
+        const what = name + ": box " + item.width + "x" + item.height + ", picture at " + pic.x + "," + pic.y + " " + pic.width + "x" + pic.height;
+        if (pic.fillMode !== Image.PreserveAspectFit) {
+            return fail(what + ": fillMode " + pic.fillMode + ", not PreserveAspectFit (the picture is cropped)");
+        }
+        if (!nearShape(pic.width, pic.height, a)) {
+            return fail(what + ": the picture rect is not of the picture's own shape " + a);
+        }
+        if (item.width > Style.imageMaxWidth + 0.5 || item.height > Style.imageMaxHeight + 0.5 || item.width < Style.imageMinWidth - 0.5 || item.height < Style.imageMinHeight - 0.5) {
+            return fail(what + ": the box is outside " + Style.imageMinWidth + "x" + Style.imageMinHeight + " .. " + Style.imageMaxWidth + "x" + Style.imageMaxHeight);
+        }
+        if (pic.x < -0.5 || pic.y < -0.5 || pic.x + pic.width > item.width + 0.5 || pic.y + pic.height > item.height + 0.5) {
+            return fail(what + ": the picture is not inside its box");
+        }
+        if (!near(pic.x + pic.width / 2, item.width / 2, 1) || !near(pic.y + pic.height / 2, item.height / 2, 1)) {
+            return fail(what + ": the picture is not centred in its box");
+        }
+        const tall = Style.imageMaxHeight;
+        switch (name) {
+        case "portrait":
+        case "landscape":
+            // Within both limits: the box is the picture, 16 grid units wide.
+            if (!near(item.width, pic.width, 1) || !near(item.height, pic.height, 1) || !near(item.width, Style.imageMaxWidth, 1)) {
+                return fail(what + ": expected the box to be the picture, as wide as the limit");
+            }
+            break;
+        case "screenshot":
+            // A phone screenshot is shown whole at the height limit (199 x 432 at 18 px grid
+            // units; today it is cut out of 288 x 461).
+            if (!near(item.height, tall, 1) || !near(item.width, tall * 1080 / 2340, 1) || !near(item.width, pic.width, 1) || !near(item.height, pic.height, 1)) {
+                return fail(what + ": expected " + tall * 1080 / 2340 + "x" + tall + ", the box being the picture");
+            }
+            break;
+        case "strip":
+            // Narrower than the minimum width: whole, on the bubble's own colour around it.
+            if (!near(item.height, tall, 1) || !near(item.width, Style.imageMinWidth, 1) || item.width - pic.width < 40) {
+                return fail(what + ": expected a minimum-width box holding the thin strip");
+            }
+            break;
+        case "panorama":
+            // Lower than the minimum height: whole in a box of the minimum height.
+            if (!near(item.width, Style.imageMaxWidth, 1) || !near(item.height, Style.imageMinHeight, 1) || item.height - pic.height < 20) {
+                return fail(what + ": expected a minimum-height box holding the flat panorama");
+            }
+            break;
+        case "tiny":
+            // Raised to the minimum width only.
+            if (!near(item.width, Style.imageMinWidth, 1) || !near(item.height, Style.imageMinWidth, 1) || !near(pic.width, item.width, 1)) {
+                return fail(what + ": expected the minimum width, square");
+            }
+            break;
+        case "narrow":
+            // 40 x 400 is raised until it is 1.5 L tall (43 x 432), not to the minimum width.
+            if (!near(pic.height, tall, 1) || !near(pic.width, tall / 10, 1) || !near(item.width, Style.imageMinWidth, 1) || !near(item.height, tall, 1)) {
+                return fail(what + ": expected " + tall / 10 + "x" + tall + " in a minimum-width box");
+            }
+            break;
+        }
+        console.warn("SHAPE " + what + " ok");
+    }
+
+    // Whether two rectangles share area (touching edges do not).
+    function overlap(a: var, b: var): bool {
+        return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+    }
+
+    // The album of seven pictures (five tiles and "+2") in justified rows: every tile has the
+    // shape of its picture within a pixel (clamped to 0.4 .. 5; a thinner picture sits whole
+    // and centred in a tile of the clamped shape), every picture is shown whole and centred in
+    // its tile, the tiles lie inside the grid and do not touch each other, the grid is at most
+    // `TOTAL_HARD` times its width tall and the "+2" lies inside the fifth tile. Not downloaded, the
+    // round badge lies whole inside its tile, even in the narrowest bubble, and the note
+    // is not over it.
+    function judgeAlbum(grid: Item, v: var) {
+        const where = "album (" + (v.remote ? "remote" : "local") + ", " + (v.avail > 0 ? v.avail : "limit") + "): ";
+        const W = grid.natural;
+        const ts = [];
+        for (const c of grid.children) {
+            if (c.clip) {
+                ts.push(c);
+            }
+        }
+        if (grid.tiles !== 5 || grid.hidden !== 2 || ts.length !== 5) {
+            return fail(where + "tiles " + grid.tiles + ", hidden " + grid.hidden + ", tile items " + ts.length);
+        }
+        let cells = "";
+        let bottom = 0;
+        for (let i = 0; i < 5; ++i) {
+            const t = ts[i];
+            const own = dims[i][0] / dims[i][1];
+            const a = Math.min(5, Math.max(0.4, own));
+            cells += " [" + t.x + "," + t.y + " " + t.width + "x" + t.height + "]";
+            bottom = Math.max(bottom, t.y + t.height);
+            if (!nearShape(t.width, t.height, a)) {
+                return fail(where + "tile " + i + " is " + t.width + "x" + t.height + ", not of the shape " + a + " of its picture (" + dims[i] + ")");
+            }
+            if (t.x < 0 || t.y < 0 || t.x + t.width > W || t.y + t.height > grid.implicitHeight) {
+                return fail(where + "tile " + i + " is outside the grid " + W + "x" + grid.implicitHeight + ":" + cells);
+            }
+            for (let j = 0; j < i; ++j) {
+                if (overlap(ts[j], t)) {
+                    return fail(where + "tiles " + j + " and " + i + " overlap:" + cells);
+                }
+            }
+            const pic = child(t, "picture");
+            if (!pic || pic.fillMode !== Image.PreserveAspectFit) {
+                return fail(where + "tile " + i + ": the picture is cropped");
+            }
+            if (!nearShape(pic.width, pic.height, own)) {
+                return fail(where + "tile " + i + ": the picture " + pic.width + "x" + pic.height + " is not of its own shape " + own);
+            }
+            if (pic.x < -0.5 || pic.y < -0.5 || pic.x + pic.width > t.width + 0.5 || pic.y + pic.height > t.height + 0.5 || !near(pic.x + pic.width / 2, t.width / 2, 1) || !near(pic.y + pic.height / 2, t.height / 2, 1)) {
+                return fail(where + "tile " + i + ": the picture is not whole and centred in its tile");
+            }
+            if (own === a && (t.width - pic.width > 3 || t.height - pic.height > 3)) {
+                return fail(where + "tile " + i + ": " + t.width + "x" + t.height + " has a bar around the picture " + pic.width + "x" + pic.height);
+            }
+            if (v.remote) {
+                const badge = child(t, "badge");
+                if (!badge || !badge.visible) {
+                    return fail(where + "tile " + i + ": no badge on a picture that is not here");
+                }
+                if (badge.x < -0.5 || badge.y < -0.5 || badge.x + badge.width > t.width + 0.5 || badge.y + badge.height > t.height + 0.5) {
+                    return fail(where + "tile " + i + " " + t.width + "x" + t.height + ": the badge " + badge.x + "," + badge.y + " " + badge.width + "x" + badge.height + " is not inside it");
+                }
+                const pill = child(t, "note");
+                if (pill && pill.visible && (pill.x < -0.5 || pill.y < -0.5 || pill.x + pill.width > t.width + 0.5 || pill.y + pill.height > t.height + 0.5 || overlap(pill, badge))) {
+                    return fail(where + "tile " + i + " " + t.width + "x" + t.height + ": the note " + pill.x + "," + pill.y + " " + pill.width + "x" + pill.height + " is outside the tile or over the badge");
+                }
+            }
+        }
+        if (bottom !== grid.implicitHeight) {
+            return fail(where + "the grid is " + grid.implicitHeight + " tall, its tiles end at " + bottom);
+        }
+        // These five are an extreme mix (a strip, a panorama): no cut keeps both the 1.5 limit
+        // and a badge-sized tile, so the layout takes the fallback, within `TOTAL_HARD`.
+        if (grid.implicitHeight > TOTALHARD * W + 4 * grid.gap + 0.5) {
+            return fail(where + "the grid is " + grid.implicitWidth + "x" + grid.implicitHeight + ", more than " + TOTALHARD + " times its width:" + cells);
+        }
+        const more = child(ts[4], "more");
+        if (!more || !more.parent.visible || more.text !== "+2") {
+            return fail(where + "the fifth tile does not say +2");
+        }
+        const at = more.mapToItem(ts[4], 0, 0);
+        if (at.x < -0.5 || at.y < -0.5 || at.x + more.width > ts[4].width + 0.5 || at.y + more.height > ts[4].height + 0.5 || more.contentWidth > more.width + 0.5) {
+            return fail(where + "the +2 (" + more.contentWidth + " wide) is not inside the fifth tile " + ts[4].width + "x" + ts[4].height);
+        }
+        console.warn("ALBUM " + where + grid.implicitWidth + "x" + grid.implicitHeight + ":" + cells + " ok");
     }
 
     Instantiator {
@@ -144,6 +365,33 @@ Window {
         active: false
         sourceComponent: ImageBlock {
             block: test.shownBlock
+        }
+    }
+
+    // The seven pictures as one album message (the fake network packs three to a message, so
+    // the block is made here from the real blocks of the pictures; its rows are Rust's). It lies
+    // on a peer's bubble colour with a margin, as in the app, and THAT is grabbed: a grab of the
+    // album alone saves its transparent places (beside a thin picture, the 2 px gaps) as black,
+    // which looks like letterboxing when the app shows the bubble's color there.
+    Rectangle {
+        id: albumBackdrop
+        x: 0
+        y: 0
+        visible: albumView.active
+        width: albumView.width + 2 * albumBackdrop.margin
+        height: albumView.height + 2 * albumBackdrop.margin
+        readonly property real margin: 12
+        color: Style.peerBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor)
+
+        Loader {
+            id: albumView
+            x: albumBackdrop.margin
+            y: albumBackdrop.margin
+            active: false
+            property var block: null
+            sourceComponent: AlbumBlock {
+                block: albumView.block
+            }
         }
     }
 
@@ -197,8 +445,16 @@ Window {
                     return;
                 }
                 console.warn("PICTURE " + test.names[test.index] + ": item " + item.width + "x" + item.height + " logical, devicePixelRatio " + item.Screen.devicePixelRatio + " stage.visible " + stage.visible + " window " + item.Window.window + " same " + (item.Window.window === stage) + " vis " + (item.Window.window ? item.Window.window.visible : "-") + " active " + stage.active);
+                // The grab is the `picture` child, not the block: the block's box holds the
+                // bubble's color beside a thin picture, and the picture is what the provider is
+                // asked for (its physical size) and what the probe compares with the file.
+                const pic = test.child(item, "picture");
+                if (!pic) {
+                    return fail("the block of " + test.names[test.index] + " has no picture child");
+                }
+                test.judge(item, pic, test.index);
                 test.step = "grabbing";
-                item.grabToImage(function (result) {
+                pic.grabToImage(function (result) {
                     if (!result.saveToFile(GRABDIR + "/" + test.names[test.index] + ".png")) {
                         return test.fail("the grab was not saved");
                     }
@@ -209,7 +465,53 @@ Window {
             case "grabbed":
                 blockView.active = false;
                 test.index += 1;
-                test.step = test.index < test.wanted.length ? "open" : "avatar";
+                test.step = test.index < test.wanted.length ? "open" : "album";
+                break;
+            case "album": {
+                const blocks = [];
+                for (const id of test.wanted) {
+                    const b = test.blockFor(id);
+                    if (!b) {
+                        return;
+                    }
+                    blocks.push(b);
+                }
+                const items = blocks.map(b => Object.assign({}, b, test.variants[test.variant].remote ? { "state": "remote", "url": "", "fullUrl": "", "placeholderUrl": "", "label": "1.2 MB", "progress": 0, "ask": false } : { "url": b.url + "ALBUMMARK" }));
+                albumView.block = { "type": "album", "items": items, "count": items.length, "rows": test.albumRows };
+                albumView.active = true;
+                test.settle = 0;
+                test.step = "album shown";
+                break;
+            }
+            case "album shown": {
+                const grid = albumView.item;
+                if (!grid) {
+                    return;
+                }
+                const v = test.variants[test.variant];
+                if (v.avail > 0 && grid.available !== v.avail) {
+                    grid.available = v.avail;
+                    return;
+                }
+                test.settle += 1;
+                if (test.settle < 4) {
+                    return;
+                }
+                test.judgeAlbum(grid, v);
+                // (For a look: the album of the seven test pictures, five shown and "+2".)
+                test.step = "album grabbing";
+                albumBackdrop.grabToImage(function (result) {
+                    if (!result.saveToFile(GRABDIR + "/album-" + test.variant + ".png")) {
+                        return test.fail("the album grab was not saved");
+                    }
+                    test.step = "album grabbed";
+                });
+                break;
+            }
+            case "album grabbed":
+                albumView.active = false;
+                test.variant += 1;
+                test.step = test.variant < test.variants.length ? "album" : "avatar";
                 break;
             case "avatar":
                 if (App.timeline.avatarUrl === "") {
@@ -264,14 +566,19 @@ Window {
 }
 "##;
 
-/// The size of the requests the provider logged for `attachment`'s `thumb/` picture, in order.
-fn requests_of(log: &[String], attachment: AttachmentId) -> Vec<(i32, i32)> {
+/// The album's copies of the blocks carry this in their picture URL (the provider ignores it):
+/// the requests of the album's tiles are told apart from those of the single block.
+const ALBUM_MARK: &str = "&album=1";
+
+/// The size of the requests the provider logged for `attachment`'s `thumb/` picture, in order
+/// (`album`: those of the album's tiles, else those of the single block).
+fn requests_of(log: &[String], attachment: AttachmentId, album: bool) -> Vec<(i32, i32)> {
     let prefix = format!("thumb/{}?", attachment.0);
     log.iter()
         .filter_map(|line| {
             let (id, size) = line.split_once(' ')?;
             let (w, h) = size.split_once('x')?;
-            if !id.starts_with(&prefix) {
+            if !id.starts_with(&prefix) || id.contains(ALBUM_MARK) != album {
                 return None;
             }
             Some((w.parse().ok()?, h.parse().ok()?))
@@ -281,12 +588,12 @@ fn requests_of(log: &[String], attachment: AttachmentId) -> Vec<(i32, i32)> {
 
 /// The last request for `attachment`'s picture.
 fn last_request(log: &[String], attachment: AttachmentId) -> Option<(i32, i32)> {
-    requests_of(log, attachment).last().copied()
+    requests_of(log, attachment, false).last().copied()
 }
 
 /// The largest side of any request for `attachment`'s picture, as `(width, height)`.
 fn largest_request(log: &[String], attachment: AttachmentId) -> (i32, i32) {
-    requests_of(log, attachment)
+    requests_of(log, attachment, false)
         .into_iter()
         .fold((0, 0), |a, r| (a.0.max(r.0), a.1.max(r.1)))
 }
@@ -338,6 +645,7 @@ fn send_picture(app: &AppHandle, conv: ConversationId, request: u64, path: PathB
         request: RequestId(request),
         paths: vec![path].into(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         caption: None,
         reply_to: None,
     })
@@ -366,9 +674,14 @@ fn send_picture(app: &AppHandle, conv: ConversationId, request: u64, path: PathB
 /// What the case found out about one picture, to be judged after Qt ran.
 struct Shown {
     name: &'static str,
+    /// Whether the sharpness and the file-or-thumbnail rule are judged (the three of
+    /// `PICTURES`); the others are judged on their box and on what the provider is asked for.
+    fine: bool,
     attachment: AttachmentId,
+    dims: (u32, u32),
     file: Vec<u8>,
     file_len: usize,
+    /// 0 when the core made no thumbnail (a picture below its size).
     thumb_len: usize,
 }
 
@@ -407,7 +720,7 @@ fn run_case(scale: &str, judged: bool) {
     let grabs = dir.join("grabs");
     std::fs::create_dir_all(&grabs).expect("grab dir");
     let mut shown = Vec::new();
-    for (n, (name, w, h)) in PICTURES.into_iter().enumerate() {
+    for (n, (name, w, h, fine)) in all_pictures().into_iter().enumerate() {
         let jpeg = kourier_qt::bridge::qobject::detail_image(w as i32, h as i32, "jpeg");
         assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]), "{name}: a JPEG");
         let path = dir.join(format!("{name}.jpg"));
@@ -417,31 +730,38 @@ fn run_case(scale: &str, judged: bool) {
         // The core made the thumbnail with the import: the entry has both files before the
         // chat is opened, so the first request already meets it (the old rule served the
         // thumbnail from then on).
+        // (A picture below the thumbnail's size may get none: only the three that are judged
+        // for sharpness need one.)
         let entry = wait_for(30, name, || {
             handle
                 .media()
                 .resolve_blocking(attachment)
                 .ok()
                 .flatten()
-                .filter(|e| e.file.is_some() && e.thumb.is_some())
+                .filter(|e| e.file.is_some() && (!fine || e.thumb.is_some()))
         });
         assert_eq!(entry.dims, Some((w, h)), "{name}");
         let media = handle.media();
         let file = media.read(entry.file.as_ref().unwrap()).expect("the file");
-        let thumb = media
-            .read(entry.thumb.as_ref().unwrap())
-            .expect("thumbnail");
+        let thumb_len = entry.thumb.as_ref().map_or(0, |t| {
+            let thumb = media.read(t).expect("thumbnail");
+            if fine {
+                assert!(
+                    thumb.len() < file.len() / 3,
+                    "{name}: the thumbnail is small"
+                );
+            }
+            thumb.len()
+        });
         assert_eq!(&file[..], &jpeg[..], "{name}: the file is the picture sent");
-        assert!(
-            thumb.len() < file.len() / 3,
-            "{name}: the thumbnail is small"
-        );
         shown.push(Shown {
             name,
+            fine,
             attachment,
+            dims: (w, h),
             file: file.to_vec(),
             file_len: file.len(),
-            thumb_len: thumb.len(),
+            thumb_len,
         });
     }
 
@@ -456,9 +776,42 @@ fn run_case(scale: &str, judged: bool) {
         .map(|s| format!("{:?}", s.name))
         .collect::<Vec<_>>()
         .join(", ");
+    let dims = all_pictures()
+        .iter()
+        .map(|p| format!("[{}, {}]", p.1, p.2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The rows of the album's five shown tiles, as `models/timeline.rs` hands them to QML.
+    let aspects: Vec<f64> = all_pictures()
+        .iter()
+        .take(5)
+        .map(|p| tile_aspect(p.1, p.2))
+        .collect();
+    let album_rows_js = album_rows(&aspects)
+        .iter()
+        .map(|r| {
+            let prefix = r
+                .prefix
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>();
+            format!(
+                "{{ \"count\": {}, \"aspect\": {:?}, \"prefix\": [{}] }}",
+                r.count,
+                r.aspect,
+                prefix.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("scale {scale} album rows {album_rows_js}");
     let script = SCRIPT
+        .replace("ALBUMROWS", &album_rows_js)
+        .replace("ALBUMMARK", ALBUM_MARK)
+        .replace("TOTALHARD", &format!("{:?}", TOTAL_HARD))
         .replace("IDS", &ids)
         .replace("NAMES", &names)
+        .replace("DIMS", &dims)
         .replace("CONVERSATION", &conv.0.to_string())
         .replace("GRABDIR", &format!("{:?}", grabs.to_string_lossy()));
     let mut engine = QQmlApplicationEngine::new();
@@ -479,6 +832,16 @@ fn run_case(scale: &str, judged: bool) {
 
     // ---- judged: which file the timeline asked for, and how sharp it came out ----
     let keep = std::env::var_os("KOURIER_PICTURE_UI_SHOTS").map(PathBuf::from);
+    if let Some(keep) = &keep {
+        // The album grabs (local, remote, remote at 120 px), for a look.
+        std::fs::create_dir_all(keep).expect("keep dir");
+        for n in 0..3 {
+            let _ = std::fs::copy(
+                grabs.join(format!("album-{n}.png")),
+                keep.join(format!("scale-{scale}-album-{n}.png")),
+            );
+        }
+    }
     let mut sharp = 0;
     // `hard` problems fail at every scale (what the provider is asked for, the avatar's corner);
     // `problems` only where the scale is judged (the sharpness of the pictures).
@@ -511,6 +874,41 @@ fn run_case(scale: &str, judged: bool) {
                 s.name, largest.0, largest.1
             ));
         }
+        // The album's tiles (the pictures are shown whole there too): every request has the
+        // picture's own shape and is no larger than the grid is wide (a request of dpr squared
+        // would be).
+        let tile_requests = requests_of(&requests, s.attachment, true);
+        println!(
+            "scale {scale} {:>10}: the album's tile asked for {tile_requests:?}",
+            s.name
+        );
+        // One request per tile, for the finished size (anchors are applied after a picture
+        // first asks, so a tile whose `ImageBlock` is anchored asks once for the size the block
+        // has before them: a decode wasted on every first tile of a row).
+        if tile_requests.len() > 1 {
+            hard.push(format!(
+                "scale {scale} {}: the album's tile asked the provider {} times: {tile_requests:?}",
+                s.name,
+                tile_requests.len()
+            ));
+        }
+        for (aw, ah) in tile_requests {
+            let own = f64::from(s.dims.0) / f64::from(s.dims.1);
+            let (fw, fh) = (f64::from(aw), f64::from(ah));
+            if own * (fh - 1.0) > fw + 1.0 || own * (fh + 1.0) < fw - 1.0 {
+                hard.push(format!(
+                    "scale {scale} {}: the album's tile asked for {aw}x{ah}, not the shape {own:.3} of the picture",
+                    s.name
+                ));
+            }
+            if f64::from(aw) > 288.0 * dpr + 1.0 {
+                hard.push(format!(
+                    "scale {scale} {}: the album's tile asked for {aw}x{ah}, more than the grid is wide ({} device pixels)",
+                    s.name,
+                    288.0 * dpr
+                ));
+            }
+        }
         let serve = |(w, h): (i32, i32)| match resolve(
             &handle,
             &format!("thumb/{}?v=1", s.attachment.0),
@@ -522,7 +920,11 @@ fn run_case(scale: &str, judged: bool) {
         };
         let served = serve(asked);
         let from_file = served == s.file_len;
-        assert!(from_file || served == s.thumb_len, "{}: neither", s.name);
+        assert!(
+            from_file || (s.thumb_len > 0 && served == s.thumb_len),
+            "{}: neither",
+            s.name
+        );
         println!(
             "scale {scale} {:>10}: item {w}x{h}, provider asked {}x{}, served the {}; coarse PSNR vs the provider's answer {psnr:.1} dB, vs the file scaled smoothly {smooth_psnr:.1} dB, detail {:.2} (grab {got:.0} / reference {want:.0}); asked {w}x{h} it would serve the {}",
             s.name,
@@ -542,6 +944,10 @@ fn run_case(scale: &str, judged: bool) {
                 grabs.join(format!("{}.png", s.name)),
                 keep.join(format!("scale-{scale}-{}.png", s.name)),
             );
+        }
+        if !s.fine {
+            // Judged on its box in the script and on what the provider was asked for, above.
+            continue;
         }
         // The rule: the file wherever the thumbnail (the long edge 400) cannot cover the ask.
         let (pw, ph) = PICTURES

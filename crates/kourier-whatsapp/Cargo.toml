@@ -1,0 +1,85 @@
+[package]
+name = "kourier-whatsapp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+# The integration tests are one binary, tests/it.rs (T3); a new tests/<name>.rs is a `mod` there.
+autotests = false
+
+[dependencies]
+kourier-model.workspace = true
+kourier-backend-api.workspace = true
+kourier-db.workspace = true
+# W5b (media send): the core's encrypted files are read through kourier-blob, and the temporary upload file is a sealed
+# kourier-blob (`.claude/rules/upload-progress.md`); still pictures are re-encoded by kourier-media as on Signal.
+kourier-blob.workspace = true
+kourier-media.workspace = true
+
+# whatsapp-rust at ONE git revision for every crate (root Cargo.toml). W1 uses the store traits
+# (`wacore::store`), the app-state and device types, and `waproto`; the client crate is here so the
+# whole graph enters Cargo.lock and the licence files in one change, and W2 builds on it.
+whatsapp-rust.workspace = true
+# The real WebSocket transport and HTTPS client. whatsapp-rust is built WITHOUT its `tokio-transport`
+# and `ureq-client` features (root Cargo.toml), so its builder REQUIRES both slots; these two crates
+# are what the real parts are made of, in ONE module (`src/real.rs`, listed in `REAL_CLIENT_MODULES`
+# of tests/builder.rs); no other file of the crate, tests included, names them.
+whatsapp-rust-tokio-transport.workspace = true
+whatsapp-rust-ureq-http-client.workspace = true
+# The agent of Kourier's HTTPS client (`src/real.rs` only; W5b decision G13: timeouts, no proxy, no redirect).
+ureq.workspace = true
+wacore.workspace = true
+wacore-binary.workspace = true
+waproto.workspace = true
+
+anyhow.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+# The history stage's key: HKDF-SHA256 of the account's backend key (src/history/stage.rs).
+hkdf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+# The type of `AccountContext::cancel`.
+tokio-util.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# The fake's WhatsApp features, compared with the backend's (`features::tests`, W5a D16; deps-check allows a
+# dev-dependency on the fake).
+kourier-fake.workspace = true
+# The kill tests need their failpoints in release test builds too (§10.4).
+kourier-db = { workspace = true, features = ["failpoints"] }
+# The copied upstream contract tests and the repro (tests/support/upstream, tests/storage_contract_repro.rs)
+# use these; whatsapp-rust's own `test-util` stays OFF (its fault hooks would reach every test build
+# of a crate that depends on this one).
+anyhow.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+# The hand-made history blobs (tests/support/history.rs, src/history/testing): zlib, as the phone uploads them.
+flate2.workspace = true
+# `futures::poll!` of the repro
+futures = { workspace = true, features = ["async-await"] }
+tempfile.workspace = true
+# The real-HTTP test's listener gets a tiny receive buffer (`src/real/tests.rs`, W5b decision G15).
+libc.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+waproto.workspace = true
+# The fixture peer (tests/support/peer.rs) runs libsignal's `process_prekey_bundle`, which takes an
+# rng of the version libsignal uses (rand 0.10; the workspace's own `rand` is 0.9). Already in the
+# lock file through whatsapp-rust; a test-only edge.
+rand = "0.10"
+# The Wire children bridge `log` records into `tracing` the way the app's subscriber does (W3b fix F6), so
+# the grep for secrets sees what whatsapp-rust and the crates under it log. Already in the lock file
+# through tracing-subscriber's `tracing-log` feature.
+tracing-log = "0.2"
+
+[[test]]
+name = "it"
+path = "tests/it.rs"

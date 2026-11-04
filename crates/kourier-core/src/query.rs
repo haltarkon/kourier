@@ -1,23 +1,27 @@
 //! Read-side queries for the facade (§4.10, §8.4), run on the read-only connections.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use kourier_db::rusqlite::{Connection, OptionalExtension, Row};
 use kourier_model::{
-    AccountId, AccountState, AccountUuid, AttachmentId, AttachmentKind, AttachmentState, BlobKey,
-    BlobRef, Body, ConnState, ConversationFeatures, ConversationId, Deletion, DisappearKind,
-    Expiry, Member, MemberRole, MessageId, ReplyTo, TargetAuthor, Text, UserId,
+    AccountId, AccountState, AccountUuid, Attachment, AttachmentId, AttachmentKind,
+    AttachmentState, BlobKey, BlobRef, Body, ConnState, Contact, ConversationFeatures,
+    ConversationId, Deletion, DisappearKind, Expiry, Member, MemberRole, MessageId, ReplyTo,
+    TargetAuthor, Text, UserId,
 };
 
 use crate::actions::{self, Facts, Sending};
 use crate::error::{CoreError, Result};
 use crate::facade::{
-    AccountRow, ConversationDetail, ConversationListQuery, ConversationPage, ConversationRow,
-    MessageRevisions, MessageRow, OriginKind, OutboxWait, Preview, QuoteState, ReactionGroup,
-    ReplyPreview, Revision, TimelineAnchor, TimelinePage, TimelineQuery,
+    AccountRow, ChatMediaItem, ChatMediaPage, ChatMediaQuery, CommonGroup, ConversationDetail,
+    ConversationListQuery, ConversationPage, ConversationRow, GroupDetail, GroupMember,
+    MAX_MEDIA_PAGE, MediaKind, MessageRevisions, MessageRow, OriginKind, OutboxWait, PersonChat,
+    PersonDetail, Preview, QuoteState, ReactionGroup, ReplyPreview, Revision, TimelineAnchor,
+    TimelinePage, TimelineQuery,
 };
+use crate::roaming;
 use crate::sql;
 
 /// Largest page any query returns.
@@ -27,6 +31,7 @@ pub const MAX_PAGE: u32 = 500;
 pub(crate) fn accounts(
     conn: &Connection,
     conn_states: &HashMap<AccountId, ConnState>,
+    holds: &HashMap<AccountId, kourier_model::AccountHold>,
 ) -> Result<Vec<AccountRow>> {
     type Raw = (
         i64,
@@ -39,11 +44,12 @@ pub(crate) fn accounts(
         String,
         Option<String>,
         i64,
+        Option<String>,
     );
     let rows: Vec<Raw> = conn
         .prepare_cached(
             "SELECT id, uuid, network, state, state_reason, display_name, own_device, own_ids,
-               number, created_at
+               number, created_at, caps
              FROM accounts ORDER BY coalesce(sort_order, id), id",
         )?
         .query_map([], |r| {
@@ -58,12 +64,13 @@ pub(crate) fn accounts(
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
+                r.get(10)?,
             ))
         })?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     rows.into_iter()
         .map(
-            |(id, uuid, network, state, reason, name, device, own_ids, number, linked_at)| {
+            |(id, uuid, network, state, reason, name, device, own_ids, number, linked_at, caps)| {
                 let state = sql::account_state(&state, reason)?;
                 // Without a running actor (after a restart) a logged-out account still says so.
                 let shown =
@@ -73,6 +80,8 @@ pub(crate) fn accounts(
                         .unwrap_or_else(|| match &state {
                             AccountState::LoggedOut { reason } => ConnState::LoggedOut {
                                 reason: reason.clone(),
+                                cause: Default::default(),
+                                note: Default::default(),
                             },
                             _ => ConnState::default(),
                         });
@@ -82,6 +91,7 @@ pub(crate) fn accounts(
                     Some(own) => contact_avatar(conn, id, own.as_str())?,
                     None => None,
                 };
+                let roaming = roaming::AccountRoaming::read(id, caps);
                 Ok(AccountRow {
                     id: AccountId(id),
                     uuid: uuid
@@ -95,6 +105,9 @@ pub(crate) fn accounts(
                     avatar,
                     number,
                     linked_at,
+                    hold: holds.get(&AccountId(id)).copied(),
+                    roaming_writes: roaming.writes,
+                    pin_limit: roaming.pin_limit,
                 })
             },
         )
@@ -117,35 +130,72 @@ fn blob_ref(conn: &Connection, file: Option<i64>) -> Result<Option<BlobRef>> {
         .prepare_cached("SELECT path, key FROM files WHERE id = ?1")?
         .query_row([file], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    Ok(row.and_then(|(path, key)| {
-        Some(BlobRef {
-            path: PathBuf::from(path),
-            key: BlobKey::new(key.try_into().ok()?),
-        })
-    }))
+    Ok(row.and_then(|(path, key)| blob_of(path, key)))
 }
 
-/// Display name of a user: nickname, address-book name, then profile name.
+/// A file row's path and key as a blob handle; `None` for a key of the wrong length.
+fn blob_of(path: String, key: Vec<u8>) -> Option<BlobRef> {
+    Some(BlobRef {
+        path: PathBuf::from(path),
+        key: BlobKey::new(key.try_into().ok()?),
+    })
+}
+
+/// The profile name of the contact aliased `$ct` as it is SHOWN (SQL): the name the person chose
+/// for themself, which WhatsApp's own apps show with a "~" in front wherever the viewer has no
+/// address-book name of their own for the person (his answer "~Name, as the phone", 2026-10-28).
+/// `$network` is the SQL expression for the account's stored network; only WhatsApp's people carry
+/// the mark (the test `the_mark_names_the_stored_network_of_whatsapp` pins the literal), every other
+/// network's profile name is shown as it is. The nickname and the address-book name come before it
+/// in every `coalesce`, so they never carry the mark. An empty name stays empty (no lone "~").
+macro_rules! shown_profile_name {
+    ($ct:literal, $network:literal) => {
+        concat!(
+            "CASE WHEN ",
+            $network,
+            " = 'WhatsApp' AND ",
+            $ct,
+            ".profile_name <> '' THEN '~' || ",
+            $ct,
+            ".profile_name ELSE ",
+            $ct,
+            ".profile_name END"
+        )
+    };
+}
+
+/// Display name of a user: nickname, address-book name, then profile name (marked for WhatsApp's
+/// people, see [`shown_profile_name`]).
 fn display_name(conn: &Connection, account: i64, user: &str) -> Result<Option<String>> {
     Ok(conn
-        .prepare_cached(
-            "SELECT coalesce(nickname, system_name, profile_name) FROM contacts
-             WHERE account_id = ?1 AND user_id = ?2",
-        )?
+        .prepare_cached(concat!(
+            "SELECT coalesce(ct.nickname, ct.system_name, ",
+            shown_profile_name!("ct", "a.network"),
+            ") FROM contacts ct JOIN accounts a ON a.id = ct.account_id
+             WHERE ct.account_id = ?1 AND ct.user_id = ?2"
+        ))?
         .query_row((account, user), |r| r.get::<_, Option<String>>(0))
         .optional()?
         .flatten())
 }
 
-const CONV_SELECT: &str = "SELECT c.id, c.account_id, c.kind, c.is_self, c.conv_key,
-      coalesce(c.title, ct.nickname, ct.system_name, ct.profile_name),
+/// (The last column, `ConversationFeatures::lists_for_roaming`: absent and `true` list the chat,
+/// only a stated `false` unlists it.)
+const CONV_SELECT: &str = concat!(
+    "SELECT c.id, c.account_id, c.kind, c.is_self, c.conv_key,
+      coalesce(c.title, ct.nickname, ct.system_name, ",
+    shown_profile_name!("ct", "a.network"),
+    "),
       coalesce(c.avatar_file, ct.avatar_file), coalesce(c.last_activity, 0), c.unread, c.mentions,
       c.marked_unread, c.muted_until, c.local_muted_until, c.archived, c.pinned_order, c.blocked,
-      c.request_pending, coalesce(c.features_hash, 0), c.draft IS NOT NULL, c.hidden
+      c.request_pending, coalesce(c.features_hash, 0), c.draft IS NOT NULL, c.hidden,
+      json_extract(c.features, '$.cannot_send') IS NULL,
+      coalesce(json_extract(c.features, '$.roaming_listed'), 1) <> 0, c.protected
     FROM conversations c
     JOIN accounts a ON a.id = c.account_id
     LEFT JOIN contacts ct ON c.kind = 'Direct' AND ct.account_id = c.account_id
-      AND ct.user_id = substr(c.conv_key, 8)";
+      AND ct.user_id = substr(c.conv_key, 8)"
+);
 
 struct ConvRaw {
     id: i64,
@@ -168,6 +218,11 @@ struct ConvRaw {
     features_hash: i64,
     has_draft: bool,
     hidden: bool,
+    can_send: bool,
+    /// The network lists the chat for roaming settings (`roaming_listed` is not `false`).
+    roaming_listed: bool,
+    /// The user protects the chat on another device (core.db `protected`).
+    protected: bool,
 }
 
 fn conv_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<ConvRaw> {
@@ -192,12 +247,32 @@ fn conv_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<ConvRaw> {
         features_hash: r.get(17)?,
         has_draft: r.get(18)?,
         hidden: r.get(19)?,
+        can_send: r.get(20)?,
+        roaming_listed: r.get(21)?,
+        protected: r.get(22)?,
     })
 }
 
-fn conv_row(conn: &Connection, raw: ConvRaw) -> Result<ConversationRow> {
+/// A conversation row. `accounts` is every account's roaming statement, read ONCE by the query
+/// ([`roaming::accounts`]); an account it does not know (a row deleted meanwhile) states none.
+fn conv_row(
+    conn: &Connection,
+    raw: ConvRaw,
+    accounts: &HashMap<i64, roaming::AccountRoaming>,
+) -> Result<ConversationRow> {
     let key = sql::conv_key(&raw.key)?;
-    let preview = preview(conn, raw.account, raw.id)?;
+    let roaming = accounts
+        .get(&raw.account)
+        .copied()
+        .unwrap_or_else(|| roaming::AccountRoaming::of(None))
+        .state(raw.roaming_listed);
+    // A protected chat's messages show nowhere outside the open chat: its row carries no
+    // preview at all (no text, author, time or kind), so no front-end can show one.
+    let preview = if raw.protected {
+        None
+    } else {
+        preview(conn, raw.account, raw.id)?
+    };
     Ok(ConversationRow {
         id: ConversationId(raw.id),
         account: AccountId(raw.account),
@@ -220,6 +295,46 @@ fn conv_row(conn: &Connection, raw: ConvRaw) -> Result<ConversationRow> {
         features_hash: u64::from_ne_bytes(raw.features_hash.to_ne_bytes()),
         has_draft: raw.has_draft,
         hidden: raw.hidden,
+        can_send: raw.can_send,
+        roaming,
+        protected: raw.protected,
+    })
+}
+
+/// The newest LISTED row of a conversation ([`crate::notices::listed`]): the same rows
+/// that give `conversations.last_activity` its value, so the preview and the place in the
+/// list always speak of one message.
+pub(crate) const PREVIEW: &str = concat!(
+    "SELECT m.id, m.net_author, m.body_kind, m.preview, m.sent_at, m.deleted, m.out_state,
+               (SELECT x.kind FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0
+                ORDER BY x.idx LIMIT 1),
+               (SELECT count(*) FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0),
+               CASE WHEN m.body_kind IN ('System', 'Unsupported') THEN m.body END,
+               (SELECT x.file_name FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0
+                ORDER BY x.idx LIMIT 1),
+               m.deleted_by
+             FROM messages m
+             WHERE m.conversation_id = ?1 AND (m.deleted IS NULL OR m.deleted <> 'ForMe')
+               AND m.expiry_hidden = 0 AND ",
+    crate::notices::listed!(),
+    "
+             ORDER BY m.sort_key DESC, m.id DESC LIMIT 1"
+);
+
+/// How a row was deleted, from its `deleted` and `deleted_by` columns: the timeline and the list's
+/// preview read it alike, so a delete that names nobody (KT-2) is `Unattributed` in both and no
+/// list says "You deleted this message" of a delete the peer may have made.
+fn deletion_of(deleted: Option<&str>, deleted_by: Option<String>) -> Result<Option<Deletion>> {
+    Ok(match deleted {
+        None => None,
+        Some("ForMe") => Some(Deletion::ForMe),
+        Some(_) => Some(match deleted_by {
+            // Nobody was named: a server that checks deletes (KT-2) need not say who.
+            None => Deletion::Unattributed,
+            Some(b) => Deletion::ForEveryone {
+                by: (!b.is_empty()).then(|| sql::user(&b)).transpose()?,
+            },
+        }),
     })
 }
 
@@ -236,23 +351,12 @@ fn preview(conn: &Connection, account: i64, conv: i64) -> Result<Option<Preview>
         i64,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     // What the list says instead of a text: the first attachment's kind and how many there
     // are (long texts are text, not files), and the body of a notice or an unsupported row.
     let row: Option<Raw> = conn
-        .prepare_cached(
-            "SELECT m.id, m.net_author, m.body_kind, m.preview, m.sent_at, m.deleted, m.out_state,
-               (SELECT x.kind FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0
-                ORDER BY x.idx LIMIT 1),
-               (SELECT count(*) FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0),
-               CASE WHEN m.body_kind IN ('System', 'Unsupported') THEN m.body END,
-               (SELECT x.file_name FROM attachments x WHERE x.message_id = m.id AND x.long_text = 0
-                ORDER BY x.idx LIMIT 1)
-             FROM messages m
-             WHERE m.conversation_id = ?1 AND (m.deleted IS NULL OR m.deleted <> 'ForMe')
-               AND m.expiry_hidden = 0
-             ORDER BY m.sort_key DESC, m.id DESC LIMIT 1",
-        )?
+        .prepare_cached(PREVIEW)?
         .query_row([conv], |r| {
             Ok((
                 r.get(0)?,
@@ -266,11 +370,24 @@ fn preview(conn: &Connection, account: i64, conv: i64) -> Result<Option<Preview>
                 r.get(8)?,
                 r.get(9)?,
                 r.get(10)?,
+                r.get(11)?,
             ))
         })
         .optional()?;
-    let Some((id, author, kind, text, sent_at, deleted, out_state, first, count, body, file_name)) =
-        row
+    let Some((
+        id,
+        author,
+        kind,
+        text,
+        sent_at,
+        deleted,
+        out_state,
+        first,
+        count,
+        body,
+        file_name,
+        deleted_by,
+    )) = row
     else {
         return Ok(None);
     };
@@ -294,7 +411,7 @@ fn preview(conn: &Connection, account: i64, conv: i64) -> Result<Option<Preview>
         body_kind: kind,
         text,
         sent_at,
-        deleted: deleted.is_some(),
+        deleted: deletion_of(deleted.as_deref(), deleted_by)?,
         out_state: sql::from_json_opt(out_state)?,
         attachment: first
             .as_deref()
@@ -307,22 +424,32 @@ fn preview(conn: &Connection, account: i64, conv: i64) -> Result<Option<Preview>
     }))
 }
 
-/// A page of the conversation list: pinned first (pin order), then newest activity.
-pub(crate) fn conversations(
-    conn: &Connection,
-    q: &ConversationListQuery,
-) -> Result<ConversationPage> {
-    let limit = q.limit.clamp(1, MAX_PAGE);
-    let sql = format!(
+/// The statement of the conversation list (`?1` account or NULL, `?2` archived: 0 the inbox, 1
+/// the archive, NULL both, `?3..?7` the keyset position, `?8` the limit). `c.last_activity` is
+/// the sort time of the newest LISTED row (none: the chat is listed after the chats that have
+/// one, as an empty chat). No chat is left out for what its rows are ([`crate::notices`],
+/// decision F1): only `hidden` does.
+pub(crate) fn list_sql() -> String {
+    format!(
         "{CONV_SELECT}
-         WHERE (?1 IS NULL OR c.account_id = ?1) AND c.archived = ?2 AND a.state <> 'Removing'
+         WHERE (?1 IS NULL OR c.account_id = ?1) AND (?2 IS NULL OR c.archived = ?2)
+           AND a.state <> 'Removing'
            AND c.hidden = 0
            AND (?3 = 0 OR ((c.pinned_order IS NULL), coalesce(c.pinned_order, 0),
                 -coalesce(c.last_activity, 0), -c.id) > (?4, ?5, ?6, ?7))
          ORDER BY (c.pinned_order IS NULL), coalesce(c.pinned_order, 0),
            -coalesce(c.last_activity, 0), -c.id
          LIMIT ?8"
-    );
+    )
+}
+
+/// A page of the conversation list: pinned first (pin order), then newest activity.
+pub(crate) fn conversations(
+    conn: &Connection,
+    q: &ConversationListQuery,
+) -> Result<ConversationPage> {
+    let limit = q.limit.clamp(1, MAX_PAGE);
+    let sql = list_sql();
     let cur = q.after;
     let raws: Vec<ConvRaw> = conn
         .prepare_cached(&sql)?
@@ -341,10 +468,11 @@ pub(crate) fn conversations(
         )?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     let more = raws.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    let accounts = roaming::accounts(conn)?;
     let mut rows = raws
         .into_iter()
         .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        .map(|r| conv_row(conn, r))
+        .map(|r| conv_row(conn, r, &accounts))
         .collect::<Result<Vec<_>>>()?;
     let next = if more {
         rows.last().map(ConversationRow::cursor)
@@ -385,12 +513,468 @@ pub(crate) fn conversation(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let accounts = roaming::accounts(conn)?;
     Ok(Some(ConversationDetail {
-        row: conv_row(conn, raw)?,
+        row: conv_row(conn, raw, &accounts)?,
         members,
         features: sql::from_json_opt::<ConversationFeatures>(features)?.unwrap_or_default(),
         timer: timer.map(|s| Duration::from_secs(u64::try_from(s.max(0)).unwrap_or(0))),
         draft: sql::from_json_opt(draft)?,
+    }))
+}
+
+/// The groups of `account` in which `user` AND one of the account's own ids are full members
+/// (`Member` or `Admin`: never one we left or are only invited to, never one `user` only asked
+/// to join), deleted chats left out, archived ones in, and a group whose stored features say
+/// `NotMember` left out (a group we were removed from before the backend could send the member list:
+/// P1 F4). Starts at `members_by_user`, then the
+/// group's own row and our own membership by the primary key of `members`
+/// (`person::tests::the_groups_in_common_start_at_the_members_index` pins the plan).
+pub(crate) const GROUPS_IN_COMMON: &str = "SELECT c.id, c.title, c.avatar_file
+    FROM members mb
+    CROSS JOIN conversations c ON c.id = mb.conversation_id
+    WHERE mb.user_id = ?1 AND mb.role IN ('Member', 'Admin')
+      AND c.account_id = ?2 AND c.kind = 'Group' AND c.hidden = 0
+      AND coalesce(json_extract(c.features, '$.cannot_send'), '') != 'NotMember'
+      AND EXISTS (SELECT 1 FROM members me
+                  WHERE me.conversation_id = c.id AND me.role IN ('Member', 'Admin')
+                    AND me.user_id IN (SELECT value FROM json_each(?3)))
+    ORDER BY c.id";
+
+/// One person for their page ([`crate::facade::Query::Person`]); `None` when the account does
+/// not exist. `user` may be an alias (a number, a PNI): the contact, the chat and the groups
+/// are the canonical person's.
+pub(crate) fn person(
+    conn: &Connection,
+    account: AccountId,
+    user: &UserId,
+) -> Result<Option<PersonDetail>> {
+    let acc: Option<(String, Option<String>, Option<String>)> = conn
+        .prepare_cached("SELECT own_ids, display_name, number FROM accounts WHERE id = ?1")?
+        .query_row([account.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    let Some((own_ids_json, own_name, own_number)) = acc else {
+        return Ok(None);
+    };
+    let own_ids: Vec<UserId> = sql::from_json(&own_ids_json)?;
+    let canonical = sql::user(&resolve_alias(conn, account.0, user)?)?;
+    let is_self = own_ids.contains(&canonical) || own_ids.contains(user);
+    let contact = contact_of(conn, account, &canonical)?;
+    let chat = match sql::conversation_id(
+        conn,
+        account,
+        &kourier_model::ConvKey::Direct(canonical.clone()),
+    )? {
+        Some(id) => {
+            let (features, timer, blocked, hidden): (Option<String>, Option<i64>, bool, bool) =
+                conn.prepare_cached(
+                    "SELECT features, timer_secs, blocked, hidden FROM conversations WHERE id = ?1",
+                )?
+                .query_row([id.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Some(PersonChat {
+                id,
+                timer: timer.map(|s| Duration::from_secs(u64::try_from(s.max(0)).unwrap_or(0))),
+                features: sql::from_json_opt::<ConversationFeatures>(features)?.unwrap_or_default(),
+                blocked,
+                hidden,
+            })
+        }
+        None => None,
+    };
+    // The own page has no groups in common (the account is in all of its own groups, so the
+    // query would list every one of them; Signal's own page has no such section).
+    let groups: Vec<(i64, Option<String>, Option<i64>)> = if is_self {
+        Vec::new()
+    } else {
+        let own_json = sql::to_json(&own_ids)?;
+        conn.prepare_cached(GROUPS_IN_COMMON)?
+            .query_map((canonical.as_str(), account.0, own_json), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<kourier_db::rusqlite::Result<_>>()?
+    };
+    let groups = groups
+        .into_iter()
+        .map(|(id, title, avatar)| {
+            Ok(CommonGroup {
+                id: ConversationId(id),
+                title,
+                avatar: blob_ref(conn, avatar)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(PersonDetail {
+        account,
+        user: canonical,
+        is_self,
+        contact,
+        own_name: is_self.then_some(own_name).flatten(),
+        own_number: is_self.then_some(own_number).flatten(),
+        chat,
+        groups,
+        // The descriptor's, filled in by the runtime ([`account_network`]).
+        safety_numbers: false,
+        // Likewise (the paused queues are the runtime's).
+        safety_waits: false,
+        // Likewise (the network makes the link).
+        link: crate::facade::LinkState::Hidden,
+        share: crate::facade::ShareState::Hidden,
+    }))
+}
+
+/// The network of `account` (`None`: no such account).
+pub(crate) fn account_network(
+    conn: &Connection,
+    account: AccountId,
+) -> Result<Option<kourier_model::NetworkKind>> {
+    let network: Option<String> = conn
+        .prepare_cached("SELECT network FROM accounts WHERE id = ?1")?
+        .query_row([account.0], |r| r.get(0))
+        .optional()?;
+    network.as_deref().map(sql::network).transpose()
+}
+
+/// The member rows of a group for its page, each with the core's name for the person
+/// (`display_name`'s rule: nickname, address book, profile) and the picture's file in the same
+/// statement: ONE statement for the whole list, not one per member (a group can hold 1,000).
+/// Starts at the group's members by the primary key of `members`; the contact by the unique key
+/// of `contacts` (`account_id, user_id`) and its picture by the primary key of `files`.
+/// `core.db` has no planner statistics: the LEFT JOINs fix the order (members outer), and
+/// `query::tests::the_group_members_start_at_the_group` pins the plan.
+pub(crate) const GROUP_MEMBERS: &str = concat!(
+    "SELECT m.user_id, m.role, coalesce(ct.nickname, ct.system_name, ",
+    shown_profile_name!("ct", "(SELECT network FROM accounts WHERE id = ?2)"),
+    "), f.path, f.key
+    FROM members m
+    LEFT JOIN contacts ct ON ct.account_id = ?2 AND ct.user_id = m.user_id
+    LEFT JOIN files f ON f.id = ct.avatar_file
+    WHERE m.conversation_id = ?1"
+);
+
+/// One group for its page ([`crate::facade::Query::Group`]); `None` when the conversation does not
+/// exist or is not a group (a 1:1 chat, a channel, a list: they have no member list to show).
+pub(crate) fn group(conn: &Connection, id: ConversationId) -> Result<Option<GroupDetail>> {
+    type Raw = (
+        i64,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        bool,
+    );
+    let raw: Option<Raw> = conn
+        .prepare_cached(
+            "SELECT account_id, kind, title, avatar_file, description, timer_secs, features, blocked
+             FROM conversations WHERE id = ?1",
+        )?
+        .query_row([id.0], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })
+        .optional()?;
+    let Some((account, kind, title, avatar, description, timer, features, blocked)) = raw else {
+        return Ok(None);
+    };
+    if sql::from_enum_name::<kourier_model::ConvKind>(&kind)? != kourier_model::ConvKind::Group {
+        return Ok(None);
+    }
+    let own_json: Option<String> = conn
+        .prepare_cached("SELECT own_ids FROM accounts WHERE id = ?1")?
+        .query_row([account], |r| r.get(0))
+        .optional()?;
+    let own_ids: Vec<UserId> = match own_json {
+        Some(json) => sql::from_json(&json)?,
+        None => Vec::new(),
+    };
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+    );
+    let rows: Vec<Row> = conn
+        .prepare_cached(GROUP_MEMBERS)?
+        .query_map((id.0, account), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let members = rows
+        .into_iter()
+        .map(|(user, role, name, path, key)| {
+            let user = sql::user(&user)?;
+            Ok(GroupMember {
+                is_self: own_ids.contains(&user),
+                user,
+                role: sql::from_enum_name(&role)?,
+                name,
+                avatar: path.zip(key).and_then(|(p, k)| blob_of(p, k)),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(GroupDetail {
+        account: AccountId(account),
+        id,
+        title,
+        avatar: blob_ref(conn, avatar)?,
+        description,
+        timer: timer.map(|s| Duration::from_secs(u64::try_from(s.max(0)).unwrap_or(0))),
+        features: sql::from_json_opt::<ConversationFeatures>(features)?.unwrap_or_default(),
+        blocked,
+        members,
+    }))
+}
+
+/// What a gallery shows of a message and of an attachment ([`chat_media`]), once: the message is
+/// not deleted (for me or for everyone), is not view-once and is not hidden because its time has
+/// come on an unconfirmed clock; the attachment is not the rest of a long text and is not one
+/// that cannot be had ("Not available on this device", "No longer available", a phone that
+/// said no): such a thing has nothing to show or open. The state is JSON: a unit variant is its
+/// name in quotes, `AskFailed` an object, matched by its TOTAL prefix (never `json_extract`, as
+/// the quiet notices' rule: the statement runs over every attachment of a chat).
+const GALLERY_SHOWN: &str = "m.deleted IS NULL AND m.view_once = 0 AND m.expiry_hidden = 0
+      AND a.long_text = 0 AND a.state NOT IN ('\"Unavailable\"', '\"Expired\"')
+      AND substr(a.state, 1, 12) <> '{\"AskFailed\"'";
+
+/// The attachment kinds of a gallery kind, as `attachments.kind` stores them. Voice notes are in
+/// neither list (and a sticker is a message of body kind `Sticker`, not `Media`).
+const VISUAL_KINDS: &str = "('Image', 'Video', 'Gif')";
+const FILE_KINDS: &str = "('File', 'Audio')";
+
+fn gallery_kinds(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Visual => VISUAL_KINDS,
+        MediaKind::Files => FILE_KINDS,
+    }
+}
+
+/// The index and the flag of a gallery kind (`0020_chat_media.sql`): the partial index of the
+/// media messages that have an attachment of that kind, and the flag that says so. A statement
+/// states BOTH terms of the index's WHERE (`body_kind = 'Media'` and the flag) and names the
+/// index (`INDEXED BY`), so it is an error and not a slow scan if the index ever stops applying
+/// (`core.db` has no planner statistics), and it never walks a message of the other kind.
+fn gallery_index(kind: MediaKind) -> (&'static str, &'static str) {
+    match kind {
+        MediaKind::Visual => ("messages_media_visual", "media_visual"),
+        MediaKind::Files => ("messages_media_files", "media_files"),
+    }
+}
+
+/// The statement of a gallery page: `?1` the chat, `?2` the limit, `?3 ?4 ?5` the position
+/// (`sort_key`, message, `idx`) the page goes on after. It starts at the PARTIAL index of its
+/// kind ([`gallery_index`]), by the row-value range `(sort_key, id) <= (?3, ?4)` of the
+/// timeline's own statement; the attachments of the message the position is in that were
+/// delivered already are cut by a plain filter (an `OR` there would invite the planner to a
+/// multi-index plan), and the attachments of one message come in `idx` order from the unique key
+/// of `attachments` (the join is nested, the outer rows are already in order: no sort).
+fn gallery_sql(kind: MediaKind) -> String {
+    let (index, flag) = gallery_index(kind);
+    format!(
+        "SELECT m.id, m.sort_key, a.idx, a.id, a.kind, a.mime, a.size, a.file_name, a.width,
+                a.height, a.duration_ms, a.blurhash, a.state
+         FROM messages m INDEXED BY {index}
+         CROSS JOIN attachments a ON a.message_id = m.id
+         WHERE m.conversation_id = ?1 AND m.body_kind = 'Media' AND m.{flag} = 1
+           AND (m.sort_key, m.id) <= (?3, ?4)
+           AND NOT (m.sort_key = ?3 AND m.id = ?4 AND a.idx <= ?5)
+           AND a.kind IN {} AND {GALLERY_SHOWN}
+         ORDER BY m.sort_key DESC, m.id DESC, a.idx
+         LIMIT ?2",
+        gallery_kinds(kind)
+    )
+}
+
+/// Whether the chat has a gallery item of this kind: one row, by the same index and rules.
+fn gallery_has_any(kind: MediaKind) -> String {
+    let (index, flag) = gallery_index(kind);
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM messages m INDEXED BY {index}
+           CROSS JOIN attachments a ON a.message_id = m.id
+           WHERE m.conversation_id = ?1 AND m.body_kind = 'Media' AND m.{flag} = 1
+             AND a.kind IN {} AND {GALLERY_SHOWN})",
+        gallery_kinds(kind)
+    )
+}
+
+/// A page of one chat's gallery ([`crate::facade::Query::ChatMedia`]): the attachments of the
+/// shown messages of one kind, newest message first. `more` is whether any follow the last item
+/// (one row more than asked is read); the first page also says whether the other kind has any
+/// (`other`).
+pub(crate) fn chat_media(conn: &Connection, q: &ChatMediaQuery) -> Result<ChatMediaPage> {
+    let limit = i64::from(q.limit.clamp(1, MAX_MEDIA_PAGE));
+    let (key, message, idx) = match q.before {
+        Some(c) => (c.sort_key, c.message.0, c.idx.map_or(-1, i64::from)),
+        None => (i64::MAX, i64::MAX, -1),
+    };
+    type Raw = (
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        String,
+    );
+    let raws: Vec<Raw> = conn
+        .prepare_cached(&gallery_sql(q.kind))?
+        .query_map((q.conv.0, limit + 1, key, message, idx), |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+            ))
+        })?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let more = raws.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    let items = raws
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .map(
+            |(msg, sort_key, idx, id, kind, mime, size, name, w, h, dur, blurhash, state)| {
+                let state = sql::from_json::<AttachmentState>(&state)?;
+                Ok(ChatMediaItem {
+                    message: MessageId(msg),
+                    sort_key,
+                    idx: sql::u32_of(idx),
+                    attachment: Attachment {
+                        id: Some(AttachmentId(id)),
+                        kind: sql::from_enum_name(&kind)?,
+                        mime: mime.unwrap_or_default(),
+                        size: size.and_then(|s| u64::try_from(s).ok()).unwrap_or(0),
+                        file_name: name,
+                        dims: w.zip(h).map(|(w, h)| (sql::u32_of(w), sql::u32_of(h))),
+                        duration_ms: dur.map(sql::u32_of),
+                        blurhash,
+                        state,
+                        ..Attachment::default()
+                    },
+                    // (`GALLERY_SHOWN` leaves out the messages and the long texts the rule refuses.)
+                    save: crate::actions::may_save_file(state, false).is_ok(),
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let other = q.before.is_none()
+        && conn
+            .prepare_cached(&gallery_has_any(match q.kind {
+                MediaKind::Visual => MediaKind::Files,
+                MediaKind::Files => MediaKind::Visual,
+            }))?
+            .query_row([q.conv.0], |r| r.get::<_, bool>(0))?;
+    Ok(ChatMediaPage {
+        conv: q.conv,
+        kind: q.kind,
+        items,
+        more,
+        other,
+    })
+}
+
+/// The media handles of the attachments of a gallery page (registered when the page is answered,
+/// like a timeline page's, §8.6): `image://kourier/thumb/<id>` draws nothing without one.
+pub(crate) fn chat_media_handles(conn: &Connection, page: &ChatMediaPage) -> Result<Vec<RawMedia>> {
+    let mut out = Vec::new();
+    for item in &page.items {
+        if let Some(id) = item.attachment.id
+            && let Some(raw) = media_entry(conn, id)?
+        {
+            out.push(raw);
+        }
+    }
+    Ok(out)
+}
+
+/// The contact row of `user` for a page: every column, as the ingest side loads it.
+fn contact_of(conn: &Connection, account: AccountId, user: &UserId) -> Result<Option<Contact>> {
+    type Row = (
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<Vec<u8>>,
+        bool,
+        bool,
+        Option<i64>,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+    );
+    let row: Option<Row> = conn
+        .prepare_cached(
+            "SELECT id, profile_name, system_name, nickname, avatar_file, trust, fingerprint,
+               blocked, hidden, unregistered_at, identifiers, meta, about, about_emoji,
+               number_shown
+             FROM contacts WHERE account_id = ?1 AND user_id = ?2",
+        )?
+        .query_row((account.0, user.as_str()), |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+                r.get(14)?,
+            ))
+        })
+        .optional()?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(Contact {
+        id: kourier_model::ContactId(r.0),
+        account,
+        user: user.clone(),
+        profile_name: r.1,
+        system_name: r.2,
+        nickname: r.3,
+        avatar: blob_ref(conn, r.4)?,
+        trust: sql::from_enum_name(&r.5)?,
+        identity_fingerprint: r.6,
+        blocked: r.7,
+        hidden: r.8,
+        unregistered_at: r.9,
+        identifiers: sql::from_json(&r.10)?,
+        meta: sql::blob_from_sql(r.11),
+        about: r.12,
+        about_emoji: r.13,
+        number_shown: r.14,
     }))
 }
 
@@ -465,6 +1049,9 @@ struct PageCtx {
     now: i64,
     /// The account is linked.
     active: bool,
+    /// The account's network has a backend in this run (a paused account's messages offer
+    /// nothing the core would refuse, [`Facts::registered`]).
+    registered: bool,
     /// The account's network can ask its other device for lost files
     /// (`AccountCaps::restores_attachments`).
     restores: bool,
@@ -476,6 +1063,8 @@ struct PageCtx {
     blocked: bool,
     /// The chat with ourselves.
     note_to_self: bool,
+    /// The conversation is a group (`ConvKey::Group`): its messages name their sender.
+    group: bool,
     features: Option<ConversationFeatures>,
     /// One of our ids is an admin of the conversation.
     admin: bool,
@@ -485,12 +1074,25 @@ struct PageCtx {
     /// Own messages that still have their send row in the outbox → that row's state
     /// (`waits` false: it failed and is only kept for "Retry").
     queued: HashMap<i64, QueuedRaw>,
+    /// The messages of this conversation whose backend reports an upload that is still moving
+    /// ([`crate::runtime::Shared::uploading`]; empty for a paused account, which has no
+    /// backend): one term of [`actions::stoppable`].
+    uploading: HashSet<i64>,
+    /// Whose safety number the conversation's queue waits for (set by [`timeline`]; `None`
+    /// for a paused account, which has no backend to confirm with).
+    paused: Option<UserId>,
     /// Display name and avatar per author.
     people: HashMap<String, (Option<String>, Option<BlobRef>)>,
 }
 
 impl PageCtx {
-    fn load(conn: &Connection, conv: ConversationId, now: i64) -> Result<Self> {
+    fn load(
+        conn: &Connection,
+        conv: ConversationId,
+        now: i64,
+        registered: bool,
+        uploading: &HashSet<MessageId>,
+    ) -> Result<Self> {
         type Raw = (
             bool,
             Option<String>,
@@ -571,11 +1173,20 @@ impl PageCtx {
             conv,
             now,
             active: sql::account_state(&state, reason)? == AccountState::Active,
+            registered,
+            uploading: if registered {
+                uploading.iter().map(|m| m.0).collect()
+            } else {
+                HashSet::new()
+            },
+            paused: None,
             restores: caps
                 .as_ref()
                 .is_some_and(kourier_model::AccountCaps::restores_attachments),
             receive_limit: caps.and_then(|c| c.max_receive_attachment_bytes),
             number_only: sql::conv_key(&conv_key).is_ok_and(|k| k.is_number_only()),
+            group: sql::conv_key(&conv_key)
+                .is_ok_and(|k| matches!(k, kourier_model::ConvKey::Group(_))),
             blocked,
             note_to_self,
             per_user: match &features {
@@ -610,21 +1221,42 @@ impl PageCtx {
     }
 }
 
-/// A timeline page, oldest first, keyset-paged by `(sort_key, id)`. `now` is the core clock:
-/// the rows' action flags are computed for it.
-pub(crate) fn timeline(conn: &Connection, q: &TimelineQuery, now: i64) -> Result<TimelinePage> {
-    let limit = i64::from(q.limit.clamp(1, MAX_PAGE));
-    let mut ctx = PageCtx::load(conn, q.conv, now)?;
-    // Not what a delete for me hid, and not what is hidden because its time has come on a
-    // clock nobody confirmed (`expiry_hidden`, [`crate::expiry`]).
-    let visible =
-        "conversation_id = ?1 AND (deleted IS NULL OR deleted <> 'ForMe') AND expiry_hidden = 0";
-    let older = |key: i64, id: i64, n: i64, inclusive: bool| -> Result<Vec<MsgRaw>> {
-        let op = if inclusive { "<=" } else { "<" };
-        let sql = format!(
-            "{MSG_SELECT} WHERE {visible} AND (sort_key, id) {op} (?2, ?3)
+/// Not what a delete for me hid, and not what is hidden because its time has come on a clock
+/// nobody confirmed (`expiry_hidden`, [`crate::expiry`]).
+const TIMELINE_VISIBLE: &str =
+    "conversation_id = ?1 AND (deleted IS NULL OR deleted <> 'ForMe') AND expiry_hidden = 0";
+
+/// The statement of the timeline's older side (`op` is `<` or `<=`): its own text, so a plan
+/// test can name the index it uses (`messages_timeline`, never one of the gallery's `messages_media_*`).
+pub(crate) fn timeline_older_sql(op: &str) -> String {
+    format!(
+        "{MSG_SELECT} WHERE {TIMELINE_VISIBLE} AND (sort_key, id) {op} (?2, ?3)
              ORDER BY sort_key DESC, id DESC LIMIT ?4"
-        );
+    )
+}
+
+/// A timeline page, oldest first, keyset-paged by `(sort_key, id)`. `now` is the core clock:
+/// the rows' action flags are computed for it. `registered`: the conversation's network has a
+/// backend in this run (a paused account's rows offer only what needs no network).
+/// `uploading`: the messages of the conversation whose upload is reported moving (the stop
+/// rule's second term, [`actions::stoppable`]). `paused`: the conversation's queue waits for
+/// the user to confirm this person's safety number ([`crate::runtime::Shared::paused`]): every
+/// own message of the queue that still waits (the paused head and the rows behind it) offers
+/// "Show <name>'s Safety Number" ([`MessageActions::safety_number`], P5a BQ-3, U4).
+pub(crate) fn timeline(
+    conn: &Connection,
+    q: &TimelineQuery,
+    now: i64,
+    registered: bool,
+    uploading: &HashSet<MessageId>,
+    paused: Option<UserId>,
+) -> Result<TimelinePage> {
+    let limit = i64::from(q.limit.clamp(1, MAX_PAGE));
+    let mut ctx = PageCtx::load(conn, q.conv, now, registered, uploading)?;
+    ctx.paused = paused.filter(|_| registered);
+    let visible = TIMELINE_VISIBLE;
+    let older = |key: i64, id: i64, n: i64, inclusive: bool| -> Result<Vec<MsgRaw>> {
+        let sql = timeline_older_sql(if inclusive { "<=" } else { "<" });
         Ok(conn
             .prepare_cached(&sql)?
             .query_map((q.conv.0, key, id, n), msg_raw)?
@@ -833,13 +1465,14 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
     // The same facts and the same rules the commands check (`actions`).
     let own = raw.author.is_empty();
     let sending = if own && ctx.queued.contains_key(&raw.id) {
-        actions::sending_of(conn, MessageId(raw.id))?
+        actions::sending_of(conn, MessageId(raw.id), ctx.uploading.contains(&raw.id))?
     } else {
         Sending::Settled
     };
     let flags = actions::all(
         &Facts {
             active: ctx.active,
+            registered: ctx.registered,
             blocked: ctx.blocked,
             features: ctx.features.as_ref(),
             admin: ctx.admin,
@@ -857,8 +1490,37 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
         ctx.now,
     );
     let mut flags = flags;
+    // "Send Again" is accepted for an own message whose send row is in the outbox and not in
+    // flight, unless the network refused it as a reach-out or the chat lost the right to send
+    // (`actions::retry`, the ONE rule `RetryMessage` checks too). A row that waits has no
+    // refusal of the network to read, but a chat that cannot send refuses it all the same.
+    flags.retry = own
+        && ctx.registered
+        && match ctx.queued.get(&raw.id) {
+            Some(q) if !q.in_flight => {
+                let floor = if q.waits {
+                    None
+                } else {
+                    crate::outbox::floor(conn, MessageId(raw.id))?
+                };
+                actions::retry(floor.as_ref(), ctx.features.as_ref()).is_ok()
+            }
+            _ => false,
+        };
+    // "Show Sender's Page" and one "Show <name>'s Page" per person the text mentions: from the
+    // body's own ranges and the conversation's kind, never from the UI (`actions::show_people`).
+    flags.show_sender = actions::show_sender(own, ctx.group);
+    flags.show_people = actions::show_people(raw.deleted.is_some(), &body, &ctx.own_ids);
+    // Every own message of a queue that waits for a safety number names the person (BQ-3, U4):
+    // the paused head (shown as failed) and the rows behind it (waiting); a row that failed for
+    // good (`waits` false) is not part of the wait.
+    flags.safety_number = match (&ctx.paused, ctx.queued.get(&raw.id)) {
+        (Some(user), Some(q)) if own && q.waits => Some(user.clone()),
+        _ => None,
+    };
     flags.ask_attachments = actions::ask_attachments(
         ctx.active
+            && ctx.registered
             && ctx.restores
             && raw.named
             && !raw.view_once
@@ -868,17 +1530,11 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
         &body,
         ctx.receive_limit,
     );
-    let deleted = match raw.deleted.as_deref() {
-        None => None,
-        Some("ForMe") => Some(Deletion::ForMe),
-        Some(_) => Some(Deletion::ForEveryone {
-            by: raw
-                .deleted_by
-                .filter(|b| !b.is_empty())
-                .map(|b| sql::user(&b))
-                .transpose()?,
-        }),
-    };
+    // The timeline's SELECT leaves out the rows hidden on an unconfirmed clock
+    // (`TIMELINE_VISIBLE`), so none reaches here; the rule asks all the same.
+    flags.save_attachments =
+        actions::save_attachments(raw.deleted.as_deref(), raw.view_once, false, &body);
+    let deleted = deletion_of(raw.deleted.as_deref(), raw.deleted_by)?;
     let expiry = match (raw.expiry_kind, raw.expiry_ms) {
         (Some(kind), Some(ms)) => Some(Expiry {
             kind: sql::from_enum_name::<DisappearKind>(&kind)?,
@@ -1033,6 +1689,25 @@ fn reactions(conn: &Connection, message: i64, per_user: Option<u8>) -> Result<Ve
     Ok(groups.into_iter().map(|(_, g)| g).collect())
 }
 
+/// SQL: the original of a quote of the conversation `?4`: the rows with the id `?2`, of the author
+/// `?3` when one is bound: by their key, a revision's key, or an earlier name (KT-2: a quote made
+/// before the server named the message).
+pub(crate) const QUOTE_ORIGINAL: &str =
+    "SELECT m.id, m.deleted, m.body, m.net_author FROM messages m
+ WHERE m.account_id = ?1 AND m.conversation_id = ?4 AND m.net_local = ?2
+   AND (?3 IS NULL OR m.net_author = ?3) AND m.expiry_hidden = 0
+ UNION ALL
+ SELECT m.id, m.deleted, m.body, m.net_author FROM message_revisions v
+   JOIN messages m ON m.id = v.message_id
+ WHERE v.account_id = ?1 AND m.conversation_id = ?4 AND v.net_local = ?2
+   AND (?3 IS NULL OR v.net_author = ?3) AND m.expiry_hidden = 0
+ UNION ALL
+ SELECT m.id, m.deleted, m.body, m.net_author FROM message_aliases a
+   CROSS JOIN messages m ON m.id = a.message_id
+ WHERE a.account_id = ?1 AND a.net_local = ?2 AND m.conversation_id = ?4
+   AND (?3 IS NULL OR m.net_author = ?3) AND m.expiry_hidden = 0
+ LIMIT 4";
+
 /// Resolves the quote of a row for display: the original (when it is a message of this
 /// conversation, by its current or a revision key), who wrote it, and what the quote block
 /// shows, from the sender's snapshot first and the original second.
@@ -1057,25 +1732,25 @@ fn reply_preview(
     };
     // (id, deleted, body, author). An original that is hidden because its time has come
     // on an unconfirmed clock is not found, like one the sweeper erased: the quote keeps
-    // only what its sender's snapshot says.
+    // only what its sender's snapshot says. A quote WITHOUT an author names its original by the
+    // id alone, and under per-sender ids two members may share an id: it shows the original only
+    // when exactly one message of the conversation has the id (a message and its own revisions
+    // are one), else the sender's snapshot, as for a missing original. With an author, the row
+    // of that author.
     type Found = (i64, Option<String>, String, String);
-    let found: Option<Found> = conn
-        .prepare_cached(
-            "SELECT m.id, m.deleted, m.body, m.net_author FROM messages m
-             WHERE m.account_id = ?1 AND m.conversation_id = ?4 AND m.net_local = ?2
-               AND (?3 IS NULL OR m.net_author = ?3) AND m.expiry_hidden = 0
-             UNION ALL
-             SELECT m.id, m.deleted, m.body, m.net_author FROM message_revisions v
-               JOIN messages m ON m.id = v.message_id
-             WHERE v.account_id = ?1 AND m.conversation_id = ?4 AND v.net_local = ?2
-               AND (?3 IS NULL OR v.net_author = ?3) AND m.expiry_hidden = 0
-             LIMIT 1",
-        )?
-        .query_row(
+    let rows: Vec<Found> = conn
+        .prepare_cached(QUOTE_ORIGINAL)?
+        .query_map(
             (account, r.target.local.as_ref(), &canonical, ctx.conv.0),
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
+        )?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    let ambiguous = canonical.is_none() && rows.iter().any(|f| f.0 != rows[0].0);
+    let found: Option<Found> = if ambiguous {
+        None
+    } else {
+        rows.into_iter().next()
+    };
     let author_col = canonical.or_else(|| found.as_ref().map(|f| f.3.clone()));
     let own = author_col.as_deref() == Some("");
     let author_name = match author_col.as_deref() {
@@ -1217,6 +1892,45 @@ pub(crate) fn conversation_of_attachment(
         .query_row([id.0], |r| r.get(0))
         .optional()?
         .map(ConversationId))
+}
+
+/// [`crate::facade::Query::SaveFacts`], without the sniffed type (the runtime reads the first
+/// bytes of the plaintext): who sent the attachment's message, when, and where the file stands
+/// among the message's files. `None` for an unknown attachment and for a message hidden on an
+/// unconfirmed clock (gone for the user).
+pub(crate) fn save_facts(
+    conn: &Connection,
+    id: AttachmentId,
+) -> Result<Option<crate::facade::SaveFacts>> {
+    type Raw = (i64, String, i64, i64, Option<String>, Option<String>);
+    let raw: Option<Raw> = conn
+        .prepare_cached(
+            "SELECT m.account_id, m.net_author, m.sent_at,
+                    (SELECT COUNT(*) FROM attachments b WHERE b.message_id = a.message_id AND b.idx <= a.idx),
+                    a.file_name, a.mime
+             FROM attachments a JOIN messages m ON m.id = a.message_id
+             WHERE a.id = ?1 AND m.expiry_hidden = 0 AND m.view_once = 0 AND m.deleted IS NULL",
+        )?
+        .query_row([id.0], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .optional()?;
+    let Some((account, author, sent_at, position, file_name, mime)) = raw else {
+        return Ok(None);
+    };
+    Ok(Some(crate::facade::SaveFacts {
+        account: AccountId(account),
+        author: if author.is_empty() {
+            None
+        } else {
+            Some(sql::user(&author)?)
+        },
+        sent_at,
+        position: sql::u32_of(position),
+        file_name,
+        mime,
+        sniffed: None,
+    }))
 }
 
 /// The files of one attachment (media-handle misses, §8.6).
@@ -1388,4 +2102,211 @@ pub(crate) fn page_media(conn: &Connection, page: &TimelinePage) -> Result<Vec<R
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use kourier_model::{MsgIdScope, NetworkKind, UserId};
+
+    /// The groups in common start at `members_by_user` (the person), then reach the group's row
+    /// and our own membership by primary keys: no walk through `members` (every member of every
+    /// group of every account) and no sort of a temporary tree. `core.db` has no planner
+    /// statistics, so the plan is pinned.
+    #[test]
+    fn the_groups_in_common_start_at_the_members_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([4u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let steps: Vec<String> = h
+            .connection()
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::GROUPS_IN_COMMON
+                    .replace("?1", "'aci:a'")
+                    .replace("?2", "1")
+                    .replace("?3", "'[\"aci:me\"]'")
+            ))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .expect("rows");
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("members_by_user (user_id=?)")),
+            "starts at the person's memberships: {steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("sqlite_autoindex_members_1")
+                    && s.contains("conversation_id=?")
+                    && s.contains("user_id=?")
+                    || s.contains("sqlite_autoindex_members_1") && s.contains("conversation_id=?")),
+            "our own membership by the primary key of members: {steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|s| !s.contains("SCAN members") && !s.contains("SCAN mb")),
+            "no walk through members: {steps:#?}"
+        );
+    }
+
+    /// The members of a group are read in ONE statement that starts at the group's rows of
+    /// `members` (its primary key) and reaches each name by the unique key of `contacts` and each
+    /// picture by the primary key of `files`: no walk through `members`, `contacts` or `files`
+    /// (a group of 1,000 would cost three scans per page) and no sort of a temporary tree.
+    /// `core.db` has no planner statistics, so the plan is pinned.
+    #[test]
+    fn the_group_members_start_at_the_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([4u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        let steps: Vec<String> = h
+            .connection()
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::GROUP_MEMBERS.replace("?1", "1").replace("?2", "1")
+            ))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .expect("rows");
+        let has = |needles: &[&str]| steps.iter().any(|s| needles.iter().all(|n| s.contains(n)));
+        assert!(
+            has(&["m", "sqlite_autoindex_members_1", "conversation_id=?"]),
+            "starts at the group's members by the primary key: {steps:#?}"
+        );
+        assert!(
+            has(&[
+                "ct",
+                "sqlite_autoindex_contacts_1",
+                "account_id=?",
+                "user_id=?"
+            ]),
+            "each name by the unique key of contacts: {steps:#?}"
+        );
+        assert!(
+            has(&["f", "INTEGER PRIMARY KEY"]),
+            "each picture by the primary key of files: {steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|s| !s.contains("SCAN") && !s.contains("TEMP B-TREE")),
+            "no walk through a table and no temporary sort: {steps:#?}"
+        );
+    }
+    /// The detail lines of `EXPLAIN QUERY PLAN` of `sql` on a migrated `core.db`, with the
+    /// parameters bound as a first page would bind them.
+    fn plan_of(sql: &str, params: &[i64]) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = crate::testing::IngestHarness::open(
+            &dir.path().join("core.db"),
+            &kourier_db::DbKey::from([4u8; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse("aci:me").expect("user id")],
+        )
+        .expect("harness");
+        h.connection()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare")
+            .query_map(kourier_db::rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("plan")
+            .collect::<kourier_db::rusqlite::Result<_>>()
+            .expect("rows")
+    }
+
+    /// The gallery of a chat (both kinds, the page and the "is there any" statement) starts at
+    /// the PARTIAL index of ITS kind (`messages_media_visual` for the pictures,
+    /// `messages_media_files` for the files: a chat of 20,000 pictures and one file must not walk
+    /// 20,000 messages for the file) by the chat, goes along it in the order of the page (no
+    /// temporary sort), reaches the attachments of a message by the unique key of `attachments`,
+    /// and never touches the other kind's index or the timeline's: no walk through the chat's
+    /// messages, whatever their number (`core.db` has no planner statistics, so the plan is
+    /// pinned, and `INDEXED BY` turns a plan that ever stops applying into an error).
+    #[test]
+    fn the_gallery_starts_at_the_partial_index_of_its_kind() {
+        for (kind, mine, other) in [
+            (
+                super::MediaKind::Visual,
+                "messages_media_visual",
+                "messages_media_files",
+            ),
+            (
+                super::MediaKind::Files,
+                "messages_media_files",
+                "messages_media_visual",
+            ),
+        ] {
+            let page = plan_of(&super::gallery_sql(kind), &[1, 8, i64::MAX, i64::MAX, -1]);
+            let any = plan_of(&super::gallery_has_any(kind), &[1]);
+            for (what, steps) in [("page", page), ("any", any)] {
+                assert!(
+                    steps
+                        .iter()
+                        .any(|s| s.contains(mine) && s.contains("conversation_id=?")),
+                    "{kind:?} {what} starts at {mine} by the chat: {steps:#?}"
+                );
+                assert!(
+                    steps
+                        .iter()
+                        .any(|s| s.contains("sqlite_autoindex_attachments_1")
+                            && s.contains("message_id=?")),
+                    "{kind:?} {what} reaches the attachments by their unique key: {steps:#?}"
+                );
+                // ("SCAN CONSTANT ROW" is the one row of `SELECT EXISTS (...)`, no table.)
+                assert!(
+                    steps
+                        .iter()
+                        .all(|s| (!s.contains("SCAN") || s.contains("CONSTANT ROW"))
+                            && !s.contains("TEMP B-TREE")),
+                    "{kind:?} {what}: no walk through a table, no temporary sort: {steps:#?}"
+                );
+                assert!(
+                    steps
+                        .iter()
+                        .all(|s| !s.contains("messages_timeline") && !s.contains(other)),
+                    "{kind:?} {what} uses its own gallery index alone: {steps:#?}"
+                );
+            }
+        }
+    }
+
+    /// The gallery's partial index takes nothing from the statements that were there: the
+    /// timeline's page (its older side) still goes along `messages_timeline`, never along
+    /// `messages_media_*` (its WHERE does not say `body_kind = 'Media'`, so SQLite cannot use a
+    /// partial index for it; `notices::tests` pin the list's own statements the same way).
+    #[test]
+    fn the_timeline_page_still_uses_the_timeline_index() {
+        for op in ["<", "<="] {
+            let steps = plan_of(&super::timeline_older_sql(op), &[1, i64::MAX, i64::MAX, 51]);
+            assert!(
+                steps.iter().any(|s| s.contains("messages_timeline")),
+                "the timeline page goes along messages_timeline: {steps:#?}"
+            );
+            assert!(
+                steps.iter().all(|s| !s.contains("messages_media")),
+                "and not along a gallery index: {steps:#?}"
+            );
+        }
+    }
 }

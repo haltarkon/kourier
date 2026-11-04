@@ -62,6 +62,7 @@ use super::calls;
 use super::group_dispatch;
 use super::media;
 use super::stage2::Row;
+use super::unarchive;
 use crate::db::{self, Account};
 use crate::error::Result;
 use crate::jobs::{self, JobKind};
@@ -148,7 +149,8 @@ impl Outcome {
 /// Maps one inbox row. Side effects (profile keys, timer versions, archived sessions, owed
 /// delivery receipts, the Message Send Log) are written on `conn`, inside the caller's zone; the
 /// features of every 1:1 chat the events touch go in front of them when the core does not have
-/// them yet. `Err` only for database failures.
+/// them yet, and a message that brings an archived chat back is preceded by the upsert that
+/// says so ([`unarchive`]). `Err` only for database failures.
 pub(crate) fn dispatch(conn: &Connection, ctx: &Ctx<'_>, row: &Row) -> Result<Outcome> {
     Ok(match dispatch_content(conn, ctx, row)? {
         Outcome::Handled {
@@ -156,7 +158,11 @@ pub(crate) fn dispatch(conn: &Connection, ctx: &Ctx<'_>, row: &Row) -> Result<Ou
             ephemeral,
             note,
         } => Outcome::Handled {
-            events: features::with_features(conn, ctx.account, events, ctx.now)?,
+            events: unarchive::bring_back(
+                conn,
+                ctx,
+                features::with_features(conn, ctx.account, events, ctx.now)?,
+            )?,
             ephemeral,
             note,
         },
@@ -359,17 +365,24 @@ fn data_message(
     let Ok(user) = aci_user_id(aci) else {
         return Ok(Outcome::dropped("sender id"));
     };
+    let mut restated = None;
     if let Some(key) = message.profile_key.as_deref().filter(|k| k.len() == 32) {
         // A new profile key (fetched again even if a fetch is running with the old one), or
         // the first message of a contact whose profile we never fetched (§6.10 cadence).
+        let shown_before = peers::number_shown_before(conn, &row.sender)?;
         if peers::store_profile_key(conn, aci, key, ctx.now)? {
             profile::request(conn, &row.sender, ctx.now)?;
+            // A key we did not hold hides a number they do not share (the rule's input moved).
+            restated = peers::number_shown_event(conn, &user, &row.sender, shown_before)?;
         } else if !profile::fetched(conn, &row.sender)? {
             profile::queue(conn, &row.sender, ctx.now)?;
         }
     }
     peers::mark_registered(conn, &row.sender, ctx.now)?;
-    let outcome = data_message_events(conn, ctx, row, aci, user, &message)?;
+    let mut outcome = data_message_events(conn, ctx, row, aci, user, &message)?;
+    if let (Some(event), Outcome::Handled { events, .. }) = (restated, &mut outcome) {
+        events.insert(0, event);
+    }
     let accepted = || -> Result<bool> {
         if message.group_v2.is_some() {
             group_dispatch::delivery_receipts_owed(conn, &message)
@@ -1080,6 +1093,83 @@ pub(super) fn edit_events(
     }])
 }
 
+/// `SyncMessage.verified` from another of our devices (P5 BQ-1 (a), critic F2/F4, Appendix
+/// M2): the person by their ACI (binary first, the string second), the key (33 bytes with its
+/// type byte) and the state. DEFAULT and VERIFIED are applied by
+/// [`crate::safety::apply_remote_state`] for the STORED key only (no row: inserted); another
+/// key stores nothing and queues a profile fetch (a message never replaces a key). UNVERIFIED
+/// is not a state a device sets by hand and is dropped, as Android does. The runner is woken
+/// after the lane step (`stage2::lane_step`), which the release needs.
+fn verified_sync(
+    conn: &Connection,
+    ctx: &Ctx<'_>,
+    row: &Row,
+    verified: &proto::Verified,
+) -> Result<Outcome> {
+    use proto::verified::State;
+    let Ok(Some(aci)) = crate::service_id::aci_from_wire(
+        verified.destination_aci_binary.as_deref(),
+        verified.destination_aci.as_deref(),
+    ) else {
+        return Ok(Outcome::dropped("verified sync without an ACI"));
+    };
+    if aci == ctx.account.aci {
+        return Ok(Outcome::dropped("verified sync about ourselves"));
+    }
+    let Some(Ok(key)) = verified
+        .identity_key
+        .as_deref()
+        .map(libsignal_protocol::IdentityKey::decode)
+    else {
+        return Ok(Outcome::dropped(
+            "verified sync without a valid identity key",
+        ));
+    };
+    let state = match verified.state.and_then(|s| State::try_from(s).ok()) {
+        Some(State::Verified) => crate::store::IDENTITY_VERIFIED,
+        Some(State::Default) | None => crate::store::IDENTITY_DEFAULT,
+        Some(State::Unverified) => {
+            return Ok(Outcome::dropped("verified sync of state unverified"));
+        }
+    };
+    let Ok(user) = crate::service_id::aci_user_id(aci) else {
+        return Ok(Outcome::dropped("verified sync without an ACI"));
+    };
+    let sid = ServiceId::Aci(aci).service_id_string();
+    match crate::safety::apply_remote_state(
+        conn,
+        &user,
+        &sid,
+        &key,
+        state,
+        ctx.now,
+        crate::safety::RemoteSource::Sync {
+            timestamp: row.timestamp,
+        },
+    )? {
+        crate::safety::Remote::OtherKey => {
+            jobs::request(conn, JobKind::ProfileFetch, &sid, ctx.now, None)?;
+            Ok(Outcome::dropped(
+                "verified sync for another key: profile fetch queued",
+            ))
+        }
+        crate::safety::Remote::Kept => Ok(Outcome::dropped("verified sync kept")),
+        crate::safety::Remote::Applied {
+            trust,
+            fingerprint,
+            events,
+            released: _,
+        } => {
+            let mut patch = ContactPatch::new(user);
+            patch.trust = Some(trust);
+            patch.identity_fingerprint = kourier_model::Patch::Set(fingerprint);
+            let mut all = vec![BackendEvent::ContactUpsert(patch)];
+            all.extend(events);
+            Ok(Outcome::events(all))
+        }
+    }
+}
+
 /// A `SyncMessage` (`#handleSyncMessage`): only from our own ACI and never from this device
 /// (item 21).
 fn sync_message(
@@ -1180,9 +1270,10 @@ fn sync_message(
         // Stage 1 applies a valid one in its own zone (`crate::number_change`); what reaches
         // stage 2 was refused there.
         Some(Sync::PniChangeNumber(_)) => Outcome::dropped("number change (not applied)"),
-        Some(Sync::Request(_) | Sync::Verified(_)) => {
-            Outcome::dropped("sync request or verified (ignored by linked devices)")
-        }
+        Some(Sync::Request(_)) => Outcome::dropped("sync request (ignored by linked devices)"),
+        // Desktop drops it, Android applies it (`IdentityUtil.processVerifiedMessage`); P5
+        // BQ-1 (a): applied for the stored key only.
+        Some(Sync::Verified(verified)) => verified_sync(conn, ctx, row, &verified)?,
         // The phone's word on a call: answered, declined, unanswered, deleted.
         Some(Sync::CallEvent(event)) => calls::call_event(conn, ctx, row, &event)?,
         // The Calls tab of the phone (clear, mark as read) and call links: Kourier has
@@ -1471,6 +1562,7 @@ fn delete_for_me(ctx: &Ctx<'_>, row: &Row, delete: &proto::sync_message::DeleteF
             conv,
             up_to,
             remove: cleared.is_full_delete.unwrap_or(false),
+            before_ms: None,
             at,
         });
     }
@@ -1482,6 +1574,7 @@ fn delete_for_me(ctx: &Ctx<'_>, row: &Row, delete: &proto::sync_message::DeleteF
             conv,
             up_to: Vec::new(),
             remove: true,
+            before_ms: None,
             at,
         });
     }

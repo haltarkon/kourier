@@ -8,14 +8,19 @@
 //! a consumer may trust the bytes only once it read to the end without an error.
 //!
 //! Writes are atomic: `<id>.tmp`, fsync, rename, fsync of the directory; files are 0600 and
-//! directories 0700. Plaintext exists only in the [`MediaCache`] (tmpfs) and in memory.
+//! directories 0700. Plaintext exists only in the [`MediaCache`] (tmpfs), in memory and in the
+//! copies a user saves into a folder of his own ([`save_copy`], [`save_to`]).
 
+mod export;
 mod format;
 mod media;
 mod reader;
 mod store;
 mod writer;
 
+pub use export::{
+    MAX_NAME_BYTES, SaveError, SaveMode, Staging, check_name, save_copy, save_staged, save_to,
+};
 pub use format::{CHUNK_SIZE, HEADER_LEN, MAGIC, VERSION};
 pub use media::{MediaCache, MediaFile};
 pub use reader::BlobReader;

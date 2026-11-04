@@ -5,13 +5,16 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (set `KOURIER_REQUIRE_MOCK_HARNESS=1` to fail instead).
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use support::harness::{
-    CreatePrimary, GroupSpec, Harness, HarnessError, HarnessOptions, PROTOCOL_VERSION, SendText,
-    Setup, locate_or_skip, parse_node_major,
+    CreateGroup, CreatePrimary, GroupInfo, GroupSpec, Harness, HarnessError, HarnessOptions,
+    PROTOCOL_VERSION, PhoneChange, Primary, SendText, Setup, StorageAccount, StorageContact,
+    StorageGroup, StorageSpec, StorageSubject, StorageWrites, locate_or_skip, parse_node_major,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -290,5 +293,585 @@ async fn startup_failures_carry_the_reason() -> Result<(), HarnessError> {
         }
         other => panic!("expected a startup error, got {:?}", other.err()),
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Storage Service commands of A10c (`tests/mock-harness/harness.mjs`): each case asserts the
+// command's own contract. Counts, ids' lengths and flags only; every value is synthetic.
+// ---------------------------------------------------------------------------------------------
+
+/// A phone with two contacts and a group, and what the cases need to name them.
+struct StoragePhone {
+    harness: Harness,
+    phone: Primary,
+    ada: Primary,
+    bo: Primary,
+    group: GroupInfo,
+}
+
+impl StoragePhone {
+    async fn start() -> Result<Option<Self>, HarnessError> {
+        let Some(harness) = Harness::start_or_skip().await? else {
+            return Ok(None);
+        };
+        let ada = harness.create_primary(&CreatePrimary::named("Ada")).await?;
+        let bo = harness.create_primary(&CreatePrimary::named("Bo")).await?;
+        let phone = harness
+            .create_primary(&CreatePrimary {
+                contacts: vec![ada.device_ref.clone(), bo.device_ref.clone()],
+                ..CreatePrimary::named("Phone")
+            })
+            .await?;
+        let group = harness
+            .create_group(&CreateGroup {
+                from: phone.device_ref.clone(),
+                title: String::from("Club"),
+                members: vec![ada.device_ref.clone(), bo.device_ref.clone()],
+                ..CreateGroup::default()
+            })
+            .await?;
+        Ok(Some(Self {
+            harness,
+            phone,
+            ada,
+            bo,
+            group,
+        }))
+    }
+
+    /// The account record, the two contacts and the group, all with their defaults.
+    fn plain(&self) -> StorageSpec {
+        StorageSpec {
+            primary: self.phone.device_ref.clone(),
+            contacts: vec![
+                StorageContact::of(&self.ada.device_ref),
+                StorageContact::of(&self.bo.device_ref),
+            ],
+            groups: vec![StorageGroup {
+                id: self.group.id.clone(),
+                ..StorageGroup::default()
+            }],
+            ..StorageSpec::default()
+        }
+    }
+}
+
+/// An unknown field 999 (length-delimited, 8 bytes): what a newer phone's record can carry.
+const UNKNOWN_FIELD: [u8; 11] = [
+    0xBA, 0x3E, 0x08, b'U', b'N', b'K', b'N', b'O', b'W', b'N', b'X',
+];
+
+/// The tag of a `StorageRecord`'s one field and that field's message, length prefix checked.
+fn split_record(raw: &[u8]) -> (u8, &[u8]) {
+    let (mut length, mut shift, mut at) = (0_usize, 0_u32, 1_usize);
+    loop {
+        let byte = raw[at];
+        at += 1;
+        length |= usize::from(byte & 0x7F) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    assert_eq!(at + length, raw.len(), "one field and nothing after it");
+    (raw[0], &raw[at..])
+}
+
+#[tokio::test]
+async fn storage_state_is_what_the_phone_reads() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let spec = StorageSpec {
+        contacts: vec![
+            StorageContact {
+                archived: Some(true),
+                marked_unread: Some(true),
+                muted_until: Some(5_000),
+                pinned: Some(true),
+                identity_state: Some(String::from("verified")),
+                ..StorageContact::of(&w.ada.device_ref)
+            },
+            StorageContact::of(&w.bo.device_ref),
+        ],
+        groups: vec![StorageGroup {
+            id: w.group.id.clone(),
+            muted_until: Some(9_000),
+            pinned: Some(true),
+            ..StorageGroup::default()
+        }],
+        account: Some(StorageAccount {
+            note_to_self_archived: Some(true),
+            ..StorageAccount::default()
+        }),
+        ..w.plain()
+    };
+    let written = w.harness.set_storage_state(&spec).await?;
+    assert_eq!(written.records, 4, "account, two contacts, a group");
+
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(written.version));
+    assert_eq!(view.records, 4);
+    let ada = view.contact(&w.ada.device_ref);
+    assert!(ada.archived && ada.marked_unread);
+    assert_eq!(ada.muted_until_ms(), 5_000);
+    let bo = view.contact(&w.bo.device_ref);
+    assert!(!bo.archived && !bo.marked_unread);
+    assert_eq!(bo.muted_until_ms(), 0);
+    let group = view.group(&w.group.id);
+    assert!(!group.archived && !group.marked_unread);
+    assert_eq!(group.muted_until_ms(), 9_000);
+    assert_eq!(
+        view.pins,
+        vec![
+            format!("contact:{}", w.ada.device_ref),
+            format!("group:{}", w.group.id)
+        ],
+        "the pins in the order they were pinned"
+    );
+    assert!(view.note_to_self.archived && !view.note_to_self.marked_unread);
+    assert_eq!(
+        view.identity_states
+            .get(&w.ada.device_ref)
+            .map(String::as_str),
+        Some("verified")
+    );
+    assert_eq!(
+        view.identity_states
+            .get(&w.bo.device_ref)
+            .map(String::as_str),
+        Some("default")
+    );
+    assert_eq!(view.orphans, 0);
+
+    // An item that no identifier lists is an orphan; the listed ones are still all readable.
+    let put = w.harness.storage_put(phone, None, 2).await?;
+    assert_eq!(put.status, 200);
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(put.version));
+    assert_eq!(view.orphans, 2);
+    assert_eq!(view.records, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_identifiers_list_ids_and_types_only() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    assert_eq!(
+        w.harness.storage_identifiers(phone).await?.version,
+        None,
+        "no manifest yet"
+    );
+    let written = w.harness.set_storage_state(&w.plain()).await?;
+    let listed = w.harness.storage_identifiers(phone).await?;
+    assert_eq!(listed.version, Some(written.version));
+    let mut kinds: Vec<u32> = listed.ids.iter().map(|id| id.kind).collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec![1, 1, 3, 4],
+        "two contacts, a group, the account"
+    );
+    for id in &listed.ids {
+        assert_eq!(STANDARD.decode(&id.id).expect("base64").len(), 16);
+    }
+    assert_eq!(
+        (
+            listed.items,
+            listed.orphans,
+            listed.missing,
+            listed.unreadable
+        ),
+        (4, 0, 0, 0)
+    );
+
+    w.harness.storage_put(phone, None, 3).await?;
+    let listed = w.harness.storage_identifiers(phone).await?;
+    assert_eq!(listed.ids.len(), 4, "the orphans are not listed");
+    assert_eq!((listed.items, listed.orphans), (7, 3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_raw_record_keeps_the_fields_the_harness_does_not_know() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let extra = STANDARD.encode(UNKNOWN_FIELD);
+    let spec = StorageSpec {
+        contacts: vec![
+            StorageContact {
+                archived: Some(true),
+                unknown_fields: Some(extra.clone()),
+                ..StorageContact::of(&w.ada.device_ref)
+            },
+            StorageContact::of(&w.bo.device_ref),
+        ],
+        groups: vec![StorageGroup {
+            id: w.group.id.clone(),
+            unknown_fields: Some(extra.clone()),
+            ..StorageGroup::default()
+        }],
+        account: Some(StorageAccount {
+            unknown_fields: Some(extra),
+            ..StorageAccount::default()
+        }),
+        ..w.plain()
+    };
+    w.harness.set_storage_state(&spec).await?;
+    let listed = w.harness.storage_identifiers(phone).await?;
+
+    // The field sits INSIDE the record's message (the length prefix counts it), at its end.
+    for (subject, tag, kind) in [
+        (StorageSubject::Contact(&w.ada.device_ref), 0x0A, 1),
+        (StorageSubject::Group(&w.group.id), 0x1A, 3),
+        (StorageSubject::Account, 0x22, 4),
+    ] {
+        let record = w.harness.raw_storage_record(phone, subject).await?;
+        let raw = record.bytes();
+        let (found_tag, message) = split_record(&raw);
+        assert_eq!(found_tag, tag, "the oneof field of kind {kind}");
+        assert!(message.ends_with(&UNKNOWN_FIELD), "kind {kind}");
+        assert!(
+            listed
+                .ids
+                .iter()
+                .any(|id| id.id == record.id && id.kind == kind),
+            "the record's id is the manifest's identifier of kind {kind}"
+        );
+    }
+    // The flags come from the same bytes, and a record without the field has none of it.
+    let ada = w
+        .harness
+        .raw_storage_record(phone, StorageSubject::Contact(&w.ada.device_ref))
+        .await?;
+    assert!(ada.flags.archived);
+    let bo = w
+        .harness
+        .raw_storage_record(phone, StorageSubject::Contact(&w.bo.device_ref))
+        .await?;
+    assert!(
+        !bo.bytes()
+            .windows(UNKNOWN_FIELD.len())
+            .any(|w| w == UNKNOWN_FIELD)
+    );
+    // The extra field does not make the record unreadable for the phone's decoder.
+    assert!(
+        w.harness
+            .storage_state(phone)
+            .await?
+            .contact(&w.ada.device_ref)
+            .archived
+    );
+    // A chat the phone has no record of is not found.
+    let stranger = w
+        .harness
+        .create_primary(&CreatePrimary::named("Stranger"))
+        .await?;
+    let missing = w
+        .harness
+        .raw_storage_record(phone, StorageSubject::Contact(&stranger.device_ref))
+        .await
+        .err();
+    assert_eq!(
+        missing.as_ref().and_then(HarnessError::remote_code),
+        Some("notFound")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undecryptable_item_stays_listed() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let spec = StorageSpec {
+        primary: phone.to_owned(),
+        contacts: vec![
+            StorageContact {
+                undecryptable: true,
+                ..StorageContact::of(&w.ada.device_ref)
+            },
+            StorageContact::of(&w.bo.device_ref),
+        ],
+        ..StorageSpec::default()
+    };
+    w.harness.set_storage_state(&spec).await?;
+
+    // The phone's own reading fails, the manifest still lists the item, the rest still opens.
+    assert!(w.harness.storage_state(phone).await.is_err());
+    let listed = w.harness.storage_identifiers(phone).await?;
+    assert_eq!(listed.ids.len(), 3, "account and two contacts");
+    assert_eq!((listed.items, listed.unreadable), (3, 1));
+    let bo = w
+        .harness
+        .raw_storage_record(phone, StorageSubject::Contact(&w.bo.device_ref))
+        .await?;
+    assert!(!bo.bytes().is_empty());
+    let ada = w
+        .harness
+        .raw_storage_record(phone, StorageSubject::Contact(&w.ada.device_ref))
+        .await
+        .err();
+    assert_eq!(
+        ada.as_ref().and_then(HarnessError::remote_code),
+        Some("notFound")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_writes_counts_the_linked_devices_puts_only() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let none = StorageWrites {
+        writes: 0,
+        conflicts: 0,
+        refused: 0,
+    };
+    assert_eq!(w.harness.storage_writes().await?, none);
+
+    // The phone's own writes are in neither count.
+    let first = w.harness.set_storage_state(&w.plain()).await?;
+    w.harness
+        .update_storage_record(
+            phone,
+            StorageSubject::Contact(&w.ada.device_ref),
+            &PhoneChange {
+                archived: Some(true),
+                ..PhoneChange::default()
+            },
+        )
+        .await?;
+    assert_eq!(w.harness.storage_writes().await?, none);
+
+    // A PUT the server applied is a write; one against a manifest that is not the next is a
+    // conflict, answered 409 with the manifest that stands.
+    let put = w.harness.storage_put(phone, None, 0).await?;
+    assert_eq!((put.status, put.version), (200, first.version + 2));
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 1,
+            conflicts: 0,
+            refused: 0,
+        }
+    );
+    let stale = w
+        .harness
+        .storage_put(phone, Some(put.version + 5), 0)
+        .await?;
+    assert_eq!((stale.status, stale.version), (409, put.version));
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 1,
+            conflicts: 1,
+            refused: 0,
+        }
+    );
+    let next = w.harness.storage_put(phone, None, 0).await?;
+    assert_eq!((next.status, next.version), (200, put.version + 1));
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 2,
+            conflicts: 1,
+            refused: 0,
+        }
+    );
+    // V4: a PUT the mock refuses (a manifest without a version: 400) is neither a write nor a
+    // conflict but it is counted, so an oracle of "nothing was written" cannot miss it.
+    assert!(w.harness.storage_put(phone, Some(0), 0).await.is_err());
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 2,
+            conflicts: 1,
+            refused: 1,
+        }
+    );
+    // What a linked device wrote, the phone reads.
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(next.version));
+    assert!(view.contact(&w.ada.device_ref).archived);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_storage_record_moves_one_record_under_a_new_id() -> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let first = w.harness.set_storage_state(&w.plain()).await?;
+    let before = w.harness.storage_identifiers(phone).await?;
+
+    // Beyond a double: the mute time travels as a decimal string.
+    let beyond: u64 = (1 << 53) + 1;
+    let version = w
+        .harness
+        .update_storage_record(
+            phone,
+            StorageSubject::Contact(&w.ada.device_ref),
+            &PhoneChange {
+                archived: Some(true),
+                muted_until: Some(beyond),
+                ..PhoneChange::default()
+            },
+        )
+        .await?;
+    assert_eq!(version, first.version + 1);
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(version));
+    let ada = view.contact(&w.ada.device_ref);
+    assert!(ada.archived && !ada.marked_unread);
+    assert_eq!(ada.muted_until.as_deref(), Some("9007199254740993"));
+    let bo = view.contact(&w.bo.device_ref);
+    assert!(
+        !bo.archived && bo.muted_until_ms() == 0,
+        "the other record is as it was"
+    );
+    assert_eq!(view.orphans, 0, "the old id is deleted");
+
+    // Exactly one identifier changed: a contact's.
+    let after = w.harness.storage_identifiers(phone).await?;
+    assert_eq!(after.ids.len(), before.ids.len());
+    let gone: Vec<_> = before
+        .ids
+        .iter()
+        .filter(|id| !after.ids.contains(id))
+        .collect();
+    let new: Vec<_> = after
+        .ids
+        .iter()
+        .filter(|id| !before.ids.contains(id))
+        .collect();
+    assert_eq!((gone.len(), new.len()), (1, 1));
+    assert_eq!((gone[0].kind, new[0].kind), (1, 1));
+    assert_eq!((after.items, after.orphans), (4, 0));
+
+    // A group's pin and the account's Note to Self move the same way.
+    w.harness
+        .update_storage_record(
+            phone,
+            StorageSubject::Group(&w.group.id),
+            &PhoneChange {
+                pinned: Some(true),
+                marked_unread: Some(true),
+                ..PhoneChange::default()
+            },
+        )
+        .await?;
+    let version = w
+        .harness
+        .update_storage_record(
+            phone,
+            StorageSubject::Account,
+            &PhoneChange {
+                archived: Some(true),
+                ..PhoneChange::default()
+            },
+        )
+        .await?;
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(version));
+    assert_eq!(view.pins, vec![format!("group:{}", w.group.id)]);
+    assert!(view.group(&w.group.id).marked_unread);
+    assert!(view.note_to_self.archived);
+    assert!(
+        view.contact(&w.ada.device_ref).archived,
+        "an earlier change stays"
+    );
+
+    // The phone changes nothing before it has a state.
+    let fresh = w
+        .harness
+        .create_primary(&CreatePrimary::named("Fresh"))
+        .await?;
+    let refused = w
+        .harness
+        .update_storage_record(
+            &fresh.device_ref,
+            StorageSubject::Account,
+            &PhoneChange::default(),
+        )
+        .await
+        .err();
+    assert_eq!(
+        refused.as_ref().and_then(HarnessError::remote_code),
+        Some("badRequest")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflict_next_storage_write_makes_the_next_put_meet_the_phones_change()
+-> Result<(), HarnessError> {
+    let Some(w) = StoragePhone::start().await? else {
+        return Ok(());
+    };
+    let phone = w.phone.device_ref.as_str();
+    let first = w.harness.set_storage_state(&w.plain()).await?;
+    let change = PhoneChange {
+        archived: Some(true),
+        ..PhoneChange::default()
+    };
+    w.harness
+        .conflict_next_storage_write(phone, StorageSubject::Contact(&w.ada.device_ref), &change)
+        .await?;
+    // Armed, not applied; one change at a time.
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(first.version));
+    assert!(!view.contact(&w.ada.device_ref).archived);
+    let twice = w
+        .harness
+        .conflict_next_storage_write(phone, StorageSubject::Contact(&w.bo.device_ref), &change)
+        .await
+        .err();
+    assert_eq!(
+        twice.as_ref().and_then(HarnessError::remote_code),
+        Some("badRequest")
+    );
+
+    // The next write was made against the old manifest: the phone's change comes first.
+    let met = w.harness.storage_put(phone, None, 0).await?;
+    assert_eq!((met.status, met.version), (409, first.version + 1));
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 0,
+            conflicts: 1,
+            refused: 0,
+        }
+    );
+    let view = w.harness.storage_state(phone).await?;
+    assert_eq!(view.version, Some(met.version));
+    assert!(view.contact(&w.ada.device_ref).archived);
+    assert!(
+        !view.contact(&w.bo.device_ref).archived,
+        "the refused arm changed nothing"
+    );
+
+    // One change only: the write after it goes through.
+    let put = w.harness.storage_put(phone, None, 0).await?;
+    assert_eq!((put.status, put.version), (200, met.version + 1));
+    assert_eq!(
+        w.harness.storage_writes().await?,
+        StorageWrites {
+            writes: 1,
+            conflicts: 1,
+            refused: 0,
+        }
+    );
     Ok(())
 }

@@ -1,0 +1,75 @@
+Kourier patch 0002: TDLib never answers an incoming call.
+
+Applied by `cargo xtask tdlib build` to TDLib commit 0e88653dcbf4e44c73cb655a05b58cd749a91169 before
+the build, after 0001 (`git apply --check`, then `git apply`); listed in third_party/tdlib/tdlib.pin
+and part of the cache key and the manifest (the patch's sha256 is a key input: a change of these bytes
+is another cache entry).
+
+What it disables: td/telegram/CallManager.cpp, `CallManager::update_call`. Unpatched, an
+`updatePhoneCall` with `phoneCallRequested` (someone calls the account) makes a `CallActor` for the
+call at once, with no request of the app. That actor sends `phone.receivedCall` right away
+(CallActor.cpp `send_received_query`), and on an error there, or when its ring or receive timeout
+runs out, it ends the call with `phone.discardCall` and the reason Missed (`on_error`,
+`try_send_discard_query`, `timeout_expired`). So every account linked to Kourier would tell Telegram
+"received" for every incoming 1:1 call and could END the caller's call as "missed" on the account's
+other devices. Kourier shows calls and never takes them (its calls rule: never a reply on the wire),
+and the helper's forbidden list cannot stop this, because no app request is involved.
+
+With the patch an incoming call gets NO call actor: no `updateCall` reaches the app, no
+`phone.receivedCall`, no `phone.discardCall`, no DH config request, no timeout. Later updates of that
+call (`phoneCallDiscarded`) find no actor and take TDLib's existing "postpone" branch right below the
+hunk, as TDLib already does for a call it never saw ringing. The call rings on the account's other
+devices and ends there; Kourier shows it from the chat's `messageCall` service message. Outgoing and
+group calls are untouched (Kourier makes none; the helper forbids the call requests).
+
+What it costs: one small `call_info_` entry (with the postponed updates of that call) per incoming
+call for the helper's life.
+
+Second hunk, the run-time marker: td/telegram/OptionManager.cpp, `get_synchronous_options` and
+`get_option_synchronously`. TDLib answers a SYNCHRONOUS option `kourier_patch_level` (beside `version` and
+`commit_hash`; `td_execute` of `getOption` before any client exists, and an `updateOption` in the first
+updates like the other two) with the value "0002": the newest Kourier patch in the library. Each later
+Kourier patch changes this one value in its own hunk. The helper reads it before the hello and the app's
+`check_pin` refuses any other value or none, so a stock, 0001-only or pre-0002 library is refused before
+any client exists, wherever it was found. It costs one more entry in the synchronous option table.
+
+The context lines are TDLib's (Boost Software License 1.0, LICENSES/BSL-1.0.txt); so is this file.
+
+--- a/td/telegram/CallManager.cpp
++++ b/td/telegram/CallManager.cpp
+@@ -160,7 +160,9 @@
+   auto &info = call_info_[call_id];
+ 
+   if (!info.call_id.is_valid() && call->phone_call_->get_id() == telegram_api::phoneCallRequested::ID) {
+-    info.call_id = create_call_actor();
++    // Kourier: an incoming call gets no call actor, so TDLib never answers it (no phone.receivedCall, no
++    // phone.discardCall); it rings on the account's other devices and ends there.
++    return;
+   }
+ 
+   if (!info.call_id.is_valid()) {
+--- a/td/telegram/OptionManager.cpp
++++ b/td/telegram/OptionManager.cpp
+@@ -596,7 +596,7 @@
+ }
+ 
+ const vector<Slice> &OptionManager::get_synchronous_options() {
+-  static const vector<Slice> options{"version", "commit_hash"};
++  static const vector<Slice> options{"version", "commit_hash", "kourier_patch_level"};
+   return options;
+ }
+ 
+@@ -819,6 +819,13 @@
+         return td_api::make_object<td_api::optionValueString>(get_git_commit_hash());
+       }
+       break;
++    case 'k':
++      if (name == "kourier_patch_level") {
++        // Kourier: the newest patch of third_party/tdlib/patches/ this library carries; each later patch
++        // changes this one value (the helper reads it before any client exists).
++        return td_api::make_object<td_api::optionValueString>("0002");
++      }
++      break;
+     case 'v':
+       if (name == "version") {
+         return td_api::make_object<td_api::optionValueString>("1.8.69");

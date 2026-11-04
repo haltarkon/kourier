@@ -10,16 +10,18 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use kourier_core::facade::UiEvent;
-use kourier_model::{AccountId, AttachmentId, ConversationId, MessageId, NetworkKind};
+use kourier_model::{AccountId, AttachmentId, ConversationId, MessageId, NetworkKind, UserId};
 
 use kourier_core::facade::FileRefusal;
 
 use crate::account_actions::{AccountAction, LogoutNotice};
-use crate::conversations::{AccountRow, Banner, ChatHeader, ConversationFilter, ConversationRow};
+use crate::conversations::{
+    AccountRow, Banner, Banners, ChatHeader, ConversationFilter, ConversationRow,
+};
 use crate::core_source::{Changes, Paging};
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules};
 use crate::fixture::Fixture;
-use crate::login::{LoginView, NetworkChoice, network_choices};
+use crate::login::{LoginView, NetworkChoice, NetworkEntry, network_choices};
 use crate::richtext::RichText;
 use crate::time::{Calendar, TimeContext};
 use crate::timeline::{self, MessageRow, QuoteBlock, RowKind, WaitLine};
@@ -65,11 +67,74 @@ impl std::fmt::Debug for MediaAnswer {
     }
 }
 
+/// Why a save did not write a file (F3b): the class the notice names, never a path or a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveFailure {
+    /// The disk is full.
+    NoSpace,
+    /// The folder does not let this user write.
+    NotWritable,
+    /// The folder is gone.
+    NoFolder,
+    /// The message is gone, deleted or no longer savable.
+    Gone,
+    /// The file is not on this PC (any more).
+    NotHere,
+    /// The file could not be read or written for another reason.
+    Other,
+}
+
+/// What a save call answers, taken with [`UiSource::take_saves`].
+#[derive(Clone, PartialEq, Eq)]
+pub enum SaveAnswer {
+    /// The name `attachment` is offered under in the dialog ([`UiSource::ask_save`]).
+    Suggested {
+        /// The attachment.
+        attachment: AttachmentId,
+        /// The cleaned name (personal data: never log it).
+        name: String,
+    },
+    /// A save ([`UiSource::save_to`]) or a batch ([`UiSource::save_all`]) ended.
+    Done(SaveOutcome),
+}
+
+/// How a save or a batch of saves ended.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SaveOutcome {
+    /// Files written.
+    pub saved: u32,
+    /// Files that were not written.
+    pub failed: u32,
+    /// The name of the last file written (the notice names it when `saved == 1`); empty when none.
+    pub name: String,
+    /// The folder they went into (personal data: never log it).
+    pub dir: PathBuf,
+    /// The class of the last failure, when `failed > 0`.
+    pub failure: Option<SaveFailure>,
+}
+
+impl std::fmt::Debug for SaveAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suggested { attachment, .. } => f
+                .debug_struct("Suggested")
+                .field("attachment", attachment)
+                .finish_non_exhaustive(),
+            Self::Done(o) => f
+                .debug_struct("Done")
+                .field("saved", &o.saved)
+                .field("failed", &o.failed)
+                .field("failure", &o.failure)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Files of a `SendFiles` the core did not take, handed back to the composer. Either the
-/// whole request (nothing of it was queued: the files, the caption and the quote return), or,
-/// when the core named the files it cannot take, only those: the others went out again
-/// without them ([`Self::resent`]), so one file the network cannot carry never holds the
-/// others back.
+/// whole request (nothing of it was queued: the files and the quote return, and the caption
+/// comes back as the chat's draft, [`UiSource::draft`]), or, when the core named the files it
+/// cannot take, only those: the others went out again without them ([`Self::resent`]), so
+/// one file the network cannot carry never holds the others back.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RefusedSend {
     /// The conversation it was for.
@@ -78,8 +143,6 @@ pub struct RefusedSend {
     pub request: u64,
     /// The files that come back.
     pub files: Vec<ReturnedFile>,
-    /// The caption as it was typed; empty when it went out with the other files.
-    pub caption: String,
     /// The quoted message; `None` when the quote went out with the other files.
     pub reply_to: Option<MessageId>,
     /// How many files of the request were sent again without the refused ones.
@@ -171,6 +234,44 @@ pub struct RevisionList {
 
 crate::safe_debug!(RevisionList { message });
 
+/// What the details panel is told about the person it shows ([`UiSource::take_person`]).
+#[derive(Clone, PartialEq)]
+pub enum PersonUpdate {
+    /// The page, new or fresher than the one on screen.
+    Show(Box<crate::person::PersonView>),
+    /// There is nothing to show any more: the chat or the account it belongs to is gone, the
+    /// account cannot be used, or the core no longer knows the account. The panel closes.
+    Ended,
+}
+
+impl std::fmt::Debug for PersonUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Show(view) => write!(f, "PersonUpdate::Show({view:?})"),
+            Self::Ended => f.write_str("PersonUpdate::Ended"),
+        }
+    }
+}
+
+/// What the details panel is told about the group it shows ([`UiSource::take_group`]).
+#[derive(Clone, PartialEq)]
+pub enum GroupUpdate {
+    /// The page, new or fresher than the one on screen.
+    Show(Box<crate::group::GroupView>),
+    /// There is nothing to show any more: the group is gone, its account cannot be used, or the
+    /// core no longer knows the group. The panel closes.
+    Ended,
+}
+
+impl std::fmt::Debug for GroupUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Show(view) => write!(f, "GroupUpdate::Show({view:?})"),
+            Self::Ended => f.write_str("GroupUpdate::Ended"),
+        }
+    }
+}
+
 /// What an edit of a message starts from.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EditTarget {
@@ -185,6 +286,23 @@ pub struct EditTarget {
 
 crate::safe_debug!(EditTarget { message, caption });
 
+/// The end of a replace's own login ([`UiSource::take_replace_news`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceNews {
+    /// The core announced the account the replace's link made.
+    Answered {
+        /// The replaced account.
+        old: AccountId,
+        /// The new account.
+        new: AccountId,
+    },
+    /// No new account comes.
+    Ended {
+        /// The replaced account.
+        old: AccountId,
+    },
+}
+
 /// Rows and commands for the UI models.
 pub trait UiSource {
     /// "Now" and the local calendar the row labels were built with.
@@ -193,6 +311,23 @@ pub trait UiSource {
     fn accounts(&self) -> Vec<AccountRow>;
     /// Conversation-list rows passing `filter`, in list order.
     fn conversations(&self, filter: &ConversationFilter) -> Vec<ConversationRow>;
+    /// How many archived chats the accounts of `filter` have (the number on the list's
+    /// "Archived Chats" entry); not by the filter's query or view.
+    fn archived_count(&self, filter: &ConversationFilter) -> u32 {
+        let archive = ConversationFilter {
+            hidden: filter.hidden.clone(),
+            query: String::new(),
+            archived: true,
+        };
+        u32::try_from(self.conversations(&archive).len()).unwrap_or(u32::MAX)
+    }
+    /// Whether the accounts have answered, so the uuids of a filter's hidden set can be told
+    /// from the ids of the rows (a source that knows its accounts from the start says so).
+    /// Until then a non-empty hidden set lists nothing, and the shown accounts' choice
+    /// ([`crate::shown_accounts`]) forgets nothing.
+    fn accounts_known(&self) -> bool {
+        true
+    }
     /// Header of a conversation.
     fn chat(&self, id: ConversationId) -> Option<ChatHeader>;
     /// Timeline rows of a conversation, newest first.
@@ -203,9 +338,17 @@ pub trait UiSource {
     fn wait_lines(&self, _id: ConversationId) -> Vec<(MessageId, WaitLine)> {
         Vec::new()
     }
+    /// The rings on the files of the open conversation's own messages that wait or upload, as
+    /// the rows of [`timeline`](Self::timeline) would show them now, for the rows of the
+    /// model that differ (`shown` is the model's rows, newest first; the answer is `(index,
+    /// row)`): what [`Changes::uploads`] asks the UI to bring up to date, row by row, without
+    /// rebuilding the timeline.
+    fn upload_rows(&self, _id: ConversationId, _shown: &[MessageRow]) -> Vec<(usize, MessageRow)> {
+        Vec::new()
+    }
     /// Networks offered on the welcome page.
     fn networks(&self) -> Vec<NetworkChoice> {
-        network_choices()
+        network_choices(&[NetworkEntry::plain(NetworkKind::Signal)], false)
     }
     /// The conversation `--page=chat` opens (the fixture's long chat); `None` for real data.
     fn demo_conversation(&self) -> Option<ConversationId> {
@@ -223,8 +366,9 @@ pub trait UiSource {
     ) -> Result<Option<MessageId>, SourceError>;
 
     /// Sends `paths`, any number of files of any kinds, with the composer text as `caption`
-    /// (§5.8), optionally as a reply; `as_file[i]` sends file `i` as the file it is (missing
-    /// entries are `false`). The core makes as many messages of them as the network needs to
+    /// (§5.8), optionally as a reply; `as_file[i]` sends file `i` as the file it is and
+    /// `with_location[i]` says the user agreed that file `i` leaves with the place it holds
+    /// (missing entries are `false`; the core refuses a located file without it). The core makes as many messages of them as the network needs to
     /// show every file ([`UiSource::plan_files`] says how many); the rows show them on a
     /// later query, each with its own state. Returns the id of the request: it is named
     /// again when the request ends ([`UiSource::take_finished_sends`],
@@ -234,6 +378,7 @@ pub trait UiSource {
         _id: ConversationId,
         _paths: Vec<PathBuf>,
         _as_file: Vec<bool>,
+        _with_location: Vec<bool>,
         _caption: &str,
         _reply_to: Option<MessageId>,
     ) -> Result<u64, SourceError> {
@@ -298,6 +443,22 @@ pub trait UiSource {
     fn set_expiry_policy(&mut self, _name: &str) -> bool {
         false
     }
+    /// Whether quiet notices (a safety number that changed, a refreshed session, a changed
+    /// number, an accepted request) count for the conversation list: `Some(true)` they are
+    /// shown there as any message, `Some(false)` (the default) the list shows the chat's
+    /// last real message and the notice does not move it. `None` until the core has said
+    /// ([`Self::load_settings`]) and for a source without the setting (the fixture).
+    fn quiet_notices(&self) -> Option<bool> {
+        None
+    }
+    /// Chooses that. It holds at once and is stored by the core, which then gives every
+    /// chat the sort time that choice says; the list is read again behind the command (the
+    /// order and the previews come from the core, §8.10). If it cannot be stored,
+    /// [`Self::quiet_notices`] reads what it was again ([`Changes::settings`]) and a notice
+    /// says so. `false`: the command did not leave (the core has stopped), or no core.
+    fn set_quiet_notices(&mut self, _shown: bool) -> bool {
+        false
+    }
     /// Asks how the composer's files would be sent to `conv`: how many messages, which files
     /// the network cannot take. The answer comes through [`UiSource::take_file_plan`]
     /// ([`Changes::plan`]); a newer request replaces one that is still waiting. `false`:
@@ -327,6 +488,126 @@ pub trait UiSource {
     }
     /// The history asked for with [`UiSource::request_revisions`] is no longer shown.
     fn close_revisions(&mut self) {}
+
+    /// Asks for the page of `user` (people pages P1): the answer comes through
+    /// [`UiSource::take_person`] ([`Changes::person`]), and again whenever the contact, the
+    /// chat or the groups change while the page is shown ([`UiSource::close_person`] ends that).
+    /// A fresh profile is asked of the network once for each call. `origin` is the chat the
+    /// panel was opened from (the open chat: the person's own 1:1 chat, or the group whose member
+    /// list the page was opened from): the page ends with it, and with nothing else of the
+    /// person's (a 1:1 chat of theirs that is deleted meanwhile only changes what the page
+    /// offers). `false`: not available.
+    fn request_person(
+        &mut self,
+        _account: AccountId,
+        _user: UserId,
+        _origin: Option<ConversationId>,
+    ) -> bool {
+        false
+    }
+    /// The newest answer to [`UiSource::request_person`], once.
+    fn take_person(&mut self) -> Option<PersonUpdate> {
+        None
+    }
+    /// The page asked for with [`UiSource::request_person`] is no longer shown.
+    fn close_person(&mut self) {}
+
+    /// Asks for the safety number of `user` (P5a, the details panel's "safety" level): the
+    /// answer comes through [`UiSource::take_safety`] ([`Changes::safety`]), and again whenever
+    /// the account's contacts or the accounts change while the level is shown (one query in
+    /// flight; an answer equal to the one on screen hands nothing over), and after a refused
+    /// Mark, Clear or Confirm of that person (with the line of [`crate::safety::refused_text`] or
+    /// [`crate::safety::not_saved_text`]); a number that turned into another one under the level
+    /// carries [`crate::safety::swapped_text`]; the line stays until the next click or the close.
+    /// [`UiSource::close_safety`] ends that. `false`: not available.
+    fn request_safety(&mut self, _account: AccountId, _user: UserId) -> bool {
+        false
+    }
+    /// The newest answer to [`UiSource::request_safety`], once.
+    fn take_safety(&mut self) -> Option<crate::safety::SafetyView> {
+        None
+    }
+    /// The level asked for with [`UiSource::request_safety`] is no longer shown.
+    fn close_safety(&mut self) {}
+    /// A button of the safety-number level was pressed (P5a): `Mark` and `Clear` send
+    /// `UiCommand::SetVerified`, `Confirm` sends `UiCommand::ConfirmIdentity` (BQ-2b: never a
+    /// Clear), each with `key`, the key of the number ON SCREEN (the front end keeps the
+    /// [`crate::safety::SafetyView`] it shows and passes its key; a key that changed meanwhile
+    /// is refused by the backend and the level asks again). `false`: not available.
+    fn safety_action(
+        &mut self,
+        _account: AccountId,
+        _user: UserId,
+        _action: crate::safety::SafetyAction,
+        _key: kourier_model::IdentityFingerprint,
+    ) -> bool {
+        false
+    }
+
+    /// The chats a contact card may go to (P5c, the share picker): every chat of the list the
+    /// source holds, with whether the user can send there, before the person's account and the
+    /// search narrow them ([`crate::share::listed_targets`]).
+    fn share_targets(&self) -> Vec<crate::share::ShareTarget> {
+        Vec::new()
+    }
+    /// "Send" of the share picker (P5c): a contact card of `user`, a person of `account`, into
+    /// `conv`. Only the core builds the card (from the contact row, with the page's number rule
+    /// and the profile name) and refuses what is not allowed (another account's chat, a person
+    /// without a card); a refusal arrives later as a notice. `false`: the command did not leave.
+    fn send_contact(&mut self, _conv: ConversationId, _account: AccountId, _user: UserId) -> bool {
+        false
+    }
+
+    /// Asks for the page of the group `conv` (people pages P2): the answer comes through
+    /// [`UiSource::take_group`] ([`Changes::group`]), and again whenever the group, a member's
+    /// contact or the accounts change while the page is shown ([`UiSource::close_group`] ends
+    /// that). The group is the page's origin: the page ends with it. `false`: not available.
+    fn request_group(&mut self, _account: AccountId, _conv: ConversationId) -> bool {
+        false
+    }
+    /// The newest answer to [`UiSource::request_group`], once.
+    fn take_group(&mut self) -> Option<GroupUpdate> {
+        None
+    }
+    /// The page asked for with [`UiSource::request_group`] is no longer shown.
+    fn close_group(&mut self) {}
+
+    /// Shows the gallery of the chat `conv` of `account` in `slot` (people pages P4: the section
+    /// of a page, the grid or the list of the level of all media): the rows come through
+    /// [`UiSource::take_chat_media`] ([`Changes::chat_media`]), and again whenever the chat's
+    /// messages change while the slot is open ([`UiSource::close_chat_media`] ends that); the
+    /// slot ends, shown empty, with its chat (removed) and with its account (removed).
+    /// `false`: not available.
+    fn open_chat_media(
+        &mut self,
+        _slot: crate::chat_media::MediaSlot,
+        _account: AccountId,
+        _conv: ConversationId,
+    ) -> bool {
+        false
+    }
+    /// Opens the picture viewer's own slot ([`crate::chat_media::MediaSlot::Viewer`]) for the
+    /// pictures of `message`, a message among the rows of `from` (a section or the level's grid):
+    /// the whole album, read AT the message, and kept up to date as the chat changes, whatever
+    /// the rows of `from` do (a section holds six squares); it is empty when the message has no
+    /// picture left. The rows come through [`UiSource::take_chat_media`]; [`UiSource::close_chat_media`]
+    /// ends it. `false`: the message is not among the rows of `from` (or not available).
+    fn open_media_viewer(
+        &mut self,
+        _from: crate::chat_media::MediaSlot,
+        _message: MessageId,
+    ) -> bool {
+        false
+    }
+    /// Asks for the next page of a slot of the level of all media (after its last row); a section
+    /// never goes on. The rows come through [`UiSource::take_chat_media`].
+    fn more_chat_media(&mut self, _slot: crate::chat_media::MediaSlot) {}
+    /// The slot shows nothing any more.
+    fn close_chat_media(&mut self, _slot: crate::chat_media::MediaSlot) {}
+    /// What the slots changed since the last call, once per slot (the newest of each).
+    fn take_chat_media(&mut self) -> Vec<crate::chat_media::MediaUpdate> {
+        Vec::new()
+    }
 
     /// What a reply to `message` quotes, for the composer's banner; `None` when the message
     /// cannot be replied to (a tombstone, a notice, a chat without replies).
@@ -455,8 +736,28 @@ pub trait UiSource {
     fn transfer_banner(&self, _account: Option<AccountId>) -> Option<Banner> {
         None
     }
+    /// The banners above the list for the accounts `filter` leaves shown: [`Self::banner`] and
+    /// [`Self::transfer_banner`] over every account, where an account in `filter.hidden` speaks
+    /// only when it needs the user (a history transfer whatever its state, or `Error`,
+    /// `Restricted`, `Clock`, `Challenge`, `LoggedOut`), plus the transfer of the shown
+    /// accounts alone. The default knows no hidden account: the three over all accounts.
+    fn banners(&self, _filter: &ConversationFilter) -> Banners {
+        Banners {
+            state: self.banner(None),
+            transfer: self.transfer_banner(None),
+            shown_transfer: self.transfer_banner(None),
+        }
+    }
     /// "Link again" for a logged-out account: starts its login; returns the first step.
     fn relink(&mut self, _account: AccountId) -> Result<LoginView, SourceError> {
+        Err(SourceError::Unavailable)
+    }
+    /// Switches the link page to another way of linking the same network (`qr`, `pair-code`):
+    /// the running login is stopped and the other flow starts at once, with no question (the
+    /// person did not leave the page). Returns the first view of the new login; a second call
+    /// while it has shown no step changes nothing. `Unavailable`: no login, a flow the network
+    /// does not offer, or a step where the page offers no switch.
+    fn switch_login_flow(&mut self, _flow: &str) -> Result<LoginView, SourceError> {
         Err(SourceError::Unavailable)
     }
     /// Restarts an account the supervisor gave up on.
@@ -512,6 +813,13 @@ pub trait UiSource {
     }
     /// The user closed the question without confirming: nothing happens.
     fn cancel_replace(&mut self) {}
+    /// What became of the login of a confirmed replace, once, in order: its new account's id
+    /// (the choice of shown accounts passes to it) or its end without an account (cancelled,
+    /// failed, lost with the core's channel; also after the announcement: the announced
+    /// account's link cancelled or failed, or the account gone before it was visible).
+    fn take_replace_news(&mut self) -> Vec<ReplaceNews> {
+        Vec::new()
+    }
 
     /// "Remove Account…" (`AccountAction::Remove`) or "Unlink…" (`AccountAction::Unlink`) of an
     /// account: the question to put first. `None`: the account does not exist (any more), is
@@ -550,6 +858,29 @@ pub trait UiSource {
     }
     /// The view of an opened copy closed (one call per answered open).
     fn close_media(&mut self, _id: AttachmentId) {}
+    /// Asks the name `id` is offered under in the "Save As" dialog; the answer comes later through
+    /// [`UiSource::take_saves`] as [`SaveAnswer::Suggested`] (or, when the attachment is gone,
+    /// as a [`SaveAnswer::Done`] that failed).
+    fn ask_save(&mut self, _id: AttachmentId) -> bool {
+        false
+    }
+    /// Saves `id` as the file `name` in `dir` (the user's choice in the dialog, which asked
+    /// about replacing): `name` is used EXACTLY as given, replacing a file of that name (it is
+    /// never cleaned on the way: the dialog's question was about this very name, and the
+    /// writer alone refuses a name that is no file name). The answer comes through
+    /// [`UiSource::take_saves`].
+    fn save_to(&mut self, _id: AttachmentId, _dir: PathBuf, _name: String) -> bool {
+        false
+    }
+    /// Saves every one of `ids` into `dir` under the name it is offered with, never replacing a
+    /// file (a clash gets " (1)", " (2)"): ONE [`SaveAnswer::Done`] when the last one ended.
+    fn save_all(&mut self, _ids: Vec<AttachmentId>, _dir: PathBuf) -> bool {
+        false
+    }
+    /// The answers to the save calls since the last call, in the order they came.
+    fn take_saves(&mut self) -> Vec<SaveAnswer> {
+        Vec::new()
+    }
     /// Answers to [`UiSource::open_media`] since the last call, in the order the opens were
     /// asked for.
     fn take_media(&mut self) -> Vec<MediaAnswer> {
@@ -610,7 +941,8 @@ pub trait UiSource {
     fn submit_login(&mut self, _values: Vec<(String, String)>) -> Result<(), SourceError> {
         Err(SourceError::Unavailable)
     }
-    /// Abandons the login.
+    /// Abandons the login. It may end a replace ([`Self::take_replace_news`]): the front-end
+    /// reads the accounts after it.
     fn cancel_login(&mut self) {}
     /// The question to put before an action that would abandon the login in progress
     /// ([`Self::cancel_login`] would stop it: a link not taken by the core yet, e.g. one
@@ -638,6 +970,11 @@ pub trait UiSource {
     /// A short notice for the composer ("Sending is not available yet"); empty for none.
     fn notice(&self) -> String {
         String::new()
+    }
+    /// The message the notice is about, when the notice offers "Delete for Everyone" for it
+    /// (the X came after the message went out: "Already sent"); `None` for every other notice.
+    fn notice_message(&self) -> Option<MessageId> {
+        None
     }
     /// Hides the notice.
     fn clear_notice(&mut self) {}
@@ -689,7 +1026,11 @@ impl UiSource for FixtureSource {
     }
 
     fn conversations(&self, filter: &ConversationFilter) -> Vec<ConversationRow> {
-        filter.apply(self.fixture.conversation_rows(&self.time()))
+        let hidden = filter.resolve(
+            self.fixture.accounts.iter().map(|(a, _, _)| (a.id, a.uuid)),
+            self.accounts_known(),
+        );
+        self.fixture.listed_rows(filter, &hidden, &self.time())
     }
 
     fn chat(&self, id: ConversationId) -> Option<ChatHeader> {
@@ -702,6 +1043,28 @@ impl UiSource for FixtureSource {
 
     fn demo_conversation(&self) -> Option<ConversationId> {
         Some(self.fixture.long_chat)
+    }
+
+    fn share_targets(&self) -> Vec<crate::share::ShareTarget> {
+        let time = self.time();
+        self.fixture
+            .conversation_rows(&time)
+            .into_iter()
+            .map(|r| crate::share::ShareTarget {
+                can_send: self
+                    .fixture
+                    .chat_header(r.id, &time)
+                    .is_none_or(|h| h.cannot_send.is_empty()),
+                id: r.id,
+                account: r.account,
+                title: r.title,
+                avatar_url: r.avatar_url,
+                is_self: r.is_self,
+                archived: r.archived,
+                pinned_order: r.pinned_order,
+                last_activity: r.last_activity,
+            })
+            .collect()
     }
 
     fn start_login(&mut self, network: NetworkKind) -> Result<LoginView, SourceError> {

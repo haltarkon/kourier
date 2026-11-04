@@ -60,6 +60,7 @@ pub(crate) fn text_message(message: &TextMessage<'_>) -> proto::DataMessage {
         quote: message.quote.cloned(),
         body_ranges: body.ranges.clone(),
         attachments: body.attachments.clone(),
+        contact: body.contact.clone(),
         timestamp: Some(message.timestamp),
         profile_key: Some(message.profile_key.to_vec()),
         expire_timer: Some(message.expire_timer),
@@ -404,6 +405,38 @@ pub(crate) fn read_sync(entries: &[(Aci, u64)]) -> proto::Content {
     })
 }
 
+/// `SyncMessage.verified` (Desktop's `getVerificationSync`): the person by the 16 raw bytes of
+/// their ACI (binary only, as every other Kourier sync; P5 critic L7), their identity key as
+/// stored, WITH its type byte (33 bytes: Android and Desktop decode it as an `IdentityKey`),
+/// the state, and a random `nullMessage` beside the sync's own padding.
+pub(crate) fn verified_sync(aci: Aci, key: &[u8], state: proto::verified::State) -> proto::Content {
+    sync_content(proto::SyncMessage {
+        content: Some(proto::sync_message::Content::Verified(proto::Verified {
+            destination_aci_binary: Some(Uuid::from(aci).as_bytes().to_vec()),
+            identity_key: Some(key.to_vec()),
+            state: Some(state.into()),
+            null_message: Some(random_padding()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
+}
+
+/// `SyncMessage.fetchLatest { STORAGE_MANIFEST }` (Desktop's `getFetchManifestSyncMessage`): tells
+/// our other devices that a write of ours is on the Storage Service, so that they fetch it now and
+/// not at their next periodic sync (A10c, `JobKind::FetchLatestSync`). It carries nothing else.
+pub(crate) fn fetch_latest_storage_manifest() -> proto::Content {
+    use proto::sync_message::fetch_latest::Type;
+    sync_content(proto::SyncMessage {
+        content: Some(proto::sync_message::Content::FetchLatest(
+            proto::sync_message::FetchLatest {
+                r#type: Some(Type::StorageManifest.into()),
+            },
+        )),
+        ..Default::default()
+    })
+}
+
 /// A conversation as sync messages name it (`ConversationIdentifier`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Thread {
@@ -613,6 +646,81 @@ mod tests {
         assert_eq!(message.required_protocol_version, Some(6));
         assert_eq!(message.expire_timer, Some(3600));
         assert_eq!(message.expire_timer_version, Some(4));
+    }
+
+    /// P5c-C1: a card goes out as `DataMessage.contact` (one card: the name as `givenName`, the
+    /// one number as a MOBILE phone; no body, no attachments, no avatar), and it survives the
+    /// wire (encoded and decoded again); a card without a name, or with one over Kourier's
+    /// 512-byte cap, is refused.
+    #[test]
+    fn a_contact_card_is_encoded() {
+        use kourier_model::{ContactCard, Identifier, IdentifierKind};
+        use prost::Message as _;
+        let card = ContactCard {
+            name: Some("Ada Lovelace".into()),
+            identifiers: vec![Identifier {
+                kind: IdentifierKind::Phone,
+                value: "+15550001234".into(),
+            }],
+            ..Default::default()
+        };
+        let body = PreparedBody {
+            contact: vec![super::super::media::contact_card(&card).expect("a card")],
+            ..PreparedBody::default()
+        };
+        let message = text_message(&TextMessage {
+            body: &body,
+            timestamp: 42,
+            profile_key: &[7; 32],
+            expire_timer: 0,
+            expire_timer_version: 0,
+            quote: None,
+        });
+        let wire = proto::DataMessage::decode(message.encode_to_vec().as_slice()).expect("decodes");
+        assert_eq!(wire.body, None, "a card has no text");
+        assert!(wire.attachments.is_empty());
+        assert_eq!(wire.contact.len(), 1, "one card per message");
+        let sent = &wire.contact[0];
+        let name = sent.name.as_ref().expect("a name");
+        assert_eq!(name.given_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(name.family_name, None);
+        assert_eq!(name.nickname, None, "never his nickname");
+        assert_eq!(sent.number.len(), 1);
+        assert_eq!(sent.number[0].value.as_deref(), Some("+15550001234"));
+        assert_eq!(
+            sent.number[0].r#type,
+            Some(proto::data_message::contact::phone::Type::Mobile as i32)
+        );
+        assert!(sent.avatar.is_none() && sent.email.is_empty() && sent.address.is_empty());
+        assert_eq!(sent.organization, None);
+
+        let nameless = ContactCard {
+            name: Some("  ".into()),
+            ..card.clone()
+        };
+        assert!(super::super::media::contact_card(&nameless).is_err());
+        let long = ContactCard {
+            name: Some("a".repeat(super::super::media::MAX_CARD_NAME_BYTES + 1)),
+            ..card.clone()
+        };
+        assert!(super::super::media::contact_card(&long).is_err());
+        let longest = ContactCard {
+            name: Some("a".repeat(super::super::media::MAX_CARD_NAME_BYTES)),
+            ..card
+        };
+        assert!(super::super::media::contact_card(&longest).is_ok());
+        // SD3: exactly one number: none, or two, is no card.
+        let numberless = ContactCard {
+            identifiers: Vec::new(),
+            ..longest.clone()
+        };
+        assert!(super::super::media::contact_card(&numberless).is_err());
+        let mut two = longest.clone();
+        two.identifiers.push(Identifier {
+            kind: IdentifierKind::Phone,
+            value: "+15550004321".into(),
+        });
+        assert!(super::super::media::contact_card(&two).is_err());
     }
 
     #[test]
@@ -1018,5 +1126,26 @@ mod tests {
                 .and_then(|c| c.identifier.clone()),
             Some(Identifier::ThreadGroupId(vec![4; 32]))
         );
+    }
+
+    /// A10c C3: the fetch-latest sync tells our other devices to fetch the Storage Service
+    /// MANIFEST (type 2, not the profile or the subscription status), nothing else rides along, and
+    /// it survives the wire (encoded and decoded again). Desktop's padding is there.
+    #[test]
+    fn the_fetch_latest_sync_asks_for_the_storage_manifest_and_nothing_else() {
+        use proto::sync_message::fetch_latest::Type;
+        let content = fetch_latest_storage_manifest();
+        let content = proto::Content::decode(&content.encode_to_vec()[..]).unwrap();
+        let Some(proto::content::Content::SyncMessage(sync)) = content.content else {
+            panic!("a sync message");
+        };
+        assert!(sync.padding.is_some_and(|p| (1..=512).contains(&p.len())));
+        let Some(proto::sync_message::Content::FetchLatest(fetch)) = sync.content else {
+            panic!("a fetch-latest sync");
+        };
+        assert_eq!(fetch.r#type, Some(Type::StorageManifest as i32));
+        assert_eq!(fetch.r#type, Some(2), "the wire value");
+        // The oneof holds the fetch alone; the repeated read markers beside it are empty.
+        assert!(sync.read.is_empty());
     }
 }

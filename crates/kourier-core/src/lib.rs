@@ -16,7 +16,8 @@
 //!   harness the property tests use.
 //! - The outbox (§4.8): `SendText` stores the message and its outbox row with the network id
 //!   allocated once; each account's supervisor transmits the heads of the per-conversation FIFOs
-//!   while the account is `Online`, with Signal's backoff inside a one-day budget, `Partial`
+//!   while the account is `Online`, with the backoff and the budget of the network's
+//!   `OutboxPolicy` (Signal's: up to 15 minutes inside a day), `Partial`
 //!   resends to the failed members only, identity and challenge pauses (a challenge ends with
 //!   the user's answer, or by itself at the time the network gave), and resumes interrupted
 //!   sends with unchanged ids after a restart.
@@ -86,9 +87,13 @@ mod ingest;
 mod local;
 mod media;
 mod modify;
+mod networks;
+mod notices;
 mod outbox;
 mod query;
 mod restore;
+mod roaming;
+mod rules;
 mod runtime;
 mod sql;
 mod store;
@@ -99,10 +104,11 @@ pub use error::{CoreError, Refusal, Result};
 pub use expiry::{ExpiryPolicy, REMEMBER as EXPIRED_MESSAGE_MEMORY};
 pub use ingest::FAILPOINT_BEFORE_COMMIT;
 pub use outbox::{
-    BUDGET as OUTBOX_BUDGET, ENQUEUE_CHUNK, FAILPOINT_AFTER_ATTEMPT,
-    FAILPOINT_AFTER_CHALLENGE_ANSWER, FAILPOINT_AFTER_ENQUEUE, FAILPOINT_AFTER_OUTCOME,
-    FAILPOINT_AFTER_STAGED, FAILPOINT_BEFORE_OUTCOME_COMMIT, FAILPOINT_IN_ENQUEUE,
-    MAX_BACKOFF as OUTBOX_MAX_BACKOFF, backoff as outbox_backoff,
+    BUDGET as OUTBOX_BUDGET, ENQUEUE_CHUNK, FAILPOINT_AFTER_ATTEMPT, FAILPOINT_AFTER_CANCEL_ANSWER,
+    FAILPOINT_AFTER_CANCEL_ASKED, FAILPOINT_AFTER_CHALLENGE_ANSWER, FAILPOINT_AFTER_ENQUEUE,
+    FAILPOINT_AFTER_OUTCOME, FAILPOINT_AFTER_STAGED, FAILPOINT_BEFORE_OUTCOME_COMMIT,
+    FAILPOINT_IN_ENQUEUE, MAX_BACKOFF as OUTBOX_MAX_BACKOFF, backoff as outbox_backoff,
+    backoff_capped as outbox_backoff_capped,
 };
 pub use runtime::{Core, CoreConfig};
 pub use store::{HISTORY_CHUNK, MIGRATIONS, UI_READERS};

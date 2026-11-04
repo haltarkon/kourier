@@ -343,6 +343,27 @@ fn retry_enabled(conn: &Connection) -> Result<bool> {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")))
 }
 
+/// Whether a retry request to `their` device `device` must wait for the user (RC7): their
+/// stored state is 2 and we hold no usable session with that device.
+fn waits_untrusted(conn: &Connection, their: &str, device: u32) -> Result<bool> {
+    if !crate::store::identity_is_changed(conn, their)? {
+        return Ok(false);
+    }
+    let now = std::time::SystemTime::now();
+    let open = crate::store::session_devices(conn, IdentityKind::Aci, their)?
+        .into_iter()
+        .any(|(d, record)| {
+            u32::from(d) == device
+                && record
+                    .has_usable_sender_chain(
+                        now,
+                        libsignal_protocol::SessionUsabilityRequirements::empty(),
+                    )
+                    .unwrap_or(false)
+        });
+    Ok(!open)
+}
+
 /// The `retry_request` job: the `DecryptionErrorMessage` as `PlaintextContent` to the sender.
 pub(crate) async fn run_request<T: SignalTransport>(
     shared: &Rc<Shared<T>>,
@@ -353,6 +374,17 @@ pub(crate) async fn run_request<T: SignalTransport>(
     let Some((sender, device, timestamp)) = parse_key(&job.key) else {
         return Ok(Done::Finished);
     };
+    // The lead's RC7: a sender in state 2 (verified, then the key changed) whose device has no
+    // open session would make every attempt fetch their prekeys and be refused again (the
+    // request, and the reset below, need a session): the job waits for the user, without a
+    // request and without an attempt counted. With a session still open it goes out (RC3:
+    // no content of ours reaches them).
+    if shared
+        .db
+        .read(|c| waits_untrusted(c, &sender.service_id_string(), device))?
+    {
+        return Ok(Done::WaitUntrusted);
+    }
     if !shared.db.read(retry_enabled)? {
         reset_session(shared, socket, &account, sender, device).await?;
         return Ok(Done::Finished);

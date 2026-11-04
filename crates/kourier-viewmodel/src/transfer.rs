@@ -43,10 +43,15 @@ pub enum TransferPhase {
     /// No transfer runs (any more), but the account still fetches the profiles of its
     /// contacts and the groups the server has not given yet (the tail of every fresh link).
     Updating,
+    /// The network pushes the message history of the account to this computer (WhatsApp:
+    /// the phone sends it in pieces after the link, nothing here asked for it): a quiet
+    /// line, no button.
+    History,
 }
 
 impl TransferPhase {
-    /// Stable name for QML (`waiting`, `downloading`, `reading`, `failed`, `updating`).
+    /// Stable name for QML (`waiting`, `downloading`, `reading`, `failed`, `updating`,
+    /// `history`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Waiting => "waiting",
@@ -54,6 +59,7 @@ impl TransferPhase {
             Self::Reading => "reading",
             Self::Failed => "failed",
             Self::Updating => "updating",
+            Self::History => "history",
         }
     }
 }
@@ -354,6 +360,38 @@ impl Entry {
             HistoryTransfer::Done | HistoryTransfer::Skipped => false,
         }
     }
+}
+
+/// The quiet banner of an account whose network pushes its message history while the chats
+/// are already usable: "Getting your message history from your phone: 40 %" (without the
+/// number while the network gives none). No button: nothing here can end it, and it ends by
+/// itself when the last chat has its history or no batch comes for a while.
+pub fn history_fill_view(account: AccountId, fraction: Option<f32>) -> TransferView {
+    let mut v = view(account, HistoryTransfer::Reading);
+    v.phase = TransferPhase::History;
+    v.skip = String::new();
+    match fraction.filter(|f| f.is_finite()) {
+        Some(f) => {
+            let f = f.clamp(0.0, 1.0);
+            // (A percentage is whole: the bar is not finer than that.)
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let percent = (f * 100.0).round() as u64;
+            v.status = trfc(
+                "@info:status banner of an account while the network sends its message history, %1 the percentage",
+                "Getting your message history from your phone: %1 %",
+                &[&percent.to_string()],
+            );
+            v.progress = f64::from(f);
+        }
+        None => {
+            v.status = trc(
+                "@info:status banner of an account while the network sends its message history",
+                "Getting your message history from your phone…",
+            )
+            .into_owned();
+        }
+    }
+    v
 }
 
 /// How far a download is: `done / total` within 0 … 1, or `-1` while the size is unknown
@@ -766,17 +804,38 @@ fn replace_abandon_paragraph(network: &str) -> String {
 /// application quits names it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum QuitWork {
+    /// A history the network pushes (WhatsApp's): the chats are usable and the banner "Getting
+    /// your message history from your phone" shows. Quitting may lose part of it (nothing here
+    /// can ask the phone again, and whether it sends a chunk it got no receipt for again is not
+    /// established: the words say "may not arrive", never that the phone sends it only once), so
+    /// this is the one kind of work whose question says so; the other two go on at the next
+    /// start. It is asked first when several run (W4, decision D2).
+    History,
     /// A history transfer: waiting for the phone, downloading or importing.
     Import,
     /// The contacts and groups a fresh link still fetches.
     Update,
 }
 
-/// The question before the application quits while `work` runs. Nothing is lost (the work
-/// goes on at the next start); the question is there because the window said "Keep Kourier
-/// open". The default answer keeps the application open.
+/// The question before the application quits while `work` runs. For an import and the update
+/// nothing is lost (the work goes on at the next start); the question is there because the
+/// window said "Keep Kourier open". A pushed history is the exception: part of it may be lost,
+/// so [`QuitWork::History`] says so. The default answer keeps the application open.
 pub fn quit_question(work: QuitWork) -> AbandonQuestion {
     let (title, text) = match work {
+        QuitWork::History => (
+            trc(
+                "@title:dialog question before the application quits while the phone sends the message history",
+                "Quit While History Arrives?",
+            ),
+            // (No "goes on at the next start", and no claim that the phone sends it only once: that
+            // is not established (W4 fix MEDIUM-4). The words also serve "Restart Now", which asks
+            // the same question.)
+            trc(
+                "@info question before the application quits while the phone sends the message history",
+                "Your phone is still sending your message history. If Kourier closes now, part of it may not arrive.",
+            ),
+        ),
         QuitWork::Import => (
             trc(
                 "@title:dialog question before the application quits while a message history is transferred",

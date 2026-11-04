@@ -23,7 +23,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::io::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -477,12 +477,8 @@ async fn killing_the_app_at_every_receive_failpoint_gives_the_uncrashed_state() 
             account: account.0,
         };
         let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "child_app_process",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .arg(support::child_filter(module_path!(), "child_app_process"))
+            .args(["--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
             .env("KOURIER_FAILPOINT", &point)
             // Warnings of the helper app reach this test's stderr (diagnosis of a stuck start).

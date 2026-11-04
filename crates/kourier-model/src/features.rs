@@ -254,10 +254,31 @@ pub enum HistorySource {
     /// Nothing beyond what was received live (Signal M1, Threema).
     #[default]
     None,
-    /// The network pushes history after linking (WhatsApp).
+    /// The network pushes history after linking (WhatsApp): the backend sends
+    /// `BackendEvent::HistoryBatch`es of the chats it has, and a conversation says
+    /// `has_more` while more is coming. It says nothing about ONE archive that a phone uploads
+    /// for a fresh link (Signal): that is [`NetworkDescriptor::history_transfer`], and a UI
+    /// offers "Transfer History from Phone…" only for that flag.
     PushedOnLink,
     /// The core requests it with `FetchHistory` (WhatsApp PDO, newsletters).
     OnDemand,
+}
+
+/// Whether the `read` flags of a network's HISTORY rows tell what the person has seen (W4 fix F1,
+/// the lead's decision). A history copy never lowers what the person has not seen: where the
+/// network cannot say it ([`HistoryReadState::Unknown`], WhatsApp: its backend states `read:
+/// true` for rows it knows nothing about and gives the unread count as a hint), the core does
+/// NOT raise an EXISTING row's read state from a history copy, because that copy may repeat a
+/// message that arrived live and is still unread here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HistoryReadState {
+    /// A history row's `read` says whether the message was seen (Signal's archive, the fake):
+    /// a copy that says "read" raises an existing row.
+    #[default]
+    Known,
+    /// A history row's `read` is only "read or not known" (WhatsApp): it never raises an
+    /// existing row's read state.
+    Unknown,
 }
 
 /// Group management actions the user may take (all false in M1).
@@ -276,6 +297,26 @@ pub struct GroupActions {
     pub leave: bool,
     /// Disband the group.
     pub disband: bool,
+}
+
+/// What a group's rules say, as the network states them (P2, the group's page). Read-only here:
+/// Kourier writes no group state. The flags are the rules that are ON; a rule the network does
+/// not have, or an access level that is not "only admins" (everyone, or nobody), is `false`.
+/// [`ConversationFeatures::group_info`] is `None` when the network did not state the rules
+/// at all (the page then shows no rule line), so "everyone may change everything" is never
+/// claimed for a network that did not say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupInfo {
+    /// Only admins may change the group's name, picture, description and disappearing-message
+    /// timer.
+    pub attributes_admin_only: bool,
+    /// Only admins may add members.
+    pub members_admin_only: bool,
+    /// Only admins may send messages (an announcement group).
+    pub announcements_only: bool,
+    /// The group was ended for everyone: nobody can send, and nobody can change anything.
+    pub terminated: bool,
 }
 
 /// Why the user cannot send in a conversation.
@@ -301,6 +342,9 @@ pub enum CannotSend {
     InvitationPending,
     /// We asked to join the group and an administrator has not answered yet.
     JoinRequestPending,
+    /// Kourier cannot send on this network yet: sending comes in a later version; a network
+    /// states it until its send path exists.
+    NotYetBuilt,
     /// Another reason, as user-facing text.
     Other(String),
 }
@@ -365,11 +409,37 @@ pub struct ConversationFeatures {
     pub history: HistorySource,
     /// Group management actions.
     pub group_actions: GroupActions,
+    /// The group's rules as the network states them; `None` = the network did not say (a
+    /// direct chat, a group known only from a history import, a network that states no rules).
+    /// Skipped from the serialised form when `None`, so a conversation that has none keeps
+    /// the [`Self::stable_hash`] it had before the field existed (its stored hash stays equal
+    /// and nothing is stated again for it), while every group that has a snapshot gets a new
+    /// hash and is stated once at the next start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_info: Option<GroupInfo>,
     /// Set when the user cannot send here.
     pub cannot_send: Option<CannotSend>,
+    /// Whether the network LISTS this chat for its roaming settings, the ones it keeps for the
+    /// account's other devices (archive, pin, mute, marked unread; [`AccountCaps::roaming_writes`]).
+    /// `Some(false)`: the network does not list the chat yet, so a change here has nothing to
+    /// attach to and the chat offers none (a message request, a person known only by a number:
+    /// the entries appear when the chat is accepted elsewhere and the network lists it).
+    /// `None` and `Some(true)`: listed. `None` is "the network says nothing", which is what
+    /// every network that states no roaming settings leaves, so a chat keeps the JSON and the
+    /// [`Self::stable_hash`] it had before the field existed. It travels with the whole
+    /// features value (they are replaced as a whole): a backend that lists or unlists a chat
+    /// states the features again. Read it through [`Self::lists_for_roaming`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roaming_listed: Option<bool>,
 }
 
 impl ConversationFeatures {
+    /// Whether the network lists this chat for its roaming settings
+    /// ([`Self::roaming_listed`]); a chat the network said nothing about counts as listed.
+    pub fn lists_for_roaming(&self) -> bool {
+        self.roaming_listed != Some(false)
+    }
+
     /// Stable hash of the canonical JSON form (`conversations.features_hash`, UI caching).
     pub fn stable_hash(&self) -> u64 {
         // Serializing plain data with string map keys cannot fail; an empty input still
@@ -535,6 +605,70 @@ pub struct RiskNotice {
     pub url: Option<String>,
 }
 
+/// Which message an own edit names on the wire (architecture §3.5.3). The core always keeps
+/// the edit as a new revision under its own id; this says what the request's `target` is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EditTarget {
+    /// The latest revision the recipients have: Signal Desktop names the revision it edited
+    /// last (`SD/ts/util/sendEditedMessage.preload.ts`), and a retry of an edit names the one
+    /// before its own.
+    #[default]
+    LatestRevision,
+    /// The original message, whatever was edited since: WhatsApp (the edit is a protocol
+    /// message whose key is the original), Threema and Telegram.
+    Original,
+}
+
+/// The numbers of a network's outbox (architecture §4.8). The curve of the back-off (none for
+/// the first failure, 190 ms, then x1.9) is the core's; the policy gives the caps. The default
+/// is Signal Desktop's: the receive windows of the other Signal clients are built on them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboxPolicy {
+    /// How long a message is tried before it fails for good (`Failed`).
+    pub budget: Duration,
+    /// The longest wait between two attempts.
+    pub max_backoff: Duration,
+    /// How long a stored challenge ("solve this to send") can still be answered.
+    pub challenge_lifetime: Duration,
+}
+
+impl OutboxPolicy {
+    /// Signal Desktop's numbers: 24 h, 15 min, 24 h.
+    pub const SIGNAL: Self = Self {
+        budget: Duration::from_secs(24 * 3600),
+        max_backoff: Duration::from_secs(15 * 60),
+        challenge_lifetime: Duration::from_secs(24 * 3600),
+    };
+}
+
+impl Default for OutboxPolicy {
+    fn default() -> Self {
+        Self::SIGNAL
+    }
+}
+
+/// What a network's SERVER decides, where most networks leave it to the clients (KT-2:
+/// Telegram). Every flag off is how the core has always worked; the core keeps its promises
+/// under either setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServerRules {
+    /// The server counts what is unread and says so
+    /// ([`ConversationPatch::server_unread`](crate::ConversationPatch::server_unread) and
+    /// `server_mentions`): the core shows the stated count instead of counting rows, and the
+    /// network states it at every change. Off: the count is the rows' (plus `unread_hint`), and
+    /// a stated count is ignored.
+    #[serde(default)]
+    pub owns_unread: bool,
+    /// The server checks a delete for everyone before it tells a client: the core applies
+    /// `BackendEvent::Deleted` of such a network without its own author, admin and window checks,
+    /// and a delete that names nobody (`by: None`) reads
+    /// [`Deletion::Unattributed`](crate::Deletion::Unattributed), not "deleted by me". Off:
+    /// today's rules (the author, an admin of a group, the receive window).
+    #[serde(default)]
+    pub validates_deletes: bool,
+}
+
 /// Static description of a network (§3.8 tier 1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkDescriptor {
@@ -551,15 +685,105 @@ pub struct NetworkDescriptor {
     /// Default history source for conversations.
     #[serde(default)]
     pub history: HistorySource,
+    /// What the `read` flag of a history row of this network means (W4 fix F1).
+    #[serde(default)]
+    pub history_read: HistoryReadState,
     /// How message ids are scoped.
     #[serde(default)]
     pub msg_id_scope: MsgIdScope,
     /// Typing-indicator timing.
     #[serde(default)]
     pub typing: TypingPolicy,
-    /// Shown before login when set.
+    /// Shown before login when set: the network is one the user should be warned about. The
+    /// UI asks first (a page the user must accept) and writes its own translated text for a
+    /// network it knows; this text is only the fallback for a network it has no words for.
     #[serde(default)]
     pub risk_notice: Option<RiskNotice>,
+    /// A fresh link can bring the account's history as ONE archive the phone uploads
+    /// (`BackendEvent::HistoryTransfer`), and a UI offers "Transfer History from Phone…"
+    /// (remove the account and link it anew) for its accounts. Signal sets it together with
+    /// the offer (`with_history_transfer_offer`); a network that pushes history batches
+    /// (WhatsApp, [`HistorySource::PushedOnLink`]) does not: for it that action would be a
+    /// link and unlink cycle, itself a risk for the account.
+    #[serde(default)]
+    pub history_transfer: bool,
+    /// Off until the user turns it on (architecture §7.4): `kourier-app` registers the
+    /// network only while its switch is on (a preference read at the start), and a UI lists
+    /// it as "Off · experimental" while it is off. Signal and the plain fake say `false`;
+    /// WhatsApp, Telegram and Threema say `true`.
+    #[serde(default)]
+    pub experimental: bool,
+    /// Which message an own edit names on the wire.
+    #[serde(default)]
+    pub edit_target: EditTarget,
+    /// The outbox's budget, back-off cap and challenge lifetime for this network.
+    #[serde(default)]
+    pub outbox: OutboxPolicy,
+    /// How long the core waits for an account's actor to stop on its own at a quit (after
+    /// `Command::Shutdown`, then again after the actor's token is cancelled), when this
+    /// network needs more than the core's default (`Timeouts::shutdown_grace`, 5 s; `None`).
+    /// WhatsApp states 20 s (W4, R-Q1): its actor waits up to 15 s for a history chunk the
+    /// phone announced and has not finished sending, which the phone sends only once. The
+    /// application's own limit for the whole core follows the largest grace of the
+    /// registered networks.
+    #[serde(default)]
+    pub shutdown_grace: Option<Duration>,
+    /// The network has safety numbers a person page offers (P5a, `Command::SafetyNumber`):
+    /// Signal and the Signal-like fake say `true`, WhatsApp (whose security code is a later
+    /// item) `false`. A static capability, so a UI decides whether the row is shown without
+    /// asking the backend; what the number is, or why there is none, the backend answers.
+    #[serde(default)]
+    pub safety_numbers: bool,
+    /// The network can SEND a contact card (P5c, `UiCommand::SendContact`; the lead's SC4):
+    /// Signal and the Signal-like fake say `true`, WhatsApp (whose vCard send is a later item)
+    /// `false`. A UI shows "Share Contact…" only when it is on, and the core refuses the
+    /// command otherwise. Receiving cards is not this flag (the kinds step).
+    #[serde(default)]
+    pub contact_cards: bool,
+    /// The pictures this network's backend cleans before they leave (LOC, F14, F27): the bytes
+    /// that leave this PC carry no location. A backend may state it ONLY when its send path runs
+    /// every picture of these types through `kourier_media::clean_still` (an xtask source check
+    /// holds that; the fake, which sends nothing off the PC, is its one named exception). A
+    /// network that strips on its server does not qualify. `None` = nothing is cleaned: every
+    /// located file asks. Signal and the Signal-like fake state JPEG, PNG, WebP and BMP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleaned_pictures: Option<CleanedPictures>,
+    /// The network's accounts always send read receipts, typing and online status: no setting
+    /// turns them off (Telegram: its API rules, HA TG6). A UI says so in its privacy settings
+    /// (KT-1b). Signal, WhatsApp, Threema and the fakes say `false`.
+    #[serde(default)]
+    pub receipts_always_sent: bool,
+    /// What the network's server owns (KT-2, [`ServerRules`]). All off for Signal, WhatsApp,
+    /// Threema and the fakes that play them, and for the real Telegram until its backend maps
+    /// onto it.
+    #[serde(default)]
+    pub server: ServerRules,
+}
+
+/// What a network's backend cleans of the location (LOC, [`NetworkDescriptor::cleaned_pictures`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanedPictures {
+    /// The MIME types it cleans (`image/jpeg` ...).
+    pub types: BTreeSet<String>,
+    /// The largest picture it cleans; `None` = no bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+}
+
+impl CleanedPictures {
+    /// The types `kourier_media::clean_still` cleans (`CLEANED_TYPES`), with no size bound:
+    /// what Signal states.
+    pub fn stills(types: &[&str]) -> Self {
+        Self {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            max_bytes: None,
+        }
+    }
+
+    /// Whether a picture of this type and size is cleaned.
+    pub fn cleans(&self, mime: &str, size: u64) -> bool {
+        self.types.contains(mime) && self.max_bytes.is_none_or(|max| size <= max)
+    }
 }
 
 /// Dynamic account capabilities from server config (§3.8 tier 2), sent as `AccountCaps`.
@@ -574,11 +798,25 @@ pub struct AccountCaps {
     pub long_text_bytes: Option<u32>,
     /// Delete-for-everyone send window from server config.
     pub delete_for_everyone_max_age_secs: Option<u32>,
+    /// How many chats the account may pin at most; `None` = the network states no limit. A
+    /// network with a limit states it (the common limit is 4; a network may have its own): the
+    /// core assumes none and refuses no pin for a count while this is `None`. Counted by the
+    /// network per account, over every chat it lists as pinned, the ones this device does not
+    /// show included.
+    pub max_pinned_chats: Option<u32>,
     /// Named feature flags.
     pub flags: BTreeMap<String, bool>,
 }
 
 impl AccountCaps {
+    /// Flag: the network can WRITE the settings it keeps for the account's other devices
+    /// (archive, pin, mute, marked unread: a "roaming" setting), and whether this account
+    /// lets it. Three states, read through [`Self::roaming_writes`]: ABSENT = the network
+    /// cannot (the entries are hidden), `false` = it can but this account's switch is off (the
+    /// entries are shown greyed, with the reason), `true` = on. Stated by the backend of the
+    /// account, never by the core; changed by `Command::SetRoamingWrites`.
+    pub const FLAG_ROAMING_WRITES: &'static str = "roaming_writes";
+
     /// Flag: the account's other device can be asked to upload again the files of a message
     /// the network no longer has (`Command::RequestAttachments`; Signal: attachment
     /// backfill). Without it a file the network lost stays lost.
@@ -590,6 +828,13 @@ impl AccountCaps {
             .get(Self::FLAG_ATTACHMENT_RESTORE)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// [`Self::FLAG_ROAMING_WRITES`] in its three states: `None` = the network cannot write
+    /// roaming settings (hide the entries), `Some(false)` = it can and this account's switch is
+    /// off (show them greyed, with the reason), `Some(true)` = on.
+    pub fn roaming_writes(&self) -> Option<bool> {
+        self.flags.get(Self::FLAG_ROAMING_WRITES).copied()
     }
 }
 

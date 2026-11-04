@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, Envelope};
 use kourier_model::{
-    BackendError, ConnState, ConvKey, HistoryTransfer, HistoryTransferFailure, IdError, UserId,
+    BackendError, CodeDelivery, ConnState, ConvKey, HistoryTransfer, HistoryTransferFailure,
+    IdError, UserId,
 };
 
 /// Why a script could not be built.
@@ -15,6 +16,17 @@ pub enum ScriptError {
     Id(#[from] IdError),
 }
 
+/// The three emoji the fake shows at the emoji step of a QR login it plays as Threema (K1,
+/// TH4 KH1c): fixed, and three of the 128 of Threema's own list, so the viewmodel's names and the
+/// pictures treat them as the real thing (the black cat is the list's emoji sequence with a
+/// zero-width joiner).
+pub const FAKE_EMOJI: [&str; 3] = ["\u{1F435}", "\u{1F408}\u{200D}\u{2B1B}", "\u{1F33B}"];
+
+/// How long the emoji step of a QR login played as Threema stands before the link goes on, on
+/// the account clock, unless the script says otherwise ([`Script::emoji_for`]): a person walking
+/// the link by hand sees the three emoji for this long.
+pub const EMOJI_FOR: Duration = Duration::from_secs(2);
+
 /// How the scripted login behaves after `StartLogin`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoginScript {
@@ -22,7 +34,8 @@ pub enum LoginScript {
     Auto,
     /// The Signal-like QR flow (§4.4): optional device-name input, `codes` rotating QR codes
     /// valid for `valid_for` each (on the account clock); the phone scans code number
-    /// `scanned_at` (0-based), or none.
+    /// `scanned_at` (0-based), or none. A fake that plays Threema shows the emoji step after the
+    /// scan ([`FAKE_EMOJI`], [`Script::emoji_for`]), as the real backend does.
     Qr {
         /// Ask for a device name first.
         ask_device_name: bool,
@@ -41,6 +54,149 @@ pub enum LoginScript {
         /// Log-safe detail.
         detail: String,
     },
+}
+
+/// The pair-code flow of a network that has one (WhatsApp's "link with phone number", flow id
+/// `pair-code`): the actor asks for the phone number (an `Input` step), may refuse it as the
+/// network does (`refusals`: the n-th pair-code attempt of the network gets the n-th error, then
+/// they are accepted), shows `code` (`ShowCode`), and the phone types it `entered_after` later
+/// on the account clock. Without this script a `pair-code` login is refused as unsupported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairCodeScript {
+    /// The errors of the first attempts, in order (a rate limit, "not available").
+    pub refusals: Vec<BackendError>,
+    /// The code shown (the real one is 8 characters).
+    pub code: String,
+    /// How long the code is valid, on the account clock.
+    pub valid_for: Duration,
+    /// When the phone enters the code after it was shown; `None`: never (the login fails with
+    /// an expiry once `valid_for` has passed).
+    pub entered_after: Option<Duration>,
+}
+
+impl PairCodeScript {
+    /// Shows `code` for three minutes; the phone enters it after ten seconds; no refusals.
+    pub fn new(code: &str) -> Self {
+        Self {
+            refusals: Vec::new(),
+            code: code.to_owned(),
+            valid_for: Duration::from_secs(180),
+            entered_after: Some(Duration::from_secs(10)),
+        }
+    }
+
+    /// The first attempts are refused with `refusals`.
+    pub fn refusing(mut self, refusals: Vec<BackendError>) -> Self {
+        self.refusals = refusals;
+        self
+    }
+
+    /// The phone never enters the code.
+    pub fn never_entered(mut self) -> Self {
+        self.entered_after = None;
+        self
+    }
+}
+
+/// The two-step verification of an account (Telegram's password): what is typed, and the hint the
+/// account's owner gave, which the step shows as the field's note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasswordScript {
+    /// The right password.
+    pub password: String,
+    /// The owner's own hint; `None`: the account set none.
+    pub hint: Option<String>,
+}
+
+/// One account of a network whose login asks for a phone number (Telegram's `phone` flow): what the
+/// network does with that NUMBER. The table of [`PhoneLoginScript`] is keyed on the digits the person
+/// types, never on the attempt, so a rehearsal that restarts the app between attempts meets the same
+/// answers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhoneAccount {
+    /// The number's digits only (the key; no `+`, no separators).
+    pub digits: String,
+    /// The network refuses this number at `phone` with this error (a flood wait, a ban); `None`:
+    /// it sends the code.
+    pub refusal: Option<BackendError>,
+    /// The right code.
+    pub code: String,
+    /// What the code step states: how the code was sent, and the wait before a new one may be asked
+    /// for (`resend.after` is the network's whole wait on the account clock; the step states the part
+    /// that is left).
+    pub delivery: CodeDelivery,
+    /// The account has two-step verification: asked after the code, and after a QR scan.
+    pub password: Option<PasswordScript>,
+    /// The network asks for a login e-mail address after the password: this is the right code it
+    /// sends there. `None`: no e-mail step.
+    pub email_code: Option<String>,
+}
+
+impl PhoneAccount {
+    /// An account at `number` (its digits are kept; `+` and separators are dropped) that sends
+    /// `code` the way `delivery` says; no refusal, no password, no e-mail.
+    pub fn new(number: &str, code: &str, delivery: CodeDelivery) -> Self {
+        Self {
+            digits: digits_of(number),
+            refusal: None,
+            code: code.to_owned(),
+            delivery,
+            password: None,
+            email_code: None,
+        }
+    }
+
+    /// The network refuses this number at `phone` with `error`.
+    pub fn refusing(mut self, error: BackendError) -> Self {
+        self.refusal = Some(error);
+        self
+    }
+
+    /// The account has two-step verification (`hint` is its owner's own words).
+    pub fn with_password(mut self, password: &str, hint: Option<&str>) -> Self {
+        self.password = Some(PasswordScript {
+            password: password.to_owned(),
+            hint: hint.map(str::to_owned),
+        });
+        self
+    }
+
+    /// The network asks for a login e-mail address, then for `email_code` sent there.
+    pub fn with_email(mut self, email_code: &str) -> Self {
+        self.email_code = Some(email_code.to_owned());
+        self
+    }
+}
+
+/// The digits of `typed` (every ASCII digit, in order).
+pub(crate) fn digits_of(typed: &str) -> String {
+    typed.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// The `phone` login flow of a network that sends a login code (Telegram, KT-1b): the number is
+/// asked for, and the ACCOUNT it names decides everything after it ([`PhoneAccount`]). A typed
+/// number that is in no row fails at `registration` (the network has no account for it); one that
+/// is a row follows the row: its refusal at `phone`, else the code step (with its delivery and its
+/// resend), the password, the e-mail steps, the link. The tail the run tool expects
+/// (`BackendConfig::expect_number_suffix`) is checked on the typed number BEFORE the code, when the
+/// script honours it ([`Script::honour_number_tail`]). Without this script a `phone` login is
+/// refused as unsupported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhoneLoginScript {
+    /// The accounts, one row per number.
+    pub numbers: Vec<PhoneAccount>,
+}
+
+impl PhoneLoginScript {
+    /// A table of `numbers`.
+    pub fn new(numbers: Vec<PhoneAccount>) -> Self {
+        Self { numbers }
+    }
+
+    /// The row of the number whose digits are `digits`.
+    pub(crate) fn account(&self, digits: &str) -> Option<&PhoneAccount> {
+        self.numbers.iter().find(|a| a.digits == digits)
+    }
 }
 
 /// One server delivery: stage 1 stores it in the inbox, stage 2 turns it into one
@@ -298,6 +454,11 @@ fn challenge(url: &str, retry_after: Option<Duration>) -> BackendError {
 /// one (the core must hand the token of the paused attempt back).
 pub const CHALLENGE_TOKEN: &str = "fake-challenge-token";
 
+/// How many chats the fake lets an account pin (`AccountCaps::max_pinned_chats`): the common limit of 4. It is
+/// the statement of a script that has [`Script::roaming_writes`] and states no limit of its own; a script
+/// states another one in an `AccountCaps` of its own (see [`Script::roaming_writes`]).
+pub const PIN_LIMIT: u32 = 4;
+
 /// A complete scripted account.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Script {
@@ -313,11 +474,45 @@ pub struct Script {
     pub number: Option<String>,
     /// The login.
     pub login: LoginScript,
+    /// The `pair-code` login flow, when the network has one ([`PairCodeScript`]).
+    pub pair_code: Option<PairCodeScript>,
+    /// The `phone` login flow, when the network has one ([`PhoneLoginScript`]); also what the
+    /// account the phone scans in is asked after a QR scan: the password of the row of
+    /// [`Self::number`] (TDLib's `WaitPassword` after a scan).
+    pub phone_login: Option<PhoneLoginScript>,
     /// What happens after login.
     pub steps: Vec<Step>,
+    /// What the network states at EVERY connect, `delay` (account clock) after the connection
+    /// is `Online` ([`after_connect`](Self::after_connect)): a backend that restates its
+    /// account hold only once it is up.
+    pub after_connect: Vec<(Duration, BackendEvent)>,
     /// Refuse roaming changes like a rejected Threema transaction (§7.3).
     pub reject_changes: bool,
-    /// Delay before each forwarded batch, on the account clock ("slow acks").
+    /// What the fake states of the settings its network keeps for the account's other devices
+    /// (archive, pin, mute, marked unread: "roaming"), in the `AccountCaps` it delivers
+    /// ([`kourier_model::AccountCaps::roaming_writes`]): `Some(true)` = the network writes them
+    /// and the account's switch is on (the DEFAULT, so every fake-driven test and fixture page that
+    /// archives or pins keeps working), `Some(false)` = it can and the switch is off, `None` =
+    /// the network cannot and the fake states nothing, like WhatsApp, Telegram and Threema until
+    /// they write. When it is `Some`, the fake adds the statement and [`PIN_LIMIT`] to the first
+    /// delivery that carries no `AccountCaps` of its own and to every `AccountCaps` of the script
+    /// that does not state the flag itself, refuses a roaming change while the stated flag is
+    /// not `Some(true)`, and obeys `Command::SetRoamingWrites`.
+    ///
+    /// The fake plays the couplings and the limit that such networks have in common (a new pin goes
+    /// to the end of the pin list a network keeps and unarchives the chat, an archive unpins, at most
+    /// [`PIN_LIMIT`] pins), whatever [`Flavor`](crate::Flavor) it plays. A script that plays another
+    /// limit (a network with 3 pins) states it in an `AccountCaps` of its own that carries
+    /// `max_pinned_chats: Some(3)`: the fake keeps the number a delivered `AccountCaps` states and adds
+    /// [`PIN_LIMIT`] only to caps that state none. A script whose own caps state the flag and no limit
+    /// plays a network without one. Test: `conformance::a_script_states_its_own_pin_limit`.
+    pub roaming_writes: Option<bool>,
+    /// Delay before each forwarded batch, on the account clock ("slow acks"). On
+    /// [`Flavor::TelegramLike`](crate::Flavor::TelegramLike) it also decides the order of the
+    /// two things the server says of an accepted message: the echo is committed with the accept,
+    /// and by default the core has it (acked) before it hears the outcome; with a forward delay
+    /// the outcome goes out at once and the echo ships behind it. A slow answer
+    /// ([`reply_delays`](Self::reply_delays)) keeps the echo first.
     pub forward_delay: Option<Duration>,
     /// Scripted transmit failures, checked in order; anything else is accepted for every
     /// recipient.
@@ -333,11 +528,24 @@ pub struct Script {
     /// server at once (its outcome is decided and recorded), but the reply reaches the core only
     /// after the delay on the account clock. The actor handles other commands meanwhile.
     pub reply_delays: Vec<(ConvKey, Duration)>,
+    /// The echo of an accepted message states no `allocated_as`
+    /// ([`Flavor::TelegramLike`](crate::Flavor::TelegramLike) only; the other flavours send no
+    /// echo): an echo that knows no binding, which the core joins to the message when the
+    /// outcome comes. Default off: the echo names the id the message was allocated under.
+    pub echo_without_binding: bool,
     /// Slow sends in EVERY conversation (fixture runs that show the line under a message on its
     /// way, link feedback L6): each transmit reports `phase` (as `BackendEvent::TransmitProgress`)
     /// and its answer reaches the core `after` this long on the account clock. Rules in
     /// [`Self::reply_delays`] win for their conversations. `None`: answers at once.
     pub slow_sends: Option<(Option<kourier_model::SendPhase>, Duration)>,
+    /// A message with files sent in one of these conversations has an UPLOAD PHASE before the
+    /// fake server takes it ([`UploadScript`]): the actor reports each file's progress
+    /// (`BackendEvent::AttachmentProgress`, `index` = the file's position in the request) and
+    /// obeys `Command::AbortTransmit` while the phase lasts. Nothing reaches the fake server
+    /// before the phase ends, so an aborted send leaves no `fake_transmits` row and no
+    /// [`FakeControl::transmits`](crate::FakeControl::transmits) record. Edits, deletes,
+    /// reactions and messages without files have none. By default the fake reports no upload.
+    pub uploads: Vec<(ConvKey, UploadScript)>,
     /// The answer the fake server accepts for a challenge (`Command::SubmitChallenge`); `None`
     /// accepts any answer. A wrong answer is refused and the challenge stands.
     pub challenge_answer: Option<String>,
@@ -364,12 +572,27 @@ pub struct Script {
     /// (`Command::RequestAttachments`, [`BackfillScript`]); `None`: the account cannot ask
     /// (no `attachment_restore` capability), so a lost file stays lost.
     pub backfill: Option<BackfillScript>,
+    /// Honour `BackendConfig::expect_number_suffix` at the pairing of the QR flow, like the real
+    /// WhatsApp backend does (W2c): when a tail is set and [`Self::number`] does not end in it,
+    /// the login fails at the `qr` step with `ErrorKind::NotTheExpectedAccount` and links
+    /// nothing (no `AccountReady`, no device). Off by default: the other fakes ignore the tail,
+    /// as they always did (the T1a rehearsal switches it on).
+    pub honour_number_tail: bool,
     /// The fake server cannot be reached for a logout (`Command::Logout`): the report says
     /// `NotReached` and the server keeps the device, as when the network is down while the
     /// user removes or unlinks the account (link feedback L4).
     pub logout_unreachable: bool,
     /// The name the device was linked with, reported with the logout (`LogoutReport`).
     pub device_name: Option<String>,
+    /// How long the emoji step of a QR login stands (account clock), for a fake that plays
+    /// Threema ([`FAKE_EMOJI`] after the scan; another fake has no such step). Default
+    /// [`EMOJI_FOR`]; a fixture page that must stand at the step gives it a long one.
+    pub emoji_for: Duration,
+    /// How long the FIRST code of the QR flow is valid, when that differs from the other codes'
+    /// `valid_for` ([`LoginScript::Qr`]): the rehearsal of a run tool that must catch the first
+    /// code on screen (a long one nobody scans), then link on a short second one. `None` (the
+    /// default): every code lives `valid_for`.
+    pub first_qr_for: Option<Duration>,
     /// The fake takes this long (on its clock) to answer a logout: a test sees the account
     /// `Unlinking` or `Removing` meanwhile.
     pub logout_delay: Option<std::time::Duration>,
@@ -378,6 +601,84 @@ pub struct Script {
     /// has not read the report yet: a test of the core taking the report after the exit. At
     /// most 6 (the event queue holds 8).
     pub logout_backlog: usize,
+    /// How many progress events the actor sends from its command loop before it answers an
+    /// `AbortTransmit`: a backend whose loop is inside an emit when the X comes (the Signal
+    /// actor's `Connect` with a stored transfer is one). The event queue holds 8, so with more
+    /// the actor waits for the core to READ before it can answer: a core that waits for the
+    /// answer without reading events would run into its time-out and take the stop for
+    /// `TooLate` (upload progress, fix K3).
+    pub abort_backlog: usize,
+    /// The safety numbers of the network (P5a, critic F15): the people who have one and the
+    /// states their key goes through ([`SafetyScript`]). Empty (the default): the fake answers
+    /// `Command::SafetyNumber` with `SafetyUnavailable::Unsupported`, as a network without
+    /// safety numbers, and refuses `SetVerified`. Sends that meet a changed key are scripted
+    /// with [`TransmitRule`]s (`ErrorKind::UntrustedIdentity`), decided before the run.
+    pub safety: Vec<SafetyScript>,
+}
+
+/// One person's safety numbers in the fake ([`Script::safety`]). The fake HOLDS one entry of
+/// `keys` at a time, starting with the first: a `Command::SafetyNumber` answers the held entry
+/// and then the fake moves on to the next (the last one stays), so a script says "the key
+/// changed after the page asked" as two entries. `SetVerified` is refused (`InvalidInput`)
+/// when its key is not the held one; otherwise it sets the held entry's state, states the
+/// contact's trust and key (`ContactUpsert`), writes the quiet `VerifiedChanged` notice into
+/// the 1:1 chat when the state changed, and tells `IdentityTrusted` when it was `Changed`.
+/// The digits and the 74 scannable bytes are made from the key (synthetic, not Signal's).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SafetyScript {
+    /// The person.
+    pub user: UserId,
+    /// The keys the fake holds in turn, each with its starting state.
+    pub keys: Vec<(
+        kourier_model::IdentityFingerprint,
+        kourier_model::VerifyState,
+    )>,
+    /// How many of the first `Command::SafetyNumber` asks are answered `SafetyUnavailable::NoKey`
+    /// ("no key yet") before the first key is shown: a person whose key the fake learns late
+    /// (0: the first ask has the number).
+    pub keyless_asks: u32,
+}
+
+/// How the fake's upload phase of a message with files behaves ([`Script::uploads`]). The
+/// reports follow the contract of `AttachmentProgress`: the first report names every file at
+/// once, `total` is the file's size from then on, `done` never goes down and a file is full
+/// only when its upload is over; the phase ends with `TransmitProgress { 1.0, None }`, and the
+/// fake server takes the message after it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UploadScript {
+    /// The files upload one after another: the file being uploaded gains `step` of its size
+    /// (a fraction, 0 < step <= 1) every 250 ms of the account clock, the files behind it are
+    /// reported at 0. An abort during the phase is answered `Stopping`.
+    Moving {
+        /// The share of a file one tick adds.
+        step: f32,
+    },
+    /// Each file is reported at its fixed share (`shares[i]` for file `i`, 0 for a file beyond
+    /// the list; the reports are repeated every second of the account clock, as a ticker
+    /// would, so a screen that opens late still hears them), and the phase lasts `hold` on the
+    /// account clock. An abort during the phase is answered `Stopping`.
+    Held {
+        /// The fixed share of each file.
+        shares: Vec<f32>,
+        /// How long the phase lasts.
+        hold: Duration,
+    },
+    /// The files are being made ready (a backend that re-encodes its pictures before the first
+    /// byte): the phase `Preparing` is said (and again every second of the account clock, as
+    /// a ticker would) for `hold` on the account clock and no file is reported; then every file
+    /// is reported full and the phase ends. An abort during it is answered `Stopping`.
+    Preparing {
+        /// How long the preparation lasts.
+        hold: Duration,
+    },
+    /// Like [`Held`](Self::Held), but the abort comes too late whenever it comes: it is
+    /// answered `TooLate` and the held phase ends at once, the message goes out.
+    TooLate {
+        /// The fixed share of each file.
+        shares: Vec<f32>,
+        /// How long the phase lasts without an abort.
+        hold: Duration,
+    },
 }
 
 /// How the fake account's phone answers a request for the files of a message the network
@@ -403,14 +704,20 @@ impl Script {
             display_name: None,
             number: None,
             login: LoginScript::Auto,
+            pair_code: None,
+            phone_login: None,
             steps: Vec::new(),
+            after_connect: Vec::new(),
             reject_changes: false,
+            roaming_writes: Some(true),
             forward_delay: None,
             transmit: Vec::new(),
             early_events: Vec::new(),
             catch_up_on_resume: None,
             reply_delays: Vec::new(),
+            echo_without_binding: false,
             slow_sends: None,
+            uploads: Vec::new(),
             challenge_answer: None,
             online_while_linking: false,
             with_ready: Vec::new(),
@@ -418,10 +725,15 @@ impl Script {
             download_delay: None,
             transfer: None,
             backfill: None,
+            honour_number_tail: false,
             logout_unreachable: false,
             logout_backlog: 0,
+            abort_backlog: 0,
+            safety: Vec::new(),
             logout_delay: None,
             device_name: None,
+            emoji_for: EMOJI_FOR,
+            first_qr_for: None,
         }
     }
 
@@ -455,9 +767,47 @@ impl Script {
         self
     }
 
+    /// States what the fake says of the roaming settings ([`roaming_writes`](Self::roaming_writes)).
+    pub fn with_roaming_writes(mut self, roaming_writes: Option<bool>) -> Self {
+        self.roaming_writes = roaming_writes;
+        self
+    }
+
     /// Gives a fresh link of the account a history transfer ([`transfer`](Self::transfer)).
     pub fn with_transfer(mut self, transfer: TransferScript) -> Self {
         self.transfer = Some(transfer);
+        self
+    }
+
+    /// States how long the emoji step of a QR login stands ([`emoji_for`](Self::emoji_for)).
+    pub fn with_emoji_for(mut self, emoji_for: Duration) -> Self {
+        self.emoji_for = emoji_for;
+        self
+    }
+
+    /// States how long the first code of the QR flow lives ([`first_qr_for`](Self::first_qr_for)).
+    pub fn with_first_qr_for(mut self, first_qr_for: Duration) -> Self {
+        self.first_qr_for = Some(first_qr_for);
+        self
+    }
+
+    /// Gives the account a `pair-code` login flow ([`pair_code`](Self::pair_code)).
+    pub fn with_pair_code(mut self, pair_code: PairCodeScript) -> Self {
+        self.pair_code = Some(pair_code);
+        self
+    }
+
+    /// Gives the account a `phone` login flow ([`phone_login`](Self::phone_login)).
+    pub fn with_phone_login(mut self, phone_login: PhoneLoginScript) -> Self {
+        self.phone_login = Some(phone_login);
+        self
+    }
+
+    /// States `event` (ephemeral) at every connect, `delay` on the account clock after the
+    /// runner brought the connection to `Online`, before the steps that are left run. A
+    /// script whose next step is a `Step::Conn` runs the connection itself and gets none.
+    pub fn after_connect(mut self, delay: Duration, event: BackendEvent) -> Self {
+        self.after_connect.push((delay, event));
         self
     }
 
@@ -505,10 +855,66 @@ impl Script {
         self
     }
 
+    /// The echo of an accepted message states no `allocated_as`
+    /// ([`Self::echo_without_binding`]).
+    pub fn with_echo_without_binding(mut self) -> Self {
+        self.echo_without_binding = true;
+        self
+    }
+
     /// Every transmit reports `phase` and is answered `after` this long
     /// ([`Self::slow_sends`]).
     pub fn slow_sends(mut self, phase: Option<kourier_model::SendPhase>, after: Duration) -> Self {
         self.slow_sends = Some((phase, after));
+        self
+    }
+
+    /// The actor sends `events` progress events before it answers an `AbortTransmit`
+    /// ([`Self::abort_backlog`]).
+    pub fn with_abort_backlog(mut self, events: usize) -> Self {
+        self.abort_backlog = events;
+        self
+    }
+
+    /// Gives the messages with files sent in `conv` an upload phase ([`Self::uploads`]).
+    pub fn with_uploads(mut self, conv: ConvKey, uploads: UploadScript) -> Self {
+        self.uploads.push((conv, uploads));
+        self
+    }
+
+    /// Gives `user` safety numbers ([`Script::safety`]).
+    pub fn with_safety(
+        mut self,
+        user: UserId,
+        keys: Vec<(
+            kourier_model::IdentityFingerprint,
+            kourier_model::VerifyState,
+        )>,
+    ) -> Self {
+        self.safety.push(SafetyScript {
+            user,
+            keys,
+            keyless_asks: 0,
+        });
+        self
+    }
+
+    /// Gives `user` safety numbers, the first `keyless_asks` asks of which are answered "no key
+    /// yet" ([`SafetyScript::keyless_asks`]).
+    pub fn with_late_safety(
+        mut self,
+        user: UserId,
+        keys: Vec<(
+            kourier_model::IdentityFingerprint,
+            kourier_model::VerifyState,
+        )>,
+        keyless_asks: u32,
+    ) -> Self {
+        self.safety.push(SafetyScript {
+            user,
+            keys,
+            keyless_asks,
+        });
         self
     }
 

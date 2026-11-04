@@ -540,6 +540,9 @@ describe('mock harness', () => {
     assert.equal(stats.groupFetches[group.id], 0);
     assert.equal(stats.uploads, 0, 'no client uploaded anything');
     assert.deepEqual(stats.certificateRequests, [], 'no client fetched a sender certificate');
+    // The count of requests open at once starts anew on demand.
+    assert.deepEqual(await harness.request('resetInFlight'), {});
+    assert.deepEqual((await harness.request('sendStats')).inFlightMax, { prekeyFetches: 0, singleSends: 0 });
 
     // Hal holds Gus's sender key after a sender-key text; forgetting it is counted.
     await harness.request('sendGroupText', { from: gus.ref, group: group.id, to: [hal.ref], text: 'hi', senderKey: true });
@@ -805,6 +808,22 @@ describe('mock harness', () => {
     assert.deepEqual(await harness.request('failAuth', { username: unborn, stop: true }), {});
     assert.equal((await upgrade(basic(unborn, 'secret')))[':status'], 403, 'stopped');
     await assert.rejects(harness.request('failAuth', { username: owner.aci }), { code: 'badRequest' });
+    // An upgrade can be held back and a request can close its socket instead of being answered;
+    // the tests that use them need a linked client (kourier-signal `robustness`).
+    assert.deepEqual(await harness.request('holdUpgrade', { username: unborn, ms: 5, count: 1 }), {});
+    assert.deepEqual(await harness.request('holdUpgrade', { username: unborn, stop: true }), {});
+    await assert.rejects(harness.request('holdUpgrade', { username: owner.aci }), { code: 'badRequest' });
+    await assert.rejects(harness.request('holdUpgrade', { username: unborn, ms: -1 }), { code: 'badRequest' });
+    assert.deepEqual(await harness.request('closeOnRequest', { verb: 'DELETE', pathPrefix: '/v1/devices/' }), {});
+    assert.deepEqual(await harness.request('closeOnRequest', { stop: true }), {});
+    await assert.rejects(harness.request('closeOnRequest', { pathPrefix: '/x' }), { code: 'badRequest' });
+    assert.deepEqual(await harness.request('holdRequest', { verb: 'DELETE', pathPrefix: '/v1/devices/', ms: 5 }), {});
+    assert.deepEqual(await harness.request('holdRequest', { stop: true }), {});
+    await assert.rejects(harness.request('holdRequest', { pathPrefix: '/x' }), { code: 'badRequest' });
+    await assert.rejects(harness.request('holdRequest', { verb: 'GET', pathPrefix: '/x', ms: -1 }), { code: 'badRequest' });
+    // The log of the clients' websocket requests: filtered by verb and path, and cleared on demand.
+    assert.deepEqual(await harness.request('requestLog', { clear: true, verb: 'GET', pathPrefix: '/v2/keys' }), { requests: [] });
+    await assert.rejects(harness.request('requestLog', { verb: 5 }), { code: 'badRequest' });
     // The answer to a link can be held back, and is not by default.
     assert.deepEqual(await harness.request('delayLink', { ms: 5 }), {});
     assert.deepEqual(await harness.request('delayLink', {}), {});
@@ -1013,6 +1032,232 @@ describe('mock harness', () => {
     // The multi-recipient challenge of the websocket route is set and lifted.
     assert.deepEqual(await harness.request('challengeMultiRecipient', { retryAfter: 7 }), { refused: 0 });
     assert.deepEqual(await harness.request('challengeMultiRecipient', { stop: true }), { refused: 0 });
+  });
+
+  /** A phone with two contacts and a group, and a Storage Service state listing all of them. */
+  async function storagePhone(overrides = {}) {
+    const ada = await harness.request('createPrimary', { profileName: 'Ada' });
+    const bo = await harness.request('createPrimary', { profileName: 'Bo' });
+    const phone = await harness.request('createPrimary', { profileName: 'Phone', contacts: [ada.ref, bo.ref] });
+    const group = await harness.request('createGroup', { from: phone.ref, title: 'Club', members: [ada.ref, bo.ref] });
+    const state = await harness.request('setStorageState', {
+      primary: phone.ref,
+      contacts: [{ ref: ada.ref, ...overrides.ada }, { ref: bo.ref, ...overrides.bo }],
+      groups: [{ id: group.id, ...overrides.group }],
+      ...(overrides.account ? { account: overrides.account } : {}),
+    });
+    return { ada, bo, phone, group, state };
+  }
+
+  test('storageState reads what the phone wrote; storageIdentifiers lists ids and types only', async () => {
+    const { ada, bo, phone, group, state } = await storagePhone({
+      ada: { archived: true, markedUnread: true, mutedUntil: 5000, pinned: true, identityState: 'verified' },
+      group: { mutedUntil: 9000, pinned: true },
+      account: { noteToSelfArchived: true },
+    });
+    assert.deepEqual(state, { version: 1, records: 4 });
+    const view = await harness.request('storageState', { primary: phone.ref });
+    assert.deepEqual(Object.keys(view).sort(), [
+      'contacts', 'groups', 'identityStates', 'noteToSelf', 'orphans', 'pins', 'records', 'version',
+    ]);
+    assert.equal(view.version, 1);
+    assert.equal(view.records, 4);
+    assert.deepEqual(view.contacts[ada.ref], { archived: true, markedUnread: true, mutedUntil: '5000' });
+    assert.deepEqual(view.contacts[bo.ref], { archived: false, markedUnread: false, mutedUntil: '0' });
+    assert.deepEqual(view.groups[group.id], { archived: false, markedUnread: false, mutedUntil: '9000' });
+    assert.deepEqual(view.identityStates, { [ada.ref]: 'verified', [bo.ref]: 'default' });
+    assert.deepEqual(view.pins, [`contact:${ada.ref}`, `group:${group.id}`]);
+    assert.deepEqual(view.noteToSelf, { archived: true, markedUnread: false });
+    assert.equal(view.orphans, 0);
+
+    const ids = await harness.request('storageIdentifiers', { primary: phone.ref });
+    assert.deepEqual(Object.keys(ids).sort(), ['ids', 'items', 'missing', 'orphans', 'unreadable', 'version']);
+    assert.equal(ids.version, 1);
+    assert.deepEqual(ids.ids.map((entry) => entry.type).sort(), [1, 1, 3, 4]);
+    for (const entry of ids.ids) {
+      assert.deepEqual(Object.keys(entry).sort(), ['id', 'type'], 'ids and types, nothing else');
+      assert.equal(decodeBase64(entry.id, 'id').length, 16);
+    }
+    assert.deepEqual([ids.items, ids.orphans, ids.missing, ids.unreadable], [4, 0, 0, 0]);
+
+    // Two items no identifier lists are orphans; the listed ones are all still readable.
+    assert.deepEqual(await harness.request('storagePut', { primary: phone.ref, orphans: 2 }), {
+      status: 200,
+      version: 2,
+    });
+    assert.equal((await harness.request('storageState', { primary: phone.ref })).orphans, 2);
+    const after = await harness.request('storageIdentifiers', { primary: phone.ref });
+    assert.deepEqual([after.ids.length, after.items, after.orphans], [4, 6, 2]);
+
+    const fresh = await harness.request('createPrimary', { profileName: 'Fresh' });
+    assert.deepEqual((await harness.request('storageState', { primary: fresh.ref })).version, null);
+    assert.equal((await harness.request('storageIdentifiers', { primary: fresh.ref })).version, null);
+  });
+
+  test('rawStorageRecord returns the bytes as written; unknownFields and undecryptable change them', async () => {
+    const unknown = Buffer.concat([Buffer.from([0xba, 0x3e, 0x08]), Buffer.from('UNKNOWNX')]);
+    const { ada, bo, phone, group } = await storagePhone({
+      ada: { archived: true, unknownFields: unknown.toString('base64') },
+      group: { unknownFields: unknown.toString('base64') },
+      account: { unknownFields: unknown.toString('base64') },
+    });
+    const ids = await harness.request('storageIdentifiers', { primary: phone.ref });
+    // The field is INSIDE the record's message: the length prefix counts it, it ends the message.
+    const split = (raw) => {
+      let at = 1;
+      let length = 0;
+      for (let shift = 0; ; shift += 7) {
+        const byte = raw[at++];
+        length += (byte & 0x7f) * 2 ** shift;
+        if ((byte & 0x80) === 0) break;
+      }
+      assert.equal(at + length, raw.length, 'one field and nothing after it');
+      return { tag: raw[0], message: raw.subarray(at) };
+    };
+    for (const [subject, tag, type] of [
+      [{ contact: ada.ref }, 0x0a, 1],
+      [{ group: group.id }, 0x1a, 3],
+      [{ account: true }, 0x22, 4],
+    ]) {
+      const record = await harness.request('rawStorageRecord', { primary: phone.ref, ...subject });
+      assert.deepEqual(Object.keys(record).sort(), ['flags', 'id', 'raw']);
+      const raw = decodeBase64(record.raw, 'raw');
+      const { tag: found, message } = split(raw);
+      assert.equal(found, tag);
+      assert.ok(message.subarray(message.length - unknown.length).equals(unknown), `type ${type} ends with it`);
+      assert.ok(ids.ids.some((entry) => entry.id === record.id && entry.type === type), 'its manifest id');
+    }
+    const adaRecord = await harness.request('rawStorageRecord', { primary: phone.ref, contact: ada.ref });
+    assert.deepEqual(adaRecord.flags, { archived: true, markedUnread: false, mutedUntil: '0' });
+    const boRecord = await harness.request('rawStorageRecord', { primary: phone.ref, contact: bo.ref });
+    assert.equal(decodeBase64(boRecord.raw, 'raw').includes(unknown), false);
+    // The phone's decoder skips the unknown field: the state reads.
+    assert.equal((await harness.request('storageState', { primary: phone.ref })).contacts[ada.ref].archived, true);
+
+    await assert.rejects(harness.request('rawStorageRecord', { primary: phone.ref }), { code: 'badRequest' });
+    const stranger = await harness.request('createPrimary', { profileName: 'Stranger' });
+    await assert.rejects(harness.request('rawStorageRecord', { primary: phone.ref, contact: stranger.ref }), {
+      code: 'notFound',
+    });
+
+    // undecryptable: the listed item is no ciphertext, so the phone's reading fails, the manifest
+    // still lists it and the others open.
+    const broken = await storagePhone({ ada: { undecryptable: true } });
+    await assert.rejects(harness.request('storageState', { primary: broken.phone.ref }));
+    const listed = await harness.request('storageIdentifiers', { primary: broken.phone.ref });
+    assert.deepEqual([listed.ids.length, listed.items, listed.unreadable], [4, 4, 1]);
+    assert.ok(await harness.request('rawStorageRecord', { primary: broken.phone.ref, contact: broken.bo.ref }));
+    await assert.rejects(
+      harness.request('rawStorageRecord', { primary: broken.phone.ref, contact: broken.ada.ref }),
+      { code: 'notFound' },
+    );
+  });
+
+  test('updateStorageRecord moves one record under a new id; the phone writes are not storageWrites', async () => {
+    const { ada, bo, phone, group } = await storagePhone();
+    const writes = await harness.request('storageWrites');
+    const before = await harness.request('storageIdentifiers', { primary: phone.ref });
+    // Beyond a double: a decimal string.
+    const updated = await harness.request('updateStorageRecord', {
+      primary: phone.ref,
+      contact: ada.ref,
+      archived: true,
+      mutedUntil: '9007199254740993',
+    });
+    assert.deepEqual(updated, { version: 2 });
+    const view = await harness.request('storageState', { primary: phone.ref });
+    assert.deepEqual(view.contacts[ada.ref], { archived: true, markedUnread: false, mutedUntil: '9007199254740993' });
+    assert.deepEqual(view.contacts[bo.ref], { archived: false, markedUnread: false, mutedUntil: '0' });
+    assert.equal(view.orphans, 0, 'the old id is deleted');
+    const after = await harness.request('storageIdentifiers', { primary: phone.ref });
+    const known = new Set(before.ids.map((entry) => entry.id));
+    const now = new Set(after.ids.map((entry) => entry.id));
+    assert.equal(after.ids.length, before.ids.length);
+    assert.equal([...now].filter((id) => !known.has(id)).length, 1, 'one new id');
+    assert.equal([...known].filter((id) => !now.has(id)).length, 1, 'one id gone');
+
+    assert.deepEqual(
+      await harness.request('updateStorageRecord', { primary: phone.ref, group: group.id, pinned: true, markedUnread: true }),
+      { version: 3 },
+    );
+    assert.deepEqual(
+      await harness.request('updateStorageRecord', { primary: phone.ref, account: true, noteToSelfArchived: true }),
+      { version: 4 },
+    );
+    const last = await harness.request('storageState', { primary: phone.ref });
+    assert.deepEqual(last.pins, [`group:${group.id}`]);
+    assert.equal(last.groups[group.id].markedUnread, true);
+    assert.deepEqual(last.noteToSelf, { archived: true, markedUnread: false });
+    assert.equal(last.contacts[ada.ref].archived, true, 'an earlier change stays');
+
+    assert.deepEqual(await harness.request('storageWrites'), writes);
+    await assert.rejects(harness.request('updateStorageRecord', { primary: phone.ref }), { code: 'badRequest' });
+    await assert.rejects(
+      harness.request('updateStorageRecord', { primary: phone.ref, contact: ada.ref, mutedUntil: 'soon' }),
+      { code: 'badRequest' },
+    );
+    const fresh = await harness.request('createPrimary', { profileName: 'Fresh' });
+    await assert.rejects(harness.request('updateStorageRecord', { primary: fresh.ref, account: true }), {
+      code: 'badRequest',
+    });
+  });
+
+  test('storageWrites counts the linked device puts; conflictNextStorageWrite makes the next one meet the phone', async () => {
+    const { ada, bo, phone } = await storagePhone();
+    const base = await harness.request('storageWrites');
+    assert.deepEqual(Object.keys(base).sort(), ['conflicts', 'refused', 'writes']);
+
+    // The phone's own writes are in neither count.
+    await harness.request('updateStorageRecord', { primary: phone.ref, contact: bo.ref, markedUnread: true });
+    assert.deepEqual(await harness.request('storageWrites'), base);
+
+    assert.deepEqual(await harness.request('storagePut', { primary: phone.ref }), { status: 200, version: 3 });
+    assert.deepEqual(await harness.request('storageWrites'), {
+      writes: base.writes + 1,
+      conflicts: base.conflicts,
+      refused: base.refused,
+    });
+    assert.deepEqual(await harness.request('storagePut', { primary: phone.ref, version: 9 }), {
+      status: 409,
+      version: 3,
+    });
+    assert.deepEqual(await harness.request('storageWrites'), {
+      writes: base.writes + 1,
+      conflicts: base.conflicts + 1,
+      refused: base.refused,
+    });
+    // V4: a PUT the mock refuses (a manifest without a version: 400) is counted as refused, so the
+    // oracle "nothing was written" sees a PUT that left the device and was turned away.
+    await assert.rejects(harness.request('storagePut', { primary: phone.ref, version: 0 }));
+    assert.deepEqual(await harness.request('storageWrites'), {
+      writes: base.writes + 1,
+      conflicts: base.conflicts + 1,
+      refused: base.refused + 1,
+    });
+
+    // Armed, not applied; one at a time; the next put meets the phone's change.
+    assert.deepEqual(
+      await harness.request('conflictNextStorageWrite', { primary: phone.ref, contact: ada.ref, archived: true }),
+      { armed: true },
+    );
+    assert.equal((await harness.request('storageState', { primary: phone.ref })).version, 3);
+    await assert.rejects(
+      harness.request('conflictNextStorageWrite', { primary: phone.ref, contact: bo.ref, archived: true }),
+      { code: 'badRequest' },
+    );
+    assert.deepEqual(await harness.request('storagePut', { primary: phone.ref }), { status: 409, version: 4 });
+    const view = await harness.request('storageState', { primary: phone.ref });
+    assert.equal(view.version, 4);
+    assert.equal(view.contacts[ada.ref].archived, true);
+    assert.deepEqual(await harness.request('storagePut', { primary: phone.ref }), { status: 200, version: 5 });
+    assert.deepEqual(await harness.request('storageWrites'), {
+      writes: base.writes + 2,
+      conflicts: base.conflicts + 2,
+      refused: base.refused + 1,
+    });
+
+    const fresh = await harness.request('createPrimary', { profileName: 'Fresh' });
+    await assert.rejects(harness.request('storagePut', { primary: fresh.ref }), { code: 'badRequest' });
   });
 
   test('errors are reported per request', async () => {

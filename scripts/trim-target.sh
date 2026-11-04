@@ -14,16 +14,19 @@ S=target/tmp/trim; mkdir -p "$S"
 failed=0
 run() {
     echo "== $*"
-    "$@" --message-format=json 2>"$S/trim-err.log" | grep '"reason":"\(compiler-artifact\|build-script-executed\)"' >> "$S/trim-artifacts.jsonl"
+    "$@" 2>"$S/trim-err.log" | grep '"reason":"\(compiler-artifact\|build-script-executed\)"' >> "$S/trim-artifacts.jsonl"
     code=${PIPESTATUS[0]}
     echo "   exit $code"
     [ "$code" -eq 0 ] || failed=1
 }
-run cargo clippy --workspace --all-targets
-run cargo test --workspace --exclude kourier-qt --no-run
-run cargo test -p kourier-qt --no-run
-run cargo build -p kourier
-run cargo build -p xtask
+# Each line spells its own --message-format=json (clippy's lint arguments, the ones of
+# `cargo xtask ci`, come after `--`: a replay with other lints would check the crates again).
+# xtask/src/prune.rs `canonical_queries` is these five; a unit test keeps them equal.
+run cargo clippy --workspace --all-targets --message-format=json -- -D warnings
+run cargo test --workspace --exclude kourier-qt --no-run --message-format=json
+run cargo test -p kourier-qt --no-run --message-format=json
+run cargo build -p kourier --message-format=json
+run cargo build -p xtask --message-format=json
 if [ "$failed" -ne 0 ]; then
     echo "a cargo command failed (see $S/trim-err.log): the list of files in use is not complete, nothing is deleted" >&2
     exit 1

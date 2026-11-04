@@ -53,7 +53,7 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use super::{cargo, qml_problems, root, run, target_dir, theme_home};
+use super::{cargo, names, qml_problems, root, run, target_dir, theme_home};
 
 const USAGE: &str = "usage: cargo xtask perf [--out <file>] [--quick] [--start] [--report-only] \
 [--idle <seconds>] [--runs <n>] [--scale <factor>] [--no-mock] [--no-build] [--keep-profile]
@@ -1712,7 +1712,7 @@ pub fn rows(m: &Measured, o: &Options) -> Vec<Row> {
         },
         Row {
             target: BINARY_SIZE.into(),
-            budget: Some(Budget::AtMost(60.0)),
+            budget: Some(Budget::AtMost(80.0)),
             limit: "",
             #[allow(clippy::cast_precision_loss)]
             value: m.binary_bytes.map(|b| b as f64 / (1024.0 * 1024.0)),
@@ -1720,9 +1720,11 @@ pub fn rows(m: &Measured, o: &Options) -> Vec<Row> {
             unit: "MiB",
             advisory: false,
             failed: false,
-            how: "`target/release/kourier` as built (default features, the default release \
-                  profile); the limit makes debug information coming back fail the table \
-                  (260 MB once)"
+            how: "`target/release/kourier` (default features, the default release profile, the \
+                  WhatsApp backend compiled in) as `cargo xtask dist` strips it: without its \
+                  symbol table, which goes into the names file kept per release (a superset of \
+                  the published file; 80 MiB since W2b, 60 before). Debug information coming back \
+                  (260 MB once) is refused by the split, as a policy, and aborts the run"
                 .into(),
         },
         Row {
@@ -3055,24 +3057,36 @@ fn release_non_dumpable(bin: &Path, config_home: &Path) -> Result<bool> {
     Ok(matches!(read, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied))
 }
 
+/// The `kourier-e2e` integration-test binary that holds the catch-up test (one binary, `it`,
+/// since T3) and the test's path inside it (`module::function`).
+const MOCK_INGEST_TARGET: &str = "it";
+const MOCK_INGEST_FILTER: &str =
+    "signal_core::five_thousand_queued_messages_ingest_at_500_per_second";
+
+/// Arguments of the cargo run of the Signal mock catch-up test.
+fn mock_ingest_args() -> Vec<&'static str> {
+    vec![
+        "test",
+        "--release",
+        "-p",
+        "kourier-e2e",
+        "--test",
+        MOCK_INGEST_TARGET,
+        MOCK_INGEST_FILTER,
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ]
+}
+
 /// Runs the Signal mock catch-up test of `kourier-e2e` once as a release build and reads its
 /// rate. A test that fails gives no number, whatever it printed before.
 fn mock_ingest() -> Result<(f64, bool)> {
     let out = cargo()
         .current_dir(root())
-        .args([
-            "test",
-            "--release",
-            "-p",
-            "kourier-e2e",
-            "--test",
-            "signal_core",
-            "five_thousand_queued_messages_ingest_at_500_per_second",
-            "--",
-            "--nocapture",
-            "--test-threads",
-            "1",
-        ])
+        .args(mock_ingest_args())
         .env("KOURIER_REQUIRE_MOCK_HARNESS", "1")
         .stdin(Stdio::null())
         .output()
@@ -3230,6 +3244,16 @@ fn build_binaries(plain: &Path, bin: &Path, plain_binary: bool) -> Result<()> {
     Ok(())
 }
 
+/// The size in bytes of `input` as `cargo xtask dist` ships it: split with [`names::split`]
+/// into `dir` (the same function dist uses), measure the shipped file, remove `dir` on every
+/// path, errors included. A refused split (debug information, no build-id) is the error: the
+/// run aborts rather than judging a file nobody gets. `input` is not touched.
+fn shipped_size(input: &Path, dir: &Path) -> Result<u64> {
+    let measured = names::split(input, dir).map(|s| s.shipped_bytes);
+    let _ = std::fs::remove_dir_all(dir);
+    measured.with_context(|| format!("split {} to measure the shipped size", input.display()))
+}
+
 fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
     let dir = perf_dir();
     std::fs::create_dir_all(&dir)?;
@@ -3260,7 +3284,7 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
     let config_home = theme_home(&dir.join("env"), "light", "BreezeLight", "breeze", false)?;
     let mut m = Measured::default();
     if plain_binary {
-        m.binary_bytes = Some(std::fs::metadata(&plain)?.len());
+        m.binary_bytes = Some(shipped_size(&plain, &dir.join("shipped"))?);
         m.release_non_dumpable = Some(release_non_dumpable(&plain, &config_home)?);
     }
     let profile = dir.join("profile");
@@ -4433,7 +4457,7 @@ Shared_Clean:        900 kB
         let size = by_target("Binary size");
         assert_eq!(
             (size.budget, size.value, size.status()),
-            (Some(Budget::AtMost(60.0)), Some(48.0), Status::Ok)
+            (Some(Budget::AtMost(80.0)), Some(48.0), Status::Ok)
         );
         assert_eq!(
             by_target("Release build is non-dumpable").status(),
@@ -4927,15 +4951,15 @@ Shared_Clean:        900 kB
             "{}",
             render_table(&table_of(&m))
         );
-        // The release binary: 60 MiB, to the byte.
+        // The release binary: 80 MiB, to the byte (W2b: the WhatsApp backend is compiled in).
         let mut m = measured();
-        m.binary_bytes = Some(60 * 1024 * 1024);
+        m.binary_bytes = Some(80 * 1024 * 1024);
         assert_eq!(row_of(&m, "Binary size").status(), Status::Close);
         assert!(missed_targets(&m).is_empty());
-        m.binary_bytes = Some(60 * 1024 * 1024 + 1);
+        m.binary_bytes = Some(80 * 1024 * 1024 + 1);
         assert_eq!(missed_targets(&m), ["Binary size"]);
         assert!(
-            render_table(&table_of(&m)).contains("| ≤ 60 MiB "),
+            render_table(&table_of(&m)).contains("| ≤ 80 MiB "),
             "{}",
             render_table(&table_of(&m))
         );
@@ -5478,6 +5502,93 @@ Shared_Clean:        900 kB
         assert_eq!(
             over.line(s(5)),
             "perf: 5 s in all: builds 10 s, profile 10 s, measurements 0 s"
+        );
+    }
+
+    // ---- the shipped size, on a compiled toy program ----
+
+    /// Compiles `int main(void){return 0;}` with `flags` into a fresh scratch directory.
+    fn toy(name: &str, flags: &[&str]) -> (PathBuf, PathBuf) {
+        let dir = target_dir()
+            .join("tmp/xtask-perf-size")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let src = dir.join("t.c");
+        std::fs::write(&src, "int main(void){return 0;}\n").expect("source");
+        let bin = dir.join("built");
+        run(
+            "cc",
+            Command::new("cc")
+                .args(flags)
+                .arg("-Wl,--build-id")
+                .arg(&src)
+                .arg("-o")
+                .arg(&bin),
+        )
+        .expect("cc");
+        (dir, bin)
+    }
+
+    #[test]
+    fn the_shipped_size_is_the_split_files_and_the_scratch_is_removed() {
+        let (dir, bin) = toy("good", &["-g0"]);
+        let out = dir.join("shipped");
+        let size = shipped_size(&bin, &out).expect("size");
+        let built = std::fs::metadata(&bin).unwrap().len();
+        assert!(size > 0 && size < built, "{size} of {built}");
+        // The very file dist would ship, byte for byte.
+        let reference = names::split(&bin, &dir.join("reference")).expect("split");
+        assert_eq!(size, reference.shipped_bytes);
+        assert_eq!(size, std::fs::metadata(&reference.shipped).unwrap().len());
+        assert!(!out.exists(), "the measuring copy is removed");
+        assert_eq!(std::fs::metadata(&bin).unwrap().len(), built);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_information_aborts_the_size_measurement() {
+        let (dir, bin) = toy("dwarf", &["-g"]);
+        let out = dir.join("shipped");
+        let err = format!("{:#}", shipped_size(&bin, &out).expect_err("refused"));
+        assert!(err.contains("debug information"), "{err}");
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mock_ingest_target_tests {
+    use super::*;
+
+    /// The `--test` target must be a `[[test]]` of kourier-e2e and the filter's module and
+    /// function must exist in its tests, so a rename cannot fail the perf row at the very end.
+    #[test]
+    fn mock_ingest_names_an_existing_test() {
+        let e2e = root().join("crates/kourier-e2e");
+        let args = mock_ingest_args();
+        let target = args[args.iter().position(|a| *a == "--test").unwrap() + 1];
+        let manifest = std::fs::read_to_string(e2e.join("Cargo.toml")).unwrap();
+        let declared = manifest.split("[[test]]").skip(1).any(|block| {
+            block
+                .lines()
+                .take_while(|l| !l.trim_start().starts_with('['))
+                .any(|l| l.replace(' ', "") == format!("name=\"{target}\""))
+        });
+        assert!(declared, "`--test {target}` is no [[test]] of kourier-e2e");
+        let (module, func) = MOCK_INGEST_FILTER.split_once("::").unwrap();
+        let tests = e2e.join("tests");
+        let root_rs = std::fs::read_to_string(tests.join(format!("{target}.rs"))).unwrap();
+        assert!(
+            root_rs
+                .lines()
+                .any(|l| l.trim() == format!("mod {module};")),
+            "`mod {module};` is not declared in {target}.rs"
+        );
+        let body = std::fs::read_to_string(tests.join(format!("{module}.rs"))).unwrap();
+        assert!(
+            body.contains(&format!("fn {func}(")),
+            "`fn {func}` is not in {module}.rs"
         );
     }
 }

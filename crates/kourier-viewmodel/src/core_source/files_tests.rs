@@ -87,6 +87,7 @@ fn alone(files: usize) -> QueryData {
             messages: (0..files).map(|i| vec![i]).collect(),
             reply_unsendable: false,
         },
+        location: vec![false; files],
     })
 }
 
@@ -189,7 +190,7 @@ fn files_in_preparation_are_counted_until_the_core_says_they_are_stored() {
         .map(|i| std::path::PathBuf::from(format!("/t/{i}.jpg")))
         .collect();
     let id = src
-        .send_files(CONV, paths, Vec::new(), "", None)
+        .send_files(CONV, paths, Vec::new(), Vec::new(), "", None)
         .expect("sent");
     let request = sends(&sent)[0].0;
     assert_eq!(request.0, id, "the id the composer got is the command's");
@@ -268,8 +269,8 @@ fn files_in_preparation_are_counted_until_the_core_says_they_are_stored() {
     let rows = src.timeline(CONV);
     assert_eq!(rows[0].key, RowKey::Message(MessageId(100_006)));
     assert_eq!(rows[1].key, RowKey::Message(MessageId(100_005)));
-    assert!(matches!(rows[0].blocks.as_slice(), [Block::Album(a)] if a.len() == 2));
-    assert!(matches!(rows[1].blocks.as_slice(), [Block::Album(a)] if a.len() == 3));
+    assert!(matches!(rows[0].blocks.as_slice(), [Block::Album(a)] if a.items.len() == 2));
+    assert!(matches!(rows[1].blocks.as_slice(), [Block::Album(a)] if a.items.len() == 3));
     assert!(rows[0].own && rows[1].own);
 }
 
@@ -292,13 +293,20 @@ fn sends_are_told_apart_by_their_request_whatever_chat_is_open() {
     let (mut src, sent) = opened(&store);
     // Two sends to one chat and one to another: three requests, each with its own id.
     let first = src
-        .send_files(CONV, files(3), Vec::new(), "", None)
+        .send_files(CONV, files(3), Vec::new(), Vec::new(), "", None)
         .expect("sent");
     let second = src
-        .send_files(CONV, files(2), Vec::new(), "", None)
+        .send_files(CONV, files(2), Vec::new(), Vec::new(), "", None)
         .expect("sent");
     let other = src
-        .send_files(ConversationId(2), files(4), Vec::new(), "", None)
+        .send_files(
+            ConversationId(2),
+            files(4),
+            Vec::new(),
+            Vec::new(),
+            "",
+            None,
+        )
         .expect("sent");
     assert!(first != second && second != other && first != other);
     assert_eq!(src.preparing_files(CONV), 5);
@@ -358,7 +366,7 @@ fn lost_events_end_the_count_without_calling_the_files_stored() {
     let store = Store::new(&[(1, 3)]);
     let (mut src, sent) = opened(&store);
     let id = src
-        .send_files(CONV, files(150), Vec::new(), "", None)
+        .send_files(CONV, files(150), Vec::new(), Vec::new(), "", None)
         .expect("sent");
     assert_eq!(src.preparing_files(CONV), 150);
     let ch = src.reload();
@@ -422,7 +430,14 @@ fn every_refused_send_comes_back() {
     let (mut src, sent) = opened(&store);
     let paths = files(3);
     let id = src
-        .send_files(CONV, paths.clone(), vec![false, true, true], "", None)
+        .send_files(
+            CONV,
+            paths.clone(),
+            vec![false, true, true],
+            Vec::new(),
+            "",
+            None,
+        )
         .expect("sent");
     let refusal = |request: RequestId, paths: &[std::path::PathBuf], as_file: &[bool]| {
         UiEvent::ActionFailed {
@@ -433,6 +448,7 @@ fn every_refused_send_comes_back() {
                 conv: CONV,
                 request,
                 as_file: as_file.to_vec(),
+                with_location: Vec::new(),
                 paths: paths.to_vec().into(),
                 caption: None,
                 reply_to: None,
@@ -504,6 +520,70 @@ fn every_refused_send_comes_back() {
 }
 
 #[test]
+fn the_rest_sent_again_keeps_the_agreement_to_send_it_with_its_location() {
+    // A file too large for the chat plus a located file the user agreed to send with its
+    // location: the core refuses the large one, the other goes out again and still carries
+    // the agreement, at its new position (F16); without it the core would refuse it too.
+    use kourier_core::facade::{ActionSubject, FileRefusal, RefusedFile, RefusedFiles};
+    let store = Store::new(&[(1, 3)]);
+    let (mut src, sent) = opened(&store);
+    let paths = files(3);
+    let id = src
+        .send_files(
+            CONV,
+            paths.clone(),
+            vec![false, false, true],
+            vec![false, true, false],
+            "",
+            None,
+        )
+        .expect("sent");
+    let with_location = |sent: &Sent| -> Vec<Vec<bool>> {
+        sent.borrow()
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::SendFiles { with_location, .. } => Some(with_location.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(with_location(&sent), [vec![false, true, false]]);
+    let ch = src.on_event(&UiEvent::ActionFailed {
+        account: None,
+        action: "SendFiles",
+        error: std::sync::Arc::new(CoreError::InvalidInput("x")),
+        subject: ActionSubject::Files(std::sync::Arc::new(RefusedFiles {
+            conv: CONV,
+            request: RequestId(id),
+            as_file: vec![false, false, true],
+            with_location: vec![false, true, false],
+            paths: paths.clone().into(),
+            caption: None,
+            reply_to: None,
+            refused: vec![RefusedFile {
+                index: 0,
+                reason: FileRefusal::TooLarge {
+                    max: 1_000,
+                    chat: true,
+                },
+            }],
+        })),
+    });
+    assert!(ch.files);
+    let again = sends(&sent);
+    assert_eq!(again.len(), 2, "the rest went out again");
+    assert_eq!(again[1].2, [false, true], "each keeps its choice");
+    assert_eq!(
+        with_location(&sent)[1],
+        [true, false],
+        "the located file keeps the agreement at its new position"
+    );
+    let back = src.take_refused_files().expect("the large file comes back");
+    assert_eq!(back.files.len(), 1);
+    assert_eq!(back.files[0].path, paths[0]);
+}
+
+#[test]
 fn neighbouring_pictures_and_videos_are_one_album() {
     use AttachmentKind::{File, Image, Video};
     let mut store = Store::new(&[(1, 2)]);
@@ -544,8 +624,8 @@ fn neighbouring_pictures_and_videos_are_one_album() {
             Block::Image(last),
             Block::Text(caption),
         ] => {
-            assert_eq!(album.len(), 3);
-            assert_eq!(album[2].kind, Video);
+            assert_eq!(album.items.len(), 3);
+            assert_eq!(album.items[2].kind, Video);
             assert_eq!(file.kind, File);
             assert_eq!(last.attachment, Some(AttachmentId(5)));
             assert_eq!(caption.plain, "all of it");
@@ -558,7 +638,7 @@ fn neighbouring_pictures_and_videos_are_one_album() {
     );
     assert!(mixed.has_text() && mixed.quote().is_none());
     let many = row(4);
-    assert!(matches!(many.blocks.as_slice(), [Block::Album(a)] if a.len() == 40));
+    assert!(matches!(many.blocks.as_slice(), [Block::Album(a)] if a.items.len() == 40));
     assert_eq!(many.attachment_kinds().len(), 40);
     // One picture stays a picture.
     assert!(matches!(row(5).blocks.as_slice(), [Block::Image(_)]));
@@ -1058,6 +1138,223 @@ fn a_choice_the_core_never_got_changes_nothing() {
     running.set(false);
     assert!(!src.set_expiry_policy("erase"));
     assert_eq!(src.expiry_policy(), Some("hide"));
+    assert!(commands(&sent).is_empty());
+}
+
+/// The quiet-notices queries sent so far (taken), by token.
+fn quiet_queries(sent: &Sent) -> Vec<QueryToken> {
+    take_queries(sent)
+        .into_iter()
+        .filter(|(_, q)| matches!(q, Query::QuietNotices))
+        .map(|(t, _)| t)
+        .collect()
+}
+
+/// The list queries sent so far (taken), by token.
+fn list_queries(sent: &Sent) -> Vec<(QueryToken, Query)> {
+    take_queries(sent)
+        .into_iter()
+        .filter(|(_, q)| matches!(q, Query::Conversations(_)))
+        .collect()
+}
+
+fn listed(src: &CoreSource) -> Vec<i64> {
+    src.conversations(&crate::conversations::ConversationFilter::default())
+        .iter()
+        .map(|r| r.id.0)
+        .collect()
+}
+
+#[test]
+fn the_quiet_notices_option_is_read_from_the_core_and_a_choice_reaches_it() {
+    let store = Store::new(&[(1, 3)]);
+    let (mut src, sent) = opened(&store);
+    // Not known before the core said, as the expiry option.
+    assert_eq!(src.quiet_notices(), None);
+    take_queries(&sent);
+    // The settings page asks for both options when it is shown, and only then.
+    src.load_settings();
+    let asked = take_queries(&sent);
+    assert_eq!(
+        asked
+            .iter()
+            .filter(|(_, q)| matches!(q, Query::QuietNotices))
+            .count(),
+        1,
+        "asked when the page is shown: {asked:?}"
+    );
+    assert!(asked.iter().any(|(_, q)| matches!(q, Query::ExpiryPolicy)));
+    let token = asked
+        .iter()
+        .find(|(_, q)| matches!(q, Query::QuietNotices))
+        .map(|(t, _)| *t)
+        .expect("asked");
+    let ch = src.on_event(&result(token, QueryData::QuietNotices(false)));
+    assert!(ch.settings);
+    assert_eq!(src.quiet_notices(), Some(false));
+    // Hidden is the core's default and what the page shows until a choice.
+    commands(&sent);
+
+    // A choice: shown at once, sent to the core, and read back from it. The LIST is read
+    // again behind the command (the order and the previews come from the core), and the
+    // other option is not asked for again.
+    assert!(src.set_quiet_notices(true));
+    assert_eq!(src.quiet_notices(), Some(true));
+    let sent_now = commands(&sent);
+    assert!(
+        matches!(
+            sent_now.as_slice(),
+            [UiCommand::SetQuietNotices { shown: true }]
+        ),
+        "{sent_now:?}"
+    );
+    let behind = take_queries(&sent);
+    assert_eq!(
+        behind
+            .iter()
+            .filter(|(_, q)| matches!(q, Query::QuietNotices))
+            .count(),
+        1,
+        "read back behind the command"
+    );
+    assert_eq!(
+        behind
+            .iter()
+            .filter(|(_, q)| matches!(q, Query::Conversations(_)))
+            .count(),
+        1,
+        "the whole list read again behind the command"
+    );
+    assert!(
+        !behind.iter().any(|(_, q)| matches!(q, Query::ExpiryPolicy)),
+        "the other option is not read again: {behind:?}"
+    );
+    let confirm = behind
+        .iter()
+        .find(|(_, q)| matches!(q, Query::QuietNotices))
+        .map(|(t, _)| *t)
+        .expect("read back");
+    let ch = src.on_event(&result(confirm, QueryData::QuietNotices(true)));
+    assert!(!ch.settings, "what the page shows already is no change");
+    // The same choice again sends nothing.
+    assert!(src.set_quiet_notices(true));
+    assert!(commands(&sent).is_empty() && take_queries(&sent).is_empty());
+    // The other choice is told and read back too.
+    assert!(src.set_quiet_notices(false));
+    assert_eq!(src.quiet_notices(), Some(false));
+    assert!(matches!(
+        commands(&sent).as_slice(),
+        [UiCommand::SetQuietNotices { shown: false }]
+    ));
+    take_queries(&sent);
+}
+
+#[test]
+fn a_list_answer_to_a_query_sent_before_the_choice_is_dropped() {
+    // The list that was on its way when the user chose describes the old order: it must
+    // not be shown, not even for a moment.
+    let old = Store::new(&[(1, 3), (9, 1)]);
+    let (mut src, sent) = opened(&Store::new(&[(1, 3)]));
+    assert_eq!(listed(&src), vec![1]);
+    src.on_event(&UiEvent::ConversationsChanged {
+        ids: vec![ConversationId(1)],
+    });
+    let early = list_queries(&sent);
+    assert_eq!(early.len(), 1, "a read of the list is on its way");
+    assert!(src.set_quiet_notices(true));
+    let late = list_queries(&sent);
+    assert_eq!(
+        late.len(),
+        1,
+        "and one more is asked for behind the command"
+    );
+    let ch = src.on_event(&result(early[0].0, old.answer(&early[0].1)));
+    assert!(!ch.conversations, "the old order is not shown");
+    assert_eq!(listed(&src), vec![1]);
+    let ch = src.on_event(&result(late[0].0, old.answer(&late[0].1)));
+    assert!(ch.conversations);
+    assert_eq!(listed(&src), vec![1, 9]);
+}
+
+#[test]
+fn an_answer_about_the_quiet_notices_option_that_was_on_its_way_is_dropped() {
+    let (mut src, sent) = opened(&Store::new(&[(1, 3)]));
+    take_queries(&sent);
+    src.load_settings();
+    let first = quiet_queries(&sent);
+    assert!(src.set_quiet_notices(false));
+    let second = quiet_queries(&sent);
+    assert_eq!((first.len(), second.len()), (1, 1));
+    let ch = src.on_event(&result(first[0], QueryData::QuietNotices(true)));
+    assert!(!ch.settings);
+    assert_eq!(src.quiet_notices(), Some(false), "not back to the old one");
+    let ch = src.on_event(&result(second[0], QueryData::QuietNotices(false)));
+    assert!(!ch.settings, "what the page shows already is no change");
+    assert_eq!(src.quiet_notices(), Some(false));
+}
+
+#[test]
+fn a_quiet_notices_choice_the_core_could_not_store_is_what_it_was() {
+    let (mut src, sent) = opened(&Store::new(&[(1, 3)]));
+    src.load_settings();
+    let asked = quiet_queries(&sent);
+    src.on_event(&result(asked[0], QueryData::QuietNotices(false)));
+    take_queries(&sent);
+    commands(&sent);
+    // The core could not store it: the switch is what it was, the page shows that again, and
+    // a notice says so.
+    assert!(src.set_quiet_notices(true));
+    assert_eq!(src.quiet_notices(), Some(true));
+    let first = quiet_queries(&sent);
+    take_queries(&sent);
+    let ch = src.on_event(&UiEvent::ActionFailed {
+        account: None,
+        action: "SetQuietNotices",
+        subject: ActionSubject::None,
+        error: std::sync::Arc::new(CoreError::Stopped),
+    });
+    assert!(ch.notice);
+    assert_eq!(src.notice(), "The setting could not be saved.");
+    let again = quiet_queries(&sent);
+    assert_eq!(again.len(), 1, "asked what the choice is now");
+    // (The answer to the query sent with the choice no longer counts.)
+    src.on_event(&result(first[0], QueryData::QuietNotices(true)));
+    assert_eq!(src.quiet_notices(), Some(true));
+    let ch = src.on_event(&result(again[0], QueryData::QuietNotices(false)));
+    assert!(ch.settings);
+    assert_eq!(src.quiet_notices(), Some(false));
+}
+
+#[test]
+fn a_quiet_notices_choice_the_core_never_got_changes_nothing() {
+    use crate::time::FixedOffset;
+    let sent: Sent = Sent::default();
+    let running = std::rc::Rc::new(std::cell::Cell::new(true));
+    let (s2, r2) = (sent.clone(), running.clone());
+    let mut src = CoreSource::new(
+        Box::new(move |c: UiCommand| {
+            if r2.get() {
+                s2.borrow_mut().push(c);
+            }
+            r2.get()
+        }),
+        CoreSourceConfig {
+            now: Box::new(|| NOW),
+            calendar: Box::new(FixedOffset(0)),
+            networks: Vec::new(),
+            hostname: "workstation".into(),
+            demo: None,
+        },
+    );
+    src.load_settings();
+    let asked = quiet_queries(&sent);
+    src.on_event(&result(asked[0], QueryData::QuietNotices(false)));
+    assert_eq!(src.quiet_notices(), Some(false));
+    // The core has stopped (the app is closing): the choice is not taken, and the switch
+    // goes on showing what holds, not what was clicked.
+    running.set(false);
+    assert!(!src.set_quiet_notices(true));
+    assert_eq!(src.quiet_notices(), Some(false));
     assert!(commands(&sent).is_empty());
 }
 

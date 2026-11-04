@@ -27,6 +27,7 @@ macro_rules! safe_debug {
 pub(crate) use safe_debug;
 
 pub mod account_actions;
+pub mod chat_media;
 pub mod composer;
 pub mod conversations;
 pub mod core_source;
@@ -34,14 +35,22 @@ pub mod diff;
 pub mod edit;
 pub mod files;
 pub mod fixture;
+pub mod group;
 pub mod i18n;
 pub mod login;
 pub mod media;
+pub mod media_layout;
 pub mod names;
 pub mod notify;
+pub mod pagetext;
+pub mod person;
 pub mod preview;
 pub mod readmore;
 pub mod richtext;
+pub mod safety;
+pub mod save_name;
+pub mod share;
+pub mod shown_accounts;
 pub mod source;
 pub mod time;
 pub mod timeline;
@@ -49,23 +58,28 @@ pub mod transfer;
 
 pub use account_actions::{AccountAction, LogoutNotice};
 pub use conversations::{
-    AccountRow, AccountStatus, ChatHeader, ConversationFilter, ConversationRow, PreviewSource,
+    AccountRow, AccountStatus, AccountTable, Banners, ChatHeader, ConversationFilter,
+    ConversationRow, Hidden, PreviewSource, TableAccount, hidden_unread,
 };
 pub use core_source::{
-    AvatarUrls, Changes, CommandSink, CoreSource, CoreSourceConfig, Paging, QueryTracker,
+    ArchiveMove, AvatarUrls, Changes, CommandSink, CoreSource, CoreSourceConfig, Paging,
+    QueryTracker,
 };
 pub use diff::{ListOp, RoleSet};
 pub use files::{
-    ArchiveRule, Counted, FileFacts, FileRow, FileStrip, FolderCount, FolderJob, FolderQuestion,
-    FolderStage, HandedFile, ListedFile, PlanAnswer, PlanRequest, StripRules, StripSummary,
+    ArchiveRule, AskedFile, Counted, FileFacts, FileRow, FileStrip, FolderCount, FolderJob,
+    FolderQuestion, FolderStage, HandedFile, ListedFile, LocationAnswer, LocationOutcome,
+    LocationPref, LocationQuestion, LocationSend, LocationSnapshot, PlanAnswer, PlanRequest,
+    StripRules, StripSummary,
 };
-pub use login::{LoginView, LoginViewKind, NetworkChoice};
+pub use login::{LoginView, LoginViewKind, NetworkChoice, NetworkEntry, NetworkMissing, RiskView};
 pub use names::{NameMap, Names};
 pub use readmore::ReadMore;
 pub use richtext::{RichText, Span16};
+pub use shown_accounts::ShownAccounts;
 pub use source::{
-    EmptySource, FinishedSend, FixtureSource, MediaAnswer, RefusedSend, ReturnedFile, RevisionList,
-    RevisionRow, SendOutcome, SourceError, UiSource,
+    EmptySource, FinishedSend, FixtureSource, MediaAnswer, RefusedSend, ReplaceNews, ReturnedFile,
+    RevisionList, RevisionRow, SendOutcome, SourceError, UiSource,
 };
 pub use time::{Calendar, FixedOffset, TimeContext};
 pub use timeline::{Block, MessageRow, Receipt, RowKey, RowKind};

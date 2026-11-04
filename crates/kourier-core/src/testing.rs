@@ -30,6 +30,8 @@ pub struct DirVault {
     unwrap_open: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
     /// `false` while [`DirVault::hold_dir_removals`] holds the removal of account directories.
     remove_open: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+    /// The accounts whose unwrapping [`DirVault::hold_unwraps_of`] holds.
+    unwrap_held: std::sync::Arc<tokio::sync::watch::Sender<std::collections::HashSet<AccountUuid>>>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -69,6 +71,9 @@ impl DirVault {
             root: root.into(),
             unwrap_open: std::sync::Arc::new(tokio::sync::watch::channel(true).0),
             remove_open: std::sync::Arc::new(tokio::sync::watch::channel(true).0),
+            unwrap_held: std::sync::Arc::new(
+                tokio::sync::watch::channel(std::collections::HashSet::new()).0,
+            ),
         }
     }
 
@@ -82,6 +87,22 @@ impl DirVault {
     /// Lets the held unwraps go on.
     pub fn release_unwraps(&self) {
         self.unwrap_open.send_replace(true);
+    }
+
+    /// Holds the [`AccountVault::unwrap`] of ONE account until [`Self::release_unwraps_of`]: its
+    /// supervisor cannot get as far as its message loop (a test that needs it busy while the
+    /// others run).
+    pub fn hold_unwraps_of(&self, uuid: AccountUuid) {
+        self.unwrap_held.send_modify(|held| {
+            held.insert(uuid);
+        });
+    }
+
+    /// Lets the held unwrapping of `uuid` go on.
+    pub fn release_unwraps_of(&self, uuid: AccountUuid) {
+        self.unwrap_held.send_modify(|held| {
+            held.remove(&uuid);
+        });
     }
 
     /// Holds [`AccountVault::remove_dir`] until [`Self::release_dir_removals`]: a test that
@@ -229,9 +250,11 @@ impl AccountVault for DirVault {
     fn unwrap(&self, uuid: AccountUuid) -> VaultFuture<'_, BackendDbKey> {
         let v = self.clone();
         let mut open = self.unwrap_open.subscribe();
+        let mut held = self.unwrap_held.subscribe();
         Box::pin(async move {
-            // (the sender lives as long as the vault: the wait cannot fail)
+            // (the senders live as long as the vault: the waits cannot fail)
             let _ = open.wait_for(|open| *open).await;
+            let _ = held.wait_for(|held| !held.contains(&uuid)).await;
             blocking(move || v.unwrap_sync(uuid)).await
         })
     }
@@ -310,7 +333,8 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
             "SELECT 'contact|' || a.l || '|' || x.user_id || '|' || quote(x.profile_name) || '|' ||
                quote(x.system_name) || '|' || quote(x.nickname) || '|' || quote(f.path) || '|' ||
                x.trust || '|' || quote(x.fingerprint) || '|' || x.blocked || '|' || x.hidden || '|' ||
-               quote(x.unregistered_at) || '|' || x.identifiers || '|' || quote(x.meta)
+               quote(x.unregistered_at) || '|' || x.identifiers || '|' || quote(x.meta) || '|' ||
+               quote(x.about) || '|' || quote(x.about_emoji) || '|' || quote(x.number_shown)
              FROM contacts x JOIN {acc} a ON a.id = x.account_id LEFT JOIN files f ON f.id = x.avatar_file"
         ),
         format!(
@@ -319,13 +343,15 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
         ),
         format!(
             "SELECT 'conv|' || a.l || '|' || c.conv_key || '|' || c.kind || '|' || c.is_self || '|' ||
-               quote(c.title) || '|' || quote(f.path) || '|' || quote(c.muted_until) || '|' ||
+               quote(c.title) || '|' || quote(c.description) || '|' || quote(f.path) || '|' || quote(c.muted_until) || '|' ||
                c.archived || '|' || quote(c.pinned_order) || '|' || c.blocked || '|' ||
                c.request_pending || '|' || c.marked_unread || '|' || quote(p.conv_key) || '|' ||
                quote(c.timer_secs) || '|' || quote(c.timer_version) || '|' || quote(c.features) ||
                '|' || quote(c.local_muted_until) ||
                '|' || quote(c.draft) || '|' || c.unread || '|' || c.unread_hint || '|' || c.mentions ||
-               '|' || quote(c.read_sent_at) || '|' || quote(c.meta) || '|' || c.hidden {order_cols_conv}
+               '|' || quote(c.read_sent_at) || '|' || quote(c.meta) || '|' || c.hidden ||
+               '|' || c.protected || '|' || quote(c.read_seq) || '|' || quote(c.peer_read_seq) ||
+               '|' || quote(c.unread_server) || '|' || quote(c.mentions_server) {order_cols_conv}
              FROM conversations c JOIN {acc} a ON a.id = c.account_id
              LEFT JOIN files f ON f.id = c.avatar_file LEFT JOIN conversations p ON p.id = c.parent_id"
         ),
@@ -345,7 +371,7 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
                quote(m.expiry_timer_ms) || '|' || quote(m.expiry_started_at) || '|' ||
                quote(m.expires_at) || '|' || m.view_once || '|' || m.history || '|' || m.silent || '|' ||
                m.mentions_me || '|' || quote(m.meta) || '|' || quote(m.raw) || '|' ||
-               m.expiry_hidden || '|' || quote(m.call_deadline) {order_cols_msg}
+               m.expiry_hidden || '|' || quote(m.call_deadline) || '|' || quote(m.net_seq) {order_cols_msg}
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              JOIN {acc} a ON a.id = m.account_id"
         ),
@@ -354,6 +380,13 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
                '|' || quote(r.body) || '|' || quote(r.edited_at)
              FROM message_revisions r JOIN messages m ON m.id = r.message_id
              JOIN conversations c ON c.id = m.conversation_id"
+        ),
+        format!(
+            // (No foreign key names the account, so a row whose account is wrong must still show.)
+            "SELECT 'alias|' || {mkey} || '|' || quote(a.l) || '|' || x.net_local
+             FROM message_aliases x JOIN messages m ON m.id = x.message_id
+             JOIN conversations c ON c.id = m.conversation_id
+             LEFT JOIN {acc} a ON a.id = x.account_id"
         ),
         format!(
             "SELECT 'react|' || {mkey} || '|' || r.user_id || '|' || r.emoji || '|' || r.at || '|' || r.removed
@@ -399,6 +432,10 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
              FROM expired_messages x JOIN {acc} a ON a.id = x.account_id"
         ),
         format!(
+            "SELECT 'cut|' || a.l || '|' || x.conv_key || '|' || x.before_ms
+             FROM conversation_cuts x JOIN {acc} a ON a.id = x.account_id"
+        ),
+        format!(
             // Attachment and thumbnail paths are random blob ids; avatar paths come from the backend.
             "SELECT 'file|' || a.l || '|' || CASE WHEN x.purpose = 'avatar' THEN x.path ELSE '<blob>' END
                || '|' || x.purpose || '|' || quote(x.size) || '|' || quote(x.mime)
@@ -419,6 +456,49 @@ pub fn dump(conn: &Connection, mode: DumpMode) -> Result<String> {
     Ok(out)
 }
 
+/// The statements the core runs for every write and every open chat, and those of the read
+/// positions, as `(name, text)`, the text being the one the core runs: what the plan test of a new
+/// index holds them against (`core.db` has no planner statistics, so an index that ties with a hot
+/// statement's takes its plan).
+pub fn hot_statements() -> Vec<(&'static str, String)> {
+    vec![
+        ("timeline page", query::timeline_older_sql("<")),
+        ("timeline page, inclusive", query::timeline_older_sql("<=")),
+        ("by_key, account-wide", ingest::BY_KEY_ACCOUNT.to_owned()),
+        (
+            "by_key, per conversation",
+            ingest::BY_KEY_CONVERSATION.to_owned(),
+        ),
+        ("by_key, per sender", ingest::BY_KEY_PER_SENDER.to_owned()),
+        ("by_key, an earlier name", ingest::BY_ALIAS.to_owned()),
+        (
+            "resolve_target, with an author",
+            ingest::RESOLVE_BY_AUTHOR.to_owned(),
+        ),
+        ("resolve_target, by id", ingest::RESOLVE_BY_LOCAL.to_owned()),
+        (
+            "messages with an id",
+            ingest::MESSAGES_WITH_LOCAL.to_owned(),
+        ),
+        ("the original of a quote", query::QUOTE_ORIGINAL.to_owned()),
+        ("recount", ingest::RECOUNT.to_owned()),
+        ("the read watermark", ingest::READ_UP_TO.to_owned()),
+        ("the read position", ingest::READ_BY_POSITION.to_owned()),
+        (
+            "the newest row at a read position",
+            ingest::NEWEST_AT_POSITION.to_owned(),
+        ),
+        (
+            "what a read here reaches",
+            local::NEWEST_READ_POSITION.to_owned(),
+        ),
+        (
+            "what the other side's marker moved",
+            ingest::PEER_READ_RANGE.to_owned(),
+        ),
+    ]
+}
+
 /// What a write of the [`IngestHarness`] wants announced (§8.7), before the focus rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Announced {
@@ -429,6 +509,8 @@ pub struct Announced {
     pub catch_up: usize,
     /// The rows that changed.
     pub changed: Vec<kourier_model::MessageId>,
+    /// The conversation rows that changed (`UiEvent::ConversationsChanged`).
+    pub conversations: Vec<kourier_model::ConversationId>,
 }
 
 impl Announced {
@@ -437,6 +519,7 @@ impl Announced {
             notify: ch.notify.iter().map(|n| n.message).collect(),
             catch_up: ch.catch_up.len() + ch.held_calls.len(),
             changed: ch.messages.values().flatten().copied().collect(),
+            conversations: ch.conversations.iter().copied().collect(),
         }
     }
 }
@@ -475,6 +558,8 @@ pub struct IngestHarness {
     conn: Connection,
     account: AccountId,
     scope: MsgIdScope,
+    history_read: kourier_model::HistoryReadState,
+    server: kourier_model::ServerRules,
     now: i64,
 }
 
@@ -520,8 +605,26 @@ impl IngestHarness {
             conn,
             account,
             scope,
+            history_read: kourier_model::HistoryReadState::Known,
+            server: kourier_model::ServerRules::default(),
             now: 1_700_000_000_000,
         })
+    }
+
+    /// States what the network says of the `read` flag of its history rows (W4 fix F1; a real
+    /// network's descriptor does it; the harness starts at `Known`).
+    #[must_use]
+    pub fn with_history_read(mut self, history_read: kourier_model::HistoryReadState) -> Self {
+        self.history_read = history_read;
+        self
+    }
+
+    /// States what the network's server owns (KT-2; a real network's descriptor does it; the
+    /// harness starts with everything off).
+    #[must_use]
+    pub fn with_server(mut self, server: kourier_model::ServerRules) -> Self {
+        self.server = server;
+        self
     }
 
     /// The account.
@@ -560,7 +663,15 @@ impl IngestHarness {
     }
 
     fn apply_one(&mut self, events: Vec<BackendEvent>) -> Result<Changes> {
-        ingest::apply_events(&mut self.conn, self.account, self.scope, self.now, events)
+        ingest::apply_events(
+            &mut self.conn,
+            self.account,
+            self.scope,
+            self.history_read,
+            self.server,
+            self.now,
+            events,
+        )
     }
 
     /// Applies one batch of live events in one transaction and returns what it wants
@@ -580,6 +691,7 @@ impl IngestHarness {
             out.notify.extend(one.notify);
             out.catch_up += one.catch_up;
             out.changed.extend(one.changed);
+            out.conversations.extend(one.conversations);
         }
         Ok(out)
     }
@@ -596,8 +708,10 @@ impl IngestHarness {
         &mut self,
         conv: kourier_model::ConversationId,
     ) -> Result<Option<Vec<kourier_backend_api::DurableCommand>>> {
-        Ok(local::mark_read(&mut self.conn, conv, self.now)?
-            .map(|m| m.commands.into_iter().map(|(_, c)| c).collect()))
+        Ok(
+            local::mark_read(&mut self.conn, conv, self.now, self.now, false)?
+                .map(|m| m.commands.into_iter().map(|(_, c)| c).collect()),
+        )
     }
 
     /// Runs the disappearing-message sweeper once at the harness clock (every account is
@@ -643,6 +757,24 @@ impl IngestHarness {
         crate::expiry::stored_policy(&self.conn)
     }
 
+    /// `UiCommand::SetQuietNotices` as the core runs it, in its one transaction: stores the
+    /// choice and gives every conversation the sort time its newest listed row says. Returns
+    /// the conversations whose sort time changed.
+    pub fn set_quiet_notices(&mut self, shown: bool) -> Result<Vec<kourier_model::ConversationId>> {
+        crate::notices::set(&mut self.conn, shown)
+    }
+
+    /// Whether the user asked to see quiet notices in the list (`Query::QuietNotices`).
+    pub fn quiet_notices(&self) -> Result<bool> {
+        crate::notices::shown(&self.conn)
+    }
+
+    /// `ingest::recount` of one conversation (its counters and its sort time), for the
+    /// measurement of what a write pays at the top of a long chat.
+    pub fn recount(&self, conv: kourier_model::ConversationId) -> Result<()> {
+        ingest::recount(&self.conn, conv)
+    }
+
     /// [`dump`] of the database.
     pub fn dump(&self, mode: DumpMode) -> Result<String> {
         dump(&self.conn, mode)
@@ -667,7 +799,11 @@ impl IngestHarness {
     /// The accounts, as the facade answers `Query::Accounts` (no actor runs: every account
     /// shows the connection state of one that is not running).
     pub fn accounts(&self) -> Result<Vec<crate::facade::AccountRow>> {
-        query::accounts(&self.conn, &std::collections::HashMap::new())
+        query::accounts(
+            &self.conn,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
     }
 
     /// The versions of a message, as the facade answers `Query::Revisions`.
@@ -689,7 +825,7 @@ impl IngestHarness {
 
     /// A timeline page, as the facade answers it (action flags at the harness clock).
     pub fn timeline(&self, q: &TimelineQuery) -> Result<TimelinePage> {
-        query::timeline(&self.conn, q, self.now)
+        query::timeline(&self.conn, q, self.now, true, &Default::default(), None)
     }
 
     /// One conversation, as the facade answers `Query::Conversation` (a hidden one too).
@@ -698,6 +834,27 @@ impl IngestHarness {
         conv: kourier_model::ConversationId,
     ) -> Result<Option<crate::facade::ConversationDetail>> {
         query::conversation(&self.conn, conv)
+    }
+
+    /// One person for their page, as the facade answers `Query::Person`.
+    pub fn person(&self, user: &UserId) -> Result<Option<crate::facade::PersonDetail>> {
+        query::person(&self.conn, self.account, user)
+    }
+
+    /// One group for its page, as the facade answers `Query::Group`.
+    pub fn group(
+        &self,
+        conv: kourier_model::ConversationId,
+    ) -> Result<Option<crate::facade::GroupDetail>> {
+        query::group(&self.conn, conv)
+    }
+
+    /// A page of a chat's gallery, as the facade answers `Query::ChatMedia`.
+    pub fn chat_media(
+        &self,
+        q: &crate::facade::ChatMediaQuery,
+    ) -> Result<crate::facade::ChatMediaPage> {
+        query::chat_media(&self.conn, q)
     }
 
     /// `UiCommand::ClearConversation` (with `remove`: `DeleteConversation`) as the core runs

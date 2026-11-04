@@ -7,7 +7,7 @@
 //! The fake network packs like this (`kourier_fake::scripts::file_packing`): pictures, GIFs and
 //! videos share a message, three at most; every other file travels alone.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +19,7 @@ use kourier_core::facade::{
 };
 use kourier_fake::scripts::{ALBUM_MAX, signal_features};
 use kourier_fake::{Flavor, Script, TransmitRecord};
-use kourier_media::{SampleFormat, sample_image};
+use kourier_media::{SampleFormat, SampleLocated, sample_image, sample_located};
 use kourier_model::{
     AccountCaps, AttachmentKind, Body, ConvKey, ConversationId, ConversationPatch, FileAlbum,
     FileLimits, FilePacking, MessageId, OutgoingState, Text,
@@ -378,6 +378,7 @@ async fn mixed_files_become_the_messages_the_network_can_show() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: g,
             paths: paths.clone().into(),
             caption: Some(Text::plain("from the trip")),
@@ -498,6 +499,7 @@ async fn more_files_than_desktop_takes_are_all_sent() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: a,
             paths: paths.clone().into(),
             caption: None,
@@ -573,6 +575,7 @@ async fn refused_files_are_named_and_the_rest_can_be_sent() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: a,
             paths: paths.clone().into(),
             caption: Some(Text::plain("some of these")),
@@ -601,6 +604,7 @@ async fn refused_files_are_named_and_the_rest_can_be_sent() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: a,
             paths: rest.clone().into(),
             caption: Some(Text::plain("some of these")),
@@ -645,6 +649,7 @@ async fn refused_files_are_named_and_the_rest_can_be_sent() {
             .send(UiCommand::SendFiles {
                 request: Default::default(),
                 as_file: Vec::new(),
+                with_location: Vec::new(),
                 conv: plain,
                 paths: vec![f.picture("fine.jpg", 9), clip].into(),
                 caption: None,
@@ -696,6 +701,7 @@ async fn a_caption_the_first_file_cannot_carry_goes_first_as_a_text() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: plain,
             paths: paths.clone().into(),
             caption: Some(Text::plain("here they are")),
@@ -740,6 +746,7 @@ async fn a_caption_the_first_file_cannot_carry_goes_first_as_a_text() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: q,
             paths: reversed.clone().into(),
             caption: None,
@@ -761,6 +768,7 @@ async fn a_caption_the_first_file_cannot_carry_goes_first_as_a_text() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: q,
             paths: reversed.clone().into(),
             caption: Some(Text::plain("both")),
@@ -817,6 +825,7 @@ async fn a_caption_too_long_for_one_message_goes_first_as_texts() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: terse,
             paths: paths.clone().into(),
             caption: Some(caption.clone()),
@@ -852,6 +861,7 @@ async fn a_caption_too_long_for_one_message_goes_first_as_texts() {
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: terse,
             paths: paths.clone().into(),
             caption: Some(Text::plain("the same again")),
@@ -927,6 +937,7 @@ async fn files_pack_by_the_format_the_network_states() {
             request: RequestId(1),
             paths: paths.clone().into(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             caption: None,
             reply_to: None,
         })
@@ -1016,6 +1027,7 @@ async fn the_plan_counts_the_texts_a_long_caption_becomes() {
             request: RequestId(7),
             paths: paths.clone().into(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             caption: Some(long),
             reply_to: None,
         })
@@ -1057,6 +1069,7 @@ async fn a_send_of_files_reports_progress_and_the_messages_it_became() {
                 request: RequestId(request),
                 paths: paths.clone().into(),
                 as_file: Vec::new(),
+                with_location: Vec::new(),
                 caption: None,
                 reply_to: None,
             })
@@ -1095,6 +1108,7 @@ async fn a_send_of_files_reports_progress_and_the_messages_it_became() {
             request: RequestId(43),
             paths: vec![first[0].clone(), missing].into(),
             as_file: vec![true, false],
+            with_location: Vec::new(),
             caption: None,
             reply_to: None,
         })
@@ -1162,6 +1176,7 @@ async fn a_picture_sent_as_a_file_leaves_untouched_and_alone() {
             request: RequestId(5),
             paths: paths.clone().into(),
             as_file,
+            with_location: Vec::new(),
             caption: None,
             reply_to: None,
         })
@@ -1228,5 +1243,252 @@ async fn a_picture_sent_as_a_file_leaves_untouched_and_alone() {
     };
     assert!(preview_of(&env, one(vec![true])).await.plan.lead_text);
     assert!(!preview_of(&env, one(Vec::new())).await.plan.lead_text);
+    env.stop().await;
+}
+
+/// A located TIFF: the TIFF of the located sample JPEG's EXIF (its offsets are relative to
+/// the TIFF header, so it is a file of its own).
+fn located_tiff() -> Vec<u8> {
+    let jpeg = sample_located(SampleLocated::Jpeg);
+    let at = jpeg
+        .windows(6)
+        .position(|w| w == b"Exif\0\0")
+        .expect("the EXIF segment");
+    let len = usize::from(u16::from_be_bytes([jpeg[at - 2], jpeg[at - 1]]));
+    jpeg[at + 6..at - 2 + len].to_vec()
+}
+
+impl Files {
+    /// A file with these bytes.
+    fn bytes(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = self.dir.path().join(name);
+        std::fs::write(&p, bytes).expect("write");
+        p
+    }
+}
+
+/// LOC: the plan says, per file, whether it would leave this PC with where it was taken. A
+/// picture the network cleans does not (the Signal-like fake states Signal's types); a video,
+/// a HEIC, a picture sent as the file it is and a picture whose content is not what its name
+/// says (a TIFF named `.jpg`: judged by the format the look read, critic F10) do. A file
+/// without a location, and a refused one, never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_plan_says_which_files_would_leave_with_their_location() {
+    let (mut env, _) = start("files-location").await;
+    let a = conv(&env, &d_alice());
+    let f = Files::new();
+    let paths = vec![
+        f.bytes("clip.mp4", &sample_located(SampleLocated::Mp4)),
+        f.bytes("original.jpg", &sample_located(SampleLocated::Jpeg)),
+        f.bytes("IMG_0001.heic", &sample_located(SampleLocated::Heic)),
+        f.bytes("phone.jpg", &sample_located(SampleLocated::Jpeg)),
+        f.bytes("x.jpg", &located_tiff()),
+        f.picture("plain.jpg", 7),
+        f.document("notes.txt"),
+        f.dir.path().to_owned(),
+    ];
+    let query = |as_file: Vec<bool>| FilePlanQuery {
+        conv: a,
+        paths: paths.clone().into(),
+        as_file,
+        caption: false,
+        caption_text: None,
+        reply: false,
+    };
+    let plan = preview_of(&env, query(vec![false, true])).await;
+    assert_eq!(
+        plan.kinds[4],
+        Some(AttachmentKind::Image),
+        "the TIFF counts as a JPEG picture by its name"
+    );
+    assert_eq!(
+        plan.refused,
+        [RefusedFile {
+            index: 7,
+            reason: FileRefusal::NotAFile
+        }]
+    );
+    assert_eq!(
+        plan.location,
+        [true, true, true, false, true, false, false, false]
+    );
+    // The same picture as a picture: the network cleans it.
+    let plan = preview_of(&env, query(Vec::new())).await;
+    assert_eq!(
+        plan.location,
+        [true, false, true, false, true, false, false, false]
+    );
+    env.stop().await;
+}
+
+/// LOC: a network that states nothing about cleaning (WhatsApp before W5b, Telegram, Threema)
+/// sends every located picture with its location: the plan says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_network_that_states_no_cleaning_leaves_every_located_picture_marked() {
+    let mut env = Env::new(Flavor::WhatsAppLike, script("files-location-plain")).await;
+    let account = add_linked(&mut env).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    env.wait_finished(account).await;
+    let a = conv(&env, &d_alice());
+    let f = Files::new();
+    let paths = vec![
+        f.bytes("phone.jpg", &sample_located(SampleLocated::Jpeg)),
+        f.picture("plain.jpg", 3),
+    ];
+    let plan = preview(&env, a, &paths, false, false).await;
+    assert_eq!(plan.refused, []);
+    assert_eq!(plan.location, [true, false]);
+    env.stop().await;
+}
+
+/// LOC (loc-brief §3.3 "measure first"): the time of a plan with the look, for a selection of
+/// the size of the `files` fixture (41) and for 1,000 files, the first time and again with
+/// the looks kept (critic F26). Printed, not asserted (a load-dependent number).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_time_of_a_plan_with_the_look_is_printed() {
+    let (mut env, _) = start("files-location-time").await;
+    let a = conv(&env, &d_alice());
+    let f = Files::new();
+    let picture = sample_image(48, 36, 1, SampleFormat::Jpeg).expect("jpeg");
+    let located = sample_located(SampleLocated::Jpeg);
+    let clip = sample_located(SampleLocated::Mp4);
+    let make = |n: usize| -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| match i % 4 {
+                0 => f.bytes(&format!("{n}-{i}.jpg"), &picture),
+                1 => f.bytes(&format!("{n}-{i}-gps.jpg"), &located),
+                2 => f.bytes(&format!("{n}-{i}.mp4"), &clip),
+                _ => f.bytes(&format!("{n}-{i}.txt"), b"a line of text"),
+            })
+            .collect()
+    };
+    for n in [41, 1_000] {
+        let paths = make(n);
+        let mut times = Vec::new();
+        let mut marked = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let plan = preview(&env, a, &paths, false, false).await;
+            times.push(t.elapsed());
+            marked.push(plan.location.iter().filter(|l| **l).count());
+        }
+        assert_eq!(marked, [n / 4 + usize::from(n % 4 > 2); 3], "the clips");
+        eprintln!(
+            "LOC plan of {n} files: first {:?}, then {:?} and {:?} (looks kept)",
+            times[0], times[1], times[2]
+        );
+    }
+    env.stop().await;
+}
+
+/// One `SendFiles` into `conv`; its end as [`followed`] reports it.
+async fn send_located(
+    env: &mut Env,
+    conv: ConversationId,
+    paths: &[PathBuf],
+    as_file: Vec<bool>,
+    with_location: Vec<bool>,
+    request: u64,
+) -> Ended {
+    let request = RequestId(request);
+    env.handle
+        .send(UiCommand::SendFiles {
+            conv,
+            request,
+            paths: paths.to_vec().into(),
+            as_file,
+            with_location,
+            caption: None,
+            reply_to: None,
+        })
+        .expect("send");
+    followed(env, request).await.1
+}
+
+/// LOC, the core's backstop (BQ1): a file that would leave with where it was taken goes only
+/// with the user's agreement for its position (`with_location`). Without it the send is
+/// refused like any other, the file named by position with `Location`, the error log-safe, and
+/// nothing is copied; with it the same send goes. A located picture the network cleans needs
+/// no agreement; the same picture sent as the file it is does. A file swapped for a located
+/// one after the plan said "no location" is refused all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_located_file_leaves_only_with_the_users_agreement() {
+    let (mut env, uuid) = start("files-location-send").await;
+    let a = conv(&env, &d_alice());
+    let blobs = env.vault.blob_dir(uuid);
+    let f = Files::new();
+    let paths = vec![
+        f.document("notes.txt"),
+        f.bytes("clip.mp4", &sample_located(SampleLocated::Mp4)),
+    ];
+    let location = RefusedFile {
+        index: 1,
+        reason: FileRefusal::Location,
+    };
+
+    let ended = send_located(&mut env, a, &paths, Vec::new(), Vec::new(), 1).await;
+    assert_eq!(
+        ended,
+        Err((RequestId(1), vec![location], Vec::new())),
+        "refused by position, without its agreement"
+    );
+    assert!(own_ids(&env, a).is_empty(), "nothing was queued");
+    assert_eq!(blob_count(&blobs), 0, "nothing was copied");
+    let ended = send_located(&mut env, a, &paths, Vec::new(), vec![true, false], 2).await;
+    assert_eq!(
+        ended,
+        Err((RequestId(2), vec![location], Vec::new())),
+        "the agreement of another position counts for nothing"
+    );
+    let ended = send_located(&mut env, a, &paths, Vec::new(), vec![false, true], 3).await;
+    assert!(ended.is_ok(), "sent with its agreement: {ended:?}");
+
+    // A located JPEG: the Signal-like network cleans it, nothing to agree to.
+    let phone = vec![f.bytes("phone.jpg", &sample_located(SampleLocated::Jpeg))];
+    let ended = send_located(&mut env, a, &phone, Vec::new(), Vec::new(), 4).await;
+    assert!(
+        ended.is_ok(),
+        "a cleaned picture needs no agreement: {ended:?}"
+    );
+    // The same JPEG as the file it is leaves untouched, with where it was taken.
+    let ended = send_located(&mut env, a, &phone, vec![true], Vec::new(), 5).await;
+    assert_eq!(
+        ended,
+        Err((
+            RequestId(5),
+            vec![RefusedFile {
+                index: 0,
+                reason: FileRefusal::Location,
+            }],
+            vec![true],
+        ))
+    );
+
+    // Planned without a location, swapped for a located clip before the send.
+    let swapped = vec![f.bytes("later.mp4", b"not a clip yet")];
+    let plan = preview(&env, a, &swapped, false, false).await;
+    assert_eq!(plan.location, [false]);
+    std::fs::write(&swapped[0], sample_located(SampleLocated::Mp4)).expect("write");
+    env.handle
+        .send(UiCommand::SendFiles {
+            conv: a,
+            request: RequestId(6),
+            paths: swapped.clone().into(),
+            as_file: Vec::new(),
+            with_location: Vec::new(),
+            caption: None,
+            reply_to: None,
+        })
+        .expect("send");
+    let (error, refused, _) = refusal(&mut env).await;
+    assert_eq!(
+        refused,
+        [RefusedFile {
+            index: 0,
+            reason: FileRefusal::Location,
+        }]
+    );
+    assert!(error.contains("holds its location"), "{error}");
+    assert!(!error.contains("later"), "the error names no file: {error}");
     env.stop().await;
 }

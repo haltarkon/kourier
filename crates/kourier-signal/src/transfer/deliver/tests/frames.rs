@@ -39,6 +39,7 @@ fn stage_of(dir: &std::path::Path, chats: &[Spec]) -> Recorded {
             profile_name: None,
             system_name: None,
             nickname: None,
+            system_nickname_only: false,
         };
         writer.contact(i, &contact).unwrap();
         let mut chat = StagedChat::direct(i);
@@ -439,6 +440,110 @@ async fn a_redo_after_the_users_timer_change_keeps_the_users_timer_and_version()
         !second.contains_key("timer"),
         "the archive's minute does not come back: {second:?}"
     );
+}
+
+/// A1, the known limit, pinned: a chats row that runs AGAIN (a redo, a lost stage) states the
+/// archive's flags of its chats again, for a chat that came back to the inbox since as well:
+/// the archive cannot know. The redo writes the base as it states it (archived again, the
+/// mute of the frame), so the Storage diff and the unarchive rule go on from the same word
+/// the core got. A chat the frame does not archive states nothing, and writes no base.
+#[tokio::test(flavor = "current_thread")]
+async fn a_redone_chats_row_states_the_archive_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorded = stage_of(
+        dir.path(),
+        &[
+            Spec {
+                rows: 1,
+                loud: true,
+                frame: ChatFrame {
+                    archived: true,
+                    muted_until: Some(i64::MAX),
+                    ..ChatFrame::default()
+                },
+                ..Spec::default()
+            },
+            Spec {
+                rows: 1,
+                loud: true,
+                ..Spec::default()
+            },
+        ],
+    );
+    let fixture = fixture();
+    reading(&fixture.db, recorded);
+    let test = testing::shared(fixture.db.clone(), fixture.account.clone(), Vec::new());
+    let shared = test.shared;
+    let sid = |i: u32| ServiceId::from(Aci::from(aci(i))).service_id_string();
+    let base = |i: u32| shared.db.read(|c| peers::load(c, &sid(i))).unwrap().roaming;
+    let said = |events: &[BackendEvent], i: u32| -> Vec<Option<bool>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::ConversationUpsert(p) if p.key == ConvKey::Direct(peer(i)) => {
+                    Some(p.archived)
+                }
+                _ => None,
+            })
+            .filter(Option::is_some)
+            .collect()
+    };
+    let chats_seq = deliver_the_chats(&shared, dir.path(), recorded);
+    let first = events(&shared.db);
+    assert_eq!(said(&first, 0), [Some(true)]);
+    assert!(
+        said(&first, 1).is_empty(),
+        "a chat that is not archived says nothing"
+    );
+    let archived = Some(peers::Roaming {
+        archived: true,
+        muted_until: Some(i64::MAX),
+    });
+    assert_eq!(base(0), archived);
+    assert_eq!(base(1), None);
+
+    // A message of ours brings the first chat back to the inbox (the phone's mute is for
+    // ever, "Keep muted chats archived" is off).
+    let chat = ConvKey::Direct(peer(0));
+    shared
+        .db
+        .zone(|tx| {
+            crate::receive::unarchive::after_own_send(
+                tx,
+                &fixture.account,
+                NOW,
+                &chat,
+                &shared.wake,
+            )
+        })
+        .unwrap();
+    let back_seq = outbox(&shared.db).last().unwrap().0;
+    assert_eq!(base(0).map(|r| r.archived), Some(false));
+
+    // The chats row is refused and runs again.
+    shared
+        .db
+        .quarantine(chats_seq, "refused by a test")
+        .unwrap();
+    assert!(settle(&shared.db, MAX_REFUSED_RUN).unwrap().new_pieces);
+    for chunk in fed_from(&shared.db, dir.path(), recorded) {
+        if matches!(chunk.place, Place::Redo { .. }) {
+            append(&shared, chunk, NOW).unwrap();
+        }
+    }
+    let again: Vec<BackendEvent> = outbox(&shared.db)
+        .into_iter()
+        .filter(|(seq, _)| *seq > back_seq)
+        .flat_map(|(_, events)| events)
+        .collect();
+    assert_eq!(said(&again, 0), [Some(true)], "the redo archives it again");
+    assert!(said(&again, 1).is_empty());
+    assert_eq!(
+        base(0),
+        archived,
+        "and the base says what the core was told"
+    );
+    assert_eq!(base(1), None);
 }
 
 /// Appends every chunk up to the first row of messages or the pins, whichever comes first;

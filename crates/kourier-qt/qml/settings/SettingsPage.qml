@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls as QQC2
+import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import org.kde.kirigamiaddons.formcard as FormCard
 import app.kourier
@@ -69,14 +70,83 @@ FormCard.FormCardPage {
     // Every account with what it offers here (`App.accountActions`).
     readonly property var accountActions: App.accountActions
 
+    // The experimental networks this build holds (WhatsApp), on or off at this start.
+    readonly property var experimentalNetworks: App.networks.filter(n => n.experimental)
+    // The ones with a switch, and the ones this build cannot log in to (Telegram without its API
+    // key or library): those are listed with their reason and no switch.
+    readonly property var switchNetworks: page.experimentalNetworks.filter(n => !n.missing)
+    readonly property var missingNetworks: page.experimentalNetworks.filter(n => n.missing)
+    // The switches show the PREFERENCE (what the next start does); `n.on` is what this start
+    // did. A difference between the two is what "Restart Now" is for.
+    function networkPref(kind: string): bool {
+        return Style.networkWanted(kind);
+    }
+    readonly property bool restartNeeded: {
+        // (A network this build cannot log in to has no switch and is never on: a restart would
+        // not change that.)
+        for (let i = 0; i < page.switchNetworks.length; ++i) {
+            const n = page.switchNetworks[i];
+            if (page.networkPref(n.kind) !== n.on) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Whether a link of `kind` is being made now (the switch waits for it).
+    function linking(kind: string): bool {
+        return App.login.network === kind && ["input", "qr", "code", "waiting", "progress"].indexOf(App.login.kind) >= 0;
+    }
+    // The question "Turn Off WhatsApp?" while it is open (tests read it).
+    property Kirigami.PromptDialog turnOffDialog: null
+
+    // Turning a network off with an account of it asks first: the account stays linked and
+    // readable, nothing is sent or received until the network is on again.
+    function askTurnOff(kind: string, name: string, text: string): void {
+        if (page.turnOffDialog !== null) {
+            return;
+        }
+        const component = Qt.createComponent(Qt.resolvedUrl("../dialogs/StopLinkingDialog.qml"));
+        if (component.status !== Component.Ready) {
+            console.error("the question could not be made: " + component.errorString());
+            return;
+        }
+        const dialog = component.createObject(page, {
+            "question": {
+                "title": L10n.i18nc("@title:window, %1 the network", "Turn Off %1?", Style.plain(name)),
+                "text": Style.plain(text),
+                "confirm": L10n.i18nc("@action:button", "Turn Off"),
+                "cancel": L10n.i18nc("@action:button", "Cancel")
+            },
+            "confirmIcon": "network-disconnect",
+            "action": () => App.settings.setNetworkOn(kind, false)
+        }) as Kirigami.PromptDialog;
+        if (dialog === null) {
+            return;
+        }
+        page.turnOffDialog = dialog;
+        dialog.closed.connect(() => {
+            page.turnOffDialog = null;
+        });
+        dialog.open();
+    }
+
     // Brings "Accounts" on screen (a fixture page shows it).
     function showAccounts(): void {
         page.flickable.contentY = Math.max(0, Math.min(accountsHeader.y, page.flickable.contentHeight - page.flickable.height));
     }
 
-    // Brings "Disappearing messages" on screen (a fixture page shows it).
+    // Brings "Disappearing messages" on screen (a fixture page shows it), a little below the top
+    // of the view. The old rule (its heading AT the top, clamped to the end) left the page's
+    // header blank in the pictures once "Networks" made the page longer: the heading then sat
+    // above the clamp, and with the style of `shots` (org.kde.desktop, software rendering) the
+    // header's content was not drawn at that scroll position (K-A, chunk 10).
     function showExpiry(): void {
-        page.flickable.contentY = Math.max(0, Math.min(expiryHeader.y, page.flickable.contentHeight - page.flickable.height));
+        page.flickable.contentY = Math.max(0, Math.min(expiryHeader.y - page.flickable.height * 0.4, page.flickable.contentHeight - page.flickable.height));
+    }
+
+    // Brings "Networks" on screen (a fixture page shows it).
+    function showNetworks(): void {
+        page.flickable.contentY = Math.max(0, Math.min(networksHeader.y, page.flickable.contentHeight - page.flickable.height));
     }
 
     // Nothing is read for this page before it is shown.
@@ -117,6 +187,28 @@ FormCard.FormCardPage {
         }
         FormCard.FormDelegateSeparator {}
         FormCard.FormSwitchDelegate {
+            objectName: "blend-accounts"
+            text: L10n.i18nc("@option:check", "Show chats of several accounts together")
+            description: L10n.i18nc("@info", "Shift+click or Ctrl+click an account in the side panel to add it to the list.")
+            checked: App.settings.blendAccounts
+            onToggled: App.settings.blendAccounts = checked
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
+            objectName: "quiet-notices"
+            text: L10n.i18nc("@option:check", "Show minor notices in the conversation list")
+            description: L10n.i18nc("@info", "Safety number changes, refreshed sessions, changed phone numbers and accepted message requests. They always stay in the chat itself.")
+            // Nothing to switch before the core has said what holds.
+            enabled: App.settings.quietNotices !== ""
+            checked: App.settings.quietNotices === "show"
+            // Applied at once. The mark follows what the core holds, not the click.
+            onToggled: {
+                App.settings.quietNotices = checked ? "show" : "hide";
+                checked = Qt.binding(() => App.settings.quietNotices === "show");
+            }
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
             objectName: "round-avatars"
             text: L10n.i18nc("@option:check", "Round avatars")
             description: L10n.i18nc("@info", "Off: squares with your theme's corners.")
@@ -147,14 +239,27 @@ FormCard.FormCardPage {
         title: L10n.i18nc("@title:group", "Privacy")
     }
     Card {
-        FormCard.FormTextDelegate {
-            text: L10n.i18nc("@label", "Read receipts")
-            description: L10n.i18nc("@info synced setting", "On · change on your phone")
+        FormCard.FormComboBoxDelegate {
+            objectName: "locationFiles"
+            text: L10n.i18nc("@label:listbox", "Files with location data")
+            description: [L10n.i18nc("@info", "When Kourier finds where a photo, video or file was taken, it asks before sending it unchanged."), L10n.i18nc("@info", "Such files are sent with their location, without a question."), L10n.i18nc("@info", "Such files stay in the list; everything else is sent.")][Math.max(0, Math.min(2, App.settings.locationFiles))]
+            model: [L10n.i18nc("@item:inlistbox", "Ask each time"), L10n.i18nc("@item:inlistbox", "Always send"), L10n.i18nc("@item:inlistbox", "Never send")]
+            currentIndex: App.settings.locationFiles
+            onActivated: index => App.settings.locationFiles = index
         }
         FormCard.FormDelegateSeparator {}
         FormCard.FormTextDelegate {
+            objectName: "readReceipts"
+            text: L10n.i18nc("@label", "Read receipts")
+            // A second line for a network that is on and always sends them ("Always sent for
+            // Telegram."): the viewmodel's sentence, empty when there is none.
+            description: L10n.i18nc("@info synced setting", "On · change on your phone") + (App.privacyNote !== "" ? "\n" + App.privacyNote : "")
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormTextDelegate {
+            objectName: "typingIndicators"
             text: L10n.i18nc("@label", "Typing indicators")
-            description: L10n.i18nc("@info synced setting", "On · change on your phone")
+            description: L10n.i18nc("@info synced setting", "On · change on your phone") + (App.privacyNote !== "" ? "\n" + App.privacyNote : "")
         }
         FormCard.FormDelegateSeparator {}
         FormCard.FormTextDelegate {
@@ -201,6 +306,93 @@ FormCard.FormCardPage {
         }
     }
 
+    // The experimental networks (WhatsApp): the switch is a preference; the core has no runtime
+    // switch, so a change takes effect when Kourier starts again ("Restart Now").
+    FormCard.FormHeader {
+        id: networksHeader
+        visible: page.experimentalNetworks.length > 0
+        title: L10n.i18nc("@title:group", "Networks")
+    }
+    Card {
+        id: networksCard
+
+        visible: page.experimentalNetworks.length > 0
+
+        Repeater {
+            model: page.switchNetworks
+            delegate: FormCard.FormSwitchDelegate {
+                id: networkSwitch
+
+                required property var modelData
+
+                objectName: "network-" + networkSwitch.modelData.kind
+                text: Style.plain(networkSwitch.modelData.name)
+                // Off for a reason the person can change: the description says which.
+                enabled: !page.linking(networkSwitch.modelData.kind)
+                // (Not `networkSwitch.enabled`: it is false while any page above is disabled.)
+                description: page.linking(networkSwitch.modelData.kind) ? L10n.i18nc("@info", "Finish or stop the link first.") : L10n.i18nc("@info, %1 the network", "Experimental. Kourier is not made or approved by %1, and %1 may restrict or ban an account it finds linked to Kourier.", Style.plain(networkSwitch.modelData.name))
+                checked: page.networkPref(networkSwitch.modelData.kind)
+                // The mark follows the preference, not the click: turning off with an account
+                // asks first and leaves it on until the question is answered.
+                onToggled: {
+                    if (!networkSwitch.checked && App.settings.accountsOf(networkSwitch.modelData.kind) > 0) {
+                        page.askTurnOff(networkSwitch.modelData.kind, networkSwitch.modelData.name, networkSwitch.modelData.turnOffText);
+                    } else {
+                        App.settings.setNetworkOn(networkSwitch.modelData.kind, networkSwitch.checked);
+                    }
+                    networkSwitch.checked = Qt.binding(() => page.networkPref(networkSwitch.modelData.kind));
+                }
+            }
+        }
+        // A network this build cannot log in to: its name and why, no switch (turning it on
+        // would not help). The viewmodel's words, never the backend's.
+        Repeater {
+            model: page.missingNetworks
+            delegate: ColumnLayout {
+                id: missingRow
+
+                required property var modelData
+                required property int index
+
+                spacing: 0
+                Layout.fillWidth: true
+
+                FormCard.FormDelegateSeparator {
+                    visible: missingRow.index > 0 || page.switchNetworks.length > 0
+                }
+                FormCard.FormTextDelegate {
+                    objectName: "network-missing-" + missingRow.modelData.kind
+                    text: Style.plain(missingRow.modelData.name)
+                    description: missingRow.modelData.description
+                    Layout.fillWidth: true
+                }
+            }
+        }
+        FormCard.FormDelegateSeparator {
+            visible: page.restartNeeded
+        }
+        FormCard.FormTextDelegate {
+            visible: page.restartNeeded
+            objectName: "networks-restart-note"
+            text: L10n.i18nc("@info", "Takes effect when Kourier starts again.")
+        }
+        FormCard.FormButtonDelegate {
+            visible: page.restartNeeded
+            objectName: "networks-restart"
+            icon.name: "system-reboot"
+            text: L10n.i18nc("@action:button", "Restart Now")
+            onClicked: {
+                // The window asks first when work still runs (a history transfer).
+                const window = Kirigami.ApplicationWindow.window;
+                if (window && window.restartAsking) {
+                    window.restartAsking(() => App.restartNow());
+                } else {
+                    App.restartNow();
+                }
+            }
+        }
+    }
+
     // What can be done with each account (link feedback L4): a group per account with its
     // line (name and number), "Transfer History from Phone…" for an account whose network
     // hands a newly linked device its history (hidden while that account still links),
@@ -211,6 +403,19 @@ FormCard.FormCardPage {
         visible: page.accountActions.length > 0
         title: L10n.i18nc("@title:group", "Accounts")
     }
+    // These cards sit straight in FormCardPage's `internalLayout`, a ColumnLayout, which is the
+    // shape that crashed the accounts drawer (AccountsDrawer.qml, F1): a Qt Quick Layout keeps
+    // a removed child in its engine until it polishes, a Repeater deletes the card before that,
+    // and a hidden window never polishes. The model is a JS array, so EVERY change of
+    // `App.accountActions` removes and remakes all the cards, also while the window is hidden.
+    // It is safe today (Qt 6.11.1, Kirigami Add-ons as installed; checked in F1) only because
+    // nothing reads `Layout.minimumHeight`, `Layout.minimumWidth` or another size hint of
+    // `internalLayout` or of a layout above it: `internalLayout` is the page's top-level
+    // layout (its parent is a plain Item of the ScrollablePage, no layout) and the page reads
+    // its `implicitHeight` only, which does not walk the engine's items. It would become
+    // unsafe the moment a `Layout.*` attached read reaches `internalLayout`, the page is put
+    // inside another layout, or Kirigami starts to read such a size hint. If so, wrap the
+    // Repeater in a `Column` (a positioner drops a removed child at once), as the drawer does.
     Repeater {
         model: page.accountActions
         delegate: Card {

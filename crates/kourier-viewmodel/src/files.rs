@@ -43,6 +43,12 @@ use crate::i18n::{trc, trfc, trnc};
 use crate::media::{icon_for_file_name, kind_for_file_name, kind_name};
 use crate::time::file_size;
 
+mod location;
+
+pub use location::{
+    AskedFile, LocationAnswer, LocationOutcome, LocationQuestion, LocationSend, LocationSnapshot,
+};
+
 /// One file waiting in the strip.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StripFile {
@@ -75,6 +81,22 @@ pub struct StripFile {
     pub as_file: bool,
     /// It is a folder, at this stage of becoming files or an archive; `None` for a file.
     pub folder: Option<FolderEntry>,
+    /// Whether it would leave with where it was taken (the core's verdict from the plan,
+    /// `FilesPreview::location`, for its CURRENT [`Self::as_file`]); `None` while that is not
+    /// known. Kept while only the caption or the reply changes (they change nothing about the
+    /// file); a new [`Self::as_file`] asks again.
+    pub location: Option<bool>,
+    /// The user's answer or the setting "Never send" keeps it back for its location: it stays
+    /// when the others go ([`FileStrip::take_sendable`]) and its row says why. Not a refusal
+    /// (the next plan clears refusals): it may go on a later Send.
+    pub held: bool,
+    /// It is the archive Kourier made of a folder (BQ4): the question about its location
+    /// speaks of the files inside.
+    pub archive: bool,
+    /// The packer found a file inside this archive that holds where it was taken (BQ4). The
+    /// core cannot look inside an archive, so its verdict is false: this one counts with it
+    /// ([`Self::location`] is true after every plan).
+    pub archive_located: bool,
 }
 
 crate::safe_debug!(StripFile {
@@ -87,7 +109,11 @@ crate::safe_debug!(StripFile {
     refusal,
     part,
     as_file,
-    folder
+    folder,
+    location,
+    held,
+    archive,
+    archive_located
 });
 
 /// Where a folder in the strip stands.
@@ -289,6 +315,10 @@ pub struct FileRow {
     pub stage: &'static str,
     /// For a folder that is being packed: how far, in thousandths.
     pub progress: u16,
+    /// The second line speaks of where the file was taken (the note that its location stays
+    /// in it, or the reason it is held or kept for it): the list lets that line take two
+    /// lines (U2), every other row keeps one.
+    pub located: bool,
 }
 
 crate::safe_debug!(FileRow {
@@ -302,7 +332,8 @@ crate::safe_debug!(FileRow {
     can_original,
     original,
     stage,
-    progress
+    progress,
+    located
 });
 
 /// What a look at a file found (off the UI thread).
@@ -340,6 +371,11 @@ pub struct StripSummary {
     /// The send would be refused as a whole: files cannot quote here and there is no text to
     /// carry the quote.
     pub reply_unsendable: bool,
+    /// A file that goes waits for its verdict on location: Send waits ([`FileStrip::can_send`]);
+    /// the hint says "Checking files…".
+    pub checking: bool,
+    /// Files held for their location ([`StripFile::held`]); they are not refused.
+    pub held: usize,
     /// Bytes of all files, once every size is known.
     pub bytes: Option<u64>,
     /// "7 files, 4 messages · 12.4 MB".
@@ -398,9 +434,18 @@ pub struct HandedFile {
     pub pasted: bool,
     /// [`StripFile::as_file`].
     pub as_file: bool,
+    /// `Some`: it is the archive Kourier made of a folder ([`StripFile::archive`]); the
+    /// value is [`StripFile::archive_located`]. The core cannot look inside an archive, so
+    /// this is the only place that knows a returned one holds where something was taken
+    /// (P1): without it the next Send would not ask and the file would leave unasked.
+    pub archive: Option<bool>,
 }
 
-crate::safe_debug!(HandedFile { pasted, as_file });
+crate::safe_debug!(HandedFile {
+    pasted,
+    as_file,
+    archive
+});
 
 /// What the network of a conversation says that the strip only tells the user about.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -442,6 +487,8 @@ impl StripRules {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileStrip {
     files: Vec<StripFile>,
+    /// Where this strip's entry ids start ([`Self::starting_at`]): its identity.
+    base: u64,
     next_id: u64,
     /// Counts every change of what a plan depends on (the files, the caption and reply flags).
     serial: u64,
@@ -456,6 +503,7 @@ pub struct FileStrip {
     caption_messages: usize,
     reply_unsendable: bool,
     rules: StripRules,
+    location_pref: LocationPref,
 }
 
 /// The file name of a path, as shown.
@@ -478,6 +526,7 @@ impl FileStrip {
     /// chat's strip by accident.
     pub fn starting_at(base: u64) -> Self {
         Self {
+            base,
             next_id: base,
             serial: base,
             ..Self::default()
@@ -540,6 +589,7 @@ impl FileStrip {
             path,
             pasted,
             as_file: false,
+            archive: None,
         }))
     }
 
@@ -562,6 +612,12 @@ impl FileStrip {
                 part: None,
                 as_file: file.as_file,
                 folder: None,
+                // A file that comes back from a send carries no earlier agreement: the next
+                // Send asks again (an archive of a folder still says what is inside it, P1).
+                location: None,
+                held: false,
+                archive: file.archive.is_some(),
+                archive_located: file.archive == Some(true),
                 path: file.path,
                 name,
             });
@@ -592,6 +648,9 @@ impl FileStrip {
             return false;
         }
         file.as_file = as_file;
+        // The verdict was for the other way of sending it.
+        file.location = None;
+        file.held = false;
         self.changed();
         true
     }
@@ -680,7 +739,7 @@ impl FileStrip {
         if answer.serial != self.serial || preview.kinds.len() != at.len() {
             return false;
         }
-        for (position, kind) in at.iter().zip(&preview.kinds) {
+        for (n, (position, kind)) in at.iter().zip(&preview.kinds).enumerate() {
             let file = &mut self.files[*position];
             if let Some(kind) = kind {
                 file.kind = *kind;
@@ -688,6 +747,13 @@ impl FileStrip {
             }
             file.refusal = None;
             file.part = None;
+            // (A core that says nothing of it found nothing.)
+            // (Nor can it look inside the archive of a folder: the packer did.)
+            let located = preview.location.get(n).copied().unwrap_or(false) || file.archive_located;
+            file.location = Some(located);
+            if !located {
+                file.held = false;
+            }
         }
         for r in &preview.refused {
             if let Some(file) = at.get(r.index).and_then(|i| self.files.get_mut(*i)) {
@@ -724,6 +790,12 @@ impl FileStrip {
         }
         for file in &mut self.files {
             file.part = None;
+            // No verdict will come: Send is not held up for one. The core looks at every file
+            // again when it is sent and refuses a located one without the user's agreement
+            // (`FileRefusal::Location`), which comes back to the strip marked.
+            if file.location.is_none() {
+                file.location = Some(file.archive_located);
+            }
         }
         self.messages = 0;
         self.lead_text = false;
@@ -745,6 +817,7 @@ impl FileStrip {
                 path,
                 pasted,
                 as_file,
+                archive,
             } = file;
             let name = name_of(&path);
             self.next_id += 1;
@@ -763,6 +836,10 @@ impl FileStrip {
                 part: None,
                 as_file,
                 folder: None,
+                location: None,
+                held: false,
+                archive: archive.is_some(),
+                archive_located: archive == Some(true),
                 path,
                 name,
             });
@@ -798,6 +875,8 @@ impl FileStrip {
                     file.refusal = None;
                     file.part = None;
                     file.as_file = false;
+                    file.location = None;
+                    file.held = false;
                     file.inspected = false;
                     changed = true;
                     folders = true;
@@ -1118,6 +1197,10 @@ impl FileStrip {
                 part: None,
                 as_file: false,
                 folder: None,
+                location: None,
+                held: false,
+                archive: false,
+                archive_located: false,
                 path: file.path,
                 name,
             });
@@ -1143,9 +1226,10 @@ impl FileStrip {
     }
 
     /// The archive of folder `id` takes its place: a file Kourier made (it is deleted when
-    /// it is no longer needed, like a pasted picture), `size` bytes. `false` when the entry
-    /// is gone: the caller then deletes the archive.
-    pub fn folder_packed(&mut self, id: u64, archive: PathBuf, size: u64) -> bool {
+    /// it is no longer needed, like a pasted picture), `size` bytes; `located`: a file packed
+    /// into it holds where it was taken (the packer looked, BQ4). `false` when the entry is
+    /// gone: the caller then deletes the archive.
+    pub fn folder_packed(&mut self, id: u64, archive: PathBuf, size: u64, located: bool) -> bool {
         let Some(file) = self
             .files
             .iter_mut()
@@ -1163,6 +1247,10 @@ impl FileStrip {
         file.picture = false;
         file.pasted = true;
         file.inspected = false;
+        file.location = None;
+        file.held = false;
+        file.archive = true;
+        file.archive_located = located;
         self.changed();
         true
     }
@@ -1187,11 +1275,12 @@ impl FileStrip {
             .collect()
     }
 
-    /// The files a send takes now: every file the core did not refuse, in order.
+    /// The files a send takes now: every file the core did not refuse and that is not held
+    /// for its location ([`StripFile::held`]), in order.
     pub fn sendable(&self) -> Vec<PathBuf> {
         self.files
             .iter()
-            .filter(|f| f.goes())
+            .filter(|f| f.leaves())
             .map(|f| f.path.clone())
             .collect()
     }
@@ -1200,23 +1289,24 @@ impl FileStrip {
     pub fn sendable_as_file(&self) -> Vec<bool> {
         self.files
             .iter()
-            .filter(|f| f.goes())
+            .filter(|f| f.leaves())
             .map(|f| f.as_file)
             .collect()
     }
 
     /// A send took the files that can go: they leave the strip, the refused ones stay with
-    /// their marks, and so do folders that are not files or an archive yet. Returns the
-    /// files that left.
+    /// their marks, and so do files held for their location and folders that are not files
+    /// or an archive yet. Returns the files that left.
     pub fn take_sendable(&mut self) -> Vec<StripFile> {
         let (sent, kept): (Vec<StripFile>, Vec<StripFile>) = std::mem::take(&mut self.files)
             .into_iter()
-            .partition(StripFile::goes);
+            .partition(StripFile::leaves);
         self.files = kept;
         if !sent.is_empty() {
             self.changed();
-            // What stays is refused: there is nothing left to plan.
-            if !self.files.is_empty() {
+            // What stays is refused: there is nothing left to plan. Files held for their
+            // location can go on the next Send: they are planned again (the verdicts stay).
+            if !self.files.is_empty() && !self.files.iter().any(StripFile::goes) {
                 self.planned = Some(self.serial);
                 self.messages = 0;
                 self.lead_text = false;
@@ -1227,9 +1317,71 @@ impl FileStrip {
         sent
     }
 
-    /// Whether a send has anything to take.
+    /// Whether a send has anything to take: a file that goes, and none that goes still
+    /// waiting for its verdict on location ([`StripFile::location`]). Held files count: Send
+    /// asks about them again or keeps them, as the setting says.
     pub fn can_send(&self) -> bool {
-        self.files.iter().any(StripFile::goes) && !(self.planned() && self.reply_unsendable)
+        self.files.iter().any(StripFile::goes)
+            && !self.checking()
+            && !(self.planned() && self.reply_unsendable)
+    }
+
+    /// A file that goes waits for its verdict on location: Send waits too ("Checking
+    /// files…").
+    fn checking(&self) -> bool {
+        self.files.iter().any(|f| f.goes() && f.location.is_none())
+    }
+
+    /// What Settings say of files with location data; the rows say it. Returns whether the
+    /// rows may read differently now.
+    pub fn set_location_pref(&mut self, pref: LocationPref) -> bool {
+        if self.location_pref == pref {
+            return false;
+        }
+        self.location_pref = pref;
+        self.files.iter().any(StripFile::located)
+    }
+
+    /// The entries that go and would leave with their location, held ones included: what
+    /// Send asks about (or keeps back), by identity, in order.
+    pub fn located(&self) -> Vec<u64> {
+        self.files
+            .iter()
+            .filter(|f| f.located())
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// How many files that go are held for their location now.
+    pub fn held_going(&self) -> usize {
+        self.files.iter().filter(|f| f.goes() && f.held).count()
+    }
+
+    /// Keeps the entries `ids` back for their location (the answer [Don't Send], or "Never
+    /// send"); only files that go with a true verdict can be held. Returns how many are held
+    /// now of those.
+    pub fn hold(&mut self, ids: &[u64]) -> usize {
+        let mut held = 0;
+        for file in &mut self.files {
+            if ids.contains(&file.id) && file.located() {
+                file.held = true;
+                held += 1;
+            }
+        }
+        held
+    }
+
+    /// Lets the entries `ids` go again with the others (the user agreed to send them with
+    /// their location). Returns how many were held.
+    pub fn release(&mut self, ids: &[u64]) -> usize {
+        let mut released = 0;
+        for file in &mut self.files {
+            if ids.contains(&file.id) && file.held {
+                file.held = false;
+                released += 1;
+            }
+        }
+        released
     }
 
     /// The rows of the list, in order.
@@ -1261,7 +1413,10 @@ impl FileStrip {
                     picture: f.picture && f.refusal.is_none(),
                     path: f.path.clone(),
                     size: f.size.map(file_size).unwrap_or_default(),
-                    reason: refusal.map(refusal_text).unwrap_or_default(),
+                    reason: match refusal {
+                        Some(r) => refusal_text(r),
+                        None => self.location_reason(f),
+                    },
                     // The caption sent first takes the first numbers; the files follow.
                     part: match f.part {
                         Some(part) if split => {
@@ -1275,12 +1430,13 @@ impl FileStrip {
                     can_original: f.can_be_original(),
                     original: f.as_file && f.can_be_original(),
                     note: if f.refusal.is_none() {
-                        self.rules.note(&f.name)
+                        self.note(f)
                     } else {
                         String::new()
                     },
                     stage: "",
                     progress: 0,
+                    located: refusal.is_none() && (f.located() || f.held),
                 }
             })
             .collect();
@@ -1365,6 +1521,16 @@ impl FileStrip {
             text.push_str(&file_size(bytes));
         }
         let mut hints: Vec<String> = Vec::new();
+        let checking = self.checking();
+        if checking {
+            hints.push(
+                trc(
+                    "@info:status strip summary while Kourier looks at the files for location data",
+                    "Checking files…",
+                )
+                .into_owned(),
+            );
+        }
         if refused > 0 {
             // (Two messages, not a plural: no number is shown, and in many languages the
             // form for one is also the form for 21.)
@@ -1421,6 +1587,8 @@ impl FileStrip {
             lead_text: planned && self.lead_text,
             caption_messages,
             reply_unsendable: planned && self.reply_unsendable,
+            checking,
+            held: self.files.iter().filter(|f| f.held).count(),
             bytes: bytes.filter(|_| files > 0),
             text: if files + folders == 0 {
                 String::new()
@@ -1430,6 +1598,86 @@ impl FileStrip {
             hint: hints.join(" "),
         }
     }
+}
+
+impl FileStrip {
+    /// Why a file the network takes stays for its location, as its row says; empty when it
+    /// does not. Under "Never send" the reason names the setting, which the user can change
+    /// (F22).
+    fn location_reason(&self, f: &StripFile) -> String {
+        let never = self.location_pref == LocationPref::Never;
+        match (f.held, never && f.located()) {
+            // Held by the answer [Don't Send]: the row says the way back (U3), since Send
+            // stays on for it under Ask and Always.
+            (true, false) if self.location_pref == LocationPref::Always => trc(
+                "@info:status why a file was not sent: the user answered Don't Send, and the setting Files with location data now says Always send",
+                "Not sent: it holds where it was taken. Send now sends it.",
+            )
+            .into_owned(),
+            (true, false) => trc(
+                "@info:status why a file was not sent: the user answered Don't Send, and the setting Files with location data says Ask each time",
+                "Not sent: it holds where it was taken. Send asks again.",
+            )
+            .into_owned(),
+            (true, true) => trc(
+                "@info:status why a file was not sent: it holds the place it was taken, and the setting Files with location data says Never send",
+                "Not sent: it holds where it was taken (Settings: Files with location data)",
+            )
+            .into_owned(),
+            (false, true) => trc(
+                "@info:status why a file will stay when Send is pressed: it holds the place it was taken, and the setting Files with location data says Never send",
+                "Will not be sent: it holds where it was taken (Settings: Files with location data)",
+            )
+            .into_owned(),
+            (false, false) => String::new(),
+        }
+    }
+
+    /// The note of a file the network takes: that its location and device data stay in it
+    /// (his words, M1 T1), and the network's note about its type, both when both apply.
+    fn note(&self, f: &StripFile) -> String {
+        let hard = self.rules.note(&f.name);
+        // (A held file, or one "Never send" keeps, says so in its reason instead.)
+        if !f.located() || !self.location_reason(f).is_empty() {
+            return hard;
+        }
+        let located = trc(
+            "@info:tooltip a file that will be sent with the place it was taken still in it",
+            "Location and device data stay in this file",
+        )
+        .into_owned();
+        if hard.is_empty() {
+            located
+        } else {
+            format!("{located} · {hard}")
+        }
+    }
+}
+
+/// What Settings say of files with location data (`location-files` in the prefs); the strip
+/// only shows it in the rows, the composer's Send acts on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocationPref {
+    /// Ask each time.
+    #[default]
+    Ask,
+    /// Always send.
+    Always,
+    /// Never send: such files stay in the list.
+    Never,
+}
+
+/// The notice after a send that kept `held` files back for their location; empty for none.
+pub fn located_stayed_notice(held: usize) -> String {
+    if held == 0 {
+        return String::new();
+    }
+    trnc(
+        "@info:status notice after a send that kept files with location data back, %1 how many files",
+        "%1 file with location data stayed in the list.",
+        "%1 files with location data stayed in the list.",
+        held as u64,
+    )
 }
 
 /// A share of a whole in thousandths (a whole of nothing is done).
@@ -1517,13 +1765,31 @@ fn folder_row(file: &StripFile, folder: &FolderEntry) -> FileRow {
         note,
         stage: folder.stage.as_str(),
         progress,
+        located: false,
     }
 }
 
 impl StripFile {
+    /// What a send that comes back must hand to [`FileStrip::add_handed`] /
+    /// [`FileStrip::restore_refused`] ([`HandedFile::archive`]): `Some(located)` for the
+    /// archive of a folder, else `None`.
+    pub fn archive_made(&self) -> Option<bool> {
+        self.archive.then_some(self.archive_located)
+    }
+
     /// A send takes it: a file the network did not refuse. A folder is not a file yet.
     fn goes(&self) -> bool {
         self.refusal.is_none() && self.folder.is_none()
+    }
+
+    /// A send takes it now: it goes and is not held for its location.
+    fn leaves(&self) -> bool {
+        self.goes() && !self.held
+    }
+
+    /// It goes and would leave with its location (held or not).
+    fn located(&self) -> bool {
+        self.goes() && self.location == Some(true)
     }
 
     /// A picture or a video that the network can take: it has the choice of going as the
@@ -1549,8 +1815,9 @@ fn kind_plural(kind: AttachmentKind) -> std::borrow::Cow<'static, str> {
     }
 }
 
-/// Why a file cannot be sent, as the strip says it. None of these reasons is Kourier's own:
-/// the first two are about the file, the others are what the network or the chat takes.
+/// Why a file cannot be sent, as the strip says it. Only `Location` is Kourier's own (the
+/// user's choice): the first two are about the file, the others are what the network or the
+/// chat takes.
 pub fn refusal_text(reason: FileRefusal) -> String {
     match reason {
         FileRefusal::Unreadable => {
@@ -1576,6 +1843,12 @@ pub fn refusal_text(reason: FileRefusal) -> String {
             "This chat does not take %1",
             &[&kind_plural(kind)],
         ),
+        // LOC: the user's own choice, not the network's (his word "taken", brief §6).
+        FileRefusal::Location => trc(
+            "@info:status why a file was not sent: it holds the place it was taken",
+            "Not sent: it holds where it was taken",
+        )
+        .into_owned(),
     }
 }
 
@@ -1757,7 +2030,7 @@ mod tests {
     use kourier_core::facade::RefusedFile;
     use kourier_model::FilePlan;
 
-    fn paths(names: &[&str]) -> Vec<PathBuf> {
+    pub(super) fn paths(names: &[&str]) -> Vec<PathBuf> {
         names
             .iter()
             .map(|n| PathBuf::from(format!("/t/{n}")))
@@ -1784,6 +2057,7 @@ mod tests {
                 messages: messages.iter().map(|m| m.to_vec()).collect(),
                 reply_unsendable: false,
             },
+            location: vec![false; kinds.len()],
         }
     }
 
@@ -2058,6 +2332,7 @@ mod tests {
             path: PathBuf::from(format!("/t/{name}")),
             pasted,
             as_file,
+            archive: None,
         };
         strip.restore_refused(vec![
             (handed("gone.txt", false, false), FileRefusal::Unreadable),
@@ -2340,7 +2615,7 @@ mod tests {
         assert!(strip.rows().iter().all(|r| r.note.is_empty()));
     }
 
-    fn is_folder(strip: &mut FileStrip, index: usize) -> u64 {
+    pub(super) fn is_folder(strip: &mut FileStrip, index: usize) -> u64 {
         let id = strip.files()[index].id;
         assert!(strip.set_facts(&[(
             id,
@@ -2361,7 +2636,7 @@ mod tests {
         }
     }
 
-    fn listed(names: &[&str]) -> Vec<ListedFile> {
+    pub(super) fn listed(names: &[&str]) -> Vec<ListedFile> {
         names
             .iter()
             .map(|n| ListedFile {
@@ -2570,7 +2845,7 @@ mod tests {
         // Done: one file in the folder's place, made by Kourier (deleted when it is no
         // longer needed), its size known.
         let archive = PathBuf::from("/cache/outgoing/ab12/Raw footage.zip");
-        assert!(strip.folder_packed(folder, archive.clone(), 1_234_567));
+        assert!(strip.folder_packed(folder, archive.clone(), 1_234_567, false));
         let file = &strip.files()[1];
         assert_eq!(file.name, "Raw footage.zip");
         assert_eq!(
@@ -2584,8 +2859,8 @@ mod tests {
         assert_eq!(strip.summary().text, "2 files");
         // An archive that arrives for an entry that is gone is not taken (the caller
         // deletes it).
-        assert!(!strip.folder_packed(folder, archive.clone(), 1));
-        assert!(!strip.folder_packed(999, archive, 1));
+        assert!(!strip.folder_packed(folder, archive.clone(), 1, false));
+        assert!(!strip.folder_packed(999, archive, 1, false));
         assert!(!strip.folder_packing(folder, 5));
     }
 
@@ -2724,6 +2999,7 @@ mod tests {
                 path: PathBuf::from("/t/Raw footage"),
                 pasted: false,
                 as_file: false,
+                archive: None,
             },
             FileRefusal::NotAFile,
         )]);
@@ -2816,6 +3092,276 @@ mod tests {
             "2 files could not be read and are not in “Busy.zip”."
         );
         assert_eq!(counted.skipped(), 13);
+    }
+
+    /// The core's answer for the strip as it stands, with `location` as the verdicts by position
+    /// and every file in one message of its own.
+    pub(super) fn plan_located(strip: &mut FileStrip, kinds: &[AttachmentKind], location: &[bool]) {
+        let kinds: Vec<Option<AttachmentKind>> = kinds.iter().map(|k| Some(*k)).collect();
+        let parts: Vec<Vec<usize>> = (0..kinds.len()).map(|i| vec![i]).collect();
+        let parts: Vec<&[usize]> = parts.iter().map(Vec::as_slice).collect();
+        let mut preview = preview(&kinds, &[], &parts);
+        preview.location = location.to_vec();
+        assert!(strip.apply_plan(&PlanAnswer {
+            serial: strip.serial(),
+            preview,
+        }));
+    }
+
+    const LOCATED_NOTE: &str = "Location and device data stay in this file";
+
+    #[test]
+    fn send_waits_for_the_verdict_on_location_and_keeps_it_while_only_the_caption_changes() {
+        let mut strip = FileStrip::new();
+        strip.add(paths(&["trip.mp4", "notes.pdf"]), false);
+        // No verdict yet: Send waits, and the hint says why.
+        assert!(strip.files().iter().all(|f| f.location.is_none()));
+        assert!(!strip.can_send());
+        let summary = strip.summary();
+        assert!(summary.checking);
+        assert_eq!(summary.hint, "Checking files…");
+        plan_located(&mut strip, &[Video, File], &[true, false]);
+        assert_eq!(
+            strip.files().iter().map(|f| f.location).collect::<Vec<_>>(),
+            [Some(true), Some(false)]
+        );
+        assert!(strip.can_send());
+        assert!(!strip.summary().checking);
+        assert_eq!(strip.summary().hint, "");
+        // A caption (short or long) and a reply change the plan, not the files: the verdicts
+        // stay while the new plan is on its way, and Send does not wait for it.
+        assert!(strip.set_caption(true, Some("x".repeat(600)), true));
+        assert!(!strip.planned());
+        assert_eq!(strip.files()[0].location, Some(true));
+        assert!(strip.can_send());
+        // Sending it as the file it is asks again.
+        assert!(strip.set_as_file(0, true));
+        assert_eq!(strip.files()[0].location, None);
+        assert_eq!(strip.files()[1].location, Some(false));
+        assert!(!strip.can_send());
+        plan_located(&mut strip, &[Video, File], &[true, false]);
+        assert!(strip.can_send());
+        // A file added later waits for its own verdict.
+        strip.add(paths(&["more.jpg"]), false);
+        assert!(!strip.can_send());
+        // A folder is no file: it waits for no verdict.
+        let mut folders = FileStrip::new();
+        folders.add(paths(&["photos", "a.txt"]), false);
+        let id = folders.files()[0].id;
+        folders.set_facts(&[(
+            id,
+            FileFacts {
+                size: None,
+                picture: false,
+                folder: true,
+            },
+        )]);
+        let mut preview = preview(&[Some(File)], &[], &[&[0]]);
+        preview.location = vec![false];
+        assert!(folders.apply_plan(&PlanAnswer {
+            serial: folders.serial(),
+            preview,
+        }));
+        assert!(folders.can_send());
+        // A core that cannot plan does not hold Send up forever: its own look at the send
+        // refuses a located file without the agreement.
+        let mut gone = FileStrip::new();
+        gone.add(paths(&["a.mp4"]), false);
+        assert!(gone.plan_unavailable(gone.serial()));
+        assert!(gone.can_send());
+    }
+
+    #[test]
+    fn held_files_stay_when_the_others_go_and_are_planned_again() {
+        let mut strip = FileStrip::new();
+        strip.add(paths(&["trip.mp4", "notes.pdf", "beach.heic"]), false);
+        plan_located(&mut strip, &[Video, File, Image], &[true, false, true]);
+        let located = strip.located();
+        assert_eq!(located, [strip.files()[0].id, strip.files()[2].id]);
+        // Only located files that go can be held.
+        let pdf = strip.files()[1].id;
+        assert_eq!(strip.hold(&[pdf]), 0);
+        assert_eq!(strip.hold(&located), 2);
+        assert!(strip.files()[0].held && !strip.files()[1].held && strip.files()[2].held);
+        // Held is not refused: Send is still possible (it asks again, or keeps them), but a
+        // send takes only the file that is not held.
+        assert!(strip.can_send());
+        assert_eq!(strip.sendable(), paths(&["notes.pdf"]));
+        assert_eq!(strip.sendable_as_file(), [false]);
+        let summary = strip.summary();
+        assert_eq!((summary.refused, summary.held), (0, 2));
+        let sent = strip.take_sendable();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(strip.len(), 2);
+        // What stays can go on the next Send: it is planned again, its verdicts kept.
+        assert!(!strip.planned());
+        assert!(strip.plan_request().is_some());
+        assert!(
+            strip
+                .files()
+                .iter()
+                .all(|f| f.held && f.location == Some(true))
+        );
+        assert!(strip.can_send());
+        plan_located(&mut strip, &[Video, Image], &[true, true]);
+        assert!(strip.files().iter().all(|f| f.held));
+        // Agreed: they go.
+        let ids = strip.located();
+        assert_eq!(strip.release(&ids), 2);
+        assert_eq!(strip.sendable().len(), 2);
+        // A held file whose verdict turns false (it was changed) is no longer held; one sent
+        // the other way is asked about again.
+        strip.hold(&ids);
+        assert!(strip.set_caption(true, None, false));
+        plan_located(&mut strip, &[Video, Image], &[false, true]);
+        assert!(!strip.files()[0].held && strip.files()[1].held);
+        assert!(strip.set_as_file(1, true));
+        assert!(!strip.files()[1].held);
+        assert_eq!(strip.files()[1].location, None);
+        // A send with only refused files left is planned as before (nothing to plan).
+        let mut refused = FileStrip::new();
+        refused.add(paths(&["a.pdf", "b.exe"]), false);
+        let mut preview = preview(
+            &[Some(File), Some(File)],
+            &[(1, FileRefusal::NotAFile)],
+            &[&[0]],
+        );
+        preview.location = vec![false, false];
+        assert!(refused.apply_plan(&PlanAnswer {
+            serial: refused.serial(),
+            preview,
+        }));
+        refused.take_sendable();
+        assert!(refused.planned());
+    }
+
+    #[test]
+    fn located_rows_say_so_and_never_send_names_the_setting() {
+        let mut strip = FileStrip::new();
+        strip.set_rules(StripRules {
+            hard_to_save: ["heic".to_string()].into_iter().collect(),
+            network: "Signal".into(),
+        });
+        strip.add(paths(&["trip.mp4", "notes.pdf", "beach.heic"]), false);
+        // Before the verdict nothing is said about the location.
+        assert!(
+            strip
+                .rows()
+                .iter()
+                .all(|r| !r.note.contains("Location") && !r.located)
+        );
+        plan_located(&mut strip, &[Video, File, Image], &[true, false, true]);
+        let rows = strip.rows();
+        // The rows whose second line speaks of the location may wrap (U2); the others not.
+        assert_eq!(
+            rows.iter().map(|r| r.located).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        // His words on the rows whose verdict is true, joined to the note about the type.
+        assert_eq!(rows[0].note, LOCATED_NOTE);
+        assert_eq!(rows[1].note, "");
+        assert_eq!(
+            rows[2].note,
+            format!("{LOCATED_NOTE} · Some Signal apps cannot save this type of file")
+        );
+        assert!(rows.iter().all(|r| r.reason.is_empty()));
+        // Always: the same rows.
+        assert!(strip.set_location_pref(LocationPref::Always));
+        assert_eq!(strip.rows()[0].note, LOCATED_NOTE);
+        // Never: the row says it will stay, and which setting does it.
+        assert!(strip.set_location_pref(LocationPref::Never));
+        assert!(!strip.set_location_pref(LocationPref::Never));
+        let rows = strip.rows();
+        let will =
+            "Will not be sent: it holds where it was taken (Settings: Files with location data)";
+        assert_eq!(rows[0].reason, will);
+        assert_eq!(rows[0].note, "");
+        assert!(rows[0].located && !rows[1].located);
+        assert_eq!(rows[1].reason, "");
+        assert_eq!(rows[2].reason, will);
+        assert_eq!(
+            rows[2].note,
+            "Some Signal apps cannot save this type of file"
+        );
+        // Held under Never: not sent, the setting named.
+        let ids = strip.located();
+        strip.hold(&ids);
+        assert_eq!(
+            strip.rows()[0].reason,
+            "Not sent: it holds where it was taken (Settings: Files with location data)"
+        );
+        // Held by the answer [Don't Send] under Ask: the reason says the way back (U3).
+        strip.set_location_pref(LocationPref::Ask);
+        assert_eq!(
+            strip.rows()[0].reason,
+            "Not sent: it holds where it was taken. Send asks again."
+        );
+        strip.set_location_pref(LocationPref::Always);
+        assert_eq!(
+            strip.rows()[0].reason,
+            "Not sent: it holds where it was taken. Send now sends it."
+        );
+        strip.set_location_pref(LocationPref::Ask);
+        assert_eq!(strip.rows()[0].note, "");
+        // A strip with no located file reads the same under every setting.
+        let mut plain = FileStrip::new();
+        plain.add(paths(&["notes.pdf"]), false);
+        plan_located(&mut plain, &[File], &[false]);
+        assert!(!plain.set_location_pref(LocationPref::Never));
+        assert_eq!(plain.rows()[0].reason, "");
+        // The notice after a send that kept files back.
+        assert_eq!(located_stayed_notice(0), "");
+        assert_eq!(
+            located_stayed_notice(1),
+            "1 file with location data stayed in the list."
+        );
+        assert_eq!(
+            located_stayed_notice(3),
+            "3 files with location data stayed in the list."
+        );
+    }
+
+    #[test]
+    fn a_returned_file_carries_no_earlier_agreement() {
+        let mut strip = FileStrip::new();
+        strip.add(paths(&["trip.mp4"]), false);
+        plan_located(&mut strip, &[Video], &[true]);
+        let ids = strip.located();
+        strip.hold(&ids);
+        strip.release(&ids);
+        let sent = strip.take_sendable();
+        assert_eq!(sent.len(), 1);
+        // The send came back whole (another request was busy): the file returns without a
+        // verdict, so the next plan judges it and Send asks again.
+        strip.add_handed(sent.into_iter().map(|f| HandedFile {
+            archive: f.archive_made(),
+            path: f.path,
+            pasted: f.pasted,
+            as_file: f.as_file,
+        }));
+        assert_eq!(strip.files()[0].location, None);
+        assert!(!strip.files()[0].held);
+        assert!(!strip.can_send());
+        plan_located(&mut strip, &[Video], &[true]);
+        assert_eq!(strip.located().len(), 1);
+        assert_eq!(strip.rows()[0].note, LOCATED_NOTE);
+        // One the core refused for its location comes back marked; the next plan clears the
+        // mark and its verdict makes Send ask again.
+        let mut back = FileStrip::new();
+        back.restore_refused(vec![(
+            HandedFile {
+                path: PathBuf::from("/t/trip.mp4"),
+                pasted: false,
+                as_file: false,
+                archive: None,
+            },
+            FileRefusal::Location,
+        )]);
+        assert_eq!(back.files()[0].location, None);
+        assert_eq!(back.rows()[0].reason, refusal_text(FileRefusal::Location));
+        plan_located(&mut back, &[Video], &[true]);
+        assert_eq!(back.located().len(), 1);
+        assert!(back.can_send());
     }
 
     #[test]

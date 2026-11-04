@@ -34,6 +34,8 @@ allow = [
     "Unlicense",
     "Zlib",
     "0BSD",
+    "MIT-0",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
@@ -45,8 +47,18 @@ crate = "sqlcipher-crypto-provider"
 expression = "MIT"
 license-files = [{ path = "../LICENSE", hash = 0x8f1765a2 }]
 
+# whatsapp-rust's Signal fork `wacore-libsignal` (31 of its 49 .rs files carry
+# an AGPL-3.0-only SPDX header and "Copyright Signal Messenger, LLC") has `license = "MIT"`
+# in its manifest. cargo-deny 0.20.2 IGNORES `[[licenses.clarify]]` for a crate that has a license
+# field (tried with the real crc32 0x3891c57b of the repository LICENSE and with expression
+# "GPL-2.0-only": no effect, `cargo deny list` still shows MIT). MIT and AGPL-3.0-only are both
+# allowed, so nothing fails; the AGPL fact is recorded in about.toml (cargo-about does honour it). W0 spike.
+
 [bans]
 # Two versions of one crate are common in a graph this size; they are listed, not refused.
+# libthreema (kourier-threema, third_party/libthreema) adds 18 such names, among them a second line
+# of the dalek crates (curve25519 4 / ed25519 2 / x25519 2 next to Signal's 5 / 3 / 3), the RustCrypto
+# AEAD 0.5 set and rand 0.8: warn only; their release rows are at opt-level "s" (root Cargo.toml).
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
@@ -73,4 +85,5 @@ allow-git = [
     "https://github.com/signalapp/SparsePostQuantumRatchet.git",
     "https://github.com/boxdot/rusqlite",
     "https://github.com/iovxw/ksni",
+    "https://github.com/oxidezap/whatsapp-rust",
 ]

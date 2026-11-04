@@ -5,7 +5,7 @@
 //! state: every download answered once, every picture thumbnailed, no row naming a blob that is
 //! missing or does not decrypt.
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -149,19 +149,19 @@ async fn child(home: PathBuf) {
 fn run_child(home: &Path, failpoint: Option<&str>) -> ExitStatus {
     let exe = std::env::current_exe().expect("test binary");
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "--exact",
-        "attachment_crash_child",
-        "--nocapture",
-        "--test-threads=1",
-    ])
-    .env(CHILD_HOME, home)
-    .env_remove(kourier_db::failpoint::ENV)
-    .stdout(Stdio::null())
-    .stderr(Stdio::from(
-        std::fs::File::create(home.join(format!("child-{}.log", failpoint.unwrap_or("clean"))))
-            .expect("log file"),
-    ));
+    cmd.arg("--exact")
+        .arg(support::child_filter(
+            module_path!(),
+            "attachment_crash_child",
+        ))
+        .args(["--nocapture", "--test-threads=1"])
+        .env(CHILD_HOME, home)
+        .env_remove(kourier_db::failpoint::ENV)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(home.join(format!("child-{}.log", failpoint.unwrap_or("clean"))))
+                .expect("log file"),
+        ));
     if let Some(fp) = failpoint {
         cmd.env(kourier_db::failpoint::ENV, fp);
     }

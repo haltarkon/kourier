@@ -102,7 +102,7 @@ fn author_aci(target: &MsgTarget) -> Option<Aci> {
 }
 
 /// Confirms `cmd` (its work is safe in `backend.db` now, or there is none).
-fn confirm(tx: &mut Tx<'_>, cmd: CmdId, now: i64, wake: &Rc<Notify>) -> Result<()> {
+pub(crate) fn confirm(tx: &mut Tx<'_>, cmd: CmdId, now: i64, wake: &Rc<Notify>) -> Result<()> {
     append_events(tx, &[BackendEvent::CommandPersisted { cmd }], now, wake)?;
     Ok(())
 }
@@ -389,6 +389,32 @@ fn receipts_left(payload: &ReceiptsPayload, index: usize, sent: usize) -> Option
     })
 }
 
+/// What a `receipts` job still owes when the authors in `waiting` (their key is not trusted,
+/// P5 M1) wait for the user and the receipt for recipient number `index` failed after `sent`
+/// of its timestamps: the waiting authors first, then what [`receipts_left`] keeps. `None`
+/// when the job is as it was.
+fn receipts_owed(
+    payload: &ReceiptsPayload,
+    waiting: &[ReceiptBatch],
+    index: usize,
+    sent: usize,
+) -> Option<ReceiptsPayload> {
+    if waiting.is_empty() {
+        return receipts_left(payload, index, sent);
+    }
+    // An author waits only after an earlier one was reached, so `index` > 0 here and
+    // `receipts_left` returns what is behind it (nothing at the end of the list).
+    let mut recipients = waiting.to_vec();
+    if let Some(left) = receipts_left(payload, index, sent) {
+        recipients.extend(left.recipients);
+    }
+    Some(ReceiptsPayload {
+        kind: payload.kind.clone(),
+        recipients,
+        group: payload.group.clone(),
+    })
+}
+
 /// Runs a `receipts` job. A recipient that can never get it (unregistered) is skipped; so is
 /// one blocked since the job was queued, and every author of a group that was blocked or
 /// left since. When a receipt has to wait (a rate limit, a challenge, the network), the job
@@ -444,12 +470,25 @@ pub(crate) async fn run_receipts<T: SignalTransport>(
             Some((id, endorsements))
         }
     };
+    // Authors whose key is not trusted (P5 M1): their receipts wait for the user's release
+    // (the job is retried), the other authors are served meanwhile.
+    let mut waiting: Vec<ReceiptBatch> = Vec::new();
+    let mut untrusted = None;
     for (index, batch) in payload.recipients.iter().enumerate() {
         let Some(peer) = parse_aci(&batch.peer) else {
             continue;
         };
         // Blocked since the job was queued: they get nothing any more.
         if shared.db.read(|c| peers::load(c, &batch.peer))?.blocked {
+            continue;
+        }
+        // P5a R4: an author in stored state 2 (verified, then the key changed) is refused at
+        // every attempt: their receipts wait, with no prekey request, until the user confirms.
+        if shared
+            .db
+            .read(|c| crate::store::identity_is_changed(c, &batch.peer))?
+        {
+            waiting.push(batch.clone());
             continue;
         }
         let token = group
@@ -463,6 +502,15 @@ pub(crate) async fn run_receipts<T: SignalTransport>(
         for (chunks_sent, chunk) in batch.timestamps.chunks(MAX_PER_MESSAGE).enumerate() {
             match send_receipt(shared, &ctx, peer, kind, chunk, in_group).await {
                 Ok(()) => {}
+                Err(e) if jobs::is_untrusted(&e) => {
+                    let sent = (chunks_sent * MAX_PER_MESSAGE).min(batch.timestamps.len());
+                    waiting.push(ReceiptBatch {
+                        peer: batch.peer.clone(),
+                        timestamps: batch.timestamps[sent..].to_vec(),
+                    });
+                    untrusted = Some(e);
+                    break;
+                }
                 Err(e) if is_permanent(&e) => {
                     tracing::info!(error = %e, "receipts to a recipient dropped");
                     break;
@@ -470,7 +518,7 @@ pub(crate) async fn run_receipts<T: SignalTransport>(
                 Err(e) => {
                     // The job runs again later: only for what is still owed.
                     if let Some(left) =
-                        receipts_left(&payload, index, chunks_sent * MAX_PER_MESSAGE)
+                        receipts_owed(&payload, &waiting, index, chunks_sent * MAX_PER_MESSAGE)
                     {
                         let left = serde_json::to_vec(&left)
                             .map_err(|_| Error::Internal("receipt payload"))?;
@@ -480,6 +528,23 @@ pub(crate) async fn run_receipts<T: SignalTransport>(
                 }
             }
         }
+    }
+    if !waiting.is_empty() {
+        let end = payload.recipients.len();
+        if let Some(left) = receipts_owed(&payload, &waiting, end, 0) {
+            let left = serde_json::to_vec(&left).map_err(|_| Error::Internal("receipt payload"))?;
+            shared.db.zone(|tx| jobs::set_payload(tx, job, &left))?;
+        }
+        tracing::info!(
+            waiting = waiting.len(),
+            "receipts wait: a recipient's key is not trusted"
+        );
+        // A refusal libsignal just gave counts as a failed attempt; authors known to be in
+        // state 2 wait without one.
+        return match untrusted {
+            Some(e) => Err(e),
+            None => Ok(Done::WaitUntrusted),
+        };
     }
     Ok(Done::Finished)
 }
@@ -557,13 +622,20 @@ pub(crate) async fn run_read_sync<T: SignalTransport>(
 }
 
 /// The delivery receipts owed, ≤ 100 of the oldest per sender, for at most
-/// [`DELIVERY_PEERS_PER_RUN`] senders.
+/// [`DELIVERY_PEERS_PER_RUN`] senders. Not those of a sender in stored state 2 (verified, then
+/// the key changed): libsignal refuses them at every attempt, so they wait without a request
+/// ([`delivery_receipts_waiting`], P5a R4) and take no place of the run.
 fn owed_delivery_receipts(conn: &Connection) -> Result<Vec<(String, Vec<u64>)>> {
     let peers: Vec<String> = conn
         .prepare_cached(
-            "SELECT peer FROM delivery_receipts GROUP BY peer ORDER BY min(created_at) LIMIT ?1",
+            "SELECT peer FROM delivery_receipts
+             WHERE peer NOT IN (SELECT service_id FROM identities WHERE verified = ?2)
+             GROUP BY peer ORDER BY min(created_at) LIMIT ?1",
         )?
-        .query_map([DELIVERY_PEERS_PER_RUN], |r| r.get(0))?
+        .query_map(
+            (DELIVERY_PEERS_PER_RUN, crate::store::IDENTITY_UNVERIFIED),
+            |r| r.get(0),
+        )?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     let mut owed = Vec::with_capacity(peers.len());
     for peer in peers {
@@ -600,6 +672,35 @@ fn forget_blocked_delivery_receipts(conn: &Connection) -> Result<usize> {
         .execute([])?)
 }
 
+/// How many delivery receipts wait for senders in stored state 2 (P5a R4: [`owed_delivery_receipts`]
+/// leaves them out), after the ones older than [`jobs::UNTRUSTED_WAIT`] are forgotten (the age
+/// bound of rows the job itself has no expiry for). Nothing is requested for them; the job
+/// sleeps ([`Done::WaitUntrusted`]) until a release or its next look.
+fn delivery_receipts_waiting(conn: &Connection, now: i64) -> Result<i64> {
+    let state = crate::store::IDENTITY_UNVERIFIED;
+    let aged = conn
+        .prepare_cached(
+            "DELETE FROM delivery_receipts WHERE created_at < ?1
+             AND peer IN (SELECT service_id FROM identities WHERE verified = ?2)",
+        )?
+        .execute((
+            now.saturating_sub(i64::try_from(jobs::UNTRUSTED_WAIT.as_millis()).unwrap_or(i64::MAX)),
+            state,
+        ))?;
+    if aged > 0 {
+        tracing::info!(
+            receipts = aged,
+            "delivery receipts for a sender whose key stayed untrusted for a day dropped"
+        );
+    }
+    Ok(conn
+        .prepare_cached(
+            "SELECT count(*) FROM delivery_receipts
+             WHERE peer IN (SELECT service_id FROM identities WHERE verified = ?1)",
+        )?
+        .query_row([state], |r| r.get(0))?)
+}
+
 /// Forgets delivery receipts that were sent (or can never be).
 fn forget_delivery_receipts(conn: &Connection, peer: &str, timestamps: &[u64]) -> Result<()> {
     for timestamp in timestamps {
@@ -610,7 +711,9 @@ fn forget_delivery_receipts(conn: &Connection, peer: &str, timestamps: &[u64]) -
 }
 
 /// Runs the `delivery_receipts` job: one receipt per sender with what is owed; again at once
-/// while more is owed. A transient failure keeps that sender's receipts and retries the job.
+/// while more is owed. A transient failure keeps that sender's receipts and retries the job. A
+/// sender in stored state 2 (verified, then the key changed) is not tried at all: their receipts
+/// wait, with no prekey request, until the user confirms (P5a R4).
 pub(crate) async fn run_delivery_receipts<T: SignalTransport>(
     shared: &Rc<Shared<T>>,
     socket: &Arc<T::Socket>,
@@ -651,11 +754,17 @@ pub(crate) async fn run_delivery_receipts<T: SignalTransport>(
     if let Some(e) = failure {
         return Err(e);
     }
+    // What is owed to the senders served above is `left`; the senders in state 2 only wait.
+    let waiting = shared
+        .db
+        .zone(|tx| delivery_receipts_waiting(tx, shared.now()))?;
     let left: i64 = shared.db.read(|c| -> Result<i64> {
         Ok(c.query_row("SELECT count(*) FROM delivery_receipts", [], |r| r.get(0))?)
     })?;
-    if left > 0 {
+    if left > waiting {
         Ok(Done::RepeatAt(shared.now()))
+    } else if waiting > 0 {
+        Ok(Done::WaitUntrusted)
     } else {
         Ok(Done::Finished)
     }
@@ -710,7 +819,7 @@ pub(crate) async fn send_typing<T: SignalTransport>(
     let Ok(SignalUser::Aci(peer)) = parse_user_id(user) else {
         return;
     };
-    let (Some(account), Some(socket)) = (shared.account(), shared.socket.borrow().clone()) else {
+    let (Some(account), Some(socket)) = (shared.account(), shared.work_socket()) else {
         return;
     };
     if peer == account.aci {
@@ -758,14 +867,61 @@ pub(crate) async fn send_typing<T: SignalTransport>(
     }
 }
 
-/// `Command::ConfirmIdentity`: the user accepted `user`'s new safety number; a contact that was
-/// verified and became unverified by the change is trusted for sending again.
-pub(crate) fn confirm_identity(conn: &Connection, aci: Aci) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE identities SET verified = 0 WHERE service_id = ?1 AND verified = 2",
-    )?
-    .execute([ServiceId::from(aci).service_id_string()])?;
-    Ok(())
+/// `Command::ConfirmIdentity`: the user accepted `user`'s new safety number, Desktop's "Send
+/// anyway" (lead's BQ-2b; SD `ts/state/ducks/conversations.preload.ts`
+/// `verifyConversationsStoppingSend`: `setVerifiedDefault()` only when `isUnverified()`,
+/// `setApproved()` always). A contact in state 2 (verified, then the key changed): the key the
+/// user was SHOWN (`key`, the lead's RC2) becomes DEFAULT through
+/// [`crate::safety::set_verified`] (trusted for sending again, the quiet "not verified" notice
+/// in the 1:1 chat, our other devices hear DEFAULT, the core hears `IdentityTrusted`); when the
+/// stored key is another one (it changed again after the number was shown) `set_verified`
+/// refuses and NOTHING is written or released: the paused send meets the new key and pauses
+/// again. Any other state: approval only, `key` ignored: the jobs that wait after an untrusted
+/// attempt are due again, the state stays, no Verified sync and no notice (the core releases
+/// its paused sends after the backend's `Ok`, the lead's RC6). A person without an ACI or a
+/// stored key has nothing to confirm ([`Confirmed::Nothing`]).
+pub(crate) fn confirm_identity(
+    tx: &mut Tx<'_>,
+    account: &Account,
+    user: &kourier_model::UserId,
+    key: &kourier_model::IdentityFingerprint,
+    now: i64,
+    stamp: u64,
+    wake: &Rc<Notify>,
+) -> Result<Confirmed> {
+    let Ok(SignalUser::Aci(aci)) = parse_user_id(user) else {
+        return Ok(Confirmed::Nothing);
+    };
+    let sid = ServiceId::from(aci).service_id_string();
+    let Some((_, state)) = crate::store::load_identity(tx, &sid)? else {
+        return Ok(Confirmed::Nothing);
+    };
+    if state != crate::store::IDENTITY_UNVERIFIED {
+        // BQ-2b: approval only (Desktop's `setApproved`).
+        jobs::release_untrusted(tx, now)?;
+        return Ok(Confirmed::Yes);
+    }
+    // RC2: the key the user was shown, not the stored one: `set_verified` refuses another.
+    Ok(
+        match crate::safety::set_verified(tx, account, user, false, key, now, stamp, wake)? {
+            crate::safety::SetOutcome::Done => Confirmed::Yes,
+            crate::safety::SetOutcome::Refused(why) => Confirmed::Refused(why),
+        },
+    )
+}
+
+/// What [`confirm_identity`] did; the actor answers `Command::ConfirmIdentity` from it (the
+/// lead's RC6: the core requeues the paused sends only after `Ok`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmed {
+    /// Confirmed or approved: the waiting jobs are due again (answered `Ok`).
+    Yes,
+    /// No ACI or no stored key: nothing to confirm (answered `Ok`: the paused send's next
+    /// attempt meets the backend's own view).
+    Nothing,
+    /// Refused (a person in state 2 and a key that is not the stored one): nothing written
+    /// (answered `Err(InvalidInput)`: the core leaves the send paused).
+    Refused(&'static str),
 }
 
 #[cfg(test)]
@@ -1031,6 +1187,38 @@ mod tests {
             .unwrap();
     }
 
+    /// P5 M1: an author whose key is not trusted waits at the front of what the job still
+    /// owes; the authors behind it are served meanwhile and leave the job.
+    #[test]
+    fn receipts_to_an_untrusted_author_wait_and_the_others_go() {
+        let batch = |peer: &str, timestamps: std::ops::Range<u64>| ReceiptBatch {
+            peer: peer.to_owned(),
+            timestamps: timestamps.collect(),
+        };
+        let payload = ReceiptsPayload {
+            kind: "read".to_owned(),
+            recipients: vec![
+                batch("ada", 0..3),
+                batch("bruno", 10..12),
+                batch("chiara", 5..6),
+            ],
+            group: None,
+        };
+        let ada = [batch("ada", 0..3)];
+        let owed = receipts_owed(&payload, &ada, 3, 0).expect("ada waits");
+        assert_eq!(
+            owed.recipients, ada,
+            "only ada waits; bruno and chiara were served"
+        );
+        let owed = receipts_owed(&payload, &ada, 2, 0).expect("chiara failed too");
+        assert_eq!(owed.recipients, [batch("ada", 0..3), batch("chiara", 5..6)]);
+        assert_eq!(
+            receipts_owed(&payload, &[], 0, 0),
+            None,
+            "the job as it was"
+        );
+    }
+
     /// A receipts job that has to wait keeps what it still owes: the authors already served
     /// and the timestamps already sent are gone from it, the rest is as it was.
     #[test]
@@ -1181,22 +1369,303 @@ mod tests {
             .unwrap();
     }
 
+    /// P5a R4: the receipts owed to a sender in stored state 2 are not asked for ([`owed_delivery_receipts`])
+    /// and wait; the ones older than a day are forgotten, the others and every other sender's
+    /// stay.
+    #[test]
+    fn delivery_receipts_for_a_changed_sender_wait_and_age_out() {
+        let fixture = fixture();
+        let day = i64::try_from(jobs::UNTRUSTED_WAIT.as_millis()).unwrap();
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                for (peer, state) in [("alice", 2), ("bob", 0)] {
+                    let key = *libsignal_protocol::IdentityKeyPair::generate(&mut rand::rng())
+                        .identity_key();
+                    tx.execute(
+                        "INSERT INTO identities(service_id, identity_key, verified, updated_at)
+                         VALUES (?1, ?2, ?3, 0)",
+                        (peer, &key.serialize()[..], state),
+                    )?;
+                }
+                queue_delivery_receipt(tx, "alice", 1, 0)?;
+                queue_delivery_receipt(tx, "alice", 2, 1_000)?;
+                queue_delivery_receipt(tx, "bob", 3, 0)?;
+                assert_eq!(
+                    owed_delivery_receipts(tx)?,
+                    [("bob".to_owned(), vec![3])],
+                    "nothing is asked for Alice"
+                );
+                assert_eq!(
+                    delivery_receipts_waiting(tx, day - 1)?,
+                    2,
+                    "nothing is a day old"
+                );
+                assert_eq!(
+                    delivery_receipts_waiting(tx, day + 500)?,
+                    1,
+                    "the first of Alice's is a day old, the second is not"
+                );
+                assert_eq!(
+                    owed_delivery_receipts(tx)?,
+                    [("bob".to_owned(), vec![3])],
+                    "Bob's, as old as it is, stays: he is not waiting for a key"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn confirming_an_identity_trusts_the_new_key_again() {
         let fixture = fixture();
         let alice = Aci::from(Uuid::from_u128(0xa11ce));
+        let user = aci_user_id(alice).unwrap();
+        let key = *libsignal_protocol::IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        let wake = Rc::new(Notify::new());
         fixture
             .db
             .zone(|tx| -> Result<()> {
                 tx.execute(
                     "INSERT INTO identities(service_id, identity_key, verified, updated_at)
-                     VALUES (?1, x'05', 2, 0)",
-                    [ServiceId::from(alice).service_id_string()],
+                     VALUES (?1, ?2, 2, 0)",
+                    (
+                        ServiceId::from(alice).service_id_string(),
+                        &key.serialize()[..],
+                    ),
                 )?;
-                confirm_identity(tx, alice)?;
+                let shown = kourier_model::IdentityFingerprint(key.serialize().to_vec());
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &user, &shown, 5, 6, &wake)?,
+                    Confirmed::Yes
+                );
                 let verified: i64 =
                     tx.query_row("SELECT verified FROM identities", [], |r| r.get(0))?;
                 assert_eq!(verified, 0);
+                assert_eq!(
+                    jobs::count(tx, JobKind::VerifiedSync)?,
+                    1,
+                    "the phone hears DEFAULT"
+                );
+                // Nobody without a stored key, or without an ACI, is confirmed.
+                let bob = aci_user_id(Aci::from(Uuid::from_u128(0xb0b))).unwrap();
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &bob, &shown, 5, 7, &wake)?,
+                    Confirmed::Nothing
+                );
+                Ok(())
+            })
+            .unwrap();
+        let events: Vec<BackendEvent> = fixture
+            .db
+            .read(|c| -> Result<_> { Ok(outbox_rows(c)) })
+            .unwrap()
+            .concat();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                BackendEvent::Notice(kourier_backend_api::BackendNotice::IdentityTrusted { user: u })
+                    if *u == user
+            )),
+            "a confirm from state 2 tells the core to release"
+        );
+    }
+
+    /// Stores `who`'s identity `key` in `state` and gives the core their 1:1 chat (so a notice
+    /// would be written), with one timer update that waits after an untrusted attempt. The
+    /// last item is the stored key as the page shows it (the key a confirm names).
+    fn confirm_fixture(
+        state: i64,
+    ) -> (
+        crate::receive::tests::Fixture,
+        UserId,
+        Rc<Notify>,
+        kourier_model::IdentityFingerprint,
+    ) {
+        let fixture = fixture();
+        let alice = Aci::from(Uuid::from_u128(0xa11ce));
+        let user = aci_user_id(alice).unwrap();
+        let key = *libsignal_protocol::IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        let sid = ServiceId::from(alice).service_id_string();
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                tx.execute(
+                    "INSERT INTO identities(service_id, identity_key, verified, updated_at)
+                     VALUES (?1, ?2, ?3, 0)",
+                    (&sid, &key.serialize()[..], state),
+                )?;
+                crate::peers::set_features_hash(tx, &sid, 7, 1)?;
+                let day = Some(Duration::from_secs(24 * 3600));
+                assert!(jobs::enqueue(tx, JobKind::TimerUpdate, &sid, 0, day)?);
+                let job = jobs::next_due(tx, 0, true, false)?.expect("the timer update");
+                jobs::retry(
+                    tx,
+                    &job,
+                    1_000,
+                    "libsignal: untrusted identity",
+                    false,
+                    None,
+                )?;
+                assert!(jobs::next_due(tx, 1_000, true, false)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        let shown = kourier_model::IdentityFingerprint(key.serialize().to_vec());
+        (fixture, user, Rc::new(Notify::new()), shown)
+    }
+
+    /// Another identity key than any stored one, as a page that shows an OLD number sends it.
+    fn stale_key() -> kourier_model::IdentityFingerprint {
+        let other = *libsignal_protocol::IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        kourier_model::IdentityFingerprint(other.serialize().to_vec())
+    }
+
+    fn verified_notices(events: &[BackendEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, BackendEvent::Message(m)
+                    if matches!(m.body, kourier_model::Body::System(
+                        kourier_model::SystemEvent::VerifiedChanged { .. })))
+            })
+            .count()
+    }
+
+    /// Lead's BQ-2b: Confirm on a DEFAULT contact (a key change Desktop calls "approval"
+    /// only) releases the waiting job, keeps the state, queues NO Verified sync and writes NO
+    /// notice and no event at all.
+    #[test]
+    fn confirm_on_a_default_contact_only_approves() {
+        let (fixture, user, wake, _shown) = confirm_fixture(crate::store::IDENTITY_DEFAULT);
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                // RC2: the approval branch ignores the key (here a stale one).
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &user, &stale_key(), 1_000, 6, &wake)?,
+                    Confirmed::Yes
+                );
+                let verified: i64 =
+                    tx.query_row("SELECT verified FROM identities", [], |r| r.get(0))?;
+                assert_eq!(verified, 0, "the state stays DEFAULT");
+                assert_eq!(
+                    jobs::count(tx, JobKind::VerifiedSync)?,
+                    0,
+                    "an approval sends no Verified sync"
+                );
+                assert!(
+                    jobs::next_due(tx, 1_000, true, false)?.is_some(),
+                    "the job that waited on the untrusted key is due again"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let events: Vec<BackendEvent> = fixture
+            .db
+            .read(|c| -> Result<_> { Ok(outbox_rows(c)) })
+            .unwrap()
+            .concat();
+        assert!(events.is_empty(), "an approval tells the core nothing");
+    }
+
+    /// Lead's BQ-2b: Confirm on an UNVERIFIED contact (state 2) is Desktop's
+    /// `setVerifiedDefault`: DEFAULT, exactly one Verified sync, the quiet notice, the release.
+    #[test]
+    fn confirm_on_an_unverified_contact_sets_default_with_sync_and_notice() {
+        let (fixture, user, wake, shown) = confirm_fixture(crate::store::IDENTITY_UNVERIFIED);
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &user, &shown, 1_000, 6, &wake)?,
+                    Confirmed::Yes
+                );
+                let verified: i64 =
+                    tx.query_row("SELECT verified FROM identities", [], |r| r.get(0))?;
+                assert_eq!(verified, 0, "the state becomes DEFAULT");
+                assert_eq!(
+                    jobs::count(tx, JobKind::VerifiedSync)?,
+                    1,
+                    "the phone hears DEFAULT once"
+                );
+                assert!(
+                    jobs::next_due(tx, 1_000, true, false)?.is_some(),
+                    "a job is due after the release"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let events: Vec<BackendEvent> = fixture
+            .db
+            .read(|c| -> Result<_> { Ok(outbox_rows(c)) })
+            .unwrap()
+            .concat();
+        assert_eq!(verified_notices(&events), 1, "one quiet notice");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                BackendEvent::Notice(kourier_backend_api::BackendNotice::IdentityTrusted { user: u })
+                    if *u == user
+            )),
+            "the core hears the release"
+        );
+    }
+
+    /// The lead's RC2: Confirm names the key the user was SHOWN. On a person in state 2 whose
+    /// stored key is another one (it changed again after the number was shown) nothing is
+    /// confirmed: the state stays 2, no Verified sync, no notice, no event for the core, and
+    /// the job that waits on the untrusted key keeps waiting; the shown key of the NEW number
+    /// then confirms as usual.
+    #[test]
+    fn confirm_with_a_stale_key_on_a_changed_contact_releases_nothing() {
+        let (fixture, user, wake, shown) = confirm_fixture(crate::store::IDENTITY_UNVERIFIED);
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &user, &stale_key(), 1_000, 6, &wake)?,
+                    Confirmed::Refused("the safety number changed"),
+                    "a key the user was not shown is not confirmed"
+                );
+                let verified: i64 =
+                    tx.query_row("SELECT verified FROM identities", [], |r| r.get(0))?;
+                assert_eq!(verified, 2, "the state stays UNVERIFIED");
+                let stored: Vec<u8> =
+                    tx.query_row("SELECT identity_key FROM identities", [], |r| r.get(0))?;
+                assert!(stored == shown.0, "the stored key is untouched");
+                assert_eq!(
+                    jobs::count(tx, JobKind::VerifiedSync)?,
+                    0,
+                    "no Verified sync for a key nobody compared"
+                );
+                assert!(
+                    jobs::next_due(tx, 1_000, true, false)?.is_none(),
+                    "the job that waits on the untrusted key stays asleep"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let events: Vec<BackendEvent> = fixture
+            .db
+            .read(|c| -> Result<_> { Ok(outbox_rows(c)) })
+            .unwrap()
+            .concat();
+        assert!(
+            events.is_empty(),
+            "a refused confirm writes no notice and tells the core nothing"
+        );
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                assert_eq!(
+                    confirm_identity(tx, &fixture.account, &user, &shown, 2_000, 7, &wake)?,
+                    Confirmed::Yes,
+                    "the key that is stored confirms"
+                );
+                let verified: i64 =
+                    tx.query_row("SELECT verified FROM identities", [], |r| r.get(0))?;
+                assert_eq!(verified, 0, "then the state becomes DEFAULT");
                 Ok(())
             })
             .unwrap();

@@ -6,7 +6,9 @@
 //! `setProfileKey`, `deriveAccessKeyIfNeeded`, `enableProfileSharing`, `shareMyPhoneNumber`) and
 //! `SD/ts/types/SealedSender.std.ts`.
 
+use kourier_backend_api::BackendEvent;
 use kourier_db::rusqlite::{Connection, OptionalExtension};
+use kourier_model::{ContactPatch, UserId};
 use libsignal_core::{Aci, ServiceId};
 use signal_crypto::Aes256Ctr32;
 use zeroize::Zeroizing;
@@ -53,6 +55,17 @@ impl SealedSenderState {
     }
 }
 
+/// What the phone said of one 1:1 chat's archive state and mute, as last told to the core (A1:
+/// the base the Storage diff compares a new record with and the receive path's unarchive rule
+/// reads, `peers.roaming_archived` and `peers.roaming_muted_until`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Roaming {
+    /// Archived (the core's `archived` of the chat, until the next statement).
+    pub(crate) archived: bool,
+    /// Muted until (ms; `i64::MAX` for ever), `None` = not muted.
+    pub(crate) muted_until: Option<i64>,
+}
+
 /// One `peers` row (the defaults when there is none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Peer {
@@ -77,6 +90,9 @@ pub(crate) struct Peer {
     /// In the phone's address book (Desktop's `isInSystemContacts`): a Storage Service system
     /// name, or a name from contact sync.
     pub(crate) system_contact: bool,
+    /// The archive state and mute last told to the core; `None` = never told (a profile from
+    /// before migration 0023, or no record stated it yet: `storage::fill_roaming` learns it).
+    pub(crate) roaming: Option<Roaming>,
 }
 
 impl Peer {
@@ -100,6 +116,7 @@ impl Default for Peer {
             features_hash: None,
             blocked: false,
             system_contact: false,
+            roaming: None,
         }
     }
 }
@@ -110,7 +127,8 @@ pub(crate) fn load(conn: &Connection, service_id: &str) -> Result<Peer> {
         .prepare_cached(
             "SELECT access_key, sealed_sender, profile_sharing, share_my_number,
                expire_timer_version, unregistered_at IS NOT NULL, features_hash, blocked,
-               system_contact OR in_contact_sync != 0, expire_timer
+               system_contact OR in_contact_sync != 0, expire_timer,
+               roaming_archived, roaming_muted_until
              FROM peers WHERE service_id = ?1",
         )?
         .query_row([service_id], |r| {
@@ -128,13 +146,15 @@ pub(crate) fn load(conn: &Connection, service_id: &str) -> Result<Peer> {
                     r.get::<_, bool>(7)?,
                     r.get::<_, bool>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, Option<bool>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
                 ),
             ))
         })
         .optional()?;
     let Some((
         (access_key, sealed, profile_sharing, share_my_number),
-        (version, unregistered, hash, blocked, system_contact, timer),
+        (version, unregistered, hash, blocked, system_contact, timer, archived, muted_until),
     )) = row
     else {
         return Ok(Peer::default());
@@ -150,7 +170,47 @@ pub(crate) fn load(conn: &Connection, service_id: &str) -> Result<Peer> {
         features_hash: hash,
         blocked,
         system_contact,
+        roaming: archived.map(|archived| Roaming {
+            archived,
+            muted_until,
+        }),
     })
+}
+
+/// Records what the core was told of a 1:1 chat's archive state and mute (a Storage record's
+/// statement, the history import's, a Note to Self statement: `muted_until` `None` there).
+pub(crate) fn set_roaming(
+    conn: &Connection,
+    service_id: &str,
+    roaming: Roaming,
+    now: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO peers(service_id, roaming_archived, roaming_muted_until, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(service_id) DO UPDATE SET roaming_archived = excluded.roaming_archived,
+           roaming_muted_until = excluded.roaming_muted_until,
+           updated_at = excluded.updated_at",
+    )?
+    .execute((service_id, roaming.archived, roaming.muted_until, now))?;
+    Ok(())
+}
+
+/// Moves only the archive half of the base (an unarchive by a new message): the phone's mute
+/// stays what it was told, and a peer never told gets a base with no mute.
+pub(crate) fn set_roaming_archived(
+    conn: &Connection,
+    service_id: &str,
+    archived: bool,
+    now: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO peers(service_id, roaming_archived, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(service_id) DO UPDATE SET roaming_archived = excluded.roaming_archived,
+           updated_at = excluded.updated_at",
+    )?
+    .execute((service_id, archived, now))?;
+    Ok(())
 }
 
 /// The stored profile key of `service_id`, if any.
@@ -381,6 +441,106 @@ pub(crate) fn mark_registered(conn: &Connection, service_id: &str, now: i64) -> 
     Ok(())
 }
 
+/// Whether the person's phone number may be shown (people pages P1; Desktop's `getE164`,
+/// `SD/ts/util/getE164.std.ts`): hidden only when they do NOT share it AND we hold their profile
+/// key AND they are not a system contact. A profile never fetched, or one without the field,
+/// counts as "not sharing" (`sharingPhoneNumber` undefined); a person we have no key for (a
+/// number-only chat, a PNI, an unknown sender) shows. The one function every site that states a
+/// number to the core asks, so the rule cannot differ between the Storage Service, the contact
+/// sync, the sealed-sender certificate, the history import and the profile fetch.
+pub(crate) fn number_shown(conn: &Connection, service_id: &str) -> Result<bool> {
+    // No row: nothing is known of them, no profile key either.
+    Ok(number_shown_before(conn, service_id)?.unwrap_or(true))
+}
+
+/// [`number_shown`], or `None` when no row of `peers` knows the person yet: the value to read
+/// BEFORE a change of the rule's inputs and give to [`number_shown_event`].
+pub(crate) fn number_shown_before(conn: &Connection, service_id: &str) -> Result<Option<bool>> {
+    // A PNI is the same person as the ACI it is linked to: the core resolves the alias in every
+    // event, so the verdict must be the ACI's, not that of a PNI row (which never has a key and
+    // would say "shown"; P1 F2c).
+    let linked: Option<String> = conn
+        .prepare_cached("SELECT aci FROM identity_links WHERE pni = ?1")?
+        .query_row([service_id], |r| r.get(0))
+        .optional()?;
+    let subject = linked.as_deref().unwrap_or(service_id);
+    let shown: Option<bool> = conn
+        .prepare_cached(
+            "SELECT system_contact = 1 OR in_contact_sync != 0 OR profile_key IS NULL
+                    OR coalesce(phone_sharing, 0) = 1
+             FROM peers WHERE service_id = ?1",
+        )?
+        .query_row([subject], |r| r.get(0))
+        .optional()?;
+    if shown == Some(false) && linked.is_some() {
+        // A PNI-only record of the address book (Storage) marks the PNI row: the person is one
+        // conversation, so the flags of the PNI row count too (re-check N4). Its key and sharing
+        // field never exist, so only the address-book flags are read.
+        let in_book: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM peers
+                   WHERE service_id = ?1 AND (system_contact = 1 OR in_contact_sync != 0))",
+            )?
+            .query_row([service_id], |r| r.get(0))?;
+        return Ok(Some(in_book));
+    }
+    Ok(shown)
+}
+
+/// [`number_shown`] for a person known by `e164` alone (a history import's number-only person):
+/// the verdict of the ACI the number is linked to where one is known (`number_links`), else
+/// shown (no profile key can exist for a bare number).
+pub(crate) fn number_shown_for_number(conn: &Connection, e164: Option<&str>) -> Result<bool> {
+    let Some(e164) = e164 else {
+        return Ok(true);
+    };
+    let aci: Option<String> = conn
+        .prepare_cached("SELECT aci FROM number_links WHERE e164 = ?1")?
+        .query_row([e164], |r| r.get(0))
+        .optional()?;
+    match aci {
+        Some(aci) => number_shown(conn, &aci),
+        None => Ok(true),
+    }
+}
+
+/// Stores what a fetched profile said about sharing the number (`None`: the profile has no
+/// such field, or none was decrypted, which counts as "not sharing").
+pub(crate) fn set_phone_sharing(
+    conn: &Connection,
+    service_id: &str,
+    sharing: Option<bool>,
+    now: i64,
+) -> Result<()> {
+    ensure(conn, service_id, now)?;
+    conn.prepare_cached(
+        "UPDATE peers SET phone_sharing = ?2, updated_at = ?3
+         WHERE service_id = ?1 AND phone_sharing IS NOT ?2",
+    )?
+    .execute((service_id, sharing, now))?;
+    Ok(())
+}
+
+/// The event that tells the core a person's number verdict, when it is not `before` any more
+/// (a profile key, a system-contact flag or a sharing field changed in this zone). `before` is
+/// [`number_shown_before`] read BEFORE the change; `None` (no row knew the person) states
+/// nothing, because nothing could have told the core a number for them: whatever brings the
+/// number states the verdict with it.
+pub(crate) fn number_shown_event(
+    conn: &Connection,
+    user: &UserId,
+    service_id: &str,
+    before: Option<bool>,
+) -> Result<Option<BackendEvent>> {
+    let now_shown = number_shown(conn, service_id)?;
+    if before.is_none_or(|b| b == now_shown) {
+        return Ok(None);
+    }
+    let mut patch = ContactPatch::new(user.clone());
+    patch.number_shown = Some(now_shown);
+    Ok(Some(BackendEvent::ContactUpsert(patch)))
+}
+
 /// Remembers the hash of the features last sent to the core for the chat with `service_id`.
 pub(crate) fn set_features_hash(
     conn: &Connection,
@@ -461,6 +621,90 @@ mod tests {
             assert!(!load(tx, &sid)?.unregistered);
             set_features_hash(tx, &sid, -5, 9)?;
             assert_eq!(load(tx, &sid)?.features_hash, Some(-5));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Desktop's `getE164` over the four inputs (a profile key, the address book, the person's
+    /// own word, and "never fetched"): hidden only for a keyed, non-system person who does not
+    /// share; a never-fetched profile counts as not sharing.
+    #[test]
+    fn a_number_shows_unless_a_keyed_stranger_does_not_share_it() {
+        let (_dir, db) = db();
+        let aci = Aci::from(uuid::Uuid::from_u128(7));
+        let sid = ServiceId::from(aci).service_id_string();
+        let user = crate::service_id::aci_user_id(aci).unwrap();
+        db.zone(|tx| -> Result<()> {
+            // Nobody knows them: shown.
+            assert!(number_shown(tx, &sid)?);
+            ensure(tx, &sid, 1)?;
+            assert!(number_shown(tx, &sid)?, "a row without a key shows");
+            // A key and nothing else: NOT shown (the profile was never fetched).
+            let shown_before = number_shown_before(tx, &sid)?;
+            assert_eq!(shown_before, Some(true));
+            assert!(store_profile_key(tx, aci, &[2; 32], 2)?);
+            assert!(!number_shown(tx, &sid)?);
+            let event = number_shown_event(tx, &user, &sid, shown_before)?;
+            assert!(
+                matches!(&event, Some(BackendEvent::ContactUpsert(p)) if p.number_shown == Some(false)),
+                "the key hid it: the core is told"
+            );
+            assert!(number_shown_event(tx, &user, &sid, Some(false))?.is_none(), "no change, no event");
+            assert!(number_shown_event(tx, &user, &sid, None)?.is_none(), "nobody knew them: nothing to restate");
+            // They say they share: shown. They say they do not: hidden.
+            set_phone_sharing(tx, &sid, Some(true), 3)?;
+            assert!(number_shown(tx, &sid)?);
+            set_phone_sharing(tx, &sid, Some(false), 4)?;
+            assert!(!number_shown(tx, &sid)?);
+            // Never fetched again (NULL) is the same as not sharing.
+            set_phone_sharing(tx, &sid, None, 5)?;
+            assert!(!number_shown(tx, &sid)?);
+            // An address-book name beats the flag, from either source.
+            set_system_contact(tx, &sid, true, 6)?;
+            assert!(number_shown(tx, &sid)?);
+            set_system_contact(tx, &sid, false, 7)?;
+            assert!(!number_shown(tx, &sid)?);
+            tx.execute("UPDATE peers SET in_contact_sync = 2 WHERE service_id = ?1", [&sid])?;
+            assert!(number_shown(tx, &sid)?, "the contact sync counts as the address book");
+            Ok(())
+        })
+        .unwrap();
+    }
+    /// P1 F2c: the verdict of a PNI, and of a number, is the one of the ACI they are linked to
+    /// (the core resolves the alias, so a PNI-only record or a number-only person must not state
+    /// "shown" on the ACI's contact when the ACI's key is held and it does not share).
+    #[test]
+    fn a_pni_and_a_number_take_the_verdict_of_the_aci_they_are_linked_to() {
+        let (_dir, db) = db();
+        let aci = Aci::from(uuid::Uuid::from_u128(7));
+        let pni = libsignal_core::Pni::from(uuid::Uuid::from_u128(8));
+        let sid = ServiceId::from(aci).service_id_string();
+        let pni_sid = ServiceId::from(pni).service_id_string();
+        let number = "+15550100777";
+        db.zone(|tx| -> Result<()> {
+            ensure(tx, &pni_sid, 1)?;
+            assert!(store_profile_key(tx, aci, &[2; 32], 2)?);
+            // Not linked yet: a PNI row has no key and shows; a bare number shows.
+            assert!(number_shown(tx, &pni_sid)?);
+            assert!(number_shown_for_number(tx, Some(number))?);
+            assert!(number_shown_for_number(tx, None)?);
+            // Linked: the ACI's word counts (a key, nothing else: hidden).
+            crate::links::learn(tx, &crate::db::test_account(), pni, aci, 3)?;
+            tx.execute(
+                "INSERT INTO number_links(e164, aci, learned_at) VALUES (?1, ?2, 3)",
+                (number, &sid),
+            )?;
+            assert!(!number_shown(tx, &sid)?);
+            assert!(!number_shown(tx, &pni_sid)?, "the PNI follows its ACI");
+            assert_eq!(number_shown_before(tx, &pni_sid)?, Some(false));
+            assert!(
+                !number_shown_for_number(tx, Some(number))?,
+                "the number follows its ACI"
+            );
+            set_phone_sharing(tx, &sid, Some(true), 4)?;
+            assert!(number_shown(tx, &pni_sid)?);
+            assert!(number_shown_for_number(tx, Some(number))?);
             Ok(())
         })
         .unwrap();

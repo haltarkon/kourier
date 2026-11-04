@@ -25,6 +25,10 @@ Item {
     required property real messageId
     required property bool own
     required property string author
+    // The author's user id ("" for a notice): a click on the name or the picture opens that person.
+    required property string authorId
+    // The pages the row's menu offers: `[{user, label}]` (the sender's, the mentioned people's).
+    required property var pages
     required property string avatarUrl
     required property bool showAuthor
     required property bool showAvatar
@@ -69,7 +73,7 @@ Item {
     readonly property color subtleInk: Style.secondary(Kirigami.Theme.textColor, root.surface)
     // Name colors come from the avatar palette and the accent from the theme: neither was
     // chosen for this bubble, so both are adjusted until they can be read on it.
-    readonly property color authorColor: Style.readable(Components.NameUtils.colorsFromString(root.author), root.surface)
+    readonly property color authorColor: Style.readable(Components.NameUtils.colorsFromString(Style.unmarked(root.author)), root.surface)
     readonly property color accentInk: Style.readable(Kirigami.Theme.highlightColor, root.surface)
 
     // The timeline's keyboard focus is on this row.
@@ -92,14 +96,45 @@ Item {
 
     // Widest natural width of the bubble's content, clamped to the bubble's maximum.
     property real naturalWidth: 0
+    // The widest picture or album box of the row (a sticker has none), 0 for a row without
+    // one; measured with the rest of the content.
+    property real pictureWidth: 0
+    // The widest block of the row that is neither text nor a picture (a quote, a file, a
+    // placeholder), 0 for a row without one; measured with the rest of the content. Such a
+    // block widens the bubble beyond its picture, and the caption must fill that width.
+    property real otherWidth: 0
+    // Where a text wraps: at the bubble's maximum, but under a picture at the width the
+    // non-text content already forces (the picture's own width, or the quote's or the
+    // file's when that is wider; not narrower than 11 grid units), so the bubble is as wide
+    // as its content and a caption never leaves bars of the bubble's color beside a photo
+    // (as in Signal Desktop, whose caption wraps at the picture's width, at least 200 px) or
+    // stands in a narrow column at the left of a picture that a quote has made room for.
+    // A bound on a measured number, no item of its own: the row is made many times.
+    readonly property real textWidth: root.pictureWidth > 0 ? Math.min(root.maxBubble - root.hpad * 2, Math.max(root.pictureWidth, root.otherWidth, Kirigami.Units.gridUnit * 11)) : root.maxBubble - root.hpad * 2
 
     function measure(): void {
-        let w = Math.max(authorLabel.visible ? authorLabel.implicitWidth : 0, footer.implicitWidth);
+        let picture = 0;
+        let other = 0;
+        let w = footer.implicitWidth;
         for (let i = 0; i < blockRepeater.count; ++i) {
             const item = blockRepeater.itemAt(i);
             if (item) {
                 w = Math.max(w, item.implicitWidth);
+                const block = root.blocks[i];
+                if (block && (block.type === "album" || block.type === "image" && !block.sticker)) {
+                    picture = Math.max(picture, item.implicitWidth);
+                } else if (block && block.type !== "text") {
+                    other = Math.max(other, item.implicitWidth);
+                }
             }
+        }
+        root.pictureWidth = Math.ceil(picture);
+        root.otherWidth = Math.ceil(other);
+        // (The name elides at the bubble's width, so a long one would widen every picture
+        // bubble of its author up to the maximum, with bars beside the picture: for a row with a
+        // picture it counts only up to the text width.)
+        if (authorLabel.visible) {
+            w = Math.max(w, root.pictureWidth > 0 ? Math.min(authorLabel.implicitWidth, root.textWidth) : authorLabel.implicitWidth);
         }
         root.naturalWidth = Math.ceil(w);
     }
@@ -264,12 +299,36 @@ Item {
         return out.filter(a => a.attachment > 0);
     }
 
+    // The attachments of the row that "Save As…" accepts, in the row's order (the core listed them,
+    // the blocks carry the flag).
+    function saveList(): var {
+        const out = [];
+        if (root.deleted) {
+            return out;
+        }
+        for (const b of root.blocks) {
+            if (b.type === "image" && b.save === true) {
+                out.push(b.attachment);
+            } else if (b.type === "album") {
+                for (const item of b.items) {
+                    if (item.save === true) {
+                        out.push(item.attachment);
+                    }
+                }
+            } else if (b.type === "file" && b.save === true) {
+                out.push(b.attachment);
+            }
+        }
+        return out.filter(a => a > 0);
+    }
+
     // What the shared popups need to know about this row.
     function rowInfo(): var {
         return {
             "messageId": root.messageId,
             "own": root.own,
             "author": root.author,
+            "pages": root.pages,
             "actions": root.actions,
             "copyText": root.copyText,
             "reactions": root.reactions,
@@ -279,7 +338,8 @@ Item {
             "mediaAction": root.mediaAction(),
             "mediaLabel": root.mediaLabel(),
             "quoted": root.quoteBlock() !== null,
-            "attachments": root.deleted ? [] : root.attachmentList()
+            "attachments": root.deleted ? [] : root.attachmentList(),
+            "saveIds": root.saveList()
         };
     }
 
@@ -355,7 +415,7 @@ Item {
     implicitHeight: column.y + column.height + (root.groupEnd ? Kirigami.Units.largeSpacing : Kirigami.Units.smallSpacing / 2)
 
     Accessible.role: Accessible.ListItem
-    Accessible.name: root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", root.author, root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", root.author, root.timeLabel, root.copyText)
+    Accessible.name: root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", Style.unmarked(root.author), root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", Style.unmarked(root.author), root.timeLabel, root.copyText)
     Accessible.description: (root.edited ? L10n.i18nc("@info accessible", "Edited.") + " " : "") + (root.failed ? L10n.i18nc("@info accessible", "Not sent.") + " " : "") + root.waitHint + root.expiry + (root.current && root.keyHint !== "" ? " " + root.keyHint : "")
     // Why the message has not left, without the seconds (a description that changes every
     // second would be read again for the focused row); a countdown has no reason, so it says
@@ -419,7 +479,41 @@ Item {
         }
     }
 
+    // A click on the sender's name or picture (the row of a group) opens that person. ONE handler
+    // for the row, which tests the point against the two places: the row is made many times
+    // (a handler each for the name and the picture would double the cost).
+    TapHandler {
+        acceptedButtons: Qt.LeftButton
+        enabled: root.authorId !== "" && (root.showAuthor || root.showAvatar)
+        onTapped: point => {
+            if (root.hitsSender(point.position)) {
+                TimelineActions.person(root.authorId);
+            }
+        }
+    }
+
+    // Whether `p` (a point of the row) lies on the sender's picture or on the sender's name.
+    function hitsSender(p: point): bool {
+        if (root.showAvatar && p.x >= senderPicture.x && p.x < senderPicture.x + senderPicture.width && p.y >= senderPicture.y && p.y < senderPicture.y + senderPicture.height) {
+            return true;
+        }
+        if (root.showAuthor) {
+            // (The name's own width, not the line's: the empty part beside a short name is the bubble.
+            // Where the text lies on the line is the label's alignment as drawn: the layout's
+            // direction does not say, a style that leaves the alignment to the text's own direction
+            // puts a Hebrew name at the right in a left-to-right window.)
+            const at = authorLabel.mapToItem(root, 0, 0);
+            const w = Math.min(authorLabel.implicitWidth, authorLabel.width);
+            const align = authorLabel.effectiveHorizontalAlignment;
+            const left = align === Text.AlignRight ? at.x + authorLabel.width - w : (align === Text.AlignHCenter ? at.x + (authorLabel.width - w) / 2 : at.x);
+            return p.x >= left && p.x < left + w && p.y >= at.y && p.y < at.y + authorLabel.height;
+        }
+        return false;
+    }
+
     Avatar {
+        id: senderPicture
+        objectName: "senderPicture"
         visible: root.showAvatar
         x: root.atRight ? root.width - root.sideMargin - width : root.sideMargin
         y: bubble.y + bubble.height - height
@@ -439,6 +533,7 @@ Item {
 
         Kirigami.ShadowedRectangle {
             id: bubble
+            objectName: "bubble"
 
             readonly property real big: Style.bubbleRadius
             readonly property real tight: Style.bubbleRadiusTight
@@ -488,6 +583,7 @@ Item {
 
                 QQC2.Label {
                     id: authorLabel
+                    objectName: "senderName"
                     visible: root.showAuthor
                     width: parent.width
                     text: root.author
@@ -519,9 +615,10 @@ Item {
                                 "type": ""
                             })
 
-                        // Text wraps at the maximum width and reports what it uses; other
-                        // blocks take the bubble's width.
-                        width: blockLoader.block.type === "text" ? root.maxBubble - root.hpad * 2 : content.width
+                        // Text wraps at the text width (the maximum, or the picture's width
+                        // under a picture) and reports what it uses; other blocks take the
+                        // bubble's width.
+                        width: blockLoader.block.type === "text" ? root.textWidth : content.width
                         onImplicitWidthChanged: root.measure()
                         sourceComponent: {
                             switch (blockLoader.block.type) {
@@ -579,6 +676,7 @@ Item {
                                 block: blockLoader.block
                                 ink: root.inkColor
                                 subtleInk: root.subtleInk
+                                message: root.messageId
                             }
                         }
                         Component {
@@ -679,7 +777,10 @@ Item {
                 width: Math.max(0, Math.min(implicitWidth, root.maxBubble - waitLine.rightPadding - (waitTimer.visible ? waitTimer.width + waitLine.spacing : 0)))
                 text: root.wait
                 textFormat: Text.PlainText
-                elide: Text.ElideRight
+                // A reason with a timer beside it is cut, so the time stays whole; one alone (a
+                // refusal that says what to do) wraps: its end is the part that matters.
+                wrapMode: root.waitTimer === "" ? Text.Wrap : Text.NoWrap
+                elide: root.waitTimer === "" ? Text.ElideNone : Text.ElideRight
                 font: Kirigami.Theme.smallFont
                 color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
                 Accessible.role: Accessible.StaticText
@@ -825,7 +926,8 @@ Item {
 
         readonly property real room: root.atRight ? column.x - root.sideMargin : root.width - root.sideMargin - (column.x + column.width)
         readonly property real buttonSize: moreButton.implicitWidth
-        readonly property bool compact: toolbar.room < toolbar.buttonSize * 3 + Kirigami.Units.smallSpacing * 2
+        // (React, Reply and the menu, and Save beside them when the row has something to save.)
+        readonly property bool compact: toolbar.room < toolbar.buttonSize * (root.actions.saveAttachments ? 4 : 3) + Kirigami.Units.smallSpacing * (root.actions.saveAttachments ? 3 : 2)
 
         visible: root.actions.any && (hover.hovered || root.current || root.active)
         y: Math.round(column.y + bubble.y + (bubble.height - height) / 2)
@@ -858,6 +960,24 @@ Item {
             QQC2.ToolTip.text: text
             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
             onClicked: root.reply()
+        }
+        // Save As… / Save All… (F3b): made only for a row that has a file to save, and only while the
+        // toolbar shows (the row is made many times).
+        Loader {
+            active: root.actions.saveAttachments === true && !toolbar.compact && toolbar.visible
+            visible: active
+            sourceComponent: QQC2.ToolButton {
+                objectName: "saveButton"
+                readonly property var ids: root.saveList()
+                focusPolicy: Qt.NoFocus
+                icon.name: "document-save-as"
+                display: QQC2.AbstractButton.IconOnly
+                text: ids.length > 1 ? L10n.i18nc("@action:button", "Save All…") : L10n.i18nc("@action:button", "Save As…")
+                QQC2.ToolTip.visible: hovered
+                QQC2.ToolTip.text: text
+                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                onClicked: MediaActions.save(ids)
+            }
         }
         QQC2.ToolButton {
             id: moreButton

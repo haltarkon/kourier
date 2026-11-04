@@ -25,18 +25,27 @@
 //! for; nothing of it rests in the profile (no plaintext, no temporary file), and the next
 //! honest photo arrives as usual.
 //!
+//! [`located_files_leave_only_as_agreed`] (LOC): a phone JPEG with GPS needs no question (the
+//! plan says it will not leave with its location) and arrives without it; a located HEIC,
+//! which Signal sends as it is, is refused without the user's agreement and arrives
+//! byte-identical with it; a located JPEG that cannot be cleaned fails its message with a
+//! log-safe reason, and nothing of it is uploaded.
+//!
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kourier_core::facade::{MessageRow, Progress, UiCommand, UiEvent};
+use kourier_core::facade::{
+    ActionSubject, FilePlanQuery, FileRefusal, MessageRow, Progress, Query, QueryData, UiCommand,
+    UiEvent,
+};
 use kourier_model::{
-    Attachment, AttachmentId, AttachmentKind, AttachmentState, Body, ConversationId, OutgoingState,
-    Text,
+    Attachment, AttachmentId, AttachmentKind, AttachmentState, Body, ConversationId, FailReason,
+    OutgoingState, Text,
 };
 use serde_json::Value;
 use support::harness::{ForgedPointer, OutgoingFile, SendAttachments};
@@ -320,6 +329,7 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![file_path].into(),
         caption: Some(Text::plain("the report")),
@@ -405,6 +415,7 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![big_path].into(),
         caption: None,
@@ -440,6 +451,7 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![mp4_path].into(),
         caption: None,
@@ -497,6 +509,7 @@ async fn attachments_travel_both_ways_byte_identical_and_never_rest_in_plaintext
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![notes_path].into(),
         caption: Some(Text::plain("second try")),
@@ -709,5 +722,165 @@ async fn hostile_pointers_fail_for_good_and_leave_nothing_behind() {
         .filter(|path| path.extension().is_some_and(|e| e == "tmp"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    world.shutdown().await;
+}
+
+/// What the plan says of each of `paths` sent as pictures: would it leave with its location.
+async fn leaves_located(app: &App, conv: ConversationId, paths: &[PathBuf]) -> Vec<bool> {
+    let query = Query::FilePlan(FilePlanQuery {
+        conv,
+        paths: paths.to_vec().into(),
+        as_file: Vec::new(),
+        caption: false,
+        caption_text: None,
+        reply: false,
+    });
+    match app.handle.query(query).await.expect("file plan") {
+        QueryData::FilePlan(preview) => {
+            assert!(preview.refused.is_empty(), "{:?}", preview.refused);
+            preview.location
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// `SendFiles` of `path` as a picture, with `caption` and the user's agreement `with_location`.
+fn send_picture(app: &App, conv: ConversationId, path: &Path, caption: &str, with_location: bool) {
+    app.send(UiCommand::SendFiles {
+        request: Default::default(),
+        as_file: Vec::new(),
+        with_location: vec![with_location],
+        conv,
+        paths: vec![path.to_path_buf()].into(),
+        caption: Some(Text::plain(caption)),
+        reply_to: None,
+    });
+}
+
+fn look_of(bytes: &[u8]) -> kourier_media::Look {
+    kourier_media::look(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn located_files_leave_only_as_agreed() {
+    init_tracing();
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let media = tempfile::tempdir().expect("media dir");
+    let picked = tempfile::tempdir().expect("picked files");
+    let mut app = App::start_with_media(world.tmp.path(), &world.env, media.path()).await;
+    let (account, device) = app.link(&world).await;
+    let me = device.device_ref.clone();
+    let conv = app.accept(&world, account, &device, &world.alice).await;
+
+    // A phone JPEG with GPS: Signal re-encodes it, so the plan asks nothing and it goes
+    // without the user's agreement; it arrives without its location.
+    let phone = kourier_media::sample_located(kourier_media::SampleLocated::Jpeg);
+    assert!(matches!(look_of(&phone), kourier_media::Look::Found(_)));
+    let phone_path = picked.path().join("phone.jpg");
+    std::fs::write(&phone_path, &phone).expect("write the phone photo");
+    assert_eq!(
+        leaves_located(&app, conv, std::slice::from_ref(&phone_path)).await,
+        [false],
+        "nothing to ask"
+    );
+    send_picture(&app, conv, &phone_path, "the phone photo", false);
+    let message = alice_receives(&world, &me).await;
+    assert_eq!(message["body"], "the phone photo");
+    let pointer = pointers_in(&message).remove(0);
+    assert_eq!(pointer["contentType"], "image/jpeg");
+    let fetched = world
+        .harness
+        .fetch_attachment(&pointer)
+        .await
+        .expect("phone photo");
+    assert!(fetched.mac_valid && fetched.digest_valid, "{fetched:?}");
+    assert_eq!(
+        look_of(&fetched.bytes()),
+        kourier_media::Look::None,
+        "it arrives without its location"
+    );
+
+    // A located HEIC goes as it is: without the user's agreement the core refuses the send
+    // and queues nothing; with it the HEIC arrives byte-identical.
+    let heic = kourier_media::sample_located(kourier_media::SampleLocated::Heic);
+    let heic_path = picked.path().join("photo.heic");
+    std::fs::write(&heic_path, &heic).expect("write the HEIC");
+    assert_eq!(
+        leaves_located(&app, conv, std::slice::from_ref(&heic_path)).await,
+        [true],
+        "the HEIC would leave with its location"
+    );
+    let uploads_before = world.harness.send_stats().await.expect("stats").uploads;
+    send_picture(&app, conv, &heic_path, "not agreed", false);
+    let (error, refused) = app
+        .event("the refused HEIC", |e| match e {
+            UiEvent::ActionFailed {
+                action: "SendFiles",
+                error,
+                subject: ActionSubject::Files(f),
+                ..
+            } => Some((error.to_string(), f.refused.clone())),
+            _ => None,
+        })
+        .await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].index, 0);
+    assert_eq!(refused[0].reason, FileRefusal::Location);
+    assert!(!error.contains("photo.heic"), "{error}");
+    send_picture(&app, conv, &heic_path, "agreed", true);
+    let message = alice_receives(&world, &me).await;
+    assert_eq!(message["body"], "agreed", "the refused send never left");
+    let pointer = pointers_in(&message).remove(0);
+    let fetched = world
+        .harness
+        .fetch_attachment(&pointer)
+        .await
+        .expect("HEIC");
+    assert!(fetched.mac_valid && fetched.digest_valid, "{fetched:?}");
+    assert_eq!(fetched.bytes(), heic, "the HEIC is byte-identical");
+    assert_eq!(
+        world.harness.send_stats().await.expect("stats").uploads - uploads_before,
+        1,
+        "only the agreed send uploaded"
+    );
+
+    // A located JPEG that neither re-encodes nor strips (broken after its EXIF): the plan
+    // trusts Signal to clean it, Signal cannot, and the message fails with a log-safe reason
+    // instead of leaving with its location. Nothing of it is uploaded.
+    let app1_end = 4 + usize::from(u16::from_be_bytes([phone[4], phone[5]]));
+    assert_eq!(&phone[2..4], [0xff, 0xe1], "the sample's APP1 follows SOI");
+    let mut broken = phone[..app1_end].to_vec();
+    broken.extend(b"not a marker");
+    assert!(matches!(look_of(&broken), kourier_media::Look::Found(_)));
+    let broken_path = picked.path().join("broken.jpg");
+    std::fs::write(&broken_path, &broken).expect("write the broken photo");
+    assert_eq!(
+        leaves_located(&app, conv, std::slice::from_ref(&broken_path)).await,
+        [false]
+    );
+    let uploads_before = world.harness.send_stats().await.expect("stats").uploads;
+    send_picture(&app, conv, &broken_path, "cannot be cleaned", false);
+    let row = app
+        .wait_row_where(conv, "the picture that cannot be cleaned", |row| {
+            caption_is(&row.body, "cannot be cleaned")
+                && matches!(row.out_state, Some(OutgoingState::Failed { .. }))
+        })
+        .await;
+    let Some(OutgoingState::Failed { reason, retryable }) = &row.out_state else {
+        unreachable!()
+    };
+    assert_eq!(*reason, FailReason::Other("invalid input".into()));
+    assert!(!retryable, "no retry can clean it");
+    let shown = format!("{row:?}");
+    assert!(!shown.contains("broken.jpg"), "{shown}");
+    assert_eq!(
+        world.harness.send_stats().await.expect("stats").uploads,
+        uploads_before,
+        "nothing of it was uploaded"
+    );
+
+    app.stop().await;
     world.shutdown().await;
 }

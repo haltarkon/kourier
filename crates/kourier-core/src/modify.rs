@@ -34,16 +34,18 @@
 //! outbox until the message is retried ([`outbox::take_due`]). A reaction or edit of a message
 //! that reached only some members still goes to all of them (as in Signal Desktop).
 //!
-//! An edit's target is set when it is sent ([`outbox::take_due`]), so an edit typed while an
-//! earlier one was on its way, which the network then refused, names the latest revision the
-//! recipients have. In Signal's Note to Self an edit has no window and no count
-//! ([`actions::edit`]).
+//! An edit's target is the network's rule ([`kourier_model::EditTarget`]). Where it is the
+//! latest revision (Signal) the target is set when the edit is sent ([`outbox::take_due`]), so
+//! an edit typed while an earlier one was on its way, which the network then refused, names the
+//! latest revision the recipients have. Where it is the original (WhatsApp, Threema) the request
+//! names the message's own key from the start and nothing moves it. In Signal's Note to Self an
+//! edit has no window and no count ([`actions::edit`]).
 
 use kourier_backend_api::{Network, OutgoingKind, OutgoingRequest, TransmitOutcome};
 use kourier_db::rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use kourier_model::{
-    AccountId, AccountState, BackendError, Body, ConvKey, ConversationFeatures, ErrorKind,
-    MessageId, MsgTarget, NetMsgId, TargetAuthor, Text,
+    AccountId, AccountState, BackendError, Body, ConvKey, ConversationFeatures, EditTarget,
+    ErrorKind, MessageId, MsgTarget, NetMsgId, OutboxPolicy, TargetAuthor, Text,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +53,7 @@ use crate::actions::{self, Facts, Sending};
 use crate::error::{CoreError, Refusal, Result};
 use crate::ingest::{Apply, MAX_EMOJI_BYTES, MsgRow};
 use crate::outbox::{self, Attempt, Next, Recorded, Written};
+use crate::rules::NetRules;
 use crate::sql;
 
 /// A change of an existing message the user asked for.
@@ -116,6 +119,10 @@ struct Target<'a> {
     blocked: bool,
     features: Option<ConversationFeatures>,
     network: &'a dyn Network,
+    /// The network's rules, read from its descriptor once: the retry budget a queued change gets
+    /// ([`queue`]) and which message an edit names. No other site reads the descriptor for them,
+    /// so a rule that is changed for one account in one place reaches this one too.
+    rules: NetRules,
     now: i64,
     /// The stored body (latest revision).
     body: Body,
@@ -148,6 +155,8 @@ impl Target<'_> {
     fn facts(&self) -> Facts<'_> {
         Facts {
             active: self.active,
+            // The command looked the network up before it got here.
+            registered: true,
             blocked: self.blocked,
             features: self.features.as_ref(),
             admin: self.admin,
@@ -190,14 +199,15 @@ pub(crate) fn modify(
     let (account, key, blocked, body, note_to_self) =
         found.ok_or(CoreError::refused(Refusal::Gone, "unknown message"))?;
     let account = AccountId(account);
-    let mut apply = Apply::begin(&tx, account, network.descriptor().msg_id_scope, now)?;
+    let rules = NetRules::of(network.descriptor());
+    let mut apply = Apply::under_rules(&tx, account, rules, now)?;
     let row = apply
         .msg_row(message)?
         .ok_or(CoreError::refused(Refusal::Gone, "unknown message"))?;
     let features = apply.features(&row)?;
     let admin = apply.own_admin(&row)?;
     let sending = if row.is_own() {
-        actions::sending_of(apply.conn, row.id)?
+        actions::sending_of(apply.conn, row.id, false)?
     } else {
         Sending::Settled
     };
@@ -209,6 +219,7 @@ pub(crate) fn modify(
         blocked,
         features,
         network,
+        rules,
         now,
         body: sql::from_json(&body)?,
         admin,
@@ -233,7 +244,8 @@ pub(crate) fn modify(
     })
 }
 
-/// Inserts the outbox row of a change of `t.row` (state `Queued`, a fresh retry budget).
+/// Inserts the outbox row of a change of `t.row` (state `Queued`, a fresh retry budget of
+/// `t.rules`: the network's [`OutboxPolicy`](kourier_model::OutboxPolicy)).
 fn queue(
     apply: &Apply<'_>,
     t: &Target<'_>,
@@ -263,7 +275,7 @@ fn queue(
             name,
             sql::to_json(&req)?,
             outbox::QUEUED,
-            t.now.saturating_add(outbox::ms(outbox::BUDGET)),
+            t.now.saturating_add(outbox::ms(t.rules.outbox.budget)),
             sql::to_json(undo)?,
         ])?;
     Ok(())
@@ -375,20 +387,26 @@ fn edit(apply: &mut Apply<'_>, t: &Target<'_>, mut text: Text) -> Result<()> {
     }
 
     let id = outbox::allocate(apply, t.network, row.conv, &t.key, t.now)?;
-    // Signal: the edit targets the previous revision's timestamp
-    // (`SD/ts/util/editHelpers.std.ts`), which is the latest one we have.
-    let previous: Option<String> = apply
-        .conn
-        .prepare_cached(
-            "SELECT net_local FROM message_revisions WHERE message_id = ?1
-             ORDER BY revision DESC LIMIT 1",
-        )?
-        .query_row([row.id.0], |r| r.get(0))
-        .optional()?;
+    // What the edit names on the wire is the network's rule (`NetworkDescriptor::edit_target`,
+    // §3.5.3). Signal: the previous revision's timestamp (`SD/ts/util/editHelpers.std.ts`),
+    // which is the latest one we have. WhatsApp and Threema: the original message, every time:
+    // the message's own key, never the id of a revision (an earlier edit is no message there).
+    let local = match t.rules.edit_target {
+        EditTarget::Original => row.net_local.clone(),
+        EditTarget::LatestRevision => apply
+            .conn
+            .prepare_cached(
+                "SELECT net_local FROM message_revisions WHERE message_id = ?1
+                 ORDER BY revision DESC LIMIT 1",
+            )?
+            .query_row([row.id.0], |r| r.get(0))
+            .optional()?
+            .unwrap_or_else(|| row.net_local.clone()),
+    };
     let target = MsgTarget {
         conv: Some(t.key.clone()),
         author: TargetAuthor::Own,
-        local: previous.unwrap_or_else(|| row.net_local.clone()).into(),
+        local: local.into(),
         alternates: Vec::new(),
     };
     // The original becomes revision 0 (once), the edit the latest revision (§3.5.3).
@@ -455,7 +473,7 @@ fn delete(apply: &mut Apply<'_>, t: &Target<'_>, for_everyone: bool) -> Result<(
     let target = t.original()?;
     if for_everyone {
         let id = outbox::allocate(apply, t.network, row.conv, &t.key, t.now)?;
-        apply.tombstone(row, "ForEveryone", "")?;
+        apply.tombstone(row, "ForEveryone", Some(""))?;
         let kind = OutgoingKind::Delete {
             target,
             for_everyone: true,
@@ -465,7 +483,7 @@ fn delete(apply: &mut Apply<'_>, t: &Target<'_>, for_everyone: bool) -> Result<(
     // Nothing of a call line is ever sent: it is removed here, and our other devices keep
     // their call entry (a delete of a call is its own sync on Signal, not `deleteForMe`).
     let call_line = crate::ingest::is_call_line(apply.conn, row.id)?;
-    apply.tombstone(row, "ForMe", "")?;
+    apply.tombstone(row, "ForMe", Some(""))?;
     // Our other devices learn it when the network syncs deletes for me (Signal `deleteForMe`).
     let syncs = t.features.as_ref().is_none_or(|f| f.delete_for_me);
     if t.active && syncs && !call_line {
@@ -530,10 +548,14 @@ fn react(apply: &mut Apply<'_>, t: &Target<'_>, emoji: &str, remove: bool) -> Re
         .query_row((row.id.0, emoji), |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let id = outbox::allocate(apply, t.network, row.conv, &t.key, t.now)?;
-    // The id's timestamp is strictly increasing per account, so this write wins (LWW by `at`).
+    // The id's timestamp is strictly increasing per account, so this write wins (LWW by `at`), also
+    // against a removal with no emoji that another device of ours sent with a clock that runs
+    // ahead (it would turn this reaction into a removal).
+    let cover = apply.removal_all_at(row.id, "")?;
     let at = id
         .sent_at
-        .max(prev.map_or(i64::MIN, |p| p.0.saturating_add(1)));
+        .max(prev.map_or(i64::MIN, |p| p.0.saturating_add(1)))
+        .max(cover.map_or(i64::MIN, |c| c.saturating_add(1)));
     apply.merge_reaction(row.id, "", emoji, at, remove)?;
     apply.ch.message(row.conv, row.id);
     let undo = Undo::React {
@@ -553,10 +575,12 @@ fn react(apply: &mut Apply<'_>, t: &Target<'_>, emoji: &str, remove: bool) -> Re
 
 /// §4.8 step 3 for an edit, delete or reaction row (inside [`outbox::record_outcome`]'s
 /// transaction): done when the network has it (for some recipients at least, if the others
-/// failed for good), retried with Signal's backoff inside the budget (only the members a partial
-/// attempt missed), paused like a message, or rolled back when refused for good.
+/// failed for good), retried with the network's backoff inside its budget (`policy`; only the
+/// members a partial attempt missed), paused like a message, or rolled back when refused for
+/// good.
 pub(crate) fn record_outcome(
     apply: &mut Apply<'_>,
+    policy: OutboxPolicy,
     attempt: &Attempt,
     outcome: Option<TransmitOutcome>,
 ) -> Result<Recorded> {
@@ -614,6 +638,15 @@ pub(crate) fn record_outcome(
     };
     let failure = match outcome {
         TransmitOutcome::Sent { .. } => None,
+        // A change has no id for a server to replace: a fault of the backend, read as `Sent`.
+        TransmitOutcome::SentAs { .. } => {
+            tracing::warn!(
+                account = apply.acc.id.0,
+                outbox = outbox_id,
+                "a change was answered with an id of its own: read as sent"
+            );
+            None
+        }
         TransmitOutcome::Partial { delivered, failed } => {
             // A member the network wants a challenge solved for, or whose safety number
             // changed, is not lost: the row waits, narrowed to the members that do not have
@@ -694,7 +727,7 @@ pub(crate) fn record_outcome(
                 .map(|(_, e)| e.kind.retry_after().unwrap_or_default())
                 .max()
                 .unwrap_or_default()
-                .max(outbox::backoff(attempts));
+                .max(outbox::backoff_capped(attempts, policy.max_backoff));
             match retry.first() {
                 Some((_, first)) if now.saturating_add(outbox::ms(wait)) <= deadline => {
                     let members = retry.iter().map(|(u, _)| u.clone()).collect();
@@ -717,7 +750,8 @@ pub(crate) fn record_outcome(
                 _ => failed.into_iter().next().map(|(_, e)| e),
             }
         }
-        TransmitOutcome::Failed(e) => match outbox::classify(&e, conv, outbox_id, attempts) {
+        TransmitOutcome::Failed(e) => match outbox::classify(&e, conv, outbox_id, attempts, policy)
+        {
             Next::Retry(wait) if now.saturating_add(outbox::ms(wait)) <= deadline => {
                 requeue(apply, wait, &attempt.req, e.kind.name())?;
                 return Ok(recorded);

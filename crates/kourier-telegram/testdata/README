@@ -1,0 +1,153 @@
+Test data of kourier-telegram (TG-2), CC0-1.0.
+
+login-flow.jsonl is what TDLib 1.8.68 (the pinned commit then; LC-20 moved the pin to 1.8.69 and kept
+this file as it is: it is the SPIKE's fixture, the lane cannot re-record it, and the auth states and
+login functions it shows are identical at 1.8.69; the fake-DC login cases prove the login live at the
+pin) wrote through td_json while the
+TDLib spike (spikes/tdlib-t0) logged in against its own fake data centre, received a message
+and sent one: 176 objects, no network of Telegram's involved. It was SCRUBBED before it came
+here: every phone number is one of two synthetic ones (+999068204719 for the own account,
+999075390162 for the peer), the names are Ada Test and Bo Peer (chat titles too), every message
+text is "synthetic text <n>", signatures, sender tags and client data are blank, the t_me_url
+option is https://example.invalid/, the request names (@extra) are gone, the UTC offset is 0
+and every date is moved to the fixed synthetic epoch 1700000000 (the seconds between the dates
+are the flow's own).
+
+The scrub is scripts/tg-fixture-scrub.py (python3 -I scripts/tg-fixture-scrub.py
+<spike-flow.jsonl> <out-dir>; it writes both files here). It asserts that no original name,
+number, title, username, signature, text or date survives (it prints the counters, all 0) and
+that every string-valued key path is on the reviewed list string-paths.txt. tests/fixture.rs
+re-checks the RESULT against the same list (an unknown string path fails
+`the_fixture_is_scrubbed`), the dates and the offset, and that the list holds no stale path;
+the originals themselves are only in the script's run, so "no original survives" is the
+script's check, not the test's.
+
+string-paths.txt is the reviewed list of string-valued key paths (one per line); a new kind of
+text in a later fixture is looked at by a person before it is added.
+
+login-rules.jsonl holds the scripted TDLib's rules (`kourier_tdlib::scripted::Script::
+from_fixture`, with the `when` and `nth` keys of TG-2) cut from that flow: the synthetic number
+answered by WaitCode, any other number by PHONE_NUMBER_INVALID, the synthetic code 12345 by the
+flow's own updates up to Ready, any other code by PHONE_CODE_INVALID, and getMe by the own user.
+
+rec-<name>.jsonl (TD-4a, fifteen files: fresh-start, restart-saved-pts, kill-at-once, kill-after-quiet,
+reconnect, gap-known-sender, gap-filled-by-push, gap-channel, gap-unknown-sender, channel-difference, edit,
+delete, read-elsewhere, incoming-call, basic-group-upgrade) are what TDLib 1.8.69 (first recorded at 1.8.68;
+LC-20 re-recorded all 19 files) with patch 0001+0002 (the
+test-only fake-DC library) wrote through the helper while the lane's fake DC
+(crates/kourier-telegram/fakedc/, its standard synthetic world) served the recording cases
+RC1-RC11 (RC5 in four cases a-d) of src/supervisor/tests/fakedc/rec.rs, inside an `unshare -rn` child: no network of
+Telegram's involved. Each holds TDLib's own lines after the login (Ready onwards), the app's
+request markers ({"@type":"kourierRequest","request":<type>,"@extra":<n>}, plus "args" with the
+request for loadChats, getChatHistory, getMessage, getChat, getChats, viewMessages and getMe only;
+never setTdlibParameters or a login input) and the case's step lines
+({"@type":"kourierStep","step":<label>}). `@extra` is RENUMBERED 1..n per file, so an answer
+pairs with its marker. Made by `cargo xtask tdlib fakedc record` (raw files under
+target/tg-fakedc/raw/, never committed) and scrubbed by
+`python3 -I scripts/tg-fixture-scrub.py --recording <raw> --world <world.json> <out-dir>`: the
+fake DC's originals (its world.json) become Ada Test / +999068204719 (own), Bo Peer /
+999075390162 and Cy, Di, Ed, Fay Sample (peers, by id), `Group <n>` / `Channel <n>` (titles),
+`synthetic_<n>` (usernames), `synthetic text <n>` (texts, one number per original text, so an
+edit shows a new number); dates and the date part of every chat order move to the epoch
+1700000000 keeping their distances (a 6 h window); the gate's per-run SOCKS5 pair in addedProxy is
+blanked and its port written as 1080. tests/fixture.rs reads EVERY testdata/*.jsonl at run time
+except login-rules.jsonl (rules, not TDLib output); every RC case compares the stream it sees
+with its file (the drift check: phases at the step lines, the set of @type names per phase,
+TDLib's own start-up and counter types left out; the refresh types TDLib sends when its own
+background fetches return are compared as one set per helper run; in a phase after a kill
+updateNewMessage is left out; rec-kill-at-once.jsonl is not compared, it has two outcomes by
+design). The test checks that testdata/ holds nothing but this README, string-paths.txt,
+login-*.jsonl, rec-*.jsonl, receive-*.jsonl and message-contents.txt. A pin bump re-records. LC-20
+(1.8.69) did: every golden assert held on the re-record, 9 of the 19 files came out byte-identical to the 1.8.68
+ones and 10 differ only by the version option, a one-second shift of the scrub's dates and orders (the fake world
+dates its messages by the wall clock; the distances are kept), the position of TDLib's own option and start-up
+bursts, background refreshes of updateSupergroup and updateUserStatus and TDLib's `unix_time` option updates
+(sent when its clock difference to the server moves by 0.5 s, so they depend on the fake DC's second boundaries:
+timing; one less in four files, one more in two): no new type, key path or string path
+(the explanation per file is made by a script that is not committed; .claude/rules/telegram.md, "The recordings").
+The files were recorded by the harness as committed here: the kill steps stamped after the stop, the regular RC10
+idling 2.5 s after the call push.
+
+rec-read-act.jsonl (TG-4 K2, the sixteenth recording, case RC13 `rc13_read_act`; made and scrubbed like the fifteen above)
+is what TDLib wrote while the read act's request (`viewMessages` with `source: null` and `force_read: true`, built by the
+product's own `LaneAsk::View`) ran with TDLib's message database off, in two helper runs split by a SIGKILL (step
+`kill-after-view`). Steps: `view-private` (the three unread ids of one private chat), `view-supergroup`, `view-again` (the
+same ids once more), `view-held` (the fake DC holds read requests: neither applied nor answered, "lost in flight"; one new
+message in a private chat and two in a basic group, then a read of the first ones), `kill-after-view` (the second run: lists
+loaded again), `reassert` (the private chat's id again: the dialog's top), `reassert-below-top` (the basic group's id below
+its top). GOLDEN (TDLib's own behaviour at the pin, re-proven at 1.8.69 by LC-20's re-record, asserted on every run): one `messages.readHistory` for the first, one
+`channels.readHistory` for the supergroup, none for the repeat, the `updateChatReadInbox` BEFORE the call's answer, no read
+request after the restart before a re-assert (nothing is replayed with the DB off), one request per re-assert, no
+`readMessageContents`, views or reactions request. GOLDEN-VIA-MODEL: the `max_id` of each request (read back through the fake
+DC's `read-state`, which stores exactly the id a request names). MODEL: the read position TDLib is told after the restart
+(below the viewed id because the fake never applied the held read), the answer shapes (`affectedMessages`, `boolTrue`), that
+the reading session gets no echo of its own read.
+
+rec-first-live-after-load.jsonl and rec-first-live-before-load.jsonl (TG-4 K3a, the seventeenth and eighteenth
+recordings, cases RC12a `rc12a_first_live_after_load` and RC12b `rc12b_first_live_before_load`; made and scrubbed like the
+fifteen above) are what TDLib wrote, with its message database off, when the FIRST live message `M` of a chat came after a
+restart (B1's case) and what `getChatHistory(chat, from = M, offset 0, limit 50)` (the product's own reconcile request) then
+answered, in two helper runs split by a SIGKILL (step `kill-quiet`, after 1 s of quiet so TDLib had saved its pts). Run 1:
+the main list loaded, step `tail` (three new messages in each of two chats, one by one: the "lost tail" TDLib processed; the
+newest message before them is the stale cursor `s` Kourier would have stored). Run 2 of `-after-load`: step `chats` (the
+list loaded again), step `first-live` (`M` of a private chat and of a supergroup), step `pages` (per chat the page from `M`,
+then from the oldest id of the last page until an id at or below `s` came). Run 2 of `-before-load`: step `first-live`
+straight after the restart (the private chat and a BASIC GROUP, the common box), step `pages`, step `chats`. GOLDEN (TDLib's
+own behaviour at the pin, re-proven at 1.8.69 by LC-20's re-record, asserted on every run; U10): in `-after-load` the FIRST page from `M` is TDLib's LOCAL answer, the
+chat's top message ALONE, for both chats (after the restart TDLib holds nothing older than the top it was told, so no local page
+bridges `M` to the stale cursor; in `-before-load` TDLib holds no top and the first page is the server's whole page, which is
+not asserted); a tail message is told again at most once after the restart (it was 0 times in the recording) and `M` exactly
+once; a chat's `updateNewChat` comes before `M`'s `updateNewMessage` in run 2. GOLDEN-VIA-MODEL (asserted; valid because the
+fake's history is pinned by its unit test `the_history_pages_from_the_newest_by_offset_id_and_add_offset` over `history_ids`,
+`fakedc/src/world/answers.rs`): across a chat's pages every tail message comes exactly once, newest first, BEFORE any id at or
+below `s`, and `M` is in no page from `M`; that is a fact of the SERVER pages (the next page of `-after-load`, the only page of
+`-before-load`), which hold the tail because the fake answers every stored message below the id: R1 reads the real server's
+page from `M`, not only the counts. PRINTED, not asserted (timing or MODEL; the recording's run): `-after-load`: that first
+page held 1 id with no request on the wire and the next page from it holds the rest (6 ids for the private chat, 3 for the
+supergroup), with `updates.getDifference`,
+`messages.getPeerDialogs` and `updates.getChannelDifference` all 0 around `M`; `-before-load`: TDLib creates the dialog
+from `M` (an `updateNewChat`, an `updateChatReadInbox` with 1 unread and a read position 0, then `M`, corrected by a second
+`updateChatReadInbox` with the server's numbers after `messages.getPeerDialogs`: 2 requests, `updates.getDifference` 0 or 1
+(printed, timing: 1 in 11 of 28 runs at 1.8.69)) and the FIRST page from `M` is the
+server's whole page (7 ids for the private chat, 5 for the basic group). MODEL: the page sizes (the fake answers everything
+below the id, up to the limit), the id sequence (one box for private chats and basic groups, one per channel), the
+unread numbers, the number of wire requests a call makes.
+
+rec-difference-too-long.jsonl (TG-4 K3c, the nineteenth recording, case RC14 `rc14_difference_too_long`; made and scrubbed like the
+fifteen above) is what TDLib wrote, with its message database off, when the COMMON box's `updates.differenceTooLong` came
+(the known limit of Q-L12), in two helper runs split by a CLEAN stop (step `stop`, then `restart-too-long`: not a kill). The
+fake DC's common too-long threshold is a MODEL choice (`queue threshold common <pts>`): 2 for the restart, then 1 for the live
+part. Run 1: the main list loaded, step `stop`. Between the runs four changes are queued (three new messages of a private chat,
+one of a basic group: more than the threshold, so the difference from the saved pts is too long). Run 2: step
+`restart-too-long` (the lists loaded again, then per chat the page the start decision asks, `getChatHistory(chat, from = the
+last message TDLib told)`, the product's own reconcile request), then the live part in the same run: step `live-gap` (two
+messages stored and a third pushed: a pts gap of two, the difference is too long again), step `live-next` (the next live
+message `M'`), step `live-pages` (`getChatHistory(chat, from M')` once). GOLDEN (TDLib's own behaviour at the pin, re-proven at 1.8.69 by LC-20's re-record, asserted on
+every run): at the restart the difference is asked at least twice (the too-long answer sets the pts and TDLib asks again),
+NONE of the four queued messages reaches the app as an `updateNewMessage`, and after `loadChats` the last message TDLib tells
+for each chat is the newest queued one (`getDialogs` is applied after the difference). GOLDEN-VIA-MODEL (asserted; the fake's
+history is pinned by its unit test `the_history_pages_from_the_newest_by_offset_id_and_add_offset`): the server pages from
+that last message hold the queued messages once each, newest first, before any id at or below the stale cursor (the fake
+answers every stored message below the id; R1 reads the real server's window). Live: a difference is asked after the push (the
+recording's run: 2), no object TDLib tells for the rest of the run names one of the three `gap` messages (not as
+`updateNewMessage`, not as the chat's last message: the push that revealed the gap does not reach the app either), `M'`
+comes exactly once, and the local first page from `M'` starts at the message that was the chat's last BEFORE the gap with none
+of the three in it: TDLib bridges the dropped window in its local history (the stated limit's hole; the server's page would
+hold them). MODEL: the thresholds, the window sizes, the page sizes, the id sequence (one box for private chats and basic
+groups).
+
+receive-<name>.jsonl (TG-3, L-14) are SYNTHETIC lines in TDLib's shapes, written by hand where no
+recording holds a kind T3 must read (bot, public, direct-messages and channel chats, scheduled and
+pending messages, a re-delivery, the chat updates the fake world never sends; receive-entities.jsonl:
+every text entity type, emoji and CJK offsets, broken offsets, mentions, links to example.org;
+receive-contents.jsonl: one message per content kind the map reads, line n = message n << 20: media with
+remote ids synthetic-remote-<n>, a sticker without ids, places, contacts, polls, view-once and timer media,
+protected, album, forwarded, restricted (a synthetic restriction reason) and auto-deleted messages, an unknown content type; receive-service.jsonl:
+one message per call and service case the map reads, line n = message n << 20: calls answered or declined
+elsewhere and outgoing ones, members added, joined, left and removed, title, photo, timer, create, pin,
+payment, video chats, a group call in a private chat, a generic service kind). They hold only the
+scrub's synthetic values (Ada Test, Bo Peer, Cy/Di/Ed/Fay Sample, Group <n>, Channel <n>,
+synthetic_<n>, "synthetic text <n>", dates within an hour of 1700000000) and are checked like
+login-flow.jsonl; every string path they add is on string-paths.txt. They are no golden output of
+TDLib: a test never builds on a fact only they hold. message-contents.txt (TG-3 C4a) lists every
+MessageContent constructor of the pinned td_api.tl (108 at 1.8.69; 107 at 1.8.68).

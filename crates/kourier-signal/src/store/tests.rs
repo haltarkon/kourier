@@ -188,6 +188,20 @@ fn a_verified_contact_with_a_new_key_needs_confirmation_before_sending() {
             |r| r.get(0),
         )?;
         assert_eq!(verified, 2, "unverified");
+        // P5 critic F3: the change carries state 2, and the core hears `Changed` (the person
+        // page says "Safety number changed"), not a plain `Unverified`.
+        let changes = stores.identity.take_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].verified, 2);
+        let events = crate::receive::stage1::identity_events(tx, &changes, 0)?;
+        let trust = events.iter().find_map(|e| match e {
+            kourier_backend_api::BackendEvent::ContactUpsert(p) => Some(p.trust),
+            _ => None,
+        });
+        assert!(
+            trust == Some(Some(kourier_model::TrustLevel::Changed)),
+            "a verified contact's key change must reach the core as Changed, got {trust:?}"
+        );
         assert!(!trusted(&stores, &new, Sending)??);
         assert!(!trusted(&stores, &old, Sending)??);
         assert!(trusted(&stores, &new, Receiving)??);

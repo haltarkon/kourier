@@ -30,6 +30,8 @@ Delegates.RoundedItemDelegate {
     required property string receipt
     required property string accountBadge
     required property string badgeIcon
+    // The account's place among its network's accounts, on the avatar's badge (0: none).
+    required property int badgeNumber
     required property bool isSelf
 
     readonly property bool hasUnread: root.unread > 0 || root.markedUnread
@@ -53,9 +55,13 @@ Delegates.RoundedItemDelegate {
     // A screen reader says the chat's name, then what the row shows besides it: the news, the
     // marks and the last message.
     Accessible.role: Accessible.ListItem
-    Accessible.name: root.title
+    Accessible.name: Style.unmarked(root.title)
     Accessible.description: {
         const parts = [];
+        // With several accounts shown the row's chip names its account.
+        if (root.accountBadge !== "") {
+            parts.push(L10n.i18nc("@info accessible, %1 the account of the chat", "Account %1", root.accountBadge));
+        }
         if (root.unread > 0) {
             parts.push(L10n.i18ncp("@info accessible, %1 how many", "%1 unread message", "%1 unread messages", root.unread));
         } else if (root.markedUnread) {
@@ -118,6 +124,7 @@ Delegates.RoundedItemDelegate {
             name: root.title
             source: root.avatarUrl
             badge: root.badgeIcon
+            badgeNumber: root.badgeNumber
             selfChat: root.isSelf
             Layout.alignment: Qt.AlignVCenter
             Layout.preferredWidth: root.compact ? Style.compactAvatarSize : Style.listAvatarSize

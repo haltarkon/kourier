@@ -142,11 +142,20 @@ pub enum NetworkKind {
     Threema,
     /// The scripted test backend (`kourier-fake`).
     Fake,
+    /// Telegram (§7.5, on TDLib through the `kourier-tdlib` helper; debug builds only). Placed
+    /// after `Fake` on purpose: the enum derives `Ord`, and every sorted use keeps its order.
+    Telegram,
 }
 
 impl NetworkKind {
     /// Every kind, in declaration order.
-    pub const ALL: [NetworkKind; 4] = [Self::Signal, Self::WhatsApp, Self::Threema, Self::Fake];
+    pub const ALL: [NetworkKind; 5] = [
+        Self::Signal,
+        Self::WhatsApp,
+        Self::Threema,
+        Self::Fake,
+        Self::Telegram,
+    ];
 
     /// The stored name (same as the serde name).
     pub fn as_str(self) -> &'static str {
@@ -155,6 +164,7 @@ impl NetworkKind {
             Self::WhatsApp => "WhatsApp",
             Self::Threema => "Threema",
             Self::Fake => "Fake",
+            Self::Telegram => "Telegram",
         }
     }
 }
@@ -411,16 +421,25 @@ pub enum MsgIdScope {
     #[default]
     AccountAuthor,
     /// `(conversation, local)` is unique; authors are compared only when both sides carry one
-    /// (WhatsApp, Threema).
+    /// (Threema: its ids are unique per conversation and random, and its references carry no
+    /// sender, so a second author under a taken id is refused). Call lines are keyed this way
+    /// on every network.
     Conversation,
+    /// `(conversation, author, local)` is unique; `author` is the author after identity
+    /// resolution, `''` for our own (WhatsApp: ids are unique per sender in a chat, so two
+    /// members may use one id). Since core.db schema 16; the rows of a WhatsApp account made
+    /// under [`Self::Conversation`] before that are not converted.
+    ConversationAuthor,
 }
 
 impl MsgIdScope {
-    /// The `messages.net_scope` column value (§5.4): 0 = AccountAuthor, 1 = Conversation.
+    /// The `messages.net_scope` column value (§5.4): 0 = AccountAuthor, 1 = Conversation,
+    /// 2 = ConversationAuthor.
     pub fn db_code(self) -> i64 {
         match self {
             Self::AccountAuthor => 0,
             Self::Conversation => 1,
+            Self::ConversationAuthor => 2,
         }
     }
 
@@ -429,6 +448,7 @@ impl MsgIdScope {
         match code {
             0 => Some(Self::AccountAuthor),
             1 => Some(Self::Conversation),
+            2 => Some(Self::ConversationAuthor),
             _ => None,
         }
     }
@@ -778,13 +798,22 @@ mod tests {
 
     #[test]
     fn scope_and_kind_codes() {
-        for s in [MsgIdScope::AccountAuthor, MsgIdScope::Conversation] {
+        for (s, code) in [
+            (MsgIdScope::AccountAuthor, 0),
+            (MsgIdScope::Conversation, 1),
+            (MsgIdScope::ConversationAuthor, 2),
+        ] {
+            assert_eq!(s.db_code(), code);
             assert_eq!(MsgIdScope::from_db_code(s.db_code()), Some(s));
         }
-        assert_eq!(MsgIdScope::from_db_code(2), None);
+        assert_eq!(MsgIdScope::from_db_code(3), None);
         for k in NetworkKind::ALL {
             assert_eq!(k.as_str().parse::<NetworkKind>(), Ok(k));
         }
+        // Telegram comes last in the sort order: the variant follows `Fake` (KT-1a).
+        assert_eq!("Telegram".parse::<NetworkKind>(), Ok(NetworkKind::Telegram));
+        assert_eq!(NetworkKind::ALL.iter().max(), Some(&NetworkKind::Telegram));
+        assert!(NetworkKind::Fake < NetworkKind::Telegram);
     }
 
     #[test]

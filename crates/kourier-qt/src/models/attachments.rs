@@ -10,7 +10,7 @@ use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 16] = [
+pub const ROLES: [&str; 17] = [
     "fileId",
     "name",
     "kind",
@@ -27,6 +27,7 @@ pub const ROLES: [&str; 16] = [
     "note",
     "stage",
     "progress",
+    "located",
 ];
 
 /// Rust side of `AttachmentListModel`.
@@ -57,6 +58,8 @@ pub struct FileQt {
     stage: QString,
     /// For a folder that is being packed: how far, 0 to 1.
     progress: f64,
+    /// The second line speaks of the file's location (it may take two lines).
+    located: bool,
 }
 
 impl FileQt {
@@ -84,6 +87,7 @@ impl FileQt {
             note: QString::from(v.note.as_str()),
             stage: QString::from(v.stage),
             progress: f64::from(v.progress) / 1000.0,
+            located: v.located,
         }
     }
 
@@ -104,6 +108,7 @@ impl FileQt {
             .with_if(13, a.note != b.note)
             .with_if(14, a.stage != b.stage)
             .with_if(15, a.progress != b.progress)
+            .with_if(16, a.located != b.located)
     }
 
     fn key(v: &FileRow) -> u64 {
@@ -134,7 +139,8 @@ impl qobject::AttachmentListModel {
             12 => QVariant::from(&row.original),
             13 => QVariant::from(&row.note),
             14 => QVariant::from(&row.stage),
-            _ => QVariant::from(&row.progress),
+            15 => QVariant::from(&row.progress),
+            _ => QVariant::from(&row.located),
         }
     }
 

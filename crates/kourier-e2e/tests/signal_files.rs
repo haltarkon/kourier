@@ -22,7 +22,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -509,6 +509,7 @@ async fn mixed_files_reach_every_phone_as_albums_and_single_files() {
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: files
             .iter()
@@ -573,6 +574,7 @@ async fn mixed_files_reach_every_phone_as_albums_and_single_files() {
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv: group_conv,
         paths: group_files
             .iter()
@@ -620,6 +622,7 @@ async fn mixed_files_reach_every_phone_as_albums_and_single_files() {
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: retried
             .iter()
@@ -722,6 +725,7 @@ async fn formats_decide_the_packing_and_a_file_sent_as_file_is_untouched() {
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file,
+        with_location: Vec::new(),
         conv,
         paths: files
             .iter()
@@ -870,12 +874,8 @@ async fn a_multi_message_send_survives_a_kill_in_the_middle() {
             paths: files.iter().map(|f| f.path.clone()).collect(),
         };
         let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "files_child_process",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .arg(support::child_filter(module_path!(), "files_child_process"))
+            .args(["--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_ENV, serde_json::to_string(&spec).expect("spec"))
             .env("KOURIER_FAILPOINT", format!("{point}:{hit}"))
             .env(
@@ -962,6 +962,7 @@ fn files_child_process() {
         app.send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv: ConversationId(spec.conv),
             paths: spec.paths.into(),
             caption: None,

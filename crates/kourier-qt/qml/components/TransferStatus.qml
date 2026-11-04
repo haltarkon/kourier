@@ -12,7 +12,8 @@ import app.kourier
 // is left). The link page shows none: the chats are usable as soon as the account is linked.
 // It is fed by the viewmodel's view (`App.bannerTransfer`): its line, how far the download
 // is, and whether "Continue Without History" is offered (a wait or a download can be
-// skipped, a read cannot).
+// skipped, a read cannot). The phase `history` is the quiet line of a network that sends
+// its history in pieces after the link (no button, a bar only when a number is known).
 //
 // Every text is the application's own, except that the line can carry an account's name: it
 // is a plain-text label.
@@ -29,6 +30,10 @@ ColumnLayout {
     // After the transfer (or without one): the profiles and groups a fresh link still
     // fetches, counted against the most seen (banner only).
     readonly property bool updating: root.phase === "updating"
+    // A network that pushes the message history in pieces while the chats already work
+    // (WhatsApp, after the link): one quiet line, with a bar once the network gives a number.
+    // It has no button: nothing here can end it.
+    readonly property bool history: root.phase === "history"
     // 0 … 1, or below zero while it is not known how far the transfer is.
     readonly property real progress: root.view.progress ?? -1
     readonly property string detail: root.view.detail ?? ""
@@ -67,7 +72,7 @@ ColumnLayout {
     // (each without a measure until its first count). A count that steps back (the download
     // went on from the file on disk after a restart) is just a shorter bar.
     RowLayout {
-        visible: root.downloading || root.reading || root.updating
+        visible: root.downloading || root.reading || root.updating || (root.history && root.progress >= 0)
         spacing: Kirigami.Units.largeSpacing
         Layout.fillWidth: true
 

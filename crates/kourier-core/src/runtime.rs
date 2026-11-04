@@ -13,29 +13,31 @@ use kourier_db::rusqlite::OptionalExtension;
 use kourier_db::{Priority, failpoint};
 use kourier_model::{
     AccountId, AccountState, AccountUuid, ConnState, ConvKey, ConversationId, MessageId,
-    NetworkKind, Text,
+    NetworkKind, SafetyAnswer, SafetyUnavailable, Text, UserId,
 };
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::actions;
 use crate::attachments::playback::Playback;
 use crate::attachments::{self, derive, import};
 use crate::dispatch::Signal;
 use crate::error::{CoreError, Refusal, Result};
 use crate::expiry::ExpiryPolicy;
 use crate::facade::{
-    ActionSubject, CoreHandle, Internal, Progress, Query, QueryData, RefusedFiles, RequestId,
-    UI_EVENT_CAPACITY, UiCommand, UiEvent,
+    ActionSubject, CoreHandle, Internal, LinkState, Progress, Query, QueryData, RefusedFiles,
+    RequestId, ShareState, UI_EVENT_CAPACITY, UiCommand, UiEvent,
 };
 use crate::ingest::{Changes, NotifyCandidate};
 use crate::media::{MediaEntry, MediaHandles};
+use crate::rules::NetRules;
 use crate::store::{GLOBAL_LANE, Store, lane};
 use crate::supervisor::{
     Control, FAILPOINT_AFTER_PENDING_COMMAND, Hint, Plan, RestartPolicy, Supervisor, Timeouts,
 };
 use crate::vault::{AccountVault, VaultError};
-use crate::{calls, expiry, local, modify, outbox, query, restore};
+use crate::{calls, expiry, local, modify, outbox, query, restore, roaming};
 
 /// Everything the core needs from the composition root.
 pub struct CoreConfig {
@@ -123,6 +125,25 @@ pub(crate) struct Shared {
     pub restart: RestartPolicy,
     pub timeouts: Timeouts,
     pub conn_states: Mutex<HashMap<AccountId, ConnState>>,
+    /// The send hold each account's backend stated and has not lifted (`Query::Accounts`).
+    pub holds: Mutex<HashMap<AccountId, kourier_model::AccountHold>>,
+    /// The messages whose attempt is in flight AND whose backend reports an upload that is
+    /// still moving (`AttachmentProgress` with `done < total`): the message → its account and
+    /// conversation. THE fact behind a message's "stoppable" ([`crate::actions::stoppable`]):
+    /// only a backend that reports per-file progress can answer an `AbortTransmit`. Filled and
+    /// emptied by the account's supervisor (when the uploads are over, when the attempt ends,
+    /// when the actor stops), read by the timeline query. In memory on purpose: a restart
+    /// starts the attempt over and the next one reports again.
+    pub uploading: Mutex<HashMap<MessageId, (AccountId, ConversationId)>>,
+    /// The conversations whose queue waits for the user to confirm a person's changed safety
+    /// number (the dispatcher's identity pauses, P5a BQ-3): the conversation → its account, the
+    /// paused head's outbox row and the person. Copied from the dispatcher by the account's
+    /// supervisor before it publishes (`Supervisor::share_pauses`), read by the timeline query
+    /// (`MessageActions::safety_number` of every own row that still waits, the head and the
+    /// rows behind it, U4) and by the safety-number answer
+    /// (`QueryData::SafetyNumber::waits`). In memory like the pauses themselves (a restart
+    /// retries once and pauses again).
+    pub paused: Mutex<HashMap<ConversationId, (AccountId, i64, UserId)>>,
     pub presence: watch::Sender<Presence>,
     pub ui_ready: watch::Sender<bool>,
     /// The media handle table (§8.6).
@@ -133,16 +154,31 @@ pub(crate) struct Shared {
     pub derive_permits: Arc<Semaphore>,
     /// Accounts being removed in this run (link feedback L4, `buttons.md` F6): their background
     /// work (the thumbnails of downloaded attachments) stops instead of reading files that are
-    /// being deleted and writing rows of an account that is gone. Account ids are never reused
-    /// (`AUTOINCREMENT`), so an id stays here for the rest of the run.
+    /// being deleted and writing rows of an account that is gone, and a login that starts
+    /// meanwhile is not told of them (`taken`). An id comes here when the removal is ASKED for
+    /// (`UiCommand::RemoveAccount` accepted by the core task) and again when the supervisor
+    /// begins it. Account ids are never reused (`AUTOINCREMENT`), so an id stays here for the
+    /// rest of the run.
     pub removing: Mutex<std::collections::BTreeSet<AccountId>>,
     /// The `LogoutOutcome`s told before the front-end said `UiReady` (`Some` until then): a
     /// removal or unlink that a quit cut off is finished while the core starts, before any
     /// front-end listens, and the user must still be told what became of the device. They are
     /// sent again at `UiReady` (same `seq`) and the list is dropped. Bounded.
     pub logout_outcomes: Mutex<Option<Vec<UiEvent>>>,
+    /// Each account's last `BackendNotice::HistoryLost` count of this run (W4 fix F2): a
+    /// backend appends the lost-history notice at its start, before the front-end listens
+    /// (an actor runs before `UiReady`), and the core's ack is what "told" means to the
+    /// backend, so the line must not depend on a receiver being there at that moment. It is
+    /// state, not an event: kept for the run and told again at every `UiReady`, like the
+    /// `LogoutOutcome`s (the viewmodel keeps ONE line per account, so a repeat changes
+    /// nothing).
+    pub lost_history: Mutex<std::collections::BTreeMap<AccountId, u32>>,
     /// The `seq` of the next `LogoutOutcome`.
     pub outcome_seq: std::sync::atomic::AtomicU64,
+    /// The `UiCommand::MarkRead`s sent through [`CoreHandle::send`] and not finished
+    /// ([`CoreHandle::reads_in_flight`]): counted up by the send, down by [`ReadDone`] after
+    /// the reading's events were emitted.
+    pub reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Wakes the disappearing-message sweeper ([`expiry`]) after a write that started a timer.
     pub expiry_wake: tokio::sync::Notify,
     /// Wakes the deadline task of ringing call lines ([`calls`]) after a write that stored
@@ -238,12 +274,57 @@ impl Shared {
         }
     }
 
+    /// Keeps `account`'s last lost-history count of this run ([`Shared::lost_history`]).
+    pub(crate) fn note_history_lost(&self, account: AccountId, count: u32) {
+        self.lost_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(account, count);
+    }
+
+    /// The front-end is ready: the lost-history count of each account that is still linked
+    /// and not being removed is told again ([`Shared::lost_history`]).
+    fn replay_lost_history(&self) {
+        let kept: Vec<(AccountId, u32)> = self
+            .lost_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(a, c)| (*a, *c))
+            .collect();
+        for (account, count) in kept {
+            let logged_out = self
+                .conn_states
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&account)
+                .is_some_and(|c| matches!(c, ConnState::LoggedOut { .. }));
+            if logged_out || self.is_removing(account) {
+                continue;
+            }
+            self.emit(UiEvent::Notice {
+                account,
+                notice: kourier_backend_api::BackendNotice::HistoryLost { count },
+            });
+        }
+    }
+
     /// Whether `account` is being removed in this run ([`Shared::removing`]).
     pub(crate) fn is_removing(&self, account: AccountId) -> bool {
         self.removing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&account)
+    }
+
+    /// The accounts being removed in this run, as a list ([`Shared::removing`]).
+    pub(crate) fn removing_accounts(&self) -> Vec<AccountId> {
+        self.removing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -254,6 +335,18 @@ impl Shared {
 
     pub(crate) fn now(&self) -> i64 {
         i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX)
+    }
+
+    /// Whether the account's send hold stands now ([`kourier_model::AccountHold`]): one the
+    /// backend stated (or the core took up from the last run) whose date, if it has one, has
+    /// not passed.
+    pub(crate) fn account_held(&self, account: AccountId) -> bool {
+        let now = u64::try_from(self.now().max(0)).unwrap_or(0);
+        self.holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&account)
+            .is_some_and(|h| h.until_ms.is_none_or(|until| now < until))
     }
 
     /// Announces what a committed change wants announced (§8.7), unless the user is looking
@@ -482,6 +575,9 @@ impl Core {
             restart: cfg.restart,
             timeouts: cfg.timeouts,
             conn_states: Mutex::new(HashMap::new()),
+            holds: Mutex::new(HashMap::new()),
+            uploading: Mutex::new(HashMap::new()),
+            paused: Mutex::new(HashMap::new()),
             presence: watch::channel(Presence::default()).0,
             ui_ready: watch::channel(false).0,
             media: MediaHandles::new(tx.clone()),
@@ -489,7 +585,9 @@ impl Core {
             derive_permits: Arc::new(Semaphore::new(DERIVE_PARALLEL)),
             removing: Mutex::new(std::collections::BTreeSet::new()),
             logout_outcomes: Mutex::new(Some(Vec::new())),
+            lost_history: Mutex::new(std::collections::BTreeMap::new()),
             outcome_seq: std::sync::atomic::AtomicU64::new(0),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             expiry_wake: tokio::sync::Notify::new(),
             calls_wake: tokio::sync::Notify::new(),
             restore_wake: tokio::sync::Notify::new(),
@@ -542,6 +640,7 @@ impl Core {
             commands: tx,
             events,
             media: shared.media.clone(),
+            reads: shared.reads.clone(),
         };
         let mut slots = HashMap::new();
         for (id, uuid, network, plan) in plans {
@@ -645,24 +744,28 @@ async fn reconcile(
                 tracing::info!(account = row.id.0, "finishing an unfinished removal");
                 plans.push((row.id, row.uuid, row.network, Plan::Remove));
             }
+            // The same two with their network off: no supervisor can run them, so they end here
+            // (K-A fix C8): the removal tells the outcome kept on the row, the unlink ends
+            // logged out with the chats kept.
+            AccountState::Removing => {
+                tracing::info!(
+                    account = row.id.0,
+                    "finishing a removal with the network off"
+                );
+                crate::networks::finish_removal(sh, row);
+            }
+            AccountState::Unlinking if sh.networks.get(row.network).is_none() => {
+                crate::networks::finish_unlink(sh, row);
+            }
             // An unlink that a quit cut off: one more logout attempt, then logged out with the
             // chats kept.
             AccountState::Unlinking => {
                 tracing::info!(account = row.id.0, "finishing an unfinished unlink");
                 plans.push((row.id, row.uuid, row.network, Plan::Unlink));
             }
-            AccountState::Linking | AccountState::Removing => {
-                tracing::info!(
-                    account = row.id.0,
-                    "discarding an unfinished link or removal"
-                );
+            AccountState::Linking => {
+                tracing::info!(account = row.id.0, "discarding an unfinished link");
                 if let Err(e) = sh.vault.shred(row.uuid).await {
-                    if row.state == AccountState::Removing {
-                        // The shred is what removal promises (§5.2): keep the row and try again
-                        // at the next start rather than drop the account with its secret alive.
-                        tracing::warn!(account = row.id.0, error = %e, "shredding a removed account failed; retried at the next start");
-                        continue;
-                    }
                     tracing::debug!(error = %e, "shred during reconciliation");
                 }
                 if let Err(e) = sh.vault.remove_dir(row.uuid).await {
@@ -827,15 +930,26 @@ async fn run_core(
     // it answers), on their own queue so a decryption never delays a send.
     let (media_q, media_rx) = mpsc::unbounded_channel();
     tokio::spawn(run_ordered(media_rx));
+    // Saves of copies into the user's folders: one at a time, in the order they were asked.
+    let (saves_q, saves_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_ordered(saves_rx));
     let queues = Queues {
         route: ordered,
         lanes: Lanes::default(),
         media: media_q,
+        saves: saves_q,
+        net_order: NetOrder::default(),
     };
     while let Some(msg) = rx.recv().await {
         slots.retain(|_, s| !s.task.is_finished());
         match msg {
             Internal::Ui(cmd) => ui_command(&sh, &mut slots, &queues, cmd).await,
+            Internal::Query(Query::SafetyNumber { account, user }, reply) => {
+                let answer = ask_safety(&sh, &slots, account, user);
+                tokio::spawn(async move {
+                    let _ = reply.send(answer.await);
+                });
+            }
             Internal::Query(q, reply) => {
                 let sh = sh.clone();
                 tokio::spawn(async move {
@@ -885,8 +999,13 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
+            let holds = sh
+                .holds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             sh.store
-                .read(move |c| query::accounts(c, &states))
+                .read(move |c| query::accounts(c, &states, &holds))
                 .await
                 .map(QueryData::Accounts)
         }
@@ -897,10 +1016,32 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .map(QueryData::Conversations),
         Query::Timeline(q) => {
             let now = sh.now();
+            let sh2 = sh.clone();
+            // The messages of this chat whose upload is reported moving (a snapshot: a change
+            // publishes the row again, `Supervisor::upload_moving`).
+            let uploading: std::collections::HashSet<MessageId> = sh
+                .uploading
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(_, (_, conv))| *conv == q.conv)
+                .map(|(m, _)| *m)
+                .collect();
+            // The identity pause of this chat (a snapshot: a change publishes the head again,
+            // `Supervisor::share_pauses`).
+            let paused = sh
+                .paused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&q.conv)
+                .map(|(_, _, user)| user.clone());
             let (page, media) = sh
                 .store
                 .read(move |c| {
-                    let page = query::timeline(c, &q, now)?;
+                    // A paused account (its network turned off) offers nothing that needs it.
+                    let registered = outbox::network_of(c, q.conv)?
+                        .is_none_or(|(_, kind)| sh2.networks.get(kind).is_some());
+                    let page = query::timeline(c, &q, now, registered, &uploading, paused)?;
                     let media = query::page_media(c, &page)?;
                     Ok((page, media))
                 })
@@ -915,11 +1056,90 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .read(move |c| query::conversation(c, id))
             .await
             .map(|d| QueryData::Conversation(d.map(Box::new))),
+        Query::Person { account, user } => {
+            let (detail, kind) = sh
+                .store
+                .read(move |c| {
+                    Ok((
+                        query::person(c, account, &user)?,
+                        query::account_network(c, account)?,
+                    ))
+                })
+                .await?;
+            // A static capability of the network (P5a critic F5); a network that is not
+            // registered at this start (turned off) offers nothing.
+            let net = kind.and_then(|k| network(sh, k).ok());
+            let safety = net.as_ref().is_some_and(|n| n.descriptor().safety_numbers);
+            Ok(QueryData::Person(detail.map(|mut d| {
+                d.safety_numbers = safety;
+                d.safety_waits = sends_wait_for(sh, d.account, &d.user);
+                // P5b: the number rule is `LinkState::of`'s; the network only formats.
+                d.link = match net.as_ref() {
+                    Some(n) => {
+                        LinkState::of(&d, n.contact_links(), |num| n.contact_link(&d.user, num))
+                    }
+                    None => LinkState::Hidden,
+                };
+                // P5c: the same number rule, and the profile name (SC1).
+                let cards = net.as_ref().is_some_and(|n| n.descriptor().contact_cards);
+                d.share = ShareState::of(&d, cards);
+                Box::new(d)
+            })))
+        }
+        Query::Group(id) => sh
+            .store
+            .read(move |c| query::group(c, id))
+            .await
+            .map(|d| QueryData::Group(d.map(Box::new))),
+        Query::ChatMedia(q) => {
+            let (page, media) = sh
+                .store
+                .read(move |c| {
+                    let page = query::chat_media(c, &q)?;
+                    let media = query::chat_media_handles(c, &page)?;
+                    Ok((page, media))
+                })
+                .await?;
+            // As for a timeline page: `image://kourier/thumb/<id>` of a square needs its handle.
+            for m in media {
+                sh.register_media(m);
+            }
+            Ok(QueryData::ChatMedia(page))
+        }
         Query::Attachment(id) => sh
             .store
             .read_media(move |c| query::attachment(c, id))
             .await
             .map(QueryData::Attachment),
+        Query::SaveFacts(id) => {
+            let facts = sh
+                .store
+                .read_media(move |c| query::save_facts(c, id))
+                .await?;
+            let Some(mut facts) = facts else {
+                return Ok(QueryData::SaveFacts(None));
+            };
+            let entry = sh.media.resolve(id).await?;
+            if let Some(file) = entry.and_then(|e| e.file) {
+                facts.sniffed = tokio::task::spawn_blocking(move || {
+                    use std::io::Read as _;
+                    let key = kourier_blob::FileKey::from_bytes(*file.key.expose());
+                    let mut reader = kourier_blob::BlobReader::open(&file.path, &key).ok()?;
+                    let mut head = [0u8; 16];
+                    let mut got = 0;
+                    while got < head.len() {
+                        match reader.read(&mut head[got..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got += n,
+                        }
+                    }
+                    kourier_media::sniff_mime(&head[..got]).map(str::to_owned)
+                })
+                .await
+                .map_err(|_| CoreError::Stopped)?;
+            }
+            Ok(QueryData::SaveFacts(Some(facts)))
+        }
         Query::FilePlan(q) => {
             let conv = q.conv;
             let rules = sh
@@ -928,10 +1148,26 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
                 .await?
                 .ok_or(CoreError::UnknownConversation(conv))?;
             let paths = q.paths.into_inner();
-            // The files are only looked at, off the async threads: 64 bytes of each.
+            // What the network states it cleans of a picture's location (LOC, N9). A network
+            // that is not registered (paused, off) states nothing: the verdict asks.
+            let cleaned = network(sh, rules.network)
+                .ok()
+                .and_then(|n| n.descriptor().cleaned_pictures.clone());
+            // The files are only looked at, off the async threads: 64 bytes of each, and the
+            // look for a location (bounded, kept by file).
             tokio::task::spawn_blocking(move || {
                 let features = rules.features.as_ref();
                 let (seen, refused) = import::inspect_all(&paths, &q.as_file, rules.max, features);
+                let location = seen
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| match s {
+                        Some(s) if !refused.iter().any(|r| r.index == i) => {
+                            s.leaves_with_location(cleaned.as_ref())
+                        }
+                        _ => false,
+                    })
+                    .collect();
                 // The plan of what would be sent, in the positions of the selection.
                 let sendable: Vec<(usize, &import::Inspected)> = seen
                     .iter()
@@ -956,6 +1192,7 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
                     kinds: seen.iter().map(|s| s.as_ref().map(|s| s.content)).collect(),
                     refused,
                     plan,
+                    location,
                 })
             })
             .await
@@ -967,6 +1204,16 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .await
             .map(QueryData::Revisions),
         Query::ExpiryPolicy => Ok(QueryData::ExpiryPolicy(sh.expiry_policy())),
+        // Answered through the account's actor (`ask_safety`) before `run_query`.
+        Query::SafetyNumber { .. } => Ok(QueryData::SafetyNumber {
+            answer: Err(SafetyUnavailable::NotRunning),
+            waits: false,
+        }),
+        Query::QuietNotices => sh
+            .store
+            .read(crate::notices::shown)
+            .await
+            .map(QueryData::QuietNotices),
     }
 }
 
@@ -1021,6 +1268,206 @@ struct Queues {
     lanes: Lanes,
     /// `OpenMedia` / `CloseMedia`.
     media: mpsc::UnboundedSender<Ordered>,
+    /// `SaveAttachment`: a copy of a big file takes seconds, and it never delays an open.
+    saves: mpsc::UnboundedSender<Ordered>,
+    /// The order in which the network hears of what the UI changed in one conversation.
+    net_order: NetOrder,
+}
+
+/// The order in which the network is told of the changes of one conversation (R1, t3 11e): the
+/// clearing of a mark when the chat is read (`mark_read`) and a change the UI asks for
+/// (`change_conversation`) each run in a task of their own, and the network applies what it
+/// hears in the order it hears it. Without this, a mark set right after a chat was read could
+/// reach the network before the clearing, which then came last: the phone ended unmarked and
+/// the row on this side marked. Each command takes its [`Turn`] in `ui_command`, which sees
+/// the commands in the order the UI sent them; the task waits for the turn before it, and only
+/// for the telling, not for the network's answer.
+///
+/// The order is transitive: a turn is over only when the turn before it is. Every task waits
+/// for its turn as its first statement, and a turn that ends without having waited (its task
+/// returned early, failed or never ran) hands the wait on, so a later turn never goes
+/// ahead of an earlier one because a middle one had nothing to tell.
+#[derive(Default)]
+struct NetOrder {
+    /// Per conversation, the end of the turn that was taken last.
+    tails: Mutex<HashMap<ConversationId, oneshot::Receiver<()>>>,
+    /// The marks the UI set (`SetMarkedUnread { true }`) and no reading has taken since, per
+    /// conversation. The row turns marked only when the backend's echo is ingested, so a reading
+    /// right behind the mark would find none to clear and the network would end marked; the
+    /// reading counts this as the mark (R1 fix, `turn_for_reading`). Shared with the
+    /// [`MarkTicket`]s, which forget a mark the backend refused (N-D).
+    marks: Arc<Mutex<MarkBook>>,
+}
+
+/// The marks the UI told the network and no reading has taken, as a COUNTER per conversation
+/// (N-D): two marks in a row are two, so the refusal of one of them (the other may be taken)
+/// does not forget the mark that still stands, and a mark the backend refused is forgotten
+/// (the next reading would otherwise tell "unmarked" for a mark the network never took). A
+/// reading, or a mark taken back, ends the run of marks: it starts a new EPOCH, and the
+/// refusal of a mark of an older epoch (its answer came late) changes nothing.
+#[derive(Default)]
+struct MarkBook {
+    /// The epoch the next run of marks gets.
+    next_epoch: u64,
+    /// Per conversation: the run's epoch and how many of its marks the network has not refused.
+    told: HashMap<ConversationId, (u64, u32)>,
+}
+
+impl MarkBook {
+    /// The UI set a mark: counts it; the run's epoch.
+    fn told(&mut self, conv: ConversationId) -> u64 {
+        let next = &mut self.next_epoch;
+        let run = self.told.entry(conv).or_insert_with(|| {
+            *next += 1;
+            (*next, 0)
+        });
+        run.1 += 1;
+        run.0
+    }
+
+    /// A mark taken back or a reading: the run ends. Whether a mark stood.
+    fn ended(&mut self, conv: ConversationId) -> bool {
+        self.told.remove(&conv).is_some()
+    }
+
+    /// The backend refused a mark of the run `epoch`.
+    fn refused(&mut self, conv: ConversationId, epoch: u64) {
+        if let Some((run, count)) = self.told.get_mut(&conv)
+            && *run == epoch
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.told.remove(&conv);
+            }
+        }
+    }
+}
+
+/// A mark the UI set, until the backend has answered it (N-D): it is counted in
+/// [`NetOrder`]'s [`MarkBook`] from the moment the UI sent it, in the UI's order, and forgotten
+/// by [`MarkTicket::forget`] when the backend refuses it. Dropped before [`MarkTicket::sent`]
+/// (the command failed before it reached the supervisor: nobody was told) it forgets too; after
+/// it only the backend's refusal does.
+struct MarkTicket {
+    marks: Arc<Mutex<MarkBook>>,
+    conv: ConversationId,
+    epoch: u64,
+    /// Forget on drop: the command never reached the supervisor.
+    armed: bool,
+}
+
+impl MarkTicket {
+    /// The command reached the supervisor; the backend's answer decides from here.
+    fn sent(&mut self) {
+        self.armed = false;
+    }
+
+    /// The mark is not (or no more) one the network took: it is not counted any more.
+    fn forget(&mut self) {
+        self.armed = false;
+        self.marks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refused(self.conv, self.epoch);
+    }
+}
+
+impl Drop for MarkTicket {
+    fn drop(&mut self) {
+        if self.armed {
+            self.forget();
+        }
+    }
+}
+
+impl NetOrder {
+    /// The next turn of `conv`, after the one taken before it.
+    fn turn(&self, conv: ConversationId) -> Turn {
+        let (done, tail) = oneshot::channel();
+        let mut tails = self.tails.lock().unwrap_or_else(PoisonError::into_inner);
+        // A turn that is over (its sender is gone) is not waited for and needs no entry.
+        tails.retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        let after = tails.insert(conv, tail);
+        Turn {
+            after,
+            done: Some(done),
+        }
+    }
+
+    /// The turn of a change the UI asks for; a mark it sets is counted for the reading behind
+    /// it (the ticket forgets it again if the backend refuses it) and a mark it takes back ends
+    /// the run. Called in the order the UI sent the commands.
+    fn turn_for_change(
+        &self,
+        conv: ConversationId,
+        change: &kourier_model::ConversationChange,
+    ) -> (Turn, Option<MarkTicket>) {
+        let mut ticket = None;
+        if let kourier_model::ConversationChange::SetMarkedUnread { marked_unread } = change {
+            let mut marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
+            if *marked_unread {
+                ticket = Some(MarkTicket {
+                    marks: self.marks.clone(),
+                    conv,
+                    epoch: marks.told(conv),
+                    armed: true,
+                });
+            } else {
+                marks.ended(conv);
+            }
+        }
+        (self.turn(conv), ticket)
+    }
+
+    /// The turn of a reading, and whether the UI set a mark since the last reading that the
+    /// backend has not refused (which the reading then clears, whether or not the row shows it
+    /// yet). Called in the order the UI sent the commands.
+    fn turn_for_reading(&self, conv: ConversationId) -> (Turn, bool) {
+        let told_mark = self
+            .marks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ended(conv);
+        (self.turn(conv), told_mark)
+    }
+}
+
+/// A command's place in [`NetOrder`]; dropped, it ends the turn (a command that fails before
+/// it tells the network holds nobody up, and one that never waited does not let the turn
+/// after it go before the turn before it).
+struct Turn {
+    after: Option<oneshot::Receiver<()>>,
+    done: Option<oneshot::Sender<()>>,
+}
+
+impl Turn {
+    /// Waits until the turn before this one is over.
+    async fn wait(&mut self) {
+        if let Some(after) = self.after.take() {
+            let _ = after.await;
+        }
+    }
+
+    /// Ends the turn: the network has been told. A turn that never waited ends when the turn
+    /// before it does (a task of its own waits for that); without a runtime nothing is left
+    /// to order and the turn ends at once.
+    fn end(&mut self) {
+        let Some(done) = self.done.take() else { return };
+        if let (Some(after), Ok(runtime)) =
+            (self.after.take(), tokio::runtime::Handle::try_current())
+        {
+            runtime.spawn(async move {
+                let _ = after.await;
+                drop(done);
+            });
+        }
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.end();
+    }
 }
 
 impl Queues {
@@ -1069,6 +1516,7 @@ async fn ui_command(
         UiCommand::UiReady => {
             sh.ui_ready.send_replace(true);
             sh.replay_logout_outcomes();
+            sh.replay_lost_history();
         }
         UiCommand::AddAccount { network, flow } => match add_account(sh, network).await {
             Ok((id, uuid, net)) => {
@@ -1101,8 +1549,27 @@ async fn ui_command(
             }
         }
         UiCommand::RemoveAccount { account } => {
-            if let Err(e) = control(slots, account, Control::Remove) {
-                fail(Some(account), "RemoveAccount", e);
+            match control(slots, account, Control::Remove) {
+                // Counted as being removed from here, not from the moment its supervisor gets
+                // to the command and writes `Removing` (that one may be busy, or still
+                // waiting for its key): a login the UI starts right behind this command (the
+                // window's "Remove and Link Again" sends both) must not be told that this
+                // account is one of the profile's identities (R1 fix 5; the supervisor's
+                // read of the other identities leaves `Shared::removing` out).
+                Ok(()) => {
+                    sh.removing
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(account);
+                }
+                // No supervisor: an account of a network this run does not have (the user
+                // turned it off) is removed here, locally (`networks.rs`); anything else is
+                // refused as before.
+                Err(e) => {
+                    if !crate::networks::remove_without_network(sh, account).await {
+                        fail(Some(account), "RemoveAccount", e);
+                    }
+                }
             }
         }
         UiCommand::Unlink { account } => {
@@ -1135,8 +1602,18 @@ async fn ui_command(
             let sh2 = sh.clone();
             let senders: HashMap<AccountId, mpsc::UnboundedSender<Control>> =
                 slots.iter().map(|(a, s)| (*a, s.control.clone())).collect();
+            // Taken here, in the order the UI sent the commands (see `NetOrder`).
+            let (turn, told_mark) = queues.net_order.turn_for_reading(conv);
+            // The moment the user read the chat, on the core's clock, read in the same
+            // synchronous step as the turn: the reading may wait for its turn behind an earlier
+            // change, and a phone's mark that is merged meanwhile is NEWER than this moment
+            // (`DurableCommand::ChangeConversation::asked_at`, A10a N-C).
+            let asked_at = sh.now();
+            // Counts the send's `reads` down however the task ends, after its events.
+            let done = ReadDone(sh.reads.clone());
             tokio::spawn(async move {
-                if let Err(e) = mark_read(&sh2, &senders, conv).await {
+                let _done = done;
+                if let Err(e) = mark_read(&sh2, &senders, conv, turn, told_mark, asked_at).await {
                     let subject = ActionSubject::Conversation(conv);
                     action_failed(&sh2, None, "MarkRead", e, subject);
                 }
@@ -1146,8 +1623,9 @@ async fn ui_command(
             let sh2 = sh.clone();
             let senders: HashMap<AccountId, mpsc::UnboundedSender<Control>> =
                 slots.iter().map(|(a, s)| (*a, s.control.clone())).collect();
+            let (turn, mark) = queues.net_order.turn_for_change(conv, &change);
             tokio::spawn(async move {
-                let res = change_conversation(&sh2, &senders, conv, change).await;
+                let res = change_conversation(&sh2, &senders, conv, change, turn, mark).await;
                 if let Err((account, e)) = res {
                     let subject = ActionSubject::Conversation(conv);
                     action_failed(&sh2, account, "ChangeConversation", e, subject);
@@ -1172,6 +1650,7 @@ async fn ui_command(
             request,
             paths,
             as_file,
+            with_location,
             caption,
             reply_to,
         } => {
@@ -1182,6 +1661,7 @@ async fn ui_command(
                     request,
                     paths: paths.into_inner(),
                     as_file,
+                    with_location,
                     caption,
                     reply_to,
                 };
@@ -1193,11 +1673,25 @@ async fn ui_command(
                         request,
                         paths: files.paths.into(),
                         as_file: files.as_file,
+                        with_location: files.with_location,
                         caption: files.caption,
                         reply_to,
                         refused: failed.refused,
                     }));
                     action_failed(&sh2, failed.account, "SendFiles", failed.error, subject);
+                }
+            });
+        }
+        UiCommand::SendContact {
+            conv,
+            account,
+            user,
+        } => {
+            let (sh2, senders) = (sh.clone(), senders(slots));
+            queues.compose(sh, Subject::Conversation(conv), async move {
+                if let Err((failed, e)) = send_contact(&sh2, &senders, conv, account, user).await {
+                    let subject = ActionSubject::Conversation(conv);
+                    action_failed(&sh2, failed, "SendContact", e, subject);
                 }
             });
         }
@@ -1218,6 +1712,22 @@ async fn ui_command(
                     Err(e) => {
                         let subject = ActionSubject::Attachment(attachment);
                         action_failed(&sh2, None, "OpenMedia", e, subject);
+                    }
+                }
+            });
+        }
+        UiCommand::SaveAttachment {
+            attachment,
+            target,
+            mode,
+        } => {
+            let sh2 = sh.clone();
+            enqueue(&queues.saves, async move {
+                match save_attachment(&sh2, attachment, target, mode).await {
+                    Ok(bytes) => sh2.emit(UiEvent::AttachmentSaved { attachment, bytes }),
+                    Err(e) => {
+                        let subject = ActionSubject::Attachment(attachment);
+                        action_failed(&sh2, None, "SaveAttachment", e, subject);
                     }
                 }
             });
@@ -1285,8 +1795,9 @@ async fn ui_command(
         }
         UiCommand::SetConversationTimer { conv, timer } => {
             let (sh2, senders) = (sh.clone(), senders(slots));
+            let turn = queues.net_order.turn(conv);
             tokio::spawn(async move {
-                if let Err((account, e)) = set_timer(&sh2, &senders, conv, timer).await {
+                if let Err((account, e)) = set_timer(&sh2, &senders, conv, timer, turn).await {
                     let subject = ActionSubject::Conversation(conv);
                     action_failed(&sh2, account, "SetConversationTimer", e, subject);
                 }
@@ -1337,9 +1848,132 @@ async fn ui_command(
                 }
             });
         }
-        UiCommand::ConfirmIdentity { account, user } => {
-            if let Err(e) = control(slots, account, Control::ConfirmIdentity(user)) {
-                fail(Some(account), "ConfirmIdentity", e);
+        UiCommand::ConfirmIdentity { account, user, key } => {
+            // Handed to the supervisor HERE (in the order of the commands, as `SetVerified`);
+            // only the wait for the backend's answer is spawned. The queues paused on `user`
+            // resume after `Ok` only (the lead's RC6): a refusal (the number changed after it
+            // was shown) leaves them paused, with no flicker, and the page shows the new number.
+            let (reply, answer) = oneshot::channel();
+            let sent = control(
+                slots,
+                account,
+                Control::ConfirmIdentity {
+                    user: user.clone(),
+                    key,
+                    reply,
+                },
+            );
+            let (sh2, senders) = (sh.clone(), senders(slots));
+            tokio::spawn(async move {
+                let result = match sent {
+                    Err(e) => Err(e),
+                    Ok(()) => match answer.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
+                        // Dropped: the actor stopped with the command in hand.
+                        Err(_) => Err(CoreError::InvalidState("the account is not running")),
+                    },
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(tx) = senders.get(&account) {
+                            let _ = tx.send(Control::Released(user));
+                        }
+                    }
+                    Err(e) => {
+                        let subject = ActionSubject::Person(user);
+                        action_failed(&sh2, Some(account), "ConfirmIdentity", e, subject);
+                    }
+                }
+            });
+        }
+        UiCommand::SetVerified {
+            account,
+            user,
+            verified,
+            key,
+        } => {
+            // Handed to the supervisor HERE, not from a spawned task (critic H3): its control
+            // channel and the actor's command loop are FIFO, so a Mark and a Clear clicked one
+            // after the other reach the backend, and the phone, in that order. Only the wait
+            // for the answer is spawned.
+            let (reply, answer) = oneshot::channel();
+            let cmd = Command::SetVerified {
+                user: user.clone(),
+                verified,
+                key,
+                reply,
+            };
+            let sent = control(slots, account, Control::Backend(cmd));
+            let (sh2, senders) = (sh.clone(), senders(slots));
+            tokio::spawn(async move {
+                let result = match sent {
+                    Err(e) => Err(e),
+                    Ok(()) => match answer.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
+                        // Dropped: the account is not linked or its actor stopped.
+                        Err(_) => Err(CoreError::InvalidState("the account is not running")),
+                    },
+                };
+                match result {
+                    // Whatever the state was (critic F2): a DEFAULT contact's paused send has
+                    // no other way out, as with `ConfirmIdentity`.
+                    Ok(()) => {
+                        if let Some(tx) = senders.get(&account) {
+                            let _ = tx.send(Control::Released(user));
+                        }
+                    }
+                    Err(e) => {
+                        let subject = ActionSubject::Person(user);
+                        action_failed(&sh2, Some(account), "SetVerified", e, subject);
+                    }
+                }
+            });
+        }
+        UiCommand::SetRoamingWrites { account, on } => {
+            // Handed to the supervisor HERE, in the order of the commands (a switch turned on and
+            // off again reaches the backend in that order); only the wait for the backend's
+            // answer is spawned. The core changes nothing itself: the backend states the new
+            // value in the account's caps. An account that is not running or linked drops the
+            // command (`Control::Backend`) and answers a failure, as `SetVerified`.
+            let (reply, answer) = oneshot::channel();
+            let sent = control(
+                slots,
+                account,
+                Control::Backend(Command::SetRoamingWrites { on, reply }),
+            );
+            let sh2 = sh.clone();
+            tokio::spawn(async move {
+                let result = match sent {
+                    Err(e) => Err(e),
+                    Ok(()) => match answer.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
+                        // Dropped: the account is not linked or its actor stopped.
+                        Err(_) => Err(CoreError::InvalidState("the account is not running")),
+                    },
+                };
+                if let Err(e) = result {
+                    action_failed(
+                        &sh2,
+                        Some(account),
+                        "SetRoamingWrites",
+                        e,
+                        ActionSubject::None,
+                    );
+                }
+            });
+        }
+        UiCommand::RefreshContact { account, user } => {
+            // A page asked for a fresher profile: the backend decides whether it is due
+            // (Signal: not within a day), a running linked one only.
+            if let Err(e) = control(
+                slots,
+                account,
+                Control::Backend(Command::RefreshContact { user }),
+            ) {
+                fail(Some(account), "RefreshContact", e);
             }
         }
         UiCommand::SubmitChallenge { account, answer } => {
@@ -1402,6 +2036,12 @@ async fn ui_command(
                 fail(None, "SetExpiryPolicy", e);
             }
         }
+        // Awaited like the option above: the list read right behind it has the new order.
+        UiCommand::SetQuietNotices { shown } => {
+            if let Err(e) = set_quiet_notices(sh, shown).await {
+                fail(None, "SetQuietNotices", e);
+            }
+        }
         UiCommand::ReleaseMemory => {
             let sh2 = sh.clone();
             tokio::spawn(async move {
@@ -1410,12 +2050,75 @@ async fn ui_command(
                 }
             });
         }
+        // The one query a backend answers (P5a): it needs the account's control channel,
+        // which `run_query` has not.
+        UiCommand::Query {
+            token,
+            query: Query::SafetyNumber { account, user },
+        } => {
+            let answer = ask_safety(sh, slots, account, user);
+            let sh2 = sh.clone();
+            tokio::spawn(async move {
+                let result = answer.await.map_err(Arc::new);
+                sh2.emit(UiEvent::QueryResult { token, result });
+            });
+        }
         UiCommand::Query { token, query } => {
             let sh2 = sh.clone();
             tokio::spawn(async move {
                 let result = run_query(&sh2, query).await.map_err(Arc::new);
                 sh2.emit(UiEvent::QueryResult { token, result });
             });
+        }
+    }
+}
+
+/// Whether a queue of `account` waits for the user to confirm `user`'s safety number (a
+/// snapshot of [`Shared::paused`]): what the safety-number answer and the person's page say.
+fn sends_wait_for(sh: &Shared, account: AccountId, user: &UserId) -> bool {
+    sh.paused
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .any(|(a, _, u)| *a == account && u == user)
+}
+
+/// The answer to [`Query::SafetyNumber`]: an account without a running, linked actor (no
+/// slot, or the command dropped) is `NotRunning`, its own sentence (critic M7), never the
+/// backend's "no key yet".
+///
+/// The command is handed to the supervisor at once (in the order of the core's commands); the
+/// returned future only waits for the answer. `waits` is read from [`Shared::paused`] when the
+/// answer is there (P5a BQ-3): whether sends to `user` wait for the user's confirm.
+fn ask_safety(
+    sh: &Arc<Shared>,
+    slots: &HashMap<AccountId, Slot>,
+    account: AccountId,
+    user: UserId,
+) -> impl Future<Output = Result<QueryData>> + Send + 'static {
+    let (reply, answer) =
+        oneshot::channel::<std::result::Result<SafetyAnswer, kourier_model::BackendError>>();
+    let cmd = Command::SafetyNumber {
+        user: user.clone(),
+        reply,
+    };
+    let sent = control(slots, account, Control::Backend(cmd)).is_ok();
+    let sh = sh.clone();
+    async move {
+        let not_running = QueryData::SafetyNumber {
+            answer: Err(SafetyUnavailable::NotRunning),
+            waits: false,
+        };
+        if !sent {
+            return Ok(not_running);
+        }
+        match answer.await {
+            Ok(Ok(answer)) => {
+                let waits = sends_wait_for(&sh, account, &user);
+                Ok(QueryData::SafetyNumber { answer, waits })
+            }
+            Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
+            Err(_) => Ok(not_running),
         }
     }
 }
@@ -1480,7 +2183,38 @@ async fn set_expiry_policy(sh: &Arc<Shared>, policy: ExpiryPolicy) -> Result<()>
     for (_, ch) in changed {
         emit_changes(sh, &ch);
     }
+    // "Erase" erases what is due before the command returns, in the sweeper's own batches: a
+    // "keep" right behind it (the next command, which waits for this one) must not find the
+    // rows only hidden and show them again (the sweeper's look could come after it). A failed
+    // batch is left to the sweeper, which retries.
+    if policy == ExpiryPolicy::EraseByLocalClock {
+        while let Some(true) = expiry::sweep_once(sh).await {}
+    }
     sh.expiry_wake.notify_one();
+    Ok(())
+}
+
+/// [`UiCommand::SetQuietNotices`]: the choice is stored and, in the same transaction, every
+/// conversation gets the sort time its newest listed row says ([`crate::notices::set`]);
+/// then the conversations whose sort time changed are announced. Nothing outside SQL reads
+/// the choice (ingest never does: a quiet notice opens nothing whatever it says), so there
+/// is no copy of it in memory to keep in step.
+async fn set_quiet_notices(sh: &Arc<Shared>, shown: bool) -> Result<()> {
+    let changed = sh
+        .store
+        .write(Priority::High, GLOBAL_LANE, move |c| {
+            crate::notices::set(c, shown)
+        })
+        .await?;
+    // (No ids and no names in the log.)
+    tracing::info!(
+        shown,
+        conversations = changed.len(),
+        "the quiet notices option changed"
+    );
+    let mut ch = Changes::default();
+    ch.conversations.extend(changed);
+    emit_changes(sh, &ch);
     Ok(())
 }
 
@@ -1537,6 +2271,7 @@ struct SendFiles {
     request: RequestId,
     paths: Vec<PathBuf>,
     as_file: Vec<bool>,
+    with_location: Vec<bool>,
     caption: Option<Text>,
     reply_to: Option<MessageId>,
 }
@@ -1617,6 +2352,65 @@ async fn send_text(
     Ok(())
 }
 
+/// P5c: a contact card of `user` (a person of `account`) into `conv`. The checks, in order: the
+/// chat's account is `account` (a card never leaves through another account), its network
+/// sends cards, the person's page allows one ([`ShareState::of`]: not the user, a number the
+/// page shows, a profile name); then the card is built from the contact row here, in the core,
+/// and queued like a text (`outbox::enqueue_contact`). Nothing about the card is logged.
+async fn send_contact(
+    sh: &Arc<Shared>,
+    senders: &HashMap<AccountId, mpsc::UnboundedSender<Control>>,
+    conv: ConversationId,
+    account: AccountId,
+    user: UserId,
+) -> std::result::Result<(), Failure> {
+    let (conv_account, kind) = sh
+        .store
+        .read(move |c| outbox::network_of(c, conv))
+        .await
+        .map_err(|e| (None, e))?
+        .ok_or((None, CoreError::UnknownConversation(conv)))?;
+    if conv_account != account {
+        return Err((
+            Some(conv_account),
+            CoreError::InvalidInput("a contact card goes only to a chat of its own account"),
+        ));
+    }
+    let net = network(sh, kind).map_err(|e| (Some(account), e))?;
+    if !net.descriptor().contact_cards {
+        return Err((
+            Some(account),
+            CoreError::refused(
+                Refusal::NotAllowedHere,
+                "the network sends no contact cards",
+            ),
+        ));
+    }
+    let detail = sh
+        .store
+        .read(move |c| query::person(c, account, &user))
+        .await
+        .map_err(|e| (Some(account), e))?
+        .ok_or((Some(account), CoreError::InvalidInput("unknown person")))?;
+    let card = detail.contact_card().ok_or((
+        Some(account),
+        CoreError::InvalidInput("this person's page offers no contact card"),
+    ))?;
+    let now = sh.now();
+    let written = sh
+        .store
+        .write(Priority::High, lane(account), move |c| {
+            outbox::enqueue_contact(c, net.as_ref(), conv, card, now)
+        })
+        .await
+        .map_err(|e| (Some(account), e))?;
+    emit_changes(sh, &written.changes);
+    if let Some(tx) = senders.get(&written.account) {
+        let _ = tx.send(Control::Outbox(Signal::Kick));
+    }
+    Ok(())
+}
+
 /// §4.8 step 5 "Retry".
 async fn retry_message(
     sh: &Arc<Shared>,
@@ -1629,15 +2423,16 @@ async fn retry_message(
         .await
         .map_err(|e| (None, e))?
         .ok_or((None, CoreError::refused(Refusal::Gone, "unknown message")))?;
-    let scope = network(sh, kind)
-        .map_err(|e| (Some(account), e))?
-        .descriptor()
-        .msg_id_scope;
+    let rules = NetRules::of(
+        network(sh, kind)
+            .map_err(|e| (Some(account), e))?
+            .descriptor(),
+    );
     let now = sh.now();
     let written = sh
         .store
         .write(Priority::High, lane(account), move |c| {
-            outbox::retry(c, scope, message, now)
+            outbox::retry(c, rules, message, now)
         })
         .await
         .map_err(|e| (Some(account), e))?;
@@ -1660,25 +2455,47 @@ async fn cancel_message(
         .await
         .map_err(|e| (None, e))?
         .ok_or((None, CoreError::refused(Refusal::Gone, "unknown message")))?;
-    let scope = network(sh, kind)
-        .map_err(|e| (Some(account), e))?
-        .descriptor()
-        .msg_id_scope;
+    // A take-back reaches nobody and needs no network: also of a paused account (its network
+    // turned off), where the scope only matters to rows the ingest writes (K-A fix C2).
+    let scope = match network(sh, kind) {
+        Ok(net) => net.descriptor().msg_id_scope,
+        Err(CoreError::UnknownNetwork(_)) => kourier_model::MsgIdScope::default(),
+        Err(e) => return Err((Some(account), e)),
+    };
     let now = sh.now();
-    let written = sh
+    // The set of reported uploads is read INSIDE the write: the rule (`actions::stoppable`)
+    // is judged on the row as the write finds it.
+    let shared = Arc::clone(sh);
+    let cancelled = sh
         .store
         .write(Priority::High, lane(account), move |c| {
-            outbox::cancel(c, scope, message, now)
+            let uploading = shared
+                .uploading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&message);
+            outbox::cancel(c, scope, message, now, uploading)
         })
         .await
         .map_err(|e| (Some(account), e))?;
+    let (written, asked) = match cancelled {
+        outbox::Cancelled::TakenBack(written) => (written, false),
+        outbox::Cancelled::Asked(written) => (written, true),
+    };
     let dir = sh
         .blob_dir_of(account)
         .await
         .map_err(|e| (Some(account), e))?;
     sh.publish_local(account, &dir, written.changes).await;
     if let Some(tx) = senders.get(&account) {
-        let _ = tx.send(Control::Outbox(Signal::Kick));
+        // A stop is asked of the backend by the account's dispatcher; a take-back only frees
+        // the chat's queue.
+        let signal = if asked {
+            Signal::Abort(message)
+        } else {
+            Signal::Kick
+        };
+        let _ = tx.send(Control::Outbox(signal));
     }
     Ok(())
 }
@@ -1726,7 +2543,10 @@ async fn set_timer(
     senders: &HashMap<AccountId, mpsc::UnboundedSender<Control>>,
     conv: ConversationId,
     timer: Option<Duration>,
+    mut turn: Turn,
 ) -> std::result::Result<(), Failure> {
+    // First, before a refusal or an error can end the turn (`NetOrder`).
+    turn.wait().await;
     let found = sh
         .store
         .read(move |c| {
@@ -1760,7 +2580,8 @@ async fn set_timer(
         ));
     }
     let change = kourier_model::ConversationChange::SetTimer { timer };
-    change_conversation(sh, senders, conv, change).await
+    // A timer is no mark: no ticket.
+    change_conversation(sh, senders, conv, change, turn, None).await
 }
 
 /// Stores or clears the composer draft (core-local).
@@ -1869,22 +2690,44 @@ async fn add_account(
     Ok((id, uuid, net))
 }
 
+/// Counts one `MarkRead` of [`Shared::reads`] down when dropped: at the end of its task,
+/// after [`mark_read`] emitted the reading's events (an early return, an error or a panic
+/// count it down too, so a screenshot never waits for a read that ended).
+struct ReadDone(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ReadDone {
+    fn drop(&mut self) {
+        // Every `UiCommand` reaches the core through `CoreHandle::send`, which counted it.
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn mark_read(
     sh: &Arc<Shared>,
     senders: &HashMap<AccountId, mpsc::UnboundedSender<Control>>,
     conv: ConversationId,
+    mut turn: Turn,
+    told_mark: bool,
+    asked_at: i64,
 ) -> Result<()> {
+    // First, before an early return can end the turn: after what the UI asked for in this
+    // conversation before the reading (and before what it asks for after it: those wait for
+    // this turn). The reading decides whether there is a mark to clear only now, so a mark
+    // the UI set right before it has been told to the network (`NetOrder`).
+    turn.wait().await;
     let account = sh
         .store
         .read(move |c| query::conversation_key(c, conv))
         .await?
         .ok_or(CoreError::UnknownConversation(conv))?
         .0;
+    // `now` is the time of the read state and of the `AfterRead` timers (after the wait);
+    // `asked_at` is the time the user asked (before it).
     let now = sh.now();
     let done = sh
         .store
         .write(Priority::High, lane(account), move |c| {
-            local::mark_read(c, conv, now)
+            local::mark_read(c, conv, now, asked_at, told_mark)
         })
         .await?;
     let Some(done) = done else { return Ok(()) };
@@ -1892,9 +2735,14 @@ async fn mark_read(
     sh.expiry_wake.notify_one();
     failpoint::hit(FAILPOINT_AFTER_PENDING_COMMAND);
     if let Some(tx) = senders.get(&done.account) {
+        // The commands the reading stored (A10a: for an account whose caps state
+        // `roaming_writes`, the clearing of the mark is one of them, durable: resent from
+        // `pending_commands` at every start until the backend answers `CommandPersisted`).
         let _ = tx.send(Control::Durable(done.commands));
-        // The mark another device set is gone here; the network hears of it so the other
-        // devices can follow. Its answer is not waited for: the chat is read on this device
+        // The mark another device set (or the UI itself, whose echo has not come yet) is gone
+        // here; the network hears of it so the other devices can follow. For an account that
+        // does not state `roaming_writes` this is the plain, best-effort form (`mark_cleared`
+        // is only set for it): its answer is not waited for, the chat is read on this device
         // whatever the network says (a backend that cannot write roaming state refuses).
         if let Some(key) = done.mark_cleared {
             let (reply, _) = oneshot::channel();
@@ -1908,6 +2756,7 @@ async fn mark_read(
             }));
         }
     }
+    turn.end();
     sh.emit(UiEvent::ConversationsChanged {
         ids: vec![done.conv],
     });
@@ -1923,7 +2772,12 @@ async fn change_conversation(
     senders: &HashMap<AccountId, mpsc::UnboundedSender<Control>>,
     conv: ConversationId,
     change: kourier_model::ConversationChange,
+    mut turn: Turn,
+    mut mark: Option<MarkTicket>,
 ) -> std::result::Result<(), (Option<AccountId>, CoreError)> {
+    // First, before an error can end the turn: after the telling of what came before in this
+    // conversation (`NetOrder`); the network's answer is not part of the turn.
+    turn.wait().await;
     let (account, key) = sh
         .store
         .read(move |c| query::conversation_key(c, conv))
@@ -1933,10 +2787,48 @@ async fn change_conversation(
     let tx = senders
         .get(&account)
         .ok_or((Some(account), CoreError::UnknownAccount(account)))?;
+    // The settings the network keeps for the account's other devices (archive, pin, mute, marked
+    // unread): the core's second line, the backend is the gate. Refused here when the chat's own
+    // account does not state that it writes them (or has the switch off), when the network does
+    // not list the chat, and for the account's one pin too many; the pins are counted per account
+    // (a blended list holds several, and the change goes to the chat's own). Nothing reaches the
+    // backend; the turn ends and a mark that was counted is forgotten when `turn` and `mark` drop.
+    if change.is_roaming() {
+        let probe = change.clone();
+        sh.store
+            .read(move |c| roaming::check(c, conv, &probe))
+            .await
+            .map_err(|e| (Some(account), e))?;
+    }
+    // During the account's send hold a timer change is refused with the reason named (the timer
+    // menu says it too): it is one more message to the network, and it is not queued. The other
+    // changes (archive, pin, mute, block, mark, accept, leave) are not held.
+    if matches!(change, kourier_model::ConversationChange::SetTimer { .. })
+        && sh.account_held(account)
+    {
+        return Err((
+            Some(account),
+            CoreError::refused(
+                Refusal::Held,
+                "the network holds back what is sent from this account for now",
+            ),
+        ));
+    }
     // A timer change is a message of its own on some networks: it gets its id from the
     // allocator of own messages, so the row the backend writes for it cannot be taken for
     // another own message (§4.2 `ChangeConversation`).
     let id = if matches!(change, kourier_model::ConversationChange::SetTimer { .. }) {
+        // A chat that cannot send takes no timer change either: it is one more message to the
+        // network (a message of its own on some networks), refused before an id is allocated
+        // and before anything reaches the backend, by the rule of a new send and of "Send
+        // Again" (`actions::cannot_send`; the timer menu is hidden for such a chat, this is
+        // the safety net for a stale UI or a second front-end).
+        let features = sh
+            .store
+            .read(move |c| outbox::features_of(c, conv))
+            .await
+            .map_err(|e| (Some(account), e))?;
+        crate::actions::cannot_send(features.as_ref()).map_err(|e| (Some(account), e))?;
         let kind = sh
             .store
             .read(move |c| outbox::network_of(c, conv))
@@ -1965,9 +2857,21 @@ async fn change_conversation(
         reply,
     }))
     .map_err(|_| (Some(account), CoreError::UnknownAccount(account)))?;
+    if let Some(mark) = mark.as_mut() {
+        mark.sent();
+    }
+    turn.end();
     match rx.await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err((Some(account), CoreError::from(e))),
+        Ok(Err(e)) => {
+            // N-D: a mark the backend refused is not one the network has; the next reading
+            // must not tell "unmarked" for it. (A dropped reply, below, is not known to be a
+            // refusal: the mark stays counted, and a clearing for nothing is harmless.)
+            if let Some(mark) = mark.as_mut() {
+                mark.forget();
+            }
+            Err((Some(account), CoreError::from(e)))
+        }
         Err(_) => Err((
             Some(account),
             CoreError::InvalidState("the account is not running"),
@@ -2070,6 +2974,7 @@ async fn send_files(
         request,
         paths,
         as_file,
+        with_location,
         caption,
         reply_to,
     } = files;
@@ -2091,8 +2996,26 @@ async fn send_files(
     // Every file is looked at before any is copied: all the refusals at once, each with its
     // position, and no gigabytes encrypted for a send that will not happen.
     let (look, flags, max, features) = (paths.clone(), as_file.clone(), rules.max, rules.features);
+    // What the network states it cleans of a picture's location (LOC): a file that would leave
+    // with where it was taken goes only with the user's agreement (`with_location`, BQ1).
+    let cleaned = net.descriptor().cleaned_pictures.clone();
+    let (agreed, c) = (with_location.clone(), cleaned.clone());
     let (seen, refused) = tokio::task::spawn_blocking(move || {
-        import::inspect_all(&look, &flags, max, features.as_ref())
+        let (seen, mut refused) = import::inspect_all(&look, &flags, max, features.as_ref());
+        for (index, s) in seen.iter().enumerate() {
+            let Some(s) = s else { continue };
+            if !refused.iter().any(|r| r.index == index)
+                && s.leaves_with_location(c.as_ref())
+                && !import::flagged(&agreed, index)
+            {
+                refused.push(crate::facade::RefusedFile {
+                    index,
+                    reason: crate::facade::FileRefusal::Location,
+                });
+            }
+        }
+        refused.sort_by_key(|r| r.index);
+        (seen, refused)
     })
     .await
     .map_err(|_| fail(CoreError::Stopped))?;
@@ -2126,7 +3049,11 @@ async fn send_files(
                 bytes: total_bytes,
             }));
         };
-        import::import_files(&d, &paths, &as_file, max, &mut report)
+        let location = import::LocationRule {
+            agreed: &with_location,
+            cleaned: cleaned.as_ref(),
+        };
+        import::import_files(&d, &paths, &as_file, location, max, &mut report)
     })
     .await
     .map_err(|_| fail(CoreError::Stopped))?
@@ -2400,6 +3327,66 @@ async fn open_media(sh: &Arc<Shared>, attachment: kourier_model::AttachmentId) -
     .map_err(|_| CoreError::Stopped)?
 }
 
+/// [`UiCommand::SaveAttachment`]: a plaintext copy of the attachment in the user's folder
+/// (`kourier_blob::save_copy`, on the blocking pool: the Qt thread and the core's task never
+/// wait for the disk). The rule is [`actions::save_attachments`]'s two functions, asked again
+/// on the attachment's own row: the handle may be a moment older than a delete, than the
+/// sweeper hiding the message on an unconfirmed clock, or than the dialog the user took his
+/// time with, and no plaintext copy is made of what is gone for the user. The log says that a
+/// save ran and how big it was (in the writer), never a path or a name.
+async fn save_attachment(
+    sh: &Arc<Shared>,
+    attachment: kourier_model::AttachmentId,
+    target: crate::facade::SaveTarget,
+    mode: kourier_blob::SaveMode,
+) -> Result<u64> {
+    kourier_blob::check_name(&target.name)?;
+    // An absolute folder only: a relative one would be opened against the process's working
+    // directory, which no front-end means (the dialog gives a full path).
+    if !target.dir.is_absolute() {
+        return Err(kourier_blob::SaveError::NoFolder.into());
+    }
+    let entry = sh
+        .media
+        .resolve(attachment)
+        .await?
+        .ok_or(CoreError::refused(Refusal::Gone, "unknown attachment"))?;
+    type Row = (Option<String>, bool, bool, String, bool);
+    let row: Option<Row> = sh
+        .store
+        .read_media(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT m.deleted, m.view_once, m.expiry_hidden, a.state, a.long_text
+                 FROM attachments a JOIN messages m ON m.id = a.message_id WHERE a.id = ?1",
+            )?
+            .query_row([attachment.0], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?)
+        })
+        .await?;
+    let (deleted, view_once, hidden, state, long_text) =
+        row.ok_or(CoreError::refused(Refusal::Gone, "unknown attachment"))?;
+    actions::may_save_message(deleted.as_deref(), view_once, hidden)?;
+    actions::may_save_file(crate::sql::from_json(&state)?, long_text)?;
+    let file = entry
+        .file
+        .clone()
+        .ok_or(CoreError::InvalidInput("the attachment is not downloaded"))?;
+    tokio::task::spawn_blocking(move || {
+        kourier_blob::save_copy(
+            &file.path,
+            &kourier_blob::FileKey::from_bytes(*file.key.expose()),
+            &target.dir,
+            &target.name,
+            mode,
+        )
+    })
+    .await
+    .map_err(|_| CoreError::Stopped)?
+    .map_err(CoreError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2478,5 +3465,155 @@ mod tests {
             .await
             .expect("ran")
             .expect("ran");
+    }
+
+    /// Polls `turn.wait()` for a moment: did the turn before it end?
+    async fn went(turn: &mut Turn) -> bool {
+        tokio::time::timeout(Duration::from_millis(150), turn.wait())
+            .await
+            .is_ok()
+    }
+
+    /// R1 fix: the order of the turns of one conversation is transitive. A turn that ends
+    /// without having waited (its task returned early: a reading with no mark to clear, a
+    /// refused timer, a failed read) must not let the turn after it go before the turn
+    /// before it, or two changes with a reading between them would reach the network in
+    /// either order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_ends_without_waiting_does_not_let_the_next_one_pass_the_first() {
+        let order = NetOrder::default();
+        let c = ConversationId(1);
+        let mut first = order.turn(c);
+        let second = order.turn(c);
+        let mut third = order.turn(c);
+        let mut other = order.turn(ConversationId(2));
+        // The middle turn is dropped at once: it had nothing to tell and never waited.
+        drop(second);
+        assert!(
+            !went(&mut third).await,
+            "the third turn went while the first was still open"
+        );
+        // Another conversation does not wait for it.
+        assert!(went(&mut other).await, "chat 2 waits for nobody");
+        first.wait().await;
+        first.end();
+        assert!(went(&mut third).await, "the first is over: the third goes");
+    }
+
+    /// The same through `end()` (a task that tells nothing but finishes normally), a chain of
+    /// several, and a first turn that is dropped with the others waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_turns_of_a_conversation_end_in_the_order_they_were_taken() {
+        let order = NetOrder::default();
+        let c = ConversationId(7);
+        let mut first = order.turn(c);
+        let mut second = order.turn(c);
+        let mut third = order.turn(c);
+        let mut fourth = order.turn(c);
+        second.end();
+        third.end();
+        assert!(
+            !went(&mut fourth).await,
+            "two ended turns hold nobody up before the first"
+        );
+        // A turn that waited and ended passes the order on as before.
+        first.end();
+        assert!(went(&mut fourth).await);
+        // No runtime: a turn dropped there ends at once and does not panic.
+        let lone = order.turn(c);
+        std::thread::spawn(move || drop(lone))
+            .join()
+            .expect("dropped");
+    }
+
+    /// R1 fix: a mark the UI sets is remembered for the reading behind it, in the UI's order.
+    #[tokio::test]
+    async fn a_reading_behind_a_mark_clears_it_and_only_once() {
+        use kourier_model::ConversationChange::{SetMarkedUnread, SetPinned};
+        let order = NetOrder::default();
+        let (a, b) = (ConversationId(1), ConversationId(2));
+        let mark = |on| SetMarkedUnread { marked_unread: on };
+        assert!(!order.turn_for_reading(a).1, "no mark was set");
+        // The tickets live as long as the commands do (a dropped ticket is a mark that never
+        // reached the network).
+        let _mark_a = order.turn_for_change(a, &mark(true));
+        let _pin_b = order.turn_for_change(b, &SetPinned { pinned: true });
+        assert!(
+            !order.turn_for_reading(b).1,
+            "another kind of change is no mark"
+        );
+        assert!(
+            order.turn_for_reading(a).1,
+            "the mark waits for the reading"
+        );
+        assert!(!order.turn_for_reading(a).1, "and a reading takes it once");
+        // Set and taken back: nothing to clear.
+        let _set = order.turn_for_change(a, &mark(true));
+        let _back = order.turn_for_change(a, &mark(false));
+        assert!(!order.turn_for_reading(a).1);
+    }
+
+    /// N-D: the told marks are a COUNTER per conversation. The refusal of a mark forgets that
+    /// mark only: of two marks in a row the second still stands, and the reading after the
+    /// refusal of the only one tells nothing. A refusal that comes late, after a reading or a
+    /// mark taken back, belongs to an older run of marks and changes nothing of the newer one;
+    /// a command that never reached the supervisor forgets its mark by being dropped, one the
+    /// supervisor took does not.
+    #[tokio::test]
+    async fn the_told_marks_are_counted_and_a_refusal_forgets_only_its_own() {
+        use kourier_model::ConversationChange::SetMarkedUnread;
+        let mark = |on| SetMarkedUnread { marked_unread: on };
+        let order = NetOrder::default();
+        let (a, b) = (ConversationId(1), ConversationId(2));
+        let told = |order: &NetOrder, conv| {
+            let (_turn, ticket) = order.turn_for_change(conv, &mark(true));
+            ticket.expect("a mark has a ticket")
+        };
+
+        // One mark, refused: the reading behind it has nothing to clear.
+        let mut only = told(&order, a);
+        only.sent();
+        only.forget();
+        assert!(!order.turn_for_reading(a).1, "a refused mark is forgotten");
+
+        // Two marks in a row, the first refused: the second stands.
+        let mut first = told(&order, a);
+        let mut second = told(&order, a);
+        first.sent();
+        second.sent();
+        first.forget();
+        assert!(order.turn_for_reading(a).1, "the second mark still stands");
+        assert!(!order.turn_for_reading(a).1, "and a reading takes both");
+        // Refused after the reading took them: nothing to undo, nothing breaks.
+        second.forget();
+        assert!(!order.turn_for_reading(a).1);
+
+        // An answer that comes late does not forget the NEWER run's mark.
+        let mut old = told(&order, b);
+        old.sent();
+        assert!(order.turn_for_reading(b).1, "a reading ends the run");
+        let mut new = told(&order, b);
+        new.sent();
+        old.forget();
+        assert!(
+            order.turn_for_reading(b).1,
+            "the old run's refusal left the new run's mark alone"
+        );
+        let mut again = told(&order, b);
+        again.sent();
+        let (_turn, taken_back) = order.turn_for_change(b, &mark(false));
+        assert!(taken_back.is_none(), "taking a mark back needs no ticket");
+        new.forget();
+        again.forget();
+        assert!(!order.turn_for_reading(b).1);
+
+        // Never reached the supervisor (dropped before `sent`): not counted any more.
+        drop(told(&order, a));
+        assert!(!order.turn_for_reading(a).1, "a mark nobody was told of");
+        // Reached it (`sent`) and dropped: still counted, the answer may be a refusal later.
+        let mut kept = told(&order, a);
+        kept.sent();
+        drop(kept);
+        assert!(order.turn_for_reading(a).1, "an answered-later mark stands");
     }
 }

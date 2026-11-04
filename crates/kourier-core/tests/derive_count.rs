@@ -3,7 +3,7 @@
 //! A screenshot (and any view that wants the final picture) waits for 0, because the thumbnail
 //! changes the picture's URLs once more (its blurhash and dimensions come with it).
 
-mod support;
+use crate::support;
 
 use std::time::{Duration, Instant};
 

@@ -7,7 +7,7 @@
 //! Skips without Node ≥ 24 or the harness's `node_modules` (`KOURIER_REQUIRE_MOCK_HARNESS=1`
 //! fails instead).
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,7 +27,7 @@ const BRUNO_AVATAR: &[u8] = b"\x89PNG\r\n\x1a\nBruno";
 async fn rows(app: &App, account: AccountId, archived: bool) -> Vec<ConversationRow> {
     let query = ConversationListQuery {
         account: Some(account),
-        archived,
+        archived: Some(archived),
         limit: 100,
         ..ConversationListQuery::default()
     };

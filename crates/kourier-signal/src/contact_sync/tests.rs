@@ -358,3 +358,65 @@ fn an_address_book_photo_replaces_a_profile_picture_only_when_the_setting_prefer
     assert!(!takes_contact_photo(Some(Source::Profile), false, false));
     assert!(takes_contact_photo(Some(Source::Profile), false, true));
 }
+
+/// P1 F3: the address book is an input of the number rule. A full sync that no longer names a
+/// person whose profile key we hold, who does not share her number, takes the number away from her
+/// page: the core is told the new verdict with the cleared name.
+#[test]
+fn a_full_sync_that_drops_a_person_restates_the_number_verdict() {
+    let fixture = fixture();
+    let (db, account) = (&fixture.db, &fixture.account);
+    let dir = tempfile::tempdir().unwrap();
+    let wake = Rc::new(Notify::new());
+    let carol = Aci::from(uuid::Uuid::from_u128(0xca01));
+    let carol_user = aci_user_id(carol).unwrap();
+    db.zone(|tx| -> Result<()> {
+        peers::store_profile_key(tx, carol, &[0x42; 32], 1)?;
+        Ok(())
+    })
+    .unwrap();
+    let apply = |contacts: Vec<Parsed>, now: i64| {
+        let contacts: Vec<_> = contacts
+            .iter()
+            .filter_map(|p| checked(account, p))
+            .collect();
+        db.zone(|tx| {
+            apply_zone(
+                tx,
+                account,
+                dir.path(),
+                &contacts,
+                &HashMap::new(),
+                Some(true),
+                now,
+                &wake,
+            )
+        })
+        .unwrap();
+        events(db)
+    };
+    let states = |events: &[BackendEvent]| -> Vec<Option<bool>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                BackendEvent::ContactUpsert(p) if p.user == carol_user => Some(p.number_shown),
+                _ => None,
+            })
+            .collect()
+    };
+    // In the address book: shown.
+    let sent = apply(
+        vec![Parsed {
+            details: details(carol, Some("Carol"), Some("+15550133")),
+            avatar: None,
+        }],
+        10,
+    );
+    assert_eq!(states(&sent), [Some(true)]);
+    // The next full sync does not name her: hidden, and the core is told.
+    let sent = apply(Vec::new(), 20);
+    assert_eq!(states(&sent), [Some(false)], "{sent:?}");
+    // Dropped again, nothing changes: nothing is restated.
+    let sent = apply(Vec::new(), 30);
+    assert!(states(&sent).is_empty(), "{sent:?}");
+}

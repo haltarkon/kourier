@@ -51,9 +51,11 @@ QQC2.ScrollView {
     property ReactionPicker pickerPopup: null
     // One of the message popups is open.
     readonly property bool popupOpen: menu.visible || whoReacted.visible || (root.pickerPopup !== null && root.pickerPopup.visible)
-    // The list of rows and the context menu (tests drive them with input events).
+    // The list of rows, the context menu and the list of who reacted (tests drive them with
+    // input events).
     readonly property alias rowList: list
     readonly property alias messageMenu: menu
+    readonly property alias reactionsPopup: whoReacted
 
     function ensurePicker(): ReactionPicker {
         if (root.pickerPopup === null) {
@@ -64,14 +66,22 @@ QQC2.ScrollView {
 
     // Escape in the timeline: the keyboard focus goes back to the composer.
     signal composerRequested
+    // A sender's name or picture, or a mention, asks for that person's page (a user id).
+    signal personRequested(string user)
+    signal safetyRequested(string user)
 
     QQC2.ScrollBar.horizontal.policy: QQC2.ScrollBar.AlwaysOff
+
+    // A page opened from this view's message menu (a sender's or a mentioned person's) keeps the
+    // row the menu was about as the list's current row while the page is open: the keyboard comes
+    // back to it when the page closes (`ChatPage.closeDetails`).
+    property bool keepCurrent: false
 
     onPopupOpenChanged: {
         if (!root.popupOpen) {
             TimelineActions.activeMessage = 0;
             // A menu entry moved the keyboard on (Reply and Edit go to the composer).
-            if (!list.activeFocus) {
+            if (!list.activeFocus && !root.keepCurrent) {
                 list.dropCurrent();
             }
         }
@@ -313,6 +323,13 @@ QQC2.ScrollView {
         currentIndex: -1
         activeFocusOnTab: true
         keyNavigationEnabled: false
+        // The list's own way of keeping its current row in view is off. It moves the view after
+        // an invisible item that glides to the current row at 400 px/s, from the key until the
+        // next write of `contentY`: the view goes on moving by itself after the key, and what is
+        // being read moves with it. A row that has no delegate yet (behind a message taller
+        // than the cache) starts that glide from a guess made of the average row height, so
+        // Up could land anywhere in the chat. `makeCurrent` brings the row into view at once.
+        highlightFollowsCurrentItem: false
         Accessible.role: Accessible.List
         Accessible.name: L10n.i18nc("@info accessible", "Messages")
 
@@ -376,20 +393,36 @@ QQC2.ScrollView {
         // BottomToTop list changes `contentY` with its height to keep its bottom edge
         // where it is, before it says that its height changed (and at the very end of the
         // content it does not get there: the bounds it checks against are still those of
-        // the old height).
-        function moved(): void {
+        // the old height). `during`: called by `realign` inside a layout that a write of
+        // `contentY` set off, before the list said that `contentY` changed (see there).
+        function moved(during: bool): void {
             const edge = list.contentY + list.height;
             if (Math.abs(edge - list.edge) < 0.01) {
                 return;
             }
             const up = edge < list.edge;
+            const by = edge - list.edge;
             list.edge = edge;
             if (list.own > 0 || list.height !== list.tall) {
                 return;
             }
-            list.held = null;
             if (up && !list.atNewest()) {
                 root.followNewest = false;
+            }
+            // The place the user moved the view to is held at once, not only when `rest`
+            // comes: a change of the content laid out in between (a row that arrives in the
+            // turn of a wheel step, a row that grows in a polish that runs first, a polish
+            // that rounds `contentY`) would else be taken for where the user left the view,
+            // and what was being read would stay moved by it. Inside a layout the rows are
+            // not back in place yet: the held row moves with the view, and `realign` puts
+            // back what the layout moved. At the newest message nothing is held: `rest`
+            // makes the view follow, and what arrives meanwhile may push.
+            if (list.following() || (!App.timeline.hasNewer && list.atNewest())) {
+                list.held = null;
+            } else if (during) {
+                list.heldAt -= by;
+            } else {
+                list.hold();
             }
             Qt.callLater(list.rest);
         }
@@ -406,23 +439,49 @@ QQC2.ScrollView {
             if (!App.timeline.hasNewer && list.atNewest()) {
                 root.followNewest = true;
             }
-            if (!list.following() && list.held === null) {
+            if (!list.following()) {
                 list.hold();
             }
         }
 
         // Holds on to the topmost row in the viewport (its top edge may be above it).
         function hold(): void {
+            list.holdOutside(0, -1);
+        }
+
+        // The same, passing over the rows `first` to `last` (the view's own row numbers).
+        function holdOutside(first: int, last: int): void {
             list.held = null;
             const x = list.width / 2;
             const end = list.contentY + list.height;
             for (let y = list.contentY + 1; y < end; y += Kirigami.Units.gridUnit) {
                 const item = list.itemAt(x, y);
-                if (item !== null) {
-                    list.heldAt = item.y - list.contentY;
-                    list.held = item;
-                    return;
+                if (item === null) {
+                    continue;
                 }
+                if (first <= last) {
+                    const at = list.indexAt(x, y);
+                    if (at >= first && at <= last) {
+                        continue;
+                    }
+                }
+                list.heldAt = item.y - list.contentY;
+                list.held = item;
+                return;
+            }
+        }
+
+        // Rows `first` to `last` are about to go. When the held row is one of them, the view
+        // holds on to the topmost row in view that stays, before the list lays the removal
+        // out: the delegate of a row that went is destroyed (leaving `null` in `held`), and
+        // a change laid out after that would move what is being read with nothing to hold.
+        function spare(first: int, last: int): void {
+            if (list.held === null || list.following()) {
+                return;
+            }
+            const at = list.indexAt(list.width / 2, list.held.y + list.held.height / 2);
+            if (at >= first && at <= last) {
+                list.holdOutside(first, last);
             }
         }
 
@@ -449,13 +508,40 @@ QQC2.ScrollView {
             } else if (list.held === null) {
                 list.rest();
             } else {
-                const y = list.bounded(list.held.y - list.heldAt);
-                if (Math.abs(y - list.contentY) >= 0.5) {
-                    list.own += 1;
-                    list.contentY = y;
-                    list.own -= 1;
+                list.realign();
+            }
+        }
+
+        // The view back to where the held row stood in it. The list lays a change out also
+        // inside a write of `contentY` (a wheel step while an arrival waits for its layout:
+        // the view's move makes it refill), before it says that `contentY` changed: that
+        // move of the user's is taken first, else putting the held row back would undo it.
+        function realign(): void {
+            if (list.own === 0) {
+                list.moved(true);
+                if (list.held === null || list.following()) {
+                    return;
                 }
             }
+            const y = list.bounded(list.held.y - list.heldAt);
+            if (Math.abs(y - list.contentY) >= 0.5) {
+                list.own += 1;
+                list.contentY = y;
+                list.layOutAgain();
+                list.own -= 1;
+            }
+        }
+
+        // The rows are laid out once more: at once, or inside a layout at the end of the polish
+        // that runs it, before the frame. `realign` often runs inside the list's loop over its
+        // rows (the held row's `y` below), and its write of `contentY` makes the list fill: a
+        // row leaves the start of the loop's list or joins it while the loop goes on, the loop
+        // passes over a row or takes one twice, and every row after it stands a row off until
+        // the next layout (the one passed over is drawn over its neighbour). A change of this
+        // margin is the one public way to ask for a layout that no model change asks for.
+        function layOutAgain(): void {
+            list.displayMarginEnd = 1 - list.displayMarginEnd;
+            list.forceLayout();
         }
 
         // `y` as a position of the view, inside the content.
@@ -490,10 +576,18 @@ QQC2.ScrollView {
 
         onCountChanged: list.keep()
         onContentHeightChanged: list.keep()
-        onContentYChanged: list.moved()
+        onContentYChanged: list.moved(false)
+        // The height changed (the composer is the page's footer: an edit starts, a line is added,
+        // the reply banner comes, the window is resized). The list reacts to it inside the
+        // layout of this frame, wrongly in both modes (at the end of its content it stops at the
+        // bounds of the old height and leaves the newest row under the composer; with a row held
+        // it keeps its bottom edge and moves the row being read), and a correction made one
+        // event later (`keep`) would come after that frame was drawn. So the view is put back at
+        // once, here, like the held row's own `y` below; `keep` finds the rest.
         onHeightChanged: {
             list.tall = list.height;
             list.edge = list.contentY + list.height;
+            list.settle();
             list.keep();
         }
         onMovementEnded: {
@@ -544,10 +638,28 @@ QQC2.ScrollView {
             return -1;
         }
 
-        // No current row: a list view keeps its current item in view, which would move the
-        // timeline under the pointer whenever rows change.
+        // No current row.
         function dropCurrent(): void {
             list.currentIndex = -1;
+        }
+
+        // `row` becomes current and comes into view when it is not, by the least move: its top
+        // at the top of the view when it lies above it, its end at the end of the view when it
+        // lies below. Of a row taller than the view the end shows, its newest lines. (Without
+        // `own`: the key is the user's, `moved` decides what the move means for following. A
+        // row without a delegate has a guessed `y`, which still says on which side it lies.)
+        function makeCurrent(row: int): void {
+            list.currentIndex = row;
+            const item = list.currentItem;
+            if (item === null) {
+                return;
+            }
+            const top = item.y - list.contentY;
+            if (item.height > list.height || top + item.height > list.height) {
+                list.positionViewAtIndex(row, ListView.Beginning);
+            } else if (top < 0) {
+                list.positionViewAtIndex(row, ListView.End);
+            }
         }
 
         // Up is older (a higher row), Down newer. The first arrow key makes a row current:
@@ -556,7 +668,7 @@ QQC2.ScrollView {
             if (list.currentIndex < 0) {
                 const row = list.focusedRow();
                 if (row >= 0) {
-                    list.currentIndex = row;
+                    list.makeCurrent(row);
                     return;
                 }
             }
@@ -583,7 +695,7 @@ QQC2.ScrollView {
                 }
             }
             if (i >= 0 && i !== list.currentIndex) {
-                list.currentIndex = i;
+                list.makeCurrent(i);
             }
         }
 
@@ -658,12 +770,15 @@ QQC2.ScrollView {
         // Rows came, went or changed (an arrival, an own send, a page at either end, a
         // message that disappeared, a receipt or a reaction): told here before the list
         // lays the change out, so the view is back in place in the same frame. (The model
-        // replaces all its rows only when none of them stays, `diff::diff_keeping`: a list
-        // that is reset starts again at its newest row.)
+        // replaces all its rows on a large change, `diff::diff_or_reset`: more than 16 rows
+        // and half the list; a list that is reset starts again at its newest row.)
         Connections {
             target: list.model
             function onRowsInserted(parent: var, first: int, last: int): void {
                 list.keep();
+            }
+            function onRowsAboutToBeRemoved(parent: var, first: int, last: int): void {
+                list.spare(first, last);
             }
             function onRowsRemoved(parent: var, first: int, last: int): void {
                 list.keep();
@@ -675,10 +790,18 @@ QQC2.ScrollView {
                 list.keep();
             }
         }
-        // The held row moved in the content while the view stood still.
+        // The held row moved in the content while the view stood still. The layouts inside the
+        // delegates settle in the polish of a frame (a picture's size becomes known, a row
+        // below the reader grows): the row's `y` changes inside it, and a correction made one
+        // event later (`keep`) would come after that frame was drawn, a frame with the whole
+        // viewport moved by the change. So the view moves back at once, here, and `keep`
+        // finds the rest.
         Connections {
             target: list.held
             function onYChanged(): void {
+                if (!list.following() && !list.moving && !root.pinToOldest) {
+                    list.realign();
+                }
                 list.keep();
             }
         }
@@ -786,6 +909,12 @@ QQC2.ScrollView {
         }
         function onReadMoreRequested(message: real): void {
             list.readMore(message);
+        }
+        function onPersonRequested(user: string): void {
+            root.personRequested(user);
+        }
+        function onSafetyRequested(user: string): void {
+            root.safetyRequested(user);
         }
     }
 

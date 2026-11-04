@@ -9,6 +9,11 @@
 //! with a caption is uploaded once and every member's phone decrypts it byte-identical from the
 //! pointer in its sender-key message.
 //!
+//! A contact card in a group (P5c, SD4, [`a_contact_card_sent_to_the_group_reaches_every_member`]):
+//! the card the user shares into a group reaches every member as one sender-key message with the
+//! one card (the profile name as `givenName`, the one shown number), nothing else, and the
+//! phone's transcript carries the same card.
+//!
 //! Read receipts in a group ([`reading_group_messages_tells_each_author`], §6.7 step 6): when
 //! the user reads a group's messages, each author gets one read receipt with the timestamps
 //! of their own messages, sealed, as a 1:1 message that does not name the group; members who
@@ -22,7 +27,7 @@
 //! Skips without Node ≥ 24 or the harness's `node_modules` (`KOURIER_REQUIRE_MOCK_HARNESS=1`
 //! fails instead).
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -33,7 +38,7 @@ use support::harness::{
     CreateGroup, CreatePrimary, DeviceInfo, GroupInfo, Harness, Primary, SendGroupText,
     StorageContact, StorageGroup, StorageSpec,
 };
-use support::{App, WAIT, World, init_tracing, local_env};
+use support::{App, WAIT, World, init_tracing, local_env, user};
 
 /// How long a test waits to be sure something did not arrive.
 const QUIET: Duration = Duration::from_millis(1500);
@@ -314,6 +319,7 @@ async fn a_file_sent_to_the_group_reaches_every_member_from_one_upload() {
     app.send(UiCommand::SendFiles {
         request: Default::default(),
         as_file: Vec::new(),
+        with_location: Vec::new(),
         conv,
         paths: vec![path].into(),
         caption: Some(Text::plain(caption)),
@@ -359,6 +365,119 @@ async fn a_file_sent_to_the_group_reaches_every_member_from_one_upload() {
     assert_eq!(synced["attachments"][0]["digest"], digests[0]);
     app.wait_row_where(conv, "the sent file", |row| {
         matches!(&row.body, Body::Media { caption: Some(c), .. } if c.body == caption)
+            && matches!(row.out_state, Some(OutgoingState::Sent { .. }))
+    })
+    .await;
+    app.stop().await;
+    gw.world.shutdown().await;
+}
+
+/// SD4 (P5c protocol review LOW-4): a card shared into a GROUP goes out on the sender-key path
+/// like a text. Dora (not a member; she shares her number in her profile and writes to us first,
+/// sealed, so her page offers her card) is the person; the user shares her card into the
+/// "Climbing club": each of the three members gets ONE sender-key message whose `contact` is the
+/// card the core built (her profile name as `givenName`, her number as the one MOBILE phone, no
+/// body, no attachments, no avatar), and our phone's transcript carries the same card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contact_card_sent_to_the_group_reaches_every_member() {
+    use crate::signal_share::{assert_fields, chat_with, page_where};
+    use kourier_core::facade::ShareState;
+
+    let Some(gw) = GroupWorld::start().await else {
+        return;
+    };
+    let dora = gw
+        .world
+        .harness
+        .create_primary(&CreatePrimary {
+            phone_number_sharing: Some(true),
+            ..CreatePrimary::named("Dora Weiss")
+        })
+        .await
+        .expect("Dora");
+    let mut app = App::start_with(
+        gw.world.tmp.path(),
+        &gw.world.env,
+        InitialSync::ContactsAndStorage,
+    )
+    .await;
+    let (account, device) = app.link(&gw.world).await;
+    let conv = gw.group_conv(&app, account).await;
+    chat_with(&gw.world, &app, account, &device, &dora, "hello from Dora").await;
+    let dora_id = user(&dora);
+    let page = page_where(&app, account, &dora_id, ShareState::Ready).await;
+    assert!(page.contact_card().is_some(), "a Ready page has a card");
+
+    app.send(UiCommand::SendContact {
+        conv,
+        account,
+        user: dora_id,
+    });
+    let harness = &gw.world.harness;
+    for (i, member) in gw.members.iter().enumerate() {
+        let got = harness
+            .wait_for_group_message(&member.aci, &gw.group.id, Some(&device.device_ref), WAIT)
+            .await
+            .unwrap_or_else(|e| panic!("member {i} got nothing: {e}"));
+        assert_eq!(got.message_type, "SenderKey", "member {i}: the group path");
+        let data = &got.data_message;
+        let cards = data["contact"].as_array().cloned().unwrap_or_default();
+        assert_eq!(cards.len(), 1, "member {i}: one card per message");
+        // The exact shape, as in the 1:1 test (SE3): the same card, and the message the same fields beside
+        // the group's own context (`groupV2`) and without the timer version (a group message has none, as
+        // Desktop's `getGroupV2Info`; `content::in_group` clears it); `$unknown` holds nothing.
+        assert_fields(&cards[0], &["name", "number"], "the card");
+        assert_fields(&cards[0]["name"], &["givenName"], "the card's name");
+        assert_fields(
+            &cards[0]["number"][0],
+            &["type", "value"],
+            "the card's number",
+        );
+        assert_fields(
+            data,
+            &[
+                "contact",
+                "expireTimer",
+                "groupV2",
+                "profileKey",
+                "timestamp",
+            ],
+            "the group message",
+        );
+        assert_eq!(
+            cards[0]["name"]["givenName"].as_str(),
+            Some(dora.profile_name.as_str()),
+            "member {i}: givenName is her profile name"
+        );
+        let numbers = cards[0]["number"].as_array().cloned().unwrap_or_default();
+        assert_eq!(numbers.len(), 1, "member {i}: exactly one number");
+        assert_eq!(
+            numbers[0]["value"].as_str(),
+            dora.e164.as_deref(),
+            "member {i}: the number is hers"
+        );
+        assert!(
+            data["body"].as_str().is_none_or(str::is_empty)
+                && data["attachments"].as_array().is_none_or(Vec::is_empty),
+            "member {i}: a card has no text and no attachments"
+        );
+        assert!(
+            cards[0]["avatar"].is_null(),
+            "member {i}: the card carries no avatar"
+        );
+    }
+    let transcript = harness
+        .wait_for_sync_message(&gw.world.phone.aci, Some(&device.device_ref), "sent", WAIT)
+        .await
+        .expect("transcript");
+    let synced = &transcript.sync_message["content"]["sent"]["message"];
+    assert_eq!(
+        synced["contact"][0]["name"]["givenName"].as_str(),
+        Some(dora.profile_name.as_str()),
+        "our phone's transcript carries the same card"
+    );
+    app.wait_row_where(conv, "the sent card", |row| {
+        matches!(&row.body, Body::Contact(_))
             && matches!(row.out_state, Some(OutgoingState::Sent { .. }))
     })
     .await;

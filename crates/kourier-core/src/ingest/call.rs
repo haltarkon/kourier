@@ -18,7 +18,8 @@
 //! Who may say what ([`CallLine::may_come_from_peer`]): a signal of the other side says only
 //! that an incoming call was started, rings or was missed; anything else from it is refused
 //! as a contract violation, here as in `Envelope::validate`. Answered, declined, unanswered,
-//! every signal of an outgoing call and the delete of a line come from our own devices only.
+//! every signal of an outgoing call and the delete of a line come from our own devices only (a
+//! server that checks deletes has checked a delete of a line as well, `Apply::apply_modifier`).
 //!
 //! A ring's deadline is kept on the local clock and capped
 //! ([`CallLine::on_local_clock`]): the time the signal says it has left, at most
@@ -49,7 +50,9 @@
 //! [`Apply::settle_calls`] turns one past its deadline into a missed one with the same
 //! effects as a signal. A line of a history batch follows the same rule by its `read` flag:
 //! a missed call the phone had not seen (`read: false`) is unread and counts, one it had
-//! seen (`read: true`) is read. It is never announced, whatever it says.
+//! seen (`read: true`) is read. It is never announced, whatever it says. A line with a position
+//! (`IncomingMessage::net_seq`, KT-2) is read by its position, as a message is, and never by time
+//! ([`super::position`]).
 //!
 //! Announcing: a line that becomes a missed call by a signal is announced like a message. One
 //! that the CLOCK makes missed is announced at once only when that happens on time and the
@@ -200,6 +203,10 @@ impl Apply<'_> {
                 // A row that is no call line: not ours to change.
                 return Ok(());
             }
+            let ex = match (ex.net_seq, m.net_seq) {
+                (None, Some(seq)) => self.position_learnt(ex, seq)?,
+                _ => ex,
+            };
             // (Also for a deleted line, so that what is left of it does not depend on
             // whether its delete came before or after this signal. A line that came with
             // imported history is a live one once a live signal names it.)
@@ -235,13 +242,25 @@ impl Apply<'_> {
             return self.store_line(&ex, &stored, &settled, how, earlier);
         }
 
-        // On a network with account-wide ids a message of ours may carry the id in this
-        // chat: the line does not take its place.
-        if self.scope == MsgIdScope::AccountAuthor
-            && self
-                .by_key(ConversationId(0), "", &m.local)?
-                .is_some_and(|r| r.conv_key == key.encode())
-        {
+        // On a network with account-wide ids, or with ids per sender in a chat, a message of
+        // ours may carry the id in this chat: the line does not take its place. (Under
+        // `Conversation` scope the line and the message share one key, and the lookup above
+        // found it.) For `ConversationAuthor`, `by_key_only` also answers with the call line of
+        // `conv` under that id, which is known not to be there at this point. (Key only: a message
+        // that once had the id does not carry it now, and the line's key does not meet its alias.)
+        let own_message_here = match self.scope {
+            MsgIdScope::AccountAuthor => self
+                .by_key_only(ConversationId(0), "", &m.local)?
+                .is_some_and(|r| r.conv_key == key.encode()),
+            MsgIdScope::ConversationAuthor => {
+                match sql::conversation_id(self.conn, self.acc.id, &key)? {
+                    Some(c) => self.by_key_only(c, "", &m.local)?.is_some(),
+                    None => false,
+                }
+            }
+            MsgIdScope::Conversation => false,
+        };
+        if own_message_here {
             return Ok(());
         }
         // The line went with a cleared chat, or its timer ran out: a later signal of the same
@@ -271,10 +290,13 @@ impl Apply<'_> {
         let (read_elsewhere, timer_secs): (bool, Option<i64>) = self
             .conn
             .prepare_cached(
-                "SELECT coalesce(read_sent_at >= ?2, 0), timer_secs FROM conversations
+                "SELECT CASE WHEN ?3 IS NULL THEN coalesce(read_sent_at >= ?2, 0)
+                     ELSE coalesce(read_seq >= ?3, 0) END, timer_secs FROM conversations
                  WHERE id = ?1",
             )?
-            .query_row((conv.0, m.sent_at), |r| Ok((r.get(0)?, r.get(1)?)))?;
+            .query_row((conv.0, m.sent_at, m.net_seq), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
         let read_state = line
             .counts_unread()
             .then_some(if how.read || read_elsewhere {
@@ -318,9 +340,9 @@ impl Apply<'_> {
                 "INSERT INTO messages(account_id, conversation_id, net_scope, net_author, net_local,
                    origin, sort_key, sent_at, server_at, received_at, arrival, body_kind, body,
                    read_state, history, silent, call_deadline, expiry_kind, expiry_timer_ms,
-                   expiry_started_at, expires_at)
+                   expiry_started_at, expires_at, net_seq)
                  VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'System', ?11, ?12, ?13, ?14,
-                   ?15, ?16, ?17, ?18, ?19)",
+                   ?15, ?16, ?17, ?18, ?19, ?20)",
             )?
             .execute(params![
                 self.acc.id.0,
@@ -342,6 +364,7 @@ impl Apply<'_> {
                 timer_ms,
                 started_at,
                 expires_at,
+                m.net_seq,
             ])?;
         let id = MessageId(self.conn.last_insert_rowid());
         // A chat deleted on another device comes back with its next call, as with a message.
@@ -412,14 +435,18 @@ impl Apply<'_> {
     }
 
     /// The read marker of our other devices is a `sent_at` watermark (§4.9): an unread line
-    /// that began at or before it is read, whenever the signal that says so arrives.
+    /// that began at or before it is read, whenever the signal that says so arrives. A line with a
+    /// position goes by the own read position instead ([`super::position`]).
     fn read_elsewhere(&mut self, id: MessageId) -> Result<()> {
         let read = self
             .conn
             .prepare_cached(
                 "UPDATE messages SET read_state = 'Read'
-                 WHERE id = ?1 AND read_state = 'Unread' AND sent_at <=
-                   (SELECT c.read_sent_at FROM conversations c WHERE c.id = conversation_id)",
+                 WHERE id = ?1 AND read_state = 'Unread' AND (
+                   SELECT CASE WHEN messages.net_seq IS NULL
+                       THEN messages.sent_at <= c.read_sent_at
+                       ELSE messages.net_seq <= c.read_seq END
+                   FROM conversations c WHERE c.id = messages.conversation_id)",
             )?
             .execute([id.0])?;
         if read > 0 {

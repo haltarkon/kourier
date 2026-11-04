@@ -179,7 +179,13 @@ enum Clock {
 /// deadline, after it, and passing it in the middle: one row, and the same row for every
 /// order of the same signals. With the clock past the deadline at the end, the row is also
 /// the same whether the clock passed it before the first signal or in the middle.
-fn every_order(group: bool) {
+///
+/// `exhaustive` is the whole run (876 orders per clock, ~6.5 s quiet for a direct call, ~8 s
+/// for a group call: the `_exhaustive` tests, in the slow set that only the full `ci` runs).
+/// Without it a fixed SAMPLE runs in every `ci --quick` (T5d): every order of every subset of
+/// one, two and three signals (156, so every pair and triple is checked against every other
+/// order of the same signals) and, of the 720 orders of all six, every 20th and the last (37).
+fn every_order(group: bool, exhaustive: bool) {
     let (_dir, mut h, c) = harness();
     let mut next_id = 1_000u64;
     let mut outcomes: BTreeMap<(Vec<usize>, Clock), (String, Vec<usize>)> = BTreeMap::new();
@@ -187,7 +193,12 @@ fn every_order(group: bool) {
     // (Sizes 4 and 5 passed too, 1,956 orders per clock; they are left out for the time
     // they take.)
     for k in [1, 2, 3, 6] {
-        for order in arrangements(6, k) {
+        let all = arrangements(6, k);
+        let last = all.len() - 1;
+        for (n, order) in all.into_iter().enumerate() {
+            if !exhaustive && k == 6 && n % 20 != 0 && n != last {
+                continue;
+            }
             for clock in [Clock::Before, Clock::After, Clock::Between] {
                 next_id += 1;
                 let call = if group {
@@ -249,7 +260,7 @@ fn every_order(group: bool) {
             }
         }
     }
-    assert_eq!(sequences, 876 * 3);
+    assert_eq!(sequences, if exhaustive { 876 * 3 } else { (156 + 37) * 3 });
     // The counters are what the rows say.
     let key = if group {
         c.group.clone()
@@ -269,12 +280,24 @@ fn every_order(group: bool) {
 
 #[test]
 fn every_order_of_every_subset_of_the_signals_of_a_direct_call() {
-    every_order(false);
+    every_order(false, false);
 }
 
 #[test]
 fn every_order_of_every_subset_of_the_signals_of_a_group_call() {
-    every_order(true);
+    every_order(true, false);
+}
+
+/// The whole of [`every_order_of_every_subset_of_the_signals_of_a_direct_call`] (slow set).
+#[test]
+fn every_order_of_every_subset_of_the_signals_of_a_direct_call_exhaustive() {
+    every_order(false, true);
+}
+
+/// The whole of [`every_order_of_every_subset_of_the_signals_of_a_group_call`] (slow set).
+#[test]
+fn every_order_of_every_subset_of_the_signals_of_a_group_call_exhaustive() {
+    every_order(true, true);
 }
 
 /// The phone's delete of the call entry at every position of every order of all six signals,

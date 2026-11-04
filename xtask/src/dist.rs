@@ -27,7 +27,7 @@
 //!    With `--release` each is an error and nothing is built.
 //! 4. Builds the release binary into its own target directory (`target/dist-build`, which the
 //!    development builds never touch) with every absolute path mapped away ([`BuildPlan`]),
-//!    without the test network (`--no-default-features --features signal`), and with the
+//!    without the test network (`--no-default-features --features signal,whatsapp`), and with the
 //!    variables that would change the output cleared ([`build_env_removals`]). A binary holds
 //!    the paths of its sources in its panic messages and C and C++ code holds them through
 //!    `__FILE__`. When the build is done the commit and the state of the tree are read again
@@ -45,8 +45,9 @@
 //! 6. Packs it deterministically ([`pack_tree`]), packs `git archive <the commit>` and writes
 //!    `SHA256SUMS`.
 //! 7. Unpacks what it packed and checks it ([`verify`]): the tree holds exactly the expected
-//!    paths, `bin/kourier --version` prints the version and `--fixture` is refused, the binary
-//!    is no measuring build, the desktop file claims no link scheme, the notices name SQLCipher
+//!    paths, `bin/kourier --version` prints the version and `--fixture` is refused, a profile
+//!    that turns WhatsApp on gets no WhatsApp from the packed binary (`--print-networks`,
+//!    [`check_release_networks`]), the binary is no measuring build, the names archive holds exactly the names file whose build-id, debuglink name and CRC match the packed binary (which has no symbol table), the desktop file claims no link scheme, the notices name SQLCipher
 //!    and BoringSSL, `desktop-file-validate` and `appstreamcli validate` pass, no file holds a
 //!    private name, and the source archive is the commit with plain modes.
 //!
@@ -91,11 +92,16 @@ const MAPPED_TOOLCHAIN: &str = "/rust-toolchain";
 /// named for the tool, because both are removed at the start of a run and at its end.
 const STAGE_DIR: &str = ".dist-stage";
 const VERIFY_DIR: &str = ".dist-verify";
+/// The checksum file of the names archive. Its own file, so the published `SHA256SUMS` stays
+/// right whether or not the names archive is published beside the others (critic MEDIUM-2).
+const NAMES_SUMS: &str = "SHA256SUMS.names";
 
-/// The cargo arguments that choose the features of the public binary: the Signal backend and
-/// not the scripted test network (`--fixture`, `--fixture-link`, the "Test network" on the
-/// welcome page; `crates/kourier/Cargo.toml`).
-const BUILD_FEATURE_ARGS: [&str; 3] = ["--no-default-features", "--features", "signal"];
+/// The cargo arguments that choose the features of the public binary: the Signal backend and the
+/// WhatsApp backend (compiled in since W2b; a release build does not REGISTER it, so the archive
+/// links no real account: `kourier-app` `whatsapp_registration`), and not the scripted test network
+/// (`--fixture`, `--fixture-link`, the "Test network" on the welcome page;
+/// `crates/kourier/Cargo.toml`).
+const BUILD_FEATURE_ARGS: [&str; 3] = ["--no-default-features", "--features", "signal,whatsapp"];
 
 /// What the stamp records for [`BUILD_FEATURE_ARGS`].
 fn build_features() -> String {
@@ -108,6 +114,29 @@ const STAMP_FILE: &str = "kourier.dist-stamp";
 /// What `bin/kourier --fixture` says when the test network is not built in
 /// (`AppError::FixtureUnavailable` in `kourier-app`; a test compares).
 const FIXTURE_REFUSAL: &str = "fixture mode needs a build with the `fake` feature";
+
+/// The hidden flag that makes the binary print which networks a normal start of its profile
+/// would register and list as off, and exit (`kourier-app` `networks_line`; a test compares).
+const PRINT_NETWORKS_FLAG: &str = "--print-networks";
+
+/// The first word of the line the flag prints (`kourier-app` `NETWORKS_LINE_HEAD`; a test compares).
+const NETWORKS_LINE_HEAD: &str = "networks";
+
+/// Where the default profile's `kourier.toml` is below a `KOURIER_HOME` (`kourier-app`
+/// `Paths::from_env`: `<home>/kourier/config/kourier.toml`; a test compares).
+const NETWORKS_PREFS_PATH: &str = "kourier/config/kourier.toml";
+
+/// The preferences the check writes: the user turned WhatsApp and Threema on (the file is meant to
+/// be edited by hand, so the names are lower case here and must still be found).
+const NETWORKS_PREFS: &str = "networks-on = [\"whatsapp\", \"threema\"]\n";
+
+/// The networks a release binary must offer in no list although [`NETWORKS_PREFS`] turns them on
+/// (`kourier-app` `whatsapp_registration`, `threema_registration`). Threema is not in the archive's
+/// features at all today (`signal,whatsapp`): the check is there for the day it joins.
+const GATED_NETWORKS: [&str; 2] = ["WhatsApp", "Threema"];
+
+/// Where the check puts its `KOURIER_HOME`, below the directory the archive was unpacked into.
+const NETWORKS_HOME_DIR: &str = ".networks-home";
 
 /// The notices the packed `THIRD-PARTY.html` must hold for what is linked in but is no crate.
 const REQUIRED_NOTICE_WORDS: [&str; 2] = ["Zetetic", "BoringSSL"];
@@ -137,7 +166,12 @@ const PLACEHOLDER_USERS: [&str; 11] = [
 /// Roots below a home directory that hold the maintainer's own work: a tracked file that
 /// names one of them tells where the maintainer keeps it (spelled in two pieces so that this
 /// file does not name it).
-const PRIVATE_TILDE_ROOTS: [&str; 1] = [concat!("~/", "projects")];
+const PRIVATE_TILDE_ROOTS: [&str; 2] = [
+    concat!("~/", "projects"),
+    // Without the `~/`: `$HOME/…`, `../…` and absolute spellings of the same tree (review
+    // MEDIUM-2: `dist` skips the export-ignored notes, so this is what a PUBLIC file is judged by).
+    concat!("projects", "/messengers"),
+];
 
 const USAGE: &str =
     "usage: cargo xtask dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]
@@ -292,6 +326,11 @@ pub struct Names {
     pub stage: String,
     /// `<stage>.tar.gz`.
     pub binary_archive: String,
+    /// `kourier-<version>-linux-<arch>-names[-suffix].tar.gz`: the symbol table split off the
+    /// binary ([`crate::names`]), with the same top directory as the binary archive so that
+    /// unpacking both merges them into one tree. The grade's suffix goes last, as in the
+    /// source archive's name.
+    pub names_archive: String,
     /// `kourier-<version>[-suffix]`: the top directory of the source archive.
     pub source_dir: String,
     /// `kourier-<version>-source[-suffix].tar.gz`.
@@ -305,6 +344,7 @@ pub fn archive_names(version: &str, arch: &str, grade: Grade) -> Names {
     let stage = format!("kourier-{version}-linux-{arch}{suffix}");
     Names {
         binary_archive: format!("{stage}.tar.gz"),
+        names_archive: format!("kourier-{version}-linux-{arch}-names{suffix}.tar.gz"),
         stage,
         source_dir: format!("kourier-{version}{suffix}"),
         source_archive: format!("kourier-{version}-source{suffix}.tar.gz"),
@@ -1261,6 +1301,26 @@ pub fn parse_version_tags(objdump_t: &str) -> VersionTags {
     tags
 }
 
+/// The glibc release that brought `GLIBC_ABI_DT_RELR`: a binary linked with packed relative
+/// relocations (`-z pack-relative-relocs`, `crates/kourier/build.rs`) names that version need and
+/// a loader before glibc 2.36 refuses it. No symbol carries the tag, so `objdump -T` never shows
+/// it; it stands under "Version References" in `objdump -p`.
+const GLIBC_ABI_DT_RELR_SINCE: &str = "2.36";
+
+/// Raises `tags.glibc` to the glibc release a version need of `objdump_p` (the "Version
+/// References" of `objdump -p`) asks for without a symbol: today only `GLIBC_ABI_DT_RELR`.
+pub fn raise_for_version_references(tags: &mut VersionTags, objdump_p: &str) {
+    let relr = objdump_p
+        .lines()
+        .any(|l| l.split_whitespace().last() == Some("GLIBC_ABI_DT_RELR"));
+    if relr {
+        let since = Version::parse(GLIBC_ABI_DT_RELR_SINCE);
+        if let Some(v) = since.filter(|v| tags.glibc.as_ref().is_none_or(|old| v > old)) {
+            tags.glibc = Some(v);
+        }
+    }
+}
+
 /// The module names imported by the QML `text`, without Kourier's own module and without
 /// imports of a directory or a file (`import "components"`).
 pub fn qml_imports(text: &str) -> BTreeSet<String> {
@@ -1478,10 +1538,12 @@ fn read_requirements(binary: &Path, qml_dir: &Path, stamp: &Stamp) -> Result<Req
         QmlModule { name, packages }
     };
     let qml_modules = qml_modules_in(qml_dir)?.into_iter().map(module).collect();
+    let mut tags = parse_version_tags(&symbols);
+    raise_for_version_references(&mut tags, &dynamic);
     Ok(Requirements {
         libraries,
         library_paths,
-        tags: parse_version_tags(&symbols),
+        tags,
         built_with_qt: Some(stamp.qt.clone()),
         built_with_kf6: Some(stamp.kf6.clone()),
         qml_modules,
@@ -1632,6 +1694,9 @@ pub struct Readme<'a> {
     pub requirements: &'a Requirements,
     /// The files of the archive.
     pub files: &'a [String],
+    /// The GNU build-id of the binary (lowercase hex): it names the names file and ties it to
+    /// the program.
+    pub build_id: &'a str,
 }
 
 /// The generated `README.txt` (plain text; nothing in it depends on when or where it was made).
@@ -1644,7 +1709,7 @@ pub fn render_readme(r: &Readme) -> String {
     ));
     t.push_str("====================================================================\n\n");
     t.push_str(&format!(
-        "Kourier is an unofficial, native Linux messenger compatible with Signal: a Qt 6\nQML + Kirigami application on a protocol-agnostic core, free software under the\nGNU AGPL version 3 only. This archive holds the program as `cargo xtask install`\nputs it on a disk, built from commit {short} ({}).\n",
+        "Kourier is an unofficial, native Linux messenger compatible with Signal: a Qt 6\nQML + Kirigami application on a protocol-agnostic core, free software under the\nGNU AGPL version 3 only. This archive holds the program as `cargo xtask install`\nputs it on a disk, without its symbol table (see \"Function names\" below), built from\ncommit {short} ({}).\n",
         r.date
     ));
     match r.grade {
@@ -1677,14 +1742,62 @@ pub fn render_readme(r: &Readme) -> String {
         "Optionally refresh the desktop's caches:\n\n    update-desktop-database ~/.local/share/applications\n\n",
     );
     t.push_str("Remove\n------\nDelete the files this archive installed (shown for ~/.local):\n\n    cd ~/.local && rm -f \\\n");
-    let installed: Vec<&String> = r.files.iter().filter(|f| *f != "README.txt").collect();
+    let names_file = crate::names::names_file_name(r.build_id);
+    let names_rel = format!("bin/.debug/{names_file}");
+    let names_glob = String::from("bin/.debug/kourier-*.debug");
+    let mut installed: Vec<&String> = r.files.iter().filter(|f| *f != "README.txt").collect();
+    // The names file is no part of this archive, but `cp -r bin share ~/.local/` installs it
+    // when the names archive was unpacked into this tree first (see "Function names"). The glob
+    // removes the names file of every version that was installed this way (review LOW-4).
+    installed.insert(0, &names_glob);
     for (i, file) in installed.iter().enumerate() {
         let end = if i + 1 == installed.len() { "" } else { " \\" };
         t.push_str(&format!("        {file}{end}\n"));
     }
+    t.push_str("    rmdir bin/.debug 2>/dev/null\n");
     t.push_str(
         "\nYour accounts and messages are not part of the program and stay where they are:\n~/.local/share/kourier, ~/.config/kourier, ~/.local/state/kourier and\n~/.cache/kourier (see PRIVACY.md in the source). Delete them yourself if you want\nthem gone.\n\n",
     );
+    // Wrapped at 80 like the rest; the build ID is 40 hex characters, so the names file's name
+    // gets a line of its own and the commands use `$f` for it. The paragraph holds whether or not
+    // the maintainer publishes the names archive (T-1: review MEDIUM-3).
+    t.push_str(&format!(
+        concat!(
+            "Function names\n--------------\n",
+            "bin/kourier has no symbol table, which keeps the download small. A crash still\n",
+            "logs its panic line (file, line, column); a stack trace (RUST_BACKTRACE=1)\n",
+            "names no functions unless the names file of this very build is beside the\n",
+            "program. The names file of this build is in\n\n    {archive}\n\n",
+            "(its checksum is in {sums}). It is attached to the release when\n",
+            "the maintainer publishes it; otherwise ask for it, giving the build ID below.\n",
+            "This build's ID is {id}.\n",
+            "The names file is called\n\n    {names_file}\n\n",
+            "after it, so the file of another version is never taken for this one; after an\n",
+            "upgrade you may delete the names file of the old version. To get names back:\n\n",
+            "    # in the directory that holds this one, with the names archive beside it:\n",
+            "    # adds to this tree:\n    #   {names_rel}\n",
+            "    tar -xzf {archive}\n",
+            "    cd {stage}\n",
+            "    # installs the names file too (rm -f above removes it)\n",
+            "    cp -r bin share ~/.local/\n",
+            "    # the same ID twice: the names file is the right one (readelf may add\n",
+            "    # \"Unable to find program interpreter name\" for the names file: expected)\n",
+            "    cd ~/.local/bin\n",
+            "    f=.debug/{names_file}\n",
+            "    readelf -n kourier | grep 'Build ID'\n",
+            "    readelf -n \"$f\" 2>/dev/null | grep 'Build ID'\n",
+            "    RUST_BACKTRACE=1 kourier\n\n",
+            "One address (an offset into the file) to a name, for a stack someone captured:\n\n",
+            "    gdb -nx -batch -ex 'info symbol 0xADDRESS' kourier\n",
+            "    addr2line -f -C -e \"$f\" 0xADDRESS\n\n",
+        ),
+        archive = r.names.names_archive,
+        sums = NAMES_SUMS,
+        id = r.build_id,
+        stage = r.names.stage,
+        names_file = names_file,
+        names_rel = names_rel,
+    ));
     t.push_str("Source and licences\n-------------------\n");
     t.push_str(&format!(
         "The source of exactly this version is the archive beside this one,\n{}, and its\nchecksum is in SHA256SUMS. ",
@@ -1904,6 +2017,122 @@ pub fn check_fixture_refused(binary: &Path, home: &Path, limit: Duration) -> Res
     Ok(())
 }
 
+/// The networks a start of the packed binary reports (`--print-networks`), by kind name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NetworksLine {
+    /// The kinds it would register.
+    pub registered: Vec<String>,
+    /// The kinds it would list as "compiled in but off".
+    pub off: Vec<String>,
+    /// The kinds the profile's `networks-on` names: that the preferences were read at all.
+    pub on: Vec<String>,
+}
+
+/// Reads the output of `--print-networks`: exactly one line,
+/// `networks registered=<kinds> off=<kinds> on=<kinds>` (kinds by commas, a list may be empty).
+/// Anything else is an error, so a changed format fails the check instead of passing it.
+pub fn parse_networks_line(stdout: &str) -> Result<NetworksLine> {
+    let line = stdout
+        .strip_suffix('\n')
+        .filter(|l| !l.contains('\n'))
+        .with_context(|| format!("expected one line, got {stdout:?}"))?;
+    let words: Vec<&str> = line.split(' ').collect();
+    let [head, registered, off, on] = words[..] else {
+        bail!("expected \"{NETWORKS_LINE_HEAD} registered=… off=… on=…\", got {line:?}");
+    };
+    let list = |word: &str, key: &str| -> Result<Vec<String>> {
+        let value = word
+            .strip_prefix(&format!("{key}="))
+            .with_context(|| format!("expected {key}=… in {line:?}"))?;
+        Ok(value
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(str::to_owned)
+            .collect())
+    };
+    if head != NETWORKS_LINE_HEAD {
+        bail!("expected the line to start with \"{NETWORKS_LINE_HEAD}\", got {line:?}");
+    }
+    Ok(NetworksLine {
+        registered: list(registered, "registered")?,
+        off: list(off, "off")?,
+        on: list(on, "on")?,
+    })
+}
+
+/// What is wrong with a [`NetworksLine`] of a RELEASE binary whose profile turned the
+/// [`GATED_NETWORKS`] on: it registers one, or lists one as off (the lane decisions: no archive
+/// links a real account of them), or the line does not show that the switch of each was read (then
+/// the empty lists prove nothing).
+pub fn networks_line_problems(line: &NetworksLine) -> Vec<String> {
+    let mut problems = Vec::new();
+    for network in GATED_NETWORKS {
+        let names = |kinds: &[String]| kinds.iter().any(|k| k.eq_ignore_ascii_case(network));
+        if names(&line.registered) {
+            problems.push(format!(
+                "the packed binary REGISTERS {network} (registered={})",
+                line.registered.join(",")
+            ));
+        }
+        if names(&line.off) {
+            problems.push(format!(
+                "the packed binary lists {network} as off (off={}); a release build offers it in no list",
+                line.off.join(",")
+            ));
+        }
+        if !names(&line.on) {
+            problems.push(format!(
+                "the binary did not read the preferences that turn {network} on (on={}): the check proves nothing",
+                line.on.join(",")
+            ));
+        }
+    }
+    problems
+}
+
+/// Runs `binary --print-networks` as a user would (an empty environment, a private home) on a
+/// profile whose `kourier.toml` has `networks-on = ["whatsapp", "threema"]` (a `KOURIER_HOME` below
+/// `work`) and fails when WhatsApp or Threema is registered or listed as off: a RELEASE build
+/// neither registers nor lists them (`kourier-app` `whatsapp_registration`, lane decision L1;
+/// `threema_registration`), which no test of a debug build can show. The flag starts nothing: no window, no database, no keyring, no network.
+pub fn check_release_networks(binary: &Path, work: &Path, limit: Duration) -> Result<()> {
+    let home = work.join(NETWORKS_HOME_DIR);
+    let prefs = home.join(NETWORKS_PREFS_PATH);
+    std::fs::create_dir_all(prefs.parent().context("the preferences' directory")?)?;
+    std::fs::write(&prefs, NETWORKS_PREFS)?;
+    let mut cmd = Command::new(binary);
+    cmd.arg(PRINT_NETWORKS_FLAG)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", work)
+        .env("KOURIER_HOME", &home);
+    let out = run_limited(cmd, limit);
+    let _ = std::fs::remove_dir_all(&home);
+    let out = out.with_context(|| format!("run {} {PRINT_NETWORKS_FLAG}", binary.display()))?;
+    if !out.status.success() {
+        bail!(
+            "{} {PRINT_NETWORKS_FLAG} exited with {}: {}",
+            binary.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = parse_networks_line(&stdout)
+        .with_context(|| format!("{PRINT_NETWORKS_FLAG} of {}", binary.display()))?;
+    let problems = networks_line_problems(&line);
+    if !problems.is_empty() {
+        bail!(
+            "{} {PRINT_NETWORKS_FLAG} on a profile with {} said {:?}:\n  {}",
+            binary.display(),
+            NETWORKS_PREFS.trim(),
+            stdout.trim(),
+            problems.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 /// What the packed notices must hold for the libraries linked in that are no crate.
 pub fn notice_problems(html: &str) -> Vec<String> {
     REQUIRED_NOTICE_WORDS
@@ -1919,6 +2148,120 @@ struct Verified {
     scans: Vec<(String, Scan)>,
     /// The unpacked top directory.
     root_dir: PathBuf,
+}
+
+/// The name of the build output's copy in the split directory.
+const BUILT_COPY: &str = "built";
+
+/// Writes `bytes` (the build output as it was read, stamped and scanned) to
+/// `<dir>/built` and returns the path: the one file the split and the tie read (review LOW-6).
+fn write_built_copy(bytes: &[u8], dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(BUILT_COPY);
+    std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// The names file's path below the top directory of the names archive.
+fn names_rel(build_id: &str) -> String {
+    format!("bin/.debug/{}", crate::names::names_file_name(build_id))
+}
+
+/// Stages the names file at `<parent>/<stage>/bin/.debug/<name>`, the top directory of the
+/// binary archive, so that unpacking both merges them into one tree; plain modes (0644, 0755).
+fn stage_names(parent: &Path, stage: &str, names_file: &Path, build_id: &str) -> Result<()> {
+    let target = parent.join(stage).join(names_rel(build_id));
+    std::fs::create_dir_all(
+        target
+            .parent()
+            .context("a directory above the names file")?,
+    )?;
+    std::fs::copy(names_file, &target)
+        .with_context(|| format!("copy {} to {}", names_file.display(), target.display()))?;
+    // The binary's path matches nothing in this tree: every file gets 0644.
+    normalize_modes(&parent.join(stage), &Path::new("bin").join(BINARY))
+}
+
+/// The checksum files of a run and the archives each one lists: `SHA256SUMS` the binary and the
+/// source archive, `SHA256SUMS.names` the names archive alone.
+fn checksum_files(names: &Names) -> [(&'static str, Vec<&str>); 2] {
+    [
+        (
+            "SHA256SUMS",
+            vec![&names.binary_archive, &names.source_archive],
+        ),
+        (NAMES_SUMS, vec![&names.names_archive]),
+    ]
+    .map(|(file, listed)| (file, listed.into_iter().map(String::as_str).collect()))
+}
+
+/// Unpacks the names archive into `work` (its own directory, never over the verified tree) and
+/// checks its tree: one top directory named like the binary archive's, holding exactly
+/// `bin/.debug/kourier-<build-id>.debug` with mode 0644. Returns the names file's path.
+fn unpack_names(archive: &Path, work: &Path, names: &Names, build_id: &str) -> Result<PathBuf> {
+    let _ = std::fs::remove_dir_all(work);
+    std::fs::create_dir_all(work)?;
+    let status = Command::new("tar")
+        .arg("--extract")
+        .arg("--gzip")
+        .arg("--file")
+        .arg(archive)
+        .arg("-C")
+        .arg(work)
+        .status()
+        .context("run tar to unpack the names archive")?;
+    if !status.success() {
+        bail!("tar could not unpack {}", archive.display());
+    }
+    let top = read_tree(work)?;
+    let top_level: Vec<&String> = top
+        .files
+        .iter()
+        .chain(&top.directories)
+        .chain(&top.others)
+        .filter(|p| !p.contains('/'))
+        .collect();
+    if top_level != [&names.stage] || !top.directories.contains(&names.stage) {
+        bail!(
+            "the names archive must hold one top directory, {}/, and nothing else; it holds {top_level:?}",
+            names.stage
+        );
+    }
+    let root_dir = work.join(&names.stage);
+    let rel = names_rel(build_id);
+    let problems = tree_problems(&read_tree(&root_dir)?, std::slice::from_ref(&rel));
+    if !problems.is_empty() {
+        bail!(
+            "the unpacked names archive is not the expected tree:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+    let file = root_dir.join(&rel);
+    let mode = std::fs::metadata(&file)?.permissions().mode() & 0o7777;
+    if mode != 0o644 {
+        bail!("{rel} in the names archive has mode {mode:o}, expected 644");
+    }
+    Ok(file)
+}
+
+/// The tie between what was built, what was packed and the names archive (SIZE S-names): the
+/// names archive is unpacked into `work` and [`crate::names::check_pair`] runs on the build
+/// output `built`, the unpacked binary `shipped` (read from the binary archive, not from the
+/// stage) and the unpacked names file. The names file is searched for private names like every
+/// packed file; a hit is returned to be counted with the others.
+fn verify_names(
+    archive: &Path,
+    work: &Path,
+    names: &Names,
+    built: &Path,
+    shipped: &Path,
+    needles: &[Needle],
+) -> Result<Option<(String, Scan)>> {
+    let id = crate::names::build_id(built)?;
+    let file = unpack_names(archive, work, names, &id)?;
+    crate::names::check_pair(built, shipped, &file)?;
+    let scan = scan_bytes(&std::fs::read(&file)?, needles, 5);
+    Ok((scan.total() > 0).then(|| (names_rel(&id), scan)))
 }
 
 /// [`verify_unpacked`] and then the two validators of the desktop file and the metainfo.
@@ -2012,6 +2355,8 @@ fn verify_unpacked(
     }
     check_version_output(&binary, version, work, VERSION_TIMEOUT)?;
     check_fixture_refused(&binary, work, VERSION_TIMEOUT)?;
+    // The release arm of the WhatsApp rule: a release binary registers and lists nothing of it.
+    check_release_networks(&binary, work, VERSION_TIMEOUT)?;
     // The public archive claims no link scheme (it would compete with a Signal Desktop).
     let layout = install::Layout::new(&root_dir);
     let desktop = std::fs::read_to_string(&layout.desktop)?;
@@ -2267,10 +2612,9 @@ pub fn private_path_hits(line: &str, who: &Who) -> Vec<String> {
             }
         }
     }
-    for root in PRIVATE_TILDE_ROOTS {
-        if line.contains(root) {
-            hits.push(root.to_owned());
-        }
+    // One hit per line from these: a path under `~/` holds both roots.
+    if let Some(root) = PRIVATE_TILDE_ROOTS.iter().find(|r| line.contains(**r)) {
+        hits.push((*root).to_owned());
     }
     hits
 }
@@ -2364,6 +2708,7 @@ fn print_scan(what: &str, scan: &Scan) {
 /// this run's result.
 pub fn is_dist_output(name: &str) -> bool {
     name == "SHA256SUMS"
+        || name == NAMES_SUMS
         || name == "NOT-READY.txt"
         || (name.starts_with("kourier-")
             && (name.ends_with(".tar.gz") || name.ends_with(".tar.gz.partial")))
@@ -2548,6 +2893,13 @@ pub fn dist(args: &[String]) -> Result<()> {
     let build_time = build_started.elapsed();
     let binary = std::fs::read(&binary_path)
         .with_context(|| format!("read {} (build it: drop --no-build)", binary_path.display()))?;
+    // The bytes just read are the ones checked against the stamp, scanned for private names,
+    // split and tied (review LOW-6): they are written once, into the split directory, and every
+    // later step reads that copy, not the build output's path again (another session's build may
+    // replace the file while the scans run).
+    let stage_parent = out.join(STAGE_DIR);
+    let split_dir = stage_parent.join("split");
+    let built_copy = write_built_copy(&binary, &split_dir)?;
     let stamp_text = std::fs::read_to_string(&stamp_file).with_context(|| {
         format!(
             "read {}: no stamp, so nothing says what this binary was built from (build it: drop --no-build)",
@@ -2560,7 +2912,7 @@ pub fn dist(args: &[String]) -> Result<()> {
         &commit.hash,
         dirty,
         &build_features(),
-        &sha256_of(&binary_path)?,
+        &sha256_of(&built_copy)?,
     )?;
     eprintln!(
         "dist: the binary was built from this commit{} with `{}`; Qt {}, KDE Frameworks {}, {}",
@@ -2570,9 +2922,6 @@ pub fn dist(args: &[String]) -> Result<()> {
         stamp.kf6,
         stamp.rustc
     );
-    if install::is_perf_build(&binary) {
-        bail!("{} is a measuring build", binary_path.display());
-    }
     let needles = all_needles(&who, &extra);
     eprintln!(
         "dist: searched for: {}",
@@ -2610,35 +2959,57 @@ pub fn dist(args: &[String]) -> Result<()> {
             "the binary still holds {private_total} private names (above); find what put them there, or give --allow-paths for a build that stays on this machine"
         );
     }
+    // The symbol table leaves the file that is shipped (SIZE S-names): the build output stays as
+    // built (the stamp describes it), `shipped` is what every check below that describes the
+    // published file reads, and the names file goes into its own archive.
+    eprintln!("dist: {}", crate::names::objcopy_version()?);
+    let split = crate::names::split(&built_copy, &split_dir)?;
+    eprintln!(
+        "dist: the symbol table is split off: shipped binary {} ({} bytes), names file {} ({} bytes), build-id {}, debuglink CRC {:#010x}",
+        human(split.shipped_bytes),
+        split.shipped_bytes,
+        human(split.names_bytes),
+        split.names_bytes,
+        split.build_id,
+        split.crc
+    );
+    let shipped = std::fs::read(&split.shipped)
+        .with_context(|| format!("read {}", split.shipped.display()))?;
+    if install::is_perf_build(&shipped) {
+        bail!("{} is a measuring build", binary_path.display());
+    }
     // The test network is not linked in (its code has panic locations; none must be there),
     // and the Signal backend is.
-    if !find_all(&binary, b"crates/kourier-fake/").is_empty() {
+    if !find_all(&shipped, b"crates/kourier-fake/").is_empty() {
         bail!(
             "the binary holds code of crates/kourier-fake: the test network is built in, and the public binary must not have it"
         );
     }
-    if find_all(&binary, b"crates/kourier-signal/").is_empty() {
+    if find_all(&shipped, b"crates/kourier-signal/").is_empty() {
         bail!(
             "the binary holds no code of crates/kourier-signal: the Signal backend is not built in"
         );
     }
-    let test_network = find_all(&binary, b"Test network").len();
+    let test_network = find_all(&shipped, b"Test network").len();
     eprintln!(
         "dist: no code of the test network is linked in (the crate kourier-fake is not in the binary); the label \"Test network\" is in it {test_network} times: crates/kourier-viewmodel/src/conversations.rs names it for `NetworkKind::Fake` in every build, and nothing can open such a network"
     );
 
     // Requirements, from the binary and the stamp.
-    let requirements =
-        read_requirements(&binary_path, &root().join("crates/kourier-qt/qml"), &stamp)?;
+    let requirements = read_requirements(
+        &split.shipped,
+        &root().join("crates/kourier-qt/qml"),
+        &stamp,
+    )?;
     let rendered = render_requirements(&requirements);
     eprintln!("\ndist: what the binary needs\n{rendered}");
 
     // Stage.
     let stage_started = Instant::now();
-    let stage_parent = out.join(STAGE_DIR);
     let stage = stage_parent.join(&names.stage);
     std::fs::create_dir_all(&stage)?;
-    let sources = Sources::in_repo(&root(), &build);
+    let mut sources = Sources::in_repo(&root(), &build);
+    sources.binary = split.shipped.clone();
     let locale = target_dir().join("locale");
     crate::i18n::build(&locale)?;
     let languages = crate::i18n::linguas()?;
@@ -2656,22 +3027,28 @@ pub fn dist(args: &[String]) -> Result<()> {
             repository: homepage.as_deref(),
             requirements: &requirements,
             files: &files,
+            build_id: &split.build_id,
         }),
     )?;
     normalize_modes(&stage, &Path::new("bin").join(BINARY))?;
+    let names_parent = stage_parent.join("names");
+    stage_names(&names_parent, &names.stage, &split.names, &split.build_id)?;
     let stage_time = stage_started.elapsed();
 
     // Pack, and verify what was packed. Nothing is left behind when either fails.
     let pack_started = Instant::now();
     let archives = [
         out.join(&names.binary_archive),
+        out.join(&names.names_archive),
         out.join(&names.source_archive),
     ];
     let remove_archives = || {
         for archive in &archives {
             remove_if_there(archive);
         }
-        remove_if_there(&out.join("SHA256SUMS"));
+        for (file, _) in checksum_files(&names) {
+            remove_if_there(&out.join(file));
+        }
     };
     let result = (|| -> Result<Verified> {
         pack_tree(
@@ -2680,24 +3057,44 @@ pub fn dist(args: &[String]) -> Result<()> {
             commit.time,
             &out.join(&names.binary_archive),
         )?;
+        pack_tree(
+            &names_parent,
+            &names.stage,
+            commit.time,
+            &out.join(&names.names_archive),
+        )?;
         pack_source(
             &root(),
             &names.source_dir,
             &commit.hash,
             &out.join(&names.source_archive),
         )?;
-        let sums = checksums(&out, &[&names.binary_archive, &names.source_archive])?;
-        std::fs::write(out.join("SHA256SUMS"), &sums)?;
+        for (file, listed) in checksum_files(&names) {
+            std::fs::write(out.join(file), checksums(&out, &listed)?)?;
+        }
         let work = out.join(VERIFY_DIR);
-        let verified = verify(
+        // What is packed must be the shipped file, not the build output.
+        let mut verified = verify(
             &out.join(&names.binary_archive),
             &work,
             &names,
             &version,
             &languages,
-            &binary,
+            &shipped,
             &needles,
         )?;
+        // The tie of build output, packed binary and names archive, before the unpacked tree
+        // goes. The names archive has its own subdirectory: a wrong one cannot replace the binary.
+        if let Some(hit) = verify_names(
+            &out.join(&names.names_archive),
+            &work.join("names-archive"),
+            &names,
+            &built_copy,
+            &verified.root_dir.join("bin").join(BINARY),
+            &needles,
+        )? {
+            verified.scans.push(hit);
+        }
         let _ = std::fs::remove_dir_all(&work);
         verify_source(
             &out.join(&names.source_archive),
@@ -2705,13 +3102,15 @@ pub fn dist(args: &[String]) -> Result<()> {
             &commit.hash,
             &hidden,
         )?;
-        let check = Command::new("sha256sum")
-            .current_dir(&out)
-            .args(["--check", "--strict", "--quiet", "SHA256SUMS"])
-            .status()
-            .context("run sha256sum --check")?;
-        if !check.success() {
-            bail!("sha256sum --check SHA256SUMS failed");
+        for (file, _) in checksum_files(&names) {
+            let check = Command::new("sha256sum")
+                .current_dir(&out)
+                .args(["--check", "--strict", "--quiet", file])
+                .status()
+                .context("run sha256sum --check")?;
+            if !check.success() {
+                bail!("sha256sum --check {file} failed");
+            }
         }
         Ok(verified)
     })();
@@ -2735,19 +3134,23 @@ pub fn dist(args: &[String]) -> Result<()> {
     let pack_time = pack_started.elapsed();
 
     eprintln!(
-        "\ndist: verified: the tree is exactly the expected one, bin/kourier --version prints \"Kourier {version}\" and --fixture is refused, the binary is no measuring build, the desktop file claims no link scheme, the notices name SQLCipher and BoringSSL, desktop-file-validate and appstreamcli pass; the source archive is the commit {} with plain modes",
+        "\ndist: verified: the tree is exactly the expected one, bin/kourier --version prints \"Kourier {version}\" and --fixture is refused, the binary is no measuring build, the names archive holds exactly the names file whose build-id, debuglink name and CRC match the packed binary (which has no symbol table), the desktop file claims no link scheme, the notices name SQLCipher and BoringSSL, desktop-file-validate and appstreamcli pass; the source archive is the commit {} with plain modes",
         &commit.hash[..12]
     );
     eprintln!("dist: files in {}:", out.display());
     for name in [
         names.binary_archive.as_str(),
+        names.names_archive.as_str(),
         names.source_archive.as_str(),
         "SHA256SUMS",
+        NAMES_SUMS,
     ] {
         let size = std::fs::metadata(out.join(name))?.len();
         eprintln!("dist:   {name}  {} ({size} bytes)", human(size));
     }
-    eprint!("{}", std::fs::read_to_string(out.join("SHA256SUMS"))?);
+    for (file, _) in checksum_files(&names) {
+        eprint!("{}", std::fs::read_to_string(out.join(file))?);
+    }
     eprintln!(
         "dist: time: build {}, stage {}, pack and verify {}, in all {}",
         minutes(build_time),
@@ -3105,6 +3508,7 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         let n = archive_names("0.1.0", "x86_64", Grade::Release);
         assert_eq!(n.stage, "kourier-0.1.0-linux-x86_64");
         assert_eq!(n.binary_archive, "kourier-0.1.0-linux-x86_64.tar.gz");
+        assert_eq!(n.names_archive, "kourier-0.1.0-linux-x86_64-names.tar.gz");
         assert_eq!(n.source_dir, "kourier-0.1.0");
         assert_eq!(n.source_archive, "kourier-0.1.0-source.tar.gz");
         // Everything that did not pass the gate says so in the file name AND the top
@@ -3112,6 +3516,10 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         let d = archive_names("0.1.0", "aarch64", Grade::Dirty);
         assert_eq!(d.stage, "kourier-0.1.0-linux-aarch64-dirty");
         assert_eq!(d.binary_archive, "kourier-0.1.0-linux-aarch64-dirty.tar.gz");
+        assert_eq!(
+            d.names_archive,
+            "kourier-0.1.0-linux-aarch64-names-dirty.tar.gz"
+        );
         assert_eq!(d.source_archive, "kourier-0.1.0-source-dirty.tar.gz");
         assert_eq!(d.source_dir, "kourier-0.1.0-dirty");
         let u = archive_names("0.1.0", "x86_64", Grade::Unreleased);
@@ -3119,6 +3527,10 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         assert_eq!(
             u.binary_archive,
             "kourier-0.1.0-linux-x86_64-unreleased.tar.gz"
+        );
+        assert_eq!(
+            u.names_archive,
+            "kourier-0.1.0-linux-x86_64-names-unreleased.tar.gz"
         );
         assert_eq!(u.source_dir, "kourier-0.1.0-unreleased");
         assert_eq!(u.source_archive, "kourier-0.1.0-source-unreleased.tar.gz");
@@ -3372,6 +3784,33 @@ DYNAMIC SYMBOL TABLE:
     }
 
     #[test]
+    fn packed_relative_relocations_need_glibc_2_36() {
+        // `objdump -p` of a binary linked with `-z pack-relative-relocs`: the version need has
+        // no symbol, so only the "Version References" name it.
+        let dynamic = "\
+Dynamic Section:
+  NEEDED               libc.so.6
+Version References:
+  required from libc.so.6:
+    0x069691b4 0x00 05 GLIBC_2.34
+    0x0e79a0b0 0x00 04 GLIBC_ABI_DT_RELR
+";
+        let symbols = "0 DF *UND*\t0 (GLIBC_2.34) __libc_start_main\n";
+        let mut tags = parse_version_tags(symbols);
+        assert_eq!(tags.glibc, Version::parse("2.34"));
+        raise_for_version_references(&mut tags, dynamic);
+        assert_eq!(tags.glibc, Version::parse("2.36"), "RELR raises the floor");
+        // A symbol that already needs more stays the requirement.
+        let mut newer = parse_version_tags("0 DF *UND*\t0 (GLIBC_2.38) strlcpy\n");
+        raise_for_version_references(&mut newer, dynamic);
+        assert_eq!(newer.glibc, Version::parse("2.38"));
+        // Without the tag nothing moves.
+        let mut plain = parse_version_tags(symbols);
+        raise_for_version_references(&mut plain, OBJDUMP_P);
+        assert_eq!(plain.glibc, Version::parse("2.34"));
+    }
+
+    #[test]
     fn a_weak_undefined_symbol_sets_no_glibc_requirement() {
         // objdump -T: the flag columns stand between the address and `*UND*`; `w` is weak.
         let sample = "\
@@ -3509,6 +3948,8 @@ DYNAMIC SYMBOL TABLE:
         );
     }
 
+    const BUILD_ID: &str = "0123456789abcdef0123456789abcdef01234567";
+
     #[test]
     fn the_readme_says_what_it_is_what_it_needs_how_to_install_and_remove() {
         let names = archive_names("1.2.3", "x86_64", Grade::Release);
@@ -3524,6 +3965,7 @@ DYNAMIC SYMBOL TABLE:
                 repository,
                 requirements: &requirements,
                 files: &files,
+                build_id: BUILD_ID,
             })
         };
         let readme = |grade| readme_at(grade, None);
@@ -3544,9 +3986,55 @@ DYNAMIC SYMBOL TABLE:
             "THIRD-PARTY.html",
             "Also needed at run time",
             "built and tried with 6.30.0",
+            // LOW-5: no symbol table, and where the names are.
+            "without its symbol table",
+            "Function names\n--------------",
+            "kourier-1.2.3-linux-x86_64-names.tar.gz",
+            "SHA256SUMS.names",
+            BUILD_ID,
+            "bin/.debug/kourier-0123456789abcdef0123456789abcdef01234567.debug",
+            "readelf -n kourier | grep 'Build ID'",
+            "f=.debug/kourier-0123456789abcdef0123456789abcdef01234567.debug",
+            "readelf -n \"$f\" 2>/dev/null | grep 'Build ID'",
+            "RUST_BACKTRACE=1 kourier",
+            "gdb -nx -batch -ex 'info symbol 0xADDRESS' kourier",
+            "addr2line -f -C -e \"$f\" 0xADDRESS",
+            // MEDIUM-3: true whether or not the maintainer publishes the names archive.
+            "attached to the release when\nthe maintainer publishes it; otherwise ask for it",
         ] {
             assert!(text.contains(want), "{want:?} not in\n{text}");
         }
+        assert!(!text.contains("beside this archive"), "{text}");
+        // LOW-1: the commands run in the right directories, in order: tar in the directory that
+        // holds the stage, then cd into the stage, then cp.
+        let block = text.split("To get names back:").nth(1).expect("the block");
+        let at = |needle: &str| block.find(needle).unwrap_or_else(|| panic!("{needle:?}"));
+        assert!(
+            at("tar -xzf kourier-1.2.3-linux-x86_64-names.tar.gz")
+                < at("cd kourier-1.2.3-linux-x86_64\n")
+                && at("cd kourier-1.2.3-linux-x86_64\n") < at("cp -r bin share ~/.local/"),
+            "{block}"
+        );
+        // LOW-2: the names file's readelf error is silenced and explained.
+        assert!(
+            block.contains("Unable to find program interpreter name"),
+            "{block}"
+        );
+        // LOW-5: the paragraph wraps at 80 like the rest.
+        let paragraph = text
+            .split("Function names\n--------------")
+            .nth(1)
+            .and_then(|t| t.split("Source and licences").next())
+            .expect("the paragraph");
+        for line in paragraph.lines() {
+            assert!(line.len() <= 80, "{} characters: {line}", line.len());
+        }
+        // The Remove list holds every version's names file (the commands install it after the
+        // merge, an upgrade adds another) and the empty directory (LOW-4).
+        let remove = text.split("Remove\n------").nth(1).expect("Remove");
+        let remove = remove.split("Your accounts").next().expect("end of Remove");
+        assert!(remove.contains("bin/.debug/kourier-*.debug"), "{remove}");
+        assert!(remove.contains("rmdir bin/.debug 2>/dev/null"), "{remove}");
         // The link handlers: what the line is and how to add it, in two lines.
         let lines: Vec<&str> = text.lines().collect();
         let at = lines
@@ -3831,6 +4319,198 @@ DYNAMIC SYMBOL TABLE:
     }
 
     #[test]
+    fn a_networks_line_that_names_whatsapp_fails() {
+        let parse = |text: &str| parse_networks_line(text).expect(text);
+        let ok = parse("networks registered=Signal off= on=WhatsApp,Threema\n");
+        assert_eq!(
+            ok,
+            NetworksLine {
+                registered: vec!["Signal".to_owned()],
+                off: vec![],
+                on: vec!["WhatsApp".to_owned(), "Threema".to_owned()],
+            }
+        );
+        assert!(networks_line_problems(&ok).is_empty());
+        // Lists of several kinds, the switch spelled as the file has it.
+        let several = parse("networks registered=Fake,Signal off= on=whatsapp,threema\n");
+        assert_eq!(several.registered, ["Fake", "Signal"]);
+        assert!(networks_line_problems(&several).is_empty());
+        // WhatsApp registered, or listed as off, in whatever case: the check fails, naming which.
+        let registered = parse("networks registered=Signal,WhatsApp off= on=WhatsApp,Threema\n");
+        let problems = networks_line_problems(&registered);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("REGISTERS WhatsApp"), "{problems:?}");
+        let listed = parse("networks registered=Signal off=whatsapp on=WhatsApp,Threema\n");
+        let problems = networks_line_problems(&listed);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("lists WhatsApp as off"),
+            "{problems:?}"
+        );
+        let both = parse("networks registered=WhatsApp off=WhatsApp on=WhatsApp,Threema\n");
+        assert_eq!(networks_line_problems(&both).len(), 2);
+        // Threema the same way (TH1: not in the archive's features, the check guards the day it is).
+        let threema = parse("networks registered=Signal,Threema off= on=WhatsApp,Threema\n");
+        let problems = networks_line_problems(&threema);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("REGISTERS Threema"), "{problems:?}");
+        let threema = parse("networks registered=Signal off=threema on=WhatsApp,Threema\n");
+        let problems = networks_line_problems(&threema);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("lists Threema as off"), "{problems:?}");
+        // The switch not shown as read: empty lists would prove nothing (one problem per network).
+        let unread = parse("networks registered=Signal off= on=\n");
+        let problems = networks_line_problems(&unread);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems.iter().all(|p| p.contains("did not read")),
+            "{problems:?}"
+        );
+        let half = parse("networks registered=Signal off= on=WhatsApp\n");
+        let problems = networks_line_problems(&half);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("turn Threema on"), "{problems:?}");
+        // A line in another shape is an error, not a pass.
+        for bad in [
+            "",
+            "\n",
+            "networks registered=Signal off= on=WhatsApp",
+            "networks registered=Signal off= on=WhatsApp\nmore\n",
+            "networks registered=Signal off=\n",
+            "networks registered=Signal off= on=WhatsApp extra\n",
+            "network registered=Signal off= on=WhatsApp\n",
+            "networks off= registered=Signal on=WhatsApp\n",
+            "networks registered Signal off= on=WhatsApp\n",
+            "Kourier 1.2.3\n",
+        ] {
+            assert!(parse_networks_line(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_release_networks_check_runs_the_binary_on_a_profile_that_turns_whatsapp_on() {
+        let scratch = Scratch::new("networks");
+        let limit = Duration::from_secs(10);
+        // A program that insists on the flag, an empty environment but KOURIER_HOME (and HOME), and
+        // the preferences the check promises, and then answers like a release build.
+        let program = |answer: &str| {
+            script(
+                &scratch,
+                &format!(
+                    "[ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ] && [ $# = 1 ] || {{ echo \"args: $*\" >&2; exit 9; }}\n\
+                     [ -z \"$USER$QT_QPA_PLATFORM$XDG_RUNTIME_DIR\" ] || {{ echo env >&2; exit 8; }}\n\
+                     grep -qF 'networks-on = [\"whatsapp\", \"threema\"]' \"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\" || {{ echo prefs >&2; exit 7; }}\n\
+                     echo '{answer}'"
+                ),
+            )
+        };
+        let release = program("networks registered=Signal off= on=WhatsApp,Threema");
+        check_release_networks(&release, &scratch.0, limit).expect("a release binary");
+        assert!(
+            !scratch.0.join(NETWORKS_HOME_DIR).exists(),
+            "the profile is removed again"
+        );
+        // A binary that registers WhatsApp, or lists it as off (a debug build's answers).
+        for answer in [
+            "networks registered=Signal,WhatsApp off= on=WhatsApp,Threema",
+            "networks registered=Signal off=WhatsApp on=WhatsApp,Threema",
+        ] {
+            let err =
+                check_release_networks(&program(answer), &scratch.0, limit).expect_err(answer);
+            assert!(format!("{err:#}").contains("WhatsApp"), "{err:#}");
+            assert!(!scratch.0.join(NETWORKS_HOME_DIR).exists());
+        }
+        // Another line, a failing program and a missing one are failures as well.
+        for answer in ["Kourier 1.2.3", "networks registered=Signal off= on="] {
+            assert!(check_release_networks(&program(answer), &scratch.0, limit).is_err());
+        }
+        let failing = script(
+            &scratch,
+            "echo 'networks registered=Signal off= on=WhatsApp,Threema'; exit 3",
+        );
+        assert!(check_release_networks(&failing, &scratch.0, limit).is_err());
+        assert!(check_release_networks(&scratch.0.join("missing"), &scratch.0, limit).is_err());
+    }
+
+    /// What the program prints is what the check reads: the flag, the line's first word and shape,
+    /// and the place of the preferences are the program's (a test of `kourier-app` and of the
+    /// `kourier` binary runs the real thing in a debug build).
+    #[test]
+    fn the_networks_flag_and_line_are_the_programs_own() {
+        let read = |path: &str| std::fs::read_to_string(root().join(path)).expect(path);
+        let main = read("crates/kourier/src/main.rs");
+        assert!(
+            main.contains(&format!("\"{PRINT_NETWORKS_FLAG}\"")),
+            "{PRINT_NETWORKS_FLAG}"
+        );
+        let app = read("crates/kourier-app/src/app.rs");
+        assert!(
+            app.contains(&format!(
+                "const NETWORKS_LINE_HEAD: &str = \"{NETWORKS_LINE_HEAD}\";"
+            )),
+            "{NETWORKS_LINE_HEAD}"
+        );
+        assert!(
+            app.contains("\"{NETWORKS_LINE_HEAD} registered={} off={} on={}\""),
+            "the line's shape"
+        );
+        // `<KOURIER_HOME>/kourier/config/kourier.toml` of the default profile.
+        let paths = read("crates/kourier-app/src/paths.rs");
+        for part in [
+            "None => \"kourier\".to_owned()",
+            "let base = home.join(&dir);",
+            "config: base.join(\"config\")",
+            "self.config.join(\"kourier.toml\")",
+        ] {
+            assert!(paths.contains(part), "{part}");
+        }
+        assert_eq!(NETWORKS_PREFS_PATH, "kourier/config/kourier.toml");
+        // The preferences the check writes are the ones `Prefs` reads (`networks-on`, any case).
+        let prefs = read("crates/kourier-app/src/prefs.rs");
+        assert!(prefs.contains("pub networks_on: Vec<String>"));
+        assert!(prefs.contains("rename_all = \"kebab-case\""));
+        assert!(NETWORKS_PREFS.contains("networks-on"));
+    }
+
+    /// The maintainer's project tree is a finding in every spelling, not only under `~/`
+    /// (review MEDIUM-2: the notes that name it are export-ignored and never scanned, so this
+    /// is what stops a PUBLIC file from naming it).
+    #[test]
+    fn the_maintainers_project_tree_is_private_in_every_spelling() {
+        let me = who("carol");
+        let tree = ["projects", "/messengers"].concat();
+        for line in [
+            format!("cp x $HOME/{tree}/releases/"),
+            format!("see ../{tree}/kourier"),
+            format!("/mnt/disk/{tree}"),
+            format!("~/{tree}/releases/0.1.0"),
+        ] {
+            let hits = private_path_hits(&line, &me);
+            assert_eq!(hits.len(), 1, "one hit per line: {line}: {hits:?}");
+        }
+        for line in ["see projects/other", "messengers/kourier", "my projects"] {
+            assert!(private_path_hits(line, &me).is_empty(), "{line}");
+        }
+        let scratch = Scratch::new("notready-tree");
+        scratch.write("pub.md", format!("copy to $HOME/{tree}/x\n").as_bytes());
+        scratch.write("ok.md", b"nothing here\n");
+        let found = not_ready_findings(
+            &scratch.0,
+            &args(&["pub.md", "ok.md"]),
+            "org.example.App",
+            &me,
+            Some("https://example.org/kourier"),
+        )
+        .expect("scan");
+        let paths: Vec<&str> = found
+            .private_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(paths, ["pub.md"], "{found:#?}");
+    }
+
+    #[test]
     fn findings_are_blanks_the_placeholder_id_and_private_paths_in_tracked_files() {
         let scratch = Scratch::new("notready");
         let me = who("carol");
@@ -4024,11 +4704,19 @@ DYNAMIC SYMBOL TABLE:
         false
     }
 
+    /// What a release build says to `--print-networks` on a profile that turns WhatsApp and Threema on.
+    const RELEASE_NETWORKS: &str = "networks registered=Signal off= on=WhatsApp,Threema";
+
     /// The program of a fake release: refuses `--fixture` like a build without the test
-    /// network, else runs `body`.
+    /// network, answers `--print-networks` like a release build, else runs `body`.
     fn fake_program(body: &str) -> String {
+        fake_program_saying(RELEASE_NETWORKS, body)
+    }
+
+    /// [`fake_program`] with another answer to `--print-networks`.
+    fn fake_program_saying(networks: &str, body: &str) -> String {
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--fixture\" ]; then echo 'kourier: {FIXTURE_REFUSAL}' >&2; exit 1; fi\n{body}\n"
+            "#!/bin/sh\nif [ \"$1\" = \"--fixture\" ]; then echo 'kourier: {FIXTURE_REFUSAL}' >&2; exit 1; fi\nif [ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ]; then echo '{networks}'; exit 0; fi\n{body}\n"
         )
     }
 
@@ -4231,6 +4919,26 @@ DYNAMIC SYMBOL TABLE:
             format!("{err:#}").contains("--fixture must be refused"),
             "{err:#}"
         );
+        // A binary that registers WhatsApp, or lists it as off, on a profile that turned it on (what a
+        // debug build does) is refused: the archive could link a real account.
+        for answer in [
+            "networks registered=Signal,WhatsApp off= on=WhatsApp,Threema",
+            "networks registered=Signal off=WhatsApp on=WhatsApp,Threema",
+        ] {
+            let err = check_fake(&scratch, "echo 'Kourier 0.1.0'", "r\n", &["uk"], &|stage| {
+                std::fs::write(
+                    stage.join("bin").join(BINARY),
+                    fake_program_saying(answer, "echo 'Kourier 0.1.0'"),
+                )
+                .expect("tamper");
+            })
+            .expect_err("WhatsApp offered");
+            assert!(
+                format!("{err:#}").contains("--print-networks")
+                    && format!("{err:#}").contains("WhatsApp"),
+                "{err:#}"
+            );
+        }
         // A desktop file that claims a scheme.
         for scheme in install::SCHEMES {
             let err = check_fake(&scratch, "echo 'Kourier 0.1.0'", "r\n", &["uk"], &|stage| {
@@ -4393,6 +5101,15 @@ DYNAMIC SYMBOL TABLE:
         assert!(is_dist_output("kourier-9.9.9-linux-aarch64-dirty.tar.gz"));
         assert!(is_dist_output("kourier-0.1.0-source-unreleased.tar.gz"));
         assert!(is_dist_output("SHA256SUMS") && is_dist_output("NOT-READY.txt"));
+        // The names archive (the grade last), its half-written file and its checksums.
+        assert!(is_dist_output("kourier-0.1.0-linux-x86_64-names.tar.gz"));
+        assert!(is_dist_output(
+            "kourier-0.1.0-linux-x86_64-names-dirty.tar.gz"
+        ));
+        assert!(is_dist_output(
+            "kourier-0.1.0-linux-x86_64-names.tar.gz.partial"
+        ));
+        assert!(is_dist_output(NAMES_SUMS));
         for not in [
             "other.tar.gz",
             "kourier-x.zip",
@@ -4621,10 +5338,12 @@ DYNAMIC SYMBOL TABLE:
         let features = build_features();
         assert!(features.contains("--no-default-features"), "{features}");
         assert_eq!(BUILD_FEATURE_ARGS[1], "--features");
-        assert_eq!(BUILD_FEATURE_ARGS[2], "signal");
+        // The WhatsApp backend is compiled in (W2b) and, being a release build, not registered.
+        assert_eq!(BUILD_FEATURE_ARGS[2], "signal,whatsapp");
         let manifest =
             std::fs::read_to_string(root().join("crates/kourier/Cargo.toml")).expect("manifest");
         assert!(manifest.lines().any(|l| l.starts_with("signal = ")));
+        assert!(manifest.lines().any(|l| l.starts_with("whatsapp = ")));
         assert!(manifest.lines().any(|l| l.starts_with("fake = ")));
         // What the program says to `--fixture` when `fake` is left out is what the check wants.
         let app =
@@ -4999,5 +5718,240 @@ DYNAMIC SYMBOL TABLE:
     /// check in `verify` is `install::is_perf_build`).
     fn install_marker() -> &'static [u8] {
         b"kourier: measuring build (cargo feature dumpable)"
+    }
+
+    // ---- the names archive (SIZE S-names) ----
+
+    /// Packs a hand-made names archive: `files` (path below `top`, mode) with `content`.
+    fn hand_names_archive(
+        scratch: &Scratch,
+        label: &str,
+        top: &str,
+        files: &[(&str, u32)],
+    ) -> PathBuf {
+        let parent = scratch.0.join(format!("{label}-tree"));
+        for (rel, mode) in files {
+            let path = scratch.write(&format!("{label}-tree/{top}/{rel}"), b"names");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode)).expect("mode");
+        }
+        let archive = scratch.0.join(format!("{label}.tar.gz"));
+        pack_tree(&parent, top, 1_791_476_348, &archive).expect("pack");
+        archive
+    }
+
+    #[test]
+    fn the_names_archive_tree_is_exactly_the_one_names_file() {
+        let scratch = Scratch::new("names-tree");
+        let names = archive_names("0.1.0", "x86_64", Grade::Dirty);
+        let rel = names_rel(BUILD_ID);
+        assert_eq!(
+            rel,
+            format!("bin/.debug/kourier-{BUILD_ID}.debug"),
+            "the path of the README and of the debuglink"
+        );
+        let work = scratch.0.join("work");
+        // Good.
+        let good = hand_names_archive(&scratch, "good", &names.stage, &[(&rel, 0o644)]);
+        let file = unpack_names(&good, &work, &names, BUILD_ID).expect("a good names archive");
+        assert!(file.ends_with(&rel) && file.is_file());
+        // One extra file (say a second binary).
+        let extra = hand_names_archive(
+            &scratch,
+            "extra",
+            &names.stage,
+            &[(&rel, 0o644), ("bin/kourier", 0o755)],
+        );
+        let err = unpack_names(&extra, &work, &names, BUILD_ID).expect_err("extra file");
+        assert!(
+            err.to_string().contains("unexpected file bin/kourier"),
+            "{err}"
+        );
+        // The names file of another build.
+        let other = hand_names_archive(
+            &scratch,
+            "other",
+            &names.stage,
+            &[("bin/.debug/kourier-ffff.debug", 0o644)],
+        );
+        let err = unpack_names(&other, &work, &names, BUILD_ID).expect_err("other build");
+        assert!(err.to_string().contains("missing file"), "{err}");
+        // Another top directory.
+        let top = hand_names_archive(
+            &scratch,
+            "top",
+            "kourier-9.9.9-linux-x86_64",
+            &[(&rel, 0o644)],
+        );
+        let err = unpack_names(&top, &work, &names, BUILD_ID).expect_err("wrong top");
+        assert!(err.to_string().contains("one top directory"), "{err}");
+        // An executable names file.
+        let exec = hand_names_archive(&scratch, "exec", &names.stage, &[(&rel, 0o755)]);
+        let err = unpack_names(&exec, &work, &names, BUILD_ID).expect_err("mode");
+        assert!(err.to_string().contains("mode 755"), "{err}");
+    }
+
+    #[test]
+    fn the_names_stage_has_plain_modes() {
+        let scratch = Scratch::new("names-stage");
+        let names = archive_names("0.1.0", "x86_64", Grade::Release);
+        // A names file that came out of objcopy executable.
+        let source = scratch.write("split/names.debug", b"names");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let parent = scratch.0.join("names");
+        stage_names(&parent, &names.stage, &source, BUILD_ID).expect("stage");
+        let file = parent.join(&names.stage).join(names_rel(BUILD_ID));
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(mode(&file), 0o644);
+        assert_eq!(mode(&parent.join(&names.stage)), 0o755);
+        assert_eq!(mode(file.parent().expect("dir")), 0o755);
+        // And what is packed from it passes the tree check.
+        let archive = scratch.0.join("n.tar.gz");
+        pack_tree(&parent, &names.stage, 1_791_476_348, &archive).expect("pack");
+        unpack_names(&archive, &scratch.0.join("work"), &names, BUILD_ID).expect("unpack");
+    }
+
+    #[test]
+    fn each_archive_is_listed_in_one_checksum_file() {
+        let names = archive_names("0.1.0", "x86_64", Grade::Release);
+        let files = checksum_files(&names);
+        // The published SHA256SUMS keeps its two lines whether or not the names archive is
+        // published (critic MEDIUM-2); the names archive has its own file.
+        assert_eq!(files[0].0, "SHA256SUMS");
+        assert_eq!(
+            files[0].1,
+            [names.binary_archive.as_str(), names.source_archive.as_str()]
+        );
+        assert_eq!(files[1].0, "SHA256SUMS.names");
+        assert_eq!(files[1].1, [names.names_archive.as_str()]);
+        // Every archive of the run is in some file.
+        let listed: Vec<&str> = files.iter().flat_map(|f| f.1.iter().copied()).collect();
+        for archive in [
+            &names.binary_archive,
+            &names.names_archive,
+            &names.source_archive,
+        ] {
+            assert!(listed.contains(&archive.as_str()), "{archive}");
+        }
+    }
+
+    /// `int <marker>(void){return <x>;}` and a `main` that calls it, built with a build-id and
+    /// no debug information: the marker is a name in the symbol table, `x` changes the build-id.
+    fn cc_program(dir: &Scratch, out: &str, x: u32, marker: &str) -> PathBuf {
+        let src = dir.write(
+            &format!("{out}.c"),
+            format!("int {marker}(void){{return {x};}}\nint main(void){{return {marker}();}}\n")
+                .as_bytes(),
+        );
+        let bin = dir.0.join(out);
+        let status = Command::new("cc")
+            .args(["-g0", "-Wl,--build-id"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .expect("cc");
+        assert!(status.success(), "cc");
+        bin
+    }
+
+    /// LOW-6: the split and the tie describe the bytes that were read, scanned and stamped, not
+    /// whatever the build output's path holds a moment later.
+    #[test]
+    fn the_split_reads_the_bytes_that_were_scanned_and_not_the_path_again() {
+        let scratch = Scratch::new("built-copy");
+        let path = cc_program(&scratch, "built", 0, "alice_marker");
+        let scanned = std::fs::read(&path).expect("read");
+        let copy = write_built_copy(&scanned, &scratch.0.join("split")).expect("copy");
+        assert_eq!(copy, scratch.0.join("split").join(BUILT_COPY));
+        // Another build replaces the file at the path while the scans run.
+        let other = cc_program(&scratch, "other", 1, "alice_marker");
+        std::fs::copy(&other, &path).expect("replace");
+        assert_ne!(std::fs::read(&path).unwrap(), scanned);
+        let split = crate::names::split(&copy, &scratch.0.join("split")).expect("split");
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            scanned,
+            "the copy is the scanned bytes"
+        );
+        assert_eq!(split.build_id, crate::names::build_id(&copy).unwrap());
+        assert_ne!(
+            split.build_id,
+            crate::names::build_id(&path).unwrap(),
+            "the path holds the other build now"
+        );
+        crate::names::check_pair(&copy, &split.shipped, &split.names).expect("the tie holds");
+    }
+
+    /// Splits `built` and packs the names archive of it, as `dist` does.
+    fn split_and_pack(
+        scratch: &Scratch,
+        built: &Path,
+        label: &str,
+        names: &Names,
+    ) -> (crate::names::Split, PathBuf) {
+        let split =
+            crate::names::split(built, &scratch.0.join(format!("{label}-split"))).expect("split");
+        let parent = scratch.0.join(format!("{label}-names"));
+        stage_names(&parent, &names.stage, &split.names, &split.build_id).expect("stage");
+        let archive = scratch.0.join(format!("{label}.tar.gz"));
+        pack_tree(&parent, &names.stage, 1_791_476_348, &archive).expect("pack");
+        (split, archive)
+    }
+
+    #[test]
+    fn the_names_archive_is_tied_to_the_build_output_and_the_packed_binary() {
+        let scratch = Scratch::new("names-tie");
+        let names = archive_names("0.1.0", "x86_64", Grade::Release);
+        let needles = private_needles(&who("carol"));
+        let one = cc_program(&scratch, "one", 0, "plain_marker");
+        let (a, a_archive) = split_and_pack(&scratch, &one, "a", &names);
+        let work = scratch.0.join("work");
+        // The tie holds, and the names file holds no private name.
+        let hit = verify_names(&a_archive, &work, &names, &one, &a.shipped, &needles)
+            .expect("a good names archive");
+        assert!(hit.is_none());
+        // The names archive of ANOTHER build: its file has another build-id in its name.
+        let two = cc_program(&scratch, "two", 1, "plain_marker");
+        let (b, b_archive) = split_and_pack(&scratch, &two, "b", &names);
+        assert_ne!(a.build_id, b.build_id, "the builds differ");
+        let err = verify_names(&b_archive, &work, &names, &one, &a.shipped, &needles)
+            .expect_err("names of another build");
+        assert!(err.to_string().contains("names archive"), "{err}");
+        // The other build's names file under THIS build's name: the tree is right, the bytes
+        // are not (the build-ids differ inside).
+        let parent = scratch.0.join("forged-names");
+        stage_names(&parent, &names.stage, &b.names, &a.build_id).expect("stage");
+        let forged = scratch.0.join("forged.tar.gz");
+        pack_tree(&parent, &names.stage, 1_791_476_348, &forged).expect("pack");
+        let err = verify_names(&forged, &work, &names, &one, &a.shipped, &needles)
+            .expect_err("forged names file");
+        assert!(err.to_string().contains("build-id"), "{err}");
+        // The unstripped build output as the packed binary: no debuglink, so no tie.
+        let err = verify_names(&a_archive, &work, &names, &one, &one, &needles)
+            .expect_err("a binary that kept its symbols");
+        assert!(err.to_string().contains("debuglink"), "{err}");
+    }
+
+    #[test]
+    fn the_names_file_is_searched_for_private_names() {
+        let scratch = Scratch::new("names-scan");
+        let names = archive_names("0.1.0", "x86_64", Grade::Release);
+        let needles = private_needles(&who("carol"));
+        // A function named after the user: its name is in the symbol table, which the names
+        // file keeps.
+        let built = cc_program(&scratch, "leaky", 0, "carol_marker");
+        let (split, archive) = split_and_pack(&scratch, &built, "leaky", &names);
+        let (file, scan) = verify_names(
+            &archive,
+            &scratch.0.join("work"),
+            &names,
+            &built,
+            &split.shipped,
+            &needles,
+        )
+        .expect("the tie holds")
+        .expect("the scan found the name");
+        assert_eq!(file, names_rel(&split.build_id));
+        assert!(scan.total() > 0, "{}", scan.summary());
     }
 }

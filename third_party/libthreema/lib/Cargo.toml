@@ -1,0 +1,193 @@
+[package]
+name = "libthreema"
+version.workspace = true
+edition.workspace = true
+description = "A suite of protocol implementations, utilities and FFI bindings tailored for Threema clients"
+readme = "../README.md"
+repository = "<Insert URL when publishing>"
+license.workspace = true
+keywords = ["communication", "messenger", "protocol", "threema"]
+categories = ["api-bindings", "cryptography"]
+
+[lib]
+# Kourier patch P6: only the Rust library. As a dependency cargo built all three types (a 19 MB `.so` and a
+# 77 MB `.a` per build); Kourier links the rlib and builds no bindings.
+crate-type = ["lib"]
+name = "libthreema"
+
+[[example]]
+name = "csp-e2e-receive"
+path = "examples/bin/csp_e2e_receive.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "csp-login"
+path = "examples/bin/csp_login.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "csp-ping-pong"
+path = "examples/bin/csp_ping_pong.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "data-backup-create"
+path = "examples/bin/data_backup_create.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "data-backup-restore"
+path = "examples/bin/data_backup_restore.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "d2d-rendezvous"
+path = "examples/bin/d2d_rendezvous.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "d2m-ping-pong"
+path = "examples/bin/d2m_ping_pong.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "identity-create"
+path = "examples/bin/identity_create.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "remote-secret"
+path = "examples/bin/remote_secret.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "update-work-properties"
+path = "examples/bin/update_work_properties.rs"
+required-features = ["cli"]
+
+[dependencies]
+arrayref = "0.3"
+chrono = {
+    version = "0.4",
+    default-features = false,
+    features = [
+        "clock",
+        "std",
+    ]
+}
+const_format = { version = "0.2", features = ["rust_1_83"] }
+derive_builder = { version = "0.20", default-features = false, features = ["alloc", "std"] }
+duplicate = "2"
+educe = { version = "0.7.4", default-features = false, features = ["Debug"] }
+form_urlencoded = "1"
+itertools = "0.14"
+libthreema-dependencies = { version = "0.1.0", path = "../dependencies" }
+libthreema-macros = { version = "0.1.0", path = "../macros" }
+prost = "0.14"
+regex = "1"
+serde = { version = "1", features = ["alloc", "derive"] }
+serde_json = "1"
+serde_repr = "0.1"
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+zeroize = "1"
+
+# Bindings (UniFFi/WASM), CLI
+tracing-subscriber = { version = "0.3", optional = true }
+
+# Bindings: UniFFI
+uniffi = { version = "0.32", optional = true }
+
+# Bindings: WASM
+getrandom = {
+    version = "0.2", # 0.3+ held back by rand_core@0.6 required by all crypto dependencies
+    features = ["js"],
+    optional = true,
+}
+js-sys = { version = "0.3", optional = true }
+serde_bytes = { version = "0.11", optional = true }
+tsify = { version = "0.5", features = ["js"], optional = true }
+# When bumping the wasm-bindgen version, increase the `image` version in
+# `.devcontainer/devcontainer.json` and `.gitlab-ci.yml`
+wasm-bindgen = { version = "=0.2.127", optional = true }
+web-time = { version = "1", optional = true }
+
+# CLI
+anyhow = { version = "1", optional = true }
+clap = { version = "4", features = ["cargo", "derive"], optional = true }
+futures-util = { version = "0.3", optional = true }
+reqwest = {
+    version = "0.13",
+    default-features = false,
+    features = [
+        "http2",
+        "native-tls",
+    ],
+    optional = true
+}
+tokio = {
+    version = "1",
+    default-features = false,
+    features = [
+        "io-util",
+        "macros",
+        "net",
+        "rt",
+        "rt-multi-thread",
+        "signal",
+        "sync",
+        "time",
+    ],
+    optional = true
+}
+tokio-tungstenite = {
+    version = "0.30",
+    default-features = false,
+    features = [
+        "connect",
+        "native-tls",
+    ],
+    optional = true
+}
+
+[dev-dependencies]
+anyhow = "1"
+assert_matches = "1.5"
+derive_builder = "0.20"
+libthreema-dependencies = { version = "0.1.0", path = "../dependencies" }
+rstest = "0.26"
+rstest_reuse = "0.7"
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+prost-build = "0.14"
+# Bindings: UniFFI
+uniffi = { version = "0.32", features = ["build"], optional = true }
+
+[features]
+cli = [
+    "dep:anyhow",
+    "dep:clap",
+    "dep:futures-util",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:tracing-subscriber",
+    "libthreema-dependencies/seedable-rng",
+]
+slow_tests = []
+uniffi = ["dep:tracing-subscriber", "dep:uniffi"]
+wasm = [
+    "chrono/wasmbind",
+    "dep:getrandom",
+    "dep:js-sys",
+    "dep:serde_bytes",
+    "dep:tracing-subscriber",
+    "dep:tsify",
+    "dep:wasm-bindgen",
+    "dep:web-time",
+]
+
+[lints]
+workspace = true

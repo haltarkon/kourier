@@ -25,15 +25,31 @@ QQC2.Popup {
     property int index: 0
     // The message the pictures belong to; 0: what was handed over is shown as it is.
     property real message: 0
+    // The gallery slot ("group", "person", "media") the pictures came from, when a square of "Media
+    // and Files" opened the viewer; empty: the timeline's. The message is then followed through the
+    // viewer's OWN query (the slot "viewer", opened by the window with `App.showGalleryViewer`): the
+    // whole album, read at the message, not the six squares of a section or the pages of a level, and
+    // not the open timeline (the square may belong to another chat). Until its first answer what the
+    // viewer opened with is shown.
+    property string gallery: ""
 
     // The message's row changed: show it as it is now, staying on the same picture.
     function refresh(): void {
-        const fresh = App.viewerItems(root.message);
-        // Not among the loaded rows (the window of the timeline moved on): what is shown stays.
-        if (fresh === undefined || fresh === null) {
-            return;
+        let fresh;
+        if (root.gallery !== "") {
+            if (!App.galleryLoaded("viewer")) {
+                return;
+            }
+            fresh = App.galleryViewerItems("viewer", root.message);
+        } else {
+            // Not among the loaded rows (the window of the timeline moved on): what is shown stays.
+            if (!App.viewerMessageLoaded(root.message)) {
+                return;
+            }
+            fresh = App.viewerItems(root.message);
         }
-        // Deleted, or no picture is left of it.
+        // Deleted (the message has no picture left in the viewer's query, or in the timeline), or no
+        // picture is left of it.
         if (fresh.length === 0) {
             root.close();
             return;
@@ -54,7 +70,16 @@ QQC2.Popup {
         target: App
         enabled: root.message > 0 && root.visible
         function onTimelineRowsChanged(): void {
-            root.refresh();
+            if (root.gallery === "") {
+                root.refresh();
+            }
+        }
+        // The rows of the viewer's own query changed (a deletion, a timer that ran out, a download, a
+        // picture added to the album): the same refresh, from its rows.
+        function onGalleryChanged(slot: string): void {
+            if (root.gallery !== "" && slot === "viewer") {
+                root.refresh();
+            }
         }
     }
 
@@ -68,6 +93,8 @@ QQC2.Popup {
     readonly property string mediaState: root.current ? root.current.state : ""
     // Gone here, and Download asks the user's phone to upload it again (the core decides it).
     readonly property bool ask: root.current ? root.current.ask === true : false
+    // The core lists this picture as one it may save (it is on this PC, and not a view-once one).
+    readonly property bool saveOffered: root.current ? root.current.save === true : false
     // What the button fetches: a download, a retry, or the question to the phone.
     readonly property bool downloadable: root.mediaState === "remote" || root.mediaState === "failed" || root.ask
     // How far its download is (0 … 1).
@@ -106,6 +133,13 @@ QQC2.Popup {
         }
     }
 
+    // Save As… for the picture on screen (the button and Ctrl+S).
+    function save(): void {
+        if (root.saveOffered && root.attachment > 0) {
+            MediaActions.save([root.attachment]);
+        }
+    }
+
     function step(delta: int): void {
         const next = Math.max(0, Math.min(root.count - 1, root.index + delta));
         if (next !== root.index) {
@@ -139,6 +173,12 @@ QQC2.Popup {
         Keys.onLeftPressed: root.step(-1)
         Keys.onRightPressed: root.step(1)
         Keys.onPressed: event => {
+            // Ctrl+S: a key of the viewer, not a window shortcut (it cannot fire behind the viewer).
+            if (event.matches(StandardKey.Save)) {
+                root.save();
+                event.accepted = true;
+                return;
+            }
             switch (event.key) {
             case Qt.Key_PageUp:
                 root.step(-1);
@@ -167,8 +207,12 @@ QQC2.Popup {
             event.accepted = true;
         }
 
-        // A click beside the picture closes; one on the picture keeps it open.
+        // A click beside the picture closes; one on the picture keeps it open. The exclusive
+        // grab on press keeps the tap here: a passive handler would let a tap on this modal
+        // popup reach the TapHandler of an item under it (Qt 6.11), which opens a second
+        // viewer from the picture underneath.
         TapHandler {
+            gesturePolicy: TapHandler.WithinBounds
             onTapped: (eventPoint, button) => {
                 const shown = root.movie ? moving : still;
                 const w = shown.paintedWidth;
@@ -344,6 +388,17 @@ QQC2.Popup {
                 onClicked: MediaActions.open(root.attachment, L10n.i18nc("@info", "Picture"), root.media)
             }
             QQC2.ToolButton {
+                objectName: "viewerSave"
+                visible: root.saveOffered && root.attachment > 0
+                focusPolicy: Qt.NoFocus
+                icon.name: "document-save-as"
+                text: L10n.i18nc("@action:button", "Save As…")
+                display: QQC2.AbstractButton.IconOnly
+                QQC2.ToolTip.visible: hovered
+                QQC2.ToolTip.text: L10n.i18nc("@info:tooltip", "Save As… (Ctrl+S)")
+                onClicked: root.save()
+            }
+            QQC2.ToolButton {
                 focusPolicy: Qt.NoFocus
                 icon.name: "dialog-close"
                 text: L10n.i18nc("@action:button", "Close")
@@ -355,5 +410,11 @@ QQC2.Popup {
         }
     }
 
-    onOpened: stage.forceActiveFocus()
+    onOpened: {
+        stage.forceActiveFocus();
+        // (An answer of the viewer's own query that came before the viewer was open.)
+        if (root.gallery !== "") {
+            root.refresh();
+        }
+    }
 }

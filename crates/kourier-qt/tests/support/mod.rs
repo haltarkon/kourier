@@ -10,16 +10,34 @@
 
 /// Answers a `--list` run with the one test this binary is, and exits. For any other
 /// arguments it returns and the caller's `main` runs everything as before.
+#[allow(dead_code)]
 pub fn answer_list(name: &str) {
+    answer_list_of(&[name]);
+}
+
+/// The same for a binary that is several tests for nextest (SE6: `scroll_ui` and its slow twin
+/// `scroll_ui_climbed`): the listing names each, and nextest then runs the binary once per name
+/// with `--exact <name>`, which `main` reads from [`named`].
+#[allow(dead_code)]
+pub fn answer_list_of(names: &[&str]) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.iter().any(|a| a == "--list") {
         return;
     }
-    // `--ignored` asks for the ignored tests only; this binary has none.
+    // `--ignored` asks for the ignored tests only; these binaries have none.
     if !args.iter().any(|a| a == "--ignored") {
-        println!("{name}: test");
+        for name in names {
+            println!("{name}: test");
+        }
     }
     std::process::exit(0);
+}
+
+/// Whether the arguments of this run name the test `name` (nextest passes `--exact <name>`, `cargo
+/// test` a filter): how a binary that lists several tests ([`answer_list_of`]) knows which one it is.
+#[allow(dead_code)]
+pub fn named(name: &str) -> bool {
+    std::env::args().skip(1).any(|a| a == name)
 }
 
 /// The lines of a case's stderr that are QML script errors (`TypeError`) or failed assignments

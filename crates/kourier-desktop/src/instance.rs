@@ -2,8 +2,9 @@
 //! name and serves `org.freedesktop.Application` on it; a later launch finds the name taken and
 //! forwards its activation (with `$XDG_ACTIVATION_TOKEN`) or its `sgnl://` URIs, then exits.
 //!
-//! The interface object is registered before the name is requested, so a forwarded call can
-//! never arrive at a name without an object.
+//! The interface object is registered, and the connection's object server is seen answering
+//! calls, before the name is requested, so a forwarded call can never arrive at a name without
+//! an object or be dropped unanswered ([`until_served`]).
 
 use std::collections::HashMap;
 
@@ -181,6 +182,7 @@ pub async fn claim(bus: Bus, name: &str) -> Result<Claim, DesktopError> {
         .object_server()
         .at(path.as_str(), Application { tx })
         .await?;
+    until_served(&bus).await;
     let reply = bus
         .connection()
         .request_name_with_flags(name, RequestNameFlags::DoNotQueue.into())
@@ -205,6 +207,40 @@ pub async fn claim(bus: Bus, name: &str) -> Result<Claim, DesktopError> {
             Ok(Claim::Secondary(bus))
         }
     }
+}
+
+/// How long one ping of [`until_served`] may take, and how many it sends at most.
+const SERVED_PING: std::time::Duration = std::time::Duration::from_millis(100);
+const SERVED_PINGS: u32 = 50;
+
+/// Waits until the connection's object server answers calls: a `Peer.Ping` of its own,
+/// through the bus, is answered.
+///
+/// zbus starts the object server's dispatch task lazily, in a task of its own, when
+/// `object_server()` is first used, and a call that reaches the connection before that task has
+/// subscribed is dropped without a reply (zbus bounds no call by default: the caller waits for
+/// ever, or a later launch runs into its `FORWARD_TIMEOUT`). A launch that forwards in the
+/// moment the name appears could hit that window (`tests/dbus.rs` `single_instance` did once in
+/// 8,000 runs under load). The object server answers `Peer` at any path, so one answered ping
+/// shows it listening; a lost ping costs [`SERVED_PING`]. After [`SERVED_PINGS`] pings the
+/// claim goes on anyway (the name matters more than the window).
+async fn until_served(bus: &Bus) {
+    let Some(me) = bus.unique_name() else {
+        return;
+    };
+    for _ in 0..SERVED_PINGS {
+        let ping = bus.connection().call_method(
+            Some(me.as_str()),
+            "/",
+            Some("org.freedesktop.DBus.Peer"),
+            "Ping",
+            &(),
+        );
+        if let Ok(Ok(_)) = tokio::time::timeout(SERVED_PING, ping).await {
+            return;
+        }
+    }
+    tracing::warn!("the object server answered no ping of its own; claiming the name anyway");
 }
 
 #[zbus::proxy(interface = "org.freedesktop.Application")]

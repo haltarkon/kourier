@@ -43,14 +43,20 @@ pub(crate) const MIGRATIONS: Migrations = Migrations::new(
         migration!(20, "0020_group_requesting"),
         migration!(21, "0021_number_links"),
         migration!(22, "0022_device_name"),
+        migration!(23, "0023_archive_base"),
+        migration!(24, "0024_phone_sharing"),
+        migration!(25, "0025_storage_writes"),
     ],
 );
 
 /// Opens (creating if needed) `backend.db` with its key and brings both schema components
-/// (`core_outbox` from kourier-db, then `signal`) up to date.
+/// (`core_outbox` from kourier-db, then `signal`) up to date. A file that carries any other
+/// component (another network's backend, the core) is refused before anything is written
+/// (`kourier_db::check_backend_file`): its bytes are not touched.
 pub(crate) fn open(path: &Path, key: &kourier_backend_api::DbKey) -> Result<ZoneDb> {
     let key = kourier_db::DbKey::from_bytes(*key.expose());
     let mut conn = kourier_db::open(path, &key)?;
+    kourier_db::check_backend_file(&conn, &MIGRATIONS)?;
     kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS)?;
     kourier_db::migrate(&mut conn, &MIGRATIONS)?;
     Ok(ZoneDb::new(conn))
@@ -428,7 +434,408 @@ mod tests {
         assert_eq!(versions.len(), 2, "{versions:?}");
         assert_eq!(versions[0].0, "core_outbox");
         assert!(versions[0].1 >= 1);
-        assert_eq!(versions[1], ("signal".to_owned(), 22));
+        assert_eq!(versions[1], ("signal".to_owned(), 25));
         assert!(db.read(Account::load).unwrap().is_none());
+    }
+
+    /// Migration 0023 (A1): a profile of schema 22 opens at 23, keeps its rows, and the new
+    /// base columns start as "never told" (NULL), the account's setting too.
+    #[test]
+    fn a_schema_22_file_opens_at_23_with_the_archive_base_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.db");
+        {
+            let mut conn =
+                kourier_db::open(&path, &kourier_db::DbKey::from_bytes([3; 32])).unwrap();
+            kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).unwrap();
+            let v22 = Migrations::new(MIGRATIONS.component, &MIGRATIONS.steps[..22]);
+            kourier_db::migrate(&mut conn, &v22).unwrap();
+            conn.execute(
+                "INSERT INTO peers(service_id, updated_at) VALUES ('old-contact', 5)",
+                [],
+            )
+            .unwrap();
+            let columns: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('peers')
+                     WHERE name IN ('roaming_archived', 'roaming_muted_until')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, 0, "schema 22 has no base columns");
+        }
+        let db = open(&path, &kourier_backend_api::DbKey::new([3; 32])).unwrap();
+        db.read(|c| -> Result<()> {
+            let version: i64 = c.query_row(
+                "SELECT version FROM schema_version WHERE component = 'signal'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(version, 25, "and on to 25 (0025_storage_writes)");
+            let peer = crate::peers::load(c, "old-contact")?;
+            assert_eq!(peer.roaming, None, "an old contact was never told");
+            let (kind, not_null, default): (String, i64, Option<String>) = c.query_row(
+                "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('account')
+                 WHERE name = 'keep_muted_archived'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(
+                (kind.as_str(), not_null, default.as_deref()),
+                ("INTEGER", 0, None),
+                "keep_muted_archived is NULL (never read) until it is filled"
+            );
+            Ok(())
+        })
+        .unwrap();
+        // Only 0 and 1 are a base.
+        let refused = db.zone(|tx| -> Result<()> {
+            tx.execute(
+                "UPDATE peers SET roaming_archived = 2 WHERE service_id = 'old-contact'",
+                [],
+            )?;
+            Ok(())
+        });
+        assert!(refused.is_err());
+    }
+
+    /// Migration 0024 (people pages P1): a profile of schema 23 opens at 24, keeps its rows, and
+    /// `peers.phone_sharing` starts as "never fetched" (NULL); only 0 and 1 are a verdict.
+    #[test]
+    fn a_schema_23_file_opens_at_24_with_the_sharing_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.db");
+        {
+            let mut conn =
+                kourier_db::open(&path, &kourier_db::DbKey::from_bytes([3; 32])).unwrap();
+            kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).unwrap();
+            let v23 = Migrations::new(MIGRATIONS.component, &MIGRATIONS.steps[..23]);
+            kourier_db::migrate(&mut conn, &v23).unwrap();
+            conn.execute(
+                "INSERT INTO peers(service_id, updated_at) VALUES ('old-contact', 5)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = open(&path, &kourier_backend_api::DbKey::new([3; 32])).unwrap();
+        db.read(|c| -> Result<()> {
+            let version: i64 = c.query_row(
+                "SELECT version FROM schema_version WHERE component = 'signal'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(version, 25, "and on to 25 (0025_storage_writes)");
+            let sharing: Option<i64> = c.query_row(
+                "SELECT phone_sharing FROM peers WHERE service_id = 'old-contact'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(sharing, None, "never fetched");
+            // The other 0024 additions: no attempt time, no hold, the verdict pass not done.
+            let tried: Option<i64> = c.query_row(
+                "SELECT profile_tried_at FROM peers WHERE service_id = 'old-contact'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(tried, None);
+            let holds: i64 = c.query_row("SELECT count(*) FROM job_holds", [], |r| r.get(0))?;
+            assert_eq!(holds, 0);
+            let (default, not_null): (String, i64) = c.query_row(
+                "SELECT dflt_value, \"notnull\" FROM pragma_table_info('account')
+                 WHERE name = 'number_verdicts_stated'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!((default.as_str(), not_null), ("0", 1));
+            // The rule, on the migrated row: no key, so the number shows.
+            assert!(crate::peers::number_shown(c, "old-contact")?);
+            Ok(())
+        })
+        .unwrap();
+        let refused = db.zone(|tx| -> Result<()> {
+            tx.execute(
+                "UPDATE peers SET phone_sharing = 2 WHERE service_id = 'old-contact'",
+                [],
+            )?;
+            Ok(())
+        });
+        assert!(refused.is_err());
+    }
+
+    /// Migration 0025 (A10, the Storage Service write engine): a profile of schema 24 opens at 25 and
+    /// keeps every row it had; the switch of the account is OFF (the lead's answer: every account, old
+    /// or new), the records have no target yet (`storage::fill_targets` fills them), the generation
+    /// and the intent counter start at 0, and the three new tables are empty and strict.
+    #[test]
+    fn a_schema_24_file_opens_at_25_with_every_row_kept_and_the_sync_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backend.db");
+        {
+            let mut conn =
+                kourier_db::open(&path, &kourier_db::DbKey::from_bytes([3; 32])).unwrap();
+            kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).unwrap();
+            let v24 = Migrations::new(MIGRATIONS.component, &MIGRATIONS.steps[..24]);
+            kourier_db::migrate(&mut conn, &v24).unwrap();
+            conn.execute(
+                "INSERT INTO account(id, aci, pni, e164, device_id, password, aci_registration_id,
+                   pni_registration_id, profile_key, master_key, storage_key, manifest_version,
+                   linked_at)
+                 VALUES (1, 'aci', 'pni', '+10000000', 2, 'pw', 11, 12, x'09', x'09', x'09', 7, 3)",
+                [],
+            )
+            .unwrap();
+            for (key, kind, peer) in [(1, 1, Some("old-contact")), (2, 2, None), (3, 3, None)] {
+                conn.execute(
+                    "INSERT INTO storage_records(key, kind, peer, record, updated_at)
+                     VALUES (?1, ?2, ?3, x'0a00', 5)",
+                    (vec![key as u8; 16], kind, peer),
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO peers(service_id, updated_at) VALUES ('old-contact', 5)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO groups(master_key, group_id, archived, updated_at)
+                 VALUES (x'07', x'08', 1, 5)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO job_holds(kind, until) VALUES ('profile_fetch', 99)",
+                [],
+            )
+            .unwrap();
+            let columns: i64 = conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM pragma_table_info('storage_records')
+                             WHERE name = 'target')
+                          + (SELECT count(*) FROM pragma_table_info('account')
+                             WHERE name IN ('roaming_writes', 'storage_generation',
+                                            'storage_intent_seq'))",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, 0, "schema 24 has none of the new columns");
+        }
+        let db = open(&path, &kourier_backend_api::DbKey::new([3; 32])).unwrap();
+        db.read(|c| -> Result<()> {
+            let version: i64 = c.query_row(
+                "SELECT version FROM schema_version WHERE component = 'signal'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(version, 25);
+            // Every row of schema 24 is still there, unchanged.
+            let (manifest, linked, switch, generation, intent_seq): (i64, i64, i64, i64, i64) = c
+                .query_row(
+                    "SELECT manifest_version, linked_at, roaming_writes, storage_generation,
+                            storage_intent_seq FROM account WHERE id = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?;
+            assert_eq!((manifest, linked), (7, 3));
+            assert_eq!(
+                (switch, generation, intent_seq),
+                (0, 0, 0),
+                "the sync is off for an account that existed, and nothing is counted yet"
+            );
+            type Row = (Vec<u8>, i64, Option<String>, Vec<u8>, Option<String>);
+            let records: Vec<Row> = {
+                let mut stmt = c.prepare(
+                    "SELECT key, kind, peer, record, target FROM storage_records ORDER BY key",
+                )?;
+                stmt.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<kourier_db::rusqlite::Result<_>>()?
+            };
+            assert_eq!(
+                records,
+                [
+                    (vec![1; 16], 1, Some("old-contact".to_owned()), vec![0x0a, 0], None),
+                    (vec![2; 16], 2, None, vec![0x0a, 0], None),
+                    (vec![3; 16], 3, None, vec![0x0a, 0], None),
+                ],
+                "the records are kept byte for byte and have no target until it is filled"
+            );
+            // Review N6: a record from before 0025 is the phone's (`ours` = 0, never NULL).
+            let (phones, ours_decl): (i64, (i64, String)) = (
+                c.query_row(
+                    "SELECT count(*) FROM storage_records WHERE ours = 0",
+                    [],
+                    |r| r.get(0),
+                )?,
+                c.query_row(
+                    "SELECT \"notnull\", dflt_value FROM pragma_table_info('storage_records')
+                     WHERE name = 'ours'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?,
+            );
+            assert_eq!((phones, ours_decl.0, ours_decl.1.as_str()), (3, 1, "0"));
+            let kept: (i64, i64, i64) = c.query_row(
+                "SELECT (SELECT count(*) FROM peers WHERE service_id = 'old-contact'),
+                        (SELECT archived FROM groups WHERE master_key = x'07'),
+                        (SELECT until FROM job_holds WHERE kind = 'profile_fetch')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(kept, (1, 1, 99));
+            // The new columns' declarations: the switch and the counters can never be NULL.
+            for name in ["roaming_writes", "storage_generation", "storage_intent_seq"] {
+                let (not_null, default): (i64, String) = c.query_row(
+                    "SELECT \"notnull\", dflt_value FROM pragma_table_info('account') WHERE name = ?1",
+                    [name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                assert_eq!((not_null, default.as_str()), (1, "0"), "{name}");
+            }
+            // The three new tables are empty.
+            for table in [
+                "storage_intents",
+                "storage_write_inflight",
+                "storage_write_times",
+            ] {
+                let rows: i64 =
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+                assert_eq!(rows, 0, "{table}");
+            }
+            // The partial index serves a lookup by target (A10's plan reads records that way).
+            let plan: String = c.query_row(
+                "EXPLAIN QUERY PLAN SELECT key FROM storage_records WHERE target = ?1",
+                ["account"],
+                |r| r.get(3),
+            )?;
+            assert!(plan.contains("storage_records_target"), "{plan}");
+            Ok(())
+        })
+        .unwrap();
+        // What the schema refuses: the switch is 0 or 1, an intent's flag too, one in-flight row of
+        // a valid JSON plan, strict types, one intent per target and field.
+        let refuses = |sql: &str| {
+            let sql = sql.to_owned();
+            db.zone(move |tx| -> Result<()> {
+                tx.execute(&sql, [])?;
+                Ok(())
+            })
+            .is_err()
+        };
+        assert!(refuses("UPDATE account SET roaming_writes = 2"));
+        assert!(refuses(
+            "INSERT INTO storage_intents(target, field, seq, automatic, created_at)
+             VALUES ('account', 'archived', 1, 2, 0)"
+        ));
+        assert!(refuses(
+            "INSERT INTO storage_intents(target, field, value, seq, created_at)
+             VALUES ('account', 'archived', 'yes', 1, 0)"
+        ));
+        assert!(refuses(
+            "INSERT INTO storage_write_inflight(id, version, new_keys, planned, generation,
+               planned_at) VALUES (2, 8, x'', '[]', 0, 0)"
+        ));
+        assert!(refuses(
+            "INSERT INTO storage_write_inflight(id, version, new_keys, planned, generation,
+               planned_at) VALUES (1, 8, x'', 'not json', 0, 0)"
+        ));
+        assert!(refuses(
+            "INSERT INTO storage_write_times(at) VALUES ('later')"
+        ));
+        assert!(!refuses(
+            "INSERT INTO storage_intents(target, field, value, base, shown, key, seq, automatic,
+               created_at) VALUES ('contact:x', 'identity', 1, 0, 0, x'05', 1, 0, 0)"
+        ));
+        assert!(
+            refuses(
+                "INSERT INTO storage_intents(target, field, seq, created_at)
+                 VALUES ('contact:x', 'identity', 2, 0)"
+            ),
+            "one intent per target and field"
+        );
+        assert!(!refuses(
+            "INSERT INTO storage_write_inflight(id, version, new_keys, planned, generation,
+               planned_at) VALUES (1, 8, x'0102', '[{\"target\":\"account\"}]', 0, 0)"
+        ));
+        assert!(
+            refuses(
+                "INSERT INTO storage_write_inflight(id, version, new_keys, planned, generation,
+                   planned_at) VALUES (1, 9, x'', '[]', 0, 0)"
+            ),
+            "at most one write in flight"
+        );
+        assert!(!refuses(
+            "INSERT INTO storage_write_times(at) VALUES (12345)"
+        ));
+    }
+
+    /// A file that carries any component but `core_outbox` and `signal` (a WhatsApp account's file
+    /// handed over by a registry mix-up, the core's, one of a backend that does not exist yet) is
+    /// refused BEFORE anything is written, so the other backend can still open it: Signal must not
+    /// add its tables to it. Every file of the directory is byte for byte what it was, and an outbox
+    /// newer than this build does not answer `TooNew` first.
+    #[test]
+    fn a_file_of_another_backend_is_refused_before_any_write() {
+        let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
+        let key = || kourier_backend_api::DbKey::new([3; 32]);
+        let cases = [
+            ("whatsapp", Some(outbox), "whatsapp"),
+            ("the core", None, "core"),
+            ("a backend of the future", None, "threema"),
+            (
+                "whatsapp with a newer outbox",
+                Some(outbox + 50),
+                "whatsapp",
+            ),
+        ];
+        for (case, outbox, other) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("backend.db");
+            {
+                let mut conn =
+                    kourier_db::open(&path, &kourier_db::DbKey::from_bytes([3; 32])).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS schema_version(
+                       component TEXT PRIMARY KEY, version INTEGER NOT NULL)",
+                )
+                .unwrap();
+                if let Some(version) = outbox {
+                    kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).unwrap();
+                    conn.execute(
+                        "UPDATE schema_version SET version = ?1 WHERE component = 'core_outbox'",
+                        [version],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO schema_version(component, version) VALUES (?1, 1)",
+                    [other],
+                )
+                .unwrap();
+            }
+            let snapshot = || {
+                let mut files: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| {
+                        let path = e.unwrap().path();
+                        (path.clone(), std::fs::read(&path).unwrap())
+                    })
+                    .collect();
+                files.sort();
+                files
+            };
+            let before = snapshot();
+            match open(&path, &key()) {
+                Err(Error::Db(kourier_db::Error::ForeignComponent { component })) => {
+                    assert_eq!(component, other, "{case}");
+                }
+                Err(other) => panic!("{case}: refused with another error: {other}"),
+                Ok(_) => panic!("{case}: the foreign file was opened"),
+            }
+            assert!(before == snapshot(), "{case}: the foreign file was written");
+        }
     }
 }

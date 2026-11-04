@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::i18n::{Msg, trc, trc_noop, trm};
+use crate::i18n::{Msg, trc, trc_noop, trfc, trm};
 
 const MS_PER_DAY: i64 = 86_400_000;
 
@@ -188,6 +188,43 @@ impl<'a> TimeContext<'a> {
         }
     }
 
+    /// A coming instant in words, for "until": `today at 14:00`, `tomorrow at 09:00`,
+    /// `18 Oct at 14:00` (the year too when it is not this one). An instant that has passed
+    /// still reads as the day it falls on (`today at 14:00` stays true all day); callers show
+    /// another sentence once the instant is past. Each shape is its own message, because a
+    /// translated date or day word may decline.
+    pub fn until(&self, ts_ms: i64) -> String {
+        let today = self.day_number(self.now_ms);
+        let day = self.day_number(ts_ms);
+        let clock = self.clock(ts_ms);
+        if day == today {
+            return trfc(
+                "@info:status a time later today, %1 the time",
+                "today at %1",
+                &[&clock],
+            );
+        }
+        if day == today + 1 {
+            return trfc(
+                "@info:status a time tomorrow, %1 the time",
+                "tomorrow at %1",
+                &[&clock],
+            );
+        }
+        let d = civil_from_days(day);
+        let month = trm(MONTHS_SHORT[(d.month - 1) as usize]);
+        let date = if d.year == civil_from_days(today).year {
+            format!("{} {month}", d.day)
+        } else {
+            format!("{} {month} {}", d.day, d.year)
+        };
+        trfc(
+            "@info:status a day and a time, %1 the day (18 Oct), %2 the time",
+            "%1 at %2",
+            &[&date, &clock],
+        )
+    }
+
     /// A local date in short form, for a date that is not "recent" (when a link was made):
     /// `12 Sep` this year, `12 Sep 2025` before. Unlike [`Self::list_label`] it never says a
     /// time, `Yesterday` or a weekday.
@@ -265,6 +302,59 @@ pub fn file_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// The two sizes of the line under an upload ("Uploading 45% · 12 of 32 MB"), both in the unit
+/// of the total, which is the unit and the figure of [`file_size`]'s label for the same file
+/// (the detail line beside it): from 10 units up his whole-number form, below 10 units one
+/// decimal for both ("1.2 of 4.2 MB"). The whole total is that label's one-decimal figure
+/// rounded half up (31.46 MB is labelled "31.5 MB" and read "of 32 MB", never "of 31"); the
+/// first number is the bytes done without a unit, rounded down in the same form (never above
+/// the total, and the total itself once all is up). Below 1 KB the unit is bytes. Decimal
+/// units, like [`file_size`].
+pub fn file_size_pair(done: u64, total: u64) -> (String, String) {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if total < 1000 {
+        return (done.min(total).to_string(), format!("{total} B"));
+    }
+    // The label's own unit and one-decimal figure, in tenths: read back from its text, so the
+    // line cannot disagree with the label by a rounding.
+    let label = file_size(total);
+    let (figure, name) = label.split_once(' ').unwrap_or((&label, "KB"));
+    let mut unit = UNITS.iter().position(|u| *u == name).unwrap_or(0);
+    let mut tenths: u128 = figure
+        .replace('.', "")
+        .parse()
+        .unwrap_or_else(|_| u128::from(total) / 100);
+    // His whole-number form from 10 units up; a total that rounds to 1000 of its unit is 1.0
+    // of the next one, in the decimal form.
+    let mut whole = tenths >= 100;
+    if whole {
+        tenths = (tenths + 5) / 10 * 10;
+        if tenths >= 10_000 && unit < UNITS.len() - 1 {
+            unit += 1;
+            tenths = 10;
+            whole = false;
+        }
+    }
+    let divisor = 1000_u128.pow(unit as u32 + 1);
+    // The bytes done in tenths of the unit, rounded down, never above the total.
+    let done_tenths = if done >= total {
+        tenths
+    } else {
+        (u128::from(done) * 10 / divisor).min(tenths)
+    };
+    let show = |t: u128| {
+        if whole {
+            (t / 10).to_string()
+        } else {
+            format!("{}.{}", t / 10, t % 10)
+        }
+    };
+    (
+        show(done_tenths),
+        format!("{} {}", show(tenths), UNITS[unit]),
+    )
+}
+
 /// Duration as `m:ss` (or `h:mm:ss`), for voice notes and videos.
 pub fn duration(ms: u32) -> String {
     let total = ms / 1000;
@@ -281,6 +371,48 @@ mod tests {
     use super::*;
 
     const KYIV: FixedOffset = FixedOffset(3 * 3600);
+
+    /// The sizes under an upload ("Uploading 45% · 12 of 30 MB"): from 10 units up his whole
+    /// numbers, below 10 units one decimal for both, always in the unit of the total and the
+    /// figure of the size label; the done part rounded down and equal to the total once all is
+    /// up, bytes below 1 KB, and a total that rounds to 1000 moves up a unit.
+    #[test]
+    fn the_upload_sizes_are_whole_numbers_from_ten_units_and_one_decimal_below() {
+        let pair = |done, total| {
+            let (up, all) = file_size_pair(done, total);
+            format!("{up} of {all}")
+        };
+        assert_eq!(pair(0, 0), "0 of 0 B");
+        assert_eq!(pair(500, 999), "500 of 999 B");
+        assert_eq!(pair(5_000, 999), "999 of 999 B", "never above the total");
+        assert_eq!(pair(999, 1_000), "0.9 of 1.0 KB", "done is rounded down");
+        assert_eq!(pair(100_000, 400_000), "100 of 400 KB");
+        assert_eq!(pair(399_999, 400_000), "399 of 400 KB");
+        assert_eq!(pair(12_900_000, 30_000_000), "12 of 30 MB");
+        assert_eq!(pair(29_999_000, 30_000_000), "29 of 30 MB");
+        assert_eq!(pair(30_000_000, 30_000_000), "30 of 30 MB");
+        // Below 10 units: one decimal for both, the total the text of the size label.
+        assert_eq!(pair(1_000_000, 1_600_000), "1.0 of 1.6 MB");
+        assert_eq!(pair(1_599_999, 1_600_000), "1.5 of 1.6 MB");
+        assert_eq!(pair(1_600_000, 1_600_000), "1.6 of 1.6 MB", "all is up");
+        assert_eq!(pair(1_200_000, 4_200_000), "1.2 of 4.2 MB");
+        assert_eq!(pair(2_500_000_000, 3_400_000_000), "2.5 of 3.4 GB");
+        // The total is the label's one-decimal figure rounded half up: 31.46 MB is labelled
+        // "31.5 MB", so the line says "of 32 MB", never "of 31".
+        assert_eq!(file_size(31_457_280), "31.5 MB");
+        assert_eq!(pair(12_000_000, 31_457_280), "12 of 32 MB");
+        assert_eq!(pair(31_457_280, 31_457_280), "32 of 32 MB");
+        assert_eq!(file_size(31_440_000), "31.4 MB");
+        assert_eq!(pair(1_000_000, 31_440_000), "1 of 31 MB");
+        // 9.96 MB is labelled "10.0 MB": 10 units, so the whole form.
+        assert_eq!(file_size(9_960_000), "10.0 MB");
+        assert_eq!(pair(5_000_000, 9_960_000), "5 of 10 MB");
+        assert_eq!(file_size(9_940_000), "9.9 MB");
+        assert_eq!(pair(5_000_000, 9_940_000), "5.0 of 9.9 MB");
+        // A total that rounds to 1000 KB is 1.0 of the next unit.
+        assert_eq!(pair(999_000, 999_600), "0.9 of 1.0 MB");
+        assert_eq!(pair(999_600, 999_600), "1.0 of 1.0 MB");
+    }
 
     fn date(year: i64, month: u32, day: u32) -> CivilDate {
         CivilDate { year, month, day }
@@ -316,6 +448,21 @@ mod tests {
         assert_eq!(t.list_label(at(date(2025, 12, 31), 12, 0)), "31 Dec 2025");
         // A future instant (clock skew) shows its time.
         assert_eq!(t.list_label(at(date(2026, 10, 7), 1, 0)), "01:00");
+    }
+
+    #[test]
+    fn until_says_today_tomorrow_or_the_date() {
+        let now = local_instant(date(2026, 10, 6), 14, 32, KYIV);
+        let t = TimeContext::new(now, &KYIV);
+        let at = |d: CivilDate, h, m| local_instant(d, h, m, KYIV);
+        assert_eq!(t.until(at(date(2026, 10, 6), 18, 5)), "today at 18:05");
+        // The local day decides, not 24 hours: 00:10 is tomorrow although it is 9 hours away.
+        assert_eq!(t.until(at(date(2026, 10, 7), 0, 10)), "tomorrow at 00:10");
+        assert_eq!(t.until(at(date(2026, 10, 18), 14, 0)), "18 Oct at 14:00");
+        assert_eq!(t.until(at(date(2027, 1, 2), 9, 0)), "2 Jan 2027 at 09:00");
+        // The same instant is another day in another offset.
+        let utc = TimeContext::new(now, &FixedOffset(0));
+        assert_eq!(utc.until(at(date(2026, 10, 7), 0, 10)), "today at 21:10");
     }
 
     #[test]

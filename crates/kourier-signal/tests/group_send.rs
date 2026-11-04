@@ -12,7 +12,7 @@
 //! (`support::fake_core`). Skips without Node ≥ 24 or the harness's `node_modules`
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ use kourier_signal::SignalNetwork;
 use serde_json::Value;
 use support::fake_core::{AccountFiles, FakeCore, Sink, WAIT, local_env, text_request_in};
 use support::harness::{
-    CreateGroup, CreatePrimary, DeviceInfo, GroupInfo, Harness, ModifyGroup, Primary,
-    ReceivedReceipt, SendGroupText, SendText, StorageContact, StorageGroup, StorageSpec,
+    CreateGroup, CreatePrimary, DeviceInfo, GroupInfo, Harness, HarnessOptions, ModifyGroup,
+    Primary, ReceivedReceipt, SendGroupText, SendText, StorageContact, StorageGroup, StorageSpec,
 };
 
 /// How long a test waits to be sure something did not arrive.
@@ -64,6 +64,11 @@ impl World {
     async fn start_with(names: &[&str]) -> Option<Self> {
         init_tracing();
         let harness = Harness::start_or_skip().await.expect("mock harness")?;
+        Some(Self::start_on(harness, names).await)
+    }
+
+    /// The same world on a harness that already runs.
+    async fn start_on(harness: Harness, names: &[&str]) -> Self {
         let tmp = tempfile::tempdir().expect("temp dir");
         let env = local_env(harness.handshake(), tmp.path()).expect("local env");
         let mut members = Vec::new();
@@ -93,7 +98,7 @@ impl World {
             .expect("create group");
         let sink = Sink::open(&tmp.path().join("sink.db")).expect("sink");
         let files = AccountFiles::new(tmp.path()).expect("account dir");
-        Some(Self {
+        Self {
             harness,
             _tmp: tmp,
             env,
@@ -102,7 +107,7 @@ impl World {
             group,
             sink,
             files,
-        })
+        }
     }
 
     fn conv(&self) -> ConvKey {
@@ -162,11 +167,12 @@ impl World {
         ));
         core.wait_online().await;
         self.files
-            .wait_for_i64(
+            .wait_for_i64_noting(
                 "group state with endorsements",
                 "SELECT count(*) FROM groups WHERE revision IS NOT NULL
                    AND endorsements_expire_at IS NOT NULL AND membership = 'member'",
                 |v| v == Some(1),
+                || self.files.timeout_note(self.harness.handshake().port),
             )
             .await;
         // The core has the group and may write to it (no "not available yet" notice).
@@ -272,6 +278,101 @@ fn acis(world: &World) -> Vec<String> {
     let mut acis: Vec<String> = world.members.iter().map(|m| m.aci.clone()).collect();
     acis.sort();
     acis
+}
+
+/// A1 (BQ5): a message of ours that the server took brings an archived group back to the
+/// inbox, once: one upsert to the core and the group's own flag (the base of the Storage diff)
+/// moved in the zone that appends it. The rule itself is tested over one `backend.db` in
+/// `storage/tests.rs`; this is the send path calling it.
+/// The mock flake of 2026-10-14, -21 and -26 (`modifiers`, `group_send`: "timed out waiting for
+/// group state with endorsements (last Some(0))", 120.6 s; `target/next/mock-endorsements-flake.md`).
+/// The harness listens on 127.0.0.1:P and hands the clients `localhost:P`, which they try as
+/// `::1` first. A program that holds `[::1]:P` (this PC's NFS daemons do, on random ports) gets
+/// every HTTPS request of the link: reqwest does not move on to 127.0.0.1 when a TLS hello is
+/// reset. So the harness takes only a port whose IPv6 twin is free. Here the test plays the
+/// other program and makes that port the harness's first candidate (`--first-port`); the
+/// handshake must name another port, and the link, whose Storage Service and group requests are
+/// HTTPS, must work. A machine without an IPv6 loopback has nothing to hold: the test returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_port_whose_ipv6_twin_is_held_is_not_taken_by_the_mock_server() {
+    init_tracing();
+    let held = match std::net::TcpListener::bind("[::1]:0") {
+        Ok(held) => held,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("skipping: no IPv6 loopback here: {e}");
+            return;
+        }
+        Err(e) => panic!("hold [::1]:0: {e}"),
+    };
+    let port = held.local_addr().expect("held address").port();
+    let options = HarnessOptions {
+        first_port: Some(port),
+        ..HarnessOptions::default()
+    };
+    let Some(harness) = Harness::start_or_skip_with(options)
+        .await
+        .expect("mock harness")
+    else {
+        return;
+    };
+    assert_ne!(
+        harness.handshake().port,
+        port,
+        "the mock server took a port whose IPv6 twin another program holds"
+    );
+    let world = World::start_on(harness, &["Ada"]).await;
+    let (core, _device) = world.link().await;
+    world.shutdown(core).await;
+    drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_message_of_ours_brings_an_archived_group_back() {
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (core, _device) = world.link().await;
+    let key = key_json(&world.conv());
+    let unarchives = |world: &World| {
+        world
+            .sink
+            .event_values("ConversationUpsert")
+            .iter()
+            .filter(|p| p["key"] == key && p["archived"] == Value::Bool(false))
+            .count()
+    };
+    // The phone archived the group: what the Storage merge writes into the group's row.
+    world
+        .files
+        .execute("UPDATE groups SET archived = 1")
+        .expect("archive the group");
+    let before = unarchives(&world);
+    let (_, outcome) = world.say(&core, "We are back").await;
+    sent_to(&outcome);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while unarchives(&world) == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the group never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        world.files.peek_i64("SELECT archived FROM groups").unwrap(),
+        Some(0),
+        "the group's flag moved with it"
+    );
+    // A second message finds the group in the inbox.
+    let (_, outcome) = world.say(&core, "And again").await;
+    sent_to(&outcome);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(unarchives(&world), before + 1, "said once");
+    world.shutdown(core).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -671,7 +772,9 @@ async fn a_challenged_sender_key_send_is_a_challenge_with_its_retry_time() {
             assert_eq!(failed.len(), 3, "every member waits for the challenge");
             failed.iter().map(|(_, error)| error).collect()
         }
-        other @ TransmitOutcome::Sent { .. } => panic!("{other:?}"),
+        other @ (TransmitOutcome::Sent { .. } | TransmitOutcome::SentAs { .. }) => {
+            panic!("{other:?}")
+        }
     };
     for error in errors {
         let ErrorKind::Challenge {
@@ -1017,6 +1120,10 @@ async fn a_group_read_receipt_names_no_group_and_carries_no_pni_signature() {
 const BIG_GROUP: usize = 100;
 const RTT: Duration = Duration::from_millis(125);
 
+/// Fewest requests of a kind the mock server must have seen open together while the key setup
+/// of the big group ran (one member after another is 1; the code's bounds are 32 and 16).
+const AT_ONCE_AT_LEAST: u64 = 8;
+
 /// The round trip of the measurement: `RTT`, or `KOURIER_TEST_RTT_MS` when set (by hand, to
 /// see the share of the CPU at 0).
 fn rtt() -> Duration {
@@ -1032,6 +1139,12 @@ fn rtt() -> Duration {
 /// 2 round trips per member (25 s and more); with the bounded concurrency of the key setup
 /// (`PREKEY_FETCHES_AT_ONCE`, `MEMBER_SENDS_AT_ONCE`) a few seconds. Measured 2026-10-13 (L6):
 /// see `target/link-feedback/L6-build.md`.
+///
+/// The overlap is judged by a COUNT, the most prekey fetches and the most 1:1 sends the mock
+/// server had open together (`SendStats::in_flight_max`; one member after another is 1), never
+/// by how long the send took: a loaded machine stretches the time (32.9 s at a load of 60,
+/// 2026-10-28 and again 2026-10-29: two strikes of the old bound of 15 s) but not that count,
+/// which the 125 ms the harness holds every request keeps up whatever the load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_send_to_a_big_group_sets_up_its_keys_at_once() {
     let names: Vec<String> = (0..BIG_GROUP).map(|i| format!("Member {i}")).collect();
@@ -1044,6 +1157,8 @@ async fn the_first_send_to_a_big_group_sets_up_its_keys_at_once() {
     phases(&mut core).await;
     let rtt = rtt();
     world.harness.set_latency(rtt).await.expect("latency");
+    // The count of requests open together starts here: nothing of the link counts.
+    world.harness.reset_in_flight().await.expect("gauge");
 
     let started = std::time::Instant::now();
     let (_, outcome) = world.say(&core, "Meeting at eight.").await;
@@ -1065,11 +1180,23 @@ async fn the_first_send_to_a_big_group_sets_up_its_keys_at_once() {
     );
     let stats = world.harness.send_stats().await.expect("stats");
     assert_eq!(stats.multi, before.multi + 1, "one multi-recipient send");
-    // One after another the key setup alone is 2 × 100 round trips = 25 s (the serial version
-    // took 30 s here); 6 s alone on a quiet machine, so the bound leaves a loaded CI room.
+    // Both steps of the key setup ran at once: the prekey fetches (up to 32 at a time in the
+    // code) and the distribution messages (up to 16). One member after another the mock server
+    // would never see more than one of either open (the serial version took 30 s here).
+    let open = stats.in_flight_max;
+    eprintln!(
+        "most open together: {} prekey fetches, {} 1:1 sends",
+        open.prekey_fetches, open.single_sends
+    );
     assert!(
-        took < Duration::from_secs(15),
-        "the key setup ran one member after another: {took:?}"
+        open.prekey_fetches >= AT_ONCE_AT_LEAST,
+        "the prekey fetches ran one member after another: at most {} open together",
+        open.prekey_fetches
+    );
+    assert!(
+        open.single_sends >= AT_ONCE_AT_LEAST,
+        "the distribution messages went one member after another: at most {} open together",
+        open.single_sends
     );
     let got = world
         .received(BIG_GROUP - 1, &device, "Meeting at eight.")
@@ -1096,8 +1223,17 @@ async fn the_first_send_to_a_big_group_sets_up_its_keys_at_once() {
         .position(|p| *p == SendPhase::SyncingOwnDevices)
         .expect("own devices");
     assert!(sent < synced, "the transcript comes last: {seen:?}");
-    // 200 member steps, a report each at most every 250 ms (plus the first and last of a step).
-    assert!(seen.len() < 60, "not throttled: {} reports", seen.len());
+    // 200 member steps, a report each at most every 250 ms (plus the first and last of a step):
+    // one report per 250 ms of the send and a few for the phases' own ends. Judged against how
+    // long the send took, since a loaded machine stretches the send and the reports with it (an
+    // unthrottled send reports all 200 steps whatever its length).
+    let slots = usize::try_from(took.as_millis() / 250).unwrap_or(usize::MAX);
+    eprintln!("{} reports in {} ms", seen.len(), took.as_millis());
+    assert!(
+        seen.len() <= slots.saturating_add(12),
+        "not throttled: {} reports in {took:?}",
+        seen.len()
+    );
     world.shutdown(core).await;
 }
 

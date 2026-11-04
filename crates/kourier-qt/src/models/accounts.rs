@@ -8,7 +8,7 @@ use kourier_viewmodel::diff::RoleSet;
 use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
-const ROLES: [&str; 11] = [
+const ROLES: [&str; 13] = [
     "accountId",
     "name",
     "network",
@@ -20,6 +20,8 @@ const ROLES: [&str; 11] = [
     "avatarUrl",
     "number",
     "device",
+    "shown",
+    "place",
 ];
 
 /// Rust side of `AccountListModel`.
@@ -42,6 +44,10 @@ pub struct AccountQt {
     avatar_url: QString,
     number: QString,
     device: QString,
+    /// The account's chats are in the list (blended chats).
+    shown: bool,
+    /// The place among its network's accounts in the panel (1, 2, …; 0 when it is alone).
+    place: i32,
 }
 
 impl AccountQt {
@@ -58,6 +64,8 @@ impl AccountQt {
             avatar_url: QString::from(v.avatar_url.as_str()),
             number: QString::from(v.number.as_str()),
             device: QString::from(v.device.as_str()),
+            shown: v.shown,
+            place: i32::try_from(v.place).unwrap_or(i32::MAX),
         }
     }
 
@@ -73,6 +81,8 @@ impl AccountQt {
             .with_if(8, a.avatar_url != b.avatar_url)
             .with_if(9, a.number != b.number)
             .with_if(10, a.device != b.device)
+            .with_if(11, a.shown != b.shown)
+            .with_if(12, a.place != b.place)
     }
 
     fn key(v: &AccountRow) -> AccountId {
@@ -98,7 +108,9 @@ impl qobject::AccountListModel {
             7 => QVariant::from(&row.unread),
             8 => QVariant::from(&row.avatar_url),
             9 => QVariant::from(&row.number),
-            _ => QVariant::from(&row.device),
+            10 => QVariant::from(&row.device),
+            11 => QVariant::from(&row.shown),
+            _ => QVariant::from(&row.place),
         }
     }
 

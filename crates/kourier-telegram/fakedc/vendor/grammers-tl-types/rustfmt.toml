@@ -1,0 +1,3 @@
+# Kourier never reformats this vendored copy (VENDORED.md): `cargo fmt --all` of the fake DC's workspace
+# (`cargo xtask tdlib fakedc build`) reaches it as a path dependency, and upstream formats with a style of its own.
+disable_all_formatting = true

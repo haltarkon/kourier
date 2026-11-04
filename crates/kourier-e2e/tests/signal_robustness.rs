@@ -32,7 +32,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (`KOURIER_REQUIRE_MOCK_HARNESS=1` fails instead).
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -830,6 +830,22 @@ async fn removing_an_account_and_linking_the_same_phone_at_once_is_not_refused()
 /// made its device. The refused device is logged out again: the phone's list ends with the
 /// phone and the second login's device, never three, and the account that linked first stays
 /// Active.
+///
+/// Back in the regular run (F1, 2026-10-14). It had been moved out (T3 fix: 3 failures in 54
+/// runs with six copies side by side, 3 in full runs): the refused actor gets `Command::Logout`
+/// while its connection task is still opening the authenticated socket that every finished
+/// link opens (the mock's IPv6 then IPv4 connect takes ~300 ms). `remove_device` used to cancel
+/// that task and open a socket of its own, but the connect runs on in Kourier's network
+/// runtime after the future that waits for it is dropped (`Net::run` spawns it and dropping the
+/// `JoinHandle` detaches it; `Net::run_aborting` aborts it since the F1 fix round): both
+/// connects completed at the same moment, the server closed
+/// the older socket with 4409 and the `DELETE /v1/devices/<id>` rode on the closed one (the
+/// account gone, its device left on the phone's list). `Logout` now waits for the attempt under
+/// way and uses its socket, and a socket closed under the request is asked again once on a new
+/// connection (`kourier-signal` `actor.rs`; the forced forms of the race are the tests
+/// `a_logout_while_the_connect_of_a_finished_link_is_under_way_waits_for_it` and
+/// `a_logout_whose_socket_closes_under_the_request_asks_again_on_a_new_connection` in
+/// `kourier-signal/tests/robustness.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_account_made_between_a_logins_start_and_its_scan_is_still_refused() {
     let Some(world) = World::start().await else {

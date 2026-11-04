@@ -96,7 +96,12 @@ pub(crate) const FILE: &str = "stage.db";
 /// 6 (step S5): attachment pointers. A message's attachments, its long text and a sticker's
 /// image are attachments with a `remote` (`BackendBlob` v 3, the trimmed `FilePointer`)
 /// while the server may still have them, else `AttachmentState::Unavailable` without one.
-pub(crate) const FORMAT: i64 = 6;
+///
+/// 7 (quiet notices): `map::is_loud` counts a refreshed session as quiet, like the other
+/// three kinds the list keeps out of a chat's preview and order (`Body::is_quiet`), so a chat
+/// whose only rows are session refreshes is staged and not delivered. A stage of format 6
+/// holds such chats as shown; it is read again from the archive, as any older stage.
+pub(crate) const FORMAT: i64 = 7;
 
 /// The HKDF info of the stage's key.
 const KEY_INFO: &[u8] = b"kourier history stage 1";
@@ -211,6 +216,11 @@ pub(crate) struct StagedContact {
     /// The name in the phone's address book.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) system_name: Option<String>,
+    /// `system_name` came from the address book's NICKNAME alone, not from a given or family
+    /// name: such a person is not a system contact for the number rule (Desktop's
+    /// `isInSystemContacts`; P1 F5). A stage made before this field existed reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) system_nickname_only: bool,
     /// The user's own nickname for the person.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) nickname: Option<String>,

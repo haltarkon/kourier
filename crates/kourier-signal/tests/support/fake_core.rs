@@ -99,18 +99,63 @@ impl AccountFiles {
         sql: &str,
         pred: impl Fn(Option<i64>) -> bool,
     ) -> Option<i64> {
+        self.wait_for_i64_noting(what, sql, pred, String::new).await
+    }
+
+    /// [`Self::wait_for_i64`] whose timeout message also carries `note()` (called only then): a
+    /// setup wait that runs out says what the harness and the jobs were doing
+    /// ([`Self::timeout_note`]).
+    pub async fn wait_for_i64_noting(
+        &self,
+        what: &str,
+        sql: &str,
+        pred: impl Fn(Option<i64>) -> bool,
+        note: impl FnOnce() -> String,
+    ) -> Option<i64> {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
             let value = self.peek_i64(sql).unwrap_or_else(|e| panic!("{what}: {e}"));
             if pred(value) {
                 return value;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what} (last {value:?})"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let note = note();
+                let sep = if note.is_empty() { "" } else { "; " };
+                panic!("timed out waiting for {what} (last {value:?}){sep}{note}");
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// What a setup wait that timed out should say: the mock harness's port (a port whose IPv6
+    /// twin another program held made every HTTPS request of a link fail at once, 2026-10-26)
+    /// and the backend jobs' last errors (`jobs.last_error` is log-safe: kinds and reasons, no
+    /// names or numbers). Reads `backend.db` through a read-only connection, so the actor may
+    /// run.
+    pub fn timeout_note(&self, harness_port: u16) -> String {
+        let errors = || -> rusqlite::Result<Vec<String>> {
+            let conn =
+                kourier_db::open_read_only(&self.backend_db(), &kourier_db::DbKey::from(self.key))
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+            let mut stmt = conn.prepare(
+                "SELECT kind, last_error FROM jobs WHERE last_error IS NOT NULL
+                 ORDER BY id DESC LIMIT 6",
+            )?;
+            stmt.query_map([], |r| {
+                Ok(format!(
+                    "{}: {}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })?
+            .collect()
+        };
+        let errors = match errors() {
+            Ok(errors) if errors.is_empty() => String::from("none"),
+            Ok(errors) => errors.join(" | "),
+            Err(e) => format!("unreadable ({e})"),
+        };
+        format!("mock harness on port {harness_port}; last job errors: {errors}")
     }
 
     /// The device ids we hold an ACI session with for `aci` (the actor must not be running).

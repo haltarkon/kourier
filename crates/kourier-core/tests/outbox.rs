@@ -4,7 +4,7 @@
 //! identity and challenge pauses, user retry and cancel, echo dedup, drafts and typing, and the
 //! two contract fixes of phase C (poison rows, `AccountReady` first).
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -373,6 +373,7 @@ async fn untrusted_identity_pauses_the_conversation_until_confirmed() {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: alice(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     out_state(&env, ca, two.id, sent()).await;
@@ -1042,6 +1043,7 @@ async fn an_identity_confirmed_during_a_restart_still_resumes_the_queue() {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: alice(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     out_state(&env, ca, one.id, OutgoingState::Queued).await;

@@ -19,7 +19,8 @@ use kourier_model::{
 };
 
 use crate::conversations::{
-    self, AccountRow, ChatHeader, ConversationInput, ConversationRow, account_row,
+    self, AccountRow, ChatHeader, ConversationFilter, ConversationInput, ConversationRow, Hidden,
+    account_row,
 };
 use crate::names::NameMap;
 use crate::source::SourceError;
@@ -216,8 +217,10 @@ impl Chat<'_> {
     fn finish(mut self) {
         self.list.sort_by_key(|m| std::cmp::Reverse(m.sort_key));
         let conv = self.conv;
+        // The list is dated by the newest message that counts for it, as the core does: a
+        // quiet notice (a safety number that changed) does not move its chat.
         if let Some(c) = self.fx.conversations.iter_mut().find(|c| c.id == conv)
-            && let Some(newest) = self.list.first()
+            && let Some(newest) = self.list.iter().find(|m| !m.body.is_quiet())
         {
             c.last_activity = newest.sent_at;
         }
@@ -356,6 +359,7 @@ impl Fixture {
                     kind,
                     is_self: false,
                     title: title.map(str::to_owned),
+                    description: None,
                     avatar: None,
                     members: members
                         .iter()
@@ -380,6 +384,7 @@ impl Fixture {
                     read_up_to: None,
                     last_activity: 0,
                     meta: None,
+                    protected: false,
                 });
             };
         let group = |s: &str| ConvKey::Group(format!("gv2:{s}").into());
@@ -862,23 +867,68 @@ impl Fixture {
             .collect()
     }
 
-    /// Conversation-list rows (unsorted).
+    /// The account table of a list call ([`conversations::AccountTable`]): the accounts in
+    /// panel order. The chip of an account is the fixture's own badge label (`""` for the
+    /// accounts that carry none, "Work"), not the display name: the pictures keep it. The
+    /// rules (when a chip, the icon and the number show) are the core's.
+    pub fn account_table(&self, hidden: &Hidden, searching: bool) -> conversations::AccountTable {
+        conversations::AccountTable::new(
+            self.accounts
+                .iter()
+                .map(|(a, _, label)| conversations::TableAccount {
+                    id: a.id,
+                    network: a.network,
+                    name: (*label).to_owned(),
+                }),
+            hidden,
+            searching,
+        )
+    }
+
+    /// The rows `filter` lists, in list order: [`Self::conversation_rows`] decorated by the
+    /// account table (chip, icon, number, panel place), then filtered and sorted.
+    pub fn listed_rows(
+        &self,
+        filter: &ConversationFilter,
+        hidden: &Hidden,
+        time: &TimeContext<'_>,
+    ) -> Vec<ConversationRow> {
+        let table = self.account_table(hidden, !filter.query.trim().is_empty());
+        let mut rows = self.conversation_rows(time);
+        for r in &mut rows {
+            table.decorate(r);
+        }
+        let mut rows = filter.apply_resolved(rows, hidden);
+        table.finish(&mut rows);
+        rows
+    }
+
+    /// Conversation-list rows (unsorted). Every chat is a row: the fixture has no chat whose
+    /// rows are all quiet notices on purpose (no page shows one); the core would list one, with
+    /// no preview, so nothing here filters it out.
     pub fn conversation_rows(&self, time: &TimeContext<'_>) -> Vec<ConversationRow> {
         let empty = Vec::new();
         self.conversations
             .iter()
             .map(|c| {
-                let (network, label) = self
+                let network = self
                     .account_of(c.account)
-                    .map_or((NetworkKind::Signal, ""), |(a, _, l)| (a.network, *l));
+                    .map_or(NetworkKind::Signal, |(a, ..)| a.network);
                 conversations::conversation_row(
                     &ConversationInput {
                         conversation: c,
-                        last: self.messages.get(&c.id).and_then(|m| m.first()),
+                        // The newest message the list may show: a quiet notice stays in
+                        // its chat and out of the list (the core's rule as long as the
+                        // setting that shows them is off, the default). The core lists a
+                        // chat whose rows are all quiet (empty, no preview, after the chats
+                        // that have a sort time) and so does this source: the fixture has no
+                        // such chat on purpose (no page needs one), the rule is the core's.
+                        last: self
+                            .messages
+                            .get(&c.id)
+                            .and_then(|m| m.iter().find(|m| !m.body.is_quiet())),
                         typing: self.typing.get(&c.id).unwrap_or(&empty),
                         network,
-                        multi_account: self.accounts.len() > 1,
-                        account_label: label,
                     },
                     &self.names,
                     time,
@@ -977,7 +1027,6 @@ impl Fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversations::ConversationFilter;
     use crate::timeline::{Block, Receipt, RowKind};
 
     #[test]
@@ -986,7 +1035,7 @@ mod tests {
         assert_eq!(fx.accounts.len(), 3);
         assert!(fx.conversations.len() >= 12);
         let time = TimeContext::new(fx.now_ms, &fx.calendar);
-        let rows = ConversationFilter::default().apply(fx.conversation_rows(&time));
+        let rows = fx.listed_rows(&ConversationFilter::default(), &Hidden::default(), &time);
         assert_eq!(rows[0].title, "Note to Self");
         assert_eq!(rows[1].title, "FPV Squad");
         assert!(rows[1].typing.contains("Olena"));
@@ -1015,6 +1064,116 @@ mod tests {
         let accounts = fx.account_rows();
         assert_eq!(accounts[0].status.as_str(), "online");
         assert_eq!(accounts[1].status.as_str(), "connecting");
+    }
+
+    /// The pure path follows the core's rules with its own labels: the fixture's chip is its
+    /// badge label ("Work"; none for the others), and it shows only while two accounts are shown.
+    #[test]
+    fn the_fixtures_chips_follow_the_shown_accounts() {
+        let fx = Fixture::build().expect("fixture");
+        let time = TimeContext::new(fx.now_ms, &fx.calendar);
+        let filter = ConversationFilter::default();
+        let rows = fx.listed_rows(&filter, &Hidden::default(), &time);
+        // Signal 1, Signal 2 ("Work"), Threema alone.
+        let numbers: std::collections::BTreeSet<(i64, u32)> =
+            rows.iter().map(|r| (r.account.0, r.badge_number)).collect();
+        assert_eq!(numbers, [(1, 1), (2, 2), (3, 0)].into());
+        assert!(rows.iter().any(|r| r.account_badge == "Work"));
+        let only_work = Hidden::Ids([AccountId(1), AccountId(3)].into());
+        let rows = fx.listed_rows(&filter, &only_work, &time);
+        assert!(rows.iter().all(|r| r.account_badge.is_empty()));
+        assert!(rows.iter().all(|r| r.badge_number == 2), "the place stays");
+    }
+
+    /// A chat whose newest message is a quiet notice (a safety number that changed) is
+    /// listed by its newest message that is not: the same preview, the same time, the same
+    /// place as without the notice, whether the notice was put in after the chat was built
+    /// (the row) or while it was built (the chat's `last_activity`, which orders the list).
+    #[test]
+    fn a_quiet_notice_does_not_stand_for_its_chat_in_the_list() {
+        let quiet = |fx: &mut Fixture, conv: i64, at_ms: i64| {
+            let id = MessageId(fx.next_message);
+            fx.next_message += 1;
+            let author = user("signal", 3).expect("user");
+            let m = message(
+                id,
+                ConversationId(conv),
+                Origin::Remote {
+                    author: author.clone(),
+                    device: None,
+                },
+                at_ms,
+                Body::System(SystemEvent::IdentityKeyChanged { user: author }),
+            );
+            assert!(m.body.is_quiet());
+            m
+        };
+        let base = Fixture::build().expect("fixture");
+        let time = TimeContext::new(base.now_ms, &base.calendar);
+        let before = ConversationFilter::default()
+            .apply_resolved(base.conversation_rows(&time), &Hidden::default());
+
+        // The notice is the newest row of chat 3, after a text and before "now".
+        let mut fx = Fixture::build().expect("fixture");
+        let newest = fx.messages[&ConversationId(3)][0].sent_at;
+        let notice = quiet(&mut fx, 3, newest + 60_000);
+        fx.messages
+            .get_mut(&ConversationId(3))
+            .expect("chat 3")
+            .insert(0, notice);
+        let after = ConversationFilter::default()
+            .apply_resolved(fx.conversation_rows(&time), &Hidden::default());
+        // (A row's `Debug` hides its texts, so the fields are compared.)
+        let shown = |rows: &[ConversationRow]| {
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        r.preview.clone(),
+                        r.preview_author.clone(),
+                        r.time_label.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&before),
+            shown(&after),
+            "the list is the list it was without the notice"
+        );
+        let chat3 = after
+            .iter()
+            .find(|r| r.id == ConversationId(3))
+            .expect("chat 3");
+        assert_eq!(chat3.preview, "Are we still on for Saturday?");
+
+        // The same notice put in while the chat is built: it does not date the chat.
+        let mut fx = Fixture::build().expect("fixture");
+        let dated = fx
+            .conversations
+            .iter()
+            .find(|c| c.id == ConversationId(3))
+            .map(|c| c.last_activity)
+            .expect("chat 3");
+        let mut c = fx.chat(3);
+        c.own(newest, Body::text("a loud message"));
+        let author = user("signal", 3).expect("user");
+        c.from(
+            &author,
+            newest + 120_000,
+            Body::System(SystemEvent::IdentityKeyChanged {
+                user: author.clone(),
+            }),
+        );
+        c.finish();
+        let after = fx
+            .conversations
+            .iter()
+            .find(|c| c.id == ConversationId(3))
+            .map(|c| c.last_activity)
+            .expect("chat 3");
+        assert_ne!(dated, 0);
+        assert_eq!(after, newest, "dated by the text, not by the notice");
     }
 
     #[test]
@@ -1074,8 +1233,9 @@ mod tests {
             dumps.push(format!("{:?}", fx.chat_header(c.id, &time)));
         }
         let filter = ConversationFilter {
-            account: None,
+            hidden: Default::default(),
             query: "Olena".into(),
+            archived: false,
         };
         dumps.push(format!("{filter:?}"));
         for secret in [

@@ -15,7 +15,7 @@
 //! - a thumbnail that a power loss cut off or lost (thumbnails are written without fsync) is
 //!   made again after the next start.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -171,12 +171,14 @@ async fn a_partly_failed_message_goes_when_its_chat_is_deleted_on_the_phone() {
                 conv: group(),
                 up_to: vec![target(Some(&group()), None, &local)],
                 remove: true,
+                before_ms: None,
                 at: T0 + 5_000,
             },
             BackendEvent::ConversationCleared {
                 conv: d_bob(),
                 up_to: Vec::new(),
                 remove: true,
+                before_ms: None,
                 at: T0 + 5_001,
             },
         ])
@@ -428,6 +430,7 @@ async fn a_retry_after_a_file_was_deleted_elsewhere_sends_what_is_left() {
             request: Default::default(),
             paths: paths.into(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             caption: None,
             reply_to: None,
         })

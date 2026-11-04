@@ -579,7 +579,12 @@ pub(crate) fn direct_features(
             .collect(),
         history: HistorySource::None,
         group_actions: Default::default(),
+        // A chat with one person has no group rules (`group_features` states them).
+        group_info: None,
         cannot_send,
+        // Signal states which chats the phone lists for its roaming settings with the roaming
+        // writes (A10b); until then it says nothing, which reads as listed.
+        roaming_listed: None,
     }
 }
 
@@ -605,6 +610,14 @@ pub(crate) fn group_features(
     features.admin_delete = limits.admin_delete;
     features.disappearing = BTreeMap::new();
     features.disappearing_custom = BTreeMap::new();
+    // The rules the page shows (P2). No snapshot (a group known only from a history import):
+    // nothing stated, so no rule line, and not "everyone may change everything".
+    features.group_info = snapshot.map(|s| kourier_model::GroupInfo {
+        attributes_admin_only: s.access.attributes_admin_only(),
+        members_admin_only: s.access.members_admin_only(),
+        announcements_only: s.announcements_only,
+        terminated: s.terminated,
+    });
     let admin = snapshot
         .and_then(|s| s.member(account.aci))
         .is_some_and(|m| m.admin);
@@ -659,6 +672,12 @@ pub(crate) fn refresh_group_features(
             .execute((&master, hash))?;
         let mut patch = ConversationPatch::new(row.keys.conv_key());
         patch.features = Some(features);
+        // The description came after the first versions stored a group: say it with the
+        // features, the one time a stored group is stated again (a group with no snapshot
+        // says nothing about it).
+        if let Some(snapshot) = &row.snapshot {
+            patch.description = snapshot.description_patch();
+        }
         events.push(BackendEvent::ConversationUpsert(patch));
     }
     Ok(events)
@@ -1121,6 +1140,132 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// P2: a group stored by a build that did not know the rules (`group_info`) is stated ONCE at
+    /// the next start, with its description (the one writer of a stored group's description), even
+    /// when every rule is off: the stored hash is the one an older build computed, that is, the
+    /// same features without the rules. A group with no description says so (`Clear`).
+    #[test]
+    fn a_group_stored_before_its_rules_were_stated_is_stated_once_with_its_description() {
+        let fixture = crate::receive::tests::fixture();
+        let account = fixture.account.clone();
+        let snapshot = |description: Option<&str>| crate::groups::Snapshot {
+            revision: 3,
+            description: description.map(str::to_owned),
+            members: vec![crate::groups::SnapMember {
+                aci: account.aci.into(),
+                admin: false,
+                joined_at: 0,
+            }],
+            // What Desktop makes a group with: every rule off.
+            access: crate::groups::Access {
+                attributes: 2,
+                members: 2,
+                add_from_invite_link: 4,
+            },
+            ..crate::groups::Snapshot::default()
+        };
+        fixture
+            .db
+            .zone(|tx| -> Result<()> {
+                let limits = Limits::load(tx)?;
+                for (master, description) in [
+                    ([4; 32], Some("Meet at six.\nBring water.")),
+                    ([5; 32], None),
+                ] {
+                    let keys = crate::groups::GroupKeys::from_master(master);
+                    let snapshot = snapshot(description);
+                    // The hash an older build stored: today's features without the rules.
+                    let mut older = group_features(
+                        Some(&snapshot),
+                        crate::groups::Membership::Member,
+                        &account,
+                        &limits,
+                    );
+                    older.group_info = None;
+                    tx.execute(
+                        "INSERT INTO groups(master_key, group_id, updated_at, revision, state,
+                           membership, features_hash) VALUES (?1, ?2, 0, 3, ?3, 'member', ?4)",
+                        (
+                            &keys.master[..],
+                            &keys.id[..],
+                            snapshot.to_json().unwrap(),
+                            hash_value(&older),
+                        ),
+                    )?;
+                }
+                let events = refresh_group_features(tx, &account)?;
+                assert_eq!(events.len(), 2, "both groups, once: {events:?}");
+                for event in &events {
+                    let BackendEvent::ConversationUpsert(patch) = event else {
+                        panic!("{event:?}");
+                    };
+                    assert_eq!(
+                        patch.features.as_ref().and_then(|f| f.group_info),
+                        Some(kourier_model::GroupInfo::default()),
+                        "all rules off is still stated: the network said so"
+                    );
+                    let first =
+                        patch.key == crate::groups::GroupKeys::from_master([4; 32]).conv_key();
+                    assert_eq!(
+                        patch.description,
+                        if first {
+                            kourier_model::Patch::Set("Meet at six.\nBring water.".into())
+                        } else {
+                            kourier_model::Patch::Clear
+                        }
+                    );
+                }
+                assert!(
+                    refresh_group_features(tx, &account)?.is_empty(),
+                    "and not again"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// P2: only a conversation whose network stated rules has `group_info` in the form that is
+    /// hashed, so a chat that states none keeps the hash it had (nothing is stated again for it)
+    /// while every group with a snapshot moves, whatever its rules are.
+    #[test]
+    fn only_a_group_with_a_snapshot_has_rules_in_its_features_hash() {
+        let fixture = crate::receive::tests::fixture();
+        let account = &fixture.account;
+        let limits = Limits::with_max_bytes(1000);
+        let has_key = |f: &ConversationFeatures| {
+            serde_json::to_string(f)
+                .expect("serialize")
+                .contains("group_info")
+        };
+        assert!(!has_key(&direct_features(true, false, false, &limits)));
+        assert!(!has_key(&direct_features(true, true, true, &limits)));
+        let no_snapshot =
+            group_features(None, crate::groups::Membership::Unknown, account, &limits);
+        assert_eq!(
+            no_snapshot.group_info, None,
+            "a history import states no rules"
+        );
+        assert!(!has_key(&no_snapshot));
+        let snapshot = crate::groups::Snapshot::default();
+        let with = group_features(
+            Some(&snapshot),
+            crate::groups::Membership::Member,
+            account,
+            &limits,
+        );
+        assert_eq!(with.group_info, Some(kourier_model::GroupInfo::default()));
+        assert!(has_key(&with));
+        let without = ConversationFeatures {
+            group_info: None,
+            ..with.clone()
+        };
+        assert_ne!(
+            hash_value(&with),
+            hash_value(&without),
+            "a group whose rules are all off still moves its hash"
+        );
     }
 
     /// The attachment limit comes from the remote config, and a new limit reaches every chat

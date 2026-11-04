@@ -29,11 +29,11 @@ pub(crate) fn decrypt_gcm(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u
     Ok(plain)
 }
 
-/// Encrypts like Desktop's `encryptProfile` (tests: the harness and the phone encrypt in
-/// production).
-#[cfg(test)]
+/// Encrypts like Desktop's `encryptProfile` (`IV ‖ ciphertext ‖ tag`; the Storage Service write,
+/// A10c, and the tests). The IV must be new for every value under one key: the caller's.
 pub(crate) fn encrypt_gcm(key: &[u8; 32], iv: [u8; GCM_IV_LEN], plaintext: &[u8]) -> Vec<u8> {
     let mut buf = plaintext.to_vec();
+    // Refused only for another key or IV size, and the types fix both.
     let mut cipher = signal_crypto::Aes256GcmEncryption::new(key, &iv, &[]).expect("cipher");
     cipher.encrypt(&mut buf);
     let tag = cipher.compute_tag();

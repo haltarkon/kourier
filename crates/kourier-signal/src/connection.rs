@@ -128,7 +128,11 @@ pub(crate) async fn run<T: SignalTransport>(
             return ConnectionEnd::Failed(BackendError::internal("connecting without an account"));
         };
         shared.set_conn(ConnState::Connecting);
+        // `biased`, the stop first: a task that was stopped before it got here (a removal that
+        // cancelled it while it was closing its last socket) must not poll the connect at all,
+        // which would start an attempt that nobody waits for.
         let connected = tokio::select! {
+            biased;
             () = stop.cancelled() => return stopped(&shared),
             connected = shared.net.connect_auth(account.credentials()) => connected,
         };
@@ -178,9 +182,16 @@ pub(crate) async fn run<T: SignalTransport>(
         let socket = Arc::new(socket);
         *shared.socket.borrow_mut() = Some(socket.clone());
         shared.set_conn(ConnState::Syncing { fraction: None });
-        let post = spawn_local(post_connect(shared.clone(), socket.clone()));
+        // Not for a device that is being removed (`Actor::remove_device` rides on this very
+        // socket) or is on its way out (`Shared::winding_down`): it should carry the `DELETE`
+        // and nothing the device is about to lose (one-time keys, the sync requests to the
+        // phone).
+        let post = (!shared.winding_down())
+            .then(|| spawn_local(post_connect(shared.clone(), socket.clone())));
         let end = receive_loop(&shared, account, events, &stop, &mut nudges, &socket).await;
-        post.abort();
+        if let Some(post) = post {
+            post.abort();
+        }
         *shared.socket.borrow_mut() = None;
         // Closes what is still open (a stale or dead socket, a stop); nothing to do for a
         // socket the server closed.
@@ -361,6 +372,8 @@ fn unlinked<T: SignalTransport>(shared: &Shared<T>, reason: String) -> Connectio
     tracing::warn!(%reason, "the server no longer knows this device: unlinked");
     shared.set_conn(ConnState::LoggedOut {
         reason: reason.clone(),
+        cause: Default::default(),
+        note: Default::default(),
     });
     ConnectionEnd::LoggedOut(reason)
 }
@@ -1630,6 +1643,94 @@ mod tests {
                 assert!(matches!(end, ConnectionEnd::Stopped));
                 // Lets the attempt still held on the network runtime end.
                 transport.auth_fail.notify_one();
+                drop(fixture);
+            })
+            .await;
+    }
+
+    /// Says "off" to everything and counts the questions about the requests target, which
+    /// `Net` asks as the first line of every request it starts (`Traced::start`).
+    struct CountsRequestStarts(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountsRequestStarts {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // Asked again at every use, not cached as "never".
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            if metadata.target() == crate::net::REQUESTS_TARGET {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A task that is stopped before it reaches its connect starts no connect (F1 fix round,
+    /// P1): `unlinked()` or `disconnect()` cancelling the task while it closes its last
+    /// socket. The `select!` is `biased` with the stop first; unbiased it polls `connect_auth`
+    /// in half of the cases, which spawns an attempt nobody waits for (the guard of
+    /// `Net::run_aborting` then aborts it, but the server may already have the upgrade). The
+    /// connect's first line asks the log whether the requests target is on; 64 runs with an
+    /// unbiased `select!` all stop first with the chance of 2^-64.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_task_stopped_before_it_connects_never_polls_the_connect() {
+        LocalSet::new()
+            .run_until(async {
+                let fixture = fixture();
+                let test = testing::shared(fixture.db.clone(), fixture.account.clone(), Vec::new());
+                let shared = Rc::new(test.shared);
+                let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let _scoped = tracing::subscriber::set_default(CountsRequestStarts(polls.clone()));
+                // The counter works: a connect that is polled is counted.
+                let (_nudge, nudges) = mpsc::unbounded_channel();
+                let stop = CancellationToken::new();
+                let task = spawn_local(run(shared.clone(), stop.clone(), nudges));
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                stop.cancel();
+                let end = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .expect("stopped")
+                    .expect("no panic");
+                assert!(matches!(end, ConnectionEnd::Stopped));
+                let polled_when_running = polls.load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    polled_when_running >= 1,
+                    "a connect that runs asks the log: {polled_when_running}"
+                );
+
+                polls.store(0, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..64 {
+                    let (_nudge, nudges) = mpsc::unbounded_channel();
+                    let stop = CancellationToken::new();
+                    stop.cancel();
+                    let end = run(shared.clone(), stop, nudges).await;
+                    assert!(matches!(end, ConnectionEnd::Stopped));
+                }
+                assert_eq!(
+                    polls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "no connect was polled by a task that was stopped before it got there"
+                );
                 drop(fixture);
             })
             .await;

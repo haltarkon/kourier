@@ -20,8 +20,8 @@ use kourier_backend_api::{
 use kourier_db::{Priority, failpoint};
 use kourier_model::{
     AccountId, AccountState, AccountUuid, BackendError, CmdId, ConnState, ConversationId,
-    DeviceLogout, ErrorKind, LoginStep, LoginStepKind, LogoutReport, MsgIdScope, PersistError,
-    Redacted, UserId,
+    DeviceLogout, ErrorKind, HistoryReadState, IdentityFingerprint, LoginStep, LoginStepKind,
+    LogoutReport, MessageId, MsgIdScope, PersistError, Redacted, SendPhase, ServerRules, UserId,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +31,7 @@ use crate::dispatch::{Dispatcher, Signal, Wake};
 use crate::error::{CoreError, Result};
 use crate::facade::{AccountLabel, ActionSubject, Progress, UiEvent};
 use crate::ingest::{self, Changes};
+use crate::rules::NetRules;
 use crate::runtime::Shared;
 use crate::store::lane;
 use crate::vault::VaultError;
@@ -129,7 +130,9 @@ impl RestartPolicy {
 /// Lifecycle timeouts (§4.3, §4.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// After `Shutdown`, wait this long before cancelling the actor's token (§4.7: 5 s).
+    /// After `Shutdown`, wait this long before cancelling the actor's token (§4.7: 5 s). The
+    /// default for a network that states no grace of its own (`NetworkDescriptor::
+    /// shutdown_grace`, R-Q1); see [`Timeouts::grace_of`].
     pub shutdown_grace: Duration,
     /// Best-effort `Logout` before removal (§4.3 step 7: 10 s).
     pub logout: Duration,
@@ -141,6 +144,16 @@ pub struct Timeouts {
     pub restore_answer: Duration,
     /// See [`Self::restore_answer`].
     pub restore_pending: Duration,
+}
+
+impl Timeouts {
+    /// The grace an actor gets at a stop: what its network states
+    /// (`NetworkDescriptor::shutdown_grace`), else [`Self::shutdown_grace`]. THE rule: the
+    /// supervisor's stop, drain and join read it, and so does the application when it sizes its
+    /// own limit for the whole core.
+    pub fn grace_of(&self, stated: Option<Duration>) -> Duration {
+        stated.unwrap_or(self.shutdown_grace)
+    }
 }
 
 impl Default for Timeouts {
@@ -222,8 +235,19 @@ pub(crate) enum Control {
     Downloads(Vec<DownloadJob>),
     /// The outbox changed or a message was retried (§4.8); the next start scans it anyway.
     Outbox(Signal),
-    /// The user accepted a safety-number change: tell the backend, resume paused queues.
-    ConfirmIdentity(UserId),
+    /// The user accepted a safety-number change (with the key of the number shown, the lead's
+    /// RC2): tell the backend; `reply` carries its answer (the lead's RC6). The paused queues
+    /// resume only after an `Ok` (the waiting side then sends [`Control::Released`]): a refusal
+    /// (the key is no longer the stored one) leaves them paused. Without a running linked
+    /// actor the confirmation is kept for the next start and answered `Ok` at once.
+    ConfirmIdentity {
+        user: UserId,
+        key: IdentityFingerprint,
+        reply: kourier_backend_api::Reply<()>,
+    },
+    /// The backend accepted a `SetVerified` of `user` (P5a): resume the queues paused on them
+    /// (critic F2: whatever the state was). Nothing to tell the backend.
+    Released(UserId),
     /// The user's answer to a challenge: handed to the running actor with the token of the
     /// challenge the outbox waits on; dropped without an actor (the reply then reports "gone").
     SubmitChallenge {
@@ -392,6 +416,14 @@ pub(crate) struct Supervisor {
     uuid: AccountUuid,
     network: Arc<dyn Network>,
     scope: MsgIdScope,
+    /// What the `read` flag of the network's history rows means (W4 fix F1).
+    history_read: HistoryReadState,
+    /// What the network's server owns (KT-2).
+    server: ServerRules,
+    /// How long a stop gives the actor, before it cancels the actor's token and again before
+    /// it lets go of it: the network's own (R-Q1, `NetworkDescriptor::shutdown_grace`), else
+    /// the core's `Timeouts::shutdown_grace`.
+    grace: Duration,
     ctl: mpsc::UnboundedReceiver<Control>,
     /// Failure times within the restart window.
     failures: VecDeque<u64>,
@@ -403,8 +435,13 @@ pub(crate) struct Supervisor {
     syncing: bool,
     /// The outbox scheduler (§4.8).
     dispatch: Dispatcher,
-    /// Safety-number confirmations given while no actor ran: sent at the next start.
-    confirm_later: Vec<UserId>,
+    /// Safety-number confirmations given while no actor ran, each with the key that was shown:
+    /// sent at the next start (the backend refuses one whose key is no longer the stored one).
+    confirm_later: Vec<(UserId, IdentityFingerprint)>,
+    /// The users a backend's `BackendNotice::IdentityTrusted` released (P5a, critic H1),
+    /// collected by [`Self::publish`] and released after it returns (critic F4: `confirmed`
+    /// publishes, so a release from inside `publish` would recurse).
+    trusted: Vec<UserId>,
     /// Commands waiting for room in the actor's queue (downloads): handed over as the actor
     /// takes them, so a burst never blocks the envelope loop. Dropped when the actor stops (the
     /// next start resends from the rows).
@@ -437,21 +474,29 @@ impl Supervisor {
         network: Arc<dyn Network>,
         ctl: mpsc::UnboundedReceiver<Control>,
     ) -> Self {
-        let scope = network.descriptor().msg_id_scope;
+        let rules = NetRules::of(network.descriptor());
+        let scope = rules.scope;
+        let history_read = rules.history_read;
+        let server = rules.server;
+        let grace = sh.timeouts.grace_of(rules.shutdown_grace);
         Self {
             sh,
             account,
             uuid,
             network,
             scope,
+            history_read,
+            server,
+            grace,
             ctl,
             failures: VecDeque::new(),
             attempt: 0,
             catch_up: (0, BTreeSet::new()),
             typing: HashSet::new(),
             syncing: false,
-            dispatch: Dispatcher::new(account, scope),
+            dispatch: Dispatcher::new(account, rules),
             confirm_later: Vec::new(),
+            trusted: Vec::new(),
             out: VecDeque::new(),
             hint: None,
             outbox_dirty: false,
@@ -486,6 +531,39 @@ impl Supervisor {
                     .await
             }
             None => std::future::pending().await,
+        }
+    }
+
+    /// Copies the dispatcher's identity pauses into [`Shared::paused`] (P5a BQ-3: the timeline
+    /// query names the person on every own row that still waits, the head and the rows behind
+    /// it (U4), the safety-number answer says that sends wait) and tells the UI whose wait began or ended ([`UiEvent::SafetyWaitChanged`]: an
+    /// open safety-number page asks again, it offers "Confirm New Safety Number" while sends
+    /// wait). Called before every publish, so a row that a pause changed is read with it.
+    fn share_pauses(&self) {
+        let now = self.dispatch.pauses();
+        let changed: BTreeSet<UserId> = {
+            let mut map = self
+                .sh
+                .paused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before: BTreeSet<UserId> = map
+                .values()
+                .filter(|(a, _, _)| *a == self.account)
+                .map(|(_, _, u)| u.clone())
+                .collect();
+            map.retain(|_, (a, _, _)| *a != self.account);
+            for (conv, outbox, user) in &now {
+                map.insert(*conv, (self.account, *outbox, user.clone()));
+            }
+            let after: BTreeSet<UserId> = now.into_iter().map(|(_, _, u)| u).collect();
+            before.symmetric_difference(&after).cloned().collect()
+        };
+        for user in changed {
+            self.emit(UiEvent::SafetyWaitChanged {
+                account: self.account,
+                user,
+            });
         }
     }
 
@@ -654,6 +732,11 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.account);
+        self.sh
+            .holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.account);
     }
 
     /// No actor runs: wait for a relink (`Idle`), a restart (`Halted`), removal or shutdown.
@@ -765,7 +848,15 @@ impl Supervisor {
                 };
             }
         };
-        self.dispatch.start(&self.sh, linked).await;
+        self.forget_uploads();
+        // Messages whose stop the backend had accepted before the last run ended are taken back.
+        let taken_back = self.dispatch.start(&self.sh, linked).await;
+        self.publish(taken_back).await;
+        // The send hold of the last run (taken up from `core.db` before anything is sent) is
+        // on show from the start, not from the backend's first statement.
+        if let Some(hold) = self.dispatch.hold() {
+            self.publish_hold(Some(hold));
+        }
         self.out.clear();
         self.hint = None;
         let account = self.account;
@@ -790,12 +881,15 @@ impl Supervisor {
                 // The other accounts' ids, so that the backend can refuse a link that brings
                 // one of them before it registers a device (the core refuses again when
                 // `AccountReady` arrives: `ingest::roaming`). Unreadable: none named, the
-                // second line still holds.
+                // second line still holds. Not those whose removal was asked for, though
+                // their rows do not say `Removing` yet: "Remove and Link Again" sends both
+                // commands back to back.
                 let account = self.account;
+                let leaving = self.sh.removing_accounts();
                 let taken = self
                     .sh
                     .store
-                    .read(move |c| ingest::other_identities(c, account))
+                    .read(move |c| ingest::other_identities(c, account, &leaving))
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(account = account.0, error = %e, "reading the profile's other identities failed");
@@ -816,12 +910,20 @@ impl Supervisor {
                     run.send(Command::Connect).await;
                 }
                 self.resend_pending(&run).await;
-                for user in std::mem::take(&mut self.confirm_later) {
-                    run.send(Command::ConfirmIdentity { user }).await;
+                for (user, key) in std::mem::take(&mut self.confirm_later) {
+                    // Its queues were released when it was given (answered `Ok` then); the
+                    // backend's answer now changes nothing: a refused one meets state 2 at
+                    // the next attempt and pauses again.
+                    let (reply, _) = tokio::sync::oneshot::channel();
+                    run.send(Command::ConfirmIdentity { user, key, reply })
+                        .await;
                 }
             }
         }
         loop {
+            if self.release_trusted().await {
+                self.kick(&run).await;
+            }
             tokio::select! {
                 // Connection state first: a backend publishes `Syncing` before the catch-up
                 // envelopes it sends, and the summary rule (§4.5) depends on seeing it first.
@@ -850,23 +952,13 @@ impl Supervisor {
                 }
                 ev = run.events.recv() => match ev {
                     Some(env) => {
-                        let was_linked = linked;
-                        if let Flow::LoginFailed(detail) = self.envelope(env, &mut linked, relinking).await {
+                        if let Some(detail) = self.on_envelope(&mut run, env, &mut linked, relinking).await {
                             // The core turned the link away (a relink as another account),
                             // or the login failed in the backend. In the first case the
                             // device exists on the network and is logged out again; in the
                             // second the backend has none and just stops.
                             self.log_out(&mut run, Ingest::Refused).await;
                             return self.login_failed(relinking, detail).await;
-                        }
-                        if linked && !was_linked {
-                            self.now_linked(&mut run).await;
-                        }
-                        if std::mem::take(&mut self.outbox_dirty) {
-                            // What was applied removed outbox rows (a tombstone, an echo):
-                            // the rows behind them start now, not when the timer armed for
-                            // a removed row fires.
-                            self.kick(&run).await;
                         }
                     }
                     None => {
@@ -957,6 +1049,14 @@ impl Supervisor {
                         let newest = jobs.iter().map(|j| j.request.0).max().unwrap_or(0);
                         run.resume_up_to = run.resume_up_to.max(newest);
                     }
+                    Some(Control::Outbox(Signal::Abort(message))) => {
+                        if let Some(detail) = self.abort(&mut run, &mut linked, relinking, message).await {
+                            // An envelope read while the stop was asked turned the link away
+                            // (see the events arm; it cannot happen on a linked account).
+                            self.log_out(&mut run, Ingest::Refused).await;
+                            return self.login_failed(relinking, detail).await;
+                        }
+                    }
                     Some(Control::Outbox(signal)) => {
                         if self.dispatch.signal(signal) {
                             let state = run.conn.borrow().clone();
@@ -964,14 +1064,21 @@ impl Supervisor {
                         }
                         self.kick(&run).await;
                     }
-                    Some(Control::ConfirmIdentity(user)) => {
-                        // A link in progress starts from an empty identity store: there is
-                        // nothing for its backend to confirm, and what it is linking may be
-                        // another account. The paused queues are released all the same; the
-                        // next attempt after the link meets the backend's own view.
+                    Some(Control::ConfirmIdentity { user, key, reply }) => {
                         if linked {
-                            run.send(Command::ConfirmIdentity { user: user.clone() }).await;
+                            // The backend answers; the queues resume after its `Ok` only
+                            // (the lead's RC6: `Control::Released` from the waiting side).
+                            run.send(Command::ConfirmIdentity { user, key, reply }).await;
+                        } else {
+                            // A link in progress starts from an empty identity store: there
+                            // is nothing for its backend to confirm, and what it is linking
+                            // may be another account. The paused queues are released all the
+                            // same (`Ok`); the next attempt after the link meets the
+                            // backend's own view.
+                            let _ = reply.send(Ok(()));
                         }
+                    }
+                    Some(Control::Released(user)) => {
                         self.confirmed(&user).await;
                         self.kick(&run).await;
                     }
@@ -1052,10 +1159,92 @@ impl Supervisor {
         self.kick(run).await;
     }
 
+    /// One envelope of the running actor: applied, acknowledged, and what it set going started.
+    /// `Some(detail)`: the link was turned away (the caller logs the device out and ends the
+    /// login).
+    async fn on_envelope(
+        &mut self,
+        run: &mut Running,
+        env: Envelope,
+        linked: &mut bool,
+        relinking: bool,
+    ) -> Option<String> {
+        let was_linked = *linked;
+        if let Flow::LoginFailed(detail) = self.envelope(env, linked, relinking).await {
+            return Some(detail);
+        }
+        if *linked && !was_linked {
+            self.now_linked(run).await;
+        }
+        if std::mem::take(&mut self.outbox_dirty) {
+            // What was applied removed outbox rows (a tombstone, an echo): the rows behind
+            // them start now, not when the timer armed for a removed row fires.
+            self.kick(run).await;
+        }
+        None
+    }
+
+    /// The user's X on an uploading message ([`outbox::cancel`] has written the mark): asks the
+    /// backend to stop and writes its answer ([`Dispatcher::abort_answered`]); the row's flags
+    /// are read again, and a message that was too late to stop leaves the set of stoppable
+    /// uploads at once.
+    ///
+    /// While it waits for the answer the supervisor KEEPS READING the account's events: a
+    /// backend whose command loop is inside an emit on a full event queue (8 envelopes: the
+    /// upload ticker of a big album fills it at once) can only take the command after the core
+    /// read, and an inline wait would end in the time-out and a `TooLate` for a stop that was
+    /// in time. The rule that stays: nothing of the attempt's OUTCOME is recorded meanwhile
+    /// (`dispatch.wake()` is not polled here), so the mark is written before the outcome.
+    /// `Some(detail)`: an envelope turned the link away (see [`Self::on_envelope`]).
+    async fn abort(
+        &mut self,
+        run: &mut Running,
+        linked: &mut bool,
+        relinking: bool,
+        message: MessageId,
+    ) -> Option<String> {
+        let target = self.dispatch.abort_target(message)?;
+        let ask = crate::dispatch::ask_to_stop(run.commands.clone(), message);
+        tokio::pin!(ask);
+        let (mut failed, mut reading) = (None, true);
+        let answer = loop {
+            tokio::select! {
+                answer = &mut ask => break answer,
+                ev = run.events.recv(), if reading => match ev {
+                    Some(env) => {
+                        if let Some(detail) = self.on_envelope(run, env, linked, relinking).await {
+                            // Not read on: the caller ends the login after the answer is written.
+                            failed = Some(detail);
+                            reading = false;
+                        }
+                    }
+                    // The channel closed: the events arm of the main loop reports the exit.
+                    None => reading = false,
+                },
+            }
+        };
+        let aborted = self
+            .dispatch
+            .abort_answered(&self.sh, message, target, answer)
+            .await;
+        // `Stopping` leaves the row greyed as the mark "asked" made it; a message the stop came
+        // too late for can no longer be stopped, whatever the backend goes on reporting.
+        if let Some((message, _)) = aborted.target
+            && !aborted.stopping
+        {
+            self.uploads_over(message, true);
+        }
+        self.kick(run).await;
+        failed
+    }
+
     /// Starts due outbox heads and publishes what that changed.
     async fn kick(&mut self, run: &Running) {
         match self.dispatch.kick(&self.sh, &run.commands).await {
             Ok(kicked) => {
+                if kicked.hold_lifted {
+                    self.publish_hold(None);
+                }
                 for failed in kicked.failed {
                     self.report_failed(failed);
                 }
@@ -1064,6 +1253,96 @@ impl Supervisor {
             Err(e) => {
                 tracing::warn!(account = self.account.0, error = %e, "starting outbox attempts failed")
             }
+        }
+    }
+
+    /// Shows the account's send hold (`None`: there is none now) to `Query::Accounts` and the
+    /// front-ends.
+    fn publish_hold(&self, hold: Option<kourier_model::AccountHold>) {
+        {
+            let mut holds = self
+                .sh
+                .holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match hold {
+                Some(h) => {
+                    holds.insert(self.account, h);
+                }
+                None => {
+                    holds.remove(&self.account);
+                }
+            }
+        }
+        self.emit(UiEvent::AccountHold {
+            account: self.account,
+            hold,
+        });
+    }
+
+    /// `message`'s upload is reported moving: from now on it may be stopped
+    /// ([`Shared::uploading`]). The row is published once, when it enters, so the UI reads its
+    /// actions again.
+    fn upload_moving(&self, message: MessageId, conv: ConversationId) {
+        let entered = self
+            .sh
+            .uploading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(message, (self.account, conv))
+            .is_none();
+        if entered {
+            self.emit(UiEvent::MessagesChanged {
+                conv,
+                ids: vec![message],
+            });
+        }
+    }
+
+    /// `message` is not uploading any more (its uploads ended, its attempt ended, or its
+    /// actor did): it cannot be stopped. `publish`: the row is published again when it left
+    /// the set; a caller whose own changes publish the row (an attempt's recorded outcome)
+    /// passes `false`.
+    fn uploads_over(&self, message: MessageId, publish: bool) {
+        let left = self
+            .sh
+            .uploading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&message);
+        if let Some((_, conv)) = left
+            && publish
+        {
+            self.emit(UiEvent::MessagesChanged {
+                conv,
+                ids: vec![message],
+            });
+        }
+    }
+
+    /// The account's actor is gone (or about to start): none of its messages uploads.
+    fn forget_uploads(&self) {
+        let gone: Vec<(MessageId, ConversationId)> = {
+            let mut set = self
+                .sh
+                .uploading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gone = set
+                .iter()
+                .filter(|(_, (account, _))| *account == self.account)
+                .map(|(m, (_, conv))| (*m, *conv))
+                .collect::<Vec<_>>();
+            for (m, _) in &gone {
+                set.remove(m);
+            }
+            gone
+        };
+        for (message, conv) in gone {
+            self.emit(UiEvent::MessagesChanged {
+                conv,
+                ids: vec![message],
+            });
         }
     }
 
@@ -1087,6 +1366,11 @@ impl Supervisor {
             self.set_conn(state).await;
         }
         if let Wake::Done(done) = w {
+            // The attempt is over, whatever it answered: its message does not upload. (The
+            // recorded outcome publishes the row.)
+            if let Some(message) = self.dispatch.message_of(&done) {
+                self.uploads_over(message, false);
+            }
             match self.dispatch.done(&self.sh, done).await {
                 Ok(effect) => {
                     if let Some(state) = effect.conn {
@@ -1102,6 +1386,14 @@ impl Supervisor {
                         self.report_failed(failed);
                     }
                     self.publish(effect.changes).await;
+                    // After the recording, so the message's delete-for-everyone works now.
+                    if let Some((message, conv)) = effect.too_late {
+                        self.emit(UiEvent::CancelTooLate {
+                            account: self.account,
+                            conv,
+                            message,
+                        });
+                    }
                 }
                 // The row was queued again after a backoff (or, if even that failed, resumes at
                 // the next actor start).
@@ -1121,13 +1413,21 @@ impl Supervisor {
         match c {
             Control::Outbox(signal) => {
                 self.dispatch.signal(signal);
+                self.share_pauses();
             }
-            Control::ConfirmIdentity(user) => {
-                self.confirmed(&user).await;
-                if !self.confirm_later.contains(&user) {
-                    self.confirm_later.push(user);
+            Control::ConfirmIdentity { user, key, reply } => {
+                // Answered `Ok`: the waiting side releases the queues (`Control::Released`).
+                let _ = reply.send(Ok(()));
+                if !self
+                    .confirm_later
+                    .iter()
+                    .any(|(u, k)| *u == user && *k == key)
+                {
+                    self.confirm_later.push((user, key));
                 }
             }
+            // The backend's answer came after its actor stopped: the pause still lifts.
+            Control::Released(user) => self.confirmed(&user).await,
             // Nothing to tell: the next actor connects when it starts.
             Control::Hint(_) => {}
             other => {
@@ -1136,9 +1436,41 @@ impl Supervisor {
         }
     }
 
-    /// `ConfirmIdentity`: the conversations paused on `user` show their heads queued again.
+    /// Releases the users [`Self::publish`] collected from `IdentityTrusted` notices (and any
+    /// a release's own publish adds). Whether anything was released.
+    async fn release_trusted(&mut self) -> bool {
+        let mut any = false;
+        while !self.trusted.is_empty() {
+            for user in std::mem::take(&mut self.trusted) {
+                self.confirmed(&user).await;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// `user`'s identity was confirmed (`ConfirmIdentity`, a `SetVerified` the backend took,
+    /// an `IdentityTrusted` notice): the conversations paused on `user` show their heads
+    /// queued again, and so do paused GROUPS with `user` as a member (critic M4; read here
+    /// first, before the dispatcher decides, F19). What holds after the retry is the
+    /// backend's call: a member in state 2 pauses the group again, a never-verified member
+    /// is trusted (TOFU, the lead's R1: `Dispatcher::confirmed_in`).
     async fn confirmed(&mut self, user: &UserId) {
-        let heads = self.dispatch.confirmed(user);
+        let others = self.dispatch.paused_on_others(user);
+        let groups = if others.is_empty() {
+            Vec::new()
+        } else {
+            let (account, u) = (self.account, user.clone());
+            self.sh
+                .store
+                .read(move |c| crate::outbox::groups_with_member(c, account, &others, &u))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(account = self.account.0, error = %e, "reading the paused groups failed");
+                    Vec::new()
+                })
+        };
+        let heads = self.dispatch.confirmed_in(user, &groups);
         if heads.is_empty() {
             return;
         }
@@ -1275,13 +1607,25 @@ impl Supervisor {
 
     async fn resend_pending(&mut self, run: &Running) {
         let account = self.account;
+        // A write, not a read: a durable roaming change of an account that no longer states
+        // `roaming_writes` is deleted instead of sent (`local::resendable_commands`).
         match self
             .sh
             .store
-            .read(move |c| local::pending_commands(c, account))
+            .write(Priority::High, lane(account), move |c| {
+                local::resendable_commands(c, account)
+            })
             .await
         {
-            Ok(cmds) => {
+            Ok((cmds, dropped)) => {
+                if dropped > 0 {
+                    // A count only: no conversation, no key.
+                    tracing::debug!(
+                        account = account.0,
+                        dropped,
+                        "durable roaming changes of an account that no longer states the flag dropped"
+                    );
+                }
                 for (id, cmd) in cmds {
                     run.send(cmd.into_command(id)).await;
                 }
@@ -1429,13 +1773,14 @@ impl Supervisor {
     async fn apply(&self, events: Vec<BackendEvent>) -> (Changes, Result<()>) {
         let mut all = Changes::default();
         for (prio, events) in segments(events) {
-            let (account, scope) = (self.account, self.scope);
+            let (account, scope, history_read, server) =
+                (self.account, self.scope, self.history_read, self.server);
             let now = i64::try_from(self.sh.clock.now_ms()).unwrap_or(i64::MAX);
             let result = self
                 .sh
                 .store
                 .write(prio, lane(account), move |conn| {
-                    ingest::apply_events(conn, account, scope, now, events)
+                    ingest::apply_events(conn, account, scope, history_read, server, now, events)
                 })
                 .await;
             match result {
@@ -1449,6 +1794,7 @@ impl Supervisor {
     /// Turns committed changes into UI events (§4.9 last row).
     async fn publish(&mut self, ch: Changes) {
         let account = self.account;
+        self.share_pauses();
         // Counted before the first UI event: a reader that saw "Local" sees the derive job
         // until its result is published (`MediaHandles::deriving`).
         self.publishing_jobs = ch.derive.len();
@@ -1535,6 +1881,18 @@ impl Supervisor {
                 self.dispatch.sync_challenge(&self.sh).await;
                 self.set_conn(shown).await;
             }
+            // The lost-history line is state (W4 fix F2): kept for the run and told again at
+            // `UiReady`, because the backend appends it at its start, before any front-end
+            // listens, and counts it told as soon as this transaction's row is acked.
+            if let BackendNotice::HistoryLost { count } = &notice {
+                self.sh.note_history_lost(account, *count);
+            }
+            // Released by the caller's loop once this returns (F4).
+            if let BackendNotice::IdentityTrusted { user } = &notice
+                && !self.trusted.contains(user)
+            {
+                self.trusted.push(user.clone());
+            }
             self.emit(UiEvent::Notice { account, notice });
         }
         for (conv, progress, has_more) in ch.history {
@@ -1608,12 +1966,25 @@ impl Supervisor {
                 index,
                 done,
                 total,
-            } => self.emit(UiEvent::Progress(Progress::Upload {
-                message: local,
-                index,
-                done,
-                total,
-            })),
+            } => {
+                // The backend names a position in its request; the UI knows attachments.
+                if let Some(attachment) = self.dispatch.attachment_of(local, index) {
+                    // An upload of the message moves: only a backend that reports one can
+                    // answer an abort, so this is what lets the message be stopped. Before
+                    // the report goes on, so whoever hears it finds the message stoppable.
+                    if done < total
+                        && let Some(conv) = self.dispatch.in_flight_conv(local)
+                    {
+                        self.upload_moving(local, conv);
+                    }
+                    self.emit(UiEvent::Progress(Progress::Upload {
+                        message: local,
+                        attachment,
+                        done,
+                        total,
+                    }));
+                }
+            }
             BackendEvent::DownloadProgress {
                 attachment,
                 done,
@@ -1628,6 +1999,24 @@ impl Supervisor {
                 progress,
                 phase,
             } => {
+                // The files are being made ready: an upload of the message is reported, so it
+                // may be stopped from now on (a backend that reports `Preparing` can stop in
+                // this phase, like in the uploads). Before the report goes on, as for a file.
+                if phase == Some(SendPhase::Preparing)
+                    && let Some(conv) = self.dispatch.in_flight_conv(local)
+                {
+                    self.upload_moving(local, conv);
+                }
+                // The uploads are over (the whole share, or a step after them): nothing of the
+                // message can be stopped any more.
+                if progress >= 1.0
+                    || !matches!(
+                        phase,
+                        None | Some(SendPhase::Preparing | SendPhase::Uploading)
+                    )
+                {
+                    self.uploads_over(local, true);
+                }
                 self.emit(UiEvent::Progress(Progress::Transmit {
                     message: local,
                     progress,
@@ -1640,6 +2029,18 @@ impl Supervisor {
             BackendEvent::AccountProgress(progress) => {
                 self.progress_open = !progress.finished;
                 self.emit(UiEvent::AccountProgress { account, progress });
+            }
+            BackendEvent::AccountHold(hold) => {
+                if self.dispatch.set_hold(hold, self.sh.now()) {
+                    tracing::info!(
+                        account = self.account.0,
+                        held = hold.is_some(),
+                        "the account's send hold changed"
+                    );
+                    self.publish_hold(hold);
+                    // A lift frees what waited; a new hold arms its end.
+                    self.outbox_dirty = true;
+                }
             }
             BackendEvent::Logout(report) => self.logout_report = Some(report),
             _ => {}
@@ -1663,7 +2064,7 @@ impl Supervisor {
     /// still linking is ingested only from its `AccountReady` on, a relink only when it is the
     /// same account, and after a refusal nothing more.
     async fn drain(&mut self, run: &mut Running, linked: &mut bool, relinking: bool) {
-        let grace = self.sh.timeouts.shutdown_grace;
+        let grace = self.grace;
         let deadline = tokio::time::Instant::now() + grace;
         let mut refused = false;
         while let Ok(Some(env)) = tokio::time::timeout_at(deadline, run.events.recv()).await {
@@ -1682,7 +2083,7 @@ impl Supervisor {
     /// just refused.
     async fn stop(&mut self, run: &mut Running, mut ingest: Ingest) {
         run.send(Command::Shutdown).await;
-        let grace = self.sh.timeouts.shutdown_grace;
+        let grace = self.grace;
         let mut deadline = tokio::time::Instant::now() + grace;
         let mut cancelled = false;
         while !run.exit_done {
@@ -1739,8 +2140,10 @@ impl Supervisor {
 
     /// Joins the actor's OS thread off the runtime (bounded).
     async fn join(&self, run: &mut Running) {
+        // The actor is gone (or going): whatever it was uploading is not any more.
+        self.forget_uploads();
         if let Some(t) = run.thread.take() {
-            let grace = self.sh.timeouts.shutdown_grace;
+            let grace = self.grace;
             let joined =
                 tokio::time::timeout(grace, tokio::task::spawn_blocking(move || t.join())).await;
             if joined.is_err() {
@@ -1955,6 +2358,8 @@ impl Supervisor {
         }
         self.set_conn(ConnState::LoggedOut {
             reason: reason.to_owned(),
+            cause: Default::default(),
+            note: Default::default(),
         })
         .await;
         self.emit(UiEvent::AccountsChanged);
@@ -2387,6 +2792,28 @@ mod tests {
         assert!(
             Hint::Resumed > Hint::NetworkChanged,
             "a resume covers a change"
+        );
+    }
+
+    /// R-Q1: the grace an actor gets at a stop is what its network states, else the core's
+    /// default; the core's default is Signal's 5 s.
+    #[test]
+    fn a_stop_grace_is_the_networks_own_else_the_cores_default() {
+        let default = Timeouts::default();
+        assert_eq!(default.shutdown_grace, Duration::from_secs(5));
+        assert_eq!(default.grace_of(None), Duration::from_secs(5));
+        assert_eq!(
+            default.grace_of(Some(Duration::from_secs(20))),
+            Duration::from_secs(20)
+        );
+        let short = Timeouts {
+            shutdown_grace: Duration::from_millis(100),
+            ..Timeouts::default()
+        };
+        assert_eq!(short.grace_of(None), Duration::from_millis(100));
+        assert_eq!(
+            short.grace_of(Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
         );
     }
 

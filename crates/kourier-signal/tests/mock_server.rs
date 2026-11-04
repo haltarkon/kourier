@@ -14,7 +14,7 @@
 //! Skips with a message when Node ≥ 24 or `tests/mock-harness/node_modules` is missing
 //! (set `KOURIER_REQUIRE_MOCK_HARNESS=1` to fail instead).
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
@@ -935,12 +935,8 @@ async fn kill_at_every_failpoint_gives_the_uncrashed_state() {
 /// Starts the helper process of [`child_actor_process`] armed with `failpoint`.
 fn spawn_child(spec: &ChildSpec, failpoint: &str) -> tokio::process::Child {
     tokio::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "child_actor_process",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .arg(support::child_filter(module_path!(), "child_actor_process"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, serde_json::to_string(spec).expect("spec"))
         .env("KOURIER_FAILPOINT", failpoint)
         .stdin(Stdio::null())

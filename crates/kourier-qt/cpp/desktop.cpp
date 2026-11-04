@@ -2,7 +2,9 @@
 
 #include <QtCore/QHash>
 #include <QtCore/QStringList>
+#include <QtCore/QUrl>
 #include <QtGui/QColor>
+#include <QtGui/QDesktopServices>
 #include <QtGui/QFont>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QIcon>
@@ -248,6 +250,18 @@ bool sessionEnding()
 void setSessionEnding(bool ending)
 {
     g_sessionEnding.store(ending);
+}
+
+void registerUrlHandlers(QObject* receiver)
+{
+    for (const char* scheme : { "http", "https", "mailto", "file" }) {
+        QDesktopServices::setUrlHandler(QString::fromLatin1(scheme), receiver, "openExternalUrl");
+    }
+}
+
+QString urlForTheOpener(const QUrl& url)
+{
+    return url.toString(QUrl::FullyEncoded);
 }
 
 } // namespace kourier

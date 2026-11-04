@@ -33,7 +33,11 @@ pub enum StartMode {
     /// Normal start with stored credentials.
     Resume,
     /// `core.db` was rebuilt: re-emit mirrored state (contacts, groups, settings) into
-    /// `core_outbox` (§4.3 step 8).
+    /// `core_outbox` (§4.3 step 8). A network that numbers its messages (KT-2) restates with
+    /// them what the rebuilt core cannot know: each message's position
+    /// (`IncomingMessage::net_seq`), the read positions (`ReadUpTo`, `PeerReadUpTo`), the counts
+    /// its server owns (`ConversationPatch::server_unread`, `server_mentions`) and, where it knows
+    /// them, the ids own messages were allocated under (`IncomingMessage::allocated_as`).
     Rebuild,
 }
 

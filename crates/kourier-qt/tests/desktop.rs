@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use cxx_qt_lib::QGuiApplication;
 use kourier_app::desktop::{ImageData, Presenter};
-use kourier_app::facade::{ConversationDetail, ConversationRow};
+use kourier_app::facade::{ConversationDetail, ConversationRow, Roaming};
 use kourier_model::{AccountId, ConvKind, ConversationFeatures, ConversationId};
 use kourier_qt::desktop::{AVATAR_SIZE, QtPresenter, TRAY_SIZES};
 
@@ -37,6 +37,9 @@ fn detail(title: &str, is_self: bool) -> ConversationDetail {
             features_hash: 0,
             has_draft: false,
             hidden: false,
+            can_send: true,
+            roaming: Roaming::Hidden,
+            protected: false,
         },
         members: Vec::new(),
         features: ConversationFeatures::default(),
@@ -101,6 +104,16 @@ fn run(dump_dir: Option<&Path>) -> Result<(), String> {
     check(
         pixel(&named, 4, 4)[3] == 0,
         "a circle is cut well inside the corner",
+    )?;
+
+    // The "~" mark of a name the person chose for themself stays out of the monogram and its
+    // colour (W6a2 PRIV-1): the same pixels as the name without it, the mark in the title only.
+    let marked = presenter
+        .avatar("~Olena Kovalenko", &detail("~Olena Kovalenko", false))
+        .ok_or("no avatar")?;
+    check(
+        marked == named,
+        "a marked name draws the same monogram and colour",
     )?;
 
     // "Round avatars" off: a square with the theme's small corner. The corner pixel is still

@@ -394,6 +394,9 @@ pub fn fixture(spec: &FixtureSpec) -> Result<Script, ScriptError> {
 
     let mut t = spec.start_ms;
     let mut events = Vec::new();
+    // The time of the newest message of each conversation (they are generated one after the
+    // other, so these only grow).
+    let mut ends: Vec<i64> = Vec::new();
     for (ci, (key, members)) in convs.iter().enumerate() {
         let mut sent: Vec<NetMsgId> = Vec::new();
         let mut photos: Vec<NetMsgId> = Vec::new();
@@ -478,6 +481,7 @@ pub fn fixture(spec: &FixtureSpec) -> Result<Script, ScriptError> {
             }
             sent.push(id);
         }
+        ends.push(t);
         // The edited marker, a tombstone and a reaction on one of ours, without drawing from
         // the random stream (the rest of the fixture stays the same).
         if spec.modifiers && (matches!(ci, 0 | 1 | 4) || key.direct_peer().is_none()) {
@@ -497,6 +501,25 @@ pub fn fixture(spec: &FixtureSpec) -> Result<Script, ScriptError> {
                 conv: Some(key.clone()),
                 up_to: MsgTarget::to_id(Some(key.clone()), last),
             });
+        }
+    }
+    // A safety number that changed is the NEWEST row of a direct chat and of a group, dated
+    // just after the next chat's newest message (so a list that counts it puts the chat one
+    // place higher, above that chat, and one that does not leaves the chat where its last
+    // real message puts it). Without drawing from the random stream.
+    if spec.modifiers {
+        for ci in quiet_notice_chats(spec.contacts, spec.groups) {
+            let (Some((key, members)), Some(after)) = (convs.get(ci), ends.get(ci + 1)) else {
+                continue;
+            };
+            let Some(user) = members.first() else {
+                continue;
+            };
+            let at = after + 10_000;
+            let mut notice = remote(key, user, &format!("keychange:fixture:{ci}"), at, "");
+            notice.body = Body::System(SystemEvent::IdentityKeyChanged { user: user.clone() });
+            notice.silent = true;
+            events.push(BackendEvent::Message(notice));
         }
     }
     if spec.showcase {
@@ -542,6 +565,21 @@ pub fn fixture(spec: &FixtureSpec) -> Result<Script, ScriptError> {
         }
     }
     Ok(s)
+}
+
+/// The indexes (in the order contacts, then groups) of the chats that end in a quiet notice
+/// ([`FixtureSpec::modifiers`]): a direct chat and the first group, each one place below a
+/// chat that is not the newest, and neither pinned, muted nor archived (those are the first
+/// four). Few contacts or groups: fewer or none.
+pub fn quiet_notice_chats(contacts: usize, groups: usize) -> Vec<usize> {
+    let mut chats = Vec::new();
+    if contacts >= 8 {
+        chats.push(contacts - 4);
+    }
+    if groups >= 3 {
+        chats.push(contacts);
+    }
+    chats
 }
 
 /// The timer of the showcase chat's messages: one week (a timer `signal_features` lists).

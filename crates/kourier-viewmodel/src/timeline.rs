@@ -8,11 +8,12 @@ use std::collections::HashMap;
 
 use kourier_model::{
     AskFailure, Attachment, AttachmentId, AttachmentKind, AttachmentState, Body, CannotSend,
-    Message, MessageId, OutgoingState, SendPhase, UserId,
+    FailReason, Message, MessageId, OutgoingState, SendPhase, UserId,
 };
 
 use crate::i18n::{trc, trfc, trnc, trnfc};
 use crate::media::{self, MediaVariant};
+use crate::media_layout;
 use crate::names::{Names, single_line};
 use crate::preview::{self, NoticeTone, Summary};
 use crate::readmore::ReadMore;
@@ -180,6 +181,22 @@ impl MediaState {
     }
 }
 
+/// The ring on a file of an own message that waits to go up or goes up (upload progress): what
+/// the ring and the X over the file show. A file whose upload is over has none, nor has any
+/// file of a message that was sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UploadView {
+    /// How much of the file is up, 0 … 1; 0 for a file nothing has been reported for (it
+    /// waits for its turn, or the backend is still preparing it).
+    pub share: f32,
+    /// The percentage the ring's note shows ("45%"); empty for a file nothing has been
+    /// reported for.
+    pub label: String,
+    /// The X is offered: the core accepts "Cancel Sending" for the message now
+    /// ([`RowActions::cancel_sending`], copied, never decided here).
+    pub cancel: bool,
+}
+
 /// An image, GIF, video or sticker.
 #[derive(Clone, Default, PartialEq)]
 pub struct ImageBlock {
@@ -218,6 +235,11 @@ pub struct ImageBlock {
     /// this attachment among the ones its Download asks for
     /// (`MessageActions::ask_attachments`); no rule of the viewmodel's.
     pub ask: bool,
+    /// "Save As…" accepts it: the core lists this attachment among the ones it may save
+    /// (`MessageActions::save_attachments`); no rule of the viewmodel's.
+    pub save: bool,
+    /// Its ring while it waits to go up or goes up (own message on its way).
+    pub upload: Option<UploadView>,
 }
 
 crate::safe_debug!(ImageBlock {
@@ -230,8 +252,44 @@ crate::safe_debug!(ImageBlock {
     state,
     progress,
     sticker,
-    ask
+    ask,
+    save,
+    upload
 });
+
+/// Several pictures and videos of one message, shown as one album.
+///
+/// The pictures are not cropped to a fixed grid: [`Self::rows`] cuts the first [`ALBUM_TILES`]
+/// of them into justified rows of their own shapes ([`media_layout`]), once, when the block is
+/// built. The rows depend on the sizes of the pictures only, never on the width the layout
+/// gives (the pixel step is the view's).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AlbumBlock {
+    /// Every picture and video of the album, in order (the viewer steps through all of them).
+    pub items: Vec<ImageBlock>,
+    /// The rows of the shown tiles: the first [`ALBUM_TILES`] of `items`.
+    pub rows: Vec<media_layout::AlbumRow>,
+    /// The one ring of the "+N" tile while the pictures behind it wait or go up: their bytes
+    /// together (`None`: none of them has a ring).
+    pub more: Option<UploadView>,
+}
+
+impl AlbumBlock {
+    /// An album of `items`, with its rows.
+    pub fn new(items: Vec<ImageBlock>) -> Self {
+        let aspects: Vec<f64> = items
+            .iter()
+            .take(ALBUM_TILES)
+            .map(|i| media_layout::tile_aspect(i.width, i.height))
+            .collect();
+        let rows = media_layout::album_rows(&aspects);
+        Self {
+            items,
+            rows,
+            more: None,
+        }
+    }
+}
 
 /// A file, audio file or voice note.
 #[derive(Clone, Default, PartialEq)]
@@ -257,6 +315,10 @@ pub struct FileBlock {
     /// It is gone here, and a click asks the user's phone to upload it again (as
     /// [`ImageBlock::ask`]).
     pub ask: bool,
+    /// "Save As…" accepts it (as [`ImageBlock::save`]).
+    pub save: bool,
+    /// Its ring while it waits to go up or goes up (own message on its way).
+    pub upload: Option<UploadView>,
 }
 
 crate::safe_debug!(FileBlock {
@@ -267,7 +329,9 @@ crate::safe_debug!(FileBlock {
     state,
     progress,
     voice,
-    ask
+    ask,
+    save,
+    upload
 });
 
 /// Whether the message a quote points at is (still) here.
@@ -329,7 +393,7 @@ pub enum Block {
     Image(ImageBlock),
     /// Several pictures and videos of one message, shown as one grid ([`ALBUM_TILES`] tiles,
     /// the last one counting what is left); the viewer steps through all of them.
-    Album(Vec<ImageBlock>),
+    Album(AlbumBlock),
     /// A file or voice note.
     File(FileBlock),
     /// A stand-in (deleted, undecryptable, unsupported, contact, location, …).
@@ -353,7 +417,7 @@ impl Block {
     pub fn images(&self) -> &[ImageBlock] {
         match self {
             Self::Image(i) => std::slice::from_ref(i),
-            Self::Album(items) => items,
+            Self::Album(album) => &album.items,
             _ => &[],
         }
     }
@@ -407,9 +471,22 @@ pub struct RowActions {
     pub take_back: bool,
     /// Its send failed for some or all recipients: it can be sent again.
     pub retry: bool,
+    /// "Cancel Sending" is accepted (`CancelMessage`): `take_back`, or an upload that can still
+    /// be stopped before anything reaches anyone. The menu's entry and the X on the rings of its
+    /// files read this one flag (the core's, `MessageActions::cancel_sending`).
+    pub cancel_sending: bool,
     /// Download on one of its gone attachments asks the user's phone to upload it again
     /// (the core's `MessageActions::ask_attachments` is not empty; the blocks carry it as `ask`).
     pub ask_attachments: bool,
+    /// "Save As…" (or "Save All…") is offered: one of its attachments is on this PC and may be
+    /// saved to a folder (the core's `MessageActions::save_attachments` is not empty; the blocks
+    /// carry it as `save`).
+    pub save_attachments: bool,
+    /// "Show Sender's Page" is offered (the core's `MessageActions::show_sender`).
+    pub show_sender: bool,
+    /// The message mentions people the menu offers a page of (the core's
+    /// `MessageActions::show_people` is not empty; the row's `pages` carry them).
+    pub show_people: bool,
 }
 
 impl RowActions {
@@ -422,8 +499,85 @@ impl RowActions {
             || self.delete_for_me
             || self.delete_for_everyone
             || self.delete_attachment
+            || self.cancel_sending
             || self.retry
+            || self.save_attachments
+            || self.show_sender
+            || self.show_people
     }
+}
+
+/// One page the row's menu offers ("Show Sender's Page", "Show <name>'s Page", "Show Your Page"): who
+/// it opens and what the entry says. The label holds a name from the network: plain text only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PageEntry {
+    /// Whose page it opens.
+    pub user: UserId,
+    /// The entry's text.
+    pub label: String,
+    /// It opens the person's safety-number page on top of their page ("Show <name>'s Safety
+    /// Number", P5a BQ-3), not only their page.
+    pub safety: bool,
+}
+
+crate::safe_debug!(PageEntry { user });
+
+/// The pages a message's menu offers, in the menu's order: the sender's, then one per person the
+/// core listed for the text. The core states which ([`RowActions::show_sender`] and the list);
+/// this only gives them their words. A name is one line of plain text, never cut here (the menu
+/// elides what does not fit).
+///
+/// `safety`: the core named this row part of a queue that waits for that person's safety
+/// number (`MessageActions::safety_number`): "Show <name>'s Safety Number" comes first.
+fn page_entries(
+    actions: &RowActions,
+    author: Option<&UserId>,
+    people: &[(UserId, bool)],
+    safety: Option<&UserId>,
+    names: &dyn Names,
+) -> Vec<PageEntry> {
+    let mut out = Vec::new();
+    if let Some(user) = safety {
+        out.push(PageEntry {
+            user: user.clone(),
+            label: trfc(
+                "@action:inmenu, %1 the name of a person whose safety number changed",
+                "Show %1's Safety Number",
+                &[&single_line(&names.display_name(user))],
+            ),
+            safety: true,
+        });
+    }
+    if let (true, Some(user)) = (actions.show_sender, author) {
+        out.push(PageEntry {
+            user: user.clone(),
+            label: trc("@action:inmenu", "Show Sender's Page").into_owned(),
+            safety: false,
+        });
+    }
+    if actions.show_people {
+        for (user, own) in people {
+            let label = if *own {
+                trc(
+                    "@action:inmenu the user's own page, from a mention of himself",
+                    "Show Your Page",
+                )
+                .into_owned()
+            } else {
+                trfc(
+                    "@action:inmenu, %1 the name of a person the message mentions",
+                    "Show %1's Page",
+                    &[&single_line(&names.display_name(user))],
+                )
+            };
+            out.push(PageEntry {
+                user: user.clone(),
+                label,
+                safety: false,
+            });
+        }
+    }
+    out
 }
 
 /// A reaction on a message (input of [`build_timeline`]).
@@ -457,21 +611,39 @@ pub enum WaitReason {
     Clock,
     /// The device is no longer linked.
     LoggedOut,
-    /// The network restricted the account.
-    Restricted,
+    /// The network restricted the account, or holds back what is sent from it, until
+    /// `until_ms` when it said. `network` is its name.
+    Restricted {
+        /// The network's name ("WhatsApp").
+        network: &'static str,
+        /// When it ends (ms), when the network said.
+        until_ms: Option<i64>,
+    },
     /// This version of Kourier is too old for the network.
     UpdateApp,
     /// Another session took over the connection.
     Reconnect,
     /// The attempt is at this step (the backend's ephemeral `SendPhase`).
     Phase(SendPhase),
+    /// The attempt uploads the message's files and the backend reports their bytes: `done` of
+    /// `total` plaintext bytes in all (the files reported so far; "Preparing files" while none
+    /// has a byte up).
+    Uploading {
+        /// Bytes up.
+        done: u64,
+        /// Bytes to go up in all.
+        total: u64,
+    },
 }
 
 impl WaitReason {
     /// The message waits for something other than its own send: no countdown to a next try
     /// means anything then.
     pub fn is_hold(self) -> bool {
-        !matches!(self, Self::Sending | Self::Phase(_))
+        !matches!(
+            self,
+            Self::Sending | Self::Phase(_) | Self::Uploading { .. }
+        )
     }
 }
 
@@ -519,6 +691,23 @@ impl WaitLine {
 /// "Sending to 20 members · 0:05", "Sent to 8 of 20 members · 0:42", "Next try in 0:30".
 /// Empty before [`WAIT_SHOWN_AFTER_MS`].
 pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
+    wait_line_in(wait, now, None)
+}
+
+/// [`wait_line`] with the calendar a date needs ("until today at 14:00"): without one a
+/// restriction names no date.
+pub fn wait_line_in(wait: &SendWait, now: i64, time: Option<&TimeContext<'_>>) -> WaitLine {
+    wait_line_named(wait, now, time, None)
+}
+
+/// [`wait_line_in`] that names `who` in the safety-number wait (P5a BQ-3: "Waiting for you to
+/// confirm the new safety number with Ada"); `None` keeps the line without a name.
+pub fn wait_line_named(
+    wait: &SendWait,
+    now: i64,
+    time: Option<&TimeContext<'_>>,
+    who: Option<&str>,
+) -> WaitLine {
     let elapsed = now.saturating_sub(wait.since);
     if elapsed < WAIT_SHOWN_AFTER_MS {
         return WaitLine::default();
@@ -560,11 +749,18 @@ pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
             "Waiting for you to verify",
         )
         .into_owned(),
-        WaitReason::SafetyNumber => trc(
-            "@info:status under a message not sent yet",
-            "Waiting for you to confirm the new safety number",
-        )
-        .into_owned(),
+        WaitReason::SafetyNumber => match who {
+            Some(who) => trfc(
+                "@info:status under a message not sent yet, %1 the name of the person whose safety number changed",
+                "Waiting for you to confirm the new safety number with %1",
+                &[who],
+            ),
+            None => trc(
+                "@info:status under a message not sent yet",
+                "Waiting for you to confirm the new safety number",
+            )
+            .into_owned(),
+        },
         WaitReason::Clock => trc(
             "@info:status under a message not sent yet",
             "Waiting for the computer's clock to be set",
@@ -575,11 +771,21 @@ pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
             "Waiting for this device to be linked again",
         )
         .into_owned(),
-        WaitReason::Restricted => trc(
-            "@info:status under a message not sent yet",
-            "Waiting: the network restricted this account",
-        )
-        .into_owned(),
+        // A date that has passed is not named (the core lifts a hold when it ends).
+        WaitReason::Restricted { network, until_ms } => {
+            match until_ms.filter(|t| *t > now).zip(time) {
+                Some((t, time)) => trfc(
+                    "@info:status under a message not sent yet, %1 the name of the network, %2 the end",
+                    "Waiting: %1 restricted this account until %2",
+                    &[network, &time.until(t)],
+                ),
+                None => trfc(
+                    "@info:status under a message not sent yet, %1 the name of the network",
+                    "Waiting: %1 restricted this account",
+                    &[network],
+                ),
+            }
+        }
         WaitReason::UpdateApp => trc(
             "@info:status under a message not sent yet",
             "Waiting for Kourier to be updated",
@@ -592,6 +798,21 @@ pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
         .into_owned(),
         WaitReason::Phase(SendPhase::Uploading) => {
             trc("@info:status under a message being sent", "Uploading files").into_owned()
+        }
+        // The backend says it makes the files ready (the pictures are re-encoded) before the
+        // first byte goes up; and nothing of the files is up yet (the upload form is asked
+        // for, the first bytes are on their way): Android's "Processing".
+        WaitReason::Phase(SendPhase::Preparing) | WaitReason::Uploading { done: 0, .. } => {
+            trc("@info:status under a message being sent", "Preparing files").into_owned()
+        }
+        // His form: whole numbers, the bytes done in the unit of the total.
+        WaitReason::Uploading { done, total } => {
+            let (up, all) = time::file_size_pair(done, total);
+            trfc(
+                "@info:status under a message being sent, %1 percent, %2 bytes done, %3 total with its unit",
+                "Uploading %1% · %2 of %3",
+                &[&upload_percent(done, total).to_string(), &up, &all],
+            )
         }
         WaitReason::Phase(SendPhase::RefreshingGroup) => trc(
             "@info:status under a message being sent",
@@ -636,20 +857,87 @@ pub fn wait_line(wait: &SendWait, now: i64) -> WaitLine {
         )
         .into_owned(),
     };
-    WaitLine {
-        reason: why,
-        timer: trfc(
+    // A restriction lasts hours or days: the seconds since the send mean nothing there, and the
+    // date in the reason is the part that matters, so the reason wraps whole (as the 463 line).
+    let timer = if matches!(wait.reason, WaitReason::Restricted { .. }) {
+        String::new()
+    } else {
+        trfc(
             "@info:status after the reason under a message on its way, %1 time since it was sent (m:ss)",
             "· %1",
             &[&since],
-        ),
+        )
+    };
+    WaitLine { reason: why, timer }
+}
+
+/// Whether the network refused the message as a first contact to someone who has not written
+/// to the account (WhatsApp's 463): Kourier never sends it again by itself.
+pub(crate) fn reach_out_refused(state: Option<&OutgoingState>) -> bool {
+    matches!(
+        state,
+        Some(OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            ..
+        })
+    )
+}
+
+/// The line under a message the network refused as a first contact: what happened and the
+/// one thing that works. It has no timer, and no "Send Again" goes with it (the core refuses
+/// the retry, `MessageActions::retry`).
+fn refused_line() -> WaitLine {
+    WaitLine {
+        reason: trc(
+            "@info:status under a message the network refused",
+            "Not sent: WhatsApp accepts this message only from your phone. Send it from your phone.",
+        )
+        .into_owned(),
+        timer: String::new(),
     }
 }
 
-/// The line of a row: only an own message that is still pending has one.
-pub(crate) fn row_wait_line(receipt: Receipt, wait: Option<SendWait>, now: i64) -> WaitLine {
+/// The line under the paused head of a queue that waits for a changed safety number: the
+/// head shows as failed, and this says whose number and what it needs (P5a U4; Signal Desktop
+/// says "Not sent" and opens the safety-number dialog on a click).
+fn paused_head_line(who: &str) -> WaitLine {
+    WaitLine {
+        reason: trfc(
+            "@info:status under a message not sent, %1 the name of the person whose safety number changed",
+            "Not sent: the safety number with %1 changed",
+            &[who],
+        ),
+        timer: String::new(),
+    }
+}
+
+/// The line of a row: only an own message that is still pending has one (or one that was
+/// refused as a first contact, which says so for good, or the paused head of a queue that
+/// waits for a safety number, which says whose).
+///
+/// `who`: the name of the person whose safety number a [`WaitReason::SafetyNumber`] wait names.
+/// `paused`: the core marked this row as part of that wait
+/// ([`kourier_core::facade::MessageActions::safety_number`]); a `Failed` row that is (the paused
+/// head) gets the named line even though its receipt is not `Pending` (U4).
+pub(crate) fn row_wait_line(
+    receipt: Receipt,
+    out_state: Option<&OutgoingState>,
+    wait: Option<SendWait>,
+    who: Option<&str>,
+    paused: bool,
+    time: &TimeContext<'_>,
+) -> WaitLine {
+    if receipt == Receipt::Failed && reach_out_refused(out_state) {
+        return refused_line();
+    }
+    if receipt == Receipt::Failed
+        && paused
+        && let Some(who) = who
+    {
+        return paused_head_line(who);
+    }
     match wait {
-        Some(w) if receipt == Receipt::Pending => wait_line(&w, now),
+        Some(w) if receipt == Receipt::Pending => wait_line_named(&w, time.now_ms, Some(time), who),
         _ => WaitLine::default(),
     }
 }
@@ -701,6 +989,9 @@ pub struct MessageRow {
     pub tone: NoticeTone,
     /// What the user may do with the message now.
     pub actions: RowActions,
+    /// The pages its menu offers: the sender's and the mentioned people's (`actions` says which
+    /// kinds; empty for every row that offers none).
+    pub pages: Vec<PageEntry>,
     /// The message disappears: what the timer mark says ("Disappears 1 week after it is
     /// read"); empty for messages that stay.
     pub expiry: String,
@@ -751,6 +1042,7 @@ impl MessageRow {
             text,
             icon: String::new(),
             actions: RowActions::default(),
+            pages: Vec::new(),
             tone: NoticeTone::Plain,
             expiry: String::new(),
             wait: String::new(),
@@ -841,7 +1133,8 @@ pub fn blocks_downloading(blocks: &[Block]) -> usize {
         .iter()
         .map(|block| match block {
             Block::Image(image) => usize::from(image.state == MediaState::Downloading),
-            Block::Album(tiles) => tiles
+            Block::Album(album) => album
+                .items
                 .iter()
                 .filter(|t| t.state == MediaState::Downloading)
                 .count(),
@@ -855,6 +1148,44 @@ pub fn blocks_downloading(blocks: &[Block]) -> usize {
 /// waits for none: their state, and with it their URLs, changes when the download ends).
 pub fn downloading(rows: &[MessageRow]) -> usize {
     rows.iter().map(|r| blocks_downloading(&r.blocks)).sum()
+}
+
+/// How many pictures, files and "+N" rings of `blocks` have an upload ring with a figure in it
+/// (the backend has reported that file: a ring that waits for its turn has none).
+pub fn blocks_uploads_reported(blocks: &[Block]) -> usize {
+    let figure = |u: &Option<UploadView>| u.as_ref().is_some_and(|u| !u.label.is_empty());
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Image(image) => usize::from(figure(&image.upload)),
+            Block::Album(album) => {
+                album.items.iter().filter(|t| figure(&t.upload)).count()
+                    + usize::from(figure(&album.more))
+            }
+            Block::File(file) => usize::from(figure(&file.upload)),
+            Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => 0,
+        })
+        .sum()
+}
+
+/// How many upload rings of the `rows` shown have a figure (a `--screenshot` of the upload pages
+/// waits for one: the fake says each file's share once a second).
+pub fn uploads_reported(rows: &[MessageRow]) -> usize {
+    rows.iter()
+        .map(|r| blocks_uploads_reported(&r.blocks))
+        .sum()
+}
+
+/// Whether the newest own message of the `rows` shown (newest first) has left the outbox: the
+/// server took it (`Sent`) or it is further (`Delivered`, `Read`; a row with no receipt, such as
+/// a deleted one, is no message on its way). False while it is queued or being sent (the clock
+/// icon, the line "Sending..." under it), when it failed, and when no own message is shown. A
+/// `--screenshot` of a page that SENDS from the window waits for it (`MainWindow.qml`, case
+/// `media`), so a picture is never taken with the clock icon.
+pub fn newest_own_left_the_outbox(rows: &[MessageRow]) -> bool {
+    rows.iter()
+        .find(|r| r.own && r.kind == RowKind::Message)
+        .is_some_and(|r| !matches!(r.receipt, Receipt::Pending | Receipt::Failed))
 }
 
 /// Aggregates reactions into chips, most frequent first (ties: first reacted first).
@@ -935,7 +1266,7 @@ fn type_label(att: &Attachment) -> String {
     }
 }
 
-fn attachment_block(att: &Attachment, sticker: bool) -> Block {
+pub(crate) fn attachment_block(att: &Attachment, sticker: bool) -> Block {
     let (state, progress) = MediaState::from_attachment(att.state);
     let media_mime = media::is_media_mime(&att.mime);
     match att.kind {
@@ -994,6 +1325,8 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
                 label,
                 sticker,
                 ask: false,
+                save: false,
+                upload: None,
             })
         }
         AttachmentKind::Voice => Block::File(FileBlock {
@@ -1007,6 +1340,8 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
             progress,
             voice: true,
             ask: false,
+            save: false,
+            upload: None,
         }),
         AttachmentKind::Audio | AttachmentKind::File => {
             let name = att
@@ -1032,7 +1367,27 @@ fn attachment_block(att: &Attachment, sticker: bool) -> Block {
                 progress,
                 voice: false,
                 ask: false,
+                save: false,
+                upload: None,
             })
+        }
+    }
+}
+
+/// Marks the blocks of the attachments "Save As…" accepts: the ones the core listed
+/// ([`Item::save`]), copied as they are.
+fn mark_savable(blocks: &mut [Block], save: &[AttachmentId]) {
+    let saves = |id: Option<AttachmentId>| id.is_some_and(|id| save.contains(&id));
+    for block in blocks {
+        match block {
+            Block::Image(i) => i.save = saves(i.attachment),
+            Block::Album(album) => {
+                for i in &mut album.items {
+                    i.save = saves(i.attachment);
+                }
+            }
+            Block::File(f) => f.save = saves(f.attachment),
+            Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => {}
         }
     }
 }
@@ -1046,8 +1401,8 @@ fn mark_askable(blocks: &mut [Block], ask: &[AttachmentId]) {
     for block in blocks {
         match block {
             Block::Image(i) => i.ask = asks(i.attachment),
-            Block::Album(items) => {
-                for i in items {
+            Block::Album(album) => {
+                for i in &mut album.items {
                     i.ask = asks(i.attachment);
                 }
             }
@@ -1073,8 +1428,8 @@ pub fn apply_progress(rows: &mut [MessageRow], progress: &HashMap<AttachmentId, 
     for block in rows.iter_mut().flat_map(|r| r.blocks.iter_mut()) {
         match block {
             Block::Image(i) => apply(i.attachment, i.state, &mut i.progress),
-            Block::Album(items) => {
-                for i in items {
+            Block::Album(album) => {
+                for i in &mut album.items {
                     apply(i.attachment, i.state, &mut i.progress);
                 }
             }
@@ -1082,6 +1437,134 @@ pub fn apply_progress(rows: &mut [MessageRow], progress: &HashMap<AttachmentId, 
             Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => {}
         }
     }
+}
+
+/// The whole percent of `done` in `total` (0 for an empty total); 100 only when all is up.
+pub(crate) fn upload_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    if done >= total {
+        return 100;
+    }
+    u64::try_from(u128::from(done) * 100 / u128::from(total)).unwrap_or(99)
+}
+
+/// The ring over a file with `bytes` reported (`None`: nothing reported for it). `going`: the
+/// message has a file that is not up yet, so a file that is up keeps a FULL ring with the same
+/// X while the message can still be stopped (brief §3.7 row 3: 100 % / 45 % / 0 %); when all
+/// are up the rings go (and none stays at 100 % through the group's key setup).
+fn ring(
+    bytes: Option<(u64, u64)>,
+    empty_ring: bool,
+    cancel: bool,
+    going: bool,
+) -> Option<UploadView> {
+    match bytes {
+        // Its upload is over, and no file of the message goes on: no ring.
+        Some((done, total)) if done >= total && !going => None,
+        Some((done, total)) => {
+            let (share, percent) = if done >= total {
+                (1.0, 100)
+            } else {
+                (
+                    (done as f64 / total as f64).clamp(0.0, 1.0) as f32,
+                    upload_percent(done, total),
+                )
+            };
+            Some(UploadView {
+                share,
+                label: trfc(
+                    "@info:status percent of a file's upload",
+                    "%1%",
+                    &[&percent.to_string()],
+                ),
+                cancel,
+            })
+        }
+        // The file waits for its turn (or is being prepared): an empty ring with the X the
+        // core offers.
+        None if empty_ring => Some(UploadView {
+            share: 0.0,
+            label: String::new(),
+            cancel,
+        }),
+        None => None,
+    }
+}
+
+/// Puts the rings on the files of an own message on its way (`row`), from the bytes the
+/// backend reported for them (`bytes`, by attachment). `empty_ring`: a file nothing was
+/// reported for waits for its turn or is being prepared and shows an empty ring; else it has
+/// none. The X is the row's `cancel_sending`. A file that is up keeps a full ring while another
+/// file of the message is not up (or waits); when every file is up there are no rings.
+/// Idempotent: every earlier ring is taken away first, so a row that carries rings can be given
+/// its next ones. Stickers have none. The "+N" ring of an album with more than
+/// [`ALBUM_TILES`] pictures counts what the tile covers: the fifth tile's own picture and the
+/// ones behind it.
+pub(crate) fn apply_uploads(
+    row: &mut MessageRow,
+    bytes: &dyn Fn(AttachmentId) -> Option<(u64, u64)>,
+    empty_ring: bool,
+) {
+    let cancel = row.actions.cancel_sending;
+    let of = |id: Option<AttachmentId>| id.and_then(bytes);
+    // A file that is not up: bytes still to come, or nothing reported while it waits.
+    let pending = |id: Option<AttachmentId>| match of(id) {
+        Some((done, total)) => done < total,
+        None => empty_ring,
+    };
+    let going = row.blocks.iter().any(|b| match b {
+        Block::Image(i) => !i.sticker && pending(i.attachment),
+        Block::Album(a) => a.items.iter().any(|i| pending(i.attachment)),
+        Block::File(f) => pending(f.attachment),
+        Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => false,
+    });
+    for block in &mut row.blocks {
+        match block {
+            Block::Image(i) => {
+                i.upload = if i.sticker {
+                    None
+                } else {
+                    ring(of(i.attachment), empty_ring, cancel, going)
+                };
+            }
+            Block::Album(album) => {
+                for i in &mut album.items {
+                    i.upload = ring(of(i.attachment), empty_ring, cancel, going);
+                }
+                // The "+N" tile has the ring of what it covers: its own picture (the overlay
+                // hides it) and the ones behind it, their bytes together.
+                album.more = if album.items.len() > ALBUM_TILES {
+                    let covered = album.items.iter().skip(ALBUM_TILES - 1);
+                    let reported: Vec<(u64, u64)> =
+                        covered.clone().filter_map(|i| of(i.attachment)).collect();
+                    if reported.is_empty() {
+                        let waits = covered.clone().any(|i| i.upload.is_some());
+                        ring(None, waits, cancel, going)
+                    } else {
+                        let done: u64 = reported.iter().map(|b| b.0).sum();
+                        let total: u64 = reported.iter().map(|b| b.1).sum();
+                        ring(Some((done, total)), empty_ring, cancel, going)
+                    }
+                } else {
+                    None
+                };
+            }
+            Block::File(f) => f.upload = ring(of(f.attachment), empty_ring, cancel, going),
+            Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => {}
+        }
+    }
+}
+
+/// Whether a row carries a ring (so that the next [`apply_uploads`] has something to take away).
+pub(crate) fn has_ring(row: &MessageRow) -> bool {
+    row.blocks.iter().any(|b| match b {
+        Block::Image(i) => i.upload.is_some(),
+        Block::Album(a) => a.more.is_some() || a.items.iter().any(|i| i.upload.is_some()),
+        Block::File(f) => f.upload.is_some(),
+        Block::Text(_) | Block::Quote(_) | Block::Placeholder(_) => false,
+    })
 }
 
 fn quote_block(
@@ -1173,7 +1656,7 @@ fn content_blocks(
             let flush = |run: &mut Vec<ImageBlock>, blocks: &mut Vec<Block>| match run.len() {
                 0 => {}
                 1 => blocks.extend(run.pop().map(Block::Image)),
-                _ => blocks.push(Block::Album(std::mem::take(run))),
+                _ => blocks.push(Block::Album(AlbumBlock::new(std::mem::take(run)))),
             };
             for a in attachments.iter().filter(|a| !a.long_text) {
                 match attachment_block(a, false) {
@@ -1229,6 +1712,20 @@ pub(crate) struct Item<'a> {
     /// The attachments whose Download asks the user's phone to upload them again (the core's
     /// per-attachment answer, copied to the blocks as `ask`).
     pub ask: &'a [AttachmentId],
+    /// The attachments "Save As…" accepts (the core's per-attachment answer, copied to the
+    /// blocks as `save`).
+    pub save: &'a [AttachmentId],
+    /// The people the core listed for the menu's pages (`MessageActions::show_people`): who, and
+    /// whether he is the user himself.
+    pub people: Vec<(UserId, bool)>,
+    /// The core named this row part of a queue that waits for this person's safety number
+    /// (`MessageActions::safety_number`: the paused head and every row behind it that waits):
+    /// its menu offers their safety-number page and its line names them.
+    pub safety: Option<&'a UserId>,
+    /// Whose safety number the line under it names while its wait is
+    /// [`WaitReason::SafetyNumber`] (the paused head's person; `None`: not known, the line
+    /// names nobody).
+    pub waits_for: Option<&'a UserId>,
     /// Its disappearing timer.
     pub expiry: Option<&'a kourier_model::Expiry>,
     /// What the line under it says while it is on its way (own messages; `None`: nothing
@@ -1309,7 +1806,7 @@ pub(crate) fn build_rows<'a>(
         let deleted = msg.deleted.is_some();
         if let Some(d) = msg.deleted {
             blocks.push(Block::Placeholder(Summary {
-                text: preview::deleted_text(d, msg.own),
+                text: preview::deleted_text(d, msg.own, msg.author),
                 icon: "trash-empty".into(),
             }));
         } else {
@@ -1318,13 +1815,27 @@ pub(crate) fn build_rows<'a>(
             if !msg.ask.is_empty() {
                 mark_askable(&mut blocks, msg.ask);
             }
+            if !msg.save.is_empty() {
+                mark_savable(&mut blocks, msg.save);
+            }
         }
         let receipt = if msg.own && !deleted {
             Receipt::from_state(msg.out_state)
         } else {
             Receipt::None
         };
-        let wait = row_wait_line(receipt, msg.wait, time.now_ms);
+        let who = msg
+            .waits_for
+            .or(msg.safety)
+            .map(|u| single_line(&names.display_name(u)));
+        let wait = row_wait_line(
+            receipt,
+            msg.out_state,
+            msg.wait,
+            who.as_deref(),
+            msg.safety.is_some(),
+            time,
+        );
         rows.push(MessageRow {
             key: RowKey::Message(msg.id),
             kind: RowKind::Message,
@@ -1345,8 +1856,12 @@ pub(crate) fn build_rows<'a>(
             receipt,
             text: String::new(),
             icon: String::new(),
+            pages: page_entries(&msg.actions, msg.author, &msg.people, msg.safety, names),
             actions: RowActions {
-                retry: receipt == Receipt::Failed,
+                // "Send Again" is the core's answer (`MessageActions::retry`: the row is kept
+                // for it and the network did not refuse it as a reach-out) on a message that
+                // shows as failed.
+                retry: receipt == Receipt::Failed && msg.actions.retry,
                 ..msg.actions
             },
             tone: NoticeTone::Plain,
@@ -1420,8 +1935,14 @@ fn model_actions(msg: &Message) -> RowActions {
         delete_attachment: content
             && matches!(&msg.body, Body::Media { attachments, .. } if attachments.iter().any(|a| !a.long_text)),
         take_back: false,
-        retry: false,
+        cancel_sending: false,
+        // No core here to refuse: a message that shows as failed may be sent again.
+        retry: true,
         ask_attachments: false,
+        save_attachments: false,
+        // (No core here: the pure fixture offers no page.)
+        show_sender: false,
+        show_people: false,
     }
 }
 
@@ -1527,6 +2048,10 @@ pub fn build_timeline(
         reactions: reaction_chips(input.reactions.get(&msg.id).unwrap_or(&empty), names),
         actions: model_actions(msg),
         ask: &[],
+        save: &[],
+        people: Vec::new(),
+        safety: None,
+        waits_for: None,
         expiry: msg.expiry.as_ref(),
         wait: None,
     });
@@ -1589,6 +2114,11 @@ pub fn cannot_send_text(reason: &CannotSend) -> String {
             "Your request to join this group is waiting for an admin.",
         )
         .into_owned(),
+        CannotSend::NotYetBuilt => trc(
+            "@info:status why the composer is off",
+            "Sending is not available here yet; it comes in a later version of Kourier.",
+        )
+        .into_owned(),
         CannotSend::Other(s) => single_line(s),
     }
 }
@@ -1612,12 +2142,12 @@ mod tests {
         let blocks = vec![
             Block::Image(tile(MediaState::Downloading)),
             Block::Image(tile(MediaState::Local)),
-            Block::Album(vec![
+            Block::Album(AlbumBlock::new(vec![
                 tile(MediaState::Downloading),
                 tile(MediaState::Local),
                 tile(MediaState::Downloading),
                 tile(MediaState::Remote),
-            ]),
+            ])),
             Block::File(FileBlock {
                 state: MediaState::Downloading,
                 ..FileBlock::default()
@@ -1626,6 +2156,66 @@ mod tests {
         ];
         assert_eq!(blocks_downloading(&blocks), 4);
         assert_eq!(blocks_downloading(&[]), 0);
+    }
+
+    /// An album of `n` pictures with the given sizes, as the viewmodel builds it from a message.
+    fn album_of(dims: &[(u32, u32)]) -> AlbumBlock {
+        let attachments = dims
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| Attachment {
+                id: Some(AttachmentId(i as i64 + 1)),
+                kind: AttachmentKind::Image,
+                mime: "image/jpeg".into(),
+                state: AttachmentState::Local,
+                dims: Some(d),
+                ..Attachment::default()
+            })
+            .collect();
+        let body = Body::Media {
+            attachments,
+            caption: None,
+        };
+        let blocks = content_blocks(MessageId(1), &body, &NameMap::new(), &ReadMore::default());
+        match blocks.as_slice() {
+            [Block::Album(album)] => album.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_album_lays_out_the_tiles_it_shows_and_none_of_the_rest() {
+        // Seven pictures: the rows cover the first five, all seven are in the viewer.
+        let album = album_of(&[(600, 450); 7]);
+        assert_eq!(album.items.len(), 7);
+        let counts: Vec<usize> = album.rows.iter().map(|r| r.count).collect();
+        assert_eq!(counts.iter().sum::<usize>(), ALBUM_TILES);
+        assert_eq!(counts, [2, 3]);
+        assert_eq!(album.rows[1].first, 2);
+        // Two pictures are one row; the sizes are the pictures' own.
+        let two = album_of(&[(600, 450), (450, 600)]);
+        assert_eq!(two.rows.len(), 1);
+        assert!((two.rows[0].aspect - (600.0 / 450.0 + 450.0 / 600.0)).abs() < 1e-9);
+        // The sixth picture's shape does not change the rows.
+        let mut dims = vec![(600, 450); 6];
+        let before = album_of(&dims).rows;
+        dims[5] = (6000, 300);
+        assert_eq!(album_of(&dims).rows, before);
+    }
+
+    #[test]
+    fn a_change_of_one_pictures_size_rebuilds_the_rows() {
+        // A sender claimed 4:3 for all three; the decoded file of the second is a screenshot.
+        let claimed = album_of(&[(1600, 1200), (1600, 1200), (1600, 1200)]);
+        assert_eq!(
+            claimed.rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let decoded = album_of(&[(1600, 1200), (1080, 2340), (1600, 1200)]);
+        assert_ne!(decoded.rows, claimed.rows);
+        // Unknown sizes are 4:3 until they are known.
+        let unknown = album_of(&[(0, 0), (0, 0), (0, 0)]);
+        assert_eq!(unknown.rows, claimed.rows);
     }
 
     fn at(day: u32, h: u32, m: u32) -> i64 {
@@ -1676,6 +2266,78 @@ mod tests {
 
     fn kinds(rows: &[MessageRow]) -> Vec<&'static str> {
         rows.iter().map(|r| r.kind.as_str()).collect()
+    }
+
+    /// The `media` page's picture waits for the newest own message to leave the outbox
+    /// (`MainWindow.qml`): only the NEWEST own row counts (an incoming message above it, or an
+    /// older own one that is still waiting, change nothing), and "on its way" means the clock
+    /// icon: queued or sending, and a failure is not "left" either.
+    #[test]
+    fn the_newest_own_message_has_left_the_outbox_once_the_server_took_it() {
+        let a = UserId::parse("aci:a").expect("id");
+        let own = |id: u32, state: Option<OutgoingState>| {
+            let mut m = msg(i64::from(id), None, at(6, 10, id), "mine");
+            m.out_state = state;
+            m
+        };
+        let left = |messages: &[Message]| newest_own_left_the_outbox(&build(messages, None, false));
+        // Newest first, as the timeline's input is.
+        let steps = [
+            (Some(OutgoingState::Queued), false),
+            (Some(OutgoingState::Sending { progress: None }), false),
+            (
+                Some(OutgoingState::Sending {
+                    progress: Some(0.5),
+                }),
+                false,
+            ),
+            (Some(OutgoingState::Sent { server_at: None }), true),
+            (Some(OutgoingState::Delivered), true),
+            (Some(OutgoingState::Read), true),
+            (Some(OutgoingState::Viewed), true),
+            (
+                Some(OutgoingState::Failed {
+                    reason: FailReason::Network,
+                    retryable: true,
+                }),
+                false,
+            ),
+            (
+                Some(OutgoingState::PartiallyFailed { failed: vec![] }),
+                false,
+            ),
+            (None, true),
+        ];
+        for (state, want) in steps {
+            let text = format!("{state:?}");
+            assert_eq!(left(&[own(2, state.clone())]), want, "{text}");
+            // An older own message that was read does not say anything for the newest one.
+            assert_eq!(
+                left(&[own(2, state.clone()), own(1, Some(OutgoingState::Read))]),
+                want,
+                "{text} above a read one"
+            );
+        }
+        // The NEWEST own message decides, not an older one that is still waiting, and a newer
+        // incoming message is no own message.
+        let incoming = msg(3, Some(&a), at(6, 10, 3), "theirs");
+        assert!(left(&[
+            incoming.clone(),
+            own(2, Some(OutgoingState::Delivered)),
+            own(1, Some(OutgoingState::Queued)),
+        ]));
+        assert!(!left(&[
+            incoming.clone(),
+            own(2, Some(OutgoingState::Queued)),
+            own(1, Some(OutgoingState::Delivered)),
+        ]));
+        // No own message at all: nothing has left.
+        assert!(!left(&[incoming]));
+        assert!(!left(&[]));
+        // A deleted own message has no receipt: it is not on its way.
+        let mut gone = own(2, Some(OutgoingState::Queued));
+        gone.deleted = Some(kourier_model::Deletion::ForEveryone { by: None });
+        assert!(left(&[gone]));
     }
 
     #[test]
@@ -1767,8 +2429,11 @@ mod tests {
                 "Waiting for this device to be linked again · 0:12",
             ),
             (
-                WaitReason::Restricted,
-                "Waiting: the network restricted this account · 0:12",
+                WaitReason::Restricted {
+                    network: "WhatsApp",
+                    until_ms: None,
+                },
+                "Waiting: WhatsApp restricted this account",
             ),
             (
                 WaitReason::UpdateApp,
@@ -1821,6 +2486,341 @@ mod tests {
                 "Sending to 20 members · 0:05"
             );
         });
+    }
+
+    /// The line under a message that uploads (upload progress): "Preparing files" until a byte
+    /// is up, then his form, whole numbers with the bytes done in the unit of the total
+    /// ("Uploading 45% · 12 of 30 MB"), the timer after it; Ukrainian reorders nothing but the
+    /// verb; a hold (the connection) still goes first (that is the source's, `send_wait`).
+    #[test]
+    fn the_upload_line_says_preparing_then_the_bytes_in_his_form() {
+        struct Uk;
+        impl crate::i18n::Translator for Uk {
+            fn translate(&self, _context: &str, msgid: &str) -> String {
+                match msgid {
+                    "Preparing files" => "Підготовка файлів".into(),
+                    "Uploading %1% · %2 of %3" => "Вивантаження %1% · %2 з %3".into(),
+                    other => other.to_owned(),
+                }
+            }
+            fn translate_plural(&self, _c: &str, one: &str, many: &str, n: u64) -> String {
+                (if n == 1 { one } else { many }).to_owned()
+            }
+        }
+        const T0: i64 = 1_760_000_000_000;
+        let line = |done: u64, total: u64, at: i64| {
+            let wait = SendWait {
+                reason: WaitReason::Uploading { done, total },
+                since: T0,
+                retry_at: None,
+            };
+            wait_line(&wait, T0 + at).text()
+        };
+        // Nothing is up yet.
+        assert_eq!(line(0, 30_000_000, 5_000), "Preparing files · 0:05");
+        assert_eq!(
+            line(13_500_000, 30_000_000, 12_000),
+            "Uploading 45% · 13 of 30 MB · 0:12"
+        );
+        assert_eq!(
+            line(29_999_999, 30_000_000, 12_000),
+            "Uploading 99% · 29 of 30 MB · 0:12"
+        );
+        // Small files read in bytes, and below 10 units with one decimal (U5), the total the
+        // text of the size label; from 10 units the total is the label's figure rounded.
+        assert_eq!(line(300, 900, 3_000), "Uploading 33% · 300 of 900 B · 0:03");
+        assert_eq!(
+            line(1_000_000, 2_400_000, 3_000),
+            "Uploading 41% · 1.0 of 2.4 MB · 0:03"
+        );
+        assert_eq!(
+            line(12_582_912, 31_457_280, 3_000),
+            "Uploading 40% · 12 of 32 MB · 0:03",
+            "31.5 MB is the label: the total is 32, never 31"
+        );
+        // Nothing before the line is shown at all.
+        assert_eq!(line(13_500_000, 30_000_000, 2_999), "");
+        crate::i18n::with_translator(Uk, || {
+            assert_eq!(line(0, 30_000_000, 5_000), "Підготовка файлів · 0:05");
+            assert_eq!(
+                line(13_500_000, 30_000_000, 12_000),
+                "Вивантаження 45% · 13 з 30 MB · 0:12"
+            );
+        });
+        assert!(!WaitReason::Uploading { done: 1, total: 2 }.is_hold());
+    }
+
+    /// The ring of a file (upload progress): the bytes reported, whole percent, the X from the
+    /// row; a file that is up has none; a file nothing is reported for has an empty ring only
+    /// when the caller says it waits; the pictures behind "+N" share one ring of their bytes.
+    #[test]
+    fn the_screenshot_hold_counts_only_rings_with_a_figure() {
+        let ring = |label: &str| {
+            Some(UploadView {
+                share: 0.4,
+                label: label.into(),
+                cancel: true,
+            })
+        };
+        let image = |label: &str| ImageBlock {
+            upload: ring(label),
+            ..ImageBlock::default()
+        };
+        let album = AlbumBlock {
+            items: vec![image("45%"), image("")],
+            more: ring(""),
+            ..AlbumBlock::default()
+        };
+        let file = FileBlock {
+            upload: ring("12%"),
+            ..FileBlock::default()
+        };
+        // A ring that waits for its turn (no figure) does not count; one that says a share does.
+        assert_eq!(
+            blocks_uploads_reported(&[
+                Block::Image(image("40%")),
+                Block::Image(image("")),
+                Block::Album(album),
+                Block::File(file),
+            ]),
+            3
+        );
+        let mut more = AlbumBlock::default();
+        assert_eq!(blocks_uploads_reported(&[Block::Album(more.clone())]), 0);
+        more.more = ring("30%");
+        assert_eq!(blocks_uploads_reported(&[Block::Album(more)]), 1);
+    }
+
+    #[test]
+    fn the_rings_follow_the_reported_bytes_and_the_rows_cancel_flag() {
+        let picture = |n: i64| ImageBlock {
+            attachment: Some(AttachmentId(n)),
+            kind: AttachmentKind::Image,
+            state: MediaState::Local,
+            ..ImageBlock::default()
+        };
+        let file = FileBlock {
+            attachment: Some(AttachmentId(99)),
+            state: MediaState::Local,
+            ..FileBlock::default()
+        };
+        let mut row = MessageRow::marker(
+            RowKey::Message(MessageId(1)),
+            RowKind::Message,
+            String::new(),
+        );
+        row.actions.cancel_sending = true;
+        row.blocks = vec![
+            Block::Album(AlbumBlock::new((1..=8).map(picture).collect())),
+            Block::File(file),
+            Block::Image(ImageBlock {
+                sticker: true,
+                ..picture(50)
+            }),
+        ];
+        // 8 pictures: tiles 1..=5, the pictures 6, 7 and 8 stand behind "+3".
+        let bytes = |a: AttachmentId| match a.0 {
+            1 => Some((100, 100)),
+            2 => Some((45, 100)),
+            3 => Some((0, 100)),
+            5 => Some((60, 100)),
+            6 => Some((10, 100)),
+            7 => Some((50, 100)),
+            8 => Some((30, 100)),
+            99 => Some((3_000, 4_000)),
+            50 => Some((1, 2)),
+            _ => None,
+        };
+        apply_uploads(&mut row, &bytes, false);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        let rings: Vec<_> = album.items.iter().map(|i| i.upload.clone()).collect();
+        assert_eq!(
+            rings[0],
+            Some(UploadView {
+                share: 1.0,
+                label: "100%".into(),
+                cancel: true
+            }),
+            "a picture that is up keeps a full ring with its X while the others go on"
+        );
+        assert_eq!(
+            rings[1],
+            Some(UploadView {
+                share: 0.45,
+                label: "45%".into(),
+                cancel: true
+            })
+        );
+        assert_eq!(rings[2].as_ref().map(|r| r.label.as_str()), Some("0%"));
+        assert_eq!(rings[3], None, "nothing reported, nothing waits: no ring");
+        let more = album.more.as_ref().expect("the ring of +3");
+        assert_eq!((more.label.as_str(), more.cancel), ("37%", true));
+        assert!(
+            (more.share - 0.375).abs() < 1e-6,
+            "the fifth tile's own 60 and the 90 behind it, of 400 bytes together"
+        );
+        assert_eq!(
+            rings[4].as_ref().map(|r| r.label.as_str()),
+            Some("60%"),
+            "the covered tile keeps its own figure (the overlay hides its ring)"
+        );
+        let Block::File(f) = &row.blocks[1] else {
+            panic!("file");
+        };
+        assert_eq!(f.upload.as_ref().map(|r| r.label.as_str()), Some("75%"));
+        let Block::Image(sticker) = &row.blocks[2] else {
+            panic!("sticker");
+        };
+        assert_eq!(sticker.upload, None, "a sticker has no ring");
+        assert!(has_ring(&row));
+
+        // The next report takes the earlier rings away first, and the X follows the row.
+        row.actions.cancel_sending = false;
+        apply_uploads(&mut row, &|_| None, false);
+        assert!(!has_ring(&row), "nothing reported, nothing waits");
+        // A message that waits for its turn: every file an empty ring with the core's X.
+        row.actions.cancel_sending = true;
+        apply_uploads(&mut row, &|_| None, true);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        let empty = UploadView {
+            share: 0.0,
+            label: String::new(),
+            cancel: true,
+        };
+        assert!(
+            album
+                .items
+                .iter()
+                .all(|i| i.upload.as_ref() == Some(&empty))
+        );
+        assert_eq!(
+            album.more.as_ref(),
+            Some(&empty),
+            "one empty ring behind +3"
+        );
+        let Block::File(f) = &row.blocks[1] else {
+            panic!("file");
+        };
+        assert_eq!(f.upload.as_ref(), Some(&empty));
+    }
+
+    /// U9: a file that is up keeps a FULL ring with its X while another file of the message goes
+    /// on (or waits for its turn); once every file is up there are no rings. The "+N" ring
+    /// counts the fifth tile's own picture (U6) and exists only with pictures behind the tiles.
+    #[test]
+    fn a_file_that_is_up_keeps_its_full_ring_while_the_others_go_on() {
+        let picture = |n: i64| ImageBlock {
+            attachment: Some(AttachmentId(n)),
+            kind: AttachmentKind::Image,
+            state: MediaState::Local,
+            ..ImageBlock::default()
+        };
+        let mut row = MessageRow::marker(
+            RowKey::Message(MessageId(1)),
+            RowKind::Message,
+            String::new(),
+        );
+        row.actions.cancel_sending = true;
+        row.blocks = vec![
+            Block::Album(AlbumBlock::new((1..=5).map(picture).collect())),
+            Block::File(FileBlock {
+                attachment: Some(AttachmentId(99)),
+                state: MediaState::Local,
+                ..FileBlock::default()
+            }),
+        ];
+        let full = Some(UploadView {
+            share: 1.0,
+            label: "100%".into(),
+            cancel: true,
+        });
+        // The file still goes: every picture that is up keeps its full ring.
+        let going = |a: AttachmentId| match a.0 {
+            99 => Some((10, 100)),
+            _ => Some((50, 50)),
+        };
+        apply_uploads(&mut row, &going, false);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        assert!(album.items.iter().all(|i| i.upload == full), "full rings");
+        assert_eq!(album.more, None, "five pictures are five tiles: no \"+N\"");
+        // A file nothing was reported for yet waits: the others that are up keep their rings.
+        let waiting = |a: AttachmentId| (a.0 != 99).then_some((50, 50));
+        apply_uploads(&mut row, &waiting, true);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        assert!(
+            album.items.iter().all(|i| i.upload == full),
+            "a waiting file goes on"
+        );
+        // Everything is up: no ring stays at 100 %.
+        let all_up = |a: AttachmentId| {
+            let size = if a.0 == 99 { 100 } else { 50 };
+            Some((size, size))
+        };
+        apply_uploads(&mut row, &all_up, false);
+        assert!(!has_ring(&row), "every file is up: no rings");
+        // The X follows the core's word for a full ring too.
+        row.actions.cancel_sending = false;
+        apply_uploads(&mut row, &going, false);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        assert_eq!(
+            album.items[0].upload.as_ref().map(|r| (r.share, r.cancel)),
+            Some((1.0, false)),
+            "a full ring without an X when the message cannot be stopped"
+        );
+    }
+
+    /// U6: six pictures, five tiles, "+1": the ring of the "+N" tile is the fifth picture's
+    /// bytes and the sixth's together, and it waits (empty) when none of them is reported.
+    #[test]
+    fn the_plus_ring_counts_the_fifth_tiles_own_picture() {
+        let picture = |n: i64| ImageBlock {
+            attachment: Some(AttachmentId(n)),
+            kind: AttachmentKind::Image,
+            state: MediaState::Local,
+            ..ImageBlock::default()
+        };
+        let mut row = MessageRow::marker(
+            RowKey::Message(MessageId(1)),
+            RowKind::Message,
+            String::new(),
+        );
+        row.actions.cancel_sending = true;
+        row.blocks = vec![Block::Album(AlbumBlock::new(
+            (1..=6).map(picture).collect(),
+        ))];
+        // Only the fifth is reported (at 80 %): the ring behind +1 shows it, not the sixth's 0.
+        let bytes = |a: AttachmentId| match a.0 {
+            5 => Some((80, 100)),
+            _ => None,
+        };
+        apply_uploads(&mut row, &bytes, false);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        let more = album.more.as_ref().expect("the ring of +1");
+        assert_eq!(more.label, "80%");
+        assert!((more.share - 0.8).abs() < 1e-6);
+        // Both reported: their bytes together (80 + 20 of 200).
+        let both = |a: AttachmentId| match a.0 {
+            5 => Some((80, 100)),
+            6 => Some((20, 100)),
+            _ => None,
+        };
+        apply_uploads(&mut row, &both, false);
+        let Block::Album(album) = &row.blocks[0] else {
+            panic!("album");
+        };
+        assert_eq!(album.more.as_ref().map(|r| r.label.as_str()), Some("50%"));
     }
 
     /// The two ways an attachment cannot be had are two states for QML, and so two texts:
@@ -1929,13 +2929,13 @@ mod tests {
                 _ => panic!("not an image"),
             }
         };
-        let mut album = vec![Block::Album(vec![tile(1), tile(2)])];
+        let mut album = vec![Block::Album(AlbumBlock::new(vec![tile(1), tile(2)]))];
         mark_askable(&mut album, &[AttachmentId(2)]);
-        let Block::Album(items) = &album[0] else {
+        let Block::Album(album) = &album[0] else {
             panic!("album")
         };
         assert_eq!(
-            items.iter().map(|i| i.ask).collect::<Vec<_>>(),
+            album.items.iter().map(|i| i.ask).collect::<Vec<_>>(),
             [false, true]
         );
     }
@@ -2294,6 +3294,38 @@ mod tests {
         );
     }
 
+    /// W6a2 (B7b, his U4): the tombstone of a message another member's admin deleted says so; the author's own delete does
+    /// not. Mutant: the author not handed to the words.
+    #[test]
+    fn a_tombstone_of_an_admins_delete_says_so() {
+        let a = UserId::parse("aci:a").expect("id");
+        let b = UserId::parse("aci:b").expect("id");
+        let mut by_admin = msg(2, Some(&a), at(6, 10, 2), "secret");
+        by_admin.deleted = Some(kourier_model::Deletion::ForEveryone {
+            by: Some(b.clone()),
+        });
+        let mut by_author = msg(1, Some(&a), at(6, 10, 1), "secret");
+        by_author.deleted = Some(kourier_model::Deletion::ForEveryone {
+            by: Some(a.clone()),
+        });
+        // Newest first, as the core gives them.
+        let rows = build(&[by_admin, by_author], None, true);
+        let texts: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match &row.blocks[..] {
+                [Block::Placeholder(s)] => Some(s.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "This message was deleted by an admin",
+                "This message was deleted"
+            ]
+        );
+    }
+
     #[test]
     fn a_failed_send_can_be_retried_and_timers_are_marked() {
         let mut failed = msg(1, None, at(6, 10, 0), "did not go");
@@ -2531,6 +3563,10 @@ mod tests {
                 CannotSend::JoinRequestPending,
                 "Your request to join this group is waiting for an admin.",
             ),
+            (
+                CannotSend::NotYetBuilt,
+                "Sending is not available here yet; it comes in a later version of Kourier.",
+            ),
             (CannotSend::Other("Some\nreason".to_owned()), "Some reason"),
         ];
         for (reason, text) in &reasons {
@@ -2541,5 +3577,135 @@ mod tests {
             .map(|(reason, _)| cannot_send_text(reason))
             .collect();
         assert_eq!(distinct.len(), reasons.len(), "two reasons share a text");
+    }
+
+    /// People pages P3: the words of the menu's pages. The core states which entries (the flags
+    /// and the list); this only names them: the sender's, one per mentioned person with the name
+    /// as ONE line of plain text and never cut here, and the user's own as "Show Your Page".
+    #[test]
+    fn the_menu_pages_have_their_words() {
+        let ari = UserId::parse("aci:ari").expect("id");
+        let me = UserId::parse("aci:me").expect("id");
+        let bold = UserId::parse("aci:bold").expect("id");
+        let mut names = NameMap::new();
+        names.insert(ari.clone(), "Ari");
+        names.insert(me.clone(), "Me Myself");
+        let long = format!("<b>x</b>\n{}", "N".repeat(400));
+        names.insert(bold.clone(), long.clone());
+        let on = RowActions {
+            show_sender: true,
+            show_people: true,
+            ..RowActions::default()
+        };
+        let people = [
+            (ari.clone(), false),
+            (me.clone(), true),
+            (bold.clone(), false),
+        ];
+        let pages = page_entries(&on, Some(&ari), &people, None, &names);
+        let labels: Vec<&str> = pages.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels[0], "Show Sender's Page");
+        assert_eq!(labels[1], "Show Ari's Page");
+        assert_eq!(labels[2], "Show Your Page", "the user's own, not his name");
+        // The name is one line of plain text, kept whole (the menu elides it).
+        assert_eq!(
+            labels[3],
+            format!("Show <b>x</b> {}'s Page", "N".repeat(400)),
+            "markup stays text, the newline is a space, nothing is cut"
+        );
+        assert_eq!(
+            pages.iter().map(|p| &p.user).collect::<Vec<_>>(),
+            vec![&ari, &ari, &me, &bold]
+        );
+        // What the core did not state is not offered, and a sender without an id has no entry.
+        let only_people = RowActions {
+            show_people: true,
+            ..RowActions::default()
+        };
+        assert_eq!(
+            page_entries(&only_people, Some(&ari), &people, None, &names).len(),
+            3
+        );
+        let only_sender = RowActions {
+            show_sender: true,
+            ..RowActions::default()
+        };
+        assert_eq!(
+            page_entries(&only_sender, Some(&ari), &people, None, &names).len(),
+            1
+        );
+        assert!(page_entries(&only_sender, None, &people, None, &names).is_empty());
+        assert!(page_entries(&RowActions::default(), Some(&ari), &people, None, &names).is_empty());
+        // A row that offers pages offers a menu.
+        assert!(only_sender.any() && only_people.any());
+    }
+
+    /// P5a BQ-3: the paused head of a queue that waits for a person's safety number offers
+    /// their safety-number page first, named; the line under the waiting messages names them
+    /// (without a known person it stays as before).
+    #[test]
+    fn a_paused_head_offers_the_safety_number_and_names_the_person() {
+        const T0: i64 = 1_760_000_000_000;
+        let ada = UserId::parse("aci:ada").expect("id");
+        let mut names = NameMap::new();
+        names.insert(ada.clone(), "Ada\nLovelace");
+        let on = RowActions {
+            show_sender: true,
+            ..RowActions::default()
+        };
+        let pages = page_entries(&on, Some(&ada), &[], Some(&ada), &names);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].label, "Show Ada Lovelace's Safety Number");
+        assert!(pages[0].safety && pages[0].user == ada);
+        assert!(!pages[1].safety, "the sender's page is a page");
+        let wait = SendWait {
+            reason: WaitReason::SafetyNumber,
+            since: T0,
+            retry_at: None,
+        };
+        assert_eq!(
+            wait_line_named(&wait, T0 + 5_000, None, Some("Ada")).reason,
+            "Waiting for you to confirm the new safety number with Ada"
+        );
+        assert_eq!(
+            wait_line_named(&wait, T0 + 5_000, None, None).reason,
+            "Waiting for you to confirm the new safety number"
+        );
+    }
+
+    /// U4: a FAILED row the core named (the paused head) says whose number, at once and with
+    /// no timer; a failed row that is not named, a named row without a known person and a
+    /// network refusal keep what they had.
+    #[test]
+    fn a_failed_row_in_a_safety_wait_names_the_person() {
+        use kourier_model::{FailReason, OutgoingState};
+        let time = TimeContext::new(at(6, 18, 0), &TZ);
+        let wait = SendWait {
+            reason: WaitReason::SafetyNumber,
+            since: 1_760_000_000_000,
+            retry_at: None,
+        };
+        let line = |receipt, state: Option<&OutgoingState>, who, paused| {
+            row_wait_line(receipt, state, Some(wait), who, paused, &time)
+        };
+        assert_eq!(
+            line(Receipt::Failed, None, Some("Ada"), true).reason,
+            "Not sent: the safety number with Ada changed"
+        );
+        assert_eq!(line(Receipt::Failed, None, Some("Ada"), true).timer, "");
+        assert_eq!(
+            line(Receipt::Failed, None, Some("Ada"), false),
+            WaitLine::default()
+        );
+        assert_eq!(line(Receipt::Failed, None, None, true), WaitLine::default());
+        let refused = OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            retryable: false,
+        };
+        // (A reach-out refusal keeps its own line whatever else is true of the row.)
+        assert_eq!(
+            line(Receipt::Failed, Some(&refused), Some("Ada"), true),
+            row_wait_line(Receipt::Failed, Some(&refused), None, None, false, &time)
+        );
     }
 }

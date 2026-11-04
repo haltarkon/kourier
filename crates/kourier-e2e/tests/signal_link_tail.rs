@@ -16,7 +16,7 @@
 //!   KOURIER_REQUIRE_MOCK_HARNESS=1 cargo test --release -p kourier-e2e --test signal_link_tail
 //!   -- --ignored --nocapture --test-threads 1
 
-mod support;
+use crate::support;
 
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};

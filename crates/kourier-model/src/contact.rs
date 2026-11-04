@@ -9,9 +9,12 @@ use crate::ids::{AccountId, BackendBlob, ContactId, Identifier, UserId};
 use crate::patch::Patch;
 
 /// How far a contact's identity key is trusted.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+///
+/// NOT ordered by trust (no `Ord`, P5 critic M3): `Changed` is "worse" than `Unverified` and a
+/// `max` would also move a trust without the key it was given to. A merge uses
+/// [`TrustLevel::merge`], which moves the trust together with its fingerprint. core.db stores
+/// the variant's NAME (TEXT, no CHECK), so a new variant needs no migration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrustLevel {
     /// Not verified.
     #[default]
@@ -20,6 +23,27 @@ pub enum TrustLevel {
     ServerVerified,
     /// Verified by the user (safety number / QR).
     Verified,
+    /// The user verified this person, then the key changed (Signal's identity state 2,
+    /// `UNVERIFIED`): the new key is not verified and a send waits for the user.
+    Changed,
+}
+
+impl TrustLevel {
+    /// The trust and fingerprint of a merged contact (`kept` = the canonical row, `alias` = the
+    /// row merged into it): the trust MOVES WITH ITS FINGERPRINT (P5 critic M3). The kept row's
+    /// fingerprint wins when it has one, and then its own trust stays (an alias's `Verified`
+    /// was given to another key); a kept row without a fingerprint takes the alias's pair. With
+    /// no fingerprint on either side the kept row's trust stays.
+    pub fn merge<F>(
+        kept: (TrustLevel, Option<F>),
+        alias: (TrustLevel, Option<F>),
+    ) -> (TrustLevel, Option<F>) {
+        match (kept, alias) {
+            (k @ (_, Some(_)), _) => k,
+            (_, a @ (_, Some(_))) => a,
+            ((t, None), _) => (t, None),
+        }
+    }
 }
 
 /// A contact row: one per account and [`UserId`]. `Debug` hides names and the fingerprint.
@@ -64,11 +88,23 @@ pub struct Contact {
     /// Backend metadata.
     #[serde(default)]
     pub meta: Option<BackendBlob>,
+    /// The "about" text of the person's profile (P1).
+    #[serde(default)]
+    pub about: Option<String>,
+    /// The emoji that goes with the about text.
+    #[serde(default)]
+    pub about_emoji: Option<String>,
+    /// Whether the person's phone number may be shown (P1): `None` = the backend never said,
+    /// which counts as NOT shown; the backend applies its network's privacy rule (Signal: the
+    /// person shares it, or a system contact, or no profile key; architecture §6.10).
+    #[serde(default)]
+    pub number_shown: Option<bool>,
 }
 
 crate::redacting_debug!(Contact {
-    id, account, user, avatar, trust, blocked, hidden, unregistered_at, identifiers, meta
-} redact { profile_name, system_name, nickname, identity_fingerprint });
+    id, account, user, avatar, trust, blocked, hidden, unregistered_at, identifiers, meta,
+    number_shown
+} redact { profile_name, system_name, nickname, identity_fingerprint, about, about_emoji });
 
 /// Field-wise contact change (`ContactUpsert`). `Patch` fields: unchanged | clear | set;
 /// `Option` fields: unchanged | set. `Debug` hides names and the fingerprint.
@@ -109,11 +145,20 @@ pub struct ContactPatch {
     /// Backend metadata.
     #[serde(default, skip_serializing_if = "Patch::is_unchanged")]
     pub meta: Patch<BackendBlob>,
+    /// The about text.
+    #[serde(default, skip_serializing_if = "Patch::is_unchanged")]
+    pub about: Patch<String>,
+    /// The emoji of the about text.
+    #[serde(default, skip_serializing_if = "Patch::is_unchanged")]
+    pub about_emoji: Patch<String>,
+    /// Whether the phone number may be shown (see [`Contact::number_shown`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_shown: Option<bool>,
 }
 
 crate::redacting_debug!(ContactPatch {
-    user, avatar, trust, blocked, hidden, unregistered_at, identifiers, meta
-} redact { profile_name, system_name, nickname, identity_fingerprint });
+    user, avatar, trust, blocked, hidden, unregistered_at, identifiers, meta, number_shown
+} redact { profile_name, system_name, nickname, identity_fingerprint, about, about_emoji });
 
 impl ContactPatch {
     /// A patch that changes nothing.
@@ -131,6 +176,9 @@ impl ContactPatch {
             unregistered_at: Patch::Unchanged,
             identifiers: None,
             meta: Patch::Unchanged,
+            about: Patch::Unchanged,
+            about_emoji: Patch::Unchanged,
+            number_shown: None,
         }
     }
 
@@ -151,6 +199,12 @@ impl ContactPatch {
         t |= self.unregistered_at.apply(&mut c.unregistered_at);
         t |= apply_set(self.identifiers, &mut c.identifiers);
         t |= self.meta.apply(&mut c.meta);
+        t |= self.about.apply(&mut c.about);
+        t |= self.about_emoji.apply(&mut c.about_emoji);
+        if let Some(n) = self.number_shown {
+            t |= c.number_shown != Some(n);
+            c.number_shown = Some(n);
+        }
         t
     }
 }
@@ -165,6 +219,55 @@ impl fmt::Debug for IdentityFingerprint {
         write!(f, "IdentityFingerprint([redacted; {} bytes])", self.0.len())
     }
 }
+
+/// The verification state of a person's identity key as the backend stores it (P5a; Signal's
+/// `identities.verified` 0 / 1 / 2, Desktop's `VerifiedStatus`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VerifyState {
+    /// Not verified ("Mark as Verified" is offered).
+    #[default]
+    Default,
+    /// The user compared the safety numbers (here or on another device).
+    Verified,
+    /// The user had verified this person, then the key changed: sends wait for a confirm.
+    Changed,
+}
+
+/// A safety number of one person (P5a), computed by the backend from OUR identity key and
+/// the person's STORED key. `Debug` hides the digits, the scannable bytes and the key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyNumber {
+    /// The 60 digits (Signal: 12 groups of 5, both halves sorted; no spaces).
+    pub digits: crate::log::Redacted<String>,
+    /// The bytes a QR code of OUR side carries (Signal: the `ScannableFingerprint` protobuf,
+    /// 74 bytes for version 2).
+    pub scannable: crate::log::Redacted<Vec<u8>>,
+    /// The person's identity key the number was computed from: a Mark or a Clear names it,
+    /// and the backend refuses when the stored key is no longer this one.
+    pub key: IdentityFingerprint,
+    /// The stored verification state of that key.
+    pub state: VerifyState,
+}
+
+/// Why a person has no safety number to show (P5a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SafetyUnavailable {
+    /// The person has no account id the number is made of (Signal: no ACI, a PNI-only or a
+    /// number-only person).
+    NoAccountId,
+    /// No identity key of the person is known yet (no message exchanged).
+    NoKey,
+    /// The person is the account itself.
+    OwnId,
+    /// The network has no safety numbers (or the backend cannot compute one).
+    Unsupported,
+    /// The account is not running (paused, logged out, still linking): the core's own answer
+    /// when the backend could not be asked.
+    NotRunning,
+}
+
+/// A backend's answer to `Command::SafetyNumber`.
+pub type SafetyAnswer = Result<SafetyNumber, SafetyUnavailable>;
 
 /// Role of a conversation member.
 #[derive(
@@ -295,6 +398,9 @@ mod tests {
             unregistered_at: Some(5),
             identifiers: vec![],
             meta: None,
+            about: None,
+            about_emoji: None,
+            number_shown: None,
         }
     }
 
@@ -324,6 +430,40 @@ mod tests {
     }
 
     #[test]
+    fn trust_merges_with_its_fingerprint() {
+        use TrustLevel::*;
+        assert_eq!(
+            TrustLevel::merge((Unverified, Some(1)), (Verified, Some(2))),
+            (Unverified, Some(1)),
+            "the alias's Verified was for another key"
+        );
+        assert_eq!(
+            TrustLevel::merge((Verified, None), (Changed, Some(2))),
+            (Changed, Some(2)),
+            "a kept row without a key takes the alias's pair"
+        );
+        assert_eq!(
+            TrustLevel::merge::<u8>((Changed, None), (Verified, None)),
+            (Changed, None)
+        );
+    }
+
+    #[test]
+    fn debug_hides_a_safety_number() {
+        let n = SafetyNumber {
+            digits: crate::log::Redacted::new("123451234512345".into()),
+            scannable: crate::log::Redacted::new(vec![0xab; 74]),
+            key: IdentityFingerprint(vec![0x05, 0xcd, 0xcd]),
+            state: VerifyState::Changed,
+        };
+        let s = format!("{n:?}");
+        for leak in ["12345", "171", "205"] {
+            assert!(!s.contains(leak), "a safety number's Debug shows {leak}");
+        }
+        assert!(s.contains("Changed"), "the state is log-safe");
+    }
+
+    #[test]
     fn debug_hides_names_and_fingerprint() {
         let fp = IdentityFingerprint(vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(
@@ -343,6 +483,69 @@ mod tests {
         for leak in ["Old", "Sys", "Nick", "222", "173", "de, ad"] {
             assert!(!s.contains(leak), "{leak} in {s}");
         }
+    }
+
+    /// P1: the about text and its emoji are as private as the names (architecture §9.1).
+    #[test]
+    fn debug_of_contact_and_patch_shows_no_about_text() {
+        let c = Contact {
+            about: Some("Gone fishing at Lake Zebra".into()),
+            about_emoji: Some("\u{1F41F}".into()),
+            number_shown: Some(true),
+            ..contact()
+        };
+        let p = ContactPatch {
+            about: Patch::Set("Gone fishing at Lake Zebra".into()),
+            about_emoji: Patch::Set("\u{1F41F}".into()),
+            number_shown: Some(true),
+            ..ContactPatch::new(c.user.clone())
+        };
+        let s = format!("{c:?} {p:?}");
+        for leak in ["Zebra", "fishing", "\u{1F41F}"] {
+            assert!(!s.contains(leak), "{leak} in {s}");
+        }
+        assert!(
+            s.contains("number_shown: Some(true)"),
+            "the flag is not a secret: {s}"
+        );
+    }
+
+    #[test]
+    fn about_and_number_shown_patch_unchanged_clear_set() {
+        let mut c = contact();
+        let set = ContactPatch {
+            about: Patch::Set("Hi".into()),
+            about_emoji: Patch::Set("x".into()),
+            number_shown: Some(false),
+            ..ContactPatch::new(c.user.clone())
+        };
+        let json = serde_json::to_string(&set).expect("serialize");
+        let back: ContactPatch = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, set);
+        assert!(back.apply(&mut c));
+        assert_eq!(c.about.as_deref(), Some("Hi"));
+        assert_eq!(
+            c.number_shown,
+            Some(false),
+            "a stated false is not 'never stated'"
+        );
+        // Unchanged keeps all three.
+        assert!(!ContactPatch::new(c.user.clone()).apply(&mut c));
+        assert_eq!(c.about.as_deref(), Some("Hi"));
+        assert_eq!(c.number_shown, Some(false));
+        // The same value again touches nothing; a clear clears.
+        let again = ContactPatch {
+            number_shown: Some(false),
+            ..ContactPatch::new(c.user.clone())
+        };
+        assert!(!again.apply(&mut c));
+        let clear = ContactPatch {
+            about: Patch::Clear,
+            ..ContactPatch::new(c.user.clone())
+        };
+        assert!(clear.apply(&mut c));
+        assert_eq!(c.about, None);
+        assert_eq!(c.about_emoji.as_deref(), Some("x"));
     }
 
     #[test]

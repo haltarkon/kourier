@@ -28,4 +28,7 @@ Item {
     required property string stage
     // How far a folder is packed, 0 to 1.
     required property real progress
+    // The second line speaks of where the file was taken (its note or its reason): that
+    // line may take two lines.
+    required property bool located
 }

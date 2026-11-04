@@ -35,6 +35,13 @@ import app.kourier
 QQC2.ToolBar {
     id: root
 
+    // The note "Already sent" offers Delete for Everyone for `message`: the page asks the
+    // delete question for that row (the same dialog as the message menu's).
+    signal deleteNoteRequested(real message)
+
+    // Room kept free on the trailing side (the chat page's details panel stands there).
+    property real rightReserved: 0
+
     readonly property bool replying: App.composer.replyToId > 0
     readonly property bool editing: App.composer.editId > 0
     readonly property bool blocked: App.timeline.cannotSend !== ""
@@ -57,6 +64,8 @@ QQC2.ToolBar {
 
     // What the text area holds.
     readonly property alias text: area.text
+    // The text area itself (tests read its focus).
+    readonly property alias textArea: area
     // The emoji picker, created when it is first asked for.
     property EmojiPopup emojiPopup: null
     // A text this long may be more than one message of the chat carries: with files waiting
@@ -67,6 +76,9 @@ QQC2.ToolBar {
     property bool captionTold: false
     // The question about folders that wait in the list, while it is asked (tests drive it).
     property FolderQuestionDialog folderDialog: null
+    // The question about files that would leave with where they were taken, while it shows
+    // (tests drive it).
+    property LocationQuestionDialog locationDialog: null
     // The attach button's menu (tests drive it).
     readonly property alias attachMenu: attachMenu
 
@@ -85,8 +97,57 @@ QQC2.ToolBar {
         }
     }
 
+    // The location question shows while Send asks it, and goes when it is answered or no
+    // longer stands (another chat, nothing left to ask). Closed without an answer (Escape,
+    // the close button, a click outside) it is dismissed: nothing is sent, nothing held,
+    // nothing remembered, the files and the text stay; the next Send asks again about what
+    // stands then, with the text of that press.
+    function syncLocationDialog(): void {
+        if (App.composer.locationAsking && root.locationDialog === null && !root.blocked) {
+            root.locationDialog = locationComponent.createObject(root) as LocationQuestionDialog;
+            root.locationDialog?.open();
+        } else if (!App.composer.locationAsking && root.locationDialog !== null) {
+            const answered = root.locationDialog;
+            root.locationDialog = null;
+            answered.close();
+            root.focusAfterQuestion();
+        }
+    }
+
+    // The question ended (an answer, by key or by click, or it no longer stands) and the
+    // composer is still shown: the keyboard goes back to the text area, as after Escape
+    // (UR7; "Send with Location" left it nowhere). Not while another question is open.
+    function focusAfterQuestion(): void {
+        if (root.visible && !root.blocked && root.locationDialog === null && root.folderDialog === null) {
+            area.forceActiveFocus();
+        }
+    }
+
+    // The answer to the location question: the composer sends what the answer says, the text
+    // of the press that asked. "Remember my choice" becomes the setting only AFTER an answer
+    // that applied (a stale one, because the files changed while the question was open, did
+    // nothing and the question comes again: nothing is remembered then), through Settings
+    // (its one owner, so the Settings page shows it): 1 always send, 2 never send.
+    function answerLocation(answer: string, remember: bool): void {
+        if (!App.composer.locationAsking) {
+            return;
+        }
+        const applied = App.composer.answerLocation(answer);
+        if (applied && remember) {
+            App.settings.locationFiles = answer === "send" ? 1 : 2;
+        }
+    }
+
+    // The setting "Files with location data" as it is now: a change shows at once in the
+    // list (the rows' notes, the counts), not only at the next change of the list.
+    readonly property int locationPref: App.settings.locationFiles
+    onLocationPrefChanged: App.composer.refreshLocationPref()
+
     // (A composer that could not be written to asks once it can again.)
-    onBlockedChanged: root.syncFolderDialog()
+    onBlockedChanged: {
+        root.syncFolderDialog();
+        root.syncLocationDialog();
+    }
 
     // Opens the picker: for files, or for one folder.
     function pick(folder: bool): void {
@@ -111,6 +172,27 @@ QQC2.ToolBar {
                     }
                 }
                 asked.destroy();
+            }
+        }
+    }
+
+    Component {
+        id: locationComponent
+        LocationQuestionDialog {
+            id: located
+            onAnswered: (answer, remember) => root.answerLocation(answer, remember)
+            // Closed without an answer (Escape, the close button, a click outside): the
+            // question is dismissed, with nothing sent, held or remembered. After an answer
+            // the question no longer stands and this dialog is no longer the composer's.
+            onClosed: {
+                // Still the question's dialog: nobody answered, the user closed it.
+                if (root.locationDialog === located) {
+                    root.locationDialog = null;
+                    if (App.composer.locationAsking) {
+                        App.composer.answerLocation("dismiss");
+                    }
+                }
+                located.destroy();
             }
         }
     }
@@ -146,8 +228,10 @@ QQC2.ToolBar {
 
     position: QQC2.ToolBar.Footer
     padding: Kirigami.Units.smallSpacing
-    leftPadding: Kirigami.Units.largeSpacing
-    rightPadding: Kirigami.Units.largeSpacing
+    // `rightReserved` is the width of the side panel on the trailing edge. A padding does not
+    // mirror, so the reserve goes on the physical side the panel stands on.
+    leftPadding: Kirigami.Units.largeSpacing + (root.LayoutMirroring.enabled ? root.rightReserved : 0)
+    rightPadding: Kirigami.Units.largeSpacing + (root.LayoutMirroring.enabled ? 0 : root.rightReserved)
 
     // Adds dropped or picked files (URLs) to the list, all of them in one call.
     function attach(urls: list<url>): void {
@@ -164,12 +248,16 @@ QQC2.ToolBar {
         if (!root.canSend) {
             return;
         }
+        // A long caption is not re-told while the question about this press is open: the
+        // text that goes is the one passed here.
+        captionSettle.stop();
         // An edit that was saved gives the text area back what it held before (`editFinished`).
         const edit = root.editing;
         if (App.composer.send(App.timeline.conversationId, area.text) && !edit) {
             root.restoring = true;
             area.clear();
             root.restoring = false;
+            root.focusAfterQuestion();
         }
     }
 
@@ -209,12 +297,23 @@ QQC2.ToolBar {
     Component.onCompleted: {
         root.switchTo(root.openConversation);
         root.syncFolderDialog();
+        root.syncLocationDialog();
     }
 
     Connections {
         target: App.composer
         function onFolderAskingChanged(): void {
             root.syncFolderDialog();
+        }
+        function onLocationAskingChanged(): void {
+            root.syncLocationDialog();
+        }
+        // The answer to the location question sent the files and the text of that Send
+        // (`send()` returned false when it asked): the text area is cleared now.
+        function onSentFromQuestion(): void {
+            root.restoring = true;
+            area.clear();
+            root.restoring = false;
         }
         function onDraftLoaded(conversation: real): void {
             if (conversation === root.conversation && area.text === "" && !root.editing) {
@@ -452,7 +551,9 @@ QQC2.ToolBar {
 
                 Layout.fillWidth: true
                 // Up to four and a half rows: the half row says there is more.
-                Layout.preferredHeight: Math.min(strip.count, 4.5) * files.rowHeight
+                // A row whose location line takes two lines is taller (U2); the list grows by
+                // that, other lists keep their height.
+                Layout.preferredHeight: Math.min(Math.max(strip.contentHeight, strip.count * files.rowHeight), 4.5 * files.rowHeight)
                 QQC2.ScrollBar.horizontal.policy: QQC2.ScrollBar.AlwaysOff
 
                 ListView {
@@ -531,7 +632,9 @@ QQC2.ToolBar {
                         readonly property bool working: fileRow.stage === "counting" || fileRow.stage === "listing" || fileRow.stage === "packing"
 
                         width: strip.width
-                        height: files.rowHeight
+                        // The usual height; a row whose location line wraps grows by its
+                        // second line.
+                        height: fileRow.located ? Math.max(files.rowHeight, Math.ceil(rowText.implicitHeight) + Kirigami.Units.smallSpacing * 2) : files.rowHeight
 
                         Accessible.role: Accessible.ListItem
                         Accessible.name: fileRow.name
@@ -657,6 +760,7 @@ QQC2.ToolBar {
                         }
 
                         Column {
+                            id: rowText
                             anchors.left: thumb.right
                             anchors.leftMargin: Kirigami.Units.largeSpacing
                             anchors.right: originalButton.visible ? originalButton.left : (work.visible ? work.left : removeButton.left)
@@ -680,6 +784,13 @@ QQC2.ToolBar {
                                 visible: text !== ""
                                 font: Kirigami.Theme.smallFont
                                 color: fileRow.refused ? files.warn : files.quiet
+                                // Where the file was taken (the note, or why it is held or kept,
+                                // which ends with the setting's name) wraps with NO line cap: the
+                                // row's height follows its text, so the setting's name is never
+                                // cut (UR1: Ukrainian at 14 pt needs more than three lines); any
+                                // other line keeps one.
+                                wrapMode: fileRow.located ? Text.Wrap : Text.NoWrap
+                                maximumLineCount: fileRow.located ? undefined : 1
                                 elide: Text.ElideRight
                                 textFormat: Text.PlainText
 
@@ -874,6 +985,18 @@ QQC2.ToolBar {
             text: Style.plain(App.composer.notice)
             Layout.fillWidth: true
             actions: [
+                // "Already sent": the X came after the message went out. The core has recorded
+                // it as sent by now, so deleting it for everyone works. The action asks the
+                // SAME question as the message menu's (the page opens the delete dialog of
+                // that row), never deletes at once. It rides on its own note only:
+                // `App.noticeMessage()` is 0 while the composer shows another notice.
+                Kirigami.Action {
+                    icon.name: "edit-delete"
+                    text: L10n.i18nc("@action:button", "Delete for Everyone")
+                    visible: App.composer.notice !== "" && App.noticeMessage() !== 0
+                    enabled: visible
+                    onTriggered: root.deleteNoteRequested(App.noticeMessage())
+                },
                 Kirigami.Action {
                     icon.name: "dialog-close"
                     text: L10n.i18nc("@action:button", "Dismiss")

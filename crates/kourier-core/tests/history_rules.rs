@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use kourier_backend_api::{
-    BackendEvent, DurableCommand, HistoryEdit, IncomingMessage, MAX_HISTORY_EDITS,
+    BackendEvent, DurableCommand, HistoryEdit, HistoryReaction, IncomingMessage, MAX_HISTORY_EDITS,
 };
 use kourier_core::facade::{
     ConversationListQuery, MessageRow, QuoteState, TimelineAnchor, TimelineQuery,
@@ -25,9 +25,9 @@ use kourier_core::testing::{DumpMode, IngestHarness};
 use kourier_fake::scripts::{own, remote, target};
 use kourier_model::{
     AccountSettingsPatch, Body, CallDirection, CallLine, CallMedia, CallState, ConvKey,
-    ConversationId, ConversationPatch, DisappearKind, Expiry, FailReason, MsgIdScope, MsgTarget,
-    NetworkKind, Origin, OutgoingState, Patch, ReadState, ReceiptKind, ReplyTo, SystemEvent,
-    TargetAuthor, UserId,
+    ConversationId, ConversationPatch, Deletion, DisappearKind, Expiry, FailReason,
+    HistoryReadState, MsgIdScope, MsgTarget, NetworkKind, Origin, OutgoingState, Patch, ReadState,
+    ReceiptKind, ReplyTo, SystemEvent, TargetAuthor, UserId,
 };
 
 const ME: &str = "aci:00000000-0000-4000-8000-0000000000aa";
@@ -1219,4 +1219,219 @@ fn an_imported_row_of_a_deleted_chat_is_dropped_and_a_live_message_brings_it_bac
     .expect("a live message");
     assert_eq!(listed(&h), 1, "a live message brings the chat back");
     assert_eq!(rows(&h, &a).len(), 1);
+}
+
+// ---------- WhatsApp's ids (ConversationAuthor): a delete made live and the history's copy ----------
+
+/// A core with WhatsApp's key (`(conversation, author, local)`): the history of a link brings copies of messages
+/// the account may already know, and a message the person's contact deleted for everyone must never get its
+/// body back from one (W4 C19, the critic's M6).
+fn whatsapp_like() -> (tempfile::TempDir, IngestHarness) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let h = IngestHarness::open(
+        &dir.path().join("core.db"),
+        &kourier_db::DbKey::from([6; 32]),
+        NetworkKind::Fake,
+        MsgIdScope::ConversationAuthor,
+        &[uid(ME)],
+    )
+    .expect("harness");
+    (dir, h)
+}
+
+/// Alice deletes her message `local` for everyone.
+fn alice_deletes(conv: &ConvKey, local: &str, at: i64) -> BackendEvent {
+    BackendEvent::Deleted {
+        target: target(Some(conv), Some(&alice()), local),
+        by: Some(alice()),
+        for_everyone: true,
+        at,
+    }
+}
+
+/// A copy of alice's message that the phone also has a reaction on: a tombstone takes no reaction.
+fn copy_with_a_reaction(conv: &ConvKey, at: i64) -> IncomingMessage {
+    let mut copy = incoming(conv, &alice(), at, true);
+    copy.reactions.push(HistoryReaction {
+        by: Some(uid(BOB)),
+        emoji: "👍".into(),
+        at: at + 10,
+    });
+    copy
+}
+
+/// The row sent at `at`: a tombstone (deleted for everyone by alice, no body, no reaction).
+fn assert_tombstone(h: &IngestHarness, key: &ConvKey, at: i64, when: &str) {
+    let r = row(h, key, at);
+    assert!(
+        matches!(r.deleted, Some(Deletion::ForEveryone { by: Some(_) })),
+        "{when}: deleted for everyone: {:?}",
+        r.deleted
+    );
+    assert_eq!(text_of(&r), "", "{when}: the body did not come back");
+    assert!(
+        r.reactions.is_empty(),
+        "{when}: a tombstone takes no reaction"
+    );
+}
+
+/// A delete made live AFTER a message's history copy took its body, and a LATER chunk that carries the same
+/// message again (the push repeats a chat across chunks): the tombstone stays a tombstone.
+#[test]
+fn a_message_deleted_live_after_its_history_copy_stays_deleted_when_a_later_chunk_repeats_it() {
+    let (_dir, mut h) = whatsapp_like();
+    let a = d_alice();
+    h.apply(vec![batch(&a, vec![incoming(&a, &alice(), 100, true)])])
+        .expect("the history copy");
+    assert_eq!(text_of(&row(&h, &a, 100)), "text");
+    h.apply(vec![alice_deletes(&a, "100", 5_000)])
+        .expect("the live delete");
+    assert_tombstone(&h, &a, 100, "after the delete");
+    h.apply(vec![batch(&a, vec![copy_with_a_reaction(&a, 100)])])
+        .expect("the same message again, from a later chunk");
+    assert_tombstone(&h, &a, 100, "after the later chunk");
+    assert_eq!(rows(&h, &a).len(), 1, "one row, not two");
+    assert_eq!(counts(&h, &a), (0, 0), "nothing is unread");
+}
+
+/// A delete made live BEFORE the history copy: the message arrived live, was deleted live, and the phone's copy
+/// of it (the chunk comes minutes later) must not bring the body back.
+#[test]
+fn a_message_deleted_live_before_its_history_copy_stays_deleted() {
+    let (_dir, mut h) = whatsapp_like();
+    let a = d_alice();
+    h.apply(vec![BackendEvent::Message(incoming(
+        &a,
+        &alice(),
+        100,
+        false,
+    ))])
+    .expect("the live message");
+    h.apply(vec![alice_deletes(&a, "100", 5_000)])
+        .expect("the live delete");
+    assert_tombstone(&h, &a, 100, "after the delete");
+    h.apply(vec![batch(&a, vec![copy_with_a_reaction(&a, 100)])])
+        .expect("the history copy");
+    assert_tombstone(&h, &a, 100, "after the history copy");
+    assert_eq!(rows(&h, &a).len(), 1, "one row, not two");
+    assert_eq!(counts(&h, &a), (0, 0), "nothing is unread");
+}
+
+/// A delete that arrives before the message exists at all (the chunk is still on its way): the copy is born
+/// deleted and shows no body.
+#[test]
+fn a_delete_that_arrives_before_the_history_copy_is_applied_to_it() {
+    let (_dir, mut h) = whatsapp_like();
+    let a = d_alice();
+    h.apply(vec![alice_deletes(&a, "100", 5_000)])
+        .expect("the live delete of a message the core has not seen");
+    h.apply(vec![batch(&a, vec![incoming(&a, &alice(), 100, true)])])
+        .expect("the history copy");
+    assert_tombstone(&h, &a, 100, "after the history copy");
+}
+
+/// The same id from two senders of a group is two messages (WhatsApp's ids are per sender): a history copy of
+/// bob's `7` does not meet the tombstone of alice's `7`.
+#[test]
+fn a_tombstone_of_one_sender_does_not_swallow_the_history_copy_of_another_senders_message_with_the_same_id()
+ {
+    let (_dir, mut h) = whatsapp_like();
+    let g = group();
+    let (alice_text, bob_text) = (
+        remote(&g, &alice(), "7", 100, "from alice"),
+        remote(&g, &uid(BOB), "7", 200, "from bob"),
+    );
+    h.apply(vec![
+        BackendEvent::Message(alice_text),
+        alice_deletes(&g, "7", 5_000),
+    ])
+    .expect("alice's message and its delete");
+    h.apply(vec![batch(&g, vec![bob_text])])
+        .expect("bob's message with the same id, from the history");
+    assert_tombstone(&h, &g, 100, "alice's message");
+    assert_eq!(text_of(&row(&h, &g, 200)), "from bob");
+    assert_eq!(rows(&h, &g).len(), 2, "two messages with one id");
+}
+
+// ---------- F1 (W4 fix round): a history copy never lowers what the person has not seen ----------
+
+/// A WhatsApp-shaped core whose network cannot say what a history row's `read` flag means.
+fn whatsapp_unknown() -> (tempfile::TempDir, IngestHarness) {
+    let (dir, h) = whatsapp_like();
+    (dir, h.with_history_read(HistoryReadState::Unknown))
+}
+
+/// The reviewer's case: m3 arrives live and unread, then a chunk that the phone built later carries m1..m3
+/// (every copy says `read: true`, the only thing a backend whose history cannot say it can state) and the
+/// hint W4 states (the phone's 3 unread minus the 1 live message it noted).
+fn live_m3_then_a_chunk_of_three(h: &mut IngestHarness, a: &ConvKey) {
+    h.apply(vec![BackendEvent::Message(incoming(
+        a,
+        &alice(),
+        300,
+        false,
+    ))])
+    .expect("m3 arrives live, unread");
+    let mut chat = ConversationPatch::new(a.clone());
+    chat.unread_hint = Some(2);
+    h.apply(vec![
+        BackendEvent::ConversationUpsert(chat),
+        batch(
+            a,
+            vec![
+                incoming(a, &alice(), 100, true),
+                incoming(a, &alice(), 200, true),
+                incoming(a, &alice(), 300, true),
+            ],
+        ),
+    ])
+    .expect("the chunk");
+}
+
+/// F1: under a network whose history read state is unknown a copy of a live unread message does not read it:
+/// the phone's 3 unread are 2 by the hint and the live m3, which stays unread (before the fix: 2 unread, m3 read,
+/// the newest message the person has not seen lost its mark).
+/// Mutant for the re-check: the raise kept (the guard on `HistoryReadState::Unknown` removed in `ingest/message.rs`).
+#[test]
+fn a_history_copy_of_a_live_unread_message_does_not_read_it_where_the_history_cannot_say_so() {
+    let (_dir, mut h) = whatsapp_unknown();
+    let a = d_alice();
+    live_m3_then_a_chunk_of_three(&mut h, &a);
+    assert_eq!(rows(&h, &a).len(), 3, "one row each");
+    assert_eq!(row(&h, &a, 300).read_state, Some(ReadState::Unread));
+    assert_eq!(row(&h, &a, 100).read_state, Some(ReadState::Read));
+    assert_eq!(row(&h, &a, 200).read_state, Some(ReadState::Read));
+    assert_eq!(counts(&h, &a), (3, 0), "the phone's three");
+}
+
+/// F1: the same events under Signal's rules (the read flag of a history row is known) raise the existing row, as
+/// they always did.
+/// Mutant for the re-check: the guard turned round (the raise skipped for `Known`).
+#[test]
+fn the_same_chunk_under_a_network_that_knows_its_read_states_still_raises_the_row() {
+    let (_dir, h) = whatsapp_like();
+    let mut h = h.with_history_read(HistoryReadState::Known);
+    let a = d_alice();
+    live_m3_then_a_chunk_of_three(&mut h, &a);
+    assert_eq!(row(&h, &a, 300).read_state, Some(ReadState::Read));
+    assert_eq!(counts(&h, &a), (2, 0), "the hint alone");
+}
+
+/// F1: a NEW row of the chunk still says what the backend states (read), and a live copy of a message the chunk
+/// already stored is not raised or lowered by anything (a live message never lowers a read row).
+#[test]
+fn an_unknown_history_read_state_changes_nothing_for_new_rows_or_for_a_live_repeat() {
+    let (_dir, mut h) = whatsapp_unknown();
+    let a = d_alice();
+    h.apply(vec![batch(&a, vec![incoming(&a, &alice(), 100, true)])])
+        .expect("the chunk");
+    h.apply(vec![BackendEvent::Message(incoming(
+        &a,
+        &alice(),
+        100,
+        false,
+    ))])
+    .expect("a live repeat of a stored message");
+    assert_eq!(row(&h, &a, 100).read_state, Some(ReadState::Read));
+    assert_eq!(counts(&h, &a), (0, 0));
 }

@@ -3,7 +3,7 @@
 //! cut off), the user is told once what became of it (`UiEvent::LogoutOutcome`), and an unlink
 //! keeps the chats readable.
 
-mod support;
+use crate::support;
 
 use kourier_backend_api::BackendEvent;
 use kourier_core::facade::{AccountLabel, UiCommand, UiEvent};
@@ -597,7 +597,7 @@ async fn a_failed_shred_tells_nothing_until_the_removal_is_done() {
         report.outcome,
         DeviceLogout::Removed | DeviceLogout::NoDevice
     ));
-    assert!(!env.account_dir(uuid).exists());
+    dir_is_gone(&env, uuid).await;
     env.stop().await;
 }
 
@@ -668,7 +668,7 @@ async fn a_kill_after_the_shred_still_tells_the_outcome_at_the_next_start() {
         spawns,
         "no second logout was tried without keys"
     );
-    assert!(!env.account_dir(uuid).exists());
+    dir_is_gone(&env, uuid).await;
     env.stop().await;
 }
 
@@ -1025,5 +1025,167 @@ async fn the_outcome_is_told_before_the_account_directory_is_removed() {
     env.vault.release_dir_removals();
     removed(&mut env, account).await;
     assert!(!env.account_dir(uuid).exists());
+    env.stop().await;
+}
+
+/// W2b B4: the new login is told EVERY own id of the profile's other accounts, one entry per id
+/// and the primary first, not the primary alone. A WhatsApp account is `[lid, pn]`: a login that
+/// is typed a number (the pair-code flow) refuses another account's number before it asks for a
+/// code only when the number is in the list (`kourier-whatsapp` `link::tests::every_own_id_in_taken_*`).
+/// Signal's accounts name their ACI first and its check by ACI reads the same list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_is_told_every_own_id_of_the_other_accounts() {
+    let (lid, pn) = (uid("lid:100000000000001"), uid("pn:4915123456789"));
+    let mut first = script("ids-a");
+    first.own_ids = vec![lid.clone(), pn.clone()];
+    let mut env = Env::new(Flavor::SignalLike, first).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let old = add_linked(&mut env).await;
+    env.wait_finished(old).await;
+    let mut next = script("ids-b");
+    next.own_ids = vec![uid("lid:100000000000002"), uid("pn:4915123456780")];
+    env.control.push_script(next);
+    env.handle
+        .send(UiCommand::AddAccount {
+            network: kourier_model::NetworkKind::Fake,
+            flow: "qr".into(),
+        })
+        .expect("send");
+    let new = env
+        .event("AccountAdded", |e| match e {
+            UiEvent::AccountAdded { account } => Some(*account),
+            _ => None,
+        })
+        .await;
+    let new_uuid = env.account(new).await.expect("row").uuid;
+    let control = env.control.clone();
+    eventually("the new login starts", WAIT, || {
+        let control = control.clone();
+        async move { !control.login_taken(new_uuid).is_empty() }
+    })
+    .await;
+    let taken = |user: &UserId| kourier_backend_api::TakenIdentity {
+        user: user.clone(),
+        logged_out: false,
+    };
+    assert_eq!(
+        env.control.login_taken(new_uuid),
+        vec![vec![taken(&lid), taken(&pn)]],
+        "every own id of the other account, the primary first"
+    );
+    env.stop().await;
+}
+
+/// W2b review F3: the account label's `twin` compares the PRIMARY own ids, as the core's check at
+/// `AccountReady` does. B4 widened `other_identities` to every own id of the other accounts and the
+/// label followed silently. Here the second account's primary id is the FIRST account's second id (a
+/// number both hold) and the two differ in name and number: the notice about the second one's removal
+/// must not say that another account looks the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_primary_own_id_of_another_account_does_not_make_a_twin() {
+    let pn = uid("pn:4915123456789");
+    let mut first = script("twin-ids-a");
+    first.own_ids = vec![uid("lid:100000000000001"), pn.clone()];
+    first.display_name = Some("Ann".into());
+    first.number = Some("+15550001".into());
+    let mut env = Env::new(Flavor::SignalLike, first).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let keep = add_linked(&mut env).await;
+    env.wait_finished(keep).await;
+    let mut second = script("twin-ids-b");
+    second.own_ids = vec![pn, uid("lid:100000000000002")];
+    second.display_name = Some("Bea".into());
+    second.number = Some("+15550002".into());
+    env.control.push_script(second);
+    let gone = add_linked(&mut env).await;
+    env.wait_finished(gone).await;
+    env.handle
+        .send(UiCommand::RemoveAccount { account: gone })
+        .expect("send");
+    let (_, was_removed, _, who) = outcome_event(&mut env, gone).await;
+    assert!(was_removed);
+    assert_eq!(who.display_name.as_deref(), Some("Bea"));
+    assert!(
+        !who.twin,
+        "another account's second id is not an identity of this one"
+    );
+    removed(&mut env, gone).await;
+    env.stop().await;
+}
+
+/// "Remove and Link Again" (`ReplaceAccountDialog`) sends `RemoveAccount` and `AddAccount` back
+/// to back. The new login's backend is told which identities the profile has already
+/// (`taken`), so that it can turn a scan of one of them away before it registers a device; the
+/// account whose removal was just asked for is not one of them, even when its supervisor has
+/// not got to the command and written `Removing` yet (R1 fix 5: the e2e test
+/// `removing_an_account_and_linking_the_same_phone_at_once_is_not_refused` was refused once in
+/// sixty runs under load, "already in the profile", right after the first link: that
+/// supervisor was still busy and the new one read the row first). Here the old account's
+/// supervisor waits for its key, so its row still says `Active` when the new login starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_right_behind_a_removal_is_not_told_of_the_account_being_removed() {
+    let mut env = Env::new(Flavor::SignalLike, script("replace-a")).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let old = add_linked(&mut env).await;
+    env.wait_finished(old).await;
+    let old_uuid = env.account(old).await.expect("row").uuid;
+    // The new link is another identity: only the first line, `taken`, is under test.
+    let mut next = script("replace-b");
+    next.own_ids = vec![uid("aci:00000000-0000-4000-8000-0000000000bb")];
+    env.control.push_script(next);
+    // Closed and opened again with the old account's key held: its supervisor reads and
+    // writes nothing until the key comes.
+    env.stop().await;
+    env.vault.hold_unwraps_of(old_uuid);
+    env.restart().await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    env.handle
+        .send(UiCommand::RemoveAccount { account: old })
+        .expect("send");
+    env.handle
+        .send(UiCommand::AddAccount {
+            network: kourier_model::NetworkKind::Fake,
+            flow: "qr".into(),
+        })
+        .expect("send");
+    let new = env
+        .event("AccountAdded", |e| match e {
+            UiEvent::AccountAdded { account } => Some(*account),
+            _ => None,
+        })
+        .await;
+    let new_uuid = env.account(new).await.expect("row").uuid;
+    let control = env.control.clone();
+    eventually("the new login starts", WAIT, || {
+        let control = control.clone();
+        async move { !control.login_taken(new_uuid).is_empty() }
+    })
+    .await;
+    assert_eq!(
+        env.account(old).await.expect("row").state,
+        AccountState::Active,
+        "the premise: the old account's row does not say Removing yet"
+    );
+    assert_eq!(
+        env.control.login_taken(new_uuid),
+        vec![vec![]],
+        "the account being removed is not named to the new login"
+    );
+    // The key comes: the removal goes through and the new link finishes.
+    env.vault.release_unwraps_of(old_uuid);
+    removed(&mut env, old).await;
+    assert!(
+        !env.control.has_device(old_uuid),
+        "its device is logged out"
+    );
+    eventually("the new account is active", WAIT, || {
+        let h = env.handle.clone();
+        async move {
+            matches!(h.query(kourier_core::facade::Query::Accounts).await,
+                Ok(kourier_core::facade::QueryData::Accounts(a))
+                if a.iter().any(|r| r.id == new && r.state == AccountState::Active))
+        }
+    })
+    .await;
     env.stop().await;
 }

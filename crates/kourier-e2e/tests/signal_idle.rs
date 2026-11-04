@@ -17,7 +17,7 @@
 //! the account's own threads wake more often than once in two seconds, which a polling loop
 //! or a ticker left running would do.
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

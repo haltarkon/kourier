@@ -124,6 +124,22 @@ impl Body {
         }
     }
 
+    /// A notice that is kept out of the conversation list ([`SystemEvent::is_quiet`]); every
+    /// other body, a message or a placeholder, is not.
+    pub fn is_quiet(&self) -> bool {
+        match self {
+            Self::System(event) => event.is_quiet(),
+            Self::Text(_)
+            | Self::Media { .. }
+            | Self::Sticker(_)
+            | Self::Contact(_)
+            | Self::Location(_)
+            | Self::Poll(_)
+            | Self::Placeholder(_)
+            | Self::Unsupported { .. } => false,
+        }
+    }
+
     /// Every [`Text`] in the body (text, caption, attachment captions).
     pub fn texts_mut(&mut self) -> Vec<&mut Text> {
         match self {
@@ -547,6 +563,69 @@ pub enum SystemEvent {
         /// Who.
         user: UserId,
     },
+    /// We marked our safety number with a contact as verified or as not verified (P5a). Written
+    /// into the 1:1 chat only, by the backend, with the contact as the row's author and
+    /// `silent` (P5 critic F10); the wording is "You marked ..." from this event.
+    VerifiedChanged {
+        /// With whom.
+        user: UserId,
+        /// `true` = marked as verified, `false` = as not verified (a Clear or a Confirm).
+        verified: bool,
+        /// The mark came from another of our devices (a Verified sync message).
+        #[serde(default)]
+        other_device: bool,
+    },
+}
+
+impl SystemEvent {
+    /// A QUIET notice: it stays in the conversation, but unless the user asks for them
+    /// (Settings > General, "Show minor notices in the conversation list") it neither is the
+    /// conversation's preview, nor gives it its time, nor lifts it in the list, and it never
+    /// opens a conversation (user decision, 2026-10-15: "Your safety number with ... messages
+    /// should have toggle to disable showing in All chat as latest message in chat. It looks
+    /// like digital garbage."). The kinds Signal Desktop keeps out of its list
+    /// (`shouldAffectPreview`) that Kourier makes, and a refreshed session beside them:
+    ///
+    /// | kind | quiet |
+    /// |---|---|
+    /// | [`IdentityKeyChanged`](Self::IdentityKeyChanged) (a contact, also in the groups they are in) | yes |
+    /// | [`SessionRefreshed`](Self::SessionRefreshed) | yes |
+    /// | [`NumberChanged`](Self::NumberChanged) | yes |
+    /// | [`VerifiedChanged`](Self::VerifiedChanged) (P5a, core.db 21) | yes |
+    /// | [`MessageRequestAccepted`](Self::MessageRequestAccepted) | yes |
+    /// | group changes (members added, removed or left, title, avatar, description, created, joined) | no |
+    /// | [`TimerChanged`](Self::TimerChanged) | no |
+    /// | [`Call`](Self::Call) | no |
+    ///
+    /// A member who left on their own is a group change and stays loud (user decision:
+    /// "group changes … still show"); Desktop and Android keep it out of the list, so if he
+    /// wants that later it is one more arm here.
+    ///
+    /// THE RULE EXISTS TWICE: here, and as the generated column `messages.quiet`
+    /// (newest definition `kourier-core/migrations/0021_verified_notice.sql`, which redefines
+    /// the 0015 column; a later redefinition copies the newest one), which reads the first
+    /// bytes of the serialised body. Both are held together by `kourier-core/tests/quiet_notices.rs`
+    /// `the_column_and_is_quiet_agree_for_every_kind`; the match has no `_` arm, so a new
+    /// variant must be judged here.
+    pub fn is_quiet(&self) -> bool {
+        match self {
+            Self::IdentityKeyChanged { .. }
+            | Self::SessionRefreshed { .. }
+            | Self::NumberChanged { .. }
+            | Self::VerifiedChanged { .. }
+            | Self::MessageRequestAccepted => true,
+            Self::MembersAdded { .. }
+            | Self::MembersRemoved { .. }
+            | Self::MemberLeft { .. }
+            | Self::TitleChanged { .. }
+            | Self::AvatarChanged { .. }
+            | Self::DescriptionChanged { .. }
+            | Self::TimerChanged { .. }
+            | Self::GroupCreated { .. }
+            | Self::Call(_)
+            | Self::Joined => false,
+        }
+    }
 }
 
 impl fmt::Debug for SystemEvent {
@@ -588,6 +667,16 @@ impl fmt::Debug for SystemEvent {
             Self::Call(line) => f.debug_tuple("Call").field(line).finish(),
             Self::Joined => f.write_str("Joined"),
             Self::NumberChanged { user: u } => user(f, "NumberChanged", u),
+            Self::VerifiedChanged {
+                user,
+                verified,
+                other_device,
+            } => f
+                .debug_struct("VerifiedChanged")
+                .field("user", user)
+                .field("verified", verified)
+                .field("other_device", other_device)
+                .finish(),
         }
     }
 }
@@ -618,6 +707,11 @@ pub enum Deletion {
     },
     /// Deleted on this account only.
     ForMe,
+    /// Deleted for everyone, and the network did not say by whom (a network whose server checks
+    /// deletes, `NetworkDescriptor::server`, and tells a client the message is gone, not who
+    /// deleted it). It is neither "you deleted this" (`ForEveryone { by: None }` on an own row)
+    /// nor an admin's: the peer may have done it.
+    Unattributed,
 }
 
 /// When a disappearing-message timer starts.
@@ -716,6 +810,199 @@ pub struct Message {
 mod tests {
     use super::*;
     use crate::text::{RangeKind, TextRange};
+
+    /// One value of EVERY [`SystemEvent`] variant with whether it is quiet. The `match` below
+    /// names every variant without a `_` arm: a new variant does not compile until it is
+    /// added here (and so judged by [`SystemEvent::is_quiet`] and by the SQL rule that
+    /// copies it, newest definition `kourier-core/migrations/0021_verified_notice.sql`, which
+    /// redefines the 0015 column: a later redefinition copies the newest one).
+    fn every_kind() -> Vec<(SystemEvent, bool)> {
+        let user = || UserId::parse("aci:a").expect("valid");
+        let all = vec![
+            (
+                SystemEvent::MembersAdded {
+                    by: None,
+                    users: vec![user()],
+                },
+                false,
+            ),
+            (
+                SystemEvent::MembersRemoved {
+                    by: None,
+                    users: vec![user()],
+                },
+                false,
+            ),
+            (SystemEvent::MemberLeft { user: user() }, false),
+            (
+                SystemEvent::TitleChanged {
+                    by: None,
+                    title: "t".into(),
+                },
+                false,
+            ),
+            (SystemEvent::AvatarChanged { by: None }, false),
+            (SystemEvent::DescriptionChanged { by: None }, false),
+            (
+                SystemEvent::TimerChanged {
+                    by: None,
+                    timer: None,
+                },
+                false,
+            ),
+            (SystemEvent::IdentityKeyChanged { user: user() }, true),
+            (SystemEvent::SessionRefreshed { user: user() }, true),
+            (SystemEvent::GroupCreated { by: None }, false),
+            (SystemEvent::MessageRequestAccepted, true),
+            (
+                SystemEvent::Call(crate::CallLine::signal(
+                    crate::CallDirection::Incoming,
+                    false,
+                    crate::CallState::Missed,
+                    1,
+                )),
+                false,
+            ),
+            (SystemEvent::Joined, false),
+            (SystemEvent::NumberChanged { user: user() }, true),
+            (
+                SystemEvent::VerifiedChanged {
+                    user: user(),
+                    verified: true,
+                    other_device: false,
+                },
+                true,
+            ),
+        ];
+        for (event, _) in &all {
+            match event {
+                SystemEvent::MembersAdded { .. }
+                | SystemEvent::MembersRemoved { .. }
+                | SystemEvent::MemberLeft { .. }
+                | SystemEvent::TitleChanged { .. }
+                | SystemEvent::AvatarChanged { .. }
+                | SystemEvent::DescriptionChanged { .. }
+                | SystemEvent::TimerChanged { .. }
+                | SystemEvent::IdentityKeyChanged { .. }
+                | SystemEvent::SessionRefreshed { .. }
+                | SystemEvent::GroupCreated { .. }
+                | SystemEvent::MessageRequestAccepted
+                | SystemEvent::Call(_)
+                | SystemEvent::Joined
+                | SystemEvent::NumberChanged { .. }
+                | SystemEvent::VerifiedChanged { .. } => {}
+            }
+        }
+        all
+    }
+
+    /// The names serde itself holds for the variants of the enum `T` (what its derived
+    /// `Deserialize` tells `deserialize_enum`; an alias is in the list too). A variant list
+    /// written by hand, or the `match` of [`every_kind`], cannot be trusted to be complete.
+    fn serde_variants<T: serde::de::DeserializeOwned>() -> Vec<&'static str> {
+        use serde::de::{Deserializer, Error as _, Visitor};
+        struct Probe<'a>(&'a std::cell::RefCell<Vec<&'static str>>);
+        impl<'de> Deserializer<'de> for Probe<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_enum<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                variants: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0.borrow_mut().extend_from_slice(variants);
+                Err(Self::Error::custom("probe"))
+            }
+            fn deserialize_any<V: Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(Self::Error::custom("not an enum"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+                struct identifier ignored_any
+            }
+        }
+        let seen = std::cell::RefCell::new(Vec::new());
+        let _ = T::deserialize(Probe(&seen));
+        seen.into_inner()
+    }
+
+    /// The serde name of a variant of an externally tagged enum value: the string of a unit
+    /// variant, the one key of the others.
+    fn serde_variant_of<T: serde::Serialize>(value: &T) -> String {
+        match serde_json::to_value(value).expect("json") {
+            serde_json::Value::String(name) => name,
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                map.keys().next().expect("one key").clone()
+            }
+            other => panic!("not an externally tagged enum value: {other}"),
+        }
+    }
+
+    /// [`every_kind`] holds a value of EVERY variant serde knows. The `match` in it only makes
+    /// the compiler name each variant: a pattern without a value in `all` compiles and the
+    /// loop never meets the kind, so a new kind could skip every check built on the table
+    /// (the review of 2026-10-15). The names come from serde itself, not from this file.
+    #[test]
+    fn every_kind_holds_a_value_of_every_variant_serde_knows() {
+        let mut known = serde_variants::<SystemEvent>();
+        // `MissedCall` is the read-only alias of `Call` (the notice a call line replaced).
+        known.retain(|name| *name != "MissedCall");
+        known.sort_unstable();
+        known.dedup();
+        assert!(known.len() >= 14, "serde told us the variants: {known:?}");
+        let mut held: Vec<String> = every_kind()
+            .iter()
+            .map(|(event, _)| serde_variant_of(event))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        assert_eq!(
+            held, known,
+            "a variant of SystemEvent has no value in every_kind()"
+        );
+    }
+
+    /// The table of [`SystemEvent::is_quiet`]: the four kinds of the user's answer are quiet
+    /// (a safety number, a refreshed session, a changed number, an accepted request) and the
+    /// verification notice of P5a (quiet like the safety-number notice), group
+    /// changes (a member who left among them), timer changes and calls are not; no other body
+    /// is. The serialised form of the quiet kinds starts with the bytes the SQL rule reads
+    /// (`messages.quiet`), and no other kind starts with them.
+    #[test]
+    fn quiet_notices_are_the_four_kinds_and_serde_spells_them_as_the_sql_reads_them() {
+        const PREFIXES: [&str; 5] = [
+            r#"{"System":{"IdentityKeyChanged":"#,
+            r#"{"System":{"SessionRefreshed":"#,
+            r#"{"System":{"NumberChanged":"#,
+            r#"{"System":{"VerifiedChanged":"#,
+            r#"{"System":"MessageRequestAccepted"}"#,
+        ];
+        let mut quiet = 0;
+        for (event, expected) in every_kind() {
+            let body = Body::System(event.clone());
+            assert_eq!(event.is_quiet(), expected, "{event:?}");
+            assert_eq!(body.is_quiet(), expected, "{event:?}");
+            let json = serde_json::to_string(&body).expect("json");
+            let by_prefix = PREFIXES.iter().any(|p| json.starts_with(p));
+            assert_eq!(by_prefix, expected, "the SQL prefix rule on {json}");
+            quiet += usize::from(expected);
+        }
+        assert_eq!(quiet, 5);
+        for body in [
+            Body::text("hello"),
+            Body::Placeholder(Placeholder::Expired),
+            Body::Unsupported {
+                kind_hint: "payment".into(),
+                summary: None,
+            },
+        ] {
+            assert!(!body.is_quiet(), "{body:?}");
+        }
+    }
 
     #[test]
     fn origin_helpers() {

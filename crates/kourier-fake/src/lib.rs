@@ -18,6 +18,15 @@
 //! The fake names the attachments of own messages
 //! (`Network::attachment_net_ids`) like those it delivers ([`scripts::attachment_name`]).
 //!
+//! Roaming settings (A10a): the fake plays a network that writes the archive, pin, mute and
+//! marked-unread settings it keeps for the account's other devices. [`Script::roaming_writes`]
+//! is what it states of them in its `AccountCaps` (default `Some(true)`; `None` = it states
+//! nothing, like a network that cannot), `PIN_LIMIT` the number of pins it allows. It keeps
+//! the account's pin list (a new pin goes to the end, archiving unpins, pinning unarchives),
+//! refuses a roaming change while the flag it last stated is not `Some(true)`, obeys
+//! `Command::SetRoamingWrites` by stating its caps again, and applies and acknowledges
+//! `Command::ChangeConversationDurable`.
+//!
 //! - [`scripts`]: one script per network shape for the conformance suite (§7.3).
 //! - [`calls`]: every signal of a call a linked device gets, as a script step, and a script
 //!   that plays them all.
@@ -34,10 +43,22 @@
 //! `DismissHistoryTransfer` as the contract says. [`FakeNetwork::with_history`] changes what
 //! the descriptor says about history.
 //!
+//! The fake that plays Telegram (KT-1b, `FakeNetwork::playing(NetworkKind::Telegram, ..)`; no
+//! Telegram code is in this crate): the `phone` login flow is a table of accounts keyed on the
+//! DIGITS the person types ([`PhoneLoginScript`], [`PhoneAccount`]): a refusal at `phone`, the code
+//! with its delivery and the wait before a new one, the two-step password, a login e-mail; a number
+//! in no row fails at `registration`. A QR scan is followed by the password of the account the
+//! phone scans in, and only then by the check of its number (TDLib's order). [`telegram`] holds
+//! what the run tool's rehearsal plays (`FakeNetwork::rehearsal_telegram()`: a first QR code nobody
+//! scans, the second linking with the password, a direct chat and a basic group served on link)
+//! and its synthetic constants, and `telegram_features`, the features the Telegram backend states.
+//!
 //! Own sends: `Command::Transmit` is answered from the script's [`TransmitRule`]s; accepted copies
 //! go to a durable server log that doubles as send progress (a resend skips recipients that have
-//! the message), readable with [`server_log`]. Rows the core refuses for good are quarantined by
-//! the forwarder's poison policy.
+//! the message), readable with [`server_log`]. The log is keyed by the message's id, the recipient
+//! and the CONVERSATION (K-B1: a network with random ids may meet one id in two chats, and those
+//! are two messages; a row an older build logged has no conversation and counts for any chat).
+//! Rows the core refuses for good are quarantined by the forwarder's poison policy.
 //!
 //! Kill points (§10.4, `KOURIER_FAILPOINT`): [`FAILPOINT_AFTER_INBOX_COMMIT`],
 //! [`FAILPOINT_BEFORE_ACK`], [`FAILPOINT_AFTER_BACKEND_EFFECTS_COMMIT`],
@@ -50,17 +71,24 @@ pub mod conformance;
 pub mod fixture;
 mod flavor;
 mod network;
+pub mod rehearsal;
+mod safety;
 mod script;
 pub mod scripts;
+pub mod telegram;
+mod upload;
 
 pub use actor::{
     FAILPOINT_AFTER_BACKEND_EFFECTS_COMMIT, FAILPOINT_AFTER_INBOX_COMMIT,
     FAILPOINT_AFTER_SERVER_ACCEPT, FAILPOINT_BEFORE_ACK, Job, MIGRATIONS, ServerDelivery, job_log,
     server_log,
 };
-pub use flavor::Flavor;
-pub use network::{FakeControl, FakeNetwork, TransmitRecord};
+pub use flavor::{Flavor, WHATSAPP_LIKE_BUDGET};
+pub use network::{AbortRecord, FakeControl, FakeNetwork, TransmitRecord};
+pub use rehearsal::{Arrival, ArriveError, PhoneAct};
 pub use script::{
-    BackfillScript, CHALLENGE_TOKEN, Delivery, LoginScript, Script, ScriptError, Step,
-    TransferScript, TransmitRule, challenge_error, challenge_error_after,
+    BackfillScript, CHALLENGE_TOKEN, Delivery, EMOJI_FOR, FAKE_EMOJI, LoginScript, PIN_LIMIT,
+    PairCodeScript, PasswordScript, PhoneAccount, PhoneLoginScript, SafetyScript, Script,
+    ScriptError, Step, TransferScript, TransmitRule, UploadScript, challenge_error,
+    challenge_error_after,
 };

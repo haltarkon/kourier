@@ -21,36 +21,39 @@ use std::time::{Duration, Instant};
 
 use kourier_core::facade::Progress;
 use kourier_core::facade::{
-    AccountRow as CoreAccount, ActionSubject, ConversationCursor, ConversationDetail,
-    ConversationListQuery, ConversationRow as CoreConversation, CoreError, ExpiryPolicy,
-    FilePlanQuery, MessageActions, MessageRevisions, MessageRow as CoreMessage, OriginKind, Query,
-    QueryData, QueryToken, QuoteState as CoreQuoteState, Refusal, RefusedFiles, RequestId,
-    TimelineAnchor, TimelineCursor, TimelinePage, TimelineQuery, UiCommand, UiEvent,
+    AccountRow as CoreAccount, ActionSubject, BackendNotice, ConversationCursor,
+    ConversationDetail, ConversationListQuery, ConversationRow as CoreConversation, CoreError,
+    ExpiryPolicy, FilePlanQuery, MessageActions, MessageRevisions, MessageRow as CoreMessage,
+    OriginKind, Query, QueryData, QueryToken, QuoteState as CoreQuoteState, Refusal, RefusedFiles,
+    RequestId, TimelineAnchor, TimelineCursor, TimelinePage, TimelineQuery, UiCommand, UiEvent,
 };
 use kourier_model::{
-    AccountId, AccountState, AttachmentId, AttachmentKind, AttachmentState, Body, ConnState,
-    ConvKind, ConversationId, ErrorKind, FailReason, HistoryTransfer, LoginStep, LoginStepKind,
-    MessageId, NetworkKind, OutgoingState, ReadState, Redacted, SendPhase, Text, UserAction,
-    UserId,
+    AccountHold, AccountId, AccountState, AttachmentId, AttachmentKind, AttachmentState, Body,
+    ConnState, ConvKind, ConversationId, ErrorKind, FailReason, HistoryTransfer, LoginStep,
+    LoginStepKind, MessageId, NetworkKind, OutgoingState, ReadState, Redacted, SendPhase, Text,
+    UserAction, UserId,
 };
 
 use crate::account_actions::{AccountAction, LogoutNotice};
 use crate::conversations::{
-    AccountRow, AccountStatus, Banner, BannerKind, ChatHeader, ConversationFilter, ConversationRow,
-    PreviewSource, account_banner, network_icon, network_name, timer_menu, timer_secs, timer_span,
+    AccountRow, AccountStatus, AccountTable, Banner, BannerContext, BannerKind, Banners,
+    ChatHeader, ConversationFilter, ConversationRow, Hidden, PreviewSource, TableAccount,
+    account_banner, history_lost_banner, hold_banner, network_icon, network_missing_banner,
+    network_name, network_off_banner, shown_archived, timer_menu, timer_secs, timer_span,
     typing_label,
 };
 use crate::edit::EditForm;
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules, refused_notice};
-use crate::i18n::{trc, trfc, trnc};
-use crate::login::{LoginView, LoginViewKind, NetworkChoice, login_view};
+use crate::i18n::{trc, trfc};
+use crate::login::{LoginView, LoginViewKind, NetworkChoice, NetworkMissing, login_view};
 use crate::media::{self, MediaVariant};
 use crate::names::{NameMap, Names, fallback_name, first_name, single_line};
 use crate::preview::{self, Summary};
 use crate::readmore::ReadMore;
 use crate::source::{
-    EditTarget, FinishedSend, MediaAnswer, RefusedSend, ReturnedFile, RevisionList, RevisionRow,
-    SendOutcome, SourceError, UiSource,
+    EditTarget, FinishedSend, GroupUpdate, MediaAnswer, PersonUpdate, RefusedSend, ReplaceNews,
+    ReturnedFile, RevisionList, RevisionRow, SaveAnswer, SaveFailure, SaveOutcome, SendOutcome,
+    SourceError, UiSource,
 };
 use crate::time::{Calendar, TimeContext};
 use crate::timeline::{
@@ -75,6 +78,19 @@ pub const MODEL_FILE_PLAN: u32 = 5;
 pub const MODEL_REVISIONS: u32 = 6;
 /// Query model id of the core's own settings (what the settings page chooses there).
 pub const MODEL_SETTINGS: u32 = 7;
+/// Query model id of the quiet-notices choice (the settings page's other core setting; a
+/// tracker of its own, so a choice of one setting never drops the answer of the other).
+pub const MODEL_QUIET: u32 = 8;
+/// Query model id of the person's page in the details panel.
+pub const MODEL_PERSON: u32 = 9;
+/// Query model id of the group's page in the details panel.
+pub const MODEL_GROUP: u32 = 10;
+/// Query model id of the safety-number level of the details panel (P5a; after the five
+/// gallery slots, `MODEL_CHAT_MEDIA` 11-15).
+pub const MODEL_SAFETY: u32 = 16;
+/// The facts a saved file's name is made of (F3b): one query per file, none of them coalesced.
+pub const MODEL_SAVE: u32 = 17;
+pub use media_slots::MODEL_CHAT_MEDIA;
 
 /// Rows per timeline page.
 pub const TIMELINE_PAGE: u32 = 50;
@@ -105,6 +121,28 @@ impl<F: FnMut(UiCommand) -> bool> CommandSink for F {
     }
 }
 
+/// The bytes a backend reported for one file of an own message while its attempt uploads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UploadBytes {
+    /// The message the file belongs to.
+    message: MessageId,
+    /// Plaintext bytes up.
+    done: u64,
+    /// Plaintext bytes this attempt uploads for the file.
+    total: u64,
+}
+
+/// Which way the open chat moved between the inbox and the archive (Signal Desktop's three
+/// rules, `conversations.preload.ts` `conversationsUpdated`): the front-end acts on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveMove {
+    /// Archive -> inbox (a new message brought the chat back, or the phone pinned it): the
+    /// list goes back to the inbox.
+    ToInbox,
+    /// Inbox -> archive (the phone archived the chat that is open): the chat closes.
+    ToArchive,
+}
+
 /// What a model refresh must pick up after an event or a command.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
@@ -117,6 +155,9 @@ pub struct Changes {
     /// Only the lines under the open timeline's messages on their way count time
     /// ([`UiSource::wait_lines`]); the rows are not rebuilt.
     pub waits: bool,
+    /// Only the rings on the files of the open timeline's own messages that wait or upload
+    /// moved ([`UiSource::upload_rows`]); the rows are not rebuilt.
+    pub uploads: bool,
     /// The open conversation's header (or it was closed).
     pub header: bool,
     /// The login page.
@@ -127,8 +168,13 @@ pub struct Changes {
     pub draft: bool,
     /// The open conversation was merged into this one (§3.3): the chat switches to it.
     pub switch_to: Option<ConversationId>,
+    /// The open chat moved between the inbox and the archive (a new message brought it back,
+    /// or the phone archived it) in the list read just applied.
+    pub archive_move: Option<ArchiveMove>,
     /// Answers to `OpenMedia` arrived ([`UiSource::take_media`]).
     pub media: bool,
+    /// Answers to the save calls arrived ([`UiSource::take_saves`]).
+    pub saves: bool,
     /// Scroll to this message of the open timeline and highlight it (a quote was activated;
     /// the message is among the rows now).
     pub jump: Option<MessageId>,
@@ -141,7 +187,16 @@ pub struct Changes {
     pub plan: bool,
     /// The versions of a message arrived ([`UiSource::take_revisions`]).
     pub revisions: bool,
-    /// A setting the core keeps became known or changed ([`UiSource::expiry_policy`]).
+    /// The person's page changed or ended ([`UiSource::take_person`]).
+    pub person: bool,
+    /// The group's page changed or ended ([`UiSource::take_group`]).
+    pub group: bool,
+    /// The safety-number level has a new answer ([`UiSource::take_safety`]).
+    pub safety: bool,
+    /// A gallery slot's rows changed ([`UiSource::take_chat_media`]).
+    pub chat_media: bool,
+    /// A setting the core keeps became known or changed ([`UiSource::expiry_policy`],
+    /// [`UiSource::quiet_notices`]).
     pub settings: bool,
     /// Conversations were merged ([`UiSource::take_merges`]): what waits for a merged-away
     /// chat (the files in its composer) goes on waiting for the one that is left.
@@ -162,16 +217,23 @@ impl Changes {
         conversations: true,
         timeline: true,
         waits: false,
+        uploads: false,
         header: true,
         login: true,
         notice: true,
         draft: false,
         switch_to: None,
+        archive_move: None,
         media: false,
+        saves: false,
         jump: None,
         files: false,
         plan: false,
         revisions: false,
+        person: false,
+        group: false,
+        safety: false,
+        chat_media: false,
         settings: false,
         merged: false,
         transfer: true,
@@ -184,16 +246,23 @@ impl Changes {
             || self.conversations
             || self.timeline
             || self.waits
+            || self.uploads
             || self.header
             || self.login
             || self.notice
             || self.draft
             || self.switch_to.is_some()
+            || self.archive_move.is_some()
             || self.media
+            || self.saves
             || self.jump.is_some()
             || self.files
             || self.plan
             || self.revisions
+            || self.person
+            || self.group
+            || self.safety
+            || self.chat_media
             || self.settings
             || self.merged
             || self.transfer
@@ -205,20 +274,29 @@ impl Changes {
         self.conversations |= other.conversations;
         self.timeline |= other.timeline;
         self.waits |= other.waits;
+        self.uploads |= other.uploads;
         self.header |= other.header;
         self.login |= other.login;
         self.notice |= other.notice;
         self.draft |= other.draft;
         self.media |= other.media;
+        self.saves |= other.saves;
         self.files |= other.files;
         self.plan |= other.plan;
         self.revisions |= other.revisions;
+        self.person |= other.person;
+        self.group |= other.group;
+        self.safety |= other.safety;
+        self.chat_media |= other.chat_media;
         self.settings |= other.settings;
         self.merged |= other.merged;
         self.transfer |= other.transfer;
         self.account_notice |= other.account_notice;
         if other.switch_to.is_some() {
             self.switch_to = other.switch_to;
+        }
+        if other.archive_move.is_some() {
+            self.archive_move = other.archive_move;
         }
         if other.jump.is_some() {
             self.jump = other.jump;
@@ -343,6 +421,22 @@ enum Fetch {
 /// whole seconds; a read right at the instant could still see the old answer).
 const FLAGS_SLACK: Duration = Duration::from_millis(250);
 
+/// The text the composer sent last, kept so that a refusal of THAT send can give the text
+/// back. The core's `ActionFailed` for a `SendText` names the conversation and nothing more, and
+/// the composer is not the only front-end that sends: the desktop's inline reply sends
+/// `SendText` too. So the entry is taken only by a failure for its own conversation, and it is
+/// forgotten once the core has stored the send ([`CoreSource::forget_stored_send`]), or a
+/// refusal of someone else's send would put an old, long sent text back into a draft.
+struct LastSent {
+    conv: ConversationId,
+    text: String,
+    reply: Option<MessageId>,
+    /// The newest row the open timeline held when the text was sent (`None`: the chat was not
+    /// open and loaded at its newest messages, so no timeline can tell that the send was
+    /// stored). A row of this device above it is the stored send.
+    after: Option<MessageId>,
+}
+
 /// The open conversation's loaded rows.
 #[derive(Clone, Debug, Default)]
 struct Window {
@@ -382,6 +476,73 @@ struct Login {
     /// The page ended because the core has the account ([`CoreSource::end_link_page`]):
     /// the backend's later steps of this login (its tail, its `Done`) change nothing.
     ended_linked: bool,
+    /// The id of the flow this login runs (`qr`, `pair-code`).
+    flow: String,
+    /// What was typed into the last input step that was answered, for the same step of the
+    /// next try ("Try Again" after a refused number, a switch of the flow and back).
+    typed: Option<Typed>,
+}
+
+/// What a person typed into an input step of a login (a phone number). It lives in memory only
+/// while the link page's login does, and it never prints.
+#[derive(Clone)]
+struct Typed {
+    /// The step it answered.
+    step_id: String,
+    /// `(field id, value)`.
+    values: Vec<(String, Redacted<String>)>,
+}
+
+impl std::fmt::Debug for Typed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Typed")
+            .field("step_id", &self.step_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long a pushed message history may go without a batch before the banner and the hold on
+/// "Clear" and "Delete" let go of it (ms): the phone may have gone away, and nothing says so.
+/// Later pieces (a chat's older messages asked for) show no banner of their own.
+pub const HISTORY_FILL_IDLE_MS: i64 = 5 * 60_000;
+
+/// What an account whose network pushes its history is waiting for.
+#[derive(Clone, Copy)]
+struct HistoryFill {
+    /// The latest progress a batch reported (0 … 1), when it gave one.
+    fraction: Option<f32>,
+    /// When the last batch came (ms).
+    last_batch: i64,
+}
+
+/// Which banner of the accounts a call asks for ([`CoreSource::banner_of`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BannerSort {
+    /// The most pressing state.
+    State,
+    /// The most pressing history transfer, of any account.
+    Transfer,
+    /// The most pressing history transfer of the SHOWN accounts alone.
+    ShownTransfer,
+}
+
+/// A replace under way: the account being replaced and how many `AddAccount`s were waiting
+/// ahead of the replace's own.
+#[derive(Clone, Copy, Debug)]
+struct Replacing {
+    old: AccountId,
+    ahead: usize,
+}
+
+/// A replace whose account the core announced ([`ReplaceNews::Answered`]): kept until that
+/// account is visible or gone, so that a cancel or a failure of its link after the
+/// announcement still ends the replace ([`ReplaceNews::Ended`]).
+#[derive(Clone, Copy, Debug)]
+struct Announced {
+    old: AccountId,
+    new: AccountId,
+    /// An accounts answer has listed the new account: one that no longer does means it went.
+    seen: bool,
 }
 
 /// What [`CoreSource::new`] needs besides the sink.
@@ -410,6 +571,9 @@ pub struct CoreSource {
     accounts_q: QueryTracker,
     accounts: Vec<CoreAccount>,
     conn: HashMap<AccountId, ConnState>,
+    /// The send hold of each account as the last event or query said (like `conn`: the live
+    /// state wins over a row that is older).
+    holds: HashMap<AccountId, Option<AccountHold>>,
     account_errors: HashSet<AccountId>,
 
     list_q: QueryTracker,
@@ -452,6 +616,14 @@ pub struct CoreSource {
     /// `AddAccount`s sent whose `AccountAdded` has not arrived yet, oldest first (the core
     /// answers them in order); `true` once the user cancelled that login.
     adds: VecDeque<bool>,
+    /// The replace ("Transfer History from Phone…") under way: whose `AddAccount` is its own
+    /// login (blended chats: the choice of the replaced account passes to the id that login
+    /// gets, and to no other login's).
+    replacing: Option<Replacing>,
+    /// What became of the replace's login, for [`UiSource::take_replace_news`].
+    replace_news: Vec<ReplaceNews>,
+    /// The replace whose account the core announced, until it is visible or gone.
+    announced: Option<Announced>,
     /// Accounts whose login was cancelled before the core announced them: their steps are
     /// ignored.
     cancelled: HashSet<AccountId>,
@@ -462,6 +634,15 @@ pub struct CoreSource {
     /// Chats an imported history still fills (`UiEvent::HistoryProgress` with more to
     /// come) → their account: clearing or deleting them waits (link feedback L3).
     filling: HashMap<ConversationId, AccountId>,
+    /// Accounts whose network pushes the history (no `history_transfer`) and that have chats
+    /// filling: the latest fraction and when the last batch came. No batch for
+    /// [`HISTORY_FILL_IDLE_MS`] ends it (a phone that went away leaves no end to wait for).
+    fills: HashMap<AccountId, HistoryFill>,
+    /// Accounts the backend told this session that part of their pushed history never arrived
+    /// (`BackendNotice::HistoryLost`): the quiet line of their banner. Memory only: the backend
+    /// tells it once per start, until the core took the notice, so a restart does not show it
+    /// again. Cleared with the account (removed, logged out).
+    lost_history: HashSet<AccountId>,
     /// Conversations merged away this session → the surviving one (§3.3).
     merged: HashMap<ConversationId, ConversationId>,
     /// Merges the composer has not heard of yet: `(merged away, surviving)`, oldest first.
@@ -470,29 +651,60 @@ pub struct CoreSource {
     /// What happens to disappearing messages while the clock is unconfirmed (§9.6), as the
     /// core holds it; `None` until its first answer.
     expiry: Option<ExpiryPolicy>,
+    quiet_q: QueryTracker,
+    /// Whether quiet notices count for the conversation list, as the core holds it (`true`:
+    /// shown); `None` until its first answer.
+    quiet: Option<bool>,
     focused: bool,
     chat_visible: bool,
     presence_sent: Option<(bool, Option<ConversationId>)>,
     last_marked: Option<(ConversationId, MessageId)>,
     typing_sent: Option<(ConversationId, i64)>,
     drafts: HashMap<ConversationId, String>,
-    /// The last text sent (with the message it replied to), given back to the composer if the
-    /// core refuses it.
-    last_sent: Option<(ConversationId, String, Option<MessageId>)>,
+    /// The last text the composer sent, given back to the composer if the core refuses that
+    /// send ([`LastSent`]).
+    last_sent: Option<LastSent>,
     notice: String,
     stopped: bool,
     /// Resolves avatar files to URLs (none: no avatars, the UI shows initials).
     avatars: Option<Box<dyn AvatarUrls>>,
     /// A row was built while its avatar was still being prepared: rebuild on a tick.
     avatars_waiting: std::cell::Cell<bool>,
+    /// The instant of the last [`UiSource::tick`], to see which instants of the banners have
+    /// passed since ([`Self::banner_instants`]).
+    last_tick: Option<i64>,
     /// Live download progress of the open timeline's attachments (`Progress::Download`).
     downloads: HashMap<AttachmentId, f32>,
     /// The step of each running send of the open timeline (`Progress::Transmit`'s phase, link
     /// feedback L6): ephemeral, kept while the row says its attempt runs, for the line under
     /// the message.
     send_phases: HashMap<MessageId, SendPhase>,
+    /// The bytes of each file of the open timeline's own messages that a backend reports
+    /// while its attempt uploads (`Progress::Upload`): ephemeral, kept while the row says its
+    /// attempt runs, dropped for a message when its uploads are over. The rings and the line
+    /// "Uploading 45% · 12 of 30 MB" are built from it.
+    uploads: HashMap<AttachmentId, UploadBytes>,
+    /// The message and the text of the note "Already sent" (the X came too late), while it is
+    /// the composer's notice: its Delete for Everyone acts on that message.
+    too_late: Option<(MessageId, String)>,
     /// Answers to `OpenMedia` not taken yet.
     media_answers: Vec<MediaAnswer>,
+    /// The save calls: what each `SaveFacts` query in flight is for, by its generation.
+    save_asks: HashMap<u64, SaveAsk>,
+    /// The generation of the next `SaveFacts` query.
+    save_next: u64,
+    /// The files whose `SaveAttachment` the core has not answered yet: ONE run per attachment,
+    /// because the core's answers name the attachment only.
+    save_runs: HashMap<AttachmentId, SaveRun>,
+    /// Runs of an attachment whose earlier save is still in flight, in the order they were asked;
+    /// the next one starts when the one in flight ends (the core serves its saves in order).
+    save_waiting: HashMap<AttachmentId, VecDeque<SaveRun>>,
+    /// The batches that wait for their files, by number.
+    save_batches: HashMap<u64, SaveBatch>,
+    /// The number of the next batch.
+    save_batch_next: u64,
+    /// Answers to the save calls not taken yet.
+    save_answers: Vec<SaveAnswer>,
     /// Files of every `SendFiles` the core did not take, oldest first, until the composer
     /// takes them back (several can wait: a send that went out again without the refused
     /// files may be refused once more before the composer looked).
@@ -518,6 +730,47 @@ pub struct CoreSource {
     /// The message whose edit history is on screen: asked about again when the open
     /// conversation changes.
     revisions_shown: Option<MessageId>,
+    person_q: QueryTracker,
+    /// The person the details panel shows, as asked (the canonical id once an answer named it).
+    person_shown: Option<(AccountId, UserId)>,
+    /// The chat the person's page was opened from (the open chat): the page ends with it, and a
+    /// merge moves it. NOT the person's own 1:1 chat unless the page was opened from that chat:
+    /// opened from a group's member list, the removal of her (maybe hidden) chat ends nothing
+    /// (people pages P2, F9).
+    person_origin: Option<ConversationId>,
+    /// Which person each query in flight was sent for: query generation → person.
+    person_sent: HashMap<u64, (AccountId, UserId)>,
+    person_answer: Option<PersonUpdate>,
+    /// The page last handed to the front end: an answer equal to it changes nothing (a message in
+    /// a busy group asks the page again, and nearly every answer is the same).
+    person_last: Option<crate::person::PersonView>,
+    group_q: QueryTracker,
+    /// The group the details panel shows (its account, its conversation): also the page's origin.
+    group_shown: Option<(AccountId, ConversationId)>,
+    /// Which group each query in flight was sent for: query generation → group.
+    group_sent: HashMap<u64, (AccountId, ConversationId)>,
+    group_answer: Option<GroupUpdate>,
+    /// As `person_last`, for the group's page.
+    group_last: Option<crate::group::GroupView>,
+    /// The safety-number level (P5a): one query in flight; a re-ask while one runs is asked
+    /// once after it (critic F16).
+    safety_q: QueryTracker,
+    /// The person whose number the level shows.
+    safety_shown: Option<(AccountId, UserId)>,
+    /// Which person each query in flight was sent for: query generation → person.
+    safety_sent: HashMap<u64, (AccountId, UserId)>,
+    safety_answer: Option<crate::safety::SafetyView>,
+    /// The level last handed over: an equal answer changes nothing.
+    safety_last: Option<crate::safety::SafetyView>,
+    /// The key the level last SHOWED, held through answers without a number (the account
+    /// stopped, a query failed) so a swap across them is still a swap (V3); a click sets it to
+    /// the key it acts on (W3); forgotten by a refusal (which has its own line), a new request
+    /// and the close.
+    safety_key: Option<kourier_model::IdentityFingerprint>,
+    /// The line of a refused click, shown with the next answer.
+    safety_notice: String,
+    /// The gallery of a chat in five places: four of the details panel and the picture viewer's own (people pages P4).
+    media: media_slots::MediaSlots,
     /// The history transfers of the accounts, as last reported (`UiEvent::HistoryTransfer`).
     transfers: TransferBook,
     /// What to say once about transfers that ended, until the front-end takes it.
@@ -595,6 +848,7 @@ impl CoreSource {
             accounts_q: QueryTracker::new(MODEL_ACCOUNTS),
             accounts: Vec::new(),
             conn: HashMap::new(),
+            holds: HashMap::new(),
             account_errors: HashSet::new(),
             list_q: QueryTracker::new(MODEL_CONVERSATIONS),
             list: Vec::new(),
@@ -620,9 +874,14 @@ impl CoreSource {
             typing: HashMap::new(),
             login: None,
             adds: VecDeque::new(),
+            replacing: None,
+            replace_news: Vec::new(),
+            announced: None,
             cancelled: HashSet::new(),
             unfinished_links: HashSet::new(),
             filling: HashMap::new(),
+            fills: HashMap::new(),
+            lost_history: HashSet::new(),
             merged: HashMap::new(),
             focused: false,
             chat_visible: false,
@@ -635,9 +894,19 @@ impl CoreSource {
             stopped: false,
             avatars: None,
             avatars_waiting: std::cell::Cell::new(false),
+            last_tick: None,
             downloads: HashMap::new(),
             send_phases: HashMap::new(),
+            uploads: HashMap::new(),
+            too_late: None,
             media_answers: Vec::new(),
+            save_asks: HashMap::new(),
+            save_next: 1,
+            save_runs: HashMap::new(),
+            save_waiting: HashMap::new(),
+            save_batches: HashMap::new(),
+            save_batch_next: 1,
+            save_answers: Vec::new(),
             refused_files: VecDeque::new(),
             next_request: 0,
             preparing: HashMap::new(),
@@ -652,9 +921,30 @@ impl CoreSource {
             revisions_sent: HashMap::new(),
             revisions_answer: None,
             revisions_shown: None,
+            person_q: QueryTracker::new(MODEL_PERSON),
+            safety_q: QueryTracker::new(MODEL_SAFETY),
+            safety_shown: None,
+            safety_sent: HashMap::new(),
+            safety_answer: None,
+            safety_last: None,
+            safety_key: None,
+            safety_notice: String::new(),
+            person_shown: None,
+            person_origin: None,
+            person_sent: HashMap::new(),
+            person_answer: None,
+            person_last: None,
+            group_q: QueryTracker::new(MODEL_GROUP),
+            group_shown: None,
+            group_sent: HashMap::new(),
+            group_answer: None,
+            group_last: None,
+            media: media_slots::MediaSlots::new(),
             merges: Vec::new(),
             settings_q: QueryTracker::new(MODEL_SETTINGS),
             expiry: None,
+            quiet_q: QueryTracker::new(MODEL_QUIET),
+            quiet: None,
             transfers: TransferBook::default(),
             transfer_notices: Vec::new(),
             replace_asked: None,
@@ -715,8 +1005,21 @@ impl CoreSource {
 
     /// Asks the core for the settings it keeps.
     fn request_settings(&mut self) {
+        self.request_expiry();
+        self.request_quiet();
+    }
+
+    /// Asks the core which option holds for disappearing messages while the clock is
+    /// unconfirmed.
+    fn request_expiry(&mut self) {
         let t = self.settings_q.request();
         self.query(t, || Query::ExpiryPolicy);
+    }
+
+    /// Asks the core whether quiet notices count for the conversation list.
+    fn request_quiet(&mut self) {
+        let t = self.quiet_q.request();
+        self.query(t, || Query::QuietNotices);
     }
 
     fn request_detail(&mut self) {
@@ -846,6 +1149,82 @@ impl CoreSource {
             .map_or(NetworkKind::Fake, |a| a.network)
     }
 
+    /// Takes the oldest waiting `AddAccount` off the queue (`Some(true)`: the user cancelled
+    /// that login) and tells the replace under way, if that was its own login's, how it went:
+    /// `answered` is the id the core announced, `None` when the add failed.
+    fn pop_add(&mut self, answered: Option<AccountId>) -> Option<bool> {
+        let cancelled = self.adds.pop_front();
+        if let Some(r) = self.replacing.as_mut() {
+            if r.ahead == 0 {
+                let old = r.old;
+                self.replacing = None;
+                self.replace_news.push(match (cancelled, answered) {
+                    (Some(false), Some(new)) => {
+                        self.announced = Some(Announced {
+                            old,
+                            new,
+                            seen: false,
+                        });
+                        ReplaceNews::Answered { old, new }
+                    }
+                    _ => ReplaceNews::Ended { old },
+                });
+            } else {
+                r.ahead -= 1;
+            }
+        }
+        cancelled
+    }
+
+    /// The announced account of a replace will not come (its link was cancelled or failed, or
+    /// it is gone): the replace ends. `true` when that was the replace's account (the caller
+    /// returns `Changes { accounts: true, .. }` so the choice is pruned at once).
+    fn end_announced(&mut self, account: AccountId) -> bool {
+        match self.announced {
+            Some(a) if a.new == account => {
+                self.announced = None;
+                self.replace_news.push(ReplaceNews::Ended { old: a.old });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// An accounts answer: the announced account of a replace that is visible now passes to
+    /// the choice (nothing more to keep); one that is gone after an answer listed it ends the
+    /// replace. `true` when news was pushed.
+    fn follow_announced(&mut self, rows: &[CoreAccount]) -> bool {
+        let Some(a) = self.announced.as_mut() else {
+            return false;
+        };
+        match rows.iter().find(|r| r.id == a.new) {
+            Some(r) if !matches!(r.state, AccountState::Linking | AccountState::Removing) => {
+                self.announced = None;
+                false
+            }
+            Some(_) => {
+                a.seen = true;
+                false
+            }
+            // An answer read before the announcement may lack it: only one after an answer
+            // that listed it says it went.
+            None if a.seen => {
+                let new = a.new;
+                self.end_announced(new)
+            }
+            None => false,
+        }
+    }
+
+    /// The filter's hidden uuids as this source's account ids, for one call: `Unknown` until
+    /// the accounts answered ([`UiSource::accounts_known`]).
+    fn resolve_hidden(&self, filter: &ConversationFilter) -> Hidden {
+        filter.resolve(
+            self.accounts.iter().map(|a| (a.id, a.uuid)),
+            self.accounts_known(),
+        )
+    }
+
     fn visible_accounts(&self) -> impl Iterator<Item = &CoreAccount> {
         self.accounts
             .iter()
@@ -893,18 +1272,31 @@ impl CoreSource {
                         // A fresh query is newer than the last state event only when no event
                         // came; keep live states, take queried ones for new accounts.
                         self.conn.entry(a.id).or_insert_with(|| a.conn.clone());
+                        self.holds.entry(a.id).or_insert(a.hold);
                     }
                     self.conn.retain(|id, _| rows.iter().any(|a| a.id == *id));
+                    self.holds.retain(|id, _| rows.iter().any(|a| a.id == *id));
                     // An account found logged out (at a start, or when its state event was
                     // lost): the backend deleted a transfer that ran with the login.
+                    self.fills.retain(|id, _| rows.iter().any(|a| a.id == *id));
+                    self.lost_history
+                        .retain(|id| rows.iter().any(|a| a.id == *id));
+                    self.filling
+                        .retain(|_, id| rows.iter().any(|a| a.id == *id));
                     for a in rows {
                         if matches!(a.state, AccountState::LoggedOut { .. }) {
+                            self.fills.remove(&a.id);
+                            self.lost_history.remove(&a.id);
                             self.filling.retain(|_, f| *f != a.id);
                             ch.transfer |= self.transfers.logged_out(a.id)
                                 | self.transfers.forget_progress(a.id);
                         }
                     }
+                    // (`ch.accounts` is set below for every answer.)
+                    let _ended = self.follow_announced(rows);
                     self.accounts = rows.clone();
+                    ch.person |= self.end_person_unless_usable();
+                    ch.group |= self.end_group_unless_usable();
                     ch.accounts = true;
                     ch.conversations = true;
                     ch.login |= self.end_link_page();
@@ -970,7 +1362,11 @@ impl CoreSource {
                         // list keeps up with a stream of changes instead of freezing until
                         // it ends); then the next read is on its way.
                         (overtaken, None) => {
+                            ch.archive_move = archive_move(self.open, &self.list, &rows);
+                            // (A gallery follows the list's `protected`: S-P, media_slots.rs.)
+                            let withheld = self.hidden_media_slots();
                             self.list = rows;
+                            ch.chat_media |= self.rerun_media_slots(&withheld);
                             self.list_restarts = 0;
                             ch.conversations = true;
                             ch.accounts = true;
@@ -1095,6 +1491,161 @@ impl CoreSource {
                 let t = self.settings_q.follow_up();
                 self.query(t, || Query::ExpiryPolicy);
             }
+            MODEL_QUIET => {
+                if self.quiet_q.complete(token) == Completion::Apply
+                    && let Ok(QueryData::QuietNotices(shown)) = result
+                    && self.quiet != Some(*shown)
+                {
+                    self.quiet = Some(*shown);
+                    ch.settings = true;
+                }
+                let t = self.quiet_q.follow_up();
+                self.query(t, || Query::QuietNotices);
+            }
+            MODEL_PERSON => {
+                let asked = self.person_sent.remove(&token.generation);
+                if self.person_q.complete(token) == Completion::Apply
+                    && let Some(asked) = asked
+                    && self.person_shown.as_ref().is_some_and(|s| *s == asked)
+                {
+                    match result {
+                        Ok(QueryData::Person(Some(detail))) => {
+                            // The answer names the canonical person (an alias is resolved).
+                            self.person_shown = Some((detail.account, detail.user.clone()));
+                            let network = self
+                                .accounts
+                                .iter()
+                                .find(|a| a.id == detail.account)
+                                .map_or(NetworkKind::Signal, |a| a.network);
+                            let mut view = crate::person::person_view(detail, network, &|blob| {
+                                self.avatar_url(detail.account, blob)
+                            });
+                            // The failure of her chat's timer stays on her page through the
+                            // refreshes (F4); a new ask forgot it with `person_last`.
+                            if let Some(last) = self.person_last.as_ref()
+                                && last.account == view.account
+                                && last.user == view.user
+                                && last.chat == view.chat
+                            {
+                                view.timer_failed.clone_from(&last.timer_failed);
+                            }
+                            // The same page again (a message in some group asked): nothing to
+                            // tell the front end.
+                            if self.person_last.as_ref() != Some(&view) {
+                                self.person_last = Some(view.clone());
+                                self.person_answer = Some(PersonUpdate::Show(Box::new(view)));
+                                ch.person = true;
+                            }
+                        }
+                        // The core no longer has the account (or the query failed): nothing
+                        // to show.
+                        _ => {
+                            self.person_answer = Some(PersonUpdate::Ended);
+                            self.person_shown = None;
+                            self.person_origin = None;
+                            self.person_last = None;
+                            ch.person = true;
+                        }
+                    }
+                }
+                let t = self.person_q.follow_up();
+                self.send_person(t);
+            }
+            MODEL_SAFETY => {
+                let asked = self.safety_sent.remove(&token.generation);
+                if self.safety_q.complete(token) == Completion::Apply
+                    && let Some((account, user)) = asked
+                    && self
+                        .safety_shown
+                        .as_ref()
+                        .is_some_and(|s| *s == (account, user.clone()))
+                {
+                    let (answer, waits) = match result {
+                        Ok(QueryData::SafetyNumber { answer, waits }) => (answer.clone(), *waits),
+                        // The core could not ask (the query failed): as an account that does
+                        // not run.
+                        _ => (Err(kourier_model::SafetyUnavailable::NotRunning), false),
+                    };
+                    let name = self
+                        .person_last
+                        .as_ref()
+                        .filter(|p| p.account == account && p.user == user)
+                        .map_or_else(|| crate::names::fallback_name(&user), |p| p.name.clone());
+                    let mut view = crate::safety::safety_view(account, user, &name, &answer, waits);
+                    // A number that turned into another one under the open level (both known,
+                    // no click in between: `safety_key` is the key last shown, held through
+                    // answers without one, and a click or a refusal forgets it) is said so, and
+                    // the line stays until the next click or the close, also through unrelated
+                    // re-asks (U2, V3). The buttons act on the NEW number, which nobody has
+                    // compared yet.
+                    let swapped = matches!(
+                        (self.safety_key.as_ref(), view.key.as_ref()),
+                        (Some(before), Some(now)) if before != now
+                    );
+                    if swapped {
+                        self.safety_notice = crate::safety::swapped_text();
+                    }
+                    if view.key.is_some() {
+                        self.safety_key.clone_from(&view.key);
+                    }
+                    view.notice.clone_from(&self.safety_notice);
+                    if self.safety_last.as_ref() != Some(&view) {
+                        self.safety_last = Some(view.clone());
+                        self.safety_answer = Some(view);
+                        ch.safety = true;
+                    }
+                }
+                let t = self.safety_q.follow_up();
+                self.send_safety(t);
+            }
+            MODEL_GROUP => {
+                let asked = self.group_sent.remove(&token.generation);
+                if self.group_q.complete(token) == Completion::Apply
+                    && let Some(asked) = asked
+                    && self.group_shown == Some(asked)
+                {
+                    match result {
+                        Ok(QueryData::Group(Some(detail))) => {
+                            let mut view = crate::group::group_view(detail, &|blob| {
+                                self.avatar_url(detail.account, blob)
+                            });
+                            // As on the person's page: the group's timer failure stays (F4).
+                            if let Some(last) = self.group_last.as_ref()
+                                && last.account == view.account
+                                && last.id == view.id
+                            {
+                                view.timer_failed.clone_from(&last.timer_failed);
+                            }
+                            if self.group_last.as_ref() != Some(&view) {
+                                self.group_last = Some(view.clone());
+                                self.group_answer = Some(GroupUpdate::Show(Box::new(view)));
+                                ch.group = true;
+                            }
+                        }
+                        // The group is gone, is no group, or the query failed: nothing to show.
+                        _ => {
+                            self.group_answer = Some(GroupUpdate::Ended);
+                            self.group_shown = None;
+                            self.group_last = None;
+                            ch.group = true;
+                        }
+                    }
+                }
+                let t = self.group_q.follow_up();
+                self.send_group(t);
+            }
+            model if media_slots::slot_of_model(model).is_some() => {
+                if let Some(slot) = media_slots::slot_of_model(model) {
+                    ch.merge(self.on_media_result(slot, token, result));
+                }
+            }
+            MODEL_SAVE => {
+                let facts = match result {
+                    Ok(QueryData::SaveFacts(f)) => f.as_ref(),
+                    _ => None,
+                };
+                ch.merge(self.on_save_facts(token.generation, facts));
+            }
             MODEL_REVISIONS => {
                 let message = self.revisions_sent.remove(&token.generation);
                 if self.revisions_q.complete(token) == Completion::Apply
@@ -1148,6 +1699,146 @@ impl CoreSource {
         });
     }
 
+    /// Sends the query for the person on screen with `token`.
+    fn send_person(&mut self, token: Option<QueryToken>) {
+        let Some(token) = token else { return };
+        let Some((account, user)) = self.person_shown.clone() else {
+            // Nothing is shown any more: the tracker must not wait for this token.
+            self.person_q.reset();
+            return;
+        };
+        self.person_sent
+            .insert(token.generation, (account, user.clone()));
+        self.send(UiCommand::Query {
+            token,
+            query: Query::Person { account, user },
+        });
+    }
+
+    /// Sends the query for the safety number on screen with `token`.
+    fn send_safety(&mut self, token: Option<QueryToken>) {
+        let Some(token) = token else { return };
+        let Some((account, user)) = self.safety_shown.clone() else {
+            // Nothing is shown any more: the tracker must not wait for this token.
+            self.safety_q.reset();
+            return;
+        };
+        self.safety_sent
+            .insert(token.generation, (account, user.clone()));
+        self.send(UiCommand::Query {
+            token,
+            query: Query::SafetyNumber { account, user },
+        });
+    }
+
+    /// The safety number is asked again (a contact or an account changed, a click was
+    /// refused); with one query in flight it is asked once after it (critic F16).
+    fn refresh_safety(&mut self) {
+        if self.safety_shown.is_none() {
+            return;
+        }
+        let t = self.safety_q.request();
+        self.send_safety(t);
+    }
+
+    /// The person's page is read again (the contact, their chat or a group changed).
+    fn refresh_person(&mut self) {
+        if self.person_shown.is_none() {
+            return;
+        }
+        let t = self.person_q.request();
+        self.send_person(t);
+    }
+
+    /// The page ends: nothing of it is asked about or shown any more.
+    fn end_person(&mut self) -> bool {
+        if self.person_shown.take().is_none() {
+            return false;
+        }
+        self.person_origin = None;
+        self.person_sent.clear();
+        self.person_q.reset();
+        self.person_last = None;
+        self.person_answer = Some(PersonUpdate::Ended);
+        true
+    }
+
+    /// The page ends when its account cannot be used any more (removed, unlinking, logged out,
+    /// or not linked yet), judged by the accounts as last read.
+    fn end_person_unless_usable(&mut self) -> bool {
+        let Some((account, _)) = self.person_shown.as_ref() else {
+            return false;
+        };
+        if self.usable(*account) {
+            false
+        } else {
+            self.end_person()
+        }
+    }
+
+    /// Whether the account is linked and in use, judged by the accounts as last read.
+    fn usable(&self, account: AccountId) -> bool {
+        self.accounts
+            .iter()
+            .any(|a| a.id == account && matches!(a.state, AccountState::Active))
+    }
+
+    /// Sends the query for the group on screen with `token`.
+    fn send_group(&mut self, token: Option<QueryToken>) {
+        let Some(token) = token else { return };
+        let Some(shown) = self.group_shown else {
+            // Nothing is shown any more: the tracker must not wait for this token.
+            self.group_q.reset();
+            return;
+        };
+        self.group_sent.insert(token.generation, shown);
+        self.send(UiCommand::Query {
+            token,
+            query: Query::Group(shown.1),
+        });
+    }
+
+    /// The group's page is read again (the group, a member's contact or the accounts changed).
+    fn refresh_group(&mut self) {
+        if self.group_shown.is_none() {
+            return;
+        }
+        let t = self.group_q.request();
+        self.send_group(t);
+    }
+
+    /// The group's page ends: nothing of it is asked about or shown any more.
+    fn end_group(&mut self) -> bool {
+        if self.group_shown.take().is_none() {
+            return false;
+        }
+        self.group_sent.clear();
+        self.group_q.reset();
+        self.group_last = None;
+        self.group_answer = Some(GroupUpdate::Ended);
+        true
+    }
+
+    /// The group's page ends when its account cannot be used any more (as for the person's).
+    fn end_group_unless_usable(&mut self) -> bool {
+        let Some((account, _)) = self.group_shown else {
+            return false;
+        };
+        if self.usable(account) {
+            false
+        } else {
+            self.end_group()
+        }
+    }
+
+    /// Ends the details pages whose origin is among the removed chats; the one rule both pages
+    /// follow (a page opened from a chat ends with that chat and with nothing else).
+    fn end_pages_of(&mut self, ids: &[ConversationId]) -> (bool, bool) {
+        let person = self.person_origin.is_some_and(|o| ids.contains(&o)) && self.end_person();
+        let group = self.group_shown.is_some_and(|(_, g)| ids.contains(&g)) && self.end_group();
+        (person, group)
+    }
+
     /// Sends the wanted revisions query with `token`.
     fn send_revisions(&mut self, token: Option<QueryToken>) {
         let Some(token) = token else { return };
@@ -1198,6 +1889,7 @@ impl CoreSource {
         conv: ConversationId,
         paths: Vec<std::path::PathBuf>,
         as_file: Vec<bool>,
+        with_location: Vec<bool>,
         caption: Option<Text>,
         reply_to: Option<MessageId>,
     ) -> Option<RequestId> {
@@ -1209,6 +1901,7 @@ impl CoreSource {
             request,
             paths: paths.into(),
             as_file,
+            with_location,
             caption,
             reply_to,
         }) {
@@ -1256,7 +1949,27 @@ impl CoreSource {
         true
     }
 
+    /// The core stored the send the composer made last: its row (of this device, above what
+    /// the timeline held at the send) is in a page of the open chat. From then on a refusal for
+    /// that chat is some other send's (the desktop's inline reply), and the entry must not give
+    /// the sent text back. A chat that was not loaded at its newest messages when the text went
+    /// has no baseline and keeps the entry until the next send replaces it.
+    fn forget_stored_send(&mut self, page: &TimelinePage) {
+        let stored = self.last_sent.as_ref().is_some_and(|s| {
+            s.conv == page.conv
+                && s.after.is_some_and(|after| {
+                    page.rows
+                        .iter()
+                        .any(|r| r.origin == OriginKind::OwnThisDevice && r.id > after)
+                })
+        });
+        if stored {
+            self.last_sent = None;
+        }
+    }
+
     fn apply_page(&mut self, page: &TimelinePage, fetch: Fetch) {
+        self.forget_stored_send(page);
         for r in &page.rows {
             if let (Some(a), Some(n)) = (&r.author, &r.author_name) {
                 self.names.insert(a.clone(), n.expose().clone());
@@ -1373,6 +2086,17 @@ impl CoreSource {
                 .map(|r| r.id)
                 .collect();
             self.send_phases.retain(|id, _| running.contains(id));
+        }
+        // Upload bytes too: the next attempt reports its own.
+        if !self.uploads.is_empty() {
+            let running: HashSet<MessageId> = self
+                .window
+                .rows
+                .iter()
+                .filter(|r| r.outbox.as_ref().is_some_and(|o| o.in_flight))
+                .map(|r| r.id)
+                .collect();
+            self.uploads.retain(|_, u| running.contains(&u.message));
         }
     }
 
@@ -1498,6 +2222,7 @@ impl CoreSource {
         self.flags_deadline = None;
         self.downloads.clear();
         self.send_phases.clear();
+        self.uploads.clear();
         self.revisions_shown = None;
         self.send_presence();
         Changes {
@@ -1546,6 +2271,33 @@ impl CoreSource {
         }
     }
 
+    /// The pages of the details panel that show the timer of `conv` say why its last change
+    /// failed (`text`), or, with an empty text, forget it (F4, critic M6): the person's page of
+    /// her 1:1 chat and the group's page. The failure lives in the page the source holds
+    /// (`person_last`, `group_last`), so a refresh carries it on and a new ask for a page
+    /// (which empties them) or the next change of any timer clears it. `conv` `None`: every
+    /// page.
+    fn timer_failure_on_pages(&mut self, conv: Option<ConversationId>, text: &str) -> Changes {
+        let mut ch = Changes::default();
+        if let Some(view) = self.person_last.as_mut()
+            && conv.is_none_or(|c| view.chat == Some(c))
+            && view.timer_failed != text
+        {
+            text.clone_into(&mut view.timer_failed);
+            self.person_answer = Some(PersonUpdate::Show(Box::new(view.clone())));
+            ch.person = true;
+        }
+        if let Some(view) = self.group_last.as_mut()
+            && conv.is_none_or(|c| view.id == c)
+            && view.timer_failed != text
+        {
+            text.clone_into(&mut view.timer_failed);
+            self.group_answer = Some(GroupUpdate::Show(Box::new(view.clone())));
+            ch.group = true;
+        }
+        ch
+    }
+
     /// The loaded row of `message` in the open timeline.
     fn loaded_row(&self, message: Option<MessageId>) -> Option<&CoreMessage> {
         let message = message?;
@@ -1575,12 +2327,20 @@ impl CoreSource {
         let refused_here = failure == Failure::Refused;
         match action {
             "SendText" | "RetryMessage" | "CancelMessage" => {
-                let sent = if action == "SendText" {
-                    self.last_sent.take()
-                } else {
-                    None
+                // The text goes back only when this refusal is of the send the composer made:
+                // the core names the conversation of a refused `SendText`, and a send of
+                // another front-end (the desktop's inline reply) or into another chat is not
+                // ours. The entry stays for its own refusal, which may still come.
+                let sent = match subject {
+                    ActionSubject::Conversation(conv)
+                        if action == "SendText"
+                            && self.last_sent.as_ref().is_some_and(|s| s.conv == *conv) =>
+                    {
+                        self.last_sent.take()
+                    }
+                    _ => None,
                 };
-                let quoted = sent.as_ref().and_then(|(_, _, reply)| *reply);
+                let quoted = sent.as_ref().and_then(|s| s.reply);
                 self.notice = if failure == Failure::Unavailable {
                     trc("@info:status", "Sending messages is not available yet.").into_owned()
                 } else if refused_here && self.quote_gone(quoted) {
@@ -1608,11 +2368,16 @@ impl CoreSource {
                     notice: true,
                     ..Changes::default()
                 };
-                // Nothing is lost: the refused text goes back into the composer.
-                if let Some((conv, text, _)) = sent
+                // Nothing is lost: the refused text goes back into the composer, and is stored
+                // as the chat's draft again. The composer cleared the stored draft before it
+                // sent (`send_text`), and its next `save_draft` of this very text would find it
+                // unchanged and send nothing, so without this a quit keeps nothing of it.
+                if let Some(LastSent { conv, text, .. }) = sent
                     && !self.drafts.contains_key(&conv)
                 {
+                    let draft = crate::composer::outgoing_text(&text);
                     self.drafts.insert(conv, text);
+                    self.send(UiCommand::SaveDraft { conv, draft });
                     ch.draft = self.open == Some(conv);
                     ch.conversations = true;
                 }
@@ -1732,7 +2497,17 @@ impl CoreSource {
                         "The disappearing-message timer could not be changed.",
                     )
                 };
-                self.notice_change(text.into_owned())
+                // The pages that show this chat's timer say it under the selector too: the
+                // notice is the open chat's composer's, hidden under a covering panel and
+                // another chat's for a member's page (F4, critic M6).
+                let mut ch = match subject {
+                    ActionSubject::Conversation(conv) => {
+                        self.timer_failure_on_pages(Some(*conv), &text)
+                    }
+                    _ => Changes::default(),
+                };
+                ch.merge(self.notice_change(text.into_owned()));
+                ch
             }
             // (A failure here is storage or a chat that went away meanwhile: the core
             // refuses neither for a reason of the network.)
@@ -1773,6 +2548,7 @@ impl CoreSource {
             "DownloadAttachment" => self.notice_change(
                 trc("@info:status", "The attachment could not be downloaded.").into_owned(),
             ),
+            "SaveAttachment" => self.on_save_failed(error, subject),
             "OpenMedia" => {
                 self.media_answers
                     .push(MediaAnswer::Failed(subject.attachment()));
@@ -1783,25 +2559,78 @@ impl CoreSource {
             }
             // The oldest `AddAccount` still waiting failed; nothing to show if the user
             // cancelled that login already.
-            "AddAccount" if self.adds.pop_front() == Some(true) => Changes::default(),
-            "AddAccount" => self.login_failed(if failure == Failure::Unavailable {
-                trc(
-                    "@info:status",
-                    "Linking is not available in this build yet.",
-                )
-                .into_owned()
-            } else {
-                trc("@info:status", "The account could not be created.").into_owned()
-            }),
+            "AddAccount" => {
+                let news = self.replace_news.len();
+                let mut ch = if self.pop_add(None) == Some(true) {
+                    Changes::default()
+                } else {
+                    self.login_failed(if failure == Failure::Unavailable {
+                        trc(
+                            "@info:status",
+                            "Linking is not available in this build yet.",
+                        )
+                        .into_owned()
+                    } else {
+                        trc("@info:status", "The account could not be created.").into_owned()
+                    })
+                };
+                // A replace that ended with it: the choice is pruned at once.
+                ch.accounts |= self.replace_news.len() != news;
+                ch
+            }
             // The option could not be stored: it is what it was. The core says which that is,
             // and the settings page shows it again.
             "SetExpiryPolicy" => {
                 self.settings_q.reset();
-                self.request_settings();
+                self.request_expiry();
                 self.notice_change(
                     trc("@info:status", "The setting could not be saved.").into_owned(),
                 )
             }
+            // The same for the quiet notices: the choice is what it was and the core changed
+            // nothing, so the list read behind the command already shows the old order.
+            "SetQuietNotices" => {
+                self.quiet_q.reset();
+                self.request_quiet();
+                self.notice_change(
+                    trc("@info:status", "The setting could not be saved.").into_owned(),
+                )
+            }
+            // A Mark, Clear or Confirm that failed (P5a). ONLY the backend's refusal of a stale
+            // key (`InvalidInput`: the number changed after it was shown) is worded as a changed
+            // number; anything else (the account is not running, the store failed) says the
+            // change was not saved and nothing about the number (U1). Either way the level of
+            // that person asks again and shows what is true now.
+            "SetVerified" | "ConfirmIdentity" => {
+                if let ActionSubject::Person(user) = subject
+                    && self.safety_shown.as_ref().is_some_and(|(_, u)| u == user)
+                {
+                    let stale = matches!(
+                        error,
+                        CoreError::Backend(e) if e.kind == ErrorKind::InvalidInput
+                    );
+                    self.safety_notice = if !stale {
+                        crate::safety::not_saved_text()
+                    } else if action == "ConfirmIdentity" {
+                        crate::safety::refused_text(crate::safety::SafetyAction::Confirm)
+                    } else {
+                        crate::safety::refused_text(crate::safety::SafetyAction::Mark)
+                    };
+                    self.safety_last = None;
+                    self.safety_key = None;
+                    self.refresh_safety();
+                }
+                Changes::default()
+            }
+            // A contact card the core refused (P5c: the chat cannot take it, the person's page
+            // offers no card any more, the account is not running): nothing was queued.
+            "SendContact" => self.notice_change(
+                trc(
+                    "@info:status a contact card was not sent",
+                    "The contact card could not be sent.",
+                )
+                .into_owned(),
+            ),
             // Drafts, typing and read markers fail quietly (they are retried by the next use).
             _ => Changes::default(),
         }
@@ -1827,21 +2656,31 @@ impl CoreSource {
                 .find(|r| r.index == index)
                 .map(|r| r.reason)
         };
-        let as_file = |index: usize| refused.as_file.get(index).copied().unwrap_or(false);
-        // The files the core did not name go out again, each with the choice made for it.
-        let rest: Vec<(std::path::PathBuf, bool)> = paths
+        let flag = |flags: &[bool], index: usize| flags.get(index).copied().unwrap_or(false);
+        // The files the core did not name go out again, each with the choices made for it
+        // (as a file, and the agreement to send it with its location), re-indexed to the rest.
+        let rest: Vec<(std::path::PathBuf, bool, bool)> = paths
             .iter()
             .enumerate()
             .filter(|(i, _)| reason_of(*i).is_none())
-            .map(|(i, p)| (p.clone(), as_file(i)))
+            .map(|(i, p)| {
+                (
+                    p.clone(),
+                    flag(&refused.as_file, i),
+                    flag(&refused.with_location, i),
+                )
+            })
             .collect();
         let named = paths.len() - rest.len();
         let resent_request = if named > 0 && !rest.is_empty() {
-            let (again, flags): (Vec<_>, Vec<_>) = rest.iter().cloned().unzip();
+            let again = rest.iter().map(|r| r.0.clone()).collect();
+            let as_file = rest.iter().map(|r| r.1).collect();
+            let with_location = rest.iter().map(|r| r.2).collect();
             self.send_files_request(
                 conv,
                 again,
-                flags,
+                as_file,
+                with_location,
                 refused.caption.clone(),
                 refused.reply_to,
             )
@@ -1885,11 +2724,10 @@ impl CoreSource {
                 .filter(|(i, _)| resent == 0 || reason_of(*i).is_some())
                 .map(|(i, p)| ReturnedFile {
                     path: p.clone(),
-                    as_file: as_file(i),
+                    as_file: flag(&refused.as_file, i),
                     reason: reason_of(i),
                 })
                 .collect(),
-            caption: if resent == 0 { caption } else { String::new() },
             reply_to: refused.reply_to.filter(|_| resent == 0),
             resent,
             resent_request: resent_request.map(|r| r.0),
@@ -1900,8 +2738,10 @@ impl CoreSource {
     /// Live progress of a download shown in the open timeline: the row is rebuilt when the
     /// shown percentage changes.
     fn on_download_progress(&mut self, attachment: AttachmentId, done: u64, total: u64) -> Changes {
+        // The gallery slots that hold the attachment (people pages P4) show it too.
+        let mut ch = self.media_download_progress(attachment, done, total);
         if self.open.is_none() || total == 0 {
-            return Changes::default();
+            return ch;
         }
         let shown = self
             .window
@@ -1910,14 +2750,12 @@ impl CoreSource {
             .flat_map(|r| attachments_of(&r.body))
             .any(|a| a.id == Some(attachment));
         if !shown {
-            return Changes::default();
+            return ch;
         }
         let p = (done as f64 / total as f64).clamp(0.0, 1.0) as f32;
         let old = self.downloads.insert(attachment, p).unwrap_or(0.0);
-        Changes {
-            timeline: (p * 100.0).floor() != (old * 100.0).floor(),
-            ..Changes::default()
-        }
+        ch.timeline |= (p * 100.0).floor() != (old * 100.0).floor();
+        ch
     }
 
     /// `UiEvent::HistoryTransfer`: where the transfer of `account` stands now. The same
@@ -2029,18 +2867,98 @@ impl CoreSource {
         true
     }
 
-    /// Sends `AddAccount` for `network` and makes its login the one the link page shows.
-    fn add_account(&mut self, network: NetworkKind) -> Result<LoginView, SourceError> {
-        let view = LoginView {
-            kind: LoginViewKind::Waiting,
-            title: trfc(
-                "@title:window page to link an account, %1 the name of a messenger",
-                "Link %1",
-                &[network_name(network)],
+    /// The login flows of `network` as (id, descriptor label), the first is the default.
+    fn flows_of(&self, network: NetworkKind) -> &[(String, String)] {
+        self.networks
+            .iter()
+            .find(|n| n.kind == network)
+            .map_or(&[], |n| n.flows.as_slice())
+    }
+
+    /// The flow a login of `network` starts with: the first one it offers (`qr` for a network
+    /// the list does not know).
+    fn first_flow(&self, network: NetworkKind) -> String {
+        self.flows_of(network)
+            .first()
+            .map_or_else(|| "qr".to_owned(), |(id, _)| id.clone())
+    }
+
+    /// `view` of a login that runs `flow`: names the flow and, where switching is a way on (a
+    /// code to scan, a number to type, a code to enter, or a failure), the other flow of the
+    /// network with the label of the button. A step in the middle of the link (`Progress`, the
+    /// emoji) offers none: a switch there would cancel a link that is nearly made. So does the
+    /// password and the e-mail of Telegram's login and their retries (reached by a QR scan or
+    /// by the phone flow, the account is known by then), and a failure that goes back with "OK"
+    /// (a banned number, a number without an account: the other way fails the same).
+    fn with_flows(&self, mut view: LoginView, network: NetworkKind, flow: &str) -> LoginView {
+        view.flow = flow.to_owned();
+        view.other_flow.clear();
+        view.other_flow_label.clear();
+        let offered = match view.kind {
+            LoginViewKind::Qr | LoginViewKind::Code => true,
+            LoginViewKind::Input => !matches!(
+                view.step_id.as_str(),
+                "password"
+                    | "password-again"
+                    | "email"
+                    | "email-again"
+                    | "email-code"
+                    | "email-code-again"
             ),
-            progress: -1.0,
-            ..LoginView::default()
+            // A link that cannot be tried again leaves for the list instead.
+            LoginViewKind::Failed => view.leave.is_empty(),
+            _ => false,
         };
+        if offered
+            && let Some((id, label)) = self.flows_of(network).iter().find(|(id, _)| id != flow)
+        {
+            view.other_flow = id.clone();
+            view.other_flow_label = crate::login::flow_switch_label(id, label);
+        }
+        view
+    }
+
+    /// `view` with the number typed earlier into the same step put back into its fields.
+    fn with_typed(view: LoginView, typed: Option<&Typed>) -> LoginView {
+        let mut view = view;
+        if let Some(typed) = typed.filter(|t| t.step_id == view.step_id) {
+            for f in &mut view.fields {
+                if let Some((_, value)) = typed.values.iter().find(|(id, _)| *id == f.id) {
+                    f.value = value.expose().clone();
+                }
+            }
+        }
+        view
+    }
+
+    /// The waiting page of a login to `network` that runs `flow`.
+    fn waiting_view(&self, network: NetworkKind, flow: &str) -> LoginView {
+        self.with_flows(
+            LoginView {
+                kind: LoginViewKind::Waiting,
+                title: trfc(
+                    "@title:window page to link an account, %1 the name of a messenger",
+                    "Link %1",
+                    &[network_name(network)],
+                ),
+                progress: -1.0,
+                icon: network_icon(network).to_owned(),
+                ..LoginView::default()
+            },
+            network,
+            flow,
+        )
+    }
+
+    /// Sends `AddAccount` for `network` with `flow` and makes its login the one the link page
+    /// shows.
+    fn add_account(
+        &mut self,
+        network: NetworkKind,
+        flow: &str,
+        typed: Option<Typed>,
+    ) -> Result<LoginView, SourceError> {
+        let view = self.waiting_view(network, flow);
         self.login = Some(Login {
             network,
             account: None,
@@ -2048,14 +2966,46 @@ impl CoreSource {
             relink: None,
             transferred: false,
             ended_linked: false,
+            flow: flow.to_owned(),
+            typed,
         });
         if !self.send(UiCommand::AddAccount {
             network,
-            flow: "qr".into(),
+            flow: flow.into(),
         }) {
             return Err(SourceError::Unavailable);
         }
         self.adds.push_back(false);
+        Ok(view)
+    }
+
+    /// Sends `Relink` for `account` with `flow` and makes its login the one the link page shows.
+    fn relink_with(
+        &mut self,
+        account: AccountId,
+        flow: &str,
+        typed: Option<Typed>,
+    ) -> Result<LoginView, SourceError> {
+        let network = self.account_network(account);
+        let view = self.waiting_view(network, flow);
+        if !self.send(UiCommand::Relink {
+            account,
+            flow: flow.into(),
+        }) {
+            return Err(SourceError::Unavailable);
+        }
+        // The account exists already: its login steps are ours from the first one.
+        self.cancelled.remove(&account);
+        self.login = Some(Login {
+            network,
+            account: Some(account),
+            view: view.clone(),
+            relink: Some(account),
+            transferred: false,
+            ended_linked: false,
+            flow: flow.to_owned(),
+            typed,
+        });
         Ok(view)
     }
 
@@ -2080,14 +3030,16 @@ impl CoreSource {
                     status = AccountStatus::NeedsAction;
                 }
                 let network_name = network_name(a.network).to_owned();
+                // (the archive's unread messages count nowhere, as on Signal Desktop's badge)
                 let unread = self
                     .list
                     .iter()
-                    .filter(|c| c.account == a.id && !muted(c, now))
+                    .filter(|c| c.account == a.id && !archived_row(c) && !muted(c, now))
                     .map(|c| c.unread)
                     .sum();
                 AccountRow {
                     id: a.id,
+                    uuid: a.uuid,
                     name: a
                         .display_name
                         .as_deref()
@@ -2105,20 +3057,22 @@ impl CoreSource {
                     offers_history: self.offers_history(a),
                     offers_unlink: self.offers_unlink(a),
                     device: self.twin_label(a).unwrap_or_default(),
+                    shown: true,
+                    place: 0,
                 }
             })
             .collect()
     }
 
     /// Whether `a` offers "Transfer History from Phone…": its network hands a newly linked
-    /// device the history (the descriptor's `HistorySource::PushedOnLink`), it can be linked
+    /// device the history as one archive (the descriptor's `history_transfer`), it can be linked
     /// in this build, no transfer of it runs, and its link is not still going on (a link's
     /// tail after the transfer, `buttons.md` F4: confirming would delete what just arrived
     /// and ask the phone for all of it again).
     fn offers_history(&self, a: &CoreAccount) -> bool {
         self.networks
             .iter()
-            .any(|n| n.kind == a.network && n.available && n.history_on_link)
+            .any(|n| n.kind == a.network && n.available && n.on && n.history_transfer)
             && !self.transfer_runs(a)
             && !self.links_now(a.id)
     }
@@ -2163,10 +3117,15 @@ impl CoreSource {
         }
     }
 
-    /// Whether `a` offers "Unlink…": it is linked (Active, its live state not logged out)
-    /// and its link is not still going on.
+    /// Whether `a` offers "Unlink…": it is linked (Active, its live state not logged out),
+    /// its link is not still going on and its network is not turned off.
     fn offers_unlink(&self, a: &CoreAccount) -> bool {
-        matches!(a.state, AccountState::Active) && !self.logged_out(a.id) && !self.links_now(a.id)
+        matches!(a.state, AccountState::Active)
+            && !self.logged_out(a.id)
+            && !self.links_now(a.id)
+            // Unlinking asks the network to forget the device; a network that is turned off
+            // cannot be asked (the core refuses it too). "Remove Account…" stays.
+            && !self.network_paused(a.network)
     }
 
     /// Whether a login of `account` runs: on the link page or left to the background. A
@@ -2203,7 +3162,8 @@ impl CoreSource {
                 self.transfers
                     .updating(a.id)
                     .filter(|_| !self.logged_out(a.id))
-            })?;
+            })
+            .or_else(|| self.fill_view(a))?;
         if view.phase != crate::transfer::TransferPhase::Failed && self.linking(a.id) {
             return None;
         }
@@ -2212,12 +3172,16 @@ impl CoreSource {
             kind: match view.phase {
                 crate::transfer::TransferPhase::Failed => BannerKind::TransferFailed,
                 crate::transfer::TransferPhase::Updating => BannerKind::Updating,
+                crate::transfer::TransferPhase::History => BannerKind::History,
                 _ => BannerKind::Transfer,
             },
             text: view.status.clone(),
             action: String::new(),
             url: String::new(),
             transfer: Some(view),
+            explanation: String::new(),
+            appeal_url: String::new(),
+            appeal_label: String::new(),
         })
     }
 
@@ -2267,17 +3231,177 @@ impl CoreSource {
         self.conn.get(&a.id).unwrap_or(&a.conn)
     }
 
+    /// The instants (ms) at which an account's banner is written to change: the end of a ban
+    /// ([`ConnState::Restricted`]), after which the banner offers "Reconnect".
+    fn banner_instants(&self) -> impl Iterator<Item = i64> + '_ {
+        self.visible_accounts().filter_map(|a| {
+            let end = match self.conn_of(a) {
+                ConnState::Restricted {
+                    until_ms: Some(t), ..
+                } => Some(*t),
+                // A hold's banner and line name its end; at the end they change.
+                _ => self.hold_of(a).and_then(|h| h.until_ms),
+            };
+            end.map(|t| i64::try_from(t).unwrap_or(i64::MAX))
+        })
+    }
+
+    /// Whether the account's network pushes its message history after a link (WhatsApp: the
+    /// descriptor has no `history_transfer`), so a filling chat shows the quiet banner. A
+    /// network that is not in the list does not.
+    fn pushes_history(&self, account: AccountId) -> bool {
+        self.accounts
+            .iter()
+            .find(|a| a.id == account)
+            .is_some_and(|a| {
+                self.networks
+                    .iter()
+                    .any(|n| n.kind == a.network && !n.history_transfer)
+            })
+    }
+
+    /// A batch of a pushed history came for `account` (`filling` is already up to date): remember
+    /// how far it is and when. `true` when what the banner shows changed (it appears, ends or
+    /// reads another percentage).
+    fn track_fill(&mut self, account: AccountId, progress: Option<f32>) -> bool {
+        if !self.pushes_history(account) {
+            return false;
+        }
+        let now = self.now_ms();
+        let filling = self.filling.values().any(|a| *a == account);
+        if !filling {
+            return self.fills.remove(&account).is_some();
+        }
+        let fraction = progress.or(self.fills.get(&account).and_then(|f| f.fraction));
+        let old = self.fills.insert(
+            account,
+            HistoryFill {
+                fraction,
+                last_batch: now,
+            },
+        );
+        old.is_none_or(|o| o.fraction != fraction)
+    }
+
+    /// The pushed history of `account` stops being waited for (its connection went, it was
+    /// logged out or removed, or no batch came for a long time): the banner and the hold on
+    /// clearing and deleting its chats go. `true` when something was cleared.
+    fn end_fills(&mut self, account: AccountId) -> bool {
+        let banner = self.fills.remove(&account).is_some();
+        let before = self.filling.len();
+        self.filling.retain(|_, a| *a != account);
+        banner || self.filling.len() != before
+    }
+
+    /// The quiet banner of an account whose pushed history is still coming.
+    fn fill_view(&self, a: &CoreAccount) -> Option<crate::transfer::TransferView> {
+        let fill = self.fills.get(&a.id)?;
+        (a.state == AccountState::Active
+            && !self.logged_out(a.id)
+            && self.now_ms().saturating_sub(fill.last_batch) < HISTORY_FILL_IDLE_MS)
+            .then(|| crate::transfer::history_fill_view(a.id, fill.fraction))
+    }
+
+    /// The account's send hold now.
+    fn hold_of(&self, a: &CoreAccount) -> Option<AccountHold> {
+        match self.holds.get(&a.id) {
+            Some(h) => *h,
+            None => a.hold,
+        }
+    }
+
+    /// Whether `kind` is an experimental network that is in this build but turned off at this
+    /// start: its accounts are paused (no backend, so nothing is sent or received; chats stay
+    /// readable). The setting is the app's (`networks-on`); the front-end tells the choices.
+    ///
+    /// A network this build cannot log in to is not "off": turning it on would not help, and
+    /// its accounts say what is missing instead ([`Self::network_missing`]).
+    fn network_off(&self, kind: NetworkKind) -> bool {
+        self.networks
+            .iter()
+            .any(|n| n.kind == kind && n.experimental && !n.on && n.missing.is_none())
+    }
+
+    /// Why this build cannot log in to `kind` (Telegram without its API key or library), when
+    /// the front-end listed the network as missing. Its accounts are paused whether the person
+    /// turned the network on or off, so they all show the banner of a missing part.
+    fn network_missing(&self, kind: NetworkKind) -> Option<NetworkMissing> {
+        self.networks
+            .iter()
+            .find(|n| n.kind == kind)
+            .and_then(|n| n.missing)
+    }
+
+    /// Whether the accounts of `kind` have no backend in this run: the network is turned off
+    /// or missing. Nothing is sent, received, held or unlinked for them.
+    fn network_paused(&self, kind: NetworkKind) -> bool {
+        self.network_off(kind) || self.network_missing(kind).is_some()
+    }
+
+    /// The quiet line of an account whose pushed history lost a part, while the account is
+    /// linked (a logged-out account says so in its own banner, and a paused one is `NetworkOff`).
+    fn history_lost_of(&self, a: &CoreAccount) -> Option<Banner> {
+        (self.lost_history.contains(&a.id)
+            && a.state == AccountState::Active
+            && !self.logged_out(a.id))
+        .then(|| history_lost_banner(a.id))
+    }
+
     /// What ONE account shows of itself: its own state or its history transfer, whichever
-    /// presses more (the order of `BannerKind`). An account never shows both.
-    fn own_banner(&self, a: &CoreAccount, several: bool) -> Option<Banner> {
+    /// presses more (the order of `BannerKind`). An account never shows both. The text does not
+    /// name the account yet ([`Self::named_banner`]).
+    fn own_banner_bare(&self, a: &CoreAccount) -> Option<Banner> {
         let stopped = self.account_errors.contains(&a.id);
-        let state = account_banner(a.id, &a.state, self.conn_of(a), stopped);
-        let mut banner = match (state, self.transfer_of(a)) {
+        let time = TimeContext::new(self.now_ms(), self.calendar.as_ref());
+        let ctx = BannerContext {
+            network: network_name(a.network),
+            time: &time,
+        };
+        let state = account_banner(a.id, &a.state, self.conn_of(a), stopped, &ctx);
+        // A network that holds back what is sent while the connection is up: the more
+        // pressing of that and the state (a restriction stands above "offline" and below
+        // what the person must fix). A paused account has no backend that could hold.
+        let state = match self
+            .hold_of(a)
+            .filter(|_| a.state == AccountState::Active && !self.network_paused(a.network))
+            .and_then(|h| hold_banner(a.id, &h, &ctx))
+        {
+            Some(h) if state.as_ref().is_none_or(|s| s.kind < h.kind) => Some(h),
+            _ => state,
+        };
+        // A paused account (its network is turned off): "turned off" stands in for every state
+        // that passes ("offline" is what the core shows an account without a backend), and
+        // what the person must fix first (logged out, gave up) keeps its place without its
+        // button, because linking or restarting an account needs the network on.
+        // A network this build cannot log in to is paused too, on or off, and says what is
+        // missing instead of "turned off" (turning it on would not help: no button).
+        let state = if self.network_paused(a.network)
+            && !matches!(a.state, AccountState::Linking | AccountState::Removing)
+        {
+            match state {
+                Some(s) if s.kind > BannerKind::NetworkOff => Some(Banner {
+                    action: String::new(),
+                    ..s
+                }),
+                _ => Some(match self.network_missing(a.network) {
+                    Some(missing) => network_missing_banner(a.id, network_name(a.network), missing),
+                    None => network_off_banner(a.id, network_name(a.network)),
+                }),
+            }
+        } else {
+            state
+        };
+        Some(match (state, self.transfer_of(a)) {
             (Some(s), Some(t)) if t.kind > s.kind => t,
             (Some(s), _) => s,
-            (None, t) => t?,
-        };
-        // With several accounts the banner says which one it is about.
+            (None, Some(t)) => t,
+            // Where the account shows nothing else: the quiet line of a history that lost a part.
+            (None, None) => self.history_lost_of(a)?,
+        })
+    }
+
+    /// With several accounts a banner says which one it is about.
+    fn named_banner(mut banner: Banner, a: &CoreAccount, several: bool) -> Banner {
         if several {
             banner.text = trfc(
                 "@info:status banner of an account, %1 the name of the account, %2 what is wrong",
@@ -2288,21 +3412,50 @@ impl CoreSource {
                 t.status = banner.text.clone();
             }
         }
-        Some(banner)
+        banner
     }
 
-    /// The banner of the accounts shown, of one sort: the states of accounts (`transfer`
-    /// false), or their history transfers (`transfer` true). The two are chosen apart, so
-    /// the state of one account never hides the transfer of another: a failed transfer
-    /// stays until its user acts, and "Continue Without History" stays in reach, whatever
-    /// another account is going through. Within one sort the most pressing kind wins (a
-    /// failed transfer before a running one), the first account among equals.
-    fn banner_of(&self, account: Option<AccountId>, transfer: bool) -> Option<Banner> {
+    /// The banner of the accounts, of one sort: the states of accounts ([`BannerSort::State`]),
+    /// or their history transfers. The two are chosen apart, so the state of one account never
+    /// hides the transfer of another: a failed transfer stays until its user acts, and
+    /// "Continue Without History" stays in reach, whatever another account is going through.
+    /// Within one sort the most pressing kind wins (a failed transfer before a running one),
+    /// the first account among equals.
+    ///
+    /// An account in `hidden` (its chats are not in the list) still speaks when it needs the
+    /// user: its transfer shows whatever its state is (`transfer_of`, not what `own_banner`
+    /// picked, which ranks Offline above a running transfer; the phases `History` and
+    /// `Updating` are transfers too), and its state shows only for `Error`, `Restricted`,
+    /// `Clock`, `Challenge` and `LoggedOut`, the kinds above `NetworkOff`: offline, connecting,
+    /// syncing, turned off and a lost history pass or are the user's own choice.
+    /// [`BannerSort::ShownTransfer`] is the transfer sort of the shown accounts alone (the
+    /// placeholder of an empty list tells about those).
+    fn banner_of(
+        &self,
+        account: Option<AccountId>,
+        hidden: &Hidden,
+        sort: BannerSort,
+    ) -> Option<Banner> {
         let several = self.visible_accounts().count() > 1;
         self.visible_accounts()
             .filter(|a| account.is_none_or(|id| id == a.id))
-            .filter_map(|a| self.own_banner(a, several))
-            .filter(|b| b.transfer.is_some() == transfer)
+            .filter_map(|a| {
+                let is_hidden = matches!(hidden, Hidden::Ids(ids) if ids.contains(&a.id));
+                let banner = match (sort, is_hidden) {
+                    (BannerSort::ShownTransfer, true) => None,
+                    (BannerSort::State, true) => self
+                        .own_banner_bare(a)
+                        .filter(|b| b.transfer.is_none() && b.kind > BannerKind::NetworkOff),
+                    (BannerSort::Transfer, true) => self.transfer_of(a),
+                    (BannerSort::State, false) => {
+                        self.own_banner_bare(a).filter(|b| b.transfer.is_none())
+                    }
+                    (BannerSort::Transfer | BannerSort::ShownTransfer, false) => {
+                        self.own_banner_bare(a).filter(|b| b.transfer.is_some())
+                    }
+                }?;
+                Some(Self::named_banner(banner, a, several))
+            })
             .fold(None, |best: Option<Banner>, b| match best {
                 Some(have) if have.kind >= b.kind => Some(have),
                 _ => Some(b),
@@ -2359,7 +3512,7 @@ impl CoreSource {
             let summary = core_preview(p, &self.names);
             text = summary.text;
             icon = summary.icon;
-            if own && !p.deleted {
+            if own && p.deleted.is_none() {
                 receipt = Receipt::from_state(p.out_state.as_ref());
             }
         }
@@ -2377,21 +3530,8 @@ impl CoreSource {
             text = single_line(draft);
             icon = String::new();
         }
-        let multi = self.visible_accounts().count() > 1;
-        let (account_badge, badge_icon) = if multi {
-            let label = self
-                .accounts
-                .iter()
-                .find(|a| a.id == c.account)
-                .and_then(|a| a.display_name.as_deref())
-                .map(single_line)
-                .unwrap_or_default();
-            (label, network_icon(network).to_owned())
-        } else {
-            (String::new(), String::new())
-        };
         let sent_at = c.preview.as_ref().map_or(0, |p| p.sent_at);
-        ConversationRow {
+        let mut row = ConversationRow {
             id: c.id,
             account: c.account,
             network,
@@ -2415,10 +3555,36 @@ impl CoreSource {
             marked_unread: c.marked_unread,
             muted: muted(c, time.now_ms),
             pinned_order: c.pinned_order,
+            archived: archived_row(c),
             receipt,
-            account_badge,
-            badge_icon,
+            // (the chip, icon, number and panel place of the account are the table's, once per
+            // call: `account_table`)
+            account_badge: String::new(),
+            badge_icon: String::new(),
+            badge_number: 0,
+            account_order: 0,
+            protected: c.protected,
+        };
+        // (The core gives a protected chat no preview; the draft this session keeps is hidden
+        // here.)
+        if row.protected {
+            row.hide_messages();
         }
+        row
+    }
+
+    /// The account table of one list call: the visible accounts in panel order, with their
+    /// chip name (the profile name, else the network's) and the call's hidden set.
+    fn account_table(&self, hidden: &Hidden, searching: bool) -> AccountTable {
+        AccountTable::new(
+            self.visible_accounts().map(|a| TableAccount {
+                id: a.id,
+                network: a.network,
+                name: Self::account_label(a),
+            }),
+            hidden,
+            searching,
+        )
     }
 
     fn header(&self, d: &ConversationDetail, time: &TimeContext<'_>) -> ChatHeader {
@@ -2434,12 +3600,9 @@ impl CoreSource {
             )
             .into_owned()
         } else if is_group {
-            trnc(
-                "@info:status subtitle of a group chat, %1 how many members",
-                "%1 member",
-                "%1 members",
-                d.members.len() as u64,
-            )
+            crate::conversations::members_line(crate::conversations::full_member_count(
+                d.members.iter().map(|m| m.role),
+            ) as u64)
         } else {
             network_name(self.account_network(c.account)).to_owned()
         };
@@ -2452,6 +3615,23 @@ impl CoreSource {
                 "You can read this chat. To write here, link this device again.",
             )
             .into_owned()
+        } else if self
+            .network_missing(self.account_network(c.account))
+            .is_some()
+        {
+            // The build cannot log in to the network: nothing the person can switch on.
+            trfc(
+                "@info:status why the composer is off, %1 the name of the network",
+                "You can read this chat. This build of Kourier cannot connect to %1.",
+                &[network_name(self.account_network(c.account))],
+            )
+        } else if self.network_off(self.account_network(c.account)) {
+            // A paused account: the core would refuse the send (no backend for the network).
+            trfc(
+                "@info:status why the composer is off, %1 the name of the network",
+                "You can read this chat. %1 is turned off: turn it on to write here.",
+                &[network_name(self.account_network(c.account))],
+            )
         } else {
             d.features
                 .cannot_send
@@ -2468,6 +3648,8 @@ impl CoreSource {
             avatar_url: self.avatar_url(c.account, c.avatar.as_ref()),
             is_group,
             is_self: c.is_self,
+            peer: c.peer.clone(),
+            has_details: crate::conversations::kind_has_details(c.kind),
             muted: muted(c, time.now_ms),
             cannot_send: cannot_send.clone(),
             attach: crate::media::AttachRules::new(&d.features.files),
@@ -2487,7 +3669,34 @@ impl CoreSource {
             // and the account is linked.
             deletes_sync: d.features.delete_for_me && !self.logged_out(c.account),
             still_filling: self.still_filling(c.id, c.account),
+            timer_held: self.timer_held(c.account, time.now_ms),
         }
+    }
+
+    /// Why the disappearing-message timer cannot be changed now; empty when it can. While the
+    /// account's network holds back what is sent ([`AccountHold`]) the core refuses a timer
+    /// change (`Refusal::Held`: on some networks it is a message of its own, one more reach-out),
+    /// so the menu says so instead of failing the click (K-A fix C3).
+    fn timer_held(&self, account: AccountId, now_ms: i64) -> String {
+        let hold = self
+            .accounts
+            .iter()
+            .find(|a| a.id == account)
+            .and_then(|a| self.hold_of(a));
+        let Some(hold) = hold else {
+            return String::new();
+        };
+        if hold
+            .until_ms
+            .is_some_and(|t| i64::try_from(t).unwrap_or(i64::MAX) <= now_ms)
+        {
+            return String::new();
+        }
+        trfc(
+            "@info:status why the disappearing-messages entry of the chat is off, %1 the name of the network",
+            "Disappearing messages cannot be changed while %1 restricts this account.",
+            &[network_name(self.account_network(account))],
+        )
     }
 
     fn timeline_rows(&self, time: &TimeContext<'_>) -> Vec<MessageRow> {
@@ -2498,26 +3707,40 @@ impl CoreSource {
         let rows = &self.window.rows;
         let by_id: HashMap<MessageId, &CoreMessage> = rows.iter().map(|r| (r.id, r)).collect();
         let names = &self.names;
-        let (hold, safety_number) = self.wait_context();
-        let items = rows.iter().map(|r| Item {
-            id: r.id,
-            sent_at: r.sent_at,
-            own: r.origin != OriginKind::Remote,
-            author: r.author.as_ref(),
-            body: &r.body,
-            deleted: r.deleted.as_ref(),
-            edited: r.revision > 0 || r.edited_at.is_some(),
-            out_state: r.out_state.as_ref(),
-            quote: if r.deleted.is_none() {
-                quote_block(r, &by_id, names)
-            } else {
-                None
-            },
-            reactions: reaction_chips(r, names),
-            actions: row_actions(&r.actions),
-            ask: &r.actions.ask_attachments,
-            expiry: r.expiry.as_ref(),
-            wait: self.send_wait(r, hold, safety_number),
+        let (hold, safety_number, who) = self.wait_context();
+        let items = rows.iter().map(|r| {
+            let wait = self.send_wait(r, hold, safety_number);
+            Item {
+                id: r.id,
+                sent_at: r.sent_at,
+                own: r.origin != OriginKind::Remote,
+                author: r.author.as_ref(),
+                body: &r.body,
+                deleted: r.deleted.as_ref(),
+                edited: r.revision > 0 || r.edited_at.is_some(),
+                out_state: r.out_state.as_ref(),
+                quote: if r.deleted.is_none() {
+                    quote_block(r, &by_id, names)
+                } else {
+                    None
+                },
+                reactions: reaction_chips(r, names),
+                actions: row_actions(&r.actions),
+                ask: &r.actions.ask_attachments,
+                save: &r.actions.save_attachments,
+                people: r
+                    .actions
+                    .show_people
+                    .iter()
+                    .map(|p| (p.user.clone(), p.own))
+                    .collect(),
+                safety: r.actions.safety_number.as_ref(),
+                waits_for: who.filter(|_| {
+                    wait.is_some_and(|w| w.reason == timeline::WaitReason::SafetyNumber)
+                }),
+                expiry: r.expiry.as_ref(),
+                wait,
+            }
         });
         let mut rows = timeline::build_rows(
             items,
@@ -2529,29 +3752,86 @@ impl CoreSource {
             &self.read_more,
         );
         timeline::apply_progress(&mut rows, &self.downloads);
+        let waiting: Vec<&CoreMessage> = self
+            .window
+            .rows
+            .iter()
+            .filter(|r| r.outbox.is_some())
+            .collect();
+        if !waiting.is_empty() {
+            for row in &mut rows {
+                if let Some(core) = row
+                    .message_id()
+                    .and_then(|m| waiting.iter().find(|r| r.id == m))
+                {
+                    self.give_rings(core, row);
+                }
+            }
+        }
         self.author_avatars(&mut rows);
         rows
     }
 
+    /// The bytes reported for `attachment`, while its message's attempt uploads.
+    fn upload_bytes(&self, attachment: AttachmentId) -> Option<(u64, u64)> {
+        self.uploads.get(&attachment).map(|u| (u.done, u.total))
+    }
+
+    /// The files of `message` that a backend reported bytes for: `(done, total)` summed over
+    /// them, and whether one of them is not up yet. `None` when nothing was reported.
+    fn upload_sum(&self, message: MessageId) -> Option<(u64, u64, bool)> {
+        let mut found: Option<(u64, u64, bool)> = None;
+        for u in self.uploads.values().filter(|u| u.message == message) {
+            let (done, total, open) = found.get_or_insert((0, 0, false));
+            *done += u.done;
+            *total += u.total;
+            *open |= u.done < u.total;
+        }
+        found
+    }
+
+    /// Puts the rings of the files of the own message `core` (a row with a send row that waits)
+    /// on its built `row`. A file nothing is reported for has an EMPTY ring while its message
+    /// waits for its turn (queued, staged: offline, held, a challenge, a retry wait included)
+    /// and while the backend says it prepares them (`SendPhase::Preparing`); the X is the
+    /// row's `cancel_sending`.
+    fn give_rings(&self, core: &CoreMessage, row: &mut MessageRow) {
+        let in_flight = core.outbox.as_ref().is_some_and(|o| o.in_flight);
+        // The backend SAYS it prepares the files (`SendPhase::Preparing`, upload progress fix
+        // U3): an empty ring and the X on every file at once. A backend that reports no file
+        // and no `Preparing` keeps the line "Uploading files" and no ring.
+        let preparing = self.send_phases.get(&core.id) == Some(&SendPhase::Preparing);
+        let bytes = |a: AttachmentId| self.upload_bytes(a);
+        timeline::apply_uploads(row, &bytes, !in_flight || preparing);
+    }
+
     /// What holds every own message of the open chat that is on its way: the account (not
     /// connected, a challenge, a wrong clock, logged out …, [`Self::account_hold`]) and
-    /// whether its queue waits for a changed safety number to be confirmed.
-    fn wait_context(&self) -> (Option<timeline::WaitReason>, bool) {
+    /// whether its queue waits for a changed safety number to be confirmed, and for whose (the
+    /// core names the person on the paused head, `MessageActions::safety_number`, BQ-3; `None`
+    /// while that head is not loaded).
+    fn wait_context(&self) -> (Option<timeline::WaitReason>, bool, Option<&UserId>) {
         let hold = self
             .detail
             .as_ref()
             .and_then(|d| self.account_hold(d.row.account));
-        let safety_number = self.window.rows.iter().any(|r| {
-            r.outbox.is_some()
-                && matches!(
-                    r.out_state,
-                    Some(OutgoingState::Failed {
-                        reason: FailReason::UntrustedIdentity,
-                        ..
-                    })
-                )
-        });
-        (hold, safety_number)
+        let who = self
+            .window
+            .rows
+            .iter()
+            .find_map(|r| r.actions.safety_number.as_ref());
+        let safety_number = who.is_some()
+            || self.window.rows.iter().any(|r| {
+                r.outbox.is_some()
+                    && matches!(
+                        r.out_state,
+                        Some(OutgoingState::Failed {
+                            reason: FailReason::UntrustedIdentity,
+                            ..
+                        })
+                    )
+            });
+        (hold, safety_number, who)
     }
 
     /// What the line under an own message on its way is built from (link feedback L6):
@@ -2569,6 +3849,10 @@ impl CoreSource {
             hold
         } else if safety_number && !outbox.in_flight {
             timeline::WaitReason::SafetyNumber
+        } else if let Some((done, total, true)) = self.upload_sum(r.id).filter(|_| outbox.in_flight)
+        {
+            // The files' own bytes say more than the step: "Uploading 45% · 12 of 30 MB".
+            timeline::WaitReason::Uploading { done, total }
         } else if let Some(phase) = self.send_phases.get(&r.id).filter(|_| outbox.in_flight) {
             timeline::WaitReason::Phase(*phase)
         } else {
@@ -2593,8 +3877,16 @@ impl CoreSource {
             // An account nothing is known about is not connected.
             return Some(W::Connection);
         };
+        let network = row.map_or("", |a| network_name(a.network));
         match conn {
-            ConnState::Syncing { .. } | ConnState::Online { .. } => None,
+            // The connection is up; the network may still hold what the user sends.
+            ConnState::Syncing { .. } | ConnState::Online { .. } => {
+                let hold = row.and_then(|a| self.hold_of(a))?;
+                let until_ms = hold.until_ms.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
+                // The core lifts a hold at its end; a line that outlives it names none.
+                (until_ms.is_none_or(|t| t > self.now_ms()))
+                    .then_some(W::Restricted { network, until_ms })
+            }
             ConnState::Offline { .. } | ConnState::Connecting => Some(W::Connection),
             ConnState::NeedsUserAction(UserAction::SolveChallenge { .. }) => Some(W::Challenge),
             ConnState::NeedsUserAction(UserAction::FixClock { .. }) => Some(W::Clock),
@@ -2603,7 +3895,15 @@ impl CoreSource {
             }
             ConnState::NeedsUserAction(UserAction::UpdateApp) => Some(W::UpdateApp),
             ConnState::NeedsUserAction(UserAction::Reconnect) => Some(W::Reconnect),
-            ConnState::Restricted { .. } => Some(W::Restricted),
+            // A ban that has ended waits for the person (the banner offers "Reconnect").
+            ConnState::Restricted { until_ms, .. } => {
+                let until_ms = until_ms.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
+                Some(if until_ms.is_some_and(|t| t <= self.now_ms()) {
+                    W::Reconnect
+                } else {
+                    W::Restricted { network, until_ms }
+                })
+            }
         }
     }
 
@@ -2625,8 +3925,112 @@ impl CoreSource {
             Some(p) => self.send_phases.insert(message, p),
             None => self.send_phases.remove(&message),
         };
+        // The empty rings of a message whose files are being made ready come with the phase and
+        // go with it; a message with figures per file shows its own (a report moves one ring).
+        let preparing = |p: Option<SendPhase>| p == Some(SendPhase::Preparing);
+        let rings = preparing(old) != preparing(phase)
+            && !self.uploads.values().any(|u| u.message == message);
         Changes {
             waits: shown && old != phase,
+            uploads: rings,
+            ..Changes::default()
+        }
+    }
+
+    /// Live bytes of one file of an own message of the open timeline whose attempt uploads
+    /// (`Progress::Upload`). The rings move per whole percent of a file and the line under the
+    /// message per whole percent of the message, on the per-row paths ([`Changes::uploads`],
+    /// [`Changes::waits`]): the timeline is never rebuilt for a byte count.
+    fn on_upload_progress(
+        &mut self,
+        message: MessageId,
+        attachment: AttachmentId,
+        done: u64,
+        total: u64,
+    ) -> Changes {
+        if self.open.is_none() || total == 0 {
+            return Changes::default();
+        }
+        let Some(row) = self.window.rows.iter().find(|r| r.id == message) else {
+            return Changes::default();
+        };
+        let ours = row.outbox.is_some()
+            && attachments_of(&row.body)
+                .iter()
+                .any(|a| a.id == Some(attachment));
+        if !ours {
+            return Changes::default();
+        }
+        let shown = self.now_ms().saturating_sub(row.sent_at) >= timeline::WAIT_SHOWN_AFTER_MS;
+        // What the line says: "Preparing files" until a byte is up, then the whole percent.
+        let line = |sum: Option<(u64, u64, bool)>| {
+            sum.map(|(d, t, open)| (d == 0, open, timeline::upload_percent(d, t)))
+        };
+        let before = line(self.upload_sum(message));
+        let old = self.uploads.insert(
+            attachment,
+            UploadBytes {
+                message,
+                done,
+                total,
+            },
+        );
+        let after = line(self.upload_sum(message));
+        let percent = |d: u64, t: u64| timeline::upload_percent(d, t);
+        Changes {
+            // A first report turns the empty ring into a ring at its percent.
+            uploads: old.is_none_or(|o| percent(o.done, o.total) != percent(done, total)),
+            waits: shown && before != after,
+            ..Changes::default()
+        }
+    }
+
+    /// The uploads of `message` are over when its share is full or its step is another one:
+    /// the bytes are let go, so that no ring stays at 100 % through a group's key setup.
+    /// The X came after the message went out (`UiEvent::CancelTooLate`, sent once the attempt's
+    /// outcome is recorded as sent): a note in the chat's composer, whose Delete for Everyone
+    /// works at once (the row is sent now). Only in the chat that is open.
+    fn on_cancel_too_late(&mut self, conv: ConversationId, message: MessageId) -> Changes {
+        if self.open != Some(conv) {
+            return Changes::default();
+        }
+        let text = trc(
+            "@info:status the X came after the message went out",
+            "Already sent",
+        )
+        .into_owned();
+        self.notice.clone_from(&text);
+        self.too_late = Some((message, text));
+        Changes {
+            notice: true,
+            ..Changes::default()
+        }
+    }
+
+    fn on_uploads_over(
+        &mut self,
+        message: MessageId,
+        progress: f32,
+        phase: Option<SendPhase>,
+    ) -> Changes {
+        let over = progress >= 1.0
+            || phase.is_some_and(|p| !matches!(p, SendPhase::Uploading | SendPhase::Preparing));
+        if !over || !self.uploads.values().any(|u| u.message == message) {
+            return Changes::default();
+        }
+        let open = self.upload_sum(message).is_some_and(|(_, _, open)| open);
+        self.uploads.retain(|_, u| u.message != message);
+        let shown = self
+            .window
+            .rows
+            .iter()
+            .find(|r| r.id == message)
+            .is_some_and(|r| {
+                self.now_ms().saturating_sub(r.sent_at) >= timeline::WAIT_SHOWN_AFTER_MS
+            });
+        Changes {
+            uploads: true,
+            waits: shown && open,
             ..Changes::default()
         }
     }
@@ -2669,7 +4073,8 @@ impl CoreSource {
     }
 }
 
-/// The core's flags as the row shows them (`retry` comes from the send state).
+/// The core's flags as the row shows them (`retry`: the core accepts "Send Again"; the row
+/// offers it only for a message that shows as failed, see `timeline::rows`).
 fn row_actions(a: &MessageActions) -> RowActions {
     RowActions {
         reply: a.reply,
@@ -2680,8 +4085,12 @@ fn row_actions(a: &MessageActions) -> RowActions {
         delete_for_everyone: a.delete_for_everyone,
         delete_attachment: a.delete_attachment,
         take_back: a.take_back,
-        retry: false,
+        cancel_sending: a.cancel_sending,
+        retry: a.retry,
         ask_attachments: !a.ask_attachments.is_empty(),
+        save_attachments: !a.save_attachments.is_empty(),
+        show_sender: a.show_sender,
+        show_people: !a.show_people.is_empty(),
     }
 }
 
@@ -2694,12 +4103,38 @@ fn attachments_of(body: &Body) -> Vec<&kourier_model::Attachment> {
     }
 }
 
+/// The whole list in one read, the inbox and the archive together (`archived: None`): search,
+/// the quick switch and the archive's count work from one snapshot, and a chat that moves
+/// between the two is in exactly one of them. The rows split by their `archived` flag.
 fn list_query(after: Option<ConversationCursor>) -> Query {
     Query::Conversations(ConversationListQuery {
+        archived: None,
         limit: CONVERSATION_PAGE,
         after,
         ..ConversationListQuery::default()
     })
+}
+
+/// Whether the core's row is in the archive (the one rule: [`shown_archived`]).
+fn archived_row(c: &CoreConversation) -> bool {
+    shown_archived(c.archived, c.pinned_order)
+}
+
+/// Whether the open chat changed sides between two reads of the list. Only a chat that both
+/// reads list can have moved: one that was not listed before (the first read, a chat just
+/// made) or is not any more (deleted, its account removed) has no side to leave.
+fn archive_move(
+    open: Option<ConversationId>,
+    old: &[CoreConversation],
+    new: &[CoreConversation],
+) -> Option<ArchiveMove> {
+    let open = open?;
+    let side = |rows: &[CoreConversation]| rows.iter().find(|c| c.id == open).map(archived_row);
+    match (side(old)?, side(new)?) {
+        (true, false) => Some(ArchiveMove::ToInbox),
+        (false, true) => Some(ArchiveMove::ToArchive),
+        _ => None,
+    }
 }
 
 fn muted(c: &CoreConversation, now_ms: i64) -> bool {
@@ -2741,22 +4176,10 @@ pub(crate) fn conversation_title(c: &CoreConversation) -> String {
 /// caption, else what it is (a voice message, three photos, who was removed from the group,
 /// view-once media).
 fn core_preview(p: &kourier_core::facade::Preview, names: &dyn Names) -> Summary {
-    if p.deleted {
-        let own = p.author.is_none();
+    // The timeline's words: a delete that names nobody (KT-2) is not "You deleted this message".
+    if let Some(deletion) = &p.deleted {
         return Summary {
-            text: if own {
-                trc(
-                    "@info:preview stand-in for a deleted message",
-                    "You deleted this message",
-                )
-                .into_owned()
-            } else {
-                trc(
-                    "@info:preview stand-in for a deleted message",
-                    "This message was deleted",
-                )
-                .into_owned()
-            },
+            text: preview::deleted_text(deletion, p.author.is_none(), p.author.as_ref()),
             icon: "trash-empty".into(),
         };
     }
@@ -3001,6 +4424,301 @@ pub(crate) enum NetworkFailure {
     Other,
 }
 
+/// What a `SaveFacts` query in flight is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SaveAsk {
+    /// The name for the dialog of one attachment.
+    Suggest(AttachmentId),
+    /// The name of one file of a batch.
+    Name {
+        /// The batch.
+        batch: u64,
+        /// The attachment.
+        attachment: AttachmentId,
+    },
+}
+
+/// One file of a batch whose `SaveAttachment` waits for the core.
+struct SaveRun {
+    batch: u64,
+    dir: std::path::PathBuf,
+    /// The name the file is offered under.
+    base: String,
+    /// The name asked for now (`base`, then `base (1)` …).
+    name: String,
+    /// How many names were tried after the first.
+    tries: u32,
+    /// Whether a clash is answered with the next name (a batch) or replaced (the dialog asked).
+    keep_both: bool,
+}
+
+/// The files of one save call: ONE answer when the last has ended.
+struct SaveBatch {
+    left: u32,
+    saved: u32,
+    failed: u32,
+    name: String,
+    dir: std::path::PathBuf,
+    failure: Option<SaveFailure>,
+}
+
+/// The most names tried for one file of a batch before it counts as failed.
+const SAVE_TRIES: u32 = 99;
+
+/// What the core's refusal of a save is called in the notice.
+fn save_failure(error: &CoreError) -> SaveFailure {
+    use kourier_core::facade::SaveError;
+    match error {
+        CoreError::Save(SaveError::NoSpace) => SaveFailure::NoSpace,
+        CoreError::Save(SaveError::NotWritable) => SaveFailure::NotWritable,
+        CoreError::Save(SaveError::NoFolder) => SaveFailure::NoFolder,
+        CoreError::Refused { .. } => SaveFailure::Gone,
+        CoreError::InvalidInput(_) => SaveFailure::NotHere,
+        _ => SaveFailure::Other,
+    }
+}
+
+impl CoreSource {
+    /// Asks the core for the facts the name of `attachment` is made of.
+    fn ask_save_facts(&mut self, what: SaveAsk) -> bool {
+        let id = match &what {
+            SaveAsk::Suggest(a) | SaveAsk::Name { attachment: a, .. } => *a,
+        };
+        let generation = self.save_next;
+        self.save_next += 1;
+        self.save_asks.insert(generation, what);
+        self.send(UiCommand::Query {
+            token: QueryToken {
+                model: MODEL_SAVE,
+                generation,
+            },
+            query: Query::SaveFacts(id),
+        });
+        !self.stopped
+    }
+
+    /// The name a file is offered under, from the facts the core gave.
+    fn save_name(&self, facts: &kourier_core::facade::SaveFacts) -> String {
+        let sender = match &facts.author {
+            Some(user) => self.names.display_name(user),
+            None => self
+                .accounts
+                .iter()
+                .find(|a| a.id == facts.account)
+                .and_then(|a| a.display_name.clone())
+                .unwrap_or_default(),
+        };
+        crate::save_name::suggested_name(
+            &crate::save_name::NameFacts {
+                file_name: facts.file_name.as_deref(),
+                sender: &sender,
+                sent_at_ms: facts.sent_at,
+                position: usize::try_from(facts.position).unwrap_or(1),
+                mime: facts.mime.as_deref(),
+                sniffed: facts.sniffed.as_deref(),
+            },
+            self.calendar.as_ref(),
+        )
+    }
+
+    /// Starts the batch `batch`'s file `attachment` under `name`. The core's answers (a saved
+    /// file, a refusal) name the attachment and nothing else, so only ONE run per attachment
+    /// is in flight: when an earlier save of it has not been answered (Save All of an album and
+    /// the viewer's Ctrl+S on one of its pictures), the new run waits for that answer and
+    /// nothing is sent yet.
+    fn start_save(&mut self, batch: u64, attachment: AttachmentId, name: String, keep_both: bool) {
+        let Some(dir) = self.save_batches.get(&batch).map(|b| b.dir.clone()) else {
+            return;
+        };
+        let run = SaveRun {
+            batch,
+            dir,
+            base: name.clone(),
+            name,
+            tries: 0,
+            keep_both,
+        };
+        if self.save_runs.contains_key(&attachment) {
+            self.save_waiting
+                .entry(attachment)
+                .or_default()
+                .push_back(run);
+            return;
+        }
+        self.send_save_run(attachment, run);
+    }
+
+    /// Makes `run` the run in flight of `attachment` and sends its first `SaveAttachment`.
+    fn send_save_run(&mut self, attachment: AttachmentId, run: SaveRun) {
+        let target = kourier_core::facade::SaveTarget {
+            dir: run.dir.clone(),
+            name: run.name.clone(),
+        };
+        let mode = if run.keep_both {
+            kourier_core::facade::SaveMode::NoReplace
+        } else {
+            kourier_core::facade::SaveMode::Replace
+        };
+        self.save_runs.insert(attachment, run);
+        self.send(UiCommand::SaveAttachment {
+            attachment,
+            target,
+            mode,
+        });
+    }
+
+    /// The run of `attachment` in flight ended: the next one asked for it, if any, starts now.
+    fn start_next_save(&mut self, attachment: AttachmentId) {
+        let next = self
+            .save_waiting
+            .get_mut(&attachment)
+            .and_then(VecDeque::pop_front);
+        if self
+            .save_waiting
+            .get(&attachment)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.save_waiting.remove(&attachment);
+        }
+        if let Some(run) = next {
+            self.send_save_run(attachment, run);
+        }
+    }
+
+    /// One file of a batch ended; the batch's answer is made with its last file.
+    fn save_file_ended(&mut self, batch: u64, saved: Option<&str>, failure: Option<SaveFailure>) {
+        let Some(b) = self.save_batches.get_mut(&batch) else {
+            return;
+        };
+        b.left = b.left.saturating_sub(1);
+        if let Some(name) = saved {
+            b.saved += 1;
+            b.name = name.to_owned();
+        } else {
+            b.failed += 1;
+            b.failure = failure.or(b.failure);
+        }
+        if b.left > 0 {
+            return;
+        }
+        if let Some(b) = self.save_batches.remove(&batch) {
+            self.save_answers.push(SaveAnswer::Done(SaveOutcome {
+                saved: b.saved,
+                failed: b.failed,
+                name: b.name,
+                dir: b.dir,
+                failure: b.failure,
+            }));
+        }
+    }
+
+    /// A new batch of `files` files into `dir`.
+    fn new_save_batch(&mut self, files: u32, dir: std::path::PathBuf) -> u64 {
+        let batch = self.save_batch_next;
+        self.save_batch_next += 1;
+        self.save_batches.insert(
+            batch,
+            SaveBatch {
+                left: files,
+                saved: 0,
+                failed: 0,
+                name: String::new(),
+                dir,
+                failure: None,
+            },
+        );
+        batch
+    }
+
+    /// The result of a `SaveFacts` query.
+    fn on_save_facts(
+        &mut self,
+        generation: u64,
+        result: Option<&kourier_core::facade::SaveFacts>,
+    ) -> Changes {
+        let Some(what) = self.save_asks.remove(&generation) else {
+            return Changes::default();
+        };
+        match (what, result) {
+            (SaveAsk::Suggest(attachment), Some(facts)) => {
+                let name = self.save_name(facts);
+                self.save_answers
+                    .push(SaveAnswer::Suggested { attachment, name });
+            }
+            (SaveAsk::Suggest(_), None) => {
+                self.save_answers.push(SaveAnswer::Done(SaveOutcome {
+                    saved: 0,
+                    failed: 1,
+                    name: String::new(),
+                    dir: std::path::PathBuf::new(),
+                    failure: Some(SaveFailure::Gone),
+                }));
+            }
+            (SaveAsk::Name { batch, attachment }, Some(facts)) => {
+                let name = self.save_name(facts);
+                self.start_save(batch, attachment, name, true);
+                return Changes::default();
+            }
+            (SaveAsk::Name { batch, .. }, None) => {
+                self.save_file_ended(batch, None, Some(SaveFailure::Gone));
+            }
+        }
+        Changes {
+            saves: !self.save_answers.is_empty(),
+            ..Changes::default()
+        }
+    }
+
+    /// The core saved `attachment`.
+    fn on_attachment_saved(&mut self, attachment: AttachmentId) -> Changes {
+        if let Some(run) = self.save_runs.remove(&attachment) {
+            self.save_file_ended(run.batch, Some(&run.name), None);
+            self.start_next_save(attachment);
+        }
+        Changes {
+            saves: !self.save_answers.is_empty(),
+            ..Changes::default()
+        }
+    }
+
+    /// The core refused to save the attachment of `subject`: a clash in a batch tries the next
+    /// name, anything else ends the file.
+    fn on_save_failed(&mut self, error: &CoreError, subject: &ActionSubject) -> Changes {
+        let Some(attachment) = subject.attachment() else {
+            return Changes::default();
+        };
+        let Some(run) = self.save_runs.get_mut(&attachment) else {
+            return Changes::default();
+        };
+        let clash = matches!(
+            error,
+            CoreError::Save(kourier_core::facade::SaveError::Exists)
+        );
+        if clash && run.keep_both && run.tries < SAVE_TRIES {
+            run.tries += 1;
+            run.name = crate::save_name::with_number(&run.base, run.tries);
+            let target = kourier_core::facade::SaveTarget {
+                dir: run.dir.clone(),
+                name: run.name.clone(),
+            };
+            self.send(UiCommand::SaveAttachment {
+                attachment,
+                target,
+                mode: kourier_core::facade::SaveMode::NoReplace,
+            });
+            return Changes::default();
+        }
+        if let Some(run) = self.save_runs.remove(&attachment) {
+            self.save_file_ended(run.batch, None, Some(save_failure(error)));
+            self.start_next_save(attachment);
+        }
+        Changes {
+            saves: !self.save_answers.is_empty(),
+            ..Changes::default()
+        }
+    }
+}
+
 impl Failure {
     /// The kind of `error`.
     pub(crate) fn of(error: &CoreError) -> Self {
@@ -3031,7 +4749,32 @@ impl UiSource for CoreSource {
 
     fn conversations(&self, filter: &ConversationFilter) -> Vec<ConversationRow> {
         let time = self.time();
-        filter.apply(self.list.iter().map(|c| self.conversation_row(c, &time)))
+        let hidden = self.resolve_hidden(filter);
+        let table = self.account_table(&hidden, !filter.query.trim().is_empty());
+        let mut rows = filter.apply_resolved(
+            self.list.iter().map(|c| {
+                let mut row = self.conversation_row(c, &time);
+                table.decorate(&mut row);
+                row
+            }),
+            &hidden,
+        );
+        table.finish(&mut rows);
+        rows
+    }
+
+    fn archived_count(&self, filter: &ConversationFilter) -> u32 {
+        let hidden = self.resolve_hidden(filter);
+        let n = self
+            .list
+            .iter()
+            .filter(|c| archived_row(c) && filter.counts_archived(c.account, &hidden))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    fn accounts_known(&self) -> bool {
+        self.accounts_q.applied() > 0
     }
 
     fn chat(&self, id: ConversationId) -> Option<ChatHeader> {
@@ -3053,8 +4796,9 @@ impl UiSource for CoreSource {
         if self.open != Some(id) || !self.window.loaded {
             return Vec::new();
         }
-        let now = self.now_ms();
-        let (hold, safety_number) = self.wait_context();
+        let time = self.time();
+        let (hold, safety_number, who) = self.wait_context();
+        let who = who.map(|u| crate::names::single_line(&self.names.display_name(u)));
         self.window
             .rows
             .iter()
@@ -3067,9 +4811,54 @@ impl UiSource for CoreSource {
                     timeline::Receipt::None
                 };
                 let wait = self.send_wait(r, hold, safety_number);
-                (r.id, timeline::row_wait_line(receipt, wait, now))
+                (
+                    r.id,
+                    timeline::row_wait_line(
+                        receipt,
+                        r.out_state.as_ref(),
+                        wait,
+                        who.as_deref(),
+                        r.actions.safety_number.is_some(),
+                        &time,
+                    ),
+                )
             })
             .collect()
+    }
+
+    fn upload_rows(&self, id: ConversationId, shown: &[MessageRow]) -> Vec<(usize, MessageRow)> {
+        if self.open != Some(id) || !self.window.loaded {
+            return Vec::new();
+        }
+        let waiting: Vec<&CoreMessage> = self
+            .window
+            .rows
+            .iter()
+            .filter(|r| r.outbox.is_some())
+            .collect();
+        let mut out = Vec::new();
+        for (at, row) in shown.iter().enumerate() {
+            let Some(message) = row
+                .message_id()
+                .filter(|_| row.kind == timeline::RowKind::Message)
+            else {
+                continue;
+            };
+            let core = waiting.iter().find(|r| r.id == message);
+            if core.is_none() && !timeline::has_ring(row) {
+                continue;
+            }
+            let mut next = row.clone();
+            match core {
+                Some(core) => self.give_rings(core, &mut next),
+                // The message left the outbox (the timeline is rebuilt for that): no rings.
+                None => timeline::apply_uploads(&mut next, &|_| None, false),
+            }
+            if next.blocks != row.blocks {
+                out.push((at, next));
+            }
+        }
+        out
     }
 
     fn networks(&self) -> Vec<NetworkChoice> {
@@ -3084,25 +4873,58 @@ impl UiSource for CoreSource {
         if !self
             .networks
             .iter()
-            .any(|n| n.kind == network && n.available)
+            .any(|n| n.kind == network && n.available && n.on)
         {
+            // Not in this build, or an experimental network that is off at this start: its
+            // row opens the warning page, which turns it on and restarts; no login starts.
             return Err(SourceError::Unavailable);
         }
-        // "Try again" after a relink that failed (an expired code, a refused link) links the
-        // same account again: its conversations and messages belong to it. A login the user
-        // left (`cancel_login`) is forgotten, so "Add account" afterwards adds one.
-        if let Some(account) = self
+        // "Try again" after a login that failed goes the SAME way (an expired code asks for a
+        // new code, a refused number is typed again with the number still in the field), and
+        // after a relink that failed it links the same account again: its conversations and
+        // messages belong to it. A login the user left (`cancel_login`) is forgotten, so "Add
+        // account" afterwards adds one, the first way.
+        let again = self
             .login
             .as_ref()
-            .filter(|l| l.view.kind == LoginViewKind::Failed)
-            .and_then(|l| l.relink)
+            .filter(|l| l.view.kind == LoginViewKind::Failed && l.network == network)
+            .map(|l| (l.flow.clone(), l.typed.clone(), l.relink));
+        let (flow, typed, relink) = again.unwrap_or_else(|| (self.first_flow(network), None, None));
+        if let Some(account) = relink
             && self.account_network(account) == network
             && self.accounts.iter().any(|a| a.id == account)
         {
-            return self.relink(account);
+            return self.relink_with(account, &flow, typed);
         }
         self.cancel_login();
-        self.add_account(network)
+        self.add_account(network, &flow, typed)
+    }
+
+    fn switch_login_flow(&mut self, flow: &str) -> Result<LoginView, SourceError> {
+        let Some(login) = self.login.as_ref() else {
+            return Err(SourceError::Unavailable);
+        };
+        let network = login.network;
+        // The login has not shown a step yet (the click before was just made, or the number
+        // is being checked): a second click on the button (a double click, a key held) changes
+        // nothing. One click, one restart.
+        if login.view.kind == LoginViewKind::Waiting && !login.ended_linked {
+            return Ok(login.view.clone());
+        }
+        // Only the other flow of the network, and only where the page offers the switch
+        // (`with_flows`): never in the middle of a link that is made, or after it.
+        if login.ended_linked || login.flow == flow || login.view.other_flow != flow {
+            return Err(SourceError::Unavailable);
+        }
+        let (relink, typed) = (login.relink, login.typed.clone());
+        // The running login is stopped (its late steps belong to an account nobody waits for any
+        // more) and the other flow starts at once: the person did not leave the page, so no
+        // "Stop Linking?".
+        self.cancel_login();
+        match relink {
+            Some(account) => self.relink_with(account, flow, typed),
+            None => self.add_account(network, flow, typed),
+        }
     }
 
     fn send_text(
@@ -3133,7 +4955,21 @@ impl UiSource for CoreSource {
         }) {
             return Err(SourceError::Unavailable);
         }
-        self.last_sent = Some((id, raw, reply_to));
+        let after =
+            (self.open == Some(id) && self.window.loaded && !self.window.has_newer).then(|| {
+                self.window
+                    .rows
+                    .iter()
+                    .map(|r| r.id)
+                    .max()
+                    .unwrap_or(MessageId(0))
+            });
+        self.last_sent = Some(LastSent {
+            conv: id,
+            text: raw,
+            reply: reply_to,
+            after,
+        });
         self.notice.clear();
         self.answered(id);
         Ok(None)
@@ -3144,6 +4980,7 @@ impl UiSource for CoreSource {
         id: ConversationId,
         paths: Vec<std::path::PathBuf>,
         as_file: Vec<bool>,
+        with_location: Vec<bool>,
         caption: &str,
         reply_to: Option<MessageId>,
     ) -> Result<u64, SourceError> {
@@ -3165,7 +5002,8 @@ impl UiSource for CoreSource {
             });
         }
         let caption_text = crate::composer::outgoing_text(caption);
-        let Some(request) = self.send_files_request(id, paths, as_file, caption_text, reply_to)
+        let Some(request) =
+            self.send_files_request(id, paths, as_file, with_location, caption_text, reply_to)
         else {
             return Err(SourceError::Unavailable);
         };
@@ -3275,7 +5113,35 @@ impl UiSource for CoreSource {
         // sent before the command are about the old option and are dropped.
         self.expiry = Some(policy);
         self.settings_q.reset();
-        self.request_settings();
+        self.request_expiry();
+        true
+    }
+
+    fn quiet_notices(&self) -> Option<bool> {
+        self.quiet
+    }
+
+    fn set_quiet_notices(&mut self, shown: bool) -> bool {
+        if self.quiet == Some(shown) {
+            return true;
+        }
+        // A command that did not leave (the core has stopped) changes nothing: the switch
+        // reads as it was.
+        if !self.send(UiCommand::SetQuietNotices { shown }) {
+            return false;
+        }
+        // Shown at once; the core's answer to the query behind the command confirms it, or
+        // says what the choice still is when it could not be stored. The choice changes the
+        // sort time of chats and so the order and the previews of the list, which come from
+        // the core (§8.10): answers to queries sent before the command describe the old
+        // order and are dropped, and the whole list is read again (the command's
+        // `ConversationsChanged` names only the chats whose sort time moved; a preview can
+        // change without that).
+        self.quiet = Some(shown);
+        self.quiet_q.reset();
+        self.request_quiet();
+        self.list_q.reset();
+        self.request_list();
         true
     }
 
@@ -3309,6 +5175,183 @@ impl UiSource for CoreSource {
 
     fn close_revisions(&mut self) {
         self.revisions_shown = None;
+    }
+
+    fn request_person(
+        &mut self,
+        account: AccountId,
+        user: UserId,
+        origin: Option<ConversationId>,
+    ) -> bool {
+        self.person_shown = Some((account, user.clone()));
+        self.person_origin = origin;
+        self.person_answer = None;
+        // The first answer of a new ask is always handed over, even when it equals the page
+        // of the one before (the front end cleared that one).
+        self.person_last = None;
+        // A fresh profile, once for each time the page is opened; the backend decides whether
+        // it is due (Signal: not within a day), and the page shows what it has meanwhile.
+        self.send(UiCommand::RefreshContact {
+            account,
+            user: user.clone(),
+        });
+        // Answers still on their way are for a person that is not shown (or for this one,
+        // asked for earlier: the new query follows them).
+        self.person_q.reset();
+        self.person_sent.clear();
+        let t = self.person_q.request();
+        self.send_person(t);
+        !self.stopped
+    }
+
+    fn take_person(&mut self) -> Option<PersonUpdate> {
+        self.person_answer.take()
+    }
+
+    fn close_person(&mut self) {
+        self.person_shown = None;
+        self.person_origin = None;
+        self.person_answer = None;
+        self.person_last = None;
+        self.person_sent.clear();
+        self.person_q.reset();
+    }
+
+    fn request_safety(&mut self, account: AccountId, user: UserId) -> bool {
+        self.safety_shown = Some((account, user));
+        self.safety_answer = None;
+        // The first answer of a new ask is always handed over.
+        self.safety_last = None;
+        self.safety_key = None;
+        self.safety_notice.clear();
+        self.safety_q.reset();
+        self.safety_sent.clear();
+        let t = self.safety_q.request();
+        self.send_safety(t);
+        !self.stopped
+    }
+
+    fn take_safety(&mut self) -> Option<crate::safety::SafetyView> {
+        self.safety_answer.take()
+    }
+
+    fn close_safety(&mut self) {
+        self.safety_shown = None;
+        self.safety_answer = None;
+        self.safety_last = None;
+        self.safety_key = None;
+        self.safety_notice.clear();
+        self.safety_sent.clear();
+        self.safety_q.reset();
+    }
+
+    fn safety_action(
+        &mut self,
+        account: AccountId,
+        user: UserId,
+        action: crate::safety::SafetyAction,
+        key: kourier_model::IdentityFingerprint,
+    ) -> bool {
+        use crate::safety::SafetyAction;
+        // A new click: the line of an earlier refusal is not carried into the next answer. The
+        // key it acts on IS the one on screen, so it stays "the one last shown": a number that
+        // turns into another after the click is a swap and says so (W3; the Qt side compares the
+        // same way). A refusal drops it and brings its own line (`on_action_failed`).
+        self.safety_notice.clear();
+        self.safety_key = Some(key.clone());
+        self.send(match action {
+            SafetyAction::Mark | SafetyAction::Clear => UiCommand::SetVerified {
+                account,
+                user,
+                verified: action == SafetyAction::Mark,
+                key,
+            },
+            // BQ-2b: Confirm is its own command, never a Clear (a Clear always tells the
+            // other devices).
+            SafetyAction::Confirm => UiCommand::ConfirmIdentity { account, user, key },
+        })
+    }
+
+    fn share_targets(&self) -> Vec<crate::share::ShareTarget> {
+        // The list holds no chat the user deleted (hidden), so the picker lists none either.
+        self.list
+            .iter()
+            .map(|c| crate::share::ShareTarget {
+                id: c.id,
+                account: c.account,
+                title: conversation_title(c),
+                avatar_url: self.avatar_url(c.account, c.avatar.as_ref()),
+                is_self: c.is_self,
+                can_send: c.can_send,
+                archived: archived_row(c),
+                pinned_order: c.pinned_order,
+                last_activity: c.last_activity,
+            })
+            .collect()
+    }
+
+    fn send_contact(&mut self, conv: ConversationId, account: AccountId, user: UserId) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        self.send(UiCommand::SendContact {
+            conv,
+            account,
+            user,
+        })
+    }
+
+    fn request_group(&mut self, account: AccountId, conv: ConversationId) -> bool {
+        self.group_shown = Some((account, conv));
+        self.group_answer = None;
+        self.group_last = None;
+        // Answers still on their way are for a group that is not shown (or for this one, asked
+        // for earlier: the new query follows them).
+        self.group_q.reset();
+        self.group_sent.clear();
+        let t = self.group_q.request();
+        self.send_group(t);
+        !self.stopped
+    }
+
+    fn take_group(&mut self) -> Option<GroupUpdate> {
+        self.group_answer.take()
+    }
+
+    fn close_group(&mut self) {
+        self.group_shown = None;
+        self.group_answer = None;
+        self.group_last = None;
+        self.group_sent.clear();
+        self.group_q.reset();
+    }
+
+    fn open_chat_media(
+        &mut self,
+        slot: crate::chat_media::MediaSlot,
+        account: AccountId,
+        conv: ConversationId,
+    ) -> bool {
+        self.open_media_slot(slot, account, conv)
+    }
+
+    fn open_media_viewer(
+        &mut self,
+        from: crate::chat_media::MediaSlot,
+        message: MessageId,
+    ) -> bool {
+        self.open_media_viewer_slot(from, message)
+    }
+
+    fn more_chat_media(&mut self, slot: crate::chat_media::MediaSlot) {
+        self.more_media_slot(slot);
+    }
+
+    fn close_chat_media(&mut self, slot: crate::chat_media::MediaSlot) {
+        self.close_media_slot(slot);
+    }
+
+    fn take_chat_media(&mut self) -> Vec<crate::chat_media::MediaUpdate> {
+        self.take_media_updates()
     }
 
     fn edit_target(&self, conv: ConversationId, message: MessageId) -> Option<EditTarget> {
@@ -3391,6 +5434,9 @@ impl UiSource for CoreSource {
     fn set_timer(&mut self, conv: ConversationId, secs: u32) -> bool {
         let conv = self.survivor(conv);
         self.notice.clear();
+        // The next change forgets the last failure on the pages (the front end reads them
+        // again: `Changes::person` and `group` come with the call).
+        let _ = self.timer_failure_on_pages(None, "");
         self.send(UiCommand::SetConversationTimer {
             conv,
             timer: (secs > 0).then(|| Duration::from_secs(u64::from(secs))),
@@ -3480,43 +5526,26 @@ impl UiSource for CoreSource {
     }
 
     fn banner(&self, account: Option<AccountId>) -> Option<Banner> {
-        self.banner_of(account, false)
+        self.banner_of(account, &Hidden::default(), BannerSort::State)
     }
 
     fn transfer_banner(&self, account: Option<AccountId>) -> Option<Banner> {
-        self.banner_of(account, true)
+        self.banner_of(account, &Hidden::default(), BannerSort::Transfer)
+    }
+
+    fn banners(&self, filter: &ConversationFilter) -> Banners {
+        let hidden = self.resolve_hidden(filter);
+        Banners {
+            state: self.banner_of(None, &hidden, BannerSort::State),
+            transfer: self.banner_of(None, &hidden, BannerSort::Transfer),
+            shown_transfer: self.banner_of(None, &hidden, BannerSort::ShownTransfer),
+        }
     }
 
     fn relink(&mut self, account: AccountId) -> Result<LoginView, SourceError> {
-        let network = self.account_network(account);
+        let flow = self.first_flow(self.account_network(account));
         self.cancel_login();
-        let view = LoginView {
-            kind: LoginViewKind::Waiting,
-            title: trfc(
-                "@title:window page to link an account, %1 the name of a messenger",
-                "Link %1",
-                &[network_name(network)],
-            ),
-            progress: -1.0,
-            ..LoginView::default()
-        };
-        if !self.send(UiCommand::Relink {
-            account,
-            flow: "qr".into(),
-        }) {
-            return Err(SourceError::Unavailable);
-        }
-        // The account exists already: its login steps are ours from the first one.
-        self.cancelled.remove(&account);
-        self.login = Some(Login {
-            network,
-            account: Some(account),
-            view: view.clone(),
-            relink: Some(account),
-            transferred: false,
-            ended_linked: false,
-        });
-        Ok(view)
+        self.relink_with(account, &flow, None)
     }
 
     fn restart_account(&mut self, account: AccountId) -> bool {
@@ -3595,11 +5624,11 @@ impl UiSource for CoreSource {
             .find(|a| a.id == account)
             .map(|a| a.network)
             .ok_or(SourceError::Unavailable)?;
-        // Nothing is removed that could not be linked again in this build.
+        // Nothing is removed that could not be linked again now (in this build, and on).
         if !self
             .networks
             .iter()
-            .any(|n| n.kind == network && n.available)
+            .any(|n| n.kind == network && n.available && n.on)
         {
             return Err(SourceError::Unavailable);
         }
@@ -3607,7 +5636,19 @@ impl UiSource for CoreSource {
         if !self.send(UiCommand::RemoveAccount { account }) {
             return Err(SourceError::Unavailable);
         }
-        self.add_account(network)
+        // The history transfer is Signal's: the first flow of the network.
+        let flow = self.first_flow(network);
+        let view = self.add_account(network, &flow, None)?;
+        // (the add just queued is the newest: this many are ahead of it)
+        self.replacing = Some(Replacing {
+            old: account,
+            ahead: self.adds.len().saturating_sub(1),
+        });
+        Ok(view)
+    }
+
+    fn take_replace_news(&mut self) -> Vec<ReplaceNews> {
+        std::mem::take(&mut self.replace_news)
     }
 
     fn cancel_replace(&mut self) {
@@ -3624,6 +5665,9 @@ impl UiSource for CoreSource {
             return None;
         }
         let about = self.account_about(a);
+        let off = self.network_paused(a.network);
+        let missing = self.network_missing(a.network).is_some();
+        let kind = a.network;
         // A logged-out account has been unlinked already (by the phone, or by "Unlink…"):
         // there is nothing for Kourier to unlink.
         let linked =
@@ -3632,6 +5676,9 @@ impl UiSource for CoreSource {
         self.replace_asked = None;
         self.action_asked = Some((account, action));
         Some(match action {
+            AccountAction::Remove if linked && off => {
+                crate::account_actions::remove_question_while_off(account, about, kind, missing)
+            }
             AccountAction::Remove => {
                 crate::account_actions::remove_question(account, about, linked)
             }
@@ -3683,6 +5730,34 @@ impl UiSource for CoreSource {
         std::mem::take(&mut self.media_answers)
     }
 
+    fn ask_save(&mut self, id: AttachmentId) -> bool {
+        self.ask_save_facts(SaveAsk::Suggest(id))
+    }
+
+    fn save_to(&mut self, id: AttachmentId, dir: std::path::PathBuf, name: String) -> bool {
+        let batch = self.new_save_batch(1, dir);
+        self.start_save(batch, id, name, false);
+        !self.stopped
+    }
+
+    fn save_all(&mut self, ids: Vec<AttachmentId>, dir: std::path::PathBuf) -> bool {
+        let Ok(files) = u32::try_from(ids.len()) else {
+            return false;
+        };
+        if files == 0 {
+            return false;
+        }
+        let batch = self.new_save_batch(files, dir);
+        for attachment in ids {
+            self.ask_save_facts(SaveAsk::Name { batch, attachment });
+        }
+        !self.stopped
+    }
+
+    fn take_saves(&mut self) -> Vec<SaveAnswer> {
+        std::mem::take(&mut self.save_answers)
+    }
+
     fn loaded(&self) -> bool {
         self.accounts_q.applied() > 0 && self.list_q.applied() > 0
     }
@@ -3693,16 +5768,36 @@ impl UiSource for CoreSource {
 
     fn on_event(&mut self, event: &UiEvent) -> Changes {
         match event {
+            // The hold is a state: the event is the newest word (the rows carry it for a
+            // start). The banner and the line under the messages that wait say it.
+            UiEvent::AccountHold { account, hold } => {
+                if self.holds.get(account).copied().flatten() == *hold {
+                    return Changes::default();
+                }
+                self.holds.insert(*account, *hold);
+                let open_here = self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.row.account == *account);
+                Changes {
+                    accounts: true,
+                    timeline: open_here && self.sends_waiting(),
+                    ..Changes::default()
+                }
+            }
             UiEvent::AccountsChanged => {
                 self.request_accounts();
                 self.request_list();
                 // An account linked or logged out: what its messages offer changed with it.
                 self.request_detail();
                 self.reload_timeline();
+                // A safety number "once this account is connected" may be there now.
+                self.refresh_safety();
                 Changes::default()
             }
             UiEvent::AccountAdded { account } => {
-                if self.adds.pop_front() == Some(true) {
+                let news = self.replace_news.len();
+                if self.pop_add(Some(*account)) == Some(true) {
                     // The user cancelled this login before the core announced the account.
                     self.cancelled.insert(*account);
                     self.send(UiCommand::CancelLogin { account: *account });
@@ -3712,7 +5807,10 @@ impl UiSource for CoreSource {
                     login.account = Some(*account);
                 }
                 self.request_accounts();
-                Changes::default()
+                Changes {
+                    accounts: self.replace_news.len() != news,
+                    ..Changes::default()
+                }
             }
             UiEvent::LogoutOutcome {
                 seq,
@@ -3760,7 +5858,16 @@ impl UiSource for CoreSource {
                 }
             }
             UiEvent::AccountRemoved { account } => {
+                let person_ended = self
+                    .person_shown
+                    .as_ref()
+                    .is_some_and(|(a, _)| a == account)
+                    && self.end_person();
+                let group_ended =
+                    self.group_shown.is_some_and(|(a, _)| a == *account) && self.end_group();
+                let media_ended = self.end_media_of_account(*account);
                 self.filling.retain(|_, a| a != account);
+                self.lost_history.remove(account);
                 self.account_errors.remove(account);
                 self.cancelled.remove(account);
                 self.unfinished_links.remove(account);
@@ -3777,6 +5884,9 @@ impl UiSource for CoreSource {
                 self.request_list();
                 Changes {
                     transfer,
+                    person: person_ended,
+                    group: group_ended,
+                    chat_media: media_ended,
                     ..Changes::default()
                 }
             }
@@ -3792,12 +5902,19 @@ impl UiSource for CoreSource {
                     self.account_errors.remove(account);
                 }
                 self.conn.insert(*account, state.clone());
+                // A pushed history stops with the connection it came on (the phone sends
+                // again after a new one, if it has more): nothing is still "coming".
+                let connected =
+                    matches!(state, ConnState::Syncing { .. } | ConnState::Online { .. });
+                let ended = !connected && self.pushes_history(*account) && self.end_fills(*account);
                 // The backend deleted a transfer that ran with the login, and says nothing
                 // about it.
                 let out = matches!(state, ConnState::LoggedOut { .. });
                 if out {
                     // The backend stopped the delivery with the login.
                     self.filling.retain(|_, a| a != account);
+                    // And what it lost of the old link says nothing about a new one.
+                    self.lost_history.remove(account);
                 }
                 // (Both: the numbers go with the backend's work, whatever the transfer did.)
                 let transfer = out
@@ -3820,7 +5937,7 @@ impl UiSource for CoreSource {
                         .detail
                         .as_ref()
                         .is_some_and(|d| d.row.account == *account),
-                    transfer,
+                    transfer: transfer | ended,
                     ..Changes::default()
                 }
             }
@@ -3831,11 +5948,15 @@ impl UiSource for CoreSource {
                     step.kind,
                     LoginStepKind::Done | LoginStepKind::Failed { .. }
                 );
-                let changed = if ended {
+                let mut changed = if ended {
                     self.unfinished_links.remove(account)
                 } else {
                     !self.cancelled.contains(account) && self.unfinished_links.insert(*account)
                 };
+                // The announced account of a replace failed to link: the replace ends.
+                if matches!(step.kind, LoginStepKind::Failed { .. }) {
+                    changed |= self.end_announced(*account);
+                }
                 let Some(login) = self.login.as_ref() else {
                     return Changes {
                         accounts: changed,
@@ -3859,12 +5980,19 @@ impl UiSource for CoreSource {
                         ..Changes::default()
                     };
                 }
-                let view = self.device_name_default(login_view(step, login.network));
+                let view = Self::with_typed(
+                    self.device_name_default(login_view(step, login.network)),
+                    login.typed.as_ref(),
+                );
+                let view = self.with_flows(view, login.network, &login.flow);
                 let done = matches!(step.kind, LoginStepKind::Done);
                 let failed = matches!(step.kind, LoginStepKind::Failed { .. });
                 if let Some(login) = self.login.as_mut() {
                     login.account = if failed { None } else { Some(*account) };
                     login.view = view;
+                    if done {
+                        login.typed = None;
+                    }
                 }
                 if done {
                     self.request_accounts();
@@ -3881,20 +6009,45 @@ impl UiSource for CoreSource {
                 if self.open.is_some_and(|o| ids.contains(&o)) {
                     self.request_detail();
                 }
+                // The person's chat, or any group (a title, a membership): the page reads again.
+                self.refresh_person();
+                // The group's page changes with its own group only (members, rules, a title).
+                if self.group_shown.is_some_and(|(_, g)| ids.contains(&g)) {
+                    self.refresh_group();
+                }
                 Changes::default()
             }
             UiEvent::ConversationsRemoved { ids } => {
                 self.request_list();
+                let (person_ended, group_ended) = self.end_pages_of(ids);
+                let media_ended = self.end_media_of(ids);
                 if self.open.is_some_and(|o| ids.contains(&o)) {
-                    return self.close();
+                    let mut ch = self.close();
+                    ch.person |= person_ended;
+                    ch.group |= group_ended;
+                    ch.chat_media |= media_ended;
+                    return ch;
                 }
-                Changes::default()
+                // A group in common may have gone: the person's page reads again unless it
+                // ended.
+                if !person_ended {
+                    self.refresh_person();
+                }
+                Changes {
+                    person: person_ended,
+                    group: group_ended,
+                    chat_media: media_ended,
+                    ..Changes::default()
+                }
             }
             UiEvent::MessagesChanged { conv, .. } | UiEvent::TimelineInvalidated { conv } => {
                 if self.open == Some(*conv) {
                     self.reload_timeline();
                     self.refresh_revisions();
                 }
+                // The gallery of that chat, wherever it is shown (a picture came, was deleted,
+                // finished downloading).
+                self.refresh_media_of(*conv);
                 Changes::default()
             }
             // The core stored the messages of a send of files (their rows are announced by
@@ -3913,6 +6066,11 @@ impl UiSource for CoreSource {
                 ..Changes::default()
             },
             UiEvent::ConversationMerged { from, into } => {
+                if self.person_origin == Some(*from) {
+                    self.person_origin = Some(*into);
+                }
+                self.merge_media_chat(*from, *into);
+                self.refresh_person();
                 // The composer saves the text of the chat it leaves under the old id: it goes
                 // to the surviving conversation.
                 self.merged.insert(*from, *into);
@@ -3927,10 +6085,40 @@ impl UiSource for CoreSource {
                     ..Changes::default()
                 }
             }
-            UiEvent::ContactsChanged { .. } => {
+            UiEvent::ContactsChanged { account } => {
                 self.request_list();
                 self.request_detail();
                 self.reload_timeline();
+                self.refresh_person();
+                self.refresh_group();
+                if self
+                    .safety_shown
+                    .as_ref()
+                    .is_some_and(|(a, _)| a == account)
+                {
+                    self.refresh_safety();
+                }
+                Changes::default()
+            }
+            // Sends to a person began or ended waiting for their safety number (BQ-3): their
+            // open level asks again (it offers Confirm while sends wait) and so does their
+            // page (its line says the number changed while they wait, U7). The rows come as
+            // `MessagesChanged`.
+            UiEvent::SafetyWaitChanged { account, user } => {
+                if self
+                    .safety_shown
+                    .as_ref()
+                    .is_some_and(|(a, u)| a == account && u == user)
+                {
+                    self.refresh_safety();
+                }
+                if self
+                    .person_shown
+                    .as_ref()
+                    .is_some_and(|(a, u)| a == account && u == user)
+                {
+                    self.refresh_person();
+                }
                 Changes::default()
             }
             UiEvent::Typing {
@@ -3963,9 +6151,21 @@ impl UiSource for CoreSource {
                 ..
             } => self.on_action_failed(action, error, subject),
             UiEvent::QueryResult { token, result } => self.on_query_result(*token, result),
-            UiEvent::Progress(Progress::Transmit { message, phase, .. }) => {
-                self.on_send_phase(*message, *phase)
+            UiEvent::Progress(Progress::Transmit {
+                message,
+                progress,
+                phase,
+            }) => {
+                let mut ch = self.on_send_phase(*message, *phase);
+                ch.merge(self.on_uploads_over(*message, *progress, *phase));
+                ch
             }
+            UiEvent::Progress(Progress::Upload {
+                message,
+                attachment,
+                done,
+                total,
+            }) => self.on_upload_progress(*message, *attachment, *done, *total),
             UiEvent::Progress(Progress::Download {
                 attachment,
                 done,
@@ -3995,29 +6195,51 @@ impl UiSource for CoreSource {
             UiEvent::HistoryProgress {
                 account,
                 conv,
+                progress,
                 has_more,
-                ..
             } => {
                 let changed = if *has_more {
                     self.filling.insert(*conv, *account).is_none()
                 } else {
                     self.filling.remove(conv).is_some()
                 };
+                // A network that pushes its history shows a banner while any chat of the
+                // account is still filling.
+                let banner = self.track_fill(*account, *progress);
                 Changes {
                     header: changed && self.open == Some(*conv),
+                    accounts: banner,
+                    transfer: banner,
                     ..Changes::default()
                 }
             }
-            UiEvent::Notify(_)
-            | UiEvent::CatchUpSummary { .. }
-            | UiEvent::Progress(_)
-            | UiEvent::Notice { .. } => Changes::default(),
+            UiEvent::CancelTooLate { conv, message, .. } => {
+                self.on_cancel_too_late(*conv, *message)
+            }
+            // Part of a pushed history never arrived: the quiet line of the account's banner
+            // (a count of 0 says nothing; the line is the same for one chunk and for many).
+            UiEvent::Notice {
+                account,
+                notice: BackendNotice::HistoryLost { count },
+            } => Changes {
+                accounts: *count > 0 && self.lost_history.insert(*account),
+                ..Changes::default()
+            },
+            // F3b: a finished save is told to the UI as the answer to its own request (the
+            // notice "Saved ...").
+            UiEvent::AttachmentSaved { attachment, .. } => self.on_attachment_saved(*attachment),
+            UiEvent::Notify(_) | UiEvent::CatchUpSummary { .. } | UiEvent::Notice { .. } => {
+                Changes::default()
+            }
         }
     }
 
     fn reload(&mut self) -> Changes {
         // After a lagged channel an `AccountAdded` may be lost: do not wait for it forever.
         self.adds.clear();
+        if let Some(r) = self.replacing.take() {
+            self.replace_news.push(ReplaceNews::Ended { old: r.old });
+        }
         // The same for the answer to a send of files: without it the composer would say for
         // ever that those files are being prepared. Whether the core is done with them is
         // not known, so the composer keeps what it made for them.
@@ -4113,10 +6335,29 @@ impl UiSource for CoreSource {
         };
         let txn = login.view.txn;
         login.view.kind = LoginViewKind::Waiting;
-        let values = values
+        let values: Vec<(String, Redacted<String>)> = values
             .into_iter()
             .map(|(k, v)| (k, Redacted::new(v)))
             .collect();
+        // What was typed comes back into a step of the same id (a wrong phone number or code
+        // is corrected, not typed again), but never a secret: a wrong password is not put back
+        // into the field of its retry, and a value that is no field of the step (the request
+        // for a new code) is nothing to put back.
+        let kept: Vec<(String, Redacted<String>)> = values
+            .iter()
+            .filter(|(id, _)| {
+                login
+                    .view
+                    .fields
+                    .iter()
+                    .any(|f| f.id == *id && f.kind != "secret")
+            })
+            .cloned()
+            .collect();
+        login.typed = Some(Typed {
+            step_id: login.view.step_id.clone(),
+            values: kept,
+        });
         if self.send(UiCommand::SubmitLoginInput {
             account,
             txn,
@@ -4133,7 +6374,14 @@ impl UiSource for CoreSource {
     }
 
     fn quit_question(&self) -> Option<AbandonQuestion> {
-        let work = if self.visible_accounts().any(|a| self.transfer_runs(a)) {
+        // A pushed history first: it is the only work that quitting can lose (the phone sends
+        // it once), so its words must not be hidden behind those of an import that goes on at
+        // the next start. It is the banner's own condition (`fill_view`): a batch came in the
+        // last five minutes and a chat still has more; so nothing is asked in the seconds
+        // after a link before the first batch, after the push ended, or for a down account.
+        let work = if self.visible_accounts().any(|a| self.fill_view(a).is_some()) {
+            QuitWork::History
+        } else if self.visible_accounts().any(|a| self.transfer_runs(a)) {
             QuitWork::Import
         } else if self
             .visible_accounts()
@@ -4163,6 +6411,9 @@ impl UiSource for CoreSource {
             Some(account) if login.relink.is_none() && self.transfers.running(account) => {}
             Some(account) => {
                 self.send(UiCommand::CancelLogin { account });
+                // The announced account of a replace: the replace ends (the front-end reads
+                // the accounts after a cancel).
+                self.end_announced(account);
             }
             // Not announced yet (this login's `AddAccount` is the newest one waiting): cancel
             // the account as soon as the core names it.
@@ -4230,6 +6481,14 @@ impl UiSource for CoreSource {
         self.notice.clone()
     }
 
+    fn notice_message(&self) -> Option<MessageId> {
+        // Only while the note itself is what the notice says (another notice replaced it).
+        self.too_late
+            .as_ref()
+            .filter(|(_, text)| *text == self.notice)
+            .map(|(message, _)| *message)
+    }
+
     fn clear_notice(&mut self) {
         self.notice.clear();
     }
@@ -4253,6 +6512,31 @@ impl UiSource for CoreSource {
             ch.conversations = true;
             ch.header = true;
         }
+        // A banner that is written for a time (a ban's end, a hold's end) changes when the
+        // time comes: the core sends no event for it.
+        if let Some(before) = self.last_tick.replace(now)
+            && self.banner_instants().any(|t| t > before && t <= now)
+        {
+            ch.accounts = true;
+        }
+        // A pushed history nobody has heard of for a while is over for the person: the
+        // banner and the hold on Clear and Delete let go.
+        let idle: Vec<AccountId> = self
+            .fills
+            .iter()
+            .filter(|(_, f)| now.saturating_sub(f.last_batch) >= HISTORY_FILL_IDLE_MS)
+            .map(|(a, _)| *a)
+            .collect();
+        for account in idle {
+            let open_here = self
+                .open
+                .is_some_and(|c| self.filling.get(&c) == Some(&account));
+            if self.end_fills(account) {
+                ch.accounts = true;
+                ch.transfer = true;
+                ch.header |= open_here;
+            }
+        }
         // The line under a message on its way counts the seconds once it is shown: those
         // rows only, never the whole timeline (`UiSource::wait_lines`).
         let shown_from = now.saturating_sub(timeline::WAIT_SHOWN_AFTER_MS);
@@ -4269,18 +6553,26 @@ impl UiSource for CoreSource {
     }
 
     fn has_timers(&self) -> bool {
-        !self.typing.is_empty() || self.avatars_waiting.get() || self.sends_waiting()
+        let now = self.now_ms();
+        !self.typing.is_empty()
+            || self.avatars_waiting.get()
+            || self.sends_waiting()
+            || !self.fills.is_empty()
+            || self.banner_instants().any(|t| t > now)
     }
 
     fn unread_total(&self) -> u32 {
         let now = (self.now)();
         self.list
             .iter()
-            .filter(|c| !muted(c, now))
+            // (the archive's unread messages count nowhere; they still notify by the mute rules)
+            .filter(|c| !archived_row(c) && !muted(c, now))
             .map(|c| c.unread.max(u32::from(c.marked_unread)))
             .fold(0, u32::saturating_add)
     }
 }
+
+mod media_slots;
 
 #[cfg(test)]
 mod tests;
@@ -4289,7 +6581,37 @@ mod tests;
 mod action_tests;
 
 #[cfg(test)]
+mod save_tests;
+
+#[cfg(test)]
 mod files_tests;
 
 #[cfg(test)]
 mod transfer_tests;
+
+#[cfg(test)]
+mod network_tests;
+
+#[cfg(test)]
+mod upload_tests;
+
+#[cfg(test)]
+mod person_tests;
+
+#[cfg(test)]
+mod group_tests;
+
+#[cfg(test)]
+mod safety_tests;
+
+#[cfg(test)]
+mod media_tests;
+
+#[cfg(test)]
+mod choice_tests;
+
+#[cfg(test)]
+mod rows_tests;
+
+#[cfg(test)]
+mod telegram_tests;

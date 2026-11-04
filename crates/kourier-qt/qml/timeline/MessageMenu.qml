@@ -40,8 +40,38 @@ QQC2.Menu {
     readonly property bool quoted: root.row !== null && root.row.quoted === true
     readonly property bool canDeleteAttachment: root.offers.deleteAttachment === true && root.row !== null && root.row.attachments !== undefined && root.row.attachments.length > 0
 
+    // The groups of entries, each non-empty exactly when one of its entries is shown. The separator
+    // after a group is shown when that group is not empty and a later one is: so a separator
+    // stands only BETWEEN two groups that are not empty, the menu never starts or ends with one
+    // and never has two in a row (the menu of someone else's deleted message in a group is "Show
+    // Sender's Page", a separator, "Delete…").
+    readonly property bool hasQuick: root.offers.react === true
+    // The attachments "Save As…" accepts (the core listed them; the row names them), and what the entry says.
+    readonly property var saveIds: root.row !== null && root.row.saveIds !== undefined ? root.row.saveIds : []
+    readonly property bool canSave: root.offers.saveAttachments === true && root.saveIds.length > 0
+    readonly property bool hasMedia: root.mediaAction !== "" || root.quoted || root.canSave
+    readonly property bool hasMain: root.offers.react === true || root.offers.reply === true || root.offers.edit === true || root.offers.copy === true || root.hasReactions || (root.row !== null && root.row.edited === true)
+    readonly property bool hasPages: root.pages.length > 0
+    readonly property bool hasDeletes: root.offers.retry === true || root.offers.cancelSending === true || root.canDeleteAttachment || (root.canDelete && root.offers.takeBack !== true)
+
+    // The pages the row offers (the core states which: the sender's, the mentioned people's).
+    readonly property var pages: root.row !== null && root.row.pages !== undefined ? root.row.pages : []
+    // How much of an entry's text fits: a longer name is elided here (it is whole in the entry's
+    // accessible name), the menu does not grow with it.
+    readonly property real pageTextWidth: Kirigami.Units.gridUnit * 20
+
     // In the window's scene (also on Wayland, and in headless screenshots).
     popupType: QQC2.Popup.Item
+
+    // Where the entries of the pages go: right after the separator that comes before them.
+    function pagesAt(): int {
+        for (let i = 0; i < root.count; ++i) {
+            if (root.itemAt(i) === pagesSeparator) {
+                return i + 1;
+            }
+        }
+        return root.count;
+    }
 
     // An entry that takes no room while it does not apply. It is also disabled then: the
     // menu's keyboard navigation does not skip an item that is only invisible, so a hidden
@@ -87,7 +117,7 @@ QQC2.Menu {
     }
 
     QQC2.MenuSeparator {
-        visible: quickRow.visible
+        visible: root.hasQuick && (root.hasMedia || root.hasMain || root.hasPages || root.hasDeletes)
         height: visible ? implicitHeight : 0
     }
 
@@ -113,6 +143,13 @@ QQC2.Menu {
         onTriggered: TimelineActions.activate(root.row.messageId)
     }
     Entry {
+        objectName: "menuSave"
+        visible: root.canSave
+        icon.name: "document-save-as"
+        text: root.saveIds.length > 1 ? L10n.i18nc("@action:inmenu", "Save All…") : L10n.i18nc("@action:inmenu", "Save As…")
+        onTriggered: MediaActions.save(root.saveIds)
+    }
+    Entry {
         objectName: "menuQuote"
         visible: root.quoted
         icon.name: "go-jump"
@@ -120,7 +157,7 @@ QQC2.Menu {
         onTriggered: TimelineActions.quote(root.row.messageId)
     }
     QQC2.MenuSeparator {
-        visible: root.mediaAction !== "" || root.quoted
+        visible: root.hasMedia && (root.hasMain || root.hasPages || root.hasDeletes)
         height: visible ? implicitHeight : 0
     }
 
@@ -162,8 +199,45 @@ QQC2.Menu {
     }
 
     QQC2.MenuSeparator {
-        // (Nothing to separate from in the menu of a notice.)
-        visible: (root.offers.retry === true || root.canDelete || root.canDeleteAttachment) && !(root.row !== null && root.row.system === true)
+        id: pagesSeparator
+        visible: root.hasMain && (root.hasPages || root.hasDeletes)
+        height: visible ? implicitHeight : 0
+    }
+
+    // "Show Sender's Page" and "Show <name>'s Page", one per person: made for the row the menu is
+    // opened for and put after the separator. The entries come from the core (`row.pages`), the
+    // text of each is plain text (a name from the network), elided to `pageTextWidth`.
+    Instantiator {
+        model: root.pages
+        delegate: Entry {
+            id: page
+
+            required property var modelData
+
+            objectName: "menuPage"
+            icon.name: "user-identity"
+            // (A name from the network may hold "&", which a menu entry reads as a mnemonic: the
+            // "&" would vanish and the letter after it would trigger the entry. "&&" is the
+            // literal one. The accessible name and the metrics keep the single "&".)
+            text: pageText.elidedText.replace(/&/g, "&&")
+            Accessible.name: Style.plain(page.modelData.label)
+            // (The entry of a paused send, "Show %1's Safety Number" (BQ-3), opens the level of the number too.)
+            onTriggered: page.modelData.safety ? TimelineActions.safety(page.modelData.user) : TimelineActions.person(page.modelData.user)
+
+            TextMetrics {
+                id: pageText
+                font: page.font
+                elide: Text.ElideRight
+                elideWidth: root.pageTextWidth
+                text: Style.plain(page.modelData.label)
+            }
+        }
+        onObjectAdded: (index, object) => root.insertItem(root.pagesAt() + index, object)
+        onObjectRemoved: (index, object) => root.removeItem(object)
+    }
+
+    QQC2.MenuSeparator {
+        visible: root.hasPages && root.hasDeletes
         height: visible ? implicitHeight : 0
     }
 
@@ -173,9 +247,11 @@ QQC2.Menu {
         text: L10n.i18nc("@action:inmenu", "Send Again")
         onTriggered: App.retryMessage(root.row.messageId)
     }
-    // Nobody has the message yet: it is simply taken back.
+    // Nobody has the message yet: it is simply taken back; or it is on its way and the core can
+    // still stop it (its upload is moving and nobody can have it: `cancelSending`).
     Entry {
-        visible: root.offers.takeBack === true && root.offers.deleteForMe === true
+        objectName: "menuCancel"
+        visible: root.offers.cancelSending === true
         icon.name: "trash-empty"
         text: root.row !== null && root.row.failed ? L10n.i18nc("@action:inmenu", "Delete") : L10n.i18nc("@action:inmenu", "Cancel Sending")
         onTriggered: App.cancelMessage(root.row.messageId)

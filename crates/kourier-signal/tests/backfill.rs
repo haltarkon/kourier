@@ -30,7 +30,7 @@
     reason = "the shared support modules serve several test files"
 )]
 
-mod support;
+use crate::support;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -449,6 +449,9 @@ async fn the_phone_gets_one_request_naming_the_chat_the_author_and_the_original_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_phones_answer_in_steps_lands_slot_by_slot_and_the_file_downloads() {
+    if support::in_own_process!() {
+        return;
+    }
     let Some(world) = World::start().await else {
         return;
     };

@@ -7,6 +7,8 @@
 #include <QtCore/QMutexLocker>
 #include <QtCore/QRunnable>
 #include <QtCore/QScopeGuard>
+#include <QtCore/QSemaphore>
+#include <QtCore/QThread>
 #include <QtCore/QThreadPool>
 #include <QtCore/QUrl>
 #include <QtGui/QClipboard>
@@ -23,6 +25,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <dlfcn.h>
 #include <memory>
 #include <vector>
 
@@ -46,6 +49,11 @@ std::atomic<int> g_pending{0};
 std::atomic<bool> g_logRequests{false};
 QMutex g_logMutex;
 std::vector<QString> g_requestLog;
+
+// Test probe (`raceImageFinishes`): 0 off, 1 a request returns only once its worker is done, 2 the
+// same, and an emission of `finished` on a thread other than the response's is held inside Qt's
+// emission until the response's thread is back in its event loop.
+std::atomic<int> g_raceFinishes{0};
 
 // Test probes of the thread that decodes (`decodeProbe`): how many pictures were scaled AFTER
 // the reader had decoded them whole (the slow path), and how many pixels the last decode made.
@@ -148,6 +156,9 @@ struct Job {
     QImage image;
     QString error;
     bool cancelled = false;
+    // Test probe (`raceImageFinishes`): released when the worker is done, and when it begins to
+    // emit `finished` on its own thread.
+    QSemaphore handedBack;
 };
 
 class Response : public QQuickImageResponse {
@@ -182,9 +193,74 @@ public:
         m_job->cancelled = true;
     }
 
+    // The test probe's view of the job (`raceImageFinishes`).
+    Job& job() const { return *m_job; }
+
 private:
     std::shared_ptr<Job> m_job;
 };
+
+// Tells Qt that the job of `response` is done; called on the worker with the job's mutex held.
+// Never emitted here: Qt's pixmap reader connects to `finished` only after
+// `requestImageResponse` returned, and Qt takes the receivers of an emission when it starts. A
+// worker's emission that started before that connection reaches only the response's own slot,
+// which sets a flag the reader checks right after it connected; when that slot runs after the
+// check, the signal reached nobody, and the Image stays in Loading for ever with nothing pending
+// here (a hidden blurhash `Image`, microseconds of work, 1 render in 277 of `cargo xtask shots`
+// under load; `raceImageFinishes(2)` makes the order certain). Queued, `finished` is emitted on
+// the response's thread (the reader's, which called `requestImageResponse`) once it is back in
+// its event loop, connected. The mutex keeps the response alive while the call is posted (its
+// destructor takes it first); Qt drops a queued call whose object was deleted.
+void announce(QQuickImageResponse* response)
+{
+    QMetaObject::invokeMethod(response, [response] { Q_EMIT response->finished(); }, Qt::QueuedConnection);
+}
+
+// Test probe (`raceImageFinishes(2)`), called by Qt before every slot it calls directly while the
+// probe is on: when the slot is the response's own `_q_finished` (connected first, in Qt's
+// constructor; it sets the flag Qt's pixmap reader checks after it connected) and the emission
+// runs on a thread other than the response's, the request may return now, and the emission waits
+// until the response's thread is back in its event loop. Qt took the emission's receivers before
+// this callback, and the reader connects and checks the flag before it goes back to its loop: the
+// order in which a `finished` emitted by the worker reaches nobody.
+void holdForeignFinish(QObject* receiver, int index, void**)
+{
+    static const int finishedSlot = QQuickImageResponse::staticMetaObject.indexOfSlot("_q_finished()");
+    if (index != finishedSlot || receiver->thread() == QThread::currentThread()) {
+        return;
+    }
+    auto* response = dynamic_cast<Response*>(receiver);
+    if (response == nullptr) {
+        return;
+    }
+    response->job().handedBack.release();
+    auto back = std::make_shared<QSemaphore>();
+    QMetaObject::invokeMethod(receiver, [back] { back->release(); }, Qt::QueuedConnection);
+    back->tryAcquire(1, 5000);
+}
+
+// Qt's test hook for signal emissions (`QSignalSpyCallbackSet`, `qt_register_signal_spy_callbacks`
+// in Qt's private `qobject_p.h`, the same since Qt 4). Looked up at run time, only when a test
+// turns the probe on, so the app does not link one more private symbol of Qt.
+struct SpyCallbacks {
+    void (*signalBegin)(QObject*, int, void**);
+    void (*slotBegin)(QObject*, int, void**);
+    void (*signalEnd)(QObject*, int);
+    void (*slotEnd)(QObject*, int);
+};
+SpyCallbacks g_spy{nullptr, &holdForeignFinish, nullptr, nullptr};
+
+bool registerSpy(bool on)
+{
+    using Register = void (*)(SpyCallbacks*);
+    static const auto reg = reinterpret_cast<Register>(
+        dlsym(RTLD_DEFAULT, "_Z32qt_register_signal_spy_callbacksP21QSignalSpyCallbackSet"));
+    if (reg == nullptr) {
+        return false;
+    }
+    reg(on ? &g_spy : nullptr);
+    return true;
+}
 
 class Provider : public QQuickAsyncImageProvider {
 public:
@@ -214,14 +290,17 @@ public:
                 + QString::number(requestedSize.height()));
         }
         m_pool.start([job, utf8, requestedSize, reader]() {
-            // Counted down on every way out, after `finished` was emitted.
-            const auto done = qScopeGuard([] { g_pending.fetch_sub(1, std::memory_order_seq_cst); });
+            // Counted down on every way out, after `finished` was announced.
+            const auto done = qScopeGuard([&job] {
+                g_pending.fetch_sub(1, std::memory_order_seq_cst);
+                job->handedBack.release();
+            });
             {
                 QMutexLocker lock(&job->mutex);
                 if (job->cancelled) {
                     job->error = QStringLiteral("cancelled");
                     if (job->response != nullptr) {
-                        Q_EMIT job->response->finished();
+                        announce(job->response);
                     }
                     return;
                 }
@@ -238,9 +317,13 @@ public:
                 job->image = image;
             }
             if (job->response != nullptr) {
-                Q_EMIT job->response->finished();
+                announce(job->response);
             }
         });
+        if (g_raceFinishes.load(std::memory_order_seq_cst) != 0) {
+            // Test probe: the worker is done (or emitting) before Qt has the response.
+            job->handedBack.tryAcquire(1, 5000);
+        }
         return response;
     }
 
@@ -273,6 +356,17 @@ rust::Vec<rust::String> takeImageRequestLog()
     }
     g_requestLog.clear();
     return out;
+}
+
+bool raceImageFinishes(int32_t how)
+{
+    const bool hooked = registerSpy(how == 2);
+    if (how == 2 && !hooked) {
+        g_raceFinishes.store(0, std::memory_order_seq_cst);
+        return false;
+    }
+    g_raceFinishes.store(how, std::memory_order_seq_cst);
+    return true;
 }
 
 QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
@@ -311,7 +405,18 @@ QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
         // for (decoding it whole costs twice as much for a 2 MP photo of a contact).
         const int asked = qMax(requested.width(), requested.height());
         const QSize cover = cornered ? QSize(asked, asked) : requested;
-        const QSize target = coverSize(natural, cover);
+        QSize target = coverSize(natural, cover);
+        // A timeline picture is drawn whole (`PreserveAspectFit`) into a rectangle of its own
+        // shape, rounded to a pixel, and Qt asks for exactly that rectangle. `coverSize` rounds
+        // the other side by itself and can come out a pixel off (1080x2340 asked 398x864 gives
+        // 399x864): drawn into 398 the picture would be resampled by 0.9975 and lose its fine
+        // detail. A cover within a pixel of what was asked on both sides is the request itself
+        // (at most one pixel of distortion); a square, a quote's thumbnail or a picture of
+        // another shape is not.
+        if (!cornered && requested.width() > 0 && requested.height() > 0 && target.isValid()
+            && qAbs(target.width() - requested.width()) <= 1 && qAbs(target.height() - requested.height()) <= 1) {
+            target = requested;
+        }
         if (target.isValid() && target != natural && reader.supportsOption(QImageIOHandler::ScaledSize)) {
             reader.setScaledSize(rotated ? target.transposed() : target);
         }

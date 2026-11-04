@@ -1073,7 +1073,10 @@ pub(crate) async fn transmit<T: SignalTransport>(
     match transmit_message(shared, socket, account, req, uploader).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            tracing::warn!(kind = error.kind.name(), error = %error.detail, "group transmit failed");
+            // A stop the user asked for is not a failure worth a warning (the actor logs it).
+            if !uploader.stop.is_requested() {
+                tracing::warn!(kind = error.kind.name(), error = %error.detail, "group transmit failed");
+            }
             TransmitOutcome::Failed(error)
         }
     }
@@ -1154,6 +1157,9 @@ async fn transmit_message<T: SignalTransport>(
         }),
     };
     let built = outgoing::build(&shared.db, uploader, &chat, req, shared.now()).await?;
+    // The point of no return: the sender-key distribution and the fan-out come next, so from
+    // here an abort is too late.
+    uploader.pass_point_of_no_return()?;
     let outgoing = built.wire.content();
     let only: Option<Vec<Aci>> = req.only.as_ref().map(|only| {
         only.iter()
@@ -1218,6 +1224,8 @@ async fn transmit_message<T: SignalTransport>(
             log_group_send(&row, req, &outcome, built_in, transcript_time, started);
             return Err(e.to_backend_error());
         }
+        // The message went out (to some member, or the lonely group's own devices).
+        super::bring_back_after_send(&ctx, req).map_err(|e| e.to_backend_error())?;
     }
     log_group_send(&row, req, &outcome, built_in, transcript_time, started);
     Ok(merge(outcome))
@@ -1331,7 +1339,7 @@ pub(crate) async fn send_typing<T: SignalTransport>(
     conv: ConvKey,
     on: bool,
 ) {
-    let (Some(account), Some(socket)) = (shared.account(), shared.socket.borrow().clone()) else {
+    let (Some(account), Some(socket)) = (shared.account(), shared.work_socket()) else {
         return;
     };
     let row = shared.db.read(|c| -> Result<Option<GroupRow>> {
@@ -1429,8 +1437,10 @@ mod tests {
     }
 
     /// The key setup and the 1:1 sends of a group run several members at once, never more
-    /// than the bound: 40 sends of 20 ms each at 16 at once take three rounds, not forty.
-    #[tokio::test(flavor = "current_thread")]
+    /// than the bound: 40 sends of 20 ms each at 16 at once take three rounds, not forty. The
+    /// clock is paused (tokio's own time, advanced when every task waits), so a loaded machine
+    /// cannot stretch the rounds.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn member_steps_run_at_once_up_to_the_bound() {
         use std::cell::Cell;
         let in_flight = Cell::new(0_usize);

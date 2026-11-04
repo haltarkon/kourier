@@ -34,10 +34,13 @@ pub use account::{
     AutoDownloadPolicy, DeviceLogout, LogoutReport, OwnDevice, ProfilePatch,
 };
 pub use call::{CallDirection, CallLine, CallMedia, CallState, MAX_RING_MS};
-pub use conn::{ConnState, UserAction};
+pub use conn::{
+    AccountHold, BanReason, ConnState, HoldReason, LogoutCause, NetworkNote, Restriction,
+    UserAction,
+};
 pub use contact::{
     Contact, ContactChange, ContactPatch, IdentityFingerprint, Member, MemberList, MemberRole,
-    TrustLevel,
+    SafetyAnswer, SafetyNumber, SafetyUnavailable, TrustLevel, VerifyState,
 };
 pub use content::{
     AskFailure, Attachment, AttachmentKind, AttachmentMeta, AttachmentState, BlobKey, BlobRef,
@@ -47,8 +50,9 @@ pub use content::{
 pub use conversation::{ConvKind, Conversation, ConversationChange, ConversationPatch};
 pub use error::{BackendError, ErrorKind, PersistError};
 pub use features::{
-    AccountCaps, CannotSend, ConversationFeatures, FileAlbum, FileLimits, FilePacking, FilePlan,
-    FormatKind, GroupActions, HistorySource, LoginFlow, NetworkDescriptor, PlanFile, RiskNotice,
+    AccountCaps, CannotSend, CleanedPictures, ConversationFeatures, EditTarget, FileAlbum,
+    FileLimits, FilePacking, FilePlan, FormatKind, GroupActions, GroupInfo, HistoryReadState,
+    HistorySource, LoginFlow, NetworkDescriptor, OutboxPolicy, PlanFile, RiskNotice, ServerRules,
     Support, TimerRange, TypingPolicy, Window,
 };
 pub use ids::{
@@ -57,7 +61,10 @@ pub use ids::{
     NetMsgId, NetworkKind, TargetAuthor, UserId,
 };
 pub use log::{Redacted, RedactedShape};
-pub use login::{InputField, InputKind, LoginStep, LoginStepKind};
+pub use login::{
+    CodeDelivery, CodeResend, CodeVia, InputField, InputKind, LoginStep, LoginStepKind,
+    RESEND_FIELD,
+};
 pub use patch::Patch;
 pub use state::{FailReason, OutgoingState, ReadState, ReceiptKind, RecipientState, SendPhase};
 pub use text::{RangeError, RangeKind, Text, TextRange, Utf16Map};

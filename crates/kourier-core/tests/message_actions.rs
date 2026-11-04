@@ -5,7 +5,7 @@
 //! avatars, timer changes with their timeline row and version, and long texts joined once
 //! their file is here.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use kourier_model::{
     AccountId, AccountUuid, Attachment, AttachmentId, AttachmentKind, BackendError, BlobKey,
     BlobRef, Body, ConnState, ContactPatch, ConvKey, ConversationId, ConversationPatch, ErrorKind,
     FileLimits, MessageId, MsgIdScope, MsgTarget, NetMsgId, NetworkKind, OutgoingState, Patch,
-    QuoteSnapshot, ReplyTo, SystemEvent, TargetAuthor, Text,
+    QuoteSnapshot, ReplyTo, SystemEvent, TargetAuthor, Text, UserId,
 };
 use support::send::*;
 use support::{CORE_KEY, Env, WAIT, add_linked, eventually};
@@ -232,6 +232,7 @@ fn send_files(
         .send(UiCommand::SendFiles {
             request: Default::default(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             conv,
             paths: paths.into(),
             caption: caption.map(Text::plain),
@@ -303,6 +304,148 @@ async fn action_flags_are_the_commands_checks_and_end_on_the_clock() {
         row(&env, c, mine.id).await.body,
         Body::text("edited in time")
     );
+}
+
+/// A text message of `conv` with these parts: a piece of text, or a mention of a user.
+fn mention_message(
+    conv: &ConvKey,
+    author: &UserId,
+    local: i64,
+    own: bool,
+    parts: &[(&str, Option<&UserId>)],
+    spoiler_over_last_mention: bool,
+) -> BackendEvent {
+    use kourier_model::text::MENTION_PLACEHOLDER;
+    use kourier_model::{RangeKind, TextRange};
+    let mut body = String::new();
+    let mut ranges = Vec::new();
+    for (text, user) in parts {
+        body.push_str(text);
+        if let Some(user) = user {
+            let start = u32::try_from(body.len()).expect("len");
+            let len = u32::try_from(MENTION_PLACEHOLDER.len_utf8()).expect("len");
+            ranges.push(TextRange {
+                start,
+                len,
+                kind: RangeKind::Mention((*user).clone()),
+            });
+            if spoiler_over_last_mention {
+                // (Replaced by the next mention's spoiler: only the last one is hidden.)
+                ranges.retain(|r| !matches!(r.kind, RangeKind::Spoiler));
+                ranges.push(TextRange {
+                    start,
+                    len,
+                    kind: RangeKind::Spoiler,
+                });
+            }
+            body.push(MENTION_PLACEHOLDER);
+        }
+    }
+    let at = T0 + local;
+    let mut message = if own {
+        kourier_fake::scripts::own(conv, &at.to_string(), at, "")
+    } else {
+        remote(conv, author, &at.to_string(), at, "")
+    };
+    message.body = Body::Text(Text { body, ranges });
+    BackendEvent::Message(message)
+}
+
+/// People pages P3 (the menu rule: the core states the entries): a message of another person
+/// in a group has "Show Sender's Page", the user's own message and a message of a chat that is no
+/// group have none; every distinct person the text mentions has an entry in the order of the first
+/// mention, the user (by any of his ids) one entry flagged `own`, a mention under a spoiler none, and
+/// our own messages keep the entries of their mentions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_offers_the_pages_of_its_sender_and_of_the_people_it_mentions() {
+    let (alice, bob, me, me_pni) = (alice(), bob(), uid(ME), uid(ME_PNI));
+    let script = script("pages").deliver(vec![
+        // 1. Alice, in the group, no mention.
+        mention_message(&group(), &alice, 1, false, &[("hello", None)], false),
+        // 2. Bob, in the group: alice, the user, alice again, the user's other id, bob himself.
+        mention_message(
+            &group(),
+            &bob,
+            2,
+            false,
+            &[
+                ("a ", Some(&alice)),
+                (" b ", Some(&me)),
+                (" c ", Some(&alice)),
+                (" d ", Some(&me_pni)),
+                (" e ", Some(&bob)),
+            ],
+            false,
+        ),
+        // 3. Bob, in the group: alice, and bob under a spoiler.
+        mention_message(
+            &group(),
+            &bob,
+            3,
+            false,
+            &[("a ", Some(&alice)), (" b ", Some(&bob))],
+            true,
+        ),
+        // 4. The user's own message from another device, in the group, mentioning alice.
+        mention_message(&group(), &me, 4, true, &[("hi ", Some(&alice))], false),
+        // 5. Alice, in a 1:1 chat, mentioning the user.
+        mention_message(&d_alice(), &alice, 5, false, &[("you ", Some(&me))], false),
+    ]);
+    let (env, account, _) = linked(script).await;
+    env.wait_finished(account).await;
+    let g = conv(&env, &group()).await;
+    let direct = conv(&env, &d_alice()).await;
+    let people = |r: &MessageRow| -> Vec<(UserId, bool)> {
+        r.actions
+            .show_people
+            .iter()
+            .map(|p| (p.user.clone(), p.own))
+            .collect()
+    };
+
+    let plain = row(&env, g, message(&env, T0 + 1).await).await;
+    assert!(
+        plain.actions.show_sender,
+        "another person's message in a group"
+    );
+    assert!(people(&plain).is_empty(), "no mention, no entry");
+
+    let many = row(&env, g, message(&env, T0 + 2).await).await;
+    assert!(many.actions.show_sender);
+    assert_eq!(
+        people(&many),
+        vec![
+            (alice.clone(), false),
+            (me.clone(), true),
+            (bob.clone(), false)
+        ],
+        "alice once, the user once whichever id he was named by, bob"
+    );
+
+    let hidden = row(&env, g, message(&env, T0 + 3).await).await;
+    assert_eq!(
+        people(&hidden),
+        vec![(alice.clone(), false)],
+        "bob's mention is under a spoiler: no entry"
+    );
+
+    let own = row(&env, g, message(&env, T0 + 4).await).await;
+    assert!(
+        !own.actions.show_sender,
+        "our own message has no sender entry"
+    );
+    assert_eq!(
+        people(&own),
+        vec![(alice.clone(), false)],
+        "its mentions keep theirs"
+    );
+
+    let one_to_one = row(&env, direct, message(&env, T0 + 5).await).await;
+    assert!(
+        !one_to_one.actions.show_sender,
+        "a 1:1 chat has no sender entry"
+    );
+    assert_eq!(people(&one_to_one), vec![(me.clone(), true)]);
 }
 
 /// Item 1. A message nobody has yet says so (`take_back`): both deletes simply remove it, far

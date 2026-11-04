@@ -27,6 +27,45 @@ pub const fn denies_dumps() -> bool {
 /// The environment variable that makes a debug build non-dumpable (`1`).
 pub const NO_DUMP_ENV: &str = "KOURIER_DEV_NO_DUMP";
 
+/// The start of every development variable (`KOURIER_DEV_KEYRING`, `KOURIER_DEV_EXPECT_NUMBER_TAIL`,
+/// `KOURIER_DEV_NO_DUMP`, ...). One of them holds the last digits of a phone number, so none may
+/// reach a program Kourier starts: `/proc/<pid>/environ` of that child is readable by every
+/// process of the same user, and Kourier itself is non-dumpable for that very reason (W2c, C0).
+pub const DEV_ENV_PREFIX: &str = "KOURIER_DEV_";
+
+/// The environment variable with the last digits of the phone number a first link must find
+/// (`dev::expected_number_tail` reads it, in a debug build). It is the one development variable
+/// that holds a secret, so it is also the one Restart Now takes out of the new process's
+/// environment; the other `KOURIER_DEV_*` variables stay (a development profile restarts in its
+/// own mode), while a program Kourier starts for the person gets none of them ([`DEV_ENV_PREFIX`]).
+pub const EXPECT_NUMBER_TAIL_ENV: &str = "KOURIER_DEV_EXPECT_NUMBER_TAIL";
+
+/// The debug-only test switch of the WhatsApp calls (`kourier-whatsapp`'s `calls::BUILTIN_ENV`): it
+/// is a development variable of its own name, so it is taken out of a child's environment with the
+/// `KOURIER_DEV_*` ones (a program a link opens in must not learn which test switches are on).
+pub const WA_CALL_BUILTIN_ENV: &str = "KOURIER_WA_CALL_BUILTIN";
+
+/// The names among `names` that are development variables ([`DEV_ENV_PREFIX`], and the exact name
+/// [`WA_CALL_BUILTIN_ENV`]). Used with the names of this process's environment, to take them out of the
+/// environment of a child.
+pub fn dev_env_names(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name.as_encoded_bytes()
+                .starts_with(DEV_ENV_PREFIX.as_bytes())
+                || name.as_encoded_bytes() == WA_CALL_BUILTIN_ENV.as_bytes()
+        })
+        .collect()
+}
+
+/// The development variables this process has right now.
+pub fn dev_env_names_now() -> Vec<std::ffi::OsString> {
+    dev_env_names(std::env::vars_os().map(|(name, _)| name))
+}
+
 /// Whether `env` asks a debug build to make itself non-dumpable ([`NO_DUMP_ENV`] is `1`).
 /// Release builds decide by themselves ([`denies_dumps`]) and never read it.
 pub fn asked_to_deny_dumps(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {

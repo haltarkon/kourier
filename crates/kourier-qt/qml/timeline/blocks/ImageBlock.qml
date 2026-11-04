@@ -7,7 +7,11 @@ import app.kourier
 
 // A photo, GIF, video or sticker (§8.6), laid out in the picture's proportions before anything
 // is downloaded: the blurhash placeholder first, then the thumbnail from the image provider
-// (decoded at display size), the full picture in the viewer on a tap. Not downloaded yet: a
+// (decoded at display size), the full picture in the viewer on a tap. A picture or video is
+// never cropped (the user's word): the block's BOX (what the bubble measures) holds the
+// PICTURE RECT, the picture's own shape fitted, centred; a very thin picture leaves the rest
+// of its box to the bubble's color. Both are plain bindings (`boxW`, `picW` …), no item of
+// their own: the row is made many times. Not downloaded yet: a
 // download button with the size; downloading: progress; failed: retry; gone: a note (a
 // sticker that is gone has no picture to put one over: it is a small framed box with the
 // note instead). GIFs and animated stickers play from a tmpfs copy (AnimatedImage cannot read
@@ -37,13 +41,64 @@ Item {
     // What a tap fetches: a download, a retry, or the question to the phone.
     readonly property bool downloadable: root.mediaState === "remote" || root.mediaState === "failed" || root.ask
     readonly property bool sticker: root.block.sticker
+
+    // The picture of an own message on its way (upload progress): a ring over it with the X
+    // that cancels the sending in its middle (the badge below), the percentage in the note pill.
+    // All of it comes from the block, and whether the X is there is the core's word
+    // (`uploadCancel`, the row's `cancelSending`), never decided here. An album that draws the
+    // ring of its "+N" tile itself takes this tile's own ring away (`ringByAlbum`).
+    property bool ringByAlbum: false
+    readonly property bool uploading: root.block.uploading === true && !root.ringByAlbum
+    readonly property real uploadShare: root.block.uploadShare ?? 0
+    readonly property string uploadLabel: root.block.uploadLabel ?? ""
+    readonly property bool uploadCancel: root.block.uploadCancel === true
+    // The X was pressed: it stays, dimmed and no longer a button, until the row changes (the
+    // core's flag has gone by then, and the message goes in a moment, or turns out to be sent)
+    // or the core offers the cancel again (a stop that came too late: the flag is back).
+    property bool cancelAsked: false
+    readonly property bool cancelShown: root.uploading && (root.uploadCancel || root.cancelAsked)
+    onUploadingChanged: {
+        if (!root.uploading) {
+            root.cancelAsked = false;
+        }
+    }
+    onUploadCancelChanged: {
+        if (root.uploadCancel) {
+            root.cancelAsked = false;
+        }
+    }
     readonly property bool animated: root.block.animated && root.local
-    // Height / width, clamped so very tall or wide pictures stay readable (they are cropped).
+    // A sticker's height / width, clamped (stickers keep their own rule).
     readonly property real ratio: root.block.width > 0 && root.block.height > 0 ? Math.max(0.4, Math.min(1.6, root.block.height / root.block.width)) : 0.75
+    // The picture's own height / width: never clamped, it is shown whole (unknown: a 4:3 box).
+    readonly property real shape: root.block.width > 0 && root.block.height > 0 ? root.block.height / root.block.width : 0.75
     // Natural width in logical pixels, never wider than the bubble allows, never tiny.
     readonly property real naturalWidth: root.block.width > 0 ? root.block.width / Screen.devicePixelRatio : Style.imageMaxWidth
     readonly property real maxWidth: root.sticker ? Style.stickerSize : Style.imageMaxWidth
-    readonly property real minWidth: root.sticker ? Kirigami.Units.gridUnit * 4 : Kirigami.Units.gridUnit * 7
+    readonly property real minWidth: root.sticker ? Kirigami.Units.gridUnit * 4 : Style.imageMinWidth
+
+    // A single picture (§8.6): W is the picture column; the picture is as large as fits W wide
+    // and `imageMaxHeight` tall, never above its own size, raised to the minimum width (or to
+    // the tallest that fits) when tiny. The box is at least the minimum width and height.
+    readonly property real column: Math.min(Style.imageMaxWidth, root.available)
+    readonly property real tallest: Style.imageMaxHeight / root.shape
+    readonly property real singleW: Math.max(Math.min(root.column, root.tallest, root.naturalWidth), Math.min(Style.imageMinWidth, root.column, root.tallest))
+    readonly property real singleBoxW: Math.round(Math.max(root.singleW, Math.min(Style.imageMinWidth, root.column)))
+    readonly property real singleBoxH: Math.round(Math.max(root.singleW * root.shape, Style.imageMinHeight))
+    // The box: a tile and a sticker are given theirs; a single picture's is its own, centred in
+    // a block a caption or an author name made wider.
+    readonly property bool framed: root.tile || root.sticker
+    readonly property real boxW: root.framed ? root.width : root.singleBoxW
+    readonly property real boxH: root.framed ? root.height : root.singleBoxH
+    readonly property real boxX: root.framed ? 0 : Math.round((root.width - root.boxW) / 2)
+    // The picture rect inside the box (a sticker fills it; a tile's picture is fitted inside the
+    // tile it is given; the rest is the bubble's color).
+    readonly property real fitW: root.tile ? Math.min(root.width, root.height / root.shape) : root.singleW
+    readonly property real fitH: root.tile ? Math.min(root.height, root.width * root.shape) : root.singleW * root.shape
+    readonly property real picW: root.sticker ? root.width : Math.max(1, Math.round(root.fitW))
+    readonly property real picH: root.sticker ? root.height : Math.max(1, Math.round(root.fitH))
+    readonly property real picX: root.boxX + (root.sticker ? 0 : Math.round((root.boxW - root.fitW) / 2))
+    readonly property real picY: root.sticker ? 0 : Math.round((root.boxH - root.fitH) / 2)
     readonly property real hue: Style.hueOf(root.block.blurhash)
     readonly property bool playing: root.animated && animation.status === AnimatedImage.Ready
     // The attachment whose pixels `picture` holds: set when it is decoded, kept while the next
@@ -72,6 +127,20 @@ Item {
             return "";
         }
         return root.block.kind === "video" ? "open" : "view";
+    }
+
+    // Whether `p`, a point of this block, is on the round badge (the ring and its X).
+    function overBadge(p: point): bool {
+        const r = badge.width / 2;
+        return Math.hypot(p.x - (badge.x + r), p.y - (badge.y + r)) <= r;
+    }
+
+    // The X: "Cancel Sending" for the whole message, as its menu entry (asked once).
+    function cancelSending(): void {
+        if (root.uploading && root.uploadCancel && !root.cancelAsked) {
+            root.cancelAsked = true;
+            App.cancelMessage(root.message);
+        }
     }
 
     // A tap, or the row's keyboard action.
@@ -127,12 +196,16 @@ Item {
     // The note in the pill over a picture: the endings of an ask in a few words (the whole
     // sentence is the pill's tooltip, `note`).
     readonly property string shortNote: {
+        if (root.uploading) {
+            // The percentage of the upload (nothing for a file that waits or is prepared).
+            return root.uploadLabel;
+        }
         const short = MediaActions.askShortNote(root.mediaState);
         return short !== "" ? short : root.note;
     }
 
-    implicitWidth: Math.round(Math.max(root.minWidth, Math.min(root.maxWidth, root.naturalWidth)))
-    implicitHeight: root.standIn && standInLoader.item ? Math.ceil((standInLoader.item as Item).implicitHeight) : Math.round(Math.min(root.implicitWidth, root.available) * root.ratio)
+    implicitWidth: root.sticker ? Math.round(Math.max(root.minWidth, Math.min(root.maxWidth, root.naturalWidth))) : root.singleBoxW
+    implicitHeight: root.standIn && standInLoader.item ? Math.ceil((standInLoader.item as Item).implicitHeight) : (root.sticker ? Math.round(Math.min(root.implicitWidth, root.available) * root.ratio) : root.singleBoxH)
 
     Accessible.role: Accessible.Graphic
     Accessible.name: root.block.kind === "video" ? L10n.i18nc("@info accessible", "Video") : L10n.i18nc("@info accessible", "Picture")
@@ -198,7 +271,10 @@ Item {
 
     // Before any blurhash: a soft gradient in a color derived from the attachment.
     Rectangle {
-        anchors.fill: parent
+        x: root.picX
+        y: root.picY
+        width: root.picW
+        height: root.picH
         visible: !root.shown && blur.status !== Image.Ready && !root.sticker
         radius: root.tile ? 0 : Style.bubbleRadiusTight
         gradient: Gradient {
@@ -220,20 +296,28 @@ Item {
 
     Image {
         id: blur
-        anchors.fill: parent
+        x: root.picX
+        y: root.picY
+        width: root.picW
+        height: root.picH
         visible: !root.shown && status === Image.Ready
         source: root.block.placeholderUrl
         asynchronous: true
         smooth: true
         fillMode: Image.Stretch
-        sourceSize.width: 32
-        sourceSize.height: Math.max(1, Math.round(32 * root.ratio))
+        // The picture's own shape, its long side 32: stretched into the picture rect it is not
+        // distorted.
+        sourceSize.width: root.shape <= 1 ? 32 : Math.max(1, Math.round(32 / root.shape))
+        sourceSize.height: root.shape <= 1 ? Math.max(1, Math.round(32 * root.shape)) : 32
     }
 
     Image {
         id: picture
         objectName: "picture"
-        anchors.fill: parent
+        x: root.picX
+        y: root.picY
+        width: root.picW
+        height: root.picH
         // Also the poster of an animation until (or unless) it plays.
         visible: root.pictureHeld && !root.playing
         source: root.block.url
@@ -241,7 +325,7 @@ Item {
         retainWhileLoading: true
         smooth: true
         mipmap: true
-        fillMode: root.sticker ? Image.PreserveAspectFit : Image.PreserveAspectCrop
+        fillMode: Image.PreserveAspectFit
         // (Logical pixels: Qt multiplies `sourceSize` by the device pixel ratio itself, so the
         // provider is asked for the physical size.)
         sourceSize.width: Math.ceil(width)
@@ -263,26 +347,54 @@ Item {
 
     AnimatedImage {
         id: animation
-        anchors.fill: parent
+        x: root.picX
+        y: root.picY
+        width: root.picW
+        height: root.picH
         visible: root.playing
         source: copy.movieUrl
         asynchronous: true
-        fillMode: root.sticker ? Image.PreserveAspectFit : Image.PreserveAspectCrop
+        fillMode: Image.PreserveAspectFit
         playing: visible && root.Window.active
     }
 
+    // (Only inside the box: beside a picture in a wider block is the bubble.) The one handler of
+    // the block also serves the X: a tap on the ring while the picture goes up cancels the
+    // sending (or does nothing, while there is no X or it was pressed) and never opens the
+    // viewer. A tile whose ring the album draws (`ringByAlbum`: the "+N" tile) leaves the whole
+    // tile to the album's overlay over it, which takes the X by position and opens the viewer
+    // anywhere else (the ring is not in the middle when the number stands beside it).
     TapHandler {
         enabled: root.attachment > 0
-        onTapped: root.activate()
+        onTapped: eventPoint => {
+            const p = eventPoint.position;
+            if (root.ringByAlbum) {
+                return;
+            }
+            if (root.uploading && root.overBadge(p)) {
+                root.cancelSending();
+            } else if (p.x >= root.boxX && p.x < root.boxX + root.boxW && p.y >= 0 && p.y < root.boxH) {
+                root.activate();
+            }
+        }
     }
 
-    // The action in the middle: download, progress, retry, play.
+    // The action in the middle: download, progress, retry, play; while the picture goes up the
+    // ring of its upload with the X (the percentage is in the note pill).
     Rectangle {
         id: badge
-        anchors.centerIn: parent
-        readonly property bool busy: root.mediaState === "downloading"
-        visible: !root.standIn && (!root.local && (!root.gone || root.ask) || root.local && root.block.kind === "video")
-        width: Kirigami.Units.gridUnit * 2.6
+        objectName: "badge"
+        x: root.boxX + Math.round((root.boxW - width) / 2)
+        y: Math.round((root.boxH - height) / 2)
+        readonly property bool downloading: root.mediaState === "downloading"
+        readonly property bool busy: badge.downloading || root.uploading
+        readonly property real share: root.uploading ? root.uploadShare : root.block.progress
+        visible: !root.standIn && (root.uploading || !root.local && (!root.gone || root.ask) || root.local && root.block.kind === "video")
+        // Whole in its tile, whatever the tile: an album's tile can be small (a very thin
+        // picture beside wide ones), so the badge keeps a small spacing off the tile's edge,
+        // and below the ring's room the percent figure goes.
+        readonly property real side: Math.min(root.width, root.height)
+        width: root.tile ? Math.min(Kirigami.Units.gridUnit * 2.6, Math.max(Math.min(badge.side, Kirigami.Units.gridUnit * 1.2), badge.side - Kirigami.Units.smallSpacing * 2)) : Kirigami.Units.gridUnit * 2.6
         height: width
         radius: width / 2
         // Overlays on a picture take the Complementary color set: its background over the
@@ -290,18 +402,27 @@ Item {
         Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
         Kirigami.Theme.inherit: false
         color: Qt.alpha(Kirigami.Theme.backgroundColor, Style.overlayOpacity)
+        // The ring is the X for a screen reader (the row's menu has "Cancel Sending" too); once
+        // pressed it is no longer a button, it says how the upload goes.
+        Accessible.ignored: !root.cancelShown
+        Accessible.role: root.cancelAsked ? Accessible.StaticText : Accessible.Button
+        Accessible.name: root.cancelAsked ? (root.uploadLabel !== "" ? L10n.i18nc("@info accessible, %1 the percentage uploaded", "Uploading %1", root.uploadLabel) : L10n.i18nc("@info accessible", "Uploading")) : L10n.i18nc("@action:button", "Cancel Sending")
+        Accessible.onPressAction: root.cancelSending()
         Kirigami.Icon {
             anchors.centerIn: parent
-            visible: !badge.busy
-            width: Kirigami.Units.iconSizes.smallMedium
+            // While it goes up: the X when there is one (dimmed once it was pressed), else
+            // only the ring (the file is being prepared, or waits).
+            visible: !badge.downloading && (!root.uploading || root.cancelShown)
+            width: Math.min(root.uploading ? Kirigami.Units.iconSizes.small : Kirigami.Units.iconSizes.smallMedium, badge.width - 4)
             height: width
-            source: root.local ? "media-playback-start" : (root.mediaState === "failed" ? "view-refresh" : "download")
+            source: root.uploading ? "window-close" : (root.local ? "media-playback-start" : (root.mediaState === "failed" ? "view-refresh" : "download"))
             color: Kirigami.Theme.textColor
             isMask: true
+            opacity: root.uploading && (!root.uploadCancel || root.cancelAsked) ? 0.4 : 1
         }
         QQC2.Label {
             anchors.centerIn: parent
-            visible: badge.busy
+            visible: badge.downloading && badge.width >= Kirigami.Units.gridUnit * 2
             text: Math.round(root.block.progress * 100) + "%"
             color: Kirigami.Theme.textColor
             font: Kirigami.Theme.smallFont
@@ -317,7 +438,7 @@ Item {
                 x: badge.width / 2 - 1.5 + (badge.width / 2 - 4) * Math.sin(index / 24 * 2 * Math.PI)
                 y: badge.height / 2 - 1.5 - (badge.height / 2 - 4) * Math.cos(index / 24 * 2 * Math.PI)
                 color: Kirigami.Theme.textColor
-                opacity: index / 24 < root.block.progress ? 1 : 0.3
+                opacity: index / 24 < badge.share ? 1 : 0.3
             }
         }
     }
@@ -327,11 +448,25 @@ Item {
     Rectangle {
         id: pill
         objectName: "note"
-        anchors.left: parent.left
-        anchors.bottom: parent.bottom
-        anchors.margins: Kirigami.Units.smallSpacing
-        visible: label.text !== "" && (!root.local || root.block.kind !== "image") && !root.sticker && !(root.tile && root.local)
-        width: Math.max(0, Math.min(label.implicitWidth, root.width - Kirigami.Units.smallSpacing * 2 - Kirigami.Units.largeSpacing)) + Kirigami.Units.largeSpacing
+        // At the start corner of the box: the left, or the right in a right-to-left layout.
+        x: root.LayoutMirroring.enabled ? root.boxX + root.boxW - pill.width - Kirigami.Units.smallSpacing : root.boxX + Kirigami.Units.smallSpacing
+        y: root.boxH - height - Kirigami.Units.smallSpacing
+        // How far the round badge reaches below the note's top edge. In a picture's box a few
+        // pixels (the badge's lowest point against the note's corner: a picture 90 px tall)
+        // touch nothing that is read, and only more would put the note under the badge; in a
+        // small tile any overlap does.
+        readonly property real overlap: badge.visible ? badge.y + badge.height - pill.y : 0
+        readonly property bool underBadge: pill.overlap > (root.tile ? 0 : Kirigami.Units.smallSpacing * 2)
+        // (Not over the badge: a small tile has no room for both, and the badge is the action.
+        // An own picture on its way shows its percentage here, a small tile too unless the
+        // badge is in the way.)
+        visible: label.text !== "" && (!root.local || root.block.kind !== "image" || root.uploading) && !root.sticker && !(root.tile && root.local && !root.uploading) && !(root.tile && pill.underBadge)
+        // The room for the note: the box's width, and where a flat picture's box (the minimum
+        // height holds the round badge, not the badge and the note under it) would put it under
+        // the badge, only what is left of the badge (the badge is centred in the box, so that is
+        // the same room on the left and on the right, whichever corner the note stands in).
+        readonly property real room: (!root.tile && pill.underBadge ? badge.x - root.boxX : root.boxW) - Kirigami.Units.smallSpacing * 2
+        width: Math.max(0, Math.min(label.implicitWidth, pill.room - Kirigami.Units.largeSpacing)) + Kirigami.Units.largeSpacing
         height: label.implicitHeight + Kirigami.Units.smallSpacing
         radius: height / 2
         Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
@@ -351,7 +486,7 @@ Item {
         HoverHandler {
             id: pillHover
         }
-        QQC2.ToolTip.visible: pillHover.hovered && (label.truncated || label.text !== root.note)
+        QQC2.ToolTip.visible: pillHover.hovered && !root.uploading && (label.truncated || label.text !== root.note)
         QQC2.ToolTip.text: root.note
         QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
     }

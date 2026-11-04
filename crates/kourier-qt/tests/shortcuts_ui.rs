@@ -10,7 +10,8 @@
 //!   above (the ends do not wrap), also while the composer has the keyboard;
 //! - a dialog has the keyboard to itself: the chat keys do nothing while one is open;
 //! - Ctrl+, opens the settings; Ctrl+Q asks the application to quit (`closedForGood`);
-//! - the tab order of the window is the search field, the conversations, the timeline and the
+//! - the tab order of the window is the search field, the conversations, the way into the
+//!   archive (the list's last row, while there are archived chats), the timeline and the
 //!   composer;
 //! - a row of the conversation list has a menu (the Menu key and Shift+F10 on the current row,
 //!   a right click) with "Mark as Read" only for a chat with unread messages; the entry,
@@ -44,6 +45,9 @@ MainWindow {
     property bool quitSeen: false
     property real first: 0
     property real second: 0
+    // The open chat before a letter was typed into the search field, and when it was typed.
+    property real before: 0
+    property real typedAt: 0
     property int rowOpened: 0
     // The list rows of the "Mark as Read" steps: one with news, one without, the open chat
     // before, the news chat's id and the other chats that have news.
@@ -161,6 +165,29 @@ MainWindow {
             if (search.activeFocus) return win.fail("the focus should have left the search field");
             win.key(Qt.Key_F, Qt.ControlModifier);
             if (!search.activeFocus) return win.fail("Ctrl+F does not focus the search field");
+            // Typing searches and nothing else: no chat opens and the keyboard stays in the
+            // field, also after Kirigami's own accept delay (his report of 2026-10-16: the first
+            // letter opened a chat and its composer took the keyboard).
+            win.before = App.timeline.conversationId;
+            win.key(Qt.Key_A, Qt.NoModifier);
+            if (search.text !== "a") return win.fail("the letter typed is not in the search field: " + search.text);
+            win.typedAt = Date.now();
+            win.next("typed");
+            return;
+        }
+        case "typed": {
+            const search = win.searchField();
+            if (App.timeline.conversationId !== win.before) return win.fail("typing a letter into the search field opened a chat");
+            if (!search.activeFocus) return win.fail("typing a letter into the search field took the keyboard away");
+            if (Date.now() - win.typedAt < 1000) return win.later("the search field keeps the keyboard past the accept delay");
+            win.key(Qt.Key_Backspace, Qt.NoModifier);
+            if (search.text !== "") return win.fail("Backspace did not empty the search field: " + search.text);
+            win.next("cleared");
+            return;
+        }
+        case "cleared": {
+            if (App.conversationAt(0) !== win.first) return win.later("the whole list back after the search is emptied");
+            if (App.timeline.conversationId !== win.before) return win.fail("emptying the search field opened a chat");
             // Enter in the search field: the first chat opens, the composer has the keyboard.
             win.key(Qt.Key_Return, Qt.NoModifier);
             win.next("switched");
@@ -247,16 +274,26 @@ MainWindow {
                 }
                 return true;
             };
+            // (The fixture has an archived chat: the list's last row, the way into the archive,
+            // is a stop of its own between the conversations and the timeline.)
+            const entry = win.pageStack.get(0).archiveEntry;
+            if (entry === null) return win.fail("the way into the archive is not there");
             win.key(Qt.Key_Tab, Qt.NoModifier);
             if (!at("the conversations after the search field", rows)) return;
+            if (entry.activeFocus) return win.fail("the keyboard should be in the conversations, not in the way into the archive");
             win.key(Qt.Key_Tab, Qt.NoModifier);
-            if (!at("the timeline after the conversations", timeline)) return;
+            if (!at("the way into the archive after the conversations", entry)) return;
+            win.key(Qt.Key_Tab, Qt.NoModifier);
+            if (!at("the timeline after the way into the archive", timeline)) return;
             win.key(Qt.Key_Tab, Qt.NoModifier);
             if (!at("the composer after the timeline", composer)) return;
             win.key(Qt.Key_Backtab, Qt.ShiftModifier);
             if (!at("the timeline before the composer", timeline)) return;
             win.key(Qt.Key_Backtab, Qt.ShiftModifier);
-            if (!at("the conversations before the timeline", rows)) return;
+            if (!at("the way into the archive before the timeline", entry)) return;
+            win.key(Qt.Key_Backtab, Qt.ShiftModifier);
+            if (!at("the conversations before the way into the archive", rows)) return;
+            if (entry.activeFocus) return win.fail("the keyboard should be in the conversations, not in the way into the archive");
             win.key(Qt.Key_Backtab, Qt.ShiftModifier);
             if (!at("the search field before the conversations", search)) return;
             win.next("rows");

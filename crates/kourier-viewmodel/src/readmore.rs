@@ -125,7 +125,13 @@ pub fn render_limited(text: &Text, names: &dyn Names, limit: usize) -> RichText 
     let Some(cut) = cut_at(text, limit) else {
         return richtext::render(text, names);
     };
-    let mut rich = richtext::render(&truncate(text, cut), names);
+    // The shown part links what the whole text links: `foo.de` of `foo.debar` is no address, cut
+    // after its `de` or not, and a span ending at the cut is whole (`cut_at` keeps links whole).
+    let urls = richtext::find_urls(&text.body)
+        .into_iter()
+        .filter(|&(_, end)| end <= cut)
+        .collect();
+    let mut rich = richtext::render_with(&truncate(text, cut), names, urls);
     rich.more = true;
     // How much is left, for the hint in "Read more". Counted the simple way (user decision,
     // 2026-10-08): what stands between spaces and line breaks is a word.
@@ -404,6 +410,74 @@ mod tests {
         assert_balanced(&r.html);
     }
 
+    /// LD: the cut never falls inside an address without a scheme, whose `href` starts `https://`.
+    #[test]
+    fn a_bare_domain_is_shown_to_its_end() {
+        let url = format!("example.org/{}", "p".repeat(30));
+        // Every place of the cut, from before the address to behind it.
+        for lead in 770..805 {
+            let body = format!("{} {url} tail {}", "x".repeat(lead), "y".repeat(200));
+            let t = text(body, vec![]);
+            let r = shown(&t, INITIAL);
+            assert!(r.more, "{lead}");
+            assert_balanced(&r.html);
+            let whole_link = format!("<a href=\"https://{url}\">{url}</a>");
+            if r.plain.contains("example") {
+                assert!(r.plain.contains(&url), "{lead}: {}", &r.plain[770..]);
+                assert!(r.html.contains(&whole_link), "{lead}");
+            } else {
+                assert!(!r.html.contains("<a "), "{lead}");
+            }
+        }
+        // With a port and a TLD of another script.
+        let url = "пример.рф:8080/шлях";
+        let body = format!("{} {url} tail {}", "x".repeat(790), "y".repeat(200));
+        let r = shown(&text(body, vec![]), INITIAL);
+        assert!(r.plain.ends_with(url), "{}", &r.plain[780..]);
+        assert!(
+            r.html
+                .ends_with(&format!("<a href=\"https://{url}\">{url}</a>")),
+            "{}",
+            r.html
+        );
+    }
+
+    /// LD: a cut after what would be a host is no link when the whole text has none there: the
+    /// word `foo.debar` cut after `de`, the name of an e-mail address cut before its `@`, a domain
+    /// cut before the `-` that makes it none.
+    #[test]
+    fn the_shown_part_links_what_the_whole_text_links() {
+        for (word, shown_part) in [
+            ("foo.debar", "foo.de"),
+            ("john.de@example.org", "john.de"),
+            ("foo.de-bar", "foo.de"),
+            ("foo.de_bar", "foo.de"),
+            ("foo.de.bar", "foo.de"),
+        ] {
+            // The cut comes after the 800th unit, right after `shown_part`.
+            let lead = 800 - shown_part.len() - 1;
+            let body = format!("{} {word} tail {}", "x".repeat(lead), "y".repeat(200));
+            let t = text(body.clone(), vec![]);
+            assert_eq!(cut_at(&t, INITIAL), Some(800), "{word}");
+            let r = shown(&t, INITIAL);
+            assert!(r.plain.ends_with(shown_part), "{word}");
+            assert!(!r.html.contains("<a "), "{word}: {}", &r.html[780..]);
+            assert_eq!(r.whole, body.trim_end(), "{word}");
+        }
+        // A real one that ends at the cut stays a link, and one before it too.
+        let lead = 800 - "foo.de".len() - 1;
+        let body = format!("{} foo.de tail {}", "x".repeat(lead), "y".repeat(200));
+        let r = shown(&text(body, vec![]), INITIAL);
+        assert!(
+            r.html.ends_with("<a href=\"https://foo.de\">foo.de</a>"),
+            "{}",
+            &r.html[780..]
+        );
+        let body = format!("a.de {} tail {}", "x".repeat(800), "y".repeat(200));
+        let r = shown(&text(body, vec![]), INITIAL);
+        assert!(r.html.starts_with("<a href=\"https://a.de\">a.de</a> "));
+    }
+
     #[test]
     fn a_link_range_is_shown_to_its_end() {
         let label = "z".repeat(40);
@@ -450,7 +524,13 @@ mod tests {
         let r = shown(&t, INITIAL);
         assert!(r.more);
         assert_eq!(r.plain, format!("{}@Olena", "m".repeat(799)));
-        assert!(r.html.ends_with("<b>@Olena</b>"), "{}", r.html);
+        // (A mention outside a link is a link of the mention scheme: people pages P3.)
+        assert!(
+            r.html
+                .ends_with("<a href=\"kourier:mention/0\"><b>@Olena</b></a>"),
+            "{}",
+            r.html
+        );
         assert_eq!(
             r.whole,
             format!("{}@Olena{}", "m".repeat(799), "z".repeat(200))

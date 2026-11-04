@@ -11,6 +11,8 @@
 //! - [`hints`]: resume from suspend (logind) and network changes (NetworkManager) on the system
 //!   bus, as hints for the backends to reconnect (§4.7).
 //! - [`secret`]: the Secret Service client for the master key (§5.2).
+//! - [`file_manager`]: `org.freedesktop.FileManager1.ShowItems`, the "Show in Folder" of a saved
+//!   file (F3b).
 //! - `testing` (cargo feature `testing`): a private bus and mock desktop services for tests.
 //!
 //! Nothing here knows about conversations or messages: `kourier-app` decides what to show and
@@ -18,6 +20,7 @@
 //! texts, reply texts, URIs or activation tokens.
 
 pub mod autostart;
+pub mod file_manager;
 pub mod hints;
 pub mod instance;
 pub mod notifications;

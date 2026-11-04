@@ -12,14 +12,20 @@
 //! - when the head of a conversation's queue goes with a tombstone, the rows behind it start
 //!   at once;
 //! - no typing notice goes to a blocked chat, an unaccepted request, a chat we cannot send in
-//!   or ourselves.
+//!   or ourselves;
+//! - a new text or send of files into a chat whose features say `cannot_send` is refused by the
+//!   core (G4), whatever the front-end showed, and keeps the draft;
+//! - "Send Again" and a timer change into such a chat are refused by the same rule
+//!   (`actions::retry`, `actions::cannot_send`): the flag is off, the command and the timer
+//!   change are refused with `CannotSend`, and nothing reaches the backend.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, BackendNotice, Clock, OutgoingKind};
-use kourier_core::facade::{ActionSubject, MessageRow, UiCommand, UiEvent};
+use kourier_core::AccountVault as _;
+use kourier_core::facade::{ActionSubject, MessageRow, Refusal, UiCommand, UiEvent};
 use kourier_fake::scripts::{T0, signal_features, target};
 use kourier_fake::{Flavor, Script, Step, TransmitRecord, TransmitRule};
 use kourier_model::{
@@ -668,6 +674,7 @@ async fn a_member_with_a_new_safety_number_holds_the_rest_of_a_group_send() {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: bob(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     is_sent(&env, g, one.id).await;
@@ -711,6 +718,7 @@ async fn a_member_with_a_new_safety_number_holds_the_rest_of_a_group_send() {
         .send(UiCommand::ConfirmIdentity {
             account,
             user: bob(),
+            key: kourier_model::IdentityFingerprint(vec![5; 33]),
         })
         .expect("send");
     until(&env, "the reaction is done", |c| {
@@ -1029,4 +1037,368 @@ async fn typing_goes_only_where_a_message_could() {
     wait_for(2).await;
     settle().await;
     assert_eq!(typing(&env), 2, "alice and bob, nobody else");
+}
+
+/// G4: the core refuses a NEW send into a chat whose stored features say it cannot take
+/// messages, also when the front-end offered it (a stale composer, a second front-end, a race
+/// with the backend's statement): `SendText` and `SendFiles` come back as `ActionFailed` with
+/// `Refusal::CannotSend`, nothing is queued or transmitted, the copies the file import made
+/// are removed, and the chat's draft stays. A chat beside it that takes messages sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_into_a_chat_that_cannot_send_is_refused_and_keeps_the_draft() {
+    let closed = ConvKey::Direct(uid("aci:00000000-0000-4000-8000-00000000c105"));
+    let mut patch = ConversationPatch::new(closed.clone());
+    let mut features = signal_features(false);
+    features.cannot_send = Some(CannotSend::NotAccepted);
+    patch.features = Some(features);
+    let s = script("cannot-send-gate").deliver(vec![BackendEvent::ConversationUpsert(patch)]);
+    let (mut env, account, uuid) = linked(s).await;
+    env.wait_finished(account).await;
+    let (closed, open) = (conv(&env, &closed).await, conv(&env, &d_alice()).await);
+    let blob_dir = env.vault.blob_dir(uuid);
+    let blobs_before = support::blob_files(&blob_dir);
+
+    env.handle
+        .send(UiCommand::SaveDraft {
+            conv: closed,
+            draft: Some(Text::plain("my unsent draft")),
+        })
+        .expect("send");
+    let draft_is_stored = |c: &kourier_db::rusqlite::Connection| {
+        c.query_row(
+            "SELECT draft LIKE '%my unsent draft%' FROM conversations WHERE id = ?1",
+            [closed.0],
+            |r| r.get::<_, Option<bool>>(0),
+        )
+        .is_ok_and(|d| d == Some(true))
+    };
+    until(&env, "the draft is stored", draft_is_stored).await;
+
+    send(&env, closed, "typed after the right was lost", None);
+    let error = env
+        .event("the refused text", |e| match e {
+            UiEvent::ActionFailed {
+                action: "SendText",
+                error,
+                subject: ActionSubject::Conversation(c),
+                ..
+            } if *c == closed => Some(error.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(error.refusal(), Some(Refusal::CannotSend));
+
+    let src = tempfile::tempdir().expect("sources");
+    let file = src.path().join("note.txt");
+    std::fs::write(&file, b"synthetic file content").expect("write");
+    env.handle
+        .send(UiCommand::SendFiles {
+            request: Default::default(),
+            as_file: Vec::new(),
+            with_location: Vec::new(),
+            conv: closed,
+            paths: vec![file.clone()].into(),
+            caption: Some(Text::plain("a caption")),
+            reply_to: None,
+        })
+        .expect("send");
+    let error = env
+        .event("the refused files", |e| match e {
+            UiEvent::ActionFailed {
+                action: "SendFiles",
+                error,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(error.refusal(), Some(Refusal::CannotSend));
+
+    // A chat that takes messages, behind the refusals in the same queue: it goes out, and it
+    // is the only thing that did.
+    send(&env, open, "this one goes", None);
+    let db = env.core_db();
+    let env_ref = &env;
+    eventually("the good message is transmitted", WAIT, || async move {
+        env_ref
+            .control
+            .transmits(uuid)
+            .iter()
+            .any(|t| matches!(&t.req.kind, OutgoingKind::Message { .. }))
+    })
+    .await;
+    settle().await;
+    assert_eq!(
+        env.control.transmits(uuid).len(),
+        1,
+        "only the message of the open chat reached the network"
+    );
+    assert_eq!(own_messages(&db, closed), Vec::new(), "nothing stored");
+    assert_eq!(own_messages(&db, open).len(), 1);
+    assert_eq!(
+        core_db(&db, |c| c
+            .query_row(
+                "SELECT count(*) FROM outbox WHERE conversation_id = ?1",
+                [closed.0],
+                |r| r.get::<_, i64>(0)
+            )
+            .expect("count")),
+        0,
+        "no outbox row in the chat that cannot send"
+    );
+    assert!(
+        core_db(&db, |c| draft_is_stored(c)),
+        "the draft of the chat is still there"
+    );
+    assert_eq!(
+        support::blob_files(&blob_dir),
+        blobs_before,
+        "the copies of the refused files are removed"
+    );
+}
+
+/// The features of `key` with the reason `why` we cannot send in it.
+fn cannot_send_patch(key: &ConvKey, why: CannotSend) -> ConversationPatch {
+    let mut patch = ConversationPatch::new(key.clone());
+    let mut features = signal_features(false);
+    features.cannot_send = Some(why);
+    patch.features = Some(features);
+    patch
+}
+
+/// "Send Again" has ONE rule for the flag and the command (`actions::retry`), and a chat that
+/// lost the right to send since the message failed (we left the group, the phone un-accepted
+/// the chat) is refused by both: the row offers no Send Again, `RetryMessage` is refused with
+/// `CannotSend`, nothing is queued again and nothing reaches the network. The same failure in
+/// a chat that still takes messages is sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_message_in_a_chat_that_lost_the_right_is_not_sent_again() {
+    let s = script("retry-lost-right")
+        .fail_transmit(
+            TransmitRule::attempts(unregistered(), 1)
+                .of_kind("Message")
+                .in_conv(d_alice()),
+        )
+        .fail_transmit(
+            TransmitRule::attempts(unregistered(), 1)
+                .of_kind("Message")
+                .in_conv(d_bob()),
+        )
+        // The chat of alice loses the right a minute in, after both messages failed.
+        .step(Step::Sleep(Duration::from_secs(60)))
+        .deliver(vec![BackendEvent::ConversationUpsert(cannot_send_patch(
+            &d_alice(),
+            CannotSend::NotMember,
+        ))]);
+    let (mut env, _account, uuid) = linked(s).await;
+    let (a, b) = (conv(&env, &d_alice()).await, conv(&env, &d_bob()).await);
+    sleeping_until(&env, T0U + 60_000).await;
+    let refused = OutgoingState::Failed {
+        reason: FailReason::Unregistered,
+        retryable: false,
+    };
+    send(&env, a, "failed in alice's chat", None);
+    let lost = queued(&env, a, 1).await;
+    out_state(&env, a, lost.id, refused.clone()).await;
+    send(&env, b, "failed in bob's chat", None);
+    let kept = queued(&env, b, 1).await;
+    out_state(&env, b, kept.id, refused.clone()).await;
+    assert_eq!(transmits(&env, uuid, 2).await.len(), 2);
+    // While the chat can send, the failed message offers Send Again (the premise).
+    assert!(row(&env, a, lost.id).await.actions.retry);
+    assert!(row(&env, b, kept.id).await.actions.retry);
+
+    // Alice's chat loses the right.
+    env.clock.advance(Duration::from_secs(60));
+    until(&env, "the chat states that we cannot send", move |c| {
+        c.query_row(
+            "SELECT json_extract(features, '$.cannot_send') IS NOT NULL FROM conversations
+             WHERE id = ?1",
+            [a.0],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    })
+    .await;
+    // The flag says no, the command says no, and nothing was queued or sent.
+    let flags = row(&env, a, lost.id).await.actions;
+    assert!(!flags.retry, "no Send Again into a chat that cannot send");
+    env.handle
+        .send(UiCommand::RetryMessage { message: lost.id })
+        .expect("send");
+    let error = env
+        .event("the refused Send Again", |e| match e {
+            UiEvent::ActionFailed {
+                action: "RetryMessage",
+                error,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(error.refusal(), Some(Refusal::CannotSend), "{error:?}");
+    settle().await;
+    assert_eq!(
+        env.control.transmits(uuid).len(),
+        2,
+        "nothing was sent again"
+    );
+    assert_eq!(
+        own_messages(&env.core_db(), a)
+            .iter()
+            .find(|m| m.id == lost.id)
+            .and_then(|m| m.out_state.clone()),
+        Some(refused),
+        "the message stays as it failed"
+    );
+
+    // Bob's chat has no such reason: the same failure is sent again.
+    assert!(row(&env, b, kept.id).await.actions.retry);
+    env.handle
+        .send(UiCommand::RetryMessage { message: kept.id })
+        .expect("send");
+    is_sent(&env, b, kept.id).await;
+    assert_eq!(transmits(&env, uuid, 3).await.len(), 3);
+    env.stop().await;
+}
+
+/// The same rule for a message that WAITS in the outbox (queued behind a dropped connection,
+/// not failed): the flag used to be on for every waiting row whatever the chat said, and
+/// the command refused it anyway. Now both say no once the chat lost the right to send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_message_in_a_chat_that_lost_the_right_offers_no_send_again() {
+    let s = script("retry-waiting-lost-right")
+        .step(Step::Conn(ConnState::Offline { retry_at_ms: None }))
+        .step(Step::Sleep(Duration::from_secs(60)))
+        .deliver(vec![BackendEvent::ConversationUpsert(cannot_send_patch(
+            &d_alice(),
+            CannotSend::NotMember,
+        ))]);
+    let (mut env, _account, uuid) = linked(s).await;
+    let a = conv(&env, &d_alice()).await;
+    sleeping_until(&env, T0U + 60_000).await;
+    send(&env, a, "waits for the connection", None);
+    let waiting = queued(&env, a, 1).await;
+    out_state(&env, a, waiting.id, OutgoingState::Queued).await;
+    assert!(
+        row(&env, a, waiting.id).await.actions.retry,
+        "a waiting row offers Send Again while the chat can send"
+    );
+
+    env.clock.advance(Duration::from_secs(60));
+    until(&env, "the chat states that we cannot send", move |c| {
+        c.query_row(
+            "SELECT json_extract(features, '$.cannot_send') IS NOT NULL FROM conversations
+             WHERE id = ?1",
+            [a.0],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        !row(&env, a, waiting.id).await.actions.retry,
+        "no Send Again into a chat that cannot send, waiting or not"
+    );
+    env.handle
+        .send(UiCommand::RetryMessage {
+            message: waiting.id,
+        })
+        .expect("send");
+    let error = env
+        .event("the refused Send Again", |e| match e {
+            UiEvent::ActionFailed {
+                action: "RetryMessage",
+                error,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(error.refusal(), Some(Refusal::CannotSend), "{error:?}");
+    settle().await;
+    assert!(
+        env.control.transmits(uuid).is_empty(),
+        "offline, and refused"
+    );
+    env.stop().await;
+}
+
+/// A change of the disappearing timer is one more message to the network on some networks, and
+/// a chat whose features say we cannot send in it refuses it (`CannotSend`) before an id is
+/// allocated: nothing reaches the backend, by the command of the timer menu and by the plain
+/// `ChangeConversation` alike. The other changes of that chat (an archive) and a timer change
+/// in a chat that can send go through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timer_change_into_a_chat_that_cannot_send_is_refused() {
+    let closed_key = ConvKey::Direct(uid("aci:00000000-0000-4000-8000-00000000c106"));
+    // (the account states that it writes roaming settings: the archive below is one)
+    let s = script("timer-cannot-send").deliver(vec![
+        support::send::roaming_caps(true),
+        BackendEvent::ConversationUpsert(cannot_send_patch(&closed_key, CannotSend::NotMember)),
+    ]);
+    let (mut env, account, uuid) = linked(s).await;
+    env.wait_finished(account).await;
+    let (closed, open) = (conv(&env, &closed_key).await, conv(&env, &d_alice()).await);
+    let timer = Some(Duration::from_secs(3600));
+
+    for (action, command) in [
+        (
+            "SetConversationTimer",
+            UiCommand::SetConversationTimer {
+                conv: closed,
+                timer,
+            },
+        ),
+        (
+            "ChangeConversation",
+            UiCommand::ChangeConversation {
+                conv: closed,
+                change: kourier_model::ConversationChange::SetTimer { timer },
+            },
+        ),
+    ] {
+        env.handle.send(command).expect("send");
+        let error = env
+            .event("the refused timer change", |e| match e {
+                UiEvent::ActionFailed {
+                    action: got, error, ..
+                } if *got == action => Some(error.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(
+            error.refusal(),
+            Some(Refusal::CannotSend),
+            "{action}: {error:?}"
+        );
+    }
+    settle().await;
+    assert!(
+        env.control.changes(uuid).is_empty(),
+        "a refused timer change reached the backend: {:?}",
+        env.control.changes(uuid)
+    );
+
+    // Only the timer is refused: an archive of the same chat goes through.
+    env.handle
+        .send(UiCommand::ChangeConversation {
+            conv: closed,
+            change: kourier_model::ConversationChange::SetArchived { archived: true },
+        })
+        .expect("send");
+    let control = env.control.clone();
+    tokio::time::timeout(WAIT, control.wait_for(|c| c.changes(uuid).len() == 1))
+        .await
+        .expect("an archive is not a send");
+
+    // A chat without the reason changes its timer.
+    env.handle
+        .send(UiCommand::SetConversationTimer { conv: open, timer })
+        .expect("send");
+    let control = env.control.clone();
+    tokio::time::timeout(WAIT, control.wait_for(|c| c.changes(uuid).len() == 2))
+        .await
+        .expect("the timer change of a chat that can send reached the backend");
+    env.stop().await;
 }

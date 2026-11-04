@@ -27,17 +27,38 @@ struct CdnState {
     /// The next body request is answered this long after its body was read (once): a slow
     /// link that is still sending what the body's queue handed over.
     answer_after: Option<Duration>,
+    /// A TUS `HEAD` is never answered (the request hangs until it is dropped).
+    head_hangs: bool,
 }
 
 #[derive(Default)]
 struct Cdn {
     state: Mutex<CdnState>,
+    /// Bodies the CDN is reading now: one leaves when its request is dropped.
+    reading: std::sync::atomic::AtomicI64,
+}
+
+/// Counts a body being read while it lives.
+struct Reading<'a>(&'a std::sync::atomic::AtomicI64);
+
+impl<'a> Reading<'a> {
+    fn new(count: &'a std::sync::atomic::AtomicI64) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 const SESSION: &str = "https://gcs.example/session/1";
 
 impl Cdn {
     async fn take_body(&self, body: Option<UploadBody>) -> (Vec<u8>, bool) {
+        let _reading = Reading::new(&self.reading);
         let (limit, stall, answer_after) = {
             let mut state = self.state.lock().unwrap();
             (
@@ -171,6 +192,10 @@ impl SignalTransport for Cdn {
                 ))
             }
             ("HEAD", true) => {
+                if self.state.lock().unwrap().head_hangs {
+                    let _reading = Reading::new(&self.reading);
+                    std::future::pending::<()>().await;
+                }
                 let len = self.state.lock().unwrap().stored.len();
                 Ok(response(200, &[("upload-offset", len.to_string())]))
             }
@@ -397,6 +422,77 @@ async fn a_small_upload_gets_the_time_of_a_tail() {
             ),
         }
     }
+}
+
+/// An upload that is dropped (its attempt was stopped by the user) takes its request with it:
+/// the request ends at once, its body receiver goes, and the task that encrypts the blob and
+/// feeds the body ends instead of waiting for room in a queue nobody reads, for ever. A request
+/// left running would go on holding the connection (and the plaintext in memory) for a blob
+/// whose key never leaves the device.
+#[tokio::test]
+async fn a_dropped_upload_ends_its_request() {
+    let cdn = Arc::new(Cdn::default());
+    // The CDN reads the start of the body and then neither reads on nor answers.
+    cdn.state.lock().unwrap().stall_after = Some(70_001);
+    let net = Net::new(cdn.clone(), tokio::runtime::Handle::current());
+    let plain = plaintext(1_500_000);
+    let upload = upload_of(3, &plain, false);
+    let Plaintext::Memory(held) = &upload.plain else {
+        unreachable!("upload_of makes memory")
+    };
+    // The producer holds a clone of the plaintext while it runs: back to this count when it ends.
+    let probe = held.clone();
+    let base = Arc::strong_count(&probe);
+
+    let gone = tokio::time::timeout(Duration::from_millis(400), tus(&net, &upload)).await;
+    assert!(
+        gone.is_err(),
+        "the held request is still going when the wait is dropped"
+    );
+
+    let ended = async {
+        while cdn.reading.load(Ordering::SeqCst) != 0 || Arc::strong_count(&probe) != base {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(200), ended)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the request and its producer outlive the upload: reading {}, holders {} (idle: {base})",
+                cdn.reading.load(Ordering::SeqCst),
+                Arc::strong_count(&probe)
+            )
+        });
+}
+
+/// The small requests of an upload (here the `HEAD` that asks a TUS server how much it has) end
+/// with their waiter too, like the one that carries the blob.
+#[tokio::test]
+async fn a_dropped_resume_query_ends_its_request() {
+    let cdn = Arc::new(Cdn::default());
+    cdn.state.lock().unwrap().head_hangs = true;
+    let net = Net::new(cdn.clone(), tokio::runtime::Handle::current());
+    let head = UploadRequest {
+        method: Method::HEAD,
+        url: "https://cdn.example/attachments/the-cdn-key".to_owned(),
+        headers: HeaderMap::from_iter([(
+            HeaderName::from_static("tus-resumable"),
+            HeaderValue::from_static("1.0.0"),
+        )]),
+        body: None,
+        timeout: Duration::from_secs(60),
+    };
+    let gone = tokio::time::timeout(Duration::from_millis(100), net.https_upload(head)).await;
+    assert!(gone.is_err(), "the CDN holds the query");
+    let ended = async {
+        while cdn.reading.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(200), ended)
+        .await
+        .expect("the query ended with the dropped upload");
 }
 
 /// A slow upload is not a stalled one: as long as bytes move, however slowly, the watch

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kourier_backend_api::clock::duration_ms;
-use kourier_db::rusqlite::Connection;
+use kourier_db::rusqlite::{Connection, OptionalExtension as _};
 
 use crate::actor::Shared;
 use crate::error::{Error, Result};
@@ -40,6 +40,20 @@ const PROFILE_FETCH_BATCH: usize = 10;
 /// How long every profile fetch waits after a 413 or 429 without a `Retry-After`
 /// (Desktop's `DEFAULT_RETRY_AFTER`, `SD/ts/util/parseRetryAfter.std.ts`).
 const PROFILE_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
+/// How long every profile fetch waits after `e` ended a job of `kind`: only a 413/429 of a
+/// profile fetch holds the kind, for the server's `Retry-After` (unbounded, so cut at
+/// [`MAX_KIND_HOLD`]; re-check N2) or [`PROFILE_RATE_LIMIT_WAIT`].
+fn profile_rate_wait(kind: JobKind, e: &Error) -> Option<Duration> {
+    (kind == JobKind::ProfileFetch && matches!(e, Error::RateLimited { .. })).then(|| {
+        e.server_wait()
+            .unwrap_or(PROFILE_RATE_LIMIT_WAIT)
+            .min(MAX_KIND_HOLD)
+    })
+}
+
+/// The longest a remembered hold of a job kind ([`pause_kind`]) lasts.
+pub(crate) const MAX_KIND_HOLD: Duration = Duration::from_secs(24 * 3600);
 
 /// What a job does. Stored as text in `jobs.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -96,11 +110,29 @@ pub(crate) enum JobKind {
     /// ([`crate::backfill`]); `key` is the command id with a digest of `payload`, the
     /// message's conversation and reference (JSON). Expires an hour after the click.
     BackfillRequest,
+    /// The `SyncMessage.verified` of a Mark, Clear or Confirm of a safety number (P5a,
+    /// [`crate::safety::run_verified_sync`]): ONE job per person, `key` their ACI string,
+    /// `payload` the newest state and the key it was set for (replaced by a later click; a
+    /// click during a run runs it again: P5 critic H3). Expires a day after the click.
+    VerifiedSync,
+    /// The Storage Service write of the chat changes made here (A10: archive, pin, mute, marked
+    /// unread, a safety number's state; `storage::intents` files the work, one job with key `""`,
+    /// [`crate::storage::write::run`]). Every failure of it is a [`Done::RepeatAt`], so it is never
+    /// dropped while intents live; `payload` counts its conflicts and failures.
+    StorageWrite,
+    /// Tells our other devices that a write of ours is on the Storage Service
+    /// (`SyncMessage.FetchLatest { STORAGE_MANIFEST }`; A10 M8): one job with key `""`, queued by
+    /// the zone that lands a write, expires after an hour; sent by
+    /// [`crate::storage::write::run_fetch_latest`] (a failed send is retried by the runner's backoff
+    /// until the hour is out). [`needs_online`](Self::needs_online) like the other sync messages
+    /// (C5b, the lane session's call): it costs nothing to wait for the catch-up, and a kill after
+    /// a landing sends it once the account is online again.
+    FetchLatestSync,
 }
 
 impl JobKind {
     /// Every kind, for parsing.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 23] = [
         Self::RemoteConfig,
         Self::Capabilities,
         Self::SyncRequest,
@@ -121,6 +153,9 @@ impl JobKind {
         Self::KeyMaintenance,
         Self::DeleteSync,
         Self::BackfillRequest,
+        Self::VerifiedSync,
+        Self::StorageWrite,
+        Self::FetchLatestSync,
     ];
 
     /// The `jobs.kind` value.
@@ -146,6 +181,9 @@ impl JobKind {
             Self::KeyMaintenance => "key_maintenance",
             Self::DeleteSync => "delete_sync",
             Self::BackfillRequest => "backfill_request",
+            Self::VerifiedSync => "verified_sync",
+            Self::StorageWrite => "storage_write",
+            Self::FetchLatestSync => "fetch_latest_sync",
         }
     }
 
@@ -162,7 +200,8 @@ impl JobKind {
             Self::SyncRequest | Self::SentTranscript | Self::ContactSyncWait => 2,
             Self::ContactSync => 2,
             Self::TimerUpdate | Self::DeleteSync | Self::BackfillRequest => 2,
-            Self::StorageSync | Self::GroupRefresh => 3,
+            Self::VerifiedSync | Self::FetchLatestSync => 2,
+            Self::StorageSync | Self::GroupRefresh | Self::StorageWrite => 3,
             Self::RetryRequest | Self::Resend => 4,
             Self::ReadSync | Self::Receipts => 4,
             Self::DeliveryReceipts | Self::ProfileFetch => 5,
@@ -202,6 +241,24 @@ impl JobKind {
         )
     }
 
+    /// The one person a job of this kind sends OUR CONTENT to, from its key: a timer update's
+    /// peer (`<peer>:<timestamp>`), the requester a resend answers (`<person>.<device>:
+    /// <timestamp>`). `None` for the kinds that send to nobody, to our own devices only, or to
+    /// several people (receipts: they check each author themselves), and for a retry request
+    /// (the lead's RC3: it carries nothing of ours, only the decryption error of THEIR message,
+    /// and Desktop sends it whatever the trust). P5a R4: the runner looks at the stored state of
+    /// this person before the job makes any request.
+    pub(crate) fn recipient(self, key: &str) -> Option<&str> {
+        match self {
+            Self::TimerUpdate => key.rsplit_once(':').map(|(peer, _)| peer),
+            Self::Resend => key
+                .rsplit_once(':')
+                .and_then(|(address, _)| address.rsplit_once('.'))
+                .map(|(person, _)| person),
+            _ => None,
+        }
+    }
+
     /// The kinds that [send to others](Self::sends_to_others), as an SQL list.
     fn sql_sends_to_others() -> String {
         Self::ALL
@@ -219,12 +276,26 @@ impl JobKind {
     pub(crate) const fn reruns_on_request(self) -> bool {
         matches!(
             self,
-            Self::StorageSync | Self::ProfileFetch | Self::ContactSync
+            Self::StorageSync
+                | Self::StorageWrite
+                | Self::FetchLatestSync
+                | Self::ProfileFetch
+                | Self::ContactSync
+                | Self::VerifiedSync
         )
     }
 
     /// Receipts and read syncs wait until the account is through its catch-up (`Online`,
-    /// §6.7 step 6; Desktop pauses its receipt queues until the incoming queue is empty).
+    /// §6.7 step 6; Desktop pauses its receipt queues until the incoming queue is empty). So
+    /// does the Verified sync (the lead's RC1): the phone's earlier Verified syncs sit in the
+    /// queue that the catch-up drains, and they must meet our queued job (the "latest click
+    /// wins by time" rule of `safety::apply_remote_state` reads that job) before it runs and
+    /// is deleted; an older phone click processed after our job ran would win here. And the
+    /// fetch-latest sync of a landed Storage Service write (A10c C5b): a sync message to our own
+    /// devices, which costs nothing to hold back. And the Storage Service write itself (V1, A10c
+    /// fix round): a live `identity` intent takes part in the same "latest click wins by time"
+    /// rule, so the phone's queued Verified syncs must meet the intent before any write carries
+    /// it; the job needs the socket for its credentials anyway.
     pub(crate) const fn needs_online(self) -> bool {
         matches!(
             self,
@@ -233,6 +304,9 @@ impl JobKind {
                 | Self::DeliveryReceipts
                 | Self::RetryRequest
                 | Self::TimerUpdate
+                | Self::VerifiedSync
+                | Self::FetchLatestSync
+                | Self::StorageWrite
         )
     }
 
@@ -240,8 +314,14 @@ impl JobKind {
     /// a history transfer is over (`transfer.rs`; Desktop enables its storage service after
     /// the import, `background.preload.ts`): the archive is the older state, what the
     /// account's storage and the live messages say comes on top of it.
+    ///
+    /// The routine profile refresh waits too: it queues our own profile (people pages P1), and
+    /// the first contact the core hears of must not be one made before the import is over.
     pub(crate) const fn waits_for_transfer(self) -> bool {
-        matches!(self, Self::StorageSync | Self::ContactSyncWait)
+        matches!(
+            self,
+            Self::StorageSync | Self::StorageWrite | Self::ContactSyncWait | Self::ProfileRefresh
+        )
     }
 
     fn parse(s: &str) -> Option<Self> {
@@ -366,6 +446,10 @@ pub(crate) enum Done {
     Finished,
     /// Finished for now; run again at this time (ms since the epoch).
     RepeatAt(i64),
+    /// What is left waits for a recipient whose key is not trusted (stored state 2: verified,
+    /// then the key changed): nothing was requested and no attempt counts
+    /// ([`wait_untrusted`]); [`release_untrusted`] wakes it, its age drops it (P5a R4).
+    WaitUntrusted,
 }
 
 /// What [`retry`] decided.
@@ -410,12 +494,13 @@ pub(crate) fn enqueue(
     max_age: Option<Duration>,
 ) -> Result<bool> {
     let expires_at = max_age.map(|age| now.saturating_add(ms(age)));
+    let due = due_floor(conn, kind, now)?;
     let inserted = conn
         .prepare_cached(
             "INSERT INTO jobs(kind, key, priority, next_at, expires_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?4) ON CONFLICT(kind, key) DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(kind, key) DO NOTHING",
         )?
-        .execute((kind.as_str(), key, kind.priority(), now, expires_at))?;
+        .execute((kind.as_str(), key, kind.priority(), due, expires_at, now))?;
     Ok(inserted > 0)
 }
 
@@ -455,13 +540,14 @@ pub(crate) fn request(
 ) -> Result<()> {
     debug_assert!(kind.reruns_on_request(), "{} is not re-run", kind.as_str());
     let expires_at = max_age.map(|age| now.saturating_add(ms(age)));
+    let due = due_floor(conn, kind, now)?;
     conn.prepare_cached(
         "INSERT INTO jobs(kind, key, priority, next_at, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?4)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(kind, key) DO UPDATE SET requests = requests + 1,
            next_at = min(next_at, excluded.next_at)",
     )?
-    .execute((kind.as_str(), key, kind.priority(), now, expires_at))?;
+    .execute((kind.as_str(), key, kind.priority(), due, expires_at, now))?;
     Ok(())
 }
 
@@ -549,6 +635,30 @@ pub(crate) fn schedule_at(conn: &Connection, kind: JobKind, key: &str, at: i64) 
     Ok(())
 }
 
+/// A trailing debounce: makes the job due at `at` (adding it if needed), and when it is queued
+/// already moves it LATER, never earlier: `next_at = max(next_at, at, the end of the kind's
+/// hold)`. Every call also asks for a run once more after the one in progress (`requests`), so
+/// a click made while the job runs is not swallowed by its [`finish`]. The other helpers
+/// ([`request`], [`schedule_at`], [`enqueue_payload`]) keep the EARLIER time, which a debounce,
+/// a back-off or a rate window cannot use: every click would pull the job forward (A10 critic
+/// Y4). Whether the job is running now is the caller's to know; the row has no such mark.
+pub(crate) fn delay_to(
+    conn: &Connection,
+    kind: JobKind,
+    key: &str,
+    at: i64,
+    now: i64,
+) -> Result<()> {
+    let at = at.max(due_floor(conn, kind, now)?);
+    conn.prepare_cached(
+        "INSERT INTO jobs(kind, key, priority, next_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(kind, key) DO UPDATE SET requests = requests + 1,
+           next_at = max(next_at, excluded.next_at)",
+    )?
+    .execute((kind.as_str(), key, kind.priority(), at, now))?;
+    Ok(())
+}
+
 /// Makes a periodic job due now (adding it if needed); a pending retry keeps its backoff only
 /// when it is due earlier anyway.
 pub(crate) fn schedule_now(conn: &Connection, kind: JobKind, key: &str, now: i64) -> Result<()> {
@@ -617,11 +727,31 @@ fn more_due(conn: &Connection, first: &Job, now: i64, limit: usize) -> Result<Ve
 }
 
 /// Holds every queued job of `kind` until `until` (ms) at the latest; one that is due later
-/// keeps its time. Returns how many were moved.
-fn pause_kind(conn: &Connection, kind: JobKind, until: i64) -> Result<usize> {
+/// keeps its time. Returns how many were moved. The hold is REMEMBERED (`job_holds`): until it
+/// ends no job of the kind is made due ([`due_floor`]), so a page opened during a 429 hold, the
+/// routine refresh or a new profile key cannot knock at the service again. `until` is clamped to
+/// [`MAX_KIND_HOLD`] after `now`: a `Retry-After` is an unbounded number from the server and the
+/// hold outlives a restart (re-check N2).
+pub(crate) fn pause_kind(conn: &Connection, kind: JobKind, now: i64, until: i64) -> Result<usize> {
+    let until = until.min(now.saturating_add(ms(MAX_KIND_HOLD)));
+    conn.prepare_cached(
+        "INSERT INTO job_holds(kind, until) VALUES (?1, ?2)
+         ON CONFLICT(kind) DO UPDATE SET until = max(until, excluded.until)",
+    )?
+    .execute((kind.as_str(), until))?;
     Ok(conn
         .prepare_cached("UPDATE jobs SET next_at = ?2 WHERE kind = ?1 AND next_at < ?2")?
         .execute((kind.as_str(), until))?)
+}
+
+/// The earliest time a job of `kind` asked for at `now` may be due: `now`, or the end of the hold
+/// of the kind ([`pause_kind`]) when that is later.
+pub(crate) fn due_floor(conn: &Connection, kind: JobKind, now: i64) -> Result<i64> {
+    let until: Option<i64> = conn
+        .prepare_cached("SELECT until FROM job_holds WHERE kind = ?1")?
+        .query_row([kind.as_str()], |r| r.get(0))
+        .optional()?;
+    Ok(until.map_or(now, |until| until.max(now)))
 }
 
 /// When the next job is due (ms), if any job that may run now (see [`next_due`]) is queued.
@@ -654,7 +784,8 @@ pub(crate) fn purge_done_commands(conn: &Connection, now: i64) -> Result<()> {
 }
 
 /// Records a success at `now`. A job asked for again while it ran
-/// ([`JobKind::reruns_on_request`]) stays, due now.
+/// ([`JobKind::reruns_on_request`]) stays, due now. A job that [waits for an untrusted
+/// recipient](Done::WaitUntrusted) is parked by [`wait_untrusted`] (no attempt counted).
 pub(crate) fn finish(conn: &Connection, job: &Job, done: Done, now: i64) -> Result<()> {
     match done {
         Done::Finished => {
@@ -679,8 +810,55 @@ pub(crate) fn finish(conn: &Connection, job: &Job, done: Done, now: i64) -> Resu
             )?
             .execute((job.id, at))?;
         }
+        Done::WaitUntrusted => {
+            wait_untrusted(conn, job, now)?;
+        }
     }
     Ok(())
+}
+
+/// How long a job that waits for an untrusted recipient ([`Done::WaitUntrusted`]) sleeps when
+/// nothing wakes it: a look at the stored state, no request.
+pub(crate) const UNTRUSTED_RECHECK: Duration = MAX_BACKOFF;
+
+/// How long a job without an expiry waits for the user to trust a recipient's key before it is
+/// dropped: the day [`UNTRUSTED_ATTEMPTS`] stands for (a job with an expiry is dropped at that).
+pub(crate) const UNTRUSTED_WAIT: Duration = Duration::from_secs(24 * 3600);
+
+/// A job whose recipient is in stored state 2 ([`Done::WaitUntrusted`], P5a R4): every attempt
+/// would fetch their prekeys and be refused again, so it sleeps for [`UNTRUSTED_RECHECK`]
+/// without a request and WITHOUT counting an attempt, marked as waiting for the key
+/// ([`UNTRUSTED_ERROR`]) so that [`release_untrusted`] makes it due. It is dropped, as [`retry`]
+/// drops a job, when its next look would start after its expiry, or, with no expiry, once it
+/// is [`UNTRUSTED_WAIT`] old (the delivery receipts' rows age out themselves).
+pub(crate) fn wait_untrusted(conn: &Connection, job: &Job, now: i64) -> Result<Retry> {
+    let at = now.saturating_add(ms(UNTRUSTED_RECHECK));
+    let created: Option<i64> = conn
+        .prepare_cached("SELECT created_at FROM jobs WHERE id = ?1")?
+        .query_row([job.id], |r| r.get(0))
+        .optional()?;
+    let Some(created) = created else {
+        return Ok(Retry::Dropped);
+    };
+    let aged = match job.expires_at {
+        Some(expires) => at > expires,
+        None => {
+            job.kind != JobKind::DeliveryReceipts
+                && now.saturating_sub(created) >= ms(UNTRUSTED_WAIT)
+        }
+    };
+    if aged {
+        conn.prepare_cached("DELETE FROM jobs WHERE id = ?1")?
+            .execute([job.id])?;
+        crate::maintenance::job_dropped(conn, job)?;
+        return Ok(Retry::Dropped);
+    }
+    conn.prepare_cached(
+        "UPDATE jobs SET next_at = ?2, last_error = ?3, challenged = 0, held_from = NULL
+         WHERE id = ?1",
+    )?
+    .execute((job.id, at, UNTRUSTED_ERROR))?;
+    Ok(Retry::At(at))
 }
 
 /// Records a failed attempt: the job runs again after [`backoff`], and not before `wait` has
@@ -778,6 +956,7 @@ pub(crate) fn set_payload(conn: &Connection, job: &Job, payload: &[u8]) -> Resul
 /// Makes a job that was asked for again during its run due at `now` with a fresh retry budget.
 /// Returns whether the row still exists.
 fn rerun_now(conn: &Connection, job: &Job, now: i64, error: Option<&str>) -> Result<bool> {
+    let now = due_floor(conn, job.kind, now)?;
     let updated = conn
         .prepare_cached(
             "UPDATE jobs SET attempts = 0, next_at = ?2, last_error = ?3 WHERE id = ?1",
@@ -805,6 +984,11 @@ pub(crate) fn is_permanent(error: &Error) -> bool {
         Error::Status { status, .. } => {
             (400..500).contains(status) && !matches!(status, 408 | 413 | 425 | 429)
         }
+        // P5 M1 (BQ-6 a): the contact's key changed and waits for the user (Confirm, Mark, a
+        // Verified sync): the job is retried within its expiry, as Desktop's conversation
+        // queue holds its jobs while a verification is pending, and a release makes it due at
+        // once ([`release_untrusted`]). [`gives_up`] bounds a job that has no expiry.
+        Error::Protocol(libsignal_protocol::SignalProtocolError::UntrustedIdentity(_)) => false,
         Error::Protocol(_) | Error::Decode(_) => true,
         Error::Transport(TransportError::InvalidRequest(_)) => true,
         Error::Challenge { .. } | Error::RateLimited { .. } => false,
@@ -846,6 +1030,43 @@ pub(crate) const GROUP_AUTH_ATTEMPTS: u32 = 30;
 pub(crate) fn gives_up(error: &Error, attempts: u32) -> bool {
     is_permanent(error)
         || (is_group_auth_refusal(error) && attempts.saturating_add(1) >= GROUP_AUTH_ATTEMPTS)
+        || (is_untrusted(error) && attempts.saturating_add(1) >= UNTRUSTED_ATTEMPTS)
+}
+
+/// How many times a job may fail because the recipient's key is not trusted before it is
+/// dropped: about a day of waits with the backoff (the 15-minute wait is reached after about
+/// half an hour, then one attempt every 15 minutes; test `untrusted_jobs_wait_about_a_day`),
+/// the bound Desktop's conversation queue gives a job. A job with an expiry is dropped at its
+/// expiry when that comes first.
+pub(crate) const UNTRUSTED_ATTEMPTS: u32 = 109;
+
+/// Whether `error` is libsignal refusing the recipient's identity key (it changed, or it is
+/// marked as changed since the user verified it).
+pub(crate) fn is_untrusted(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Protocol(libsignal_protocol::SignalProtocolError::UntrustedIdentity(
+            _
+        ))
+    )
+}
+
+/// The `last_error` [`retry`] writes for an [untrusted](is_untrusted) recipient (the error's
+/// log-safe text: no address).
+pub(crate) const UNTRUSTED_ERROR: &str = "libsignal: untrusted identity";
+
+/// A key was trusted again (Confirm, Mark, Clear, a Verified sync, a Storage record): every
+/// job that waits after an [untrusted](is_untrusted) failure is due now (P5 M1), unless a
+/// send challenge holds it; the caller wakes the runner (`jobs_wake`). Jobs that failed for
+/// another person run one attempt early, which is harmless (they fail the same way). By the
+/// `jobs_due` index (`next_at`). Returns how many jobs were made due.
+pub(crate) fn release_untrusted(conn: &Connection, now: i64) -> Result<usize> {
+    Ok(conn
+        .prepare_cached(
+            "UPDATE jobs SET next_at = ?1
+             WHERE next_at > ?1 AND last_error = ?2 AND challenged = 0",
+        )?
+        .execute((now, UNTRUSTED_ERROR))?)
 }
 
 /// Runs due jobs on `socket` until the task is aborted (the socket closed); returns only the
@@ -982,6 +1203,15 @@ fn settle<T: SignalTransport>(
     let e = match outcome {
         Ok(done) => {
             shared.db.zone(|tx| finish(tx, job, done, now))?;
+            // Debug, not info: a delivery receipt job looks again after every incoming message.
+            if done == Done::WaitUntrusted {
+                tracing::debug!(
+                    kind = job.kind.as_str(),
+                    key = %job.log_key(),
+                    "job waits: a recipient's key is not trusted"
+                );
+                return Ok(true);
+            }
             // A batch is summed up by `run`: a line per profile is hundreds after an import.
             if job.kind.batch() > 1 {
                 tracing::debug!(kind = job.kind.as_str(), key = %job.log_key(), "job done");
@@ -1006,8 +1236,7 @@ fn settle<T: SignalTransport>(
     };
     // A rate limit of a profile fetch holds every profile fetch, as Desktop's
     // `ProfileService` pauses its queue: the next ones would only be refused too.
-    let rate_wait = (job.kind == JobKind::ProfileFetch && matches!(e, Error::RateLimited { .. }))
-        .then(|| e.server_wait().unwrap_or(PROFILE_RATE_LIMIT_WAIT));
+    let rate_wait = profile_rate_wait(job.kind, &e);
     let wait = challenge_wait.or(rate_wait).or_else(|| e.server_wait());
     let retried = shared.db.zone(|tx| -> Result<Retry> {
         let retried = retry(tx, job, now, &detail, permanent, wait)?;
@@ -1022,7 +1251,7 @@ fn settle<T: SignalTransport>(
             }
         }
         if let Some(wait) = rate_wait {
-            let held = pause_kind(tx, job.kind, now.saturating_add(ms(wait)))?;
+            let held = pause_kind(tx, job.kind, now, now.saturating_add(ms(wait)))?;
             if held > 0 {
                 tracing::info!(
                     held,
@@ -1132,7 +1361,7 @@ mod tests {
             assert!(enqueue(tx, JobKind::ProfileFetch, "b", 5_000, None)?);
             assert!(enqueue(tx, JobKind::ProfileFetch, "c", 90_000, None)?);
             assert!(enqueue(tx, JobKind::DeliveryReceipts, "", 0, None)?);
-            assert_eq!(pause_kind(tx, JobKind::ProfileFetch, 60_000)?, 2);
+            assert_eq!(pause_kind(tx, JobKind::ProfileFetch, 0, 60_000)?, 2);
             let due = next_due(tx, 59_999, true, false)?.expect("due");
             assert_eq!(due.kind, JobKind::DeliveryReceipts);
             finish(tx, &due, Done::Finished, 0)?;
@@ -1140,6 +1369,39 @@ mod tests {
             let due = next_due(tx, 60_000, true, false)?.expect("due");
             assert_eq!(due.kind, JobKind::ProfileFetch);
             assert_eq!(more_due(tx, &due, 60_000, 9)?.len(), 1, "c is due at 90 s");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Re-check N2: the hold of a 429 is remembered across restarts, so a bogus `Retry-After`
+    /// (an unbounded number of seconds) holds the profile service for a day at most.
+    #[test]
+    fn a_huge_retry_after_holds_the_profile_service_a_day_at_most() {
+        let day = ms(MAX_KIND_HOLD);
+        let ten_years = Error::RateLimited {
+            retry_after_secs: Some(10 * 365 * 24 * 3600),
+        };
+        assert_eq!(
+            profile_rate_wait(JobKind::ProfileFetch, &ten_years),
+            Some(MAX_KIND_HOLD),
+            "the wait the runner applies is cut"
+        );
+        let unbounded = Error::RateLimited {
+            retry_after_secs: Some(u64::MAX),
+        };
+        assert_eq!(
+            profile_rate_wait(JobKind::ProfileFetch, &unbounded),
+            Some(MAX_KIND_HOLD)
+        );
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(enqueue(tx, JobKind::ProfileFetch, "a", 0, None)?);
+            let far = 1_000 + 10 * 365 * 24 * 3600 * 1000;
+            pause_kind(tx, JobKind::ProfileFetch, 1_000, far)?;
+            assert_eq!(due_floor(tx, JobKind::ProfileFetch, 2_000)?, 1_000 + day);
+            assert!(next_due(tx, 1_000 + day - 1, true, false)?.is_none());
+            assert!(next_due(tx, 1_000 + day, true, false)?.is_some());
             Ok(())
         })
         .unwrap();
@@ -1647,6 +1909,76 @@ mod tests {
         .unwrap();
     }
 
+    /// The lead's RC1: a Verified sync waits for the catch-up like the receipts do, so the
+    /// phone's earlier syncs (queued for us on the server) are read while our job still waits.
+    #[test]
+    fn a_verified_sync_waits_for_the_catch_up() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(JobKind::VerifiedSync.needs_online());
+            enqueue_payload(tx, JobKind::VerifiedSync, "aci", b"{}", 0, None)?;
+            assert_eq!(
+                next_due(tx, 1_000, false, false)?,
+                None,
+                "not while the account drains its queue"
+            );
+            assert_eq!(next_at(tx, false, false)?, None);
+            let job = next_due(tx, 1_000, true, false)?.expect("due once online");
+            assert_eq!(job.kind, JobKind::VerifiedSync);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// C5b: the sync that tells our other devices to fetch the manifest waits for the catch-up
+    /// like the other sync messages; once online it is due (`request` keeps the hour of its news).
+    #[test]
+    fn a_fetch_latest_sync_waits_for_the_catch_up() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(JobKind::FetchLatestSync.needs_online());
+            request(
+                tx,
+                JobKind::FetchLatestSync,
+                "",
+                1_000,
+                Some(Duration::from_secs(3600)),
+            )?;
+            assert_eq!(
+                next_due(tx, 1_000, false, false)?,
+                None,
+                "not while the account drains its queue"
+            );
+            assert_eq!(next_at(tx, false, false)?, None);
+            let job = next_due(tx, 1_000, true, false)?.expect("due once online");
+            assert_eq!(job.kind, JobKind::FetchLatestSync);
+            assert_eq!(job.expires_at, Some(1_000 + 3_600_000));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// V1: the Storage Service write waits for the catch-up, so the phone's queued Verified syncs
+    /// meet a live identity intent before any write carries it.
+    #[test]
+    fn a_storage_write_waits_for_the_catch_up() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            assert!(JobKind::StorageWrite.needs_online());
+            delay_to(tx, JobKind::StorageWrite, "", 1_000, 1_000)?;
+            assert_eq!(
+                next_due(tx, 1_000, false, false)?,
+                None,
+                "not while the account drains its queue"
+            );
+            assert_eq!(next_at(tx, false, false)?, None);
+            let job = next_due(tx, 1_000, true, false)?.expect("due once online");
+            assert_eq!(job.kind, JobKind::StorageWrite);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn unknown_kinds_are_left_alone() {
         let (_dir, db) = db();
@@ -1661,6 +1993,172 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    fn untrusted() -> Error {
+        let address = libsignal_protocol::ProtocolAddress::new(
+            "9d0652a3-dcc3-4d11-975f-74d61598733f".to_owned(),
+            libsignal_core::DeviceId::new(1).unwrap(),
+        );
+        Error::from(libsignal_protocol::SignalProtocolError::UntrustedIdentity(
+            address,
+        ))
+    }
+
+    /// P5 M1 (BQ-6 a): a timer update to a contact whose key changed is not dropped at its
+    /// first attempt: it waits (within its expiry), and the release makes it due at once,
+    /// while a job that waits for another reason (a rate limit) keeps its time.
+    #[test]
+    fn an_untrusted_timer_update_waits() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            let day = Some(Duration::from_secs(24 * 3600));
+            assert!(enqueue(tx, JobKind::TimerUpdate, "peer:9", 0, day)?);
+            assert!(enqueue(tx, JobKind::Resend, "other.1:3", 0, day)?);
+            let job = next_due_of(tx, JobKind::TimerUpdate);
+            let e = untrusted();
+            let permanent = gives_up(&e, job.attempts);
+            assert!(
+                !permanent,
+                "an untrusted recipient must not drop the job at its first attempt"
+            );
+            let at = match retry(tx, &job, 1_000, &e.to_string(), permanent, None)? {
+                Retry::At(at) => at,
+                Retry::Dropped => panic!("the timer update to a changed contact was dropped"),
+            };
+            assert!(at > 1_000, "the retry waits for its backoff");
+            // A resend waits out a rate limit of an hour.
+            let other = next_due_of(tx, JobKind::Resend);
+            let hour = Some(Duration::from_secs(3600));
+            retry(tx, &other, 1_000, "rate limited", false, hour)?;
+            assert!(
+                next_due(tx, 1_000, true, false)?.is_none(),
+                "nothing is due before the release"
+            );
+            assert_eq!(release_untrusted(tx, 1_000)?, 1, "only the untrusted job");
+            let due = next_due(tx, 1_000, true, false)?.expect("the released job is due now");
+            assert_eq!(due.key, "peer:9");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The bound of a job without an expiry that keeps meeting an untrusted key: about a day
+    /// of waits, then it is dropped.
+    #[test]
+    fn untrusted_jobs_wait_about_a_day() {
+        let e = untrusted();
+        let waited: Duration = (1..UNTRUSTED_ATTEMPTS)
+            .map(|attempts| backoff(attempts.saturating_add(1)))
+            .sum();
+        let hours = waited.as_secs_f64() / 3600.0;
+        assert!(
+            (23.0..=25.0).contains(&hours),
+            "the untrusted retries wait {hours:.1} hours, not about a day"
+        );
+        assert!(!gives_up(&e, UNTRUSTED_ATTEMPTS - 2));
+        assert!(gives_up(&e, UNTRUSTED_ATTEMPTS - 1));
+        assert_eq!(
+            e.to_string(),
+            UNTRUSTED_ERROR,
+            "the release finds the retry's text"
+        );
+    }
+
+    /// P5a R4: a job that waits for an untrusted recipient ([`wait_untrusted`]) sleeps for the
+    /// recheck without counting an attempt, is made due by [`release_untrusted`], and is dropped
+    /// when its next look would pass its expiry, or, with no expiry, once it is a day old.
+    #[test]
+    fn a_job_that_waits_for_an_untrusted_recipient_counts_no_attempt() {
+        let (_dir, db) = db();
+        let day = Some(Duration::from_secs(24 * 3600));
+        let recheck = ms(UNTRUSTED_RECHECK);
+        let wait = ms(UNTRUSTED_WAIT);
+        db.zone(|tx| -> Result<()> {
+            assert!(enqueue(tx, JobKind::TimerUpdate, "p:1", 0, day)?);
+            let job = next_due(tx, 0, true, false)?.expect("due");
+            // One failed attempt of another kind of trouble counts; the waits add none.
+            retry(tx, &job, 10, "network", false, None)?;
+            let job = next_due(tx, 1_000_000, true, false)?.expect("due again");
+            assert_eq!(job.attempts, 1);
+            assert_eq!(wait_untrusted(tx, &job, 1_000)?, Retry::At(1_000 + recheck));
+            let (attempts, error, next_at): (u32, Option<String>, i64) =
+                tx.query_row("SELECT attempts, last_error, next_at FROM jobs", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+            assert_eq!(attempts, 1, "a wait is no attempt");
+            assert_eq!(error.as_deref(), Some(UNTRUSTED_ERROR));
+            assert_eq!(next_at, 1_000 + recheck);
+            assert!(next_due(tx, 1_000 + recheck - 1, true, false)?.is_none());
+            // The release finds it by the text, and it runs now.
+            assert_eq!(release_untrusted(tx, 2_000)?, 1);
+            assert!(next_due(tx, 2_000, true, false)?.is_some());
+            // The look after the next one would start past its expiry (a day): dropped.
+            let job = next_due(tx, 2_000, true, false)?.expect("due");
+            let late = 24 * 3600 * 1000 - recheck + 1;
+            assert_eq!(wait_untrusted(tx, &job, late)?, Retry::Dropped);
+            assert_eq!(count(tx, JobKind::TimerUpdate)?, 0);
+
+            // No expiry: a day from its creation (the day UNTRUSTED_ATTEMPTS stood for).
+            assert!(enqueue(tx, JobKind::Receipts, "1:a", 0, None)?);
+            let job = next_due(tx, 0, true, false)?.expect("due");
+            assert_eq!(
+                wait_untrusted(tx, &job, wait - 1)?,
+                Retry::At(wait - 1 + recheck)
+            );
+            assert_eq!(wait_untrusted(tx, &job, wait)?, Retry::Dropped);
+            assert_eq!(count(tx, JobKind::Receipts)?, 0);
+
+            // The delivery receipts' rows age out themselves: their job is never dropped here.
+            assert!(enqueue(tx, JobKind::DeliveryReceipts, "", 0, None)?);
+            let job = next_due(tx, 0, true, false)?.expect("due");
+            let long = 5 * wait;
+            assert_eq!(wait_untrusted(tx, &job, long)?, Retry::At(long + recheck));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// P5a R4: the person a job sends to, from its key, for the kinds that send to one.
+    #[test]
+    fn the_recipient_of_a_job_is_in_its_key() {
+        let aci = "9d0652a3-dcc3-4d11-975f-74d61598733f";
+        assert_eq!(
+            JobKind::TimerUpdate.recipient(&format!("{aci}:1700")),
+            Some(aci)
+        );
+        assert_eq!(
+            JobKind::Resend.recipient(&format!("{aci}.2:1700")),
+            Some(aci)
+        );
+        // The lead's RC3: a retry request carries nothing of ours, it never waits for a key.
+        assert_eq!(
+            JobKind::RetryRequest.recipient(&format!("{aci}.1:5")),
+            None,
+            "a retry request to a changed contact goes out"
+        );
+        assert_eq!(
+            JobKind::TimerUpdate.recipient(&format!("PNI:{aci}:1700")),
+            Some(format!("PNI:{aci}").as_str()),
+            "a service id with a colon of its own"
+        );
+        assert_eq!(JobKind::Resend.recipient("garbage"), None);
+        // The kinds that send to nobody, to our own devices, or to several people.
+        for kind in [
+            JobKind::Receipts,
+            JobKind::DeliveryReceipts,
+            JobKind::ReadSync,
+            JobKind::SentTranscript,
+            JobKind::VerifiedSync,
+            JobKind::ProfileFetch,
+        ] {
+            assert_eq!(
+                kind.recipient(&format!("{aci}:1")),
+                None,
+                "{}",
+                kind.as_str()
+            );
+        }
     }
 
     #[test]
@@ -1920,5 +2418,11 @@ mod tests {
         assert_eq!(job("contacts").log_key(), "contacts");
         assert_eq!(job("7:0011223344556677").log_key(), "7:0011223344556677");
         assert_eq!(job("").log_key(), "");
+        // A Verified sync (P5a, critic L2) is keyed by their ACI: hidden the same way.
+        let sync = Job {
+            kind: JobKind::VerifiedSync,
+            ..job(aci)
+        };
+        assert_eq!(sync.log_key(), "aci:…733f");
     }
 }

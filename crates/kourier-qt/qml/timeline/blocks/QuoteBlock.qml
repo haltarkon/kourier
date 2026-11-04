@@ -24,7 +24,7 @@ Rectangle {
     readonly property color fill: Kirigami.ColorUtils.linearInterpolation(root.surface, root.ink, quoteHover.hovered && root.reachable ? 0.14 : 0.08)
     // Own quotes take the accent, others the author's color, each adjusted to be readable on
     // the quote's own background.
-    readonly property color barColor: Style.readable(root.block.own ? Kirigami.Theme.highlightColor : Components.NameUtils.colorsFromString(root.block.author), root.fill)
+    readonly property color barColor: Style.readable(root.block.own ? Kirigami.Theme.highlightColor : Components.NameUtils.colorsFromString(Style.unmarked(root.block.author)), root.fill)
     readonly property color snippetInk: Style.secondary(root.ink, root.fill)
     // A little smaller than the message text (TextBlock uses the default font). Not
     // `Kirigami.Theme.smallFont`: on this plain Item its point size can come out larger than
@@ -46,7 +46,7 @@ Rectangle {
     clip: true
 
     Accessible.role: root.reachable ? Accessible.Button : Accessible.StaticText
-    Accessible.name: L10n.i18nc("@info accessible, %1 author, %2 text", "Quote of %1: %2", root.block.author, root.block.text)
+    Accessible.name: L10n.i18nc("@info accessible, %1 author, %2 text", "Quote of %1: %2", Style.unmarked(root.block.author), root.block.text)
     Accessible.onPressAction: root.activate()
 
     Rectangle {

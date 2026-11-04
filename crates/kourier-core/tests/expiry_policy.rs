@@ -8,7 +8,8 @@
 //!   versions of a message, attachment lookups, media handles, plaintext playback copies, and
 //!   the commands that name the message; nothing of it is deleted, and it shows again exactly
 //!   as before when the confirmed time says it is not due;
-//! - a change of the option in each of the six directions, at once;
+//! - a change of the option in each of the six directions, at once; "keep" right behind
+//!   "erase" finds the due messages erased, never shown again;
 //! - a message that comes due while others are hidden;
 //! - a kill between hiding and erasing (a child process that aborts): nothing shows at the
 //!   next start, nothing is lost, and it is erased once the time is confirmed;
@@ -16,7 +17,7 @@
 //! - "erase" never holds; each account follows its own backend;
 //! - the option is stored where a start reads it, with no UI.
 
-mod support;
+use crate::support;
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -452,6 +453,24 @@ async fn assert_hidden_everywhere(s: &mut Scene, before: &View) {
     let (photo, alice, attachment) = (s.photo, s.alice, s.attachment);
     h.send(UiCommand::OpenMedia { attachment }).expect("send");
     assert_eq!(s.refused("OpenMedia").await, Some(Refusal::Gone));
+    let folder = tempfile::tempdir().expect("folder");
+    h.send(UiCommand::SaveAttachment {
+        attachment,
+        target: kourier_core::facade::SaveTarget {
+            dir: folder.path().to_owned(),
+            name: "photo.jpg".into(),
+        },
+        mode: kourier_core::facade::SaveMode::Replace,
+    })
+    .expect("send");
+    assert_eq!(s.refused("SaveAttachment").await, Some(Refusal::Gone));
+    assert!(
+        std::fs::read_dir(folder.path())
+            .expect("folder")
+            .next()
+            .is_none(),
+        "no copy is made of what is gone for the user"
+    );
     h.send(UiCommand::DownloadAttachment { attachment })
         .expect("send");
     assert_eq!(s.refused("DownloadAttachment").await, Some(Refusal::Gone));
@@ -951,6 +970,41 @@ async fn a_change_of_the_option_takes_effect_at_once_in_every_direction() {
     assert_eq!(s.fates().await, [Erased, Hidden, Erased]);
     choose(&s, ExpiryPolicy::KeepUntilConfirmed).await;
     assert_eq!(s.fates().await, [Erased, Shown, Erased]);
+    s.env.stop().await;
+}
+
+/// What "erase" hid never comes back: a change to "keep" sent right behind the change to
+/// "erase" (two clicks on the settings page) finds the due messages erased, not only hidden,
+/// because the change to "erase" runs the sweeper's batches before it returns (the sweeper's
+/// own look, which needs a read first, could come after "keep" and then follow "keep").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_erase_followed_at_once_by_keep_stays_erased() {
+    let mut s = Scene::new(Some(ExpiryPolicy::KeepUntilConfirmed)).await;
+    let blob = s.blob();
+    let _verdict = s.restart(START + 10 * MINUTE, offline()).await;
+    s.connects(&offline()).await;
+    assert_eq!(s.fates().await, [Shown, Shown, Shown], "kept and readable");
+    for policy in [
+        ExpiryPolicy::EraseByLocalClock,
+        ExpiryPolicy::KeepUntilConfirmed,
+    ] {
+        s.env
+            .handle
+            .send(UiCommand::SetExpiryPolicy { policy })
+            .expect("send");
+    }
+    assert_eq!(
+        policy_of(&s.env.handle).await,
+        ExpiryPolicy::KeepUntilConfirmed
+    );
+    assert_eq!(
+        s.fates().await,
+        [Erased, Shown, Erased],
+        "the read right behind \"keep\": erased, not shown again"
+    );
+    s.stays("and they never come back", [Erased, Shown, Erased])
+        .await;
+    assert_erased_for_good(&s, &blob).await;
     s.env.stop().await;
 }
 
@@ -1459,12 +1513,9 @@ fn run_kill_child(home: &Path, phase: &str) -> std::process::ExitStatus {
     let exe = std::env::current_exe().expect("test binary");
     let log = home.join(format!("child-{phase}.log"));
     let mut child = Command::new(exe)
-        .args([
-            "--exact",
-            "expiry_kill_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .arg("--exact")
+        .arg(support::child_filter(module_path!(), "expiry_kill_child"))
+        .args(["--nocapture", "--test-threads=1"])
         .env(CHILD_HOME, home)
         .env(CHILD_PHASE, phase)
         .env_remove(kourier_db::failpoint::ENV)

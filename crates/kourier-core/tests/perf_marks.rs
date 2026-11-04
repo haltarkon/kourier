@@ -3,7 +3,7 @@
 //! One test in a binary of its own: the marks are `tracing` events, and the subscriber that
 //! collects them is installed for the whole process.
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -71,6 +71,9 @@ fn number(mark: &Mark, field: &str) -> f64 {
 /// Afterwards the core gives its caches back on request and goes on working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_receive_path_is_marked_and_memory_is_given_back_on_request() {
+    if support::in_own_process!() {
+        return;
+    }
     let marks = Marks::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(marks.clone()))
         .expect("the only subscriber of this process");

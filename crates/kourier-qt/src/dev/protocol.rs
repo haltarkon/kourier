@@ -103,10 +103,21 @@ pub enum Command {
         conversation: i64,
     },
     /// The conversation list as marks: per row `conversation` (id), `kind` (`direct`,
-    /// `group`, `other`), `self` (the note to self), `unread`, `last_activity` (ms) and
-    /// `newest_own` (the send state of the previewed message when it is ours, else `none`).
+    /// `group`, `other`), `self` (the note to self), `unread`, `last_activity` (ms),
+    /// `newest_own` (the send state of the previewed message when it is ours, else `none`),
+    /// and the phone's settings as the SHOWN list has them: `pinned`, `muted`, `marked_unread`.
     /// No titles, no previews.
     Chats,
+    /// What the CORE's own row of one chat says, whether or not the list shows it (T2 M12: the
+    /// shown list is the inbox, so an archived chat is not in `chats`): `archived`, `pinned`,
+    /// `muted`, `marked_unread`, `kind`, the call lines of the newest page of its timeline
+    /// (`calls`: `state`, `direction`, `group`) and, for a group, `members` and `admins`
+    /// counts. Ids, booleans and counts only. Read from the facade off the Qt thread
+    /// ([`super::facts`]); `notFound` when the core has no such chat.
+    ChatFacts {
+        /// The conversation's id (from `chats`).
+        conversation: i64,
+    },
     /// Shows a page.
     Page {
         /// Which.
@@ -123,9 +134,16 @@ pub enum Command {
     },
     /// Sends `text` from the composer of the open conversation. With files waiting, `text` may
     /// be empty (no caption).
+    ///
+    /// `conversation` is the guard of a driver that must not send into any other chat (T2, C7:
+    /// the run tool's send run): given, it is checked ON THE QT THREAD in the call that sends,
+    /// and a send while another chat is open is refused (`guardRefused`, "refused: ...") with
+    /// nothing sent. Without it the command sends into whatever chat is open, as always.
     Send {
         /// The text.
         text: String,
+        /// The chat that must be the open one (an id from `chats`), or no check.
+        conversation: Option<i64>,
     },
     /// Answers the challenge an account waits on with what the browser would hand back (the
     /// solution token or the whole `signalcaptcha://` link), through the invokable the
@@ -136,11 +154,21 @@ pub enum Command {
     },
     /// What the user does to a message of the open conversation: a reaction, a reply that
     /// quotes it, an edit, a delete.
+    ///
+    /// The two guards of C7 (the run tool's send run), both checked on the Qt thread in the same
+    /// call that acts: `conversation` must be the open chat, and `message` (the core's message
+    /// id from `state.rows`) must be a message of it that is not deleted and is the kind `on`
+    /// names; the act then takes exactly that message instead of "the newest one". Either
+    /// mismatch is refused (`guardRefused`, "refused: ...") with nothing done.
     Act {
         /// Which message.
         on: ActOn,
         /// What to do with it.
         action: Action,
+        /// The chat that must be the open one (an id from `chats`), or no check.
+        conversation: Option<i64>,
+        /// The message to act on (an id from `state.rows`), or the newest of kind `on`.
+        message: Option<i64>,
     },
     /// Waits until a condition holds.
     Wait {
@@ -171,6 +199,25 @@ pub enum Command {
     /// Closes the main window like its close button (to the tray when one is shown, else
     /// Kourier quits).
     Close,
+    /// Rehearsal runs only (`KOURIER_DEV_REHEARSAL=whatsapp`): the rehearsal network's phone
+    /// puts one text from the other member into the first chat of this kind of the running
+    /// account, as live traffic. Refused (`failed`) in every other run.
+    RehearsalArrive {
+        /// Which chat.
+        kind: kourier_app::RehearsalKind,
+    },
+    /// Rehearsal runs only: the rehearsal network's phone plays `act` in the first chat of `kind`
+    /// of the running account (T2 T-5): a setting it changes (`archive`, `unarchive`, `pin`,
+    /// `unpin`, `mute`, `unmute`), a call into a 1:1 chat that rings and is answered on the
+    /// phone (`call`), or the other person's `peer_react`, `peer_edit` or `peer_delete` of the
+    /// text that arrived last there. Refused (`failed`) in every other run; the fake takes no
+    /// frame for it.
+    RehearsalAct {
+        /// Which chat.
+        kind: kourier_app::RehearsalKind,
+        /// What the phone does.
+        act: kourier_app::RehearsalAct,
+    },
     /// Counts and states for the driver's log: no texts or names.
     State,
     /// Leaves the event loop (exit code 0).
@@ -366,6 +413,22 @@ pub fn parse_line(line: &str) -> Result<Request, (Value, ParseError)> {
         .map_err(|e| (id, e))
 }
 
+/// An optional id argument (a conversation or a message id): absent or `null` is `None`, a
+/// positive integer is `Some`, anything else (zero, a negative number, a string, a float, a
+/// bool) is a bad request, so a driver's typo can never turn a guard off.
+fn optional_id(
+    args: &Map<String, Value>,
+    name: &str,
+    cmd: &str,
+) -> Result<Option<i64>, ParseError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_i64().filter(|id| *id > 0).map(Some).ok_or_else(|| {
+            ParseError::BadRequest(format!("{cmd}: \"{name}\" must be a positive id"))
+        }),
+    }
+}
+
 fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
     let cmd = obj
         .get("cmd")
@@ -413,6 +476,17 @@ fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
                 })?,
         },
         "chats" => Command::Chats,
+        "chat_facts" => Command::ChatFacts {
+            conversation: args
+                .get("conversation")
+                .and_then(Value::as_i64)
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    ParseError::BadRequest(
+                        "chat_facts: \"conversation\" must be a conversation id".into(),
+                    )
+                })?,
+        },
         "page" => Command::Page {
             name: match string("name")?.as_str() {
                 "welcome" => PageName::Welcome,
@@ -460,7 +534,10 @@ fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
                     ));
                 }
             };
-            Command::Send { text }
+            Command::Send {
+                text,
+                conversation: optional_id(args, "conversation", cmd)?,
+            }
         }
         "challenge" => {
             let answer = string("answer")?;
@@ -503,7 +580,12 @@ fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
                     )));
                 }
             };
-            Command::Act { on, action }
+            Command::Act {
+                on,
+                action,
+                conversation: optional_id(args, "conversation", cmd)?,
+                message: optional_id(args, "message", cmd)?,
+            }
         }
         "wait" => Command::Wait {
             until: Until::parse(&string("until")?)?,
@@ -551,6 +633,37 @@ fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
             }
         }
         "close" => Command::Close,
+        "rehearsal_arrive" => Command::RehearsalArrive {
+            kind: match string("kind")?.as_str() {
+                "direct" => kourier_app::RehearsalKind::Direct,
+                "group" => kourier_app::RehearsalKind::Group,
+                other => {
+                    return Err(ParseError::BadRequest(format!(
+                        "rehearsal_arrive: unknown \"kind\" {other:?} (direct, group)"
+                    )));
+                }
+            },
+        },
+        "rehearsal_act" => Command::RehearsalAct {
+            kind: match string("kind")?.as_str() {
+                "direct" => kourier_app::RehearsalKind::Direct,
+                "group" => kourier_app::RehearsalKind::Group,
+                other => {
+                    return Err(ParseError::BadRequest(format!(
+                        "rehearsal_act: unknown \"kind\" {other:?} (direct, group)"
+                    )));
+                }
+            },
+            act: {
+                let name = string("act")?;
+                kourier_app::RehearsalAct::ALL
+                    .into_iter()
+                    .find(|a| a.name() == name)
+                    .ok_or_else(|| {
+                        ParseError::BadRequest(format!("rehearsal_act: unknown \"act\" {name:?}"))
+                    })?
+            },
+        },
         "state" => Command::State,
         "quit" => Command::Quit,
         other => return Err(ParseError::UnknownCommand(other.to_owned())),
@@ -668,6 +781,104 @@ mod tests {
     }
 
     #[test]
+    fn chat_facts_takes_one_conversation_id_and_nothing_else() {
+        assert_eq!(
+            cmd(r#"{"cmd":"chat_facts","args":{"conversation":7}}"#),
+            Command::ChatFacts { conversation: 7 }
+        );
+        for bad in [
+            r#"{"cmd":"chat_facts"}"#,
+            r#"{"cmd":"chat_facts","args":{}}"#,
+            r#"{"cmd":"chat_facts","args":{"conversation":"7"}}"#,
+            r#"{"cmd":"chat_facts","args":{"conversation":0}}"#,
+            r#"{"cmd":"chat_facts","args":{"conversation":-3}}"#,
+            r#"{"cmd":"chat_facts","args":{"title":"x"}}"#,
+        ] {
+            assert_eq!(fails(bad).1, "badRequest", "{bad}");
+        }
+    }
+
+    #[test]
+    fn rehearsal_arrive_parses_only_direct_or_group() {
+        assert_eq!(
+            cmd(r#"{"cmd":"rehearsal_arrive","args":{"kind":"direct"}}"#),
+            Command::RehearsalArrive {
+                kind: kourier_app::RehearsalKind::Direct
+            }
+        );
+        assert_eq!(
+            cmd(r#"{"cmd":"rehearsal_arrive","args":{"kind":"group"}}"#),
+            Command::RehearsalArrive {
+                kind: kourier_app::RehearsalKind::Group
+            }
+        );
+        for bad in [
+            r#"{"cmd":"rehearsal_arrive"}"#,
+            r#"{"cmd":"rehearsal_arrive","args":{}}"#,
+            r#"{"cmd":"rehearsal_arrive","args":{"kind":"Direct"}}"#,
+            r#"{"cmd":"rehearsal_arrive","args":{"kind":"other"}}"#,
+            r#"{"cmd":"rehearsal_arrive","args":{"kind":""}}"#,
+            r#"{"cmd":"rehearsal_arrive","args":{"kind":1}}"#,
+        ] {
+            assert_eq!(fails(bad).1, "badRequest", "{bad}");
+        }
+    }
+
+    #[test]
+    fn rehearsal_act_parses_every_act_for_a_direct_or_a_group_chat_and_nothing_else() {
+        // Every act by its name, both kinds; the name is the app's own (`RehearsalAct::name`).
+        for act in kourier_app::RehearsalAct::ALL {
+            for (kind_name, kind) in [
+                ("direct", kourier_app::RehearsalKind::Direct),
+                ("group", kourier_app::RehearsalKind::Group),
+            ] {
+                assert_eq!(
+                    cmd(&format!(
+                        r#"{{"cmd":"rehearsal_act","args":{{"kind":"{kind_name}","act":"{}"}}}}"#,
+                        act.name()
+                    )),
+                    Command::RehearsalAct { kind, act }
+                );
+            }
+        }
+        // The spellings are fixed: the ten names, in lower case.
+        let names: Vec<_> = kourier_app::RehearsalAct::ALL
+            .into_iter()
+            .map(kourier_app::RehearsalAct::name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "archive",
+                "unarchive",
+                "pin",
+                "unpin",
+                "mute",
+                "unmute",
+                "call",
+                "peer_react",
+                "peer_edit",
+                "peer_delete"
+            ]
+        );
+        for bad in [
+            r#"{"cmd":"rehearsal_act"}"#,
+            r#"{"cmd":"rehearsal_act","args":{}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"direct"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"act":"pin"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"Direct","act":"pin"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"other","act":"pin"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"direct","act":"Pin"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"direct","act":"send"}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"direct","act":""}}"#,
+            r#"{"cmd":"rehearsal_act","args":{"kind":"direct","act":1}}"#,
+        ] {
+            let (_, code) = fails(bad);
+            assert!(code == "badRequest", "{bad}: {code}");
+        }
+    }
+
+    #[test]
     fn message_actions() {
         assert_eq!(
             cmd(r#"{"cmd":"act","args":{"on":"other","action":"react","emoji":"👍"}}"#),
@@ -676,14 +887,18 @@ mod tests {
                 action: Action::React {
                     emoji: "👍".into(),
                     remove: false
-                }
+                },
+                conversation: None,
+                message: None,
             }
         );
         assert_eq!(
             cmd(r#"{"cmd":"act","args":{"on":"other","action":"reply","text":"yes"}}"#),
             Command::Act {
                 on: ActOn::Other,
-                action: Action::Reply { text: "yes".into() }
+                action: Action::Reply { text: "yes".into() },
+                conversation: None,
+                message: None,
             }
         );
         assert_eq!(
@@ -692,14 +907,18 @@ mod tests {
                 on: ActOn::Own,
                 action: Action::Edit {
                     text: "fixed".into()
-                }
+                },
+                conversation: None,
+                message: None,
             }
         );
         assert_eq!(
             cmd(r#"{"cmd":"act","args":{"on":"own","action":"delete","for_everyone":true}}"#),
             Command::Act {
                 on: ActOn::Own,
-                action: Action::Delete { for_everyone: true }
+                action: Action::Delete { for_everyone: true },
+                conversation: None,
+                message: None,
             }
         );
         for bad in [
@@ -707,6 +926,68 @@ mod tests {
             r#"{"cmd":"act","args":{"on":"own","action":"forward"}}"#,
             r#"{"cmd":"act","args":{"on":"own","action":"edit","text":" "}}"#,
             r#"{"cmd":"act","args":{"on":"own","action":"react"}}"#,
+        ] {
+            assert_eq!(fails(bad).1, "badRequest", "{bad}");
+        }
+    }
+
+    /// T2 (C7): the guard fields of `send` and `act` are optional ids. Absent or `null` is no
+    /// guard; a positive integer is the guard; anything else is a bad request, so that a typo
+    /// can never turn a guard off by being ignored.
+    #[test]
+    fn send_and_act_take_optional_guards_and_refuse_a_bad_one() {
+        assert_eq!(
+            cmd(r#"{"cmd":"send","args":{"text":"hi","conversation":7}}"#),
+            Command::Send {
+                text: "hi".into(),
+                conversation: Some(7)
+            }
+        );
+        assert_eq!(
+            cmd(r#"{"cmd":"send","args":{"text":"hi","conversation":null}}"#),
+            Command::Send {
+                text: "hi".into(),
+                conversation: None
+            }
+        );
+        assert_eq!(
+            cmd(
+                r#"{"cmd":"act","args":{"on":"own","action":"delete","for_everyone":true,"conversation":7,"message":31}}"#
+            ),
+            Command::Act {
+                on: ActOn::Own,
+                action: Action::Delete { for_everyone: true },
+                conversation: Some(7),
+                message: Some(31),
+            }
+        );
+        // Each guard alone.
+        assert_eq!(
+            cmd(r#"{"cmd":"act","args":{"on":"own","action":"react","emoji":"x","message":5}}"#),
+            Command::Act {
+                on: ActOn::Own,
+                action: Action::React {
+                    emoji: "x".into(),
+                    remove: false
+                },
+                conversation: None,
+                message: Some(5),
+            }
+        );
+        for bad in [
+            r#"{"cmd":"send","args":{"text":"hi","conversation":0}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":-3}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":"7"}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":7.5}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":true}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":[7]}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","conversation":0}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","conversation":"7"}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","message":0}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","message":-1}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","message":"31"}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","message":31.5}}"#,
+            r#"{"cmd":"act","args":{"on":"own","action":"delete","message":false}}"#,
         ] {
             assert_eq!(fails(bad).1, "badRequest", "{bad}");
         }
@@ -762,13 +1043,17 @@ mod tests {
         );
         assert_eq!(
             cmd(r#"{"cmd":"send","args":{"text":"hi"}}"#),
-            Command::Send { text: "hi".into() }
+            Command::Send {
+                text: "hi".into(),
+                conversation: None
+            }
         );
         // Files without a caption.
         assert_eq!(
             cmd(r#"{"cmd":"send"}"#),
             Command::Send {
-                text: String::new()
+                text: String::new(),
+                conversation: None
             }
         );
         assert_eq!(

@@ -8,14 +8,27 @@ use libsignal_protocol::{
     SignalProtocolError,
 };
 
+use kourier_model::TrustLevel;
+
 use super::{device_of, sql_error};
 
 /// `identities.verified`: the user has not compared safety numbers.
-const DEFAULT: i64 = 0;
+pub(crate) const DEFAULT: i64 = 0;
 /// `identities.verified`: verified (our own identities, or the user compared safety numbers).
-const VERIFIED: i64 = 1;
+pub(crate) const VERIFIED: i64 = 1;
 /// `identities.verified`: was verified, then the key changed.
-const UNVERIFIED: i64 = 2;
+pub(crate) const UNVERIFIED: i64 = 2;
+
+/// The core's [`TrustLevel`] of an `identities.verified` state (P5 critic F3): 1 is
+/// `Verified`, 2 (verified, then the key changed) is `Changed`, 0 and anything else
+/// `Unverified`. Every writer of a contact's trust from that column uses it.
+pub(crate) fn trust_of(verified: i64) -> TrustLevel {
+    match verified {
+        VERIFIED => TrustLevel::Verified,
+        UNVERIFIED => TrustLevel::Changed,
+        _ => TrustLevel::Unverified,
+    }
+}
 
 /// A remote identity key that replaced a different one (stage 1 turns it into core events).
 #[derive(Clone, PartialEq, Eq)]
@@ -24,6 +37,9 @@ pub(crate) struct IdentityChangeRecord {
     pub(crate) service_id: String,
     /// The new key.
     pub(crate) identity: IdentityKey,
+    /// The `identities.verified` state `save_identity` stored with it (2 when a verified
+    /// contact's key changed, P5 critic F3).
+    pub(crate) verified: i64,
 }
 
 /// Identity keys of one own identity's view. Remote identities are shared by both own
@@ -143,6 +159,7 @@ impl IdentityKeyStore for SqlIdentityStore<'_> {
                 self.changes.push(IdentityChangeRecord {
                     service_id: address.name().to_owned(),
                     identity: *identity,
+                    verified,
                 });
                 Ok(IdentityChange::ReplacedExisting)
             }
@@ -208,6 +225,35 @@ pub(crate) fn load_identity_key(
         .optional()?;
     key.map(|key| {
         IdentityKey::decode(&key).map_err(|_| crate::error::Error::Decode("identity key"))
+    })
+    .transpose()
+}
+
+/// Whether `service_id` is in state 2 ([`UNVERIFIED`]: verified, then the key changed):
+/// libsignal refuses every send to them until the user confirms, so a job that sends to them
+/// waits without a request (P5a R4). One read; a person without a stored key is not.
+pub(crate) fn is_changed(conn: &Connection, service_id: &str) -> crate::error::Result<bool> {
+    let state: Option<i64> = conn
+        .prepare_cached("SELECT verified FROM identities WHERE service_id = ?1")?
+        .query_row([service_id], |r| r.get(0))
+        .optional()?;
+    Ok(state == Some(UNVERIFIED))
+}
+
+/// The stored identity key of a remote service id string and its `verified` state
+/// ([`DEFAULT`], [`VERIFIED`] or [`UNVERIFIED`]), if any.
+pub(crate) fn load_identity(
+    conn: &Connection,
+    service_id: &str,
+) -> crate::error::Result<Option<(IdentityKey, i64)>> {
+    let row: Option<(Vec<u8>, i64)> = conn
+        .prepare_cached("SELECT identity_key, verified FROM identities WHERE service_id = ?1")?
+        .query_row([service_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    row.map(|(key, verified)| {
+        IdentityKey::decode(&key)
+            .map(|key| (key, verified))
+            .map_err(|_| crate::error::Error::Decode("identity key"))
     })
     .transpose()
 }

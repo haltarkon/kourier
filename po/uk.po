@@ -17,9 +17,66 @@ msgstr ""
 
 #: crates/kourier-qt/qml/AccountsDrawer.qml
 #, kde-format
+msgctxt "@info"
+msgid "At least one account stays in the list"
+msgstr "У списку лишається щонайменше один акаунт"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Open the side panel"
+msgstr "Відкрити бічну панель"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@info:tooltip, %1 how many"
+msgid "Open the side panel · %1 unread message in hidden accounts"
+msgid_plural "Open the side panel · %1 unread messages in hidden accounts"
+msgstr[0] "Відкрити бічну панель · %1 непрочитане повідомлення в прихованих акаунтах"
+msgstr[1] "Відкрити бічну панель · %1 непрочитані повідомлення в прихованих акаунтах"
+msgstr[2] "Відкрити бічну панель · %1 непрочитаних повідомлень у прихованих акаунтах"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Close the side panel"
+msgstr "Закрити бічну панель"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Show in List"
+msgstr "Показувати у списку"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Show Only This Account"
+msgstr "Показувати лише цей акаунт"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@option:check, %1 an account's name"
+msgid "Show %1 in the list"
+msgstr "Показувати «%1» у списку"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
 msgctxt "@action:button all conversations"
 msgid "All Chats"
 msgstr "Усі чати"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Hidden from the list. Ctrl+Space shows or hides it."
+msgstr "Приховано зі списку. Ctrl+Пробіл показує або приховує його."
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Shown in the list. Ctrl+Space shows or hides it."
+msgstr "Показано у списку. Ctrl+Пробіл показує або приховує його."
 
 #: crates/kourier-qt/qml/AccountsDrawer.qml
 #, kde-format
@@ -101,18 +158,117 @@ msgid "Open"
 msgstr "Відкрити"
 
 #: crates/kourier-qt/qml/MainWindow.qml
+#: crates/kourier-qt/qml/components/TimerPart.qml
 #: crates/kourier-qt/qml/dialogs/AttachmentDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/ChatDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
 #: crates/kourier-viewmodel/src/account_actions.rs
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
 msgctxt "@action:button"
 msgid "Cancel"
 msgstr "Скасувати"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status, %1 how many files"
+msgid "Saved %1 file"
+msgid_plural "Saved %1 files"
+msgstr[0] "Збережено %1 файл"
+msgstr[1] "Збережено %1 файли"
+msgstr[2] "Збережено %1 файлів"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status, %1 the name of the saved file"
+msgid "Saved “%1”"
+msgstr "Збережено «%1»"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status, %1 how many files were saved, %2 how many were to be"
+msgid "Some files could not be saved (%1 of %2 saved)."
+msgstr "Не всі файли вдалося зберегти (збережено %1 з %2)."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "Could not save %1 file"
+msgid_plural "Could not save %1 files"
+msgstr[0] "Не вдалося зберегти %1 файл"
+msgstr[1] "Не вдалося зберегти %1 файли"
+msgstr[2] "Не вдалося зберегти %1 файлів"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "Could not save the file"
+msgstr "Не вдалося зберегти файл"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status why a file could not be saved"
+msgid "there is no space left on the disk"
+msgstr "на диску немає місця"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status why a file could not be saved"
+msgid "the folder is not writable"
+msgstr "у цю теку не можна записувати"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status why a file could not be saved"
+msgid "the folder is gone"
+msgstr "теки більше немає"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status why a file could not be saved"
+msgid "the message is gone"
+msgstr "повідомлення більше немає"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status why a file could not be saved"
+msgid "the file is not on this computer"
+msgstr "файла немає на цьому комп’ютері"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status, %1 what could not be saved"
+msgid "%1."
+msgstr "%1."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status, %1 what could not be saved, %2 why"
+msgid "%1: %2."
+msgstr "%1: %2."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Show in Folder"
+msgstr "Показати в теці"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@title:window question before the application restarts while work runs"
+msgid "Restart Kourier?"
+msgstr "Перезапустити Kourier?"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@action:button restart the application"
+msgid "Restart"
+msgstr "Перезапустити"
 
 #: crates/kourier-qt/qml/MediaActions.qml
 #, kde-format
@@ -158,6 +314,12 @@ msgstr "Виберіть чат зі списку, щоб почати чита�
 
 #: crates/kourier-qt/qml/components/ConversationDelegate.qml
 #, kde-format
+msgctxt "@info accessible, %1 the account of the chat"
+msgid "Account %1"
+msgstr "Акаунт %1"
+
+#: crates/kourier-qt/qml/components/ConversationDelegate.qml
+#, kde-format
 msgctxt "@info accessible, %1 how many"
 msgid "%1 unread message"
 msgid_plural "%1 unread messages"
@@ -189,6 +351,264 @@ msgstr "Сповіщення вимкнено"
 msgctxt "@info accessible"
 msgid "Pinned"
 msgstr "Закріплено"
+
+#: crates/kourier-qt/qml/components/DescriptionText.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy"
+msgstr "Скопіювати"
+
+#: crates/kourier-qt/qml/components/DescriptionText.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Select All"
+msgstr "Вибрати все"
+
+#: crates/kourier-qt/qml/components/DescriptionText.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Open Link…"
+msgstr "Відкрити посилання…"
+
+#: crates/kourier-qt/qml/components/DescriptionText.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Link Address"
+msgstr "Скопіювати адресу посилання"
+
+#: crates/kourier-qt/qml/components/DescriptionText.qml
+#, kde-format
+msgctxt "@action:inmenu, %1 a web address"
+msgid "Open %1…"
+msgstr "Відкрити %1…"
+
+#: crates/kourier-qt/qml/components/DetailsPanel.qml
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#, kde-format
+msgctxt "@title:group the level with every picture and file of a chat"
+msgid "All Media and Files"
+msgstr "Усі медіа та файли"
+
+#: crates/kourier-qt/qml/components/DetailsPanel.qml
+#: crates/kourier-qt/qml/dialogs/ChallengeDialog.qml
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/dialogs/LogoutNoticeDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Close"
+msgstr "Закрити"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@info:accessible the group's description"
+msgid "Group description"
+msgstr "Опис групи"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button show less of the group's description"
+msgid "Less"
+msgstr "Менше"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button show the rest of the group's description"
+msgid "More"
+msgstr "Більше"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#: crates/kourier-qt/qml/components/MembersPage.qml
+#, kde-format
+msgctxt "@title:group the members part of a group's page"
+msgid "Members"
+msgstr "Учасники"
+
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#: crates/kourier-qt/qml/components/MembersPage.qml
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#: crates/kourier-qt/qml/components/SafetyPage.qml
+#: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Back"
+msgstr "Назад"
+
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#, kde-format
+msgctxt "@title:tab the pictures and videos of a chat"
+msgid "Media"
+msgstr "Медіа"
+
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#, kde-format
+msgctxt "@title:tab the files of a chat"
+msgid "Files"
+msgstr "Файли"
+
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#, kde-format
+msgctxt "@info:placeholder a chat has no pictures or videos"
+msgid "No media"
+msgstr "Немає медіа"
+
+#: crates/kourier-qt/qml/components/MediaPage.qml
+#, kde-format
+msgctxt "@info:placeholder a chat has no files"
+msgid "No files"
+msgstr "Немає файлів"
+
+#: crates/kourier-qt/qml/components/MediaSection.qml
+#, kde-format
+msgctxt "@title:group the pictures and files of a chat, on the page of a person or a group"
+msgid "Media and Files"
+msgstr "Медіа та файли"
+
+#: crates/kourier-qt/qml/components/MediaSection.qml
+#, kde-format
+msgctxt "@action:button open the page with every picture and file of a chat"
+msgid "All Media and Files"
+msgstr "Усі медіа та файли"
+
+#: crates/kourier-qt/qml/components/MediaTile.qml
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info"
+msgid "Video"
+msgstr "Відео"
+
+#: crates/kourier-qt/qml/components/MediaTile.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Picture"
+msgstr "Зображення"
+
+#: crates/kourier-qt/qml/components/MediaTile.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Video"
+msgstr "Відео"
+
+#: crates/kourier-qt/qml/components/MediaTile.qml
+#, kde-format
+msgctxt "@info accessible a picture that is not downloaded yet"
+msgid "Not downloaded"
+msgstr "Не завантажено"
+
+#: crates/kourier-qt/qml/components/MediaTile.qml
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Download"
+msgstr "Завантажити"
+
+#: crates/kourier-qt/qml/components/MembersPage.qml
+#, kde-format
+msgctxt "@info:placeholder the search field of a group's members"
+msgid "Search members…"
+msgstr "Пошук учасників…"
+
+#: crates/kourier-qt/qml/components/MembersPage.qml
+#, kde-format
+msgctxt "@info:placeholder nothing in a group's members matches the search"
+msgid "No members match."
+msgstr "Жоден учасник не відповідає пошуку."
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@info:status toast after a contact card was handed to the core, %1 the chat's name"
+msgid "Sending the contact card to %1"
+msgstr "Надсилання картки контакту в чат «%1»"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@info:accessible a person's about text"
+msgid "About text"
+msgstr "Текст про себе"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button show less of the about text"
+msgid "Less"
+msgstr "Менше"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button show the rest of the about text"
+msgid "More"
+msgstr "Більше"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button open the chat with this person"
+msgid "Message"
+msgstr "Повідомлення"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "View Safety Number"
+msgstr "Переглянути код безпеки"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Copy Link"
+msgstr "Скопіювати посилання"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@info:status toast after Copy Link"
+msgid "Link copied"
+msgstr "Посилання скопійовано"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Share Contact…"
+msgstr "Поділитися контактом…"
+
+#: crates/kourier-qt/qml/components/PersonPage.qml
+#, kde-format
+msgctxt "@title:group"
+msgid "Groups in Common"
+msgstr "Спільні групи"
+
+#: crates/kourier-qt/qml/components/TimerPart.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:group"
+msgid "Disappearing Messages"
+msgstr "Тимчасові повідомлення"
+
+#: crates/kourier-qt/qml/components/TimerPart.qml
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Custom Time…"
+msgstr "Свій час…"
+
+#: crates/kourier-qt/qml/components/TimerPart.qml
+#, kde-format
+msgctxt "@info accessible description of the disappearing messages selector"
+msgid "Not applied yet. Choose Apply to change it."
+msgstr "Ще не застосовано. Натисніть «Застосувати», щоб змінити."
+
+#: crates/kourier-qt/qml/components/TimerPart.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Apply"
+msgstr "Застосувати"
+
+#: crates/kourier-qt/qml/components/TimerPart.qml
+#, kde-format
+msgctxt "@info:status the new time of disappearing messages is being set"
+msgid "Applying…"
+msgstr "Застосовується…"
 
 #: crates/kourier-qt/qml/composer/AttachDialog.qml
 #, kde-format
@@ -347,6 +767,13 @@ msgstr[1] "Підготовка %1 файлів до надсилання… С�
 msgstr[2] "Підготовка %1 файлів до надсилання… Скопійовано: %2"
 
 #: crates/kourier-qt/qml/composer/Composer.qml
+#: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Delete for Everyone"
+msgstr "Видалити для всіх"
+
+#: crates/kourier-qt/qml/composer/Composer.qml
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
@@ -487,14 +914,6 @@ msgid "Submit"
 msgstr "Надіслати"
 
 #: crates/kourier-qt/qml/dialogs/ChallengeDialog.qml
-#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
-#: crates/kourier-qt/qml/dialogs/LogoutNoticeDialog.qml
-#, kde-format
-msgctxt "@action:button"
-msgid "Close"
-msgstr "Закрити"
-
-#: crates/kourier-qt/qml/dialogs/ChallengeDialog.qml
 #, kde-format
 msgctxt "@info"
 msgid "The network asks for a quick check that a person is sending these messages. It opens in your browser; the messages that wait are sent once it is done."
@@ -605,12 +1024,6 @@ msgstr "Службове повідомлення буде видалено з �
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
 #, kde-format
 msgctxt "@action:button"
-msgid "Delete for Everyone"
-msgstr "Видалити для всіх"
-
-#: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
-#, kde-format
-msgctxt "@action:button"
 msgid "Delete"
 msgstr "Видалити"
 
@@ -619,19 +1032,6 @@ msgstr "Видалити"
 msgctxt "@action:button"
 msgid "Delete for Me"
 msgstr "Видалити для мене"
-
-#: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
-#, kde-format
-msgctxt "@action:button"
-msgid "Back"
-msgstr "Назад"
-
-#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
-#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
-#, kde-format
-msgctxt "@info"
-msgid "Video"
-msgstr "Відео"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #, kde-format
@@ -682,14 +1082,6 @@ msgstr "Ще не завантажено"
 msgctxt "@info:placeholder"
 msgid "Videos play in another application"
 msgstr "Відео відтворюються в іншому застосунку"
-
-#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
-#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
-#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
-#, kde-format
-msgctxt "@action:button"
-msgid "Download"
-msgstr "Завантажити"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
@@ -747,6 +1139,20 @@ msgctxt "@info"
 msgid "Picture"
 msgstr "Зображення"
 
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Save As…"
+msgstr "Зберегти як…"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Save As… (Ctrl+S)"
+msgstr "Зберегти як… (Ctrl+S)"
+
 #: crates/kourier-qt/qml/dialogs/RevisionsDialog.qml
 #, kde-format
 msgctxt "@title:dialog"
@@ -776,6 +1182,54 @@ msgstr "Початкова версія"
 msgctxt "@info a version of a message with files that had no text"
 msgid "No caption"
 msgstr "Без підпису"
+
+#: crates/kourier-qt/qml/dialogs/SaveDialog.qml
+#, kde-format
+msgctxt "@title:window"
+msgid "Save As"
+msgstr "Зберегти як"
+
+#: crates/kourier-qt/qml/dialogs/SaveDialog.qml
+#, kde-format
+msgctxt "@title:window"
+msgid "Save All"
+msgstr "Зберегти все"
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@title:dialog, %1 the person whose contact card is sent"
+msgid "Send %1's Contact Card"
+msgstr "Надіслати картку контакту користувача %1"
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@action:button send a contact card to the chosen chat"
+msgid "Send"
+msgstr "Надіслати"
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@info:placeholder the search field of the chats a contact card can go to"
+msgid "Search chats…"
+msgstr "Пошук чатів…"
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@info:accessible the chats a contact card can go to"
+msgid "Chats"
+msgstr "Чати"
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@info:placeholder no chat of the account can take a contact card"
+msgid "No chat of this account can take a message."
+msgstr "Жоден чат цього облікового запису не може приймати повідомлення."
+
+#: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
+#, kde-format
+msgctxt "@info:placeholder nothing in the chats a contact card can go to matches the search"
+msgid "No chats match."
+msgstr "Немає відповідних чатів."
 
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
 #, kde-format
@@ -911,6 +1365,12 @@ msgstr "Одиниця часу"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #, kde-format
+msgctxt "@action:button the chat's header opens the page of the person or the group, %1 its name"
+msgid "Details of %1"
+msgstr "Відомості про %1"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
 msgctxt "@info accessible"
 msgid "Messages disappear after %1"
 msgstr "Таймер тимчасових повідомлень: %1"
@@ -947,15 +1407,15 @@ msgstr "Час до зникнення повідомлень"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #, kde-format
-msgctxt "@action:inmenu"
-msgid "Custom Time…"
-msgstr "Свій час…"
-
-#: crates/kourier-qt/qml/pages/ChatPage.qml
-#, kde-format
 msgctxt "@info:placeholder"
 msgid "Drop files to attach them"
 msgstr "Перетягніть файли сюди, щоб прикріпити їх"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "These chats are archived. They come back to your chats when a new message arrives."
+msgstr "Ці чати заархівовано. Вони повернуться до списку чатів, коли надійде нове повідомлення."
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -989,6 +1449,12 @@ msgstr "Чати"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
+msgctxt "@info:placeholder"
+msgid "No archived chats"
+msgstr "Архівних чатів немає"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
 msgctxt "@info:placeholder, %1 what was searched for"
 msgid "No chats match “%1”"
 msgstr "За запитом «%1» чатів не знайдено"
@@ -1010,6 +1476,12 @@ msgstr "Імпорт історії повідомлень"
 msgctxt "@info:placeholder"
 msgid "Getting your chats"
 msgstr "Чати надходять"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Getting your message history"
+msgstr "Отримання історії повідомлень"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1038,8 +1510,41 @@ msgstr "Чати з'являтимуться тут у міру надходже
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
 msgctxt "@info:placeholder"
+msgid "Chats appear here as your phone sends them."
+msgstr "Чати з'являтимуться тут, у міру того як телефон їх надсилає."
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
 msgid "Chats from your phone appear here once they sync."
 msgstr "Чати з вашого телефону з'являться тут після синхронізації."
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible, %1 how many"
+msgid "Archived Chats, %1 chat"
+msgid_plural "Archived Chats, %1 chats"
+msgstr[0] "Архівні чати, %1 чат"
+msgstr[1] "Архівні чати, %1 чати"
+msgstr[2] "Архівні чати, %1 чатів"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:button, %1 how many archived chats there are"
+msgid "Archived Chats (%1)"
+msgstr "Архівні чати (%1)"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Back to Chats"
+msgstr "Назад до чатів"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Back to Chats"
+msgstr "Назад до чатів"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1055,33 +1560,9 @@ msgstr "Зв'язати акаунт"
 
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
 #, kde-format
-msgctxt "@info"
-msgid "Your phone shows this name in its list of linked devices."
-msgstr "Телефон показуватиме цю назву у списку зв'язаних пристроїв."
-
-#: crates/kourier-qt/qml/pages/LinkAccountPage.qml
-#, kde-format
 msgctxt "@action:button"
 msgid "Continue"
 msgstr "Продовжити"
-
-#: crates/kourier-qt/qml/pages/LinkAccountPage.qml
-#, kde-format
-msgctxt "@info linking step"
-msgid "Go to Settings → Linked devices"
-msgstr "Перейдіть у «Налаштування» → «Зв'язані пристрої»"
-
-#: crates/kourier-qt/qml/pages/LinkAccountPage.qml
-#, kde-format
-msgctxt "@info linking step, %1 is the network"
-msgid "Open %1 on your phone"
-msgstr "Відкрийте %1 на телефоні"
-
-#: crates/kourier-qt/qml/pages/LinkAccountPage.qml
-#, kde-format
-msgctxt "@info linking step"
-msgid "Tap “Link new device” and scan this code"
-msgstr "Натисніть «Зв'язати новий пристрій» і зіскануйте цей код"
 
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
 #, kde-format
@@ -1143,12 +1624,6 @@ msgctxt "@title:group"
 msgid "Choose a Network"
 msgstr "Виберіть мережу"
 
-#: crates/kourier-qt/qml/pages/WelcomePage.qml
-#, kde-format
-msgctxt "@info"
-msgid "Kourier links as an additional device: your phone stays the main device, keeps your message history and can send a copy of it."
-msgstr "Kourier зв'язується як додатковий пристрій: телефон залишається основним пристроєм, зберігає вашу історію повідомлень і може надіслати її копію."
-
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@title"
@@ -1190,6 +1665,18 @@ msgstr "Стирати за годинником цього комп'ютера"
 msgctxt "@info"
 msgid "They are gone at once, also offline; a clock that runs ahead erases them too early, for good."
 msgstr "Вони зникають одразу, навіть поза мережею; якщо годинник поспішає, їх буде стерто зарано й назавжди."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:window, %1 the network"
+msgid "Turn Off %1?"
+msgstr "Вимкнути %1?"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn Off"
+msgstr "Вимкнути"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -1272,6 +1759,30 @@ msgstr "Компактний список чатів"
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@option:check"
+msgid "Show chats of several accounts together"
+msgstr "Показувати чати кількох акаунтів разом"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Shift+click or Ctrl+click an account in the side panel to add it to the list."
+msgstr "Клацніть акаунт на бічній панелі, утримуючи Shift або Ctrl, щоб додати його до списку."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Show minor notices in the conversation list"
+msgstr "Показувати другорядні сповіщення у списку чатів"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Safety number changes, refreshed sessions, changed phone numbers and accepted message requests. They always stay in the chat itself."
+msgstr "Зміни коду безпеки, оновлені сеанси, змінені номери телефонів і прийняті запити на повідомлення. У самому чаті вони лишаються завжди."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
 msgid "Round avatars"
 msgstr "Круглі аватари"
 
@@ -1349,6 +1860,48 @@ msgstr "Конфіденційність"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
+msgctxt "@label:listbox"
+msgid "Files with location data"
+msgstr "Файли з даними про місцезнаходження"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Such files are sent with their location, without a question."
+msgstr "Такі файли надсилаються з місцезнаходженням, без запитання."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Such files stay in the list; everything else is sent."
+msgstr "Такі файли лишаються в списку; усе інше надсилається."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "When Kourier finds where a photo, video or file was taken, it asks before sending it unchanged."
+msgstr "Коли Kourier знаходить, де знято фото, відео чи файл, він запитує, перш ніж надіслати його без змін."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox"
+msgid "Always send"
+msgstr "Завжди надсилати"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox"
+msgid "Ask each time"
+msgstr "Питати щоразу"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox"
+msgid "Never send"
+msgstr "Ніколи не надсилати"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
 msgctxt "@label"
 msgid "Read receipts"
 msgstr "Відмітки про читання"
@@ -1379,12 +1932,6 @@ msgstr "Вимкнено в цій версії"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
-msgctxt "@title:group"
-msgid "Disappearing Messages"
-msgstr "Тимчасові повідомлення"
-
-#: crates/kourier-qt/qml/settings/SettingsPage.qml
-#, kde-format
 msgctxt "@label"
 msgid "While the time cannot be confirmed"
 msgstr "Поки час не вдається підтвердити"
@@ -1394,6 +1941,36 @@ msgstr "Поки час не вдається підтвердити"
 msgctxt "@info"
 msgid "Kourier checks this computer's clock with the network. Until it can (a start without a connection, or a clock the network calls wrong), messages whose time is up are handled like this:"
 msgstr "Kourier звіряє годинник цього комп'ютера з мережею. Поки це неможливо (запуск без з'єднання або годинник, який мережа вважає неточним), із повідомленнями, час яких сплив, відбувається таке:"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:group"
+msgid "Networks"
+msgstr "Мережі"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info, %1 the network"
+msgid "Experimental. Kourier is not made or approved by %1, and %1 may restrict or ban an account it finds linked to Kourier."
+msgstr "Експериментально. Kourier не створено й не схвалено %1, а %1 може обмежити або заблокувати акаунт, який виявить зв'язаним із Kourier."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Finish or stop the link first."
+msgstr "Спершу завершіть або припиніть зв'язування."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Takes effect when Kourier starts again."
+msgstr "Набуде чинності після повторного запуску Kourier."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Restart Now"
+msgstr "Перезапустити зараз"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -1578,6 +2155,12 @@ msgstr "Відповісти"
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
 msgctxt "@action:button"
+msgid "Save All…"
+msgstr "Зберегти все…"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#, kde-format
+msgctxt "@action:button"
 msgid "More Actions"
 msgstr "Інші дії"
 
@@ -1594,6 +2177,18 @@ msgstr "Поставити реакцію %1"
 msgctxt "@action:button accessible"
 msgid "Remove reaction %1"
 msgstr "Прибрати реакцію %1"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Save All…"
+msgstr "Зберегти все…"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Save As…"
+msgstr "Зберегти як…"
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
@@ -1724,6 +2319,28 @@ msgstr[0] "Ще %1 зображення"
 msgstr[1] "Ще %1 зображення"
 msgstr[2] "Ще %1 зображень"
 
+#: crates/kourier-qt/qml/timeline/blocks/AlbumBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Cancel Sending"
+msgstr "Скасувати надсилання"
+
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Uploading"
+msgstr "Вивантаження"
+
+#: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info accessible, %1 the percentage uploaded"
+msgid "Uploading %1"
+msgstr "Вивантаження %1"
+
 #: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
 #, kde-format
 msgctxt "@info:tooltip"
@@ -1774,18 +2391,6 @@ msgctxt "@info"
 msgid "Download failed"
 msgstr "Не вдалося завантажити"
 
-#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
-#, kde-format
-msgctxt "@info accessible"
-msgid "Picture"
-msgstr "Зображення"
-
-#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
-#, kde-format
-msgctxt "@info accessible"
-msgid "Video"
-msgstr "Відео"
-
 #: crates/kourier-qt/qml/timeline/blocks/QuoteBlock.qml
 #, kde-format
 msgctxt "@info accessible, %1 author, %2 text"
@@ -1824,21 +2429,18 @@ msgstr "Усі чати"
 
 #: crates/kourier-qt/src/app.rs
 #, kde-format
-msgctxt "@info:status a messenger that cannot be linked"
-msgid "Not available in fixture mode"
-msgstr "Недоступно в режимі тестових даних"
+msgctxt "@title:window list header, the archived chats"
+msgid "Archived Chats"
+msgstr "Архівні чати"
 
 #: crates/kourier-qt/src/app.rs
 #, kde-format
-msgctxt "@info:status a messenger that cannot be linked"
-msgid "Not in this build"
-msgstr "Немає в цій збірці"
-
-#: crates/kourier-qt/src/app.rs
-#, kde-format
-msgctxt "@info a test account that can be linked"
-msgid "A scripted demo account with sample chats"
-msgstr "Демонстраційний акаунт зі сценарієм і зразками чатів"
+msgctxt "@title:window list header, how many accounts' chats it shows"
+msgid "%1 account"
+msgid_plural "%1 accounts"
+msgstr[0] "%1 акаунт"
+msgstr[1] "%1 акаунти"
+msgstr[2] "%1 акаунтів"
 
 #: crates/kourier-qt/src/app.rs
 #, kde-format
@@ -1938,6 +2540,36 @@ msgstr "Вилучити акаунт"
 
 #: crates/kourier-viewmodel/src/account_actions.rs
 #, kde-format
+msgctxt "@info question before an account of a network this build cannot connect to is removed from this computer, %1 the network"
+msgid "This build of Kourier cannot connect to %1, so it cannot end this session. Kourier deletes this account's chats, messages and files from this computer."
+msgstr "Ця збірка Kourier не може підключитися до %1, тому не може завершити цей сеанс. Kourier видалить із цього комп'ютера чати, повідомлення та файли цього акаунта."
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account of a network with sessions that is turned off is removed from this computer, %1 the network"
+msgid "%1 is turned off, so Kourier cannot end this session. Kourier deletes this account's chats, messages and files from this computer."
+msgstr "%1 вимкнено, тому Kourier не може завершити цей сеанс. Kourier видалить із цього комп'ютера чати, повідомлення та файли цього акаунта."
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account of a network that is turned off is removed from this computer, %1 the network"
+msgid "%1 is turned off, so Kourier cannot tell your phone. Kourier deletes this account's chats, messages and files from this computer."
+msgstr "%1 вимкнено, тому Kourier не може повідомити про це телефон. Kourier видалить із цього комп'ютера чати, повідомлення та файли цього акаунта."
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account of a network with sessions is removed from this computer without ending its session, %1 the network"
+msgid "This session stays listed in your other %1 apps until you end it there."
+msgstr "Цей сеанс залишиться в списку ваших інших застосунків %1, доки ви не завершите його там."
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
+msgctxt "@info question before an account of a network that is turned off is removed from this computer"
+msgid "This computer stays in the linked devices of your phone until you remove it there."
+msgstr "Цей комп'ютер залишиться у списку зв'язаних пристроїв на телефоні, доки ви не вилучите його там."
+
+#: crates/kourier-viewmodel/src/account_actions.rs
+#, kde-format
 msgctxt "@title:dialog question before this computer is unlinked from an account"
 msgid "Unlink This Computer?"
 msgstr "Відв'язати цей комп'ютер?"
@@ -2033,6 +2665,12 @@ msgid "Logged out"
 msgstr "Не зв'язано"
 
 #: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@item:intext in the chat list, in place of the last message of a protected chat"
+msgid "Protected chat"
+msgstr "Захищений чат"
+
+#: crates/kourier-viewmodel/src/conversations.rs
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
 msgctxt "@item:intext title of the chat with yourself"
@@ -2041,6 +2679,7 @@ msgstr "Нотатник"
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #: crates/kourier-viewmodel/src/core_source.rs
+#: crates/kourier-viewmodel/src/group.rs crates/kourier-viewmodel/src/person.rs
 #, kde-format
 msgctxt "@item:intext title of a group without a name"
 msgid "Unnamed group"
@@ -2089,15 +2728,16 @@ msgstr "Чернетка"
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #, kde-format
+msgctxt "@item:intext account name on a chat row, %1 the name, %2 the account's number among the accounts of its network"
+msgid "%1 · %2"
+msgstr "%1 · %2"
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
 msgctxt "@item:inlistbox disappearing messages timer"
 msgid "Off"
 msgstr "Вимкнено"
-
-#: crates/kourier-viewmodel/src/conversations.rs
-#, kde-format
-msgctxt "@info:status banner of an account"
-msgid "This device is no longer linked. Link it again to send and receive messages."
-msgstr "Цей пристрій більше не зв'язано. Зв'яжіть його знову, щоб надсилати й отримувати повідомлення."
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #, kde-format
@@ -2137,9 +2777,9 @@ msgstr "Відновити з'єднання"
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #, kde-format
-msgctxt "@info:status banner of an account"
-msgid "The network restricted this account for now."
-msgstr "Мережа тимчасово обмежила цей акаунт."
+msgctxt "@info:status banner of an account, %1 the name of its network"
+msgid "The %1 ban on this account has ended. Reconnect to send and receive again."
+msgstr "Блокування цього акаунта в %1 завершилося. Відновіть з'єднання, щоб знову надсилати й отримувати повідомлення."
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #, kde-format
@@ -2173,6 +2813,186 @@ msgstr "Отримання нових повідомлень…"
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 restricted this account until %2."
+msgstr "%1 обмежив цей акаунт до %2."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 restricted this account for now."
+msgstr "%1 тимчасово обмежив цей акаунт."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2: you sent too many messages to people who have not saved your number."
+msgstr "%1 заблокував цей акаунт до %2: ви надіслали забагато повідомлень людям, які не зберегли ваш номер."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now: you sent too many messages to people who have not saved your number."
+msgstr "%1 тимчасово заблокував цей акаунт: ви надіслали забагато повідомлень людям, які не зберегли ваш номер."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2: too many people blocked you."
+msgstr "%1 заблокував цей акаунт до %2: вас заблокувало забагато людей."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now: too many people blocked you."
+msgstr "%1 тимчасово заблокував цей акаунт: вас заблокувало забагато людей."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2: you created too many groups with people who have not saved your number."
+msgstr "%1 заблокував цей акаунт до %2: ви створили забагато груп із людьми, які не зберегли ваш номер."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now: you created too many groups with people who have not saved your number."
+msgstr "%1 тимчасово заблокував цей акаунт: ви створили забагато груп із людьми, які не зберегли ваш номер."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2: you sent the same message to too many people."
+msgstr "%1 заблокував цей акаунт до %2: ви надіслали те саме повідомлення надто багатьом людям."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now: you sent the same message to too many people."
+msgstr "%1 тимчасово заблокував цей акаунт: ви надіслали те саме повідомлення надто багатьом людям."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2: you sent too many messages to a broadcast list."
+msgstr "%1 заблокував цей акаунт до %2: ви надіслали забагато повідомлень до списку розсилки."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now: you sent too many messages to a broadcast list."
+msgstr "%1 тимчасово заблокував цей акаунт: ви надіслали забагато повідомлень до списку розсилки."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 banned this account until %2."
+msgstr "%1 заблокував цей акаунт до %2."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 banned this account for now."
+msgstr "%1 тимчасово заблокував цей акаунт."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 restricts this account until %2: messages to people who have not written to you may be refused. Kourier holds your messages until then."
+msgstr "%1 обмежує цей акаунт до %2: повідомлення людям, які вам не писали, можуть не прийматися. Kourier притримує ваші повідомлення до того часу."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 restricts this account for now: messages to people who have not written to you may be refused. Kourier holds your messages until it ends."
+msgstr "%1 тимчасово обмежує цей акаунт: повідомлення людям, які вам не писали, можуть не прийматися. Kourier притримує ваші повідомлення, доки обмеження не буде знято."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 has frozen this account. You can read your chats; Kourier holds what you send until %1 lifts it. To appeal, open the %1 app."
+msgstr "%1 заморозив цей акаунт. Ви можете читати чати; Kourier притримує повідомлення, які ви надсилаєте, доки %1 його не розморозить. Щоб оскаржити рішення, відкрийте застосунок %1."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network, %2 the end"
+msgid "%1 is not taking the messages you send until %2. Kourier holds them until then."
+msgstr "%1 не приймає ваші повідомлення до %2. Kourier притримує їх до того часу."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 is not taking the messages you send for now. Kourier holds them until it ends."
+msgstr "%1 тимчасово не приймає ваші повідомлення. Kourier притримує їх, доки це не закінчиться."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account"
+msgid "This device is no longer linked. Link it again to send and receive messages."
+msgstr "Цей пристрій більше не зв'язано. Зв'яжіть його знову, щоб надсилати й отримувати повідомлення."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account"
+msgid "This computer was removed from the linked devices on your phone. Link it again to send and receive messages."
+msgstr "Цей комп'ютер вилучено зі списку зв'язаних пристроїв на телефоні. Зв'яжіть його знову, щоб надсилати й отримувати повідомлення."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 unlinked this computer because your phone was not used for a long time. Link it again to send and receive messages."
+msgstr "%1 відв'язав цей комп'ютер, бо телефоном довго не користувалися. Зв'яжіть його знову, щоб надсилати й отримувати повідомлення."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 closed or locked this account."
+msgstr "%1 закрив або заблокував цей акаунт."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of the network"
+msgid "%1 logged this account out because Kourier is not an official app."
+msgstr "%1 завершив сеанс цього акаунта, бо Kourier не є офіційним застосунком."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@action:button in the banner of an account, %1 the name of the network"
+msgid "Open %1's Page"
+msgstr "Відкрити сторінку %1"
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account whose network lost part of its message history"
+msgid "Part of your message history did not arrive from your phone."
+msgstr "Частина історії повідомлень не надійшла з телефона."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of its network"
+msgid "%1 is turned off. Turn it on to send and receive."
+msgstr "%1 вимкнено. Увімкніть, щоб надсилати й отримувати повідомлення."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@action:button in the banner of an account, turns a network on and restarts Kourier"
+msgid "Turn On and Restart"
+msgstr "Увімкнути й перезапустити"
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of its network"
+msgid "This build of Kourier has no %1 API key, so it cannot connect to %1. The chats stay readable."
+msgstr "У цій збірці Kourier немає ключа API %1, тому вона не може підключитися до %1. Чати, як і раніше, можна читати."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
+msgctxt "@info:status banner of an account, %1 the name of its network"
+msgid "The %1 part of Kourier is missing from this installation. The chats stay readable."
+msgstr "У цій копії Kourier немає компонента для %1. Чати, як і раніше, можна читати."
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#, kde-format
 msgctxt "@info:status banner of an account, %1 a length of time"
 msgid "The clock of this computer is about %1 ahead. Set the date and time to send and receive messages."
 msgstr "Годинник цього комп'ютера поспішає; різниця — приблизно %1. Установіть правильні дату й час, щоб надсилати й отримувати повідомлення."
@@ -2184,14 +3004,6 @@ msgid "The clock of this computer is about %1 behind. Set the date and time to s
 msgstr "Годинник цього комп'ютера відстає; різниця — приблизно %1. Установіть правильні дату й час, щоб надсилати й отримувати повідомлення."
 
 #: crates/kourier-viewmodel/src/conversations.rs
-#: crates/kourier-viewmodel/src/core_source.rs
-#, kde-format
-msgctxt "@info:status subtitle of the chat with yourself"
-msgid "Messages to yourself"
-msgstr "Повідомлення собі"
-
-#: crates/kourier-viewmodel/src/conversations.rs
-#: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
 msgctxt "@info:status subtitle of a group chat, %1 how many members"
 msgid "%1 member"
@@ -2199,6 +3011,13 @@ msgid_plural "%1 members"
 msgstr[0] "%1 учасник"
 msgstr[1] "%1 учасники"
 msgstr[2] "%1 учасників"
+
+#: crates/kourier-viewmodel/src/conversations.rs
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status subtitle of the chat with yourself"
+msgid "Messages to yourself"
+msgstr "Повідомлення собі"
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
@@ -2388,6 +3207,12 @@ msgstr "Не вдалося зберегти налаштування."
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
+msgctxt "@info:status a contact card was not sent"
+msgid "The contact card could not be sent."
+msgstr "Не вдалося надіслати картку контакту."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
 msgctxt "@info:status a disabled entry of the chat menu: why the chat cannot be cleared or deleted yet"
 msgid "Available once this chat's history has arrived"
 msgstr "Доступно, коли надійде історія цього чату"
@@ -2412,6 +3237,30 @@ msgid "You can read this chat. To write here, link this device again."
 msgstr "Цей чат можна читати. Щоб писати тут, зв'яжіть цей пристрій знову."
 
 #: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status why the composer is off, %1 the name of the network"
+msgid "You can read this chat. This build of Kourier cannot connect to %1."
+msgstr "Цей чат можна читати. Ця збірка Kourier не може підключитися до %1."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status why the composer is off, %1 the name of the network"
+msgid "You can read this chat. %1 is turned off: turn it on to write here."
+msgstr "Цей чат можна читати. %1 вимкнено: щоб писати тут, увімкніть його."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status why the disappearing-messages entry of the chat is off, %1 the name of the network"
+msgid "Disappearing messages cannot be changed while %1 restricts this account."
+msgstr "Налаштування тимчасових повідомлень не можна змінити, поки %1 обмежує цей акаунт."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status the X came after the message went out"
+msgid "Already sent"
+msgstr "Уже надіслано"
+
+#: crates/kourier-viewmodel/src/core_source.rs
 #: crates/kourier-viewmodel/src/names.rs
 #: crates/kourier-viewmodel/src/preview.rs
 #: crates/kourier-viewmodel/src/timeline.rs
@@ -2419,20 +3268,6 @@ msgstr "Цей чат можна читати. Щоб писати тут, зв'
 msgctxt "@item:intext a person without a name"
 msgid "Unknown"
 msgstr "Невідомий користувач"
-
-#: crates/kourier-viewmodel/src/core_source.rs
-#: crates/kourier-viewmodel/src/preview.rs
-#, kde-format
-msgctxt "@info:preview stand-in for a deleted message"
-msgid "You deleted this message"
-msgstr "Ви видалили це повідомлення"
-
-#: crates/kourier-viewmodel/src/core_source.rs
-#: crates/kourier-viewmodel/src/preview.rs
-#, kde-format
-msgctxt "@info:preview stand-in for a deleted message"
-msgid "This message was deleted"
-msgstr "Це повідомлення видалено"
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #: crates/kourier-viewmodel/src/preview.rs
@@ -2656,6 +3491,12 @@ msgstr[2] "%1 повідомлень"
 
 #: crates/kourier-viewmodel/src/files.rs
 #, kde-format
+msgctxt "@info:status strip summary while Kourier looks at the files for location data"
+msgid "Checking files…"
+msgstr "Перевірка файлів…"
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
 msgctxt "@info:tooltip why the one file cannot be sent"
 msgid "This file cannot be sent here."
 msgstr "Цей файл не можна надіслати сюди."
@@ -2695,6 +3536,45 @@ msgstr[2] "Ваш текст задовгий для одного повідом
 msgctxt "@info:tooltip about sending files with a text"
 msgid "Your text is sent first, as a message of its own."
 msgstr "Ваш текст буде надіслано першим, окремим повідомленням."
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:status why a file was not sent: the user answered Don't Send, and the setting Files with location data now says Always send"
+msgid "Not sent: it holds where it was taken. Send now sends it."
+msgstr "Не надіслано: у ньому записано, де його знято. Тепер «Надіслати» його надішле."
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:status why a file was not sent: the user answered Don't Send, and the setting Files with location data says Ask each time"
+msgid "Not sent: it holds where it was taken. Send asks again."
+msgstr "Не надіслано: у ньому записано, де його знято. «Надіслати» запитає знову."
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:status why a file was not sent: it holds the place it was taken, and the setting Files with location data says Never send"
+msgid "Not sent: it holds where it was taken (Settings: Files with location data)"
+msgstr "Не надіслано: у ньому записано, де його знято (Налаштування: Файли з даними про місцезнаходження)"
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:status why a file will stay when Send is pressed: it holds the place it was taken, and the setting Files with location data says Never send"
+msgid "Will not be sent: it holds where it was taken (Settings: Files with location data)"
+msgstr "Не буде надіслано: у ньому записано, де його знято (Налаштування: Файли з даними про місцезнаходження)"
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:tooltip a file that will be sent with the place it was taken still in it"
+msgid "Location and device data stay in this file"
+msgstr "У цьому файлі лишаються дані про місцезнаходження й пристрій"
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
+msgctxt "@info:status notice after a send that kept files with location data back, %1 how many files"
+msgid "%1 file with location data stayed in the list."
+msgid_plural "%1 files with location data stayed in the list."
+msgstr[0] "%1 файл із даними про місцезнаходження лишився в списку."
+msgstr[1] "%1 файли з даними про місцезнаходження лишилися в списку."
+msgstr[2] "%1 файлів із даними про місцезнаходження лишилося в списку."
 
 #: crates/kourier-viewmodel/src/files.rs
 #, kde-format
@@ -2797,6 +3677,12 @@ msgstr "Цей чат не приймає %1"
 
 #: crates/kourier-viewmodel/src/files.rs
 #, kde-format
+msgctxt "@info:status why a file was not sent: it holds the place it was taken"
+msgid "Not sent: it holds where it was taken"
+msgstr "Не надіслано: у ньому записано, де його знято"
+
+#: crates/kourier-viewmodel/src/files.rs
+#, kde-format
 msgctxt "@info what a folder walk left out, part of a list"
 msgid "%1 link"
 msgid_plural "%1 links"
@@ -2896,6 +3782,207 @@ msgstr[0] "%1 файл для іншого чату не вдалося наді
 msgstr[1] "%1 файли для іншого чату не вдалося надіслати, вони чекають там. Решта вже надсилається."
 msgstr[2] "%1 файлів для іншого чату не вдалося надіслати, вони чекають там. Решта вже надсилається."
 
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@title:dialog asking before one file that holds where it was taken is sent"
+msgid "Send It Anyway?"
+msgstr "Усе одно надіслати?"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@title:dialog asking before several files that hold where they were taken are sent"
+msgid "Send Them Anyway?"
+msgstr "Усе одно надіслати їх?"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before several recordings that hold where they were made are sent, %1 how many"
+msgid "%1 recording contains where it was made."
+msgid_plural "%1 recordings contain where they were made."
+msgstr[0] "У %1 записі збережено, де його зроблено."
+msgstr[1] "У %1 записах збережено, де їх зроблено."
+msgstr[2] "У %1 записах збережено, де їх зроблено."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before files that hold where they were taken are sent, %1 how many"
+msgid "%1 file contains where it was taken."
+msgid_plural "%1 files contain where they were taken."
+msgstr[0] "У %1 файлі записано, де його знято."
+msgstr[1] "У %1 файлах записано, де їх знято."
+msgstr[2] "У %1 файлах записано, де їх знято."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info list of files, after the names shown, %1 how many more"
+msgid "and %1 more"
+msgid_plural "and %1 more"
+msgstr[0] "і ще %1"
+msgstr[1] "і ще %1"
+msgstr[2] "і ще %1"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info separator between the file names a screen reader reads out"
+msgid ", "
+msgstr ", "
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the end of the list of file names a screen reader reads out, %1 the list"
+msgid "%1."
+msgstr "%1."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@action:button"
+msgid "Send with Location"
+msgstr "Надіслати з місцезнаходженням"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@action:button"
+msgid "Don't Send"
+msgstr "Не надсилати"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@option:check"
+msgid "Remember my choice"
+msgstr "Запам'ятати мій вибір"
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info under the question before files with location data are sent"
+msgid "You can change this in Settings."
+msgstr "Це можна змінити в налаштуваннях."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before a .zip of a folder is sent"
+msgid "This archive holds files that contain where they were taken."
+msgstr "В архіві є файли, у яких записано, де їх знято."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before a video that holds where it was taken is sent"
+msgid "This video contains where it was taken."
+msgstr "У цьому відео записано, де його знято."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before a photo that holds where it was taken is sent"
+msgid "This photo contains where it was taken."
+msgstr "У цьому фото записано, де його знято."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before a recording that holds where it was made is sent"
+msgid "This recording contains where it was made."
+msgstr "У цьому записі збережено, де його зроблено."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info the question before a file that holds where it was taken is sent"
+msgid "This file contains where it was taken."
+msgstr "У цьому файлі записано, де його знято."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info what Don't Send still sends: the other files and the text, without the one file asked about"
+msgid "The other files and the text are sent without it."
+msgstr "Інші файли й текст буде надіслано без нього."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info what Don't Send still sends: the other files and the text, without the files asked about"
+msgid "The other files and the text are sent without them."
+msgstr "Інші файли й текст буде надіслано без них."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info what Don't Send still sends: the other files, without the one file asked about"
+msgid "The other files are sent without it."
+msgstr "Інші файли буде надіслано без нього."
+
+#: crates/kourier-viewmodel/src/files/location.rs
+#, kde-format
+msgctxt "@info what Don't Send still sends: the other files, without the files asked about"
+msgid "The other files are sent without them."
+msgstr "Інші файли буде надіслано без них."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@item:intext a member row of a group, yourself"
+msgid "You"
+msgstr "Ви"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@action:button show every member of a group, %1 how many"
+msgid "Show All (%1)"
+msgstr "Показати всіх (%1)"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status why a group setting is read-only"
+msgid "Only admins can change this."
+msgstr "Змінювати це можуть лише адміністратори."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status why the group's disappearing messages timer is read-only here"
+msgid "Change this group's timer on your phone."
+msgstr "Змініть таймер цієї групи на телефоні."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status a group that was ended for everyone"
+msgid "This group has ended."
+msgstr "Групу закрито."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status a group setting"
+msgid "Only admins can edit the group info."
+msgstr "Змінювати відомості про групу можуть лише адміністратори."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status a group setting"
+msgid "Only admins can add members."
+msgstr "Додавати учасників можуть лише адміністратори."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status a group setting"
+msgid "Only admins can send messages."
+msgstr "Надсилати повідомлення можуть лише адміністратори."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status how many people are invited to a group, %1 the count"
+msgid "%1 invited"
+msgid_plural "%1 invited"
+msgstr[0] "%1 запрошений"
+msgstr[1] "%1 запрошені"
+msgstr[2] "%1 запрошених"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status how many people asked to join a group, %1 the count"
+msgid "%1 request to join"
+msgid_plural "%1 requests to join"
+msgstr[0] "%1 запит на приєднання"
+msgstr[1] "%1 запити на приєднання"
+msgstr[2] "%1 запитів на приєднання"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status a group member who is an admin"
+msgid "Admin"
+msgstr "Адміністратор"
+
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
 msgctxt "@info:usage how to link a Signal account"
@@ -2916,6 +4003,12 @@ msgstr "Введіть цей код на телефоні."
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
+msgctxt "@info:usage how long a code to type on the phone is valid"
+msgid "The code is valid for about three minutes. Your phone may also show a notification to enter it."
+msgstr "Код дійсний приблизно три хвилини. Телефон також може показати сповіщення, щоб ви його ввели."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
 msgctxt "@title:window page to link an account"
 msgid "Compare the Emoji"
 msgstr "Порівняйте емоджі"
@@ -2923,8 +4016,14 @@ msgstr "Порівняйте емоджі"
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
 msgctxt "@info:usage how to link an account"
-msgid "Confirm that your phone shows the same emoji."
-msgstr "Підтвердьте, що телефон показує такі самі емоджі."
+msgid "Check that your phone shows the same three emoji, then confirm on your phone."
+msgstr "Переконайтеся, що телефон показує ті самі три емоджі, а потім підтвердьте на телефоні."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button ask the network for another login code"
+msgid "Send a New Code"
+msgstr "Надіслати новий код"
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
@@ -2940,15 +4039,1137 @@ msgstr "Зв'язано"
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
+msgctxt "@action:button go to the chats, where the banner of the account that must be linked again is"
+msgid "Go to Chats"
+msgstr "Перейти до чатів"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
 msgctxt "@action:button close a message and go to the chats"
 msgid "OK"
 msgstr "Гаразд"
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
-msgctxt "@action:button go to the chats, where the banner of the account that must be linked again is"
-msgid "Go to Chats"
-msgstr "Перейти до чатів"
+msgctxt "@action:button switch the link page to linking with a phone number"
+msgid "Link with Phone Number Instead"
+msgstr "Зв'язати за номером телефону"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button switch the link page to scanning a QR code"
+msgid "Scan a QR Code Instead"
+msgstr "Сканувати QR-код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 the name of a messenger"
+msgid "%1 has banned this phone number. Kourier cannot link it."
+msgstr "%1 заблокував цей номер телефону. Kourier не може зв'язати цей акаунт."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 the name of a messenger"
+msgid "This phone number has no %1 account. Create the account in the %1 app first, then link it here."
+msgstr "Для цього номера телефону немає акаунта %1. Спершу створіть акаунт у застосунку %1, а потім зв'яжіть його тут."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 the name of a messenger"
+msgid "%1 asks for a purchase before it sends a code to this number. Scan a QR code instead."
+msgstr "%1 вимагає покупки, перш ніж надіслати код на цей номер. Натомість зіскануйте QR-код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 the name of a messenger"
+msgid "%1 asks for a newer version of Kourier to log in."
+msgstr "%1 вимагає новішої версії Kourier для входу."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 the name of a messenger"
+msgid "%1 sent the code in a way Kourier cannot take. Scan a QR code instead."
+msgstr "%1 надіслав код способом, який Kourier не підтримує. Натомість зіскануйте QR-код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 the name of a messenger"
+msgid "%1 does not accept this email address. Try another address, or scan a QR code instead."
+msgstr "%1 не приймає цю адресу електронної пошти. Спробуйте іншу адресу або зіскануйте QR-код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 the name of a messenger"
+msgid "%1 does not offer linking with a phone number to this account yet. Scan a QR code instead."
+msgstr "%1 поки не пропонує для цього акаунта зв'язування за номером телефону. Натомість зіскануйте QR-код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed"
+msgid "Check the phone number. Enter it with its country code, for example +380 67 123 4567."
+msgstr "Перевірте номер телефону. Введіть його з кодом країни, наприклад +380 67 123 4567."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed"
+msgid "This number is not the one this run expects. Check it, or link the expected phone."
+msgstr "Цей номер не той, якого очікує цей запуск. Перевірте його або зв'яжіть очікуваний телефон."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
+msgid "Kourier links Threema only in a prepared test profile. No code was shown."
+msgstr "Kourier зв'язує Threema лише в підготовленому тестовому профілі. Код не показано."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
+msgid "This Threema ID is not on Kourier's list of test IDs. Kourier did not link it."
+msgstr "Цього Threema ID немає в списку тестових ID Kourier. Kourier його не зв'язав."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 the name of a messenger"
+msgid "%1 is limiting link attempts for this number. Wait a while before you try again."
+msgstr "%1 обмежує кількість спроб зв'язування для цього номера. Зачекайте трохи, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 a number of minutes, %2 the name of a messenger"
+msgid "%2 is limiting link attempts for this number. Wait %1 minute before you try again."
+msgid_plural "%2 is limiting link attempts for this number. Wait %1 minutes before you try again."
+msgstr[0] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 хвилину, перш ніж спробувати знову."
+msgstr[1] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 хвилини, перш ніж спробувати знову."
+msgstr[2] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 хвилин, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking with a phone number failed, %1 a number of hours, %2 the name of a messenger"
+msgid "%2 is limiting link attempts for this number. Wait %1 hour before you try again."
+msgid_plural "%2 is limiting link attempts for this number. Wait %1 hours before you try again."
+msgstr[0] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 годину, перш ніж спробувати знову."
+msgstr[1] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 години, перш ніж спробувати знову."
+msgstr[2] "%2 обмежує кількість спроб зв'язування для цього номера. Зачекайте %1 годин, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 the name of a messenger"
+msgid "%1 is limiting link attempts for this account. Wait a while before you try again."
+msgstr "%1 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте трохи, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 a number of minutes, %2 the name of a messenger"
+msgid "%2 is limiting link attempts for this account. Wait %1 minute before you try again."
+msgid_plural "%2 is limiting link attempts for this account. Wait %1 minutes before you try again."
+msgstr[0] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 хвилину, перш ніж спробувати знову."
+msgstr[1] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 хвилини, перш ніж спробувати знову."
+msgstr[2] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 хвилин, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 a number of hours, %2 the name of a messenger"
+msgid "%2 is limiting link attempts for this account. Wait %1 hour before you try again."
+msgid_plural "%2 is limiting link attempts for this account. Wait %1 hours before you try again."
+msgstr[0] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 годину, перш ніж спробувати знову."
+msgstr[1] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 години, перш ніж спробувати знову."
+msgstr[2] "%2 обмежує кількість спроб зв'язування для цього акаунта. Зачекайте %1 годин, перш ніж спробувати знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step, %1 is the network"
+msgid "Open %1 on your phone"
+msgstr "Відкрийте %1 на телефоні"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Go to Settings → Linked devices"
+msgstr "Перейдіть у «Налаштування» → «Зв'язані пристрої»"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap “Link new device” and scan this code"
+msgstr "Натисніть «Зв'язати новий пристрій» і зіскануйте цей код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap Menu ⋮ (Android) or Settings (iPhone), then “Linked devices”"
+msgstr "Натисніть меню ⋮ (Android) або «Налаштування» (iPhone), потім «Зв'язані пристрої»"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap “Link a device” and scan this code"
+msgstr "Натисніть «Зв'язати пристрій» і зіскануйте цей код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Go to Settings → Linked Devices"
+msgstr "Перейдіть у «Налаштування» → «Зв'язані пристрої»"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap the button to link a device and scan this code"
+msgstr "Натисніть кнопку, щоб зв'язати пристрій, і зіскануйте цей код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Go to Settings → Devices"
+msgstr "Перейдіть у «Налаштування» → «Пристрої»"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap “Link Desktop Device” and scan this code"
+msgstr "Натисніть «Зв'язати пристрій на комп'ютері» і зіскануйте цей код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap Menu ⋮ or Settings, then “Linked devices” and “Link a device”"
+msgstr "Натисніть меню ⋮ або «Налаштування», потім «Зв'язані пристрої» і «Зв'язати пристрій»"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info linking step"
+msgid "Tap “Link with phone number instead” and type this code"
+msgstr "Натисніть «Зв'язати за номером телефону» і введіть цей код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Monkey"
+msgstr "Мавпа"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dog"
+msgstr "Собака"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Poodle"
+msgstr "Пудель"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Fox"
+msgstr "Лис"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Black Cat"
+msgstr "Чорний кіт"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Horse"
+msgstr "Кінь"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bison"
+msgstr "Бізон"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Cow"
+msgstr "Корова"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Pig"
+msgstr "Свиня"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Camel"
+msgstr "Верблюд"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Giraffe"
+msgstr "Жирафа"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Elephant"
+msgstr "Слон"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Mouse"
+msgstr "Миша"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Rabbit"
+msgstr "Кролик"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chipmunk"
+msgstr "Бурундук"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Panda"
+msgstr "Панда"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Kangaroo"
+msgstr "Кенгуру"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chicken"
+msgstr "Курка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dove"
+msgstr "Голуб"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Duck"
+msgstr "Качка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Swan"
+msgstr "Лебідь"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Owl"
+msgstr "Сова"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dodo"
+msgstr "Дронт"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Feather"
+msgstr "Пір'їна"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Flamingo"
+msgstr "Фламінго"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Frog"
+msgstr "Жаба"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Whale"
+msgstr "Кит"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dolphin"
+msgstr "Дельфін"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Seal"
+msgstr "Тюлень"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Fish"
+msgstr "Риба"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Spiral Shell"
+msgstr "Морська мушля"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Beetle"
+msgstr "Жук"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Spider Web"
+msgstr "Павутиння"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Rosette"
+msgstr "Розета"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Sunflower"
+msgstr "Соняшник"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Evergreen Tree"
+msgstr "Вічнозелене дерево"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Herb"
+msgstr "Лікарська рослина"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Shamrock"
+msgstr "Трилисник"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Watermelon"
+msgstr "Кавун"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Lemon"
+msgstr "Лимон"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Red Apple"
+msgstr "Червоне яблуко"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Cherries"
+msgstr "Вишні"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Strawberry"
+msgstr "Полуниця"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Blueberries"
+msgstr "Лохина"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Tomato"
+msgstr "Помідор"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Avocado"
+msgstr "Авокадо"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Carrot"
+msgstr "Морква"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Broccoli"
+msgstr "Броколі"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Mushroom"
+msgstr "Гриб"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Beans"
+msgstr "Квасоля"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Salt"
+msgstr "Сіль"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Cookie"
+msgstr "Печиво"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chocolate Bar"
+msgstr "Плитка шоколаду"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Hot Beverage"
+msgstr "Гарячий напій"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Ice Cube"
+msgstr "Кубик льоду"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chopsticks"
+msgstr "Палички"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "World Map"
+msgstr "Карта світу"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Volcano"
+msgstr "Вулкан"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Camping"
+msgstr "Кемпінг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Desert Island"
+msgstr "Безлюдний острів"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Classical Building"
+msgstr "Антична будівля"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Locomotive"
+msgstr "Паровий локомотив"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Delivery Truck"
+msgstr "Вантажівка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Tractor"
+msgstr "Трактор"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Railway Track"
+msgstr "Залізнична колія"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Anchor"
+msgstr "Якір"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Satellite"
+msgstr "Супутник"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Rocket"
+msgstr "Ракета"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Crescent Moon"
+msgstr "Серп місяця"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Sun"
+msgstr "Сонце"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Star"
+msgstr "Зірка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Rainbow"
+msgstr "Веселка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Umbrella"
+msgstr "Парасолька"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Snowflake"
+msgstr "Сніжинка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Snowman"
+msgstr "Сніговик"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Fire"
+msgstr "Вогонь"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Droplet"
+msgstr "Крапля"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Sparkles"
+msgstr "Блискітки"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Balloon"
+msgstr "Повітряна кулька"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Ribbon"
+msgstr "Бант"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Gold Medal"
+msgstr "Золота медаль"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Basketball"
+msgstr "Баскетбольний м'яч"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Volleyball"
+msgstr "Волейбольний м'яч"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bowling"
+msgstr "Боулінг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Ping Pong"
+msgstr "Пінг-понг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Golf Flag"
+msgstr "Гольфовий прапорець"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bullseye"
+msgstr "Мішень"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Joystick"
+msgstr "Джойстик"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Puzzle Piece"
+msgstr "Елемент пазла"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Teddy Bear"
+msgstr "Ведмедик"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Spade Suit"
+msgstr "Піка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Heart Suit"
+msgstr "Чирва"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dress"
+msgstr "Сукня"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Crown"
+msgstr "Корона"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bell"
+msgstr "Дзвоник"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Saxophone"
+msgstr "Саксофон"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Guitar"
+msgstr "Гітара"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Printer"
+msgstr "Принтер"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Camera"
+msgstr "Фотоапарат"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Candle"
+msgstr "Свічка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Open Book"
+msgstr "Відкрита книга"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Package"
+msgstr "Пакунок"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Postbox"
+msgstr "Поштова скринька"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Memo"
+msgstr "Нотатка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Briefcase"
+msgstr "Кейс"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Clipboard"
+msgstr "Планшет для аркушів"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Lock"
+msgstr "Замок"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Key"
+msgstr "Ключ"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Hammer and Pick"
+msgstr "Молоток і кирка"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Boomerang"
+msgstr "Бумеранг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Balance Scale"
+msgstr "Ваги"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chain Link"
+msgstr "Ланка ланцюга"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Hook"
+msgstr "Гачок"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Microscope"
+msgstr "Мікроскоп"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Chair"
+msgstr "Стілець"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Toilet"
+msgstr "Унітаз"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Broom"
+msgstr "Мітла"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bucket"
+msgstr "Відро"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Bubbles"
+msgstr "Бульбашки"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Black Circle"
+msgstr "Чорний круг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Yellow Square"
+msgstr "Жовтий квадрат"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Play Button"
+msgstr "Кнопка відтворення"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Antenna Bars"
+msgstr "Рівень сигналу"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Collision"
+msgstr "Зіткнення"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Speech Balloon"
+msgstr "Текстова булька"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Dizzy"
+msgstr "Запаморочення"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Eyes"
+msgstr "Очі"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label name of an emoji the phone shows when linking"
+msgid "Footprints"
+msgstr "Сліди ніг"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info"
+msgid "Your phone shows this name in its list of linked devices."
+msgstr "Телефон показуватиме цю назву у списку зв'язаних пристроїв."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info what to type in the phone number field"
+msgid "Enter the phone number of your WhatsApp account with its country code, for example +380 67 123 4567."
+msgstr "Введіть номер телефону вашого акаунта WhatsApp з кодом країни, наприклад +380 67 123 4567."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info what the phone lists after linking with a phone number"
+msgid "Your phone will list this computer as “Chrome (Linux)”: WhatsApp accepts only a browser name when you link with a phone number."
+msgstr "Телефон покаже цей комп'ютер як «Chrome (Linux)»: під час зв'язування за номером телефону WhatsApp приймає лише назву браузера."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info what to type in the phone number field, %1 the name of a messenger"
+msgid "Enter the phone number of your %1 account with its country code, for example +380 67 123 4567."
+msgstr "Введіть номер телефону вашого акаунта %1 з кодом країни, наприклад +380 67 123 4567."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 sent the code to your %1 app on another device."
+msgstr "%1 надіслав код у ваш застосунок %1 на іншому пристрої."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 sent the code by SMS."
+msgstr "%1 надіслав код в SMS-повідомленні."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 sent a word by SMS. Enter that word."
+msgstr "%1 надіслав слово в SMS-повідомленні. Введіть це слово."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 sent a phrase by SMS. Enter that phrase."
+msgstr "%1 надіслав фразу в SMS-повідомленні. Введіть цю фразу."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 is calling you to tell you the code."
+msgstr "%1 телефонує вам, щоб назвати код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "%1 sent the code to your anonymous number on Fragment."
+msgstr "%1 надіслав код на ваш анонімний номер у Fragment."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "Enter the code %1 sent you."
+msgstr "Введіть код, який надіслав %1."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info where the network sent the login code, %1 the name of a messenger"
+msgid "Enter the code %1 sent to your email address."
+msgstr "Введіть код, який %1 надіслав на вашу адресу електронної пошти."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info the login code that was entered last was wrong"
+msgid "That code is not right. Check it and enter it again."
+msgstr "Цей код неправильний. Перевірте його й введіть ще раз."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info what to type in the password field of a login"
+msgid "This account has two-step verification. Enter its password."
+msgstr "Цей акаунт захищено двоетапною перевіркою. Введіть пароль."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info the login password that was entered last was wrong"
+msgid "That password is not right. Try again."
+msgstr "Цей пароль неправильний. Спробуйте знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info what to type in the email field of a login, %1 the name of a messenger"
+msgid "%1 asks for an email address for this account's logins. It sends a code there next."
+msgstr "%1 просить вказати адресу електронної пошти для входу в цей акаунт. Далі на неї надійде код."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info the email address that was entered last was refused, %1 the name of a messenger"
+msgid "%1 does not accept that address. Check it and try again."
+msgstr "%1 не приймає цю адресу. Перевірте її й спробуйте знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info how to get a forgotten login password back, %1 the name of a messenger"
+msgid "Forgot it? Reset it in the %1 app: Kourier cannot."
+msgstr "Забули пароль? Скиньте його в застосунку %1: Kourier цього не може."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Device name"
+msgstr "Назва пристрою"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Phone number"
+msgstr "Номер телефону"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Word"
+msgstr "Слово"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Phrase"
+msgstr "Фраза"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Code"
+msgstr "Код"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Password"
+msgstr "Пароль"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Email address"
+msgstr "Адреса електронної пошти"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info the hint the account owner gave their password, %1 the hint"
+msgid "Hint: %1"
+msgstr "Підказка: %1"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info the first letter or word of a login code sent by SMS, %1 that letter or word"
+msgid "It starts with “%1”."
+msgstr "Починається з «%1»."
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
@@ -2983,8 +5204,26 @@ msgstr "Цей акаунт уже є в Kourier. Щоб користувати�
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
 msgctxt "@info:status why linking failed"
+msgid "This phone belongs to another account than the one this run expects. Kourier did not link it."
+msgstr "Цей телефон належить не тому акаунту, якого очікує цей запуск. Kourier його не зв'язав."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
 msgid "The phone rejected the link."
 msgstr "Телефон відхилив зв'язування."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed, %1 how many linked devices the network allows"
+msgid "This account already has as many linked devices as the network allows (%1). Remove one in the linked devices on your phone, then try again."
+msgstr "У цього акаунта вже стільки зв'язаних пристроїв, скільки дозволяє мережа (%1). Вилучіть один зі списку зв'язаних пристроїв на телефоні й спробуйте знову."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status why linking failed"
+msgid "This account already has as many linked devices as the network allows. Remove one in the linked devices on your phone, then try again."
+msgstr "У цього акаунта вже стільки зв'язаних пристроїв, скільки дозволяє мережа. Вилучіть один зі списку зв'язаних пристроїв на телефоні й спробуйте знову."
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
@@ -2994,15 +5233,201 @@ msgstr "Щось пішло не так."
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
-msgctxt "@info:status a messenger that cannot be linked yet"
-msgid "Coming later"
-msgstr "З'явиться пізніше"
+msgctxt "@info:status a messenger that cannot be linked"
+msgid "Not available in this build"
+msgstr "Недоступно в цій збірці"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status a messenger that is in this build, experimental and turned off"
+msgid "Off · experimental"
+msgstr "Вимкнено · експериментально"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info, %1 the name of a messenger"
+msgid "Kourier stops connecting to your %1 account. It stays linked, also on your phone, and its chats stay here; turn %1 on again to send and receive. %1 removes a linked device that has not connected for about 30 days."
+msgstr "Kourier перестане підключатися до вашого акаунта %1. Акаунт лишиться зв'язаним, зокрема на телефоні, а його чати залишаться тут; щоб знову надсилати й отримувати повідомлення, увімкніть %1. %1 вилучає зв'язаний пристрій, який не підключався приблизно 30 днів."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info, %1 the name of a messenger"
+msgid "Kourier stops connecting to your %1 account. Its session stays, and its chats stay here; turn %1 on again to send and receive. %1 ends a session that has not connected for the time set in the %1 app (six months unless changed)."
+msgstr "Kourier перестане підключатися до вашого акаунта %1. Його сеанс лишиться, а чати залишаться тут; щоб знову надсилати й отримувати повідомлення, увімкніть %1. %1 завершує сеанс, який не підключався довше за час, установлений у застосунку %1 (типово — шість місяців)."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info, %1 the name of a messenger"
+msgid "Kourier stops connecting to your %1 account. It stays linked, also on your phone, and its chats stay here; turn %1 on again to send and receive. %1 may remove a linked device that has not connected for a long time."
+msgstr "Kourier перестане підключатися до вашого акаунта %1. Акаунт лишиться зв'язаним, зокрема на телефоні, а його чати залишаться тут; щоб знову надсилати й отримувати повідомлення, увімкніть %1. %1 може вилучити зв'язаний пристрій, який довго не підключався."
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
 msgctxt "@info a messenger that can be linked"
 msgid "Link as a secondary device of the Signal app on your phone"
 msgstr "Зв'язати як додатковий пристрій застосунку Signal на вашому телефоні"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info a test account that can be linked"
+msgid "A scripted demo account with sample chats"
+msgstr "Демонстраційний акаунт зі сценарієм і зразками чатів"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info a messenger that can be linked, still experimental, %1 its name"
+msgid "Link as a secondary device of the %1 app on your phone (experimental)"
+msgstr "Зв'язати як додатковий пристрій застосунку %1 на вашому телефоні (експериментально)"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info a messenger that can be linked, %1 its name"
+msgid "Link as a secondary device of the %1 app on your phone"
+msgstr "Зв'язати як додатковий пристрій застосунку %1 на вашому телефоні"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status a messenger that cannot be linked"
+msgid "Not available in fixture mode"
+msgstr "Недоступно в режимі тестових даних"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:status a messenger that cannot be linked"
+msgid "Not in this build"
+msgstr "Немає в цій збірці"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info"
+msgid "Kourier links as an additional device: your phone stays the main device, keeps your message history and can send a copy of it."
+msgstr "Kourier зв'язується як додатковий пристрій: телефон залишається основним пристроєм, зберігає вашу історію повідомлень і може надіслати її копію."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info"
+msgid "Kourier links as an additional device."
+msgstr "Kourier зв'язується як додатковий пристрій."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info"
+msgid "Kourier links as an additional device: your phone stays the main device and keeps your message history."
+msgstr "Kourier зв'язується як додатковий пристрій: телефон залишається основним пристроєм і зберігає вашу історію повідомлень."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info a network that always sends read receipts and typing, %1 its name"
+msgid "Always sent for %1."
+msgstr "Для %1 увімкнено завжди."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button go back without linking"
+msgid "Cancel"
+msgstr "Скасувати"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info:tooltip why the button does not work yet"
+msgid "Tick the box above to continue."
+msgstr "Щоб продовжити, позначте прапорець вище."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button go on to link the account"
+msgid "Continue"
+msgstr "Продовжити"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@action:button turn the network on, restart Kourier and go on to link the account"
+msgid "Turn On and Restart"
+msgstr "Увімкнути й перезапустити"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info why a button restarts the application, %1 the name of a messenger"
+msgid "Kourier has to start again to turn %1 on. It then opens the page that links the account."
+msgstr "Щоб увімкнути %1, Kourier має запуститися знову. Після цього він відкриє сторінку зв'язування акаунта."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@title:window warning before linking a WhatsApp account"
+msgid "Before You Link WhatsApp"
+msgstr "Перш ніж зв'язувати WhatsApp"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking WhatsApp"
+msgid "Kourier is not made or approved by WhatsApp. It links to your account as an additional device, as WhatsApp Web does, but WhatsApp's terms do not allow unofficial apps."
+msgstr "Kourier не створено й не схвалено WhatsApp. Він зв'язується з вашим акаунтом як додатковий пристрій, як і WhatsApp Web, але умови WhatsApp не дозволяють неофіційні застосунки."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking WhatsApp"
+msgid "WhatsApp may restrict or ban an account it finds using Kourier, for some hours or for good. This has happened to people using apps like this, also with ordinary use."
+msgstr "WhatsApp може обмежити або заблокувати акаунт, у якому виявить Kourier, на кілька годин або назавжди. Так траплялося з людьми, які користувалися такими застосунками, навіть за звичайного користування."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking WhatsApp"
+msgid "Kourier never starts a new chat. To write to someone new, start the chat on your phone."
+msgstr "Kourier ніколи не починає новий чат. Щоб написати комусь новому, почніть чат на телефоні."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking WhatsApp"
+msgid "If you can, use a separate phone number for WhatsApp in Kourier, not an account you cannot lose."
+msgstr "Якщо можете, використовуйте для WhatsApp у Kourier окремий номер телефону, а не акаунт, який ви не можете дозволити собі втратити."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking WhatsApp"
+msgid "Your phone lists this computer as a linked device. No usage statistics are sent to WhatsApp."
+msgstr "Телефон показує цей комп'ютер у списку зв'язаних пристроїв. До WhatsApp не надсилається жодна статистика використання."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@option:check the person understands the risk of linking WhatsApp"
+msgid "I understand that WhatsApp may restrict or ban this account"
+msgstr "Я розумію, що WhatsApp може обмежити або заблокувати цей акаунт"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@title:window warning before adding a Telegram account"
+msgid "Before You Add Telegram"
+msgstr "Перш ніж додати Telegram"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking Telegram"
+msgid "Kourier is not made by Telegram. It uses the Telegram API as an independent app with its own API key."
+msgstr "Kourier не створено Telegram. Він використовує API Telegram як незалежний застосунок зі своїм ключем API."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking Telegram"
+msgid "Telegram watches accounts used with new apps more closely; mass actions or unusual use can get an account limited or banned."
+msgstr "Telegram пильніше стежить за акаунтами, які використовують у нових застосунках; масові дії або незвичне використання можуть призвести до обмеження чи блокування акаунта."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@info warning before linking Telegram"
+msgid "Kourier always sends read receipts, typing and online status for Telegram, as Telegram's rules require, and shows the sponsored messages Telegram puts in channels."
+msgstr "Kourier завжди надсилає для Telegram відмітки про читання, індикатор набору тексту й статус «у мережі», як цього вимагають правила Telegram, і показує спонсоровані повідомлення, які Telegram розміщує в каналах."
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@option:check the person understands the risk of linking Telegram"
+msgid "I understand that Telegram may limit or ban this account"
+msgstr "Я розумію, що Telegram може обмежити або заблокувати цей акаунт"
+
+#: crates/kourier-viewmodel/src/login.rs
+#, kde-format
+msgctxt "@option:check the person has read the warning before linking"
+msgid "I have read this"
+msgstr "Прочитано"
 
 #. TRANSLATORS: the name of a person with no name, made from the end of their id: %1 is four characters.
 #: crates/kourier-viewmodel/src/names.rs
@@ -3107,6 +5532,49 @@ msgstr "Показати Kourier"
 msgctxt "@action:inmenu tray icon"
 msgid "Quit"
 msgstr "Вийти"
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status a person you blocked"
+msgid "Blocked"
+msgstr "Заблоковано"
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status a person who left the network, %1 the network"
+msgid "Not on %1 any more"
+msgstr "Більше немає в %1"
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@action:button show every group two people share, %1 how many"
+msgid "Show All (%1)"
+msgstr "Показати всі (%1)"
+
+#. TRANSLATORS: %1 is the person's own profile name, %2 their phone number: what the contact card about to be sent contains.
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info under the title of the contact card picker, %1 the name and %2 the phone number on the card"
+msgid "The card holds %1 and %2."
+msgstr "Картка містить %1 і %2."
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info under the disabled Copy Link button, %1 the person's name"
+msgid "%1's phone number is not shown."
+msgstr "Номер телефону користувача %1 не показано."
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info under the disabled Copy Link button, %1 the person's name"
+msgid "Kourier does not know %1's phone number."
+msgstr "Kourier не знає номера телефону користувача %1."
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info under the disabled Share Contact button, %1 the person's name"
+msgid "%1 has no name to share."
+msgstr "У користувача %1 немає імені профілю, яким можна поділитися."
 
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
@@ -3336,6 +5804,24 @@ msgctxt "@info:preview stand-in for a message"
 msgid "This message expired"
 msgstr "Час цього повідомлення сплив"
 
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:preview stand-in for a deleted message"
+msgid "This message was deleted by an admin"
+msgstr "Це повідомлення видалив адміністратор"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:preview stand-in for a deleted message"
+msgid "You deleted this message"
+msgstr "Ви видалили це повідомлення"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:preview stand-in for a deleted message"
+msgid "This message was deleted"
+msgstr "Це повідомлення видалено"
+
 #. TRANSLATORS: %1 is one name or several joined with commas, %2 the last name.
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
@@ -3492,6 +5978,30 @@ msgstr "Ви приєдналися до групи"
 msgctxt "@info:status chat notice, %1 a name"
 msgid "%1 changed their phone number"
 msgstr "Користувач %1 змінив номер телефону"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status quiet notice, %1 a name"
+msgid "You marked your safety number with %1 as verified"
+msgstr "Ви позначили код безпеки з %1 як перевірений"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status quiet notice, %1 a name"
+msgid "You marked your safety number with %1 as not verified"
+msgstr "Ви позначили код безпеки з %1 як неперевірений"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status quiet notice, %1 a name"
+msgid "You marked your safety number with %1 as verified from another device"
+msgstr "Ви позначили код безпеки з %1 як перевірений на іншому пристрої"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:status quiet notice, %1 a name"
+msgid "You marked your safety number with %1 as not verified from another device"
+msgstr "Ви позначили код безпеки з %1 як неперевірений на іншому пристрої"
 
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
@@ -3660,6 +6170,108 @@ msgstr "Груповий виклик · прийнято на іншому пр
 msgctxt "@info:status chat notice, a call the user made from their phone"
 msgid "Outgoing group call"
 msgstr "Вихідний груповий виклик"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@title"
+msgid "Verify Safety Number"
+msgstr "Перевірка коду безпеки"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info accessible the details panel at a person's safety number, %1 the person"
+msgid "Safety number with %1"
+msgstr "Код безпеки з %1"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info accessible the digits of a safety number, %1 the groups of digits"
+msgid "Safety number: %1"
+msgstr "Код безпеки: %1"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info"
+msgid "To verify end-to-end encryption with %1, compare the numbers above with their device. They can also scan your code on their device."
+msgstr "Щоб перевірити наскрізне шифрування з %1, порівняйте ці числа з тими, що на їхньому пристрої. Також вони можуть відсканувати ваш код своїм пристроєм."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@action:button"
+msgid "Mark as Verified"
+msgstr "Позначити як перевірений"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@action:button"
+msgid "Clear Verification"
+msgstr "Скасувати перевірку"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@action:button"
+msgid "Confirm New Safety Number"
+msgstr "Підтвердити новий код безпеки"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Your safety number with %1 changed since you verified it."
+msgstr "Код безпеки з %1 змінився після вашої перевірки."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info"
+msgid "A safety number will be created with this person after you exchange messages with them."
+msgstr "Код безпеки з цією людиною з'явиться, коли ви обміняєтеся повідомленнями."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info"
+msgid "The safety number can be shown once this account is connected."
+msgstr "Код безпеки буде видно, коли цей обліковий запис під'єднається."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info"
+msgid "This person cannot be verified yet: Kourier does not know their Signal account."
+msgstr "Цю людину поки не можна перевірити: Kourier не знає її облікового запису Signal."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status a refused confirm"
+msgid "The safety number changed. Look at the new one before you confirm it."
+msgstr "Код безпеки змінився. Перегляньте новий, перш ніж підтверджувати."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status a refused mark"
+msgid "The safety number changed. Look at the new one before you mark it."
+msgstr "Код безпеки змінився. Перегляньте новий, перш ніж позначати."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "The change could not be saved."
+msgstr "Не вдалося зберегти зміну."
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status under the button, state"
+msgid "Verified"
+msgstr "Перевірено"
+
+#: crates/kourier-viewmodel/src/safety.rs
+#, kde-format
+msgctxt "@info:status under the button, state"
+msgid "Safety number changed"
+msgstr "Код безпеки змінився"
+
+#: crates/kourier-viewmodel/src/save_name.rs
+#, kde-format
+msgctxt "@item:intext file name offered when the sender gave none"
+msgid "Attachment"
+msgstr "Вкладення"
 
 #: crates/kourier-viewmodel/src/time.rs
 #, kde-format
@@ -3897,6 +6509,24 @@ msgstr "Учора"
 
 #: crates/kourier-viewmodel/src/time.rs
 #, kde-format
+msgctxt "@info:status a time later today, %1 the time"
+msgid "today at %1"
+msgstr "%1 сьогодні"
+
+#: crates/kourier-viewmodel/src/time.rs
+#, kde-format
+msgctxt "@info:status a time tomorrow, %1 the time"
+msgid "tomorrow at %1"
+msgstr "%1 завтра"
+
+#: crates/kourier-viewmodel/src/time.rs
+#, kde-format
+msgctxt "@info:status a day and a time, %1 the day (18 Oct), %2 the time"
+msgid "%1 at %2"
+msgstr "%2, %1"
+
+#: crates/kourier-viewmodel/src/time.rs
+#, kde-format
 msgctxt "@title date header of the timeline, today"
 msgid "Today"
 msgstr "Сьогодні"
@@ -3906,6 +6536,30 @@ msgstr "Сьогодні"
 msgctxt "@title date header of the timeline, the day before today"
 msgid "Yesterday"
 msgstr "Учора"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@action:inmenu, %1 the name of a person whose safety number changed"
+msgid "Show %1's Safety Number"
+msgstr "Показати код безпеки з %1"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Show Sender's Page"
+msgstr "Показати сторінку відправника"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@action:inmenu the user's own page, from a mention of himself"
+msgid "Show Your Page"
+msgstr "Показати вашу сторінку"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@action:inmenu, %1 the name of a person the message mentions"
+msgid "Show %1's Page"
+msgstr "Показати сторінку %1"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
@@ -3933,6 +6587,12 @@ msgstr "Очікування, поки ви пройдете перевірку"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
+msgctxt "@info:status under a message not sent yet, %1 the name of the person whose safety number changed"
+msgid "Waiting for you to confirm the new safety number with %1"
+msgstr "Очікування підтвердження нового коду безпеки з %1"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
 msgctxt "@info:status under a message not sent yet"
 msgid "Waiting for you to confirm the new safety number"
 msgstr "Очікування підтвердження нового коду безпеки"
@@ -3951,9 +6611,15 @@ msgstr "Очікування повторного зв'язування прис
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
-msgctxt "@info:status under a message not sent yet"
-msgid "Waiting: the network restricted this account"
-msgstr "Очікування: мережа обмежила цей акаунт"
+msgctxt "@info:status under a message not sent yet, %1 the name of the network, %2 the end"
+msgid "Waiting: %1 restricted this account until %2"
+msgstr "Очікування: %1 обмежив цей акаунт до %2"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent yet, %1 the name of the network"
+msgid "Waiting: %1 restricted this account"
+msgstr "Очікування: %1 обмежив цей акаунт"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
@@ -3972,6 +6638,18 @@ msgstr "Очікування, поки ви відновите з'єднання
 msgctxt "@info:status under a message being sent"
 msgid "Uploading files"
 msgstr "Вивантаження файлів"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent"
+msgid "Preparing files"
+msgstr "Підготовка файлів"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message being sent, %1 percent, %2 bytes done, %3 total with its unit"
+msgid "Uploading %1% · %2 of %3"
+msgstr "Вивантаження %1% · %2 з %3"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
@@ -4026,9 +6704,27 @@ msgstr "· %1"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
+msgctxt "@info:status under a message the network refused"
+msgid "Not sent: WhatsApp accepts this message only from your phone. Send it from your phone."
+msgstr "Не надіслано: WhatsApp приймає це повідомлення лише з телефона. Надішліть його з телефона."
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status under a message not sent, %1 the name of the person whose safety number changed"
+msgid "Not sent: the safety number with %1 changed"
+msgstr "Не надіслано: код безпеки з %1 змінився"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
 msgctxt "@item:intext the author of a message, yourself"
 msgid "You"
 msgstr "Ви"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status percent of a file's upload"
+msgid "%1%"
+msgstr "%1%"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
@@ -4093,6 +6789,12 @@ msgctxt "@info:status why the composer is off"
 msgid "Your request to join this group is waiting for an admin."
 msgstr "Ваш запит на приєднання до цієї групи очікує на відповідь адміністратора."
 
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:status why the composer is off"
+msgid "Sending is not available here yet; it comes in a later version of Kourier."
+msgstr "Надсилання тут поки що недоступне; воно з'явиться в одній із наступних версій Kourier."
+
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
 msgctxt "@info:status a passing notice"
@@ -4104,6 +6806,18 @@ msgstr "Історію повідомлень перенесено."
 msgctxt "@info:status a passing notice"
 msgid "The message history was not transferred."
 msgstr "Історію повідомлень не перенесено."
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account while the network sends its message history, %1 the percentage"
+msgid "Getting your message history from your phone: %1 %"
+msgstr "Отримання історії повідомлень із телефона: %1 %"
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info:status banner of an account while the network sends its message history"
+msgid "Getting your message history from your phone…"
+msgstr "Отримання історії повідомлень із телефона…"
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
@@ -4338,6 +7052,18 @@ msgstr "Зв'язування іншого акаунта %1 ще не заве�
 
 #: crates/kourier-viewmodel/src/transfer.rs
 #, kde-format
+msgctxt "@title:dialog question before the application quits while the phone sends the message history"
+msgid "Quit While History Arrives?"
+msgstr "Вийти під час отримання історії?"
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
+msgctxt "@info question before the application quits while the phone sends the message history"
+msgid "Your phone is still sending your message history. If Kourier closes now, part of it may not arrive."
+msgstr "Телефон ще надсилає історію ваших повідомлень. Якщо Kourier закриється зараз, частина історії може не надійти."
+
+#: crates/kourier-viewmodel/src/transfer.rs
+#, kde-format
 msgctxt "@title:dialog question before the application quits while a message history is transferred"
 msgid "Quit While Importing History?"
 msgstr "Вийти під час імпорту історії?"
@@ -4395,6 +7121,31 @@ msgstr "Повідомлення і вкладення зберігаються 
 #: packaging/app.kourier.Kourier.metainfo.xml
 msgid "The Kourier developers"
 msgstr "Розробники Kourier"
+
+#, kde-format
+#~ msgctxt "@info:status why linking failed, %1 the name of a messenger"
+#~ msgid "%1 asks for a purchase before this account can log in. Do that in the %1 app, then try again."
+#~ msgstr "%1 просить зробити покупку, щоб цей акаунт міг увійти. Зробіть це в застосунку %1 і спробуйте знову."
+
+#, kde-format
+#~ msgctxt "@info under the disabled Copy Link button, %1 the person's name"
+#~ msgid "%1 does not share their phone number."
+#~ msgstr "%1 не показує свій номер телефону."
+
+#, kde-format
+#~ msgctxt "@action:button show every picture and file of a chat"
+#~ msgid "Show All"
+#~ msgstr "Показати все"
+
+#, kde-format
+#~ msgctxt "@action:button in the banner of an account"
+#~ msgid "Turn On"
+#~ msgstr "Увімкнути"
+
+#, kde-format
+#~ msgctxt "@info:status a messenger that cannot be linked yet"
+#~ msgid "Coming later"
+#~ msgstr "З'явиться пізніше"
 
 #, kde-format
 #~ msgctxt "@info:status under a message on its way, %1 why it waits, %2 time since it was sent"

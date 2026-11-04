@@ -3,7 +3,7 @@
 
 use kourier_blob::{
     BlobError, BlobId, BlobReader, BlobStore, BlobWriter, CHUNK_SIZE, FileKey, HEADER_LEN, MAGIC,
-    MediaCache, read_all, write_all,
+    MediaCache, SaveError, SaveMode, Staging, read_all, save_copy, save_staged, save_to, write_all,
 };
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -368,4 +368,458 @@ fn a_volatile_blob_reads_back_and_has_its_sealed_length() {
     w.write_all(b"cut off").unwrap();
     drop(w);
     assert!(!store.path(&id).exists());
+}
+
+// ---------- save_copy / save_to: a plaintext copy in a folder of the user's (§5.8.2) ----------
+
+const BOTH: [Staging; 2] = [Staging::Auto, Staging::Named];
+
+/// The names in a folder.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn save(
+    dir: &Path,
+    name: &str,
+    mode: SaveMode,
+    staging: Staging,
+    plain: &[u8],
+) -> Result<u64, SaveError> {
+    save_staged(dir, name, mode, staging, &mut &plain[..])
+}
+
+#[test]
+fn a_copy_has_the_bytes_the_name_and_no_executable_bit() {
+    let store = tempfile::tempdir().unwrap();
+    let key = FileKey::generate();
+    for staging in BOTH {
+        for len in [0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, 3 * CHUNK_SIZE + 17] {
+            let plain = data(len);
+            let sealed = store.path().join(format!("b{len}"));
+            write_all(&sealed, &key, &plain).unwrap();
+            let out = tempfile::tempdir().unwrap();
+            // The blob wrapper is the writer over a BlobReader; both routes give the same file.
+            let mut reader = BlobReader::open(&sealed, &key).unwrap();
+            let n = save_staged(
+                out.path(),
+                "photo.jpg",
+                SaveMode::Replace,
+                staging,
+                &mut reader,
+            )
+            .unwrap();
+            assert_eq!(n, len as u64, "{staging:?} {len}");
+            assert_eq!(std::fs::read(out.path().join("photo.jpg")).unwrap(), plain);
+            // Nothing else stays in the folder, no hidden part either.
+            assert_eq!(names(out.path()), ["photo.jpg"], "{staging:?} {len}");
+            let m = mode(&out.path().join("photo.jpg"));
+            assert_eq!(m & 0o111, 0, "no executable bit: {m:o}");
+            assert_eq!(m & !0o666, 0, "no more than a plain file asked for: {m:o}");
+        }
+    }
+    // The thin wrapper over a blob.
+    let sealed = blob(store.path(), &key, b"saved bytes");
+    let out = tempfile::tempdir().unwrap();
+    let n = save_copy(&sealed, &key, out.path(), "kept.bin", SaveMode::NoReplace).unwrap();
+    assert_eq!(n, 11);
+    assert_eq!(
+        std::fs::read(out.path().join("kept.bin")).unwrap(),
+        b"saved bytes"
+    );
+}
+
+/// A reader that looks into the folder on its first read: while the data is being copied the
+/// anonymous file has no name (a half-written copy can show under none), and the named route
+/// has the hidden part.
+struct Peek<'a> {
+    dir: &'a Path,
+    seen: std::cell::RefCell<Option<Vec<String>>>,
+    rest: &'a [u8],
+}
+
+impl Read for Peek<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.seen.borrow().is_none() {
+            *self.seen.borrow_mut() = Some(names(self.dir));
+        }
+        let n = out.len().min(self.rest.len());
+        out[..n].copy_from_slice(&self.rest[..n]);
+        self.rest = &self.rest[n..];
+        Ok(n)
+    }
+}
+
+#[test]
+fn the_data_waits_nameless_in_a_tmpfile_and_hidden_on_the_fallback_route() {
+    let out = tempfile::tempdir().unwrap();
+    for (staging, name) in [(Staging::Auto, "a"), (Staging::Named, "b")] {
+        let mut peek = Peek {
+            dir: out.path(),
+            seen: Default::default(),
+            rest: b"data",
+        };
+        save_staged(out.path(), name, SaveMode::NoReplace, staging, &mut peek).unwrap();
+        let seen = peek.seen.take().unwrap();
+        match staging {
+            // O_TMPFILE: the folder holds nothing while the data is written. (tmpfs and ext4,
+            // where the tests run, have it.)
+            Staging::Auto => assert!(seen.is_empty(), "{seen:?}"),
+            Staging::Named => {
+                assert_eq!(
+                    seen.len(),
+                    2,
+                    "the first copy and the hidden part: {seen:?}"
+                );
+                let part = seen.iter().find(|n| n.as_str() != "a").unwrap();
+                assert!(
+                    part.starts_with(".kourier-") && part.ends_with(".part"),
+                    "{part}"
+                );
+            }
+        }
+    }
+    assert_eq!(names(out.path()), ["a", "b"]);
+}
+
+#[test]
+fn no_replace_answers_exists_and_replace_replaces() {
+    for staging in BOTH {
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("report.pdf");
+        std::fs::write(&target, b"old").unwrap();
+        let err = save(
+            out.path(),
+            "report.pdf",
+            SaveMode::NoReplace,
+            staging,
+            b"new",
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaveError::Exists), "{staging:?}: {err:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old", "untouched");
+        assert_eq!(names(out.path()), ["report.pdf"], "no part is left behind");
+        // A second name is free.
+        save(
+            out.path(),
+            "report 2.pdf",
+            SaveMode::NoReplace,
+            staging,
+            b"two",
+        )
+        .unwrap();
+        // Replace puts the copy over it.
+        save(out.path(), "report.pdf", SaveMode::Replace, staging, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(names(out.path()), ["report 2.pdf", "report.pdf"]);
+    }
+}
+
+/// A reader that counts how often it is asked.
+struct Counting<'a> {
+    reads: usize,
+    rest: &'a [u8],
+}
+
+impl Read for Counting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        self.rest.read(buf)
+    }
+}
+
+#[test]
+fn a_taken_name_is_answered_before_a_byte_is_read() {
+    use std::os::unix::fs::symlink;
+    for staging in BOTH {
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("report.pdf"), b"old").unwrap();
+        // A dangling link counts as taken too.
+        symlink("nowhere", out.path().join("link.pdf")).unwrap();
+        for name in ["report.pdf", "link.pdf"] {
+            let mut src = Counting {
+                reads: 0,
+                rest: b"new data",
+            };
+            let err =
+                save_staged(out.path(), name, SaveMode::NoReplace, staging, &mut src).unwrap_err();
+            assert!(matches!(err, SaveError::Exists), "{staging:?}: {err:?}");
+            assert_eq!(src.reads, 0, "{staging:?} {name}: nothing was read");
+        }
+        assert_eq!(
+            std::fs::read(out.path().join("report.pdf")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            names(out.path()),
+            ["link.pdf", "report.pdf"],
+            "no part is left"
+        );
+        // A free name still reads the source to its end; Replace never asks early.
+        let mut src = Counting {
+            reads: 0,
+            rest: b"new data",
+        };
+        save_staged(
+            out.path(),
+            "free.pdf",
+            SaveMode::NoReplace,
+            staging,
+            &mut src,
+        )
+        .unwrap();
+        assert!(src.reads >= 1);
+        let mut src = Counting {
+            reads: 0,
+            rest: b"new data",
+        };
+        save_staged(
+            out.path(),
+            "report.pdf",
+            SaveMode::Replace,
+            staging,
+            &mut src,
+        )
+        .unwrap();
+        assert!(src.reads >= 1);
+        assert_eq!(
+            std::fs::read(out.path().join("report.pdf")).unwrap(),
+            b"new data"
+        );
+    }
+}
+
+#[test]
+fn a_link_of_that_name_is_replaced_or_counts_as_taken_and_never_followed() {
+    use std::os::unix::fs::symlink;
+    for staging in BOTH {
+        let out = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        // Replace: the link goes, the file it pointed at stays as it was.
+        symlink(&victim, out.path().join("a")).unwrap();
+        save(out.path(), "a", SaveMode::Replace, staging, b"copy").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "{staging:?}");
+        let meta = std::fs::symlink_metadata(out.path().join("a")).unwrap();
+        assert!(meta.is_file(), "the link was replaced by a plain file");
+        assert_eq!(std::fs::read(out.path().join("a")).unwrap(), b"copy");
+        // No replace: a link counts as a file that exists, one to a file, to a folder, or to
+        // nothing at all (a dangling link must not look free: creating through it would make
+        // the file where the link points).
+        let dangling = elsewhere.path().join("not-there");
+        symlink(&victim, out.path().join("b")).unwrap();
+        symlink(elsewhere.path(), out.path().join("c")).unwrap();
+        symlink(&dangling, out.path().join("d")).unwrap();
+        for name in ["b", "c", "d"] {
+            let err = save(out.path(), name, SaveMode::NoReplace, staging, b"copy").unwrap_err();
+            assert!(
+                matches!(err, SaveError::Exists),
+                "{staging:?} {name}: {err:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(out.path().join(name))
+                    .unwrap()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!dangling.exists(), "nothing was made where the link points");
+        // Replace over a link to a folder replaces the link, not the folder's content.
+        save(out.path(), "c", SaveMode::Replace, staging, b"copy").unwrap();
+        assert!(
+            std::fs::symlink_metadata(out.path().join("c"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(names(elsewhere.path()), ["victim"]);
+    }
+}
+
+#[test]
+fn the_name_is_one_path_component_and_nothing_is_written_outside_the_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let out = outer.path().join("chosen");
+    std::fs::create_dir(&out).unwrap();
+    let long = "x".repeat(256);
+    for name in [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "a/b",
+        "/abs",
+        "x/",
+        "ok\0bad",
+        "dir/../x",
+        long.as_str(),
+    ] {
+        for staging in BOTH {
+            let err = save(&out, name, SaveMode::Replace, staging, b"copy").unwrap_err();
+            assert!(matches!(err, SaveError::BadName), "{name:?}: {err:?}");
+        }
+    }
+    assert!(names(&out).is_empty(), "{:?}", names(&out));
+    assert_eq!(names(outer.path()), ["chosen"], "nothing outside either");
+    // A name at the limit and one that merely looks like a path are fine.
+    save(
+        &out,
+        &"y".repeat(255),
+        SaveMode::Replace,
+        Staging::Auto,
+        b"1",
+    )
+    .unwrap();
+    save(&out, "..a", SaveMode::Replace, Staging::Auto, b"2").unwrap();
+    save(&out, "a..", SaveMode::Replace, Staging::Auto, b"3").unwrap();
+    // The check comes before the blob is opened.
+    let missing = outer.path().join("no-such-blob");
+    let err = save_copy(
+        &missing,
+        &FileKey::generate(),
+        &out,
+        "../x",
+        SaveMode::Replace,
+    )
+    .unwrap_err();
+    assert!(matches!(err, SaveError::BadName), "{err:?}");
+}
+
+/// Fails after some bytes; the folder is then as it was, whichever route.
+struct Breaks {
+    left: usize,
+}
+
+impl Read for Breaks {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::Error::other("the source broke"));
+        }
+        let n = out.len().min(self.left);
+        out[..n].fill(7);
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn a_failing_reader_leaves_nothing_under_the_final_name_and_keeps_an_old_file() {
+    for staging in BOTH {
+        for mode in [SaveMode::Replace, SaveMode::NoReplace] {
+            let out = tempfile::tempdir().unwrap();
+            let err = save_staged(
+                out.path(),
+                "new",
+                mode,
+                staging,
+                &mut Breaks { left: 70_000 },
+            )
+            .unwrap_err();
+            assert!(matches!(err, SaveError::Source(_)), "{err:?}");
+            assert!(
+                names(out.path()).is_empty(),
+                "{staging:?} {mode:?}: {:?}",
+                names(out.path())
+            );
+            // An old file at the name stays as it was.
+            std::fs::write(out.path().join("old"), b"keep me").unwrap();
+            save_staged(out.path(), "old", mode, staging, &mut Breaks { left: 5 }).unwrap_err();
+            assert_eq!(std::fs::read(out.path().join("old")).unwrap(), b"keep me");
+            assert_eq!(names(out.path()), ["old"]);
+        }
+    }
+}
+
+#[test]
+fn a_tampered_or_truncated_blob_saves_nothing_and_the_key_is_checked() {
+    let store = tempfile::tempdir().unwrap();
+    let key = FileKey::generate();
+    let plain = data(2 * CHUNK_SIZE + 100);
+    let path = blob(store.path(), &key, &plain);
+    let original = std::fs::read(&path).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    // A byte flipped in the last chunk comes up only at the end: after more than a chunk of
+    // plaintext went to the tmpfile.
+    let mut bad = original.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    std::fs::write(&path, &bad).unwrap();
+    let err = save_copy(&path, &key, out.path(), "x", SaveMode::Replace).unwrap_err();
+    assert!(
+        matches!(err, SaveError::Source(BlobError::Corrupt)),
+        "{err:?}"
+    );
+    // Cut after a whole chunk.
+    std::fs::write(&path, &original[..HEADER_LEN + CHUNK_SIZE + TAG]).unwrap();
+    let err = save_copy(&path, &key, out.path(), "x", SaveMode::Replace).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SaveError::Source(BlobError::Truncated | BlobError::Corrupt)
+        ),
+        "{err:?}"
+    );
+    // The wrong key.
+    std::fs::write(&path, &original).unwrap();
+    let err = save_copy(
+        &path,
+        &FileKey::generate(),
+        out.path(),
+        "x",
+        SaveMode::Replace,
+    )
+    .unwrap_err();
+    assert!(matches!(err, SaveError::Source(_)), "{err:?}");
+    assert!(names(out.path()).is_empty(), "{:?}", names(out.path()));
+    // Not a blob, and no such file.
+    std::fs::write(&path, b"plain text, not a blob at all, just bytes").unwrap();
+    assert!(save_copy(&path, &key, out.path(), "x", SaveMode::Replace).is_err());
+    assert!(
+        save_copy(
+            &store.path().join("gone"),
+            &key,
+            out.path(),
+            "x",
+            SaveMode::Replace
+        )
+        .is_err()
+    );
+    assert!(names(out.path()).is_empty());
+}
+
+#[test]
+fn a_folder_that_is_missing_or_not_a_folder_is_a_typed_answer() {
+    let out = tempfile::tempdir().unwrap();
+    let file = out.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    for dir in [out.path().join("missing"), file] {
+        let err = save_to(&dir, "x", SaveMode::Replace, &mut &b"y"[..]).unwrap_err();
+        assert!(matches!(err, SaveError::NoFolder), "{err:?}");
+    }
+    // A folder reached through a link is the user's choice and works.
+    let link = out.path().join("link");
+    std::os::unix::fs::symlink(out.path(), &link).unwrap();
+    save_to(&link, "via-link", SaveMode::Replace, &mut &b"y"[..]).unwrap();
+    assert_eq!(std::fs::read(out.path().join("via-link")).unwrap(), b"y");
+    // Read-only: skipped for root, which writes anywhere.
+    let ro = out.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        for staging in BOTH {
+            let err = save(&ro, "x", SaveMode::Replace, staging, b"y").unwrap_err();
+            assert!(
+                matches!(err, SaveError::NotWritable),
+                "{staging:?}: {err:?}"
+            );
+        }
+        assert!(names(&ro).is_empty());
+    }
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
 }

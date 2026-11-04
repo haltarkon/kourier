@@ -1,12 +1,8 @@
 //! Metadata stripping (EXIF with GPS, XMP, IPTC, comments, text chunks) for JPEG and PNG.
 
-use std::io::Cursor;
-
-use image::metadata::Orientation;
-use image::{ImageDecoder, ImageReader};
-
 use crate::MediaError;
 use crate::decode::decode;
+use crate::tiff;
 
 /// The result of [`strip_metadata`].
 #[derive(Clone, PartialEq, Eq)]
@@ -33,11 +29,16 @@ impl std::fmt::Debug for Stripped {
 const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// Removes metadata from a JPEG (APP1 EXIF/XMP, APP13 IPTC, other APPn, COM; keeps JFIF, the
-/// ICC profile and the Adobe colour-transform marker) or a PNG (eXIf, tEXt, zTXt, iTXt, tIME).
-/// Bytes after the end of the image (JPEG EOI, PNG IEND), such as a motion photo's video, are
+/// ICC profile and the Adobe colour-transform marker) or a PNG (eXIf, tEXt, zTXt, iTXt, tIME, and caBX, the C2PA manifest, whose
+/// `stds.exif` assertion can hold GPS). Bytes after the end of the image (JPEG EOI, PNG IEND), such as a motion photo's video, are
 /// dropped too. When an EXIF orientation other than "normal" is present, the image is decoded, rotated and
-/// re-encoded instead, so it still shows upright. Other formats: [`MediaError::Unsupported`]
-/// (use [`scale_to_level`](crate::scale_to_level), which always re-encodes).
+/// re-encoded instead, so it still shows upright; when that decode or encode fails (an
+/// arithmetic-coded or lossless JPEG, a damaged file), the metadata is stripped all the same and
+/// a minimal EXIF holding ONLY the orientation is written back (LOC, F11). The orientation is
+/// read with the crate's own TIFF walker, so a file the decoders cannot open is still stripped;
+/// an orientation that cannot be read counts as "normal". Other formats:
+/// [`MediaError::Unsupported`] (use [`scale_to_level`](crate::scale_to_level), which always
+/// re-encodes).
 pub fn strip_metadata(bytes: &[u8]) -> Result<Stripped, MediaError> {
     let mime = if bytes.starts_with(&[0xff, 0xd8]) {
         "image/jpeg"
@@ -46,8 +47,12 @@ pub fn strip_metadata(bytes: &[u8]) -> Result<Stripped, MediaError> {
     } else {
         return Err(MediaError::Unsupported);
     };
-    if orientation(bytes)? != Orientation::NoTransforms {
-        let e = decode(bytes)?.reencode()?;
+    let turned = exif_blob(bytes)
+        .and_then(tiff::orientation)
+        .filter(|o| (2..=8).contains(o));
+    if turned.is_some()
+        && let Ok(e) = decode(bytes).and_then(|d| d.reencode())
+    {
         return Ok(Stripped {
             bytes: e.bytes,
             mime: e.mime,
@@ -59,6 +64,10 @@ pub fn strip_metadata(bytes: &[u8]) -> Result<Stripped, MediaError> {
     } else {
         strip_png(bytes)?
     };
+    let out = match turned {
+        Some(o) => with_orientation(out, o),
+        None => out,
+    };
     Ok(Stripped {
         bytes: out,
         mime,
@@ -66,12 +75,110 @@ pub fn strip_metadata(bytes: &[u8]) -> Result<Stripped, MediaError> {
     })
 }
 
-fn orientation(bytes: &[u8]) -> Result<Orientation, MediaError> {
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| MediaError::Decode(e.to_string()))?;
-    let mut decoder = reader.into_decoder().map_err(MediaError::from_image)?;
-    Ok(decoder.orientation().unwrap_or(Orientation::NoTransforms))
+/// The EXIF (TIFF) blob of a JPEG (the first APP1 `Exif\0\0` before the first scan) or a PNG
+/// (the `eXIf` chunk before the image data), if there is one.
+pub(crate) fn exif_blob(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.starts_with(&PNG_SIG) {
+        let mut pos = PNG_SIG.len();
+        loop {
+            let len = bytes.get(pos..pos + 4)?;
+            let len = usize::try_from(u32::from_be_bytes([len[0], len[1], len[2], len[3]])).ok()?;
+            let kind = bytes.get(pos + 4..pos + 8)?;
+            let data = bytes.get(pos + 8..pos.checked_add(8)?.checked_add(len)?)?;
+            match kind {
+                b"eXIf" => return Some(data.strip_prefix(b"Exif\0\0").unwrap_or(data)),
+                b"IDAT" | b"IEND" => return None,
+                _ => pos += 12 + len,
+            }
+        }
+    }
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut pos = 2;
+    loop {
+        if bytes.get(pos) != Some(&0xff) {
+            return None;
+        }
+        let mut m = pos + 1;
+        while bytes.get(m) == Some(&0xff) {
+            m += 1;
+        }
+        match *bytes.get(m)? {
+            0xd9 | 0xda => return None,
+            0x01 | 0xd0..=0xd7 => pos = m + 1,
+            marker => {
+                let len = bytes.get(m + 1..m + 3)?;
+                let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+                if len < 2 {
+                    return None;
+                }
+                let payload = bytes.get(m + 3..m + 1 + len)?;
+                if marker == 0xe1
+                    && let Some(tiff) = payload.strip_prefix(b"Exif\0\0")
+                {
+                    return Some(tiff);
+                }
+                pos = m + 1 + len;
+            }
+        }
+    }
+}
+
+/// A big-endian TIFF whose IFD0 holds only the orientation `o`.
+fn orientation_tiff(o: u16) -> Vec<u8> {
+    let mut t = b"MM\0*".to_vec();
+    t.extend(8u32.to_be_bytes());
+    t.extend(1u16.to_be_bytes());
+    t.extend(0x0112u16.to_be_bytes());
+    t.extend(3u16.to_be_bytes());
+    t.extend(1u32.to_be_bytes());
+    t.extend(o.to_be_bytes());
+    t.extend([0, 0]);
+    t.extend(0u32.to_be_bytes());
+    t
+}
+
+/// `stripped` (a JPEG or PNG without metadata) with a minimal EXIF of the orientation `o` put
+/// back: a JPEG APP1 after SOI (after JFIF's APP0 when it leads), a PNG `eXIf` after IHDR.
+pub(crate) fn with_orientation(stripped: Vec<u8>, o: u16) -> Vec<u8> {
+    let tiff = orientation_tiff(o);
+    if stripped.starts_with(&PNG_SIG) {
+        // IHDR is always the first chunk: 8 + 4 + 4 + 13 + 4.
+        let at = PNG_SIG.len() + 25;
+        if stripped.get(PNG_SIG.len() + 4..PNG_SIG.len() + 8) != Some(b"IHDR")
+            || stripped.len() < at
+        {
+            return stripped;
+        }
+        let mut chunk = u32::try_from(tiff.len())
+            .unwrap_or(0)
+            .to_be_bytes()
+            .to_vec();
+        chunk.extend(b"eXIf");
+        chunk.extend(&tiff);
+        let mut crc = flate2::Crc::new();
+        crc.update(&chunk[4..]);
+        chunk.extend(crc.sum().to_be_bytes());
+        let mut out = stripped[..at].to_vec();
+        out.extend(chunk);
+        out.extend(&stripped[at..]);
+        return out;
+    }
+    let mut at = 2;
+    if stripped.get(2..4) == Some(&[0xff, 0xe0])
+        && let Some(len) = stripped.get(4..6)
+    {
+        at = (4 + usize::from(u16::from_be_bytes([len[0], len[1]]))).min(stripped.len());
+    }
+    let mut seg = vec![0xff, 0xe1];
+    seg.extend(u16::try_from(2 + 6 + tiff.len()).unwrap_or(0).to_be_bytes());
+    seg.extend(b"Exif\0\0");
+    seg.extend(tiff);
+    let mut out = stripped[..at].to_vec();
+    out.extend(seg);
+    out.extend(&stripped[at..]);
+    out
 }
 
 fn malformed(what: &str) -> MediaError {
@@ -181,7 +288,10 @@ fn strip_png(bytes: &[u8]) -> Result<Vec<u8>, MediaError> {
             .ok_or_else(|| malformed("PNG chunk"))?;
         let chunk = bytes.get(pos..end).ok_or_else(|| malformed("PNG chunk"))?;
         let kind = &chunk[4..8];
-        let drop = matches!(kind, b"eXIf" | b"tEXt" | b"zTXt" | b"iTXt" | b"tIME");
+        let drop = matches!(
+            kind,
+            b"eXIf" | b"tEXt" | b"zTXt" | b"iTXt" | b"tIME" | b"caBX"
+        );
         if !drop {
             out.extend_from_slice(chunk);
         }
@@ -298,6 +408,26 @@ mod tests {
             }
         }
         !crc
+    }
+
+    #[test]
+    fn a_png_c2pa_manifest_goes() {
+        // LOC P5: `caBX` (C2PA) can hold a GPS assertion; an unknown ancillary chunk passes, this
+        // one must not.
+        let png = sample_image(20, 10, 2, SampleFormat::Png).unwrap();
+        let mut tagged = png[..33].to_vec();
+        let data = b"jumb manifest with exif GPSLatitude";
+        tagged.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        let mut typed = b"caBX".to_vec();
+        typed.extend_from_slice(data);
+        tagged.extend_from_slice(&typed);
+        tagged.extend_from_slice(&crc32(&typed).to_be_bytes());
+        tagged.extend_from_slice(&png[33..]);
+        assert!(tagged.windows(4).any(|w| w == b"caBX"));
+        let s = strip_metadata(&tagged).unwrap();
+        assert!(!s.reencoded);
+        assert!(!s.bytes.windows(4).any(|w| w == b"caBX"));
+        assert_eq!(s.bytes, png);
     }
 
     #[test]

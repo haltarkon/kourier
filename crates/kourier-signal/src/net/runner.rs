@@ -92,13 +92,29 @@ pub(crate) struct Net<T: SignalTransport> {
     rt: tokio::runtime::Handle,
 }
 
-/// A task of the network runtime that ends with whoever waits for it.
-struct AbortOnDrop<R>(tokio::task::JoinHandle<R>);
+/// A task that ends with whoever owns this guard (dropping a tokio `JoinHandle` alone detaches
+/// its task): a network task of [`Net::run_aborting`], or a task of the actor's `LocalSet` that
+/// must not outlive the future that made it.
+pub(crate) struct AbortOnDrop<R>(pub(crate) tokio::task::JoinHandle<R>);
 
 impl<R> Drop for AbortOnDrop<R> {
     fn drop(&mut self) {
         // Nothing happens to a task that finished.
         self.0.abort();
+    }
+}
+
+/// What a network task came to: its result, or [`TransportError::Disconnected`] for a panic or
+/// a runtime that shut down (logged).
+fn joined<R>(
+    task: Result<Result<R, TransportError>, tokio::task::JoinError>,
+) -> Result<R, TransportError> {
+    match task {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(panic = error.is_panic(), "network task did not finish");
+            Err(TransportError::Disconnected)
+        }
     }
 }
 
@@ -133,18 +149,34 @@ impl<T: SignalTransport> Net<T> {
 
     /// Runs `future` on the network runtime and waits for it. A panic or a runtime shutdown
     /// surfaces as [`TransportError::Disconnected`].
+    ///
+    /// The future runs ON when the one that waits for it is dropped (dropping a tokio
+    /// `JoinHandle` detaches its task): right for a request that may already be on the wire
+    /// and whose effect is the same whoever listens, wrong for a connect, see
+    /// [`Self::run_aborting`].
     pub(crate) async fn run<F, R>(&self, future: F) -> Result<R, TransportError>
     where
         F: Future<Output = Result<R, TransportError>> + Send + 'static,
         R: Send + 'static,
     {
-        match self.rt.spawn(future).await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(panic = error.is_panic(), "network task did not finish");
-                Err(TransportError::Disconnected)
-            }
-        }
+        joined(self.rt.spawn(future).await)
+    }
+
+    /// [`Self::run`], but the task ENDS with whoever waits for it: when the returned future is
+    /// dropped (a `select!` that went the other way, a `timeout`, a cancelled task) the task is
+    /// aborted at its next await point. For the futures that open a socket. A connect that
+    /// Kourier has stopped waiting for must stop: left running it still completes at the
+    /// server, which then holds two sockets of the device and closes the older one with 4409
+    /// ("connected elsewhere with the same credentials"), perhaps the one a later request rides
+    /// on (the `DELETE /v1/devices/<id>` of a removal, F1). It narrows the window rather than
+    /// closing it: an upgrade that has reached the server already completes there.
+    pub(crate) async fn run_aborting<F, R>(&self, future: F) -> Result<R, TransportError>
+    where
+        F: Future<Output = Result<R, TransportError>> + Send + 'static,
+        R: Send + 'static,
+    {
+        let mut task = AbortOnDrop(self.rt.spawn(future));
+        joined((&mut task.0).await)
     }
 
     /// Opens the authenticated chat socket.
@@ -155,7 +187,7 @@ impl<T: SignalTransport> Net<T> {
         let traced = Traced::start("chat", &Method::CONNECT, || "authenticated socket".into());
         let transport = self.transport.clone();
         let result = self
-            .run(async move { transport.connect_auth(&credentials).await })
+            .run_aborting(async move { transport.connect_auth(&credentials).await })
             .await;
         Traced::end(traced, &result, |_| None);
         result
@@ -168,7 +200,7 @@ impl<T: SignalTransport> Net<T> {
         let traced = Traced::start("chat", &Method::CONNECT, || "unauthenticated socket".into());
         let transport = self.transport.clone();
         let result = self
-            .run(async move { transport.connect_unauth().await })
+            .run_aborting(async move { transport.connect_unauth().await })
             .await;
         Traced::end(traced, &result, |_| None);
         result
@@ -181,7 +213,7 @@ impl<T: SignalTransport> Net<T> {
         let traced = Traced::start("chat", &Method::CONNECT, || "provisioning socket".into());
         let transport = self.transport.clone();
         let result = self
-            .run(async move { transport.connect_provisioning().await })
+            .run_aborting(async move { transport.connect_provisioning().await })
             .await;
         Traced::end(traced, &result, |_| None);
         result
@@ -256,13 +288,7 @@ impl<T: SignalTransport> Net<T> {
             self.rt
                 .spawn(async move { transport.https_download(request, sink).await }),
         );
-        let result = match (&mut task.0).await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(panic = error.is_panic(), "network task did not finish");
-                Err(TransportError::Disconnected)
-            }
-        };
+        let result = joined((&mut task.0).await);
         Traced::end(traced, &result, |status| Some(status.as_u16()));
         result
     }
@@ -307,8 +333,10 @@ impl<T: SignalTransport> Net<T> {
         // The URL is a credential the server handed out: never in a log.
         let traced = Traced::start("upload", &request.method, || "(signed upload URL)".into());
         let transport = self.transport.clone();
+        // Aborting: a stopped send drops the upload that waits here, and the request, with the
+        // body it reads, must go with it (the producer of the body ends when its receiver does).
         let result = self
-            .run(async move {
+            .run_aborting(async move {
                 let send = transport.https_upload(request);
                 tokio::pin!(send);
                 let step = (stall / 4).max(std::time::Duration::from_millis(10));
@@ -341,7 +369,8 @@ impl<T: SignalTransport> Net<T> {
         result
     }
 
-    /// Sends one upload request to a CDN.
+    /// Sends one upload request to a CDN. Aborting like [`Self::https_upload_watched`]: an
+    /// upload that is stopped does not leave its requests running.
     pub(crate) async fn https_upload(
         &self,
         request: UploadRequest,
@@ -349,7 +378,7 @@ impl<T: SignalTransport> Net<T> {
         let traced = Traced::start("upload", &request.method, || "(signed upload URL)".into());
         let transport = self.transport.clone();
         let result = self
-            .run(async move { transport.https_upload(request).await })
+            .run_aborting(async move { transport.https_upload(request).await })
             .await;
         Traced::end(traced, &result, |r| Some(r.status.as_u16()));
         result
@@ -408,4 +437,179 @@ pub(crate) fn parse_json<R: DeserializeOwned>(
             e.column()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::net::libsignal::LibsignalSocket;
+
+    /// What the stand-in transport saw of its connects.
+    #[derive(Default)]
+    struct Seen {
+        /// Connects begun.
+        started: AtomicUsize,
+        /// Connect futures dropped (finished or not).
+        dropped: AtomicUsize,
+        /// Connects that ran to their end.
+        finished: AtomicUsize,
+        /// Lets the connects that wait come to their end.
+        release: Notify,
+    }
+
+    /// A transport whose three connects wait until the test releases them, then fail.
+    struct Waiting(Arc<Seen>);
+
+    struct OnDrop(Arc<Seen>);
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Waiting {
+        async fn wait<R>(&self) -> Result<R, TransportError> {
+            self.0.started.fetch_add(1, Ordering::SeqCst);
+            let _guard = OnDrop(self.0.clone());
+            self.0.release.notified().await;
+            self.0.finished.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::Disconnected)
+        }
+    }
+
+    impl SignalTransport for Waiting {
+        type Socket = LibsignalSocket;
+
+        async fn connect_auth(
+            &self,
+            _credentials: &AuthCredentials,
+        ) -> Result<Connected<LibsignalSocket, ChatEvent>, TransportError> {
+            self.wait().await
+        }
+
+        async fn connect_unauth(
+            &self,
+        ) -> Result<Connected<LibsignalSocket, ChatEvent>, TransportError> {
+            self.wait().await
+        }
+
+        async fn connect_provisioning(
+            &self,
+        ) -> Result<Connected<LibsignalSocket, ProvisioningEvent>, TransportError> {
+            self.wait().await
+        }
+
+        async fn https(&self, _request: HttpsRequest) -> Result<HttpsResponse, TransportError> {
+            self.wait().await
+        }
+
+        async fn https_download(
+            &self,
+            _request: HttpsRequest,
+            _sink: DownloadSink,
+        ) -> Result<http::StatusCode, TransportError> {
+            self.wait().await
+        }
+
+        async fn https_upload(
+            &self,
+            _request: UploadRequest,
+        ) -> Result<HttpsResponse, TransportError> {
+            self.wait().await
+        }
+
+        fn network_changed(&self) {}
+    }
+
+    fn credentials() -> AuthCredentials {
+        AuthCredentials {
+            aci: libsignal_core::Aci::from(uuid::Uuid::from_u128(0xabcd_ef01)),
+            device_id: libsignal_core::DeviceId::new(2).expect("a device id"),
+            password: zeroize::Zeroizing::new("pw".to_owned()),
+        }
+    }
+
+    /// Waits until `seen` satisfies `done`, at most two seconds.
+    async fn until(seen: &Seen, what: &str, done: impl Fn(&Seen) -> bool) {
+        for _ in 0..200 {
+            if done(seen) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    /// F1 (P1): a connect Kourier stops waiting for stops. The spawned task of a dropped
+    /// `Net::run` future runs on (a tokio `JoinHandle` detaches), so the connect completed at
+    /// the server after the caller had given it up, and the server closed the older of two
+    /// sockets of the device with 4409. `run_aborting` ends the task with the future that
+    /// waits for it. A request, which `run` serves, keeps running: its effect does not depend
+    /// on who listens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_that_nobody_waits_for_any_more_stops() {
+        for kind in ["auth", "unauth", "provisioning"] {
+            let seen = Arc::new(Seen::default());
+            let net = Net::new(
+                Arc::new(Waiting(seen.clone())),
+                tokio::runtime::Handle::current(),
+            );
+            // The connect is under way when its waiter is dropped (a timeout, a `select!`).
+            let outcome = match kind {
+                "auth" => tokio::time::timeout(
+                    Duration::from_millis(150),
+                    net.connect_auth(credentials()),
+                )
+                .await
+                .map(drop),
+                "unauth" => tokio::time::timeout(Duration::from_millis(150), net.connect_unauth())
+                    .await
+                    .map(drop),
+                _ => tokio::time::timeout(Duration::from_millis(150), net.connect_provisioning())
+                    .await
+                    .map(drop),
+            };
+            assert!(outcome.is_err(), "{kind}: the connect is still waiting");
+            assert_eq!(seen.started.load(Ordering::SeqCst), 1, "{kind}");
+            // Not released: the task has to end because its waiter went, not because it was told.
+            until(&seen, "the connect task was aborted", |s| {
+                s.dropped.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            seen.release.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                seen.finished.load(Ordering::SeqCst),
+                0,
+                "{kind}: the connect ran on to its end"
+            );
+        }
+    }
+
+    /// The contrast that makes the rule above a choice: a plain request (`Net::run`) is not
+    /// aborted when its waiter goes, since it may be on the wire already.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_that_nobody_waits_for_any_more_runs_on() {
+        let seen = Arc::new(Seen::default());
+        let net = Net::new(
+            Arc::new(Waiting(seen.clone())),
+            tokio::runtime::Handle::current(),
+        );
+        let request = HttpsRequest::get(crate::net::HttpsHost::Storage, "/v1/x");
+        let outcome = tokio::time::timeout(Duration::from_millis(150), net.https(request))
+            .await
+            .map(drop);
+        assert!(outcome.is_err(), "the request is still waiting");
+        seen.release.notify_waiters();
+        until(&seen, "the request ran to its end", |s| {
+            s.finished.load(Ordering::SeqCst) == 1
+        })
+        .await;
+    }
 }

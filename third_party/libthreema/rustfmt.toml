@@ -1,0 +1,3 @@
+# Kourier never reformats this vendored copy (third_party/libthreema/VENDORED.md): `cargo fmt --all`
+# reaches it as a path dependency of kourier-threema, and upstream formats with a style of its own.
+disable_all_formatting = true

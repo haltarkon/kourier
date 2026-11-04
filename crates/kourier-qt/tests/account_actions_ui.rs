@@ -38,6 +38,11 @@
 //! assign"), Kirigami's included (L5: the return to the list after the second link of
 //! `remove` printed three errors and a warning).
 //!
+//! Before a question is asked, every case checks that no account entry of the accounts drawer
+//! has a Qt Quick Layout as its parent (step F1: an entry in a layout is freed while the
+//! layout still names it, the SIGSEGV of `trayed`; the entries sit in a `Column`). The
+//! QML-level guard that reads the sizes at the moment of the crash is `drawer_layout_ui.rs`.
+//!
 //! `KOURIER_ACCOUNT_ACTIONS_ONLY=a,b` picks cases; `KOURIER_ACCOUNT_ACTIONS_SHOTS=<dir>`
 //! writes pictures of the questions, the menu and the notice for a look.
 
@@ -138,8 +143,45 @@ MainWindow {
         }
     }
 
+    // Every item under `root` for which `pred` holds.
+    function findAll(root: Item, pred: var, into: var): void {
+        if (root === null) {
+            return;
+        }
+        if (pred(root)) {
+            into.push(root);
+        }
+        for (const child of root.children) {
+            win.findAll(child, pred, into);
+        }
+    }
+
+    // The drawer's account entries are no direct children of a Qt Quick Layout (step F1). A
+    // layout keeps a removed child in its engine until it polishes, the Repeater deletes the
+    // entry before that and a window hidden in the tray never polishes: the next size read of
+    // the drawer walks the freed entry (the SIGSEGV of `trayed`, 13-15 % of runs, once a hang).
+    // That needs luck to show, this does not: it fails on the old `AccountsDrawer.qml` in every
+    // run. A positioner (`Column`) drops a removed child at once.
+    function entriesOutsideLayouts(): bool {
+        const entries = [];
+        win.findAll(win.globalDrawer.contentItem, i => i.menuAccount > 0, entries);
+        if (entries.length === 0) {
+            win.fail("no account entry in the drawer");
+            return false;
+        }
+        for (const e of entries) {
+            const p = e.parent;
+            if (p === null || p === undefined || String(p).indexOf("Layout") >= 0 || p.uniformCellSizes !== undefined) {
+                win.fail("an account entry of the drawer sits in a layout: " + String(p));
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Asks the question the way the case does: the settings row, or the drawer's menu.
     function ask(): void {
+        if (!win.entriesOutsideLayouts()) return;
         win.asks += 1;
         if (win.mode === "last" || win.mode === "nohover" || win.mode === "hidden") {
             const entry = win.find(win.globalDrawer.contentItem, i => i.menuAccount === win.target && i.visible);

@@ -8,7 +8,7 @@ import org.kde.kirigamiaddons.formcard as FormCard
 import org.kde.prison as Prison
 import app.kourier
 
-// Generic login-step renderer (§8.3): input fields, QR code (rotating), pairing code, emoji,
+// Generic login-step renderer (§8.3): input fields, QR code (rotating or not), pairing code, emoji,
 // progress, error with retry.
 //
 // After the code was scanned the phone may transfer the account's message history. The page
@@ -23,6 +23,43 @@ Kirigami.ScrollablePage {
 
     // The user left the page (Cancel or back): the login is abandoned.
     signal cancelled
+
+    // Whether the wait before a new login code may be asked for is over (the button
+    // "Send a New Code" shows only then). The viewmodel states the wait that REMAINS at each
+    // showing of the step, so it is counted again whenever the page turns to an input step: a
+    // click goes through "waiting" and the code step comes back as an input step (a wait of 0 is
+    // over at once, no timer).
+    property bool resendReady: false
+    function restartResend(): void {
+        resendTimer.stop();
+        page.resendReady = false;
+        if (App.login.kind !== "input" || App.login.resendLabel === "") {
+            return;
+        }
+        if (App.login.resendAfterMs <= 0) {
+            page.resendReady = true;
+            return;
+        }
+        resendTimer.interval = App.login.resendAfterMs;
+        resendTimer.start();
+    }
+    Timer {
+        id: resendTimer
+        repeat: false
+        onTriggered: page.resendReady = true
+    }
+    Connections {
+        target: App.login
+        function onKindChanged(): void {
+            if (App.login.kind === "input") {
+                page.restartResend();
+            } else {
+                resendTimer.stop();
+                page.resendReady = false;
+            }
+        }
+    }
+    Component.onCompleted: page.restartResend()
 
     title: App.login.title !== "" ? App.login.title : L10n.i18nc("@title", "Link Account")
     Kirigami.ColumnView.fillWidth: true
@@ -68,7 +105,11 @@ Kirigami.ScrollablePage {
             }
 
             QQC2.Label {
-                text: L10n.i18nc("@info", "Your phone shows this name in its list of linked devices.")
+                // The viewmodel's words for the step's purpose (the device name, the phone
+                // number), never the backend's.
+                visible: text !== ""
+                text: App.login.explain
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 horizontalAlignment: Text.AlignHCenter
                 color: page.quiet
@@ -99,9 +140,26 @@ Kirigami.ScrollablePage {
                             QQC2.TextField {
                                 text: field.modelData.value
                                 echoMode: field.modelData.kind === "secret" ? TextInput.Password : TextInput.Normal
+                                // The hint below the field is a separate item: a screen reader
+                                // on the field hears it as the field's description (the
+                                // viewmodel's plain string, foreign words from the network).
+                                Accessible.description: field.modelData.note
                                 Layout.fillWidth: true
                                 onTextChanged: App.login.setField(field.modelData.id, text)
                                 onAccepted: continueButton.clicked()
+                            }
+                            QQC2.Label {
+                                // What the network said about the field (a password's hint, the
+                                // first word of a code sent by SMS): the viewmodel's one line of
+                                // PLAIN text, foreign words from the network.
+                                objectName: "fieldNote"
+                                visible: text !== ""
+                                text: field.modelData.note
+                                textFormat: Text.PlainText
+                                wrapMode: Text.Wrap
+                                color: page.quiet
+                                font: Kirigami.Theme.smallFont
+                                Layout.fillWidth: true
                             }
                         }
                     }
@@ -113,6 +171,18 @@ Kirigami.ScrollablePage {
                     text: L10n.i18nc("@action:button", "Continue")
                     onClicked: App.login.submit()
                 }
+            }
+
+            // Asking the network for another login code: only when it allows one (the label is
+            // the viewmodel's, empty otherwise) and its wait is over. A click sends that request
+            // alone, never the typed code.
+            QQC2.Button {
+                objectName: "resendButton"
+                visible: App.login.resendLabel !== "" && page.resendReady
+                text: App.login.resendLabel
+                Layout.alignment: Qt.AlignHCenter
+                Layout.topMargin: Kirigami.Units.largeSpacing
+                onClicked: App.login.resend()
             }
         }
 
@@ -175,15 +245,16 @@ Kirigami.ScrollablePage {
             Layout.fillWidth: true
         }
 
-        // Steps for Signal's QR flow (other networks show their hint below).
+        // The numbered steps the viewmodel wrote for this network and step (Signal's, WhatsApp's
+        // and Threema's QR codes, WhatsApp's typed code); a step without them shows its hint below.
         ColumnLayout {
-            visible: page.kind === "qr" && App.login.network === "Signal"
+            visible: (page.kind === "qr" || page.kind === "code") && App.login.steps.length > 0
             spacing: Kirigami.Units.smallSpacing
             Layout.alignment: Qt.AlignHCenter
             Layout.maximumWidth: Kirigami.Units.gridUnit * 24
 
             Repeater {
-                model: [L10n.i18nc("@info linking step, %1 is the network", "Open %1 on your phone", App.login.network), L10n.i18nc("@info linking step", "Go to Settings → Linked devices"), L10n.i18nc("@info linking step", "Tap “Link new device” and scan this code")]
+                model: App.login.steps
                 delegate: RowLayout {
                     id: step
                     required property string modelData
@@ -205,6 +276,7 @@ Kirigami.ScrollablePage {
                     }
                     QQC2.Label {
                         text: step.modelData
+                        textFormat: Text.PlainText
                         wrapMode: Text.Wrap
                         Layout.fillWidth: true
                     }
@@ -213,7 +285,9 @@ Kirigami.ScrollablePage {
         }
 
         QQC2.Label {
-            visible: (page.kind !== "qr" || App.login.network !== "Signal") && page.kind !== "input" && App.login.hint !== ""
+            // With steps the hint would say the same (a QR code); a typed code's hint is its
+            // validity, which the steps do not say.
+            visible: (App.login.steps.length === 0 || page.kind === "code") && page.kind !== "input" && App.login.hint !== ""
             text: App.login.hint
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -224,8 +298,66 @@ Kirigami.ScrollablePage {
             Layout.alignment: Qt.AlignHCenter
         }
 
+        // The emoji step (Threema): the three emoji the phone shows, each with its name under it. The
+        // person compares them and confirms ON THE PHONE, so the page has no button but Cancel.
+        // A reader says the name once per emoji (the item's own), never the glyph or the name label.
+        // The row keeps THE PHONE'S ORDER (first emoji first, left to right) in a right-to-left
+        // locale too, as the safety number's digits do (SafetyPage): the person compares the
+        // sequence with the phone's, and the phone's order is not the desktop's direction (U2).
+        RowLayout {
+            objectName: "emojiRow"
+            visible: page.kind === "emoji"
+            LayoutMirroring.enabled: false
+            LayoutMirroring.childrenInherit: true
+            uniformCellSizes: true
+            spacing: Kirigami.Units.largeSpacing
+            Layout.fillWidth: true
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+            Layout.alignment: Qt.AlignHCenter
+            Layout.topMargin: Kirigami.Units.largeSpacing
+
+            Repeater {
+                model: page.kind === "emoji" ? App.login.emoji : []
+                delegate: ColumnLayout {
+                    id: emojiItem
+                    required property var modelData
+                    objectName: "emojiItem"
+                    spacing: Kirigami.Units.smallSpacing
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignTop
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: emojiItem.modelData.name
+
+                    QQC2.Label {
+                        objectName: "emojiGlyph"
+                        text: emojiItem.modelData.glyph
+                        textFormat: Text.PlainText
+                        // Three times the size of the default font.
+                        font: Style.styled(Kirigami.Theme.defaultFont, {
+                            "scale": 3
+                        })
+                        Layout.alignment: Qt.AlignHCenter
+                        Accessible.ignored: true
+                    }
+                    QQC2.Label {
+                        objectName: "emojiName"
+                        text: emojiItem.modelData.name
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        horizontalAlignment: Text.AlignHCenter
+                        color: page.quiet
+                        Layout.fillWidth: true
+                        Accessible.ignored: true
+                    }
+                }
+            }
+        }
+
         QQC2.Label {
-            visible: page.kind === "qr"
+            objectName: "rotationLine"
+            // Only a code that is replaced by a new one while the page waits (the viewmodel says so:
+            // Threema's QR code is one for the whole link).
+            visible: page.kind === "qr" && App.login.rotates
             text: L10n.i18nc("@info", "The code changes every few seconds; scan the one shown.")
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
@@ -237,7 +369,8 @@ Kirigami.ScrollablePage {
         }
 
         RowLayout {
-            visible: page.kind === "qr" || page.kind === "waiting" || page.kind === "progress"
+            objectName: "waitingRow"
+            visible: page.kind === "qr" || page.kind === "code" || page.kind === "emoji" || page.kind === "waiting" || page.kind === "progress"
             spacing: Kirigami.Units.smallSpacing
             Layout.alignment: Qt.AlignHCenter
             Layout.topMargin: Kirigami.Units.largeSpacing
@@ -286,6 +419,17 @@ Kirigami.ScrollablePage {
                     onTriggered: page.cancelled()
                 }
             ]
+        }
+
+        // The other way to link the same network (a QR code or a typed phone number): one
+        // click stops this login and starts the other, with no question. A normal, framed
+        // button: it is an action, not a link (the lead's answer, K-A fix round).
+        QQC2.Button {
+            objectName: "otherFlowButton"
+            visible: App.login.otherFlow !== "" && page.kind !== "done" && page.kind !== "progress"
+            text: App.login.otherFlowLabel
+            Layout.alignment: Qt.AlignHCenter
+            onClicked: App.login.switchFlow()
         }
 
         Kirigami.PlaceholderMessage {

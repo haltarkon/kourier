@@ -1,0 +1,232 @@
+//! Frame (i.e. a fixed size of bytes) utilities.
+use core::{fmt, marker::PhantomData};
+
+use duplicate::duplicate_item;
+use libthreema_macros::Name;
+
+use crate::utils::debug::Name as _;
+
+/// Contains a stream of data and hands out individual fixed length frames, one by one.
+#[derive(Name)]
+pub(crate) struct FixedLengthFrameDecoder<const LENGTH: usize> {
+    data: Vec<u8>,
+}
+impl<const LENGTH: usize> FixedLengthFrameDecoder<LENGTH> {
+    /// Create an empty fixed-length frame decoder.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self { data: vec![] }
+    }
+
+    /// Create a fixed-length frame decoder with `data` being the initial data.
+    #[inline]
+    pub(crate) fn new_with_data(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+
+    /// Dissolve the frame decoder, returning any excess data.
+    #[inline]
+    pub(crate) fn dissolve(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// Return the buffered amount of bytes contained in the decoder.
+    #[inline]
+    pub(crate) fn buffered_length(&self) -> usize {
+        self.data.len()
+    }
+
+    /// The required amount of bytes for the decoder to decode a full frame.
+    ///
+    /// Note: An efficient implementation may always provide more than the required amount of bytes,
+    /// if already available.
+    #[inline]
+    pub(crate) fn required_length(&self) -> usize {
+        LENGTH.saturating_sub(self.data.len())
+    }
+
+    /// Add chunks to the decoder's stream of data and return the amount of data that is currently
+    /// buffered.
+    #[inline]
+    pub(crate) fn add_chunks(&mut self, chunks: &[&[u8]]) -> usize {
+        for chunk in chunks {
+            self.data.extend_from_slice(chunk);
+        }
+        self.data.len()
+    }
+
+    /// Get the next frame from the decoder, passing through a transformation step (e.g. to avoid
+    /// copying) if available.
+    #[inline]
+    pub(crate) fn next_frame_and_then<TResult, F>(&mut self, map_fn: F) -> Option<TResult>
+    where
+        F: FnOnce(&[u8; LENGTH]) -> TResult,
+    {
+        if self.data.len() < LENGTH {
+            return None;
+        }
+        Some(map_fn(
+            self.data
+                .drain(..LENGTH)
+                .as_slice()
+                .try_into()
+                .expect("self.data must contain LENGTH bytes"),
+        ))
+    }
+}
+impl<const LENGTH: usize> fmt::Debug for FixedLengthFrameDecoder<LENGTH> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(Self::NAME)
+            .field("data", &format_args!("length={}", self.data.len()))
+            .field("required_length()", &self.required_length())
+            .finish()
+    }
+}
+
+/// An arbitrary fixed-size frame delimiter, decoding itself to yield the length of a frame.
+pub(crate) trait FrameDelimiter<const LENGTH: usize> {
+    const LENGTH: usize;
+
+    /// Decode the frame delimiter and return the length of the frame.
+    fn decode(data: [u8; LENGTH]) -> usize;
+}
+
+/// [`u16`] little endian length delimiter.
+pub(crate) struct LittleEndianDelimiterU16;
+
+/// [`u32`] little endian length delimiter.
+pub(crate) struct LittleEndianDelimiterU32;
+
+#[duplicate_item(
+    delimiter_type               int_type int_length;
+    [ LittleEndianDelimiterU16 ] [ u16 ]  [ 2 ];
+    [ LittleEndianDelimiterU32 ] [ u32 ]  [ 4 ];
+)]
+impl FrameDelimiter<int_length> for delimiter_type {
+    const LENGTH: usize = int_length;
+
+    #[inline]
+    fn decode(data: [u8; int_length]) -> usize {
+        int_type::from_le_bytes(data) as usize
+    }
+}
+
+#[derive(Debug)]
+enum VariableLengthFrameDecoderState {
+    PartialDelimiter,
+    PartialFrame { length: usize },
+}
+
+/// Contains a stream of data and hands out individual variable length frames, one by one.
+#[derive(Name)]
+pub(crate) struct VariableLengthFrameDecoder<
+    const DELIMITER_LENGTH: usize,
+    TDelimiter: FrameDelimiter<DELIMITER_LENGTH>,
+> {
+    delimiter: PhantomData<TDelimiter>,
+    state: VariableLengthFrameDecoderState,
+    data: Vec<u8>,
+}
+impl<const DELIMITER_LENGTH: usize, TDelimiter: FrameDelimiter<DELIMITER_LENGTH>>
+    VariableLengthFrameDecoder<DELIMITER_LENGTH, TDelimiter>
+{
+    const LENGTH: usize = DELIMITER_LENGTH;
+
+    /// Create an empty frame decoder using a [`FrameDelimiter`] to decode the length of frames.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::new_with_data(vec![])
+    }
+
+    /// Create a frame decoder using a [`FrameDelimiter`] to decode the length of frames with `data`
+    /// being the initial data.
+    #[inline]
+    pub(crate) fn new_with_data(data: Vec<u8>) -> Self {
+        Self {
+            delimiter: PhantomData,
+            state: VariableLengthFrameDecoderState::PartialDelimiter,
+            data,
+        }
+    }
+
+    /// The required amount of bytes for the decoder to advance its internal state, eventually decoding a full
+    /// frame.
+    ///
+    /// Note: An efficient implementation may always provide more than the required amount of bytes,
+    /// if already available.
+    #[inline]
+    pub(crate) fn required_length(&self) -> usize {
+        match &self.state {
+            VariableLengthFrameDecoderState::PartialDelimiter => Self::LENGTH.saturating_sub(self.data.len()),
+            VariableLengthFrameDecoderState::PartialFrame { length } => {
+                length.saturating_sub(self.data.len())
+            },
+        }
+    }
+
+    /// Add chunks to the decoder's stream of data and return the amount of data that is currently
+    /// buffered.
+    #[inline]
+    pub(crate) fn add_chunks(&mut self, chunks: &[&[u8]]) -> usize {
+        for chunk in chunks {
+            self.data.extend_from_slice(chunk);
+        }
+        self.data.len()
+    }
+
+    /// Get the next frame from the decoder, passing through a transformation step (e.g. to avoid
+    /// copying) if available.
+    #[inline]
+    pub(crate) fn next_frame_and_then<TResult, F>(&mut self, map_fn: F) -> Option<TResult>
+    where
+        [(); DELIMITER_LENGTH]:,
+        F: FnOnce(&[u8]) -> TResult,
+    {
+        if let VariableLengthFrameDecoderState::PartialDelimiter = &self.state {
+            // Check if we have sufficient bytes to decode the limiter or wait for more
+            let delimiter = self.data.get(..DELIMITER_LENGTH)?;
+
+            // Decode the delimiter to retrieve the length
+            let delimiter: [u8; DELIMITER_LENGTH] = delimiter
+                .try_into()
+                .expect("[0..DELIMITER_LENGTH] must be DELIMITER_LENGTH bytes");
+            let length = TDelimiter::decode(delimiter);
+
+            // Drain the delimiter and move into the next state
+            let _ = self.data.drain(..DELIMITER_LENGTH);
+            self.state = VariableLengthFrameDecoderState::PartialFrame { length };
+        }
+
+        if let VariableLengthFrameDecoderState::PartialFrame { length } = &self.state {
+            if self.data.len() < *length {
+                // We have less data than what our frame needs. Wait for more.
+                return None;
+            }
+
+            // The chunk contains more than or exactly what our frame needs. Drain the frame data
+            // and move into the next state with the remaining data.
+            let frame = map_fn(self.data.drain(..*length).as_slice());
+            self.state = VariableLengthFrameDecoderState::PartialDelimiter;
+            return Some(frame);
+        }
+
+        unreachable!("All decoder states should have been handled at this point");
+    }
+}
+impl<const DELIMITER_LENGTH: usize, TDelimiter: FrameDelimiter<DELIMITER_LENGTH>> fmt::Debug
+    for VariableLengthFrameDecoder<DELIMITER_LENGTH, TDelimiter>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(Self::NAME)
+            .field("state", &self.state)
+            .field("data", &format_args!("length={}", self.data.len()))
+            .finish()
+    }
+}
+
+pub(crate) type VariableLengthFrameDecoderU16LittleEndianDelimited =
+    VariableLengthFrameDecoder<{ LittleEndianDelimiterU16::LENGTH }, LittleEndianDelimiterU16>;
+pub(crate) type VariableLengthFrameDecoderU32LittleEndianDelimited =
+    VariableLengthFrameDecoder<{ LittleEndianDelimiterU32::LENGTH }, LittleEndianDelimiterU32>;

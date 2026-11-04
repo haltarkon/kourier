@@ -14,7 +14,7 @@
 //! The numbers are printed (`--nocapture`); `KOURIER_SCALE_FILES` sets the selection's size
 //! (1,500 by default) and `TMPDIR` where the profile lives (a tmpfs has no fsync cost).
 
-mod support;
+use crate::support;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -93,6 +93,7 @@ async fn a_send_of_thousands_of_files_holds_up_nothing_else() {
             request,
             paths: paths.into(),
             as_file: Vec::new(),
+            with_location: Vec::new(),
             caption: None,
             reply_to: None,
         })

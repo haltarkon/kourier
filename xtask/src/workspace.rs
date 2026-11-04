@@ -221,4 +221,87 @@ pub mod tests {
         );
         assert!(ws.deps_of("serde").is_empty());
     }
+
+    /// The workspace crates that need an `opt-level` of their own in dev and test builds
+    /// (T2, 2026-10-14): `[profile.dev.package."*"]` covers only the packages that are not
+    /// workspace members, and these two instantiate the hot GENERIC code of dependencies (the
+    /// JPEG encoder, the fixture's pictures and the blurhash input in `kourier-media`; the
+    /// AES-GCM stream of every attachment file in `kourier-blob`), which a generic function
+    /// compiles at the opt-level of the crate that names the concrete types.
+    const DEV_OPTIMISED: [&str; 2] = ["kourier-media", "kourier-blob"];
+
+    /// The `opt-level` a manifest gives `[profile.dev.package.<name>]` (`name` as written in the
+    /// header: `"*"` keeps its quotes). Read line by line: `toml` is not an xtask dependency and
+    /// adding one changes `Cargo.lock`, which makes the next `ci` render every picture again.
+    fn dev_package_opt_level(manifest: &str, name: &str) -> Option<u32> {
+        let header = format!("[profile.dev.package.{name}]");
+        let mut inside = false;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                inside = line == header;
+            } else if inside && let Some(rest) = line.strip_prefix("opt-level") {
+                let value = rest.trim_start().strip_prefix('=')?;
+                return value.split('#').next()?.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_opt_level_of_one_dev_package_is_read_from_its_own_table() {
+        let manifest = r#"
+[profile.dev.package."*"]
+# a comment
+opt-level = 2
+debug = "line-tables-only"
+[profile.dev.package.sha2]
+opt-level = 3   # why
+[profile.dev.package.kourier-media]
+debug = true
+[profile.release]
+opt-level = 1
+"#;
+        assert_eq!(dev_package_opt_level(manifest, "\"*\""), Some(2));
+        assert_eq!(dev_package_opt_level(manifest, "sha2"), Some(3));
+        // A table without the key, a table that is not there and a key of another table.
+        assert_eq!(dev_package_opt_level(manifest, "kourier-media"), None);
+        assert_eq!(dev_package_opt_level(manifest, "kourier-blob"), None);
+        assert_eq!(
+            dev_package_opt_level("[profile.dev]\nopt-level = 1\n", "\"*\""),
+            None
+        );
+    }
+
+    /// Without this the dev and test builds run libsignal, SQLCipher, BoringSSL and the image
+    /// codecs unoptimised again: a chat screenshot cost 9.5 CPU-s instead of ~3 (T2 measured
+    /// the effect, `target/next/t2-build.md`). A test cannot assert a CPU time (load decides),
+    /// so it asserts the setting.
+    #[test]
+    fn dependencies_and_the_hot_workspace_crates_are_optimised_in_dev_builds() {
+        let manifest = std::fs::read_to_string(crate::root().join("Cargo.toml")).unwrap();
+        let level = |name: &str| dev_package_opt_level(&manifest, name);
+        assert!(
+            level("\"*\"") >= Some(1),
+            "[profile.dev.package.\"*\"] opt-level must be 1 or more: {:?}",
+            level("\"*\"")
+        );
+        for krate in DEV_OPTIMISED {
+            assert!(
+                crate::root()
+                    .join("crates")
+                    .join(krate)
+                    .join("Cargo.toml")
+                    .is_file(),
+                "{krate} is not a workspace crate any more: rename it in DEV_OPTIMISED and Cargo.toml"
+            );
+            assert!(
+                level(krate) >= Some(1),
+                "[profile.dev.package.{krate}] opt-level must be 1 or more: {:?}",
+                level(krate)
+            );
+        }
+        // The two that were there before T2 stay (a named package wins over "*").
+        assert_eq!(level("sqlcipher-crypto-provider"), Some(3));
+        assert_eq!(level("sha2"), Some(3));
+    }
 }

@@ -4,7 +4,9 @@
 //!   §5.3 (WAL, `synchronous = FULL`, `secure_delete`, …). A wrong key fails with
 //!   [`Error::WrongKey`] before anything is written.
 //! - [`migrate`]: the forward-only migration runner with one `schema_version` row per component;
-//!   a database newer than the binary is refused ([`Error::TooNew`]).
+//!   a database newer than the binary is refused ([`Error::TooNew`]). [`check_backend_file`] is what
+//!   every backend runs BEFORE its first write: a `backend.db` may carry `core_outbox` and the
+//!   backend's own component, nothing else ([`Error::ForeignComponent`]).
 //! - [`ZoneDb`]: the synchronous zone API of §6.3 (`BEGIN IMMEDIATE … COMMIT`, no awaits inside).
 //! - [`outbox`]: the generic `core_outbox` table and its [`Forwarder`] (§5.6), shared by every
 //!   backend; rows are opaque versioned bytes here. Rows the core refuses for good are
@@ -26,7 +28,10 @@ mod writer;
 mod zone;
 
 pub use key::DbKey;
-pub use migrate::{Migration, MigrationOutcome, Migrations, Step, migrate, schema_version};
+pub use migrate::{
+    Migration, MigrationOutcome, Migrations, Step, check_backend_file, migrate, schema_components,
+    schema_version,
+};
 pub use open::{checkpoint_truncate, open, open_read_only, try_checkpoint_truncate};
 pub use outbox::{
     Batch, Forwarder, ForwarderConfig, OutboxRow, OutboxSource, PoisonRow, Refusal, Rejected,
@@ -58,6 +63,13 @@ pub enum Error {
         found: i64,
         /// Latest version this binary knows.
         supported: i64,
+    },
+    /// A backend's `backend.db` carries the schema of something else (another network's backend, the
+    /// core): it is not this backend's file and is left untouched ([`check_backend_file`]).
+    #[error("this database belongs to something else (it carries the {component} schema)")]
+    ForeignComponent {
+        /// The schema component found (`core`, `signal`, `whatsapp`, …): a name this code wrote.
+        component: String,
     },
     /// A migration list is malformed (gaps, duplicates, file name not matching the number).
     #[error("invalid migration list for {component}: {reason}")]

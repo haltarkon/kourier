@@ -11,7 +11,7 @@ use kourier_core::facade::{
 };
 use kourier_model::{
     AccountId, AccountState, AccountUuid, AttachmentId, AttachmentKind, BlobKey, BlobRef, Body,
-    CannotSend, ConnState, ConversationId, DisappearKind, Expiry, FailReason, LoginStep,
+    CannotSend, ConnState, ConversationId, Deletion, DisappearKind, Expiry, FailReason, LoginStep,
     LoginStepKind, MessageId, OutgoingState, ReadState, Redacted, SystemEvent, Text, UserAction,
 };
 
@@ -39,7 +39,13 @@ fn own_actions() -> MessageActions {
         delete_attachment: false,
         copy: true,
         take_back: false,
+        cancel_sending: false,
         ask_attachments: Vec::new(),
+        save_attachments: Vec::new(),
+        retry: false,
+        show_sender: false,
+        show_people: Vec::new(),
+        safety_number: None,
         until: None,
     }
 }
@@ -88,6 +94,154 @@ fn row(src: &CoreSource, message: MessageId) -> MessageRow {
         .expect("row")
 }
 
+/// People pages P3: the pages of a row's menu are the core's flags and list, given their words
+/// and nothing more (the viewmodel decides none of it): a row the core offered no page for has none, a
+/// row with the sender's page has "Show Sender's Page", and the people the core listed come after it, the
+/// user's own as "Show Your Page".
+#[test]
+fn the_menu_pages_are_what_the_core_states() {
+    use kourier_core::facade::ShownPerson;
+    let mut store = store(6);
+    let who = UserId::parse("aci:00000000-0000-4000-8000-0000000000f1").expect("id");
+    let me = UserId::parse("aci:00000000-0000-4000-8000-0000000000aa").expect("id");
+    {
+        let rows = store.convs.get_mut(&1).expect("conv");
+        rows[1].actions.show_sender = true;
+        rows[3].actions.show_sender = true;
+        rows[3].actions.show_people = vec![
+            ShownPerson {
+                user: who.clone(),
+                own: false,
+            },
+            ShownPerson {
+                user: me.clone(),
+                own: true,
+            },
+        ];
+        // A row with a mentioned person and no sender entry (the core states that for an own
+        // message): the person keeps the entry.
+        rows[4].actions.show_people = vec![ShownPerson {
+            user: who.clone(),
+            own: false,
+        }];
+    }
+    let (src, _) = opened(&store);
+    let none = row(&src, id(1));
+    assert!(none.pages.is_empty() && !none.actions.show_sender && !none.actions.show_people);
+    let sender = row(&src, id(2));
+    assert!(sender.actions.show_sender && !sender.actions.show_people);
+    let labels = |r: &crate::timeline::MessageRow| -> Vec<String> {
+        r.pages.iter().map(|p| p.label.clone()).collect()
+    };
+    assert_eq!(labels(&sender), vec!["Show Sender's Page"]);
+    assert_eq!(
+        sender.pages[0].user,
+        sender.author_id.clone().expect("a sender")
+    );
+    let both = row(&src, id(4));
+    assert!(both.actions.show_sender && both.actions.show_people && both.actions.any());
+    let l = labels(&both);
+    assert_eq!(l.len(), 3);
+    assert_eq!(l[0], "Show Sender's Page");
+    assert!(
+        l[1].starts_with("Show ") && l[1].ends_with("'s Page"),
+        "{}",
+        l[1]
+    );
+    assert_eq!(l[2], "Show Your Page");
+    assert_eq!(both.pages[1].user, who);
+    assert_eq!(both.pages[2].user, me);
+    let own = row(&src, id(5));
+    assert!(
+        !own.actions.show_sender,
+        "the core stated no sender for an own message"
+    );
+    assert_eq!(
+        own.pages.len(),
+        1,
+        "an own message keeps its mention's entry"
+    );
+}
+
+/// A message the network refused as a reach-out shows as failed but offers no "Send Again":
+/// the button follows the core's flag (`MessageActions::retry`), not the send state alone.
+/// Taking it back stays.
+#[test]
+fn a_reach_out_refusal_offers_no_send_again_only_taking_it_back() {
+    let mut store = store(6);
+    {
+        let rows = store.convs.get_mut(&1).expect("conv");
+        rows[2].out_state = Some(OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            retryable: false,
+        });
+        rows[2].actions = MessageActions {
+            delete_for_me: true,
+            take_back: true,
+            retry: false,
+            ..MessageActions::default()
+        };
+        // The same row for any other failure: the core accepts "Send Again".
+        rows[5].out_state = Some(OutgoingState::Failed {
+            reason: FailReason::Network,
+            retryable: true,
+        });
+        rows[5].actions = MessageActions {
+            delete_for_me: true,
+            take_back: true,
+            retry: true,
+            ..MessageActions::default()
+        };
+    }
+    let (src, _) = opened(&store);
+    let refused = row(&src, id(3));
+    assert_eq!(refused.receipt, crate::timeline::Receipt::Failed);
+    assert!(!refused.actions.retry && refused.actions.take_back);
+    let other = row(&src, id(6));
+    assert_eq!(other.receipt, crate::timeline::Receipt::Failed);
+    assert!(other.actions.retry && other.actions.take_back);
+    // The refused one says why and what works, for good (no timer); another failure says
+    // nothing of the kind.
+    assert_eq!(
+        refused.wait,
+        "Not sent: WhatsApp accepts this message only from your phone. Send it from your phone."
+    );
+    assert_eq!(refused.wait_timer, "");
+    assert_eq!(other.wait, "");
+}
+
+/// The tick brings the lines under messages on their way up to date; a refused message that
+/// still has an outbox row must keep its sentence (the tick's line is the timeline's line).
+#[test]
+fn the_tick_does_not_blank_the_line_of_a_refused_reach_out() {
+    use kourier_core::facade::OutboxWait;
+    let mut store = store(6);
+    {
+        let rows = store.convs.get_mut(&1).expect("conv");
+        rows[2].origin = OriginKind::OwnThisDevice;
+        rows[2].author = None;
+        rows[2].out_state = Some(OutgoingState::Failed {
+            reason: FailReason::ReachOutRefused,
+            retryable: false,
+        });
+        rows[2].outbox = Some(OutboxWait {
+            in_flight: false,
+            attempts: 1,
+            next_attempt_at: None,
+            last_error: None,
+        });
+    }
+    let (src, _) = opened(&store);
+    let lines = src.wait_lines(CONV);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].0, id(3));
+    assert_eq!(
+        lines[0].1.text(),
+        "Not sent: WhatsApp accepts this message only from your phone. Send it from your phone."
+    );
+    assert_eq!(lines[0].1.reason, row(&src, id(3)).wait);
+}
+
 #[test]
 fn rows_carry_the_cores_flags_and_say_what_a_reply_or_an_edit_starts_from() {
     let mut store = store(6);
@@ -101,10 +255,11 @@ fn rows_carry_the_cores_flags_and_say_what_a_reply_or_an_edit_starts_from() {
         rows[2].actions = MessageActions {
             delete_for_me: true,
             take_back: true,
+            retry: true,
             ..MessageActions::default()
         };
         // A tombstone offers only its removal from this account.
-        rows[3].deleted = Some(kourier_model::Deletion::ForEveryone { by: Some(user(1)) });
+        rows[3].deleted = Some(Deletion::ForEveryone { by: Some(user(1)) });
         rows[3].actions = MessageActions {
             delete_for_me: true,
             ..MessageActions::default()
@@ -363,7 +518,7 @@ fn refused_actions_show_a_notice_chosen_by_kind_and_row_state() {
             ..own_actions()
         };
         // 3: an own text that was deleted meanwhile.
-        rows[2].deleted = Some(kourier_model::Deletion::ForEveryone { by: None });
+        rows[2].deleted = Some(Deletion::ForEveryone { by: None });
         rows[2].actions = MessageActions {
             delete_for_me: true,
             ..MessageActions::default()
@@ -536,6 +691,159 @@ fn refused_actions_show_a_notice_chosen_by_kind_and_row_state() {
     src.on_action_failed("React", &network_no(), &ActionSubject::Message(peer));
     assert!(src.react(id(5), "👍", false));
     assert!(src.notice().is_empty());
+}
+
+/// The commands that store a draft: what was sent to the core since the last look.
+fn saved_drafts(sent: &Sent) -> Vec<(ConversationId, Option<String>)> {
+    commands(sent)
+        .into_iter()
+        .filter_map(|c| match c {
+            UiCommand::SaveDraft { conv, draft } => Some((conv, draft.map(|t| t.body))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An own text of this device that the core stored in conversation 1 after the first `n`
+/// messages of the simulated store.
+fn stored_own_text(n: i64, text: &str) -> CoreMessage {
+    let mut m = message(1, n + 1, false);
+    m.author = None;
+    m.author_name = None;
+    m.origin = OriginKind::OwnThisDevice;
+    m.read_state = None;
+    m.body = Body::Text(Text::plain(text));
+    m
+}
+
+/// The core refuses a `SendText` the composer did not make (the desktop's inline reply sends
+/// one too, with no composer): the refusal names its conversation, and only a send of that
+/// conversation is the composer's last one. Another chat's refusal puts no text back into any
+/// draft, and the composer's own entry is still there for its own refusal.
+#[test]
+fn a_refusal_of_a_send_into_another_chat_restores_nothing() {
+    let store = store(5);
+    let (mut src, sent) = opened(&store);
+    let other = ConversationId(2);
+    src.send_text(CONV, "my words", None).expect("send");
+    commands(&sent);
+    for subject in [
+        ActionSubject::Conversation(other),
+        ActionSubject::None,
+        ActionSubject::Message(id(1)),
+    ] {
+        let ch = src.on_action_failed("SendText", &core_no(), &subject);
+        assert!(
+            !ch.draft && !ch.conversations,
+            "no draft is shown anywhere for {subject:?}"
+        );
+        assert_eq!(
+            src.draft(CONV),
+            "",
+            "nothing in the open chat for {subject:?}"
+        );
+        assert_eq!(
+            src.draft(other),
+            "",
+            "nothing in the other chat for {subject:?}"
+        );
+        assert!(
+            saved_drafts(&sent).is_empty(),
+            "nothing stored for {subject:?}"
+        );
+    }
+    // The entry was not used up by them: the refusal of the composer's own send gives the
+    // text back.
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(ch.draft);
+    assert_eq!(src.draft(CONV), "my words");
+    // ... once.
+    src.save_draft(CONV, "");
+    commands(&sent);
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(!ch.draft);
+    assert_eq!(src.draft(CONV), "");
+}
+
+/// A send the core stored is forgotten: a refusal for that chat later on is another send's
+/// (the inline reply into a chat that stopped taking messages), and the sent text of hours ago
+/// must not come back into the composer as a draft.
+#[test]
+fn a_stored_send_is_not_given_back_by_a_later_refusal() {
+    let mut store = store(5);
+    let (mut src, sent) = opened(&store);
+    src.send_text(CONV, "sent hours ago", None).expect("send");
+    let stored = stored_own_text(5, "sent hours ago");
+    let stored_id = stored.id;
+    store.convs.get_mut(&1).expect("conv").push(stored);
+    src.on_event(&UiEvent::MessagesChanged {
+        conv: CONV,
+        ids: vec![stored_id],
+    });
+    settle(&mut src, &sent, &store);
+    commands(&sent);
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(!ch.draft && !ch.conversations);
+    assert_eq!(src.draft(CONV), "");
+    assert!(saved_drafts(&sent).is_empty());
+}
+
+/// What does not say that the send was stored does not forget it: a message of the other
+/// person, a message of the user's phone, and a change of a row that was there before. The
+/// refusal of the send, which comes at once in the same chat, still gives the text back.
+#[test]
+fn a_change_in_the_chat_does_not_forget_a_send_the_core_has_not_stored() {
+    let mut store = store(5);
+    let (mut src, sent) = opened(&store);
+    src.send_text(CONV, "still mine", None).expect("send");
+    let (mut remote, mut phone) = (message(1, 7, true), message(1, 9, false));
+    remote.origin = OriginKind::Remote;
+    phone.origin = OriginKind::OwnOtherDevice;
+    let rows = store.convs.get_mut(&1).expect("conv");
+    // A receipt on an own row of this device from before the send.
+    rows[4].origin = OriginKind::OwnThisDevice;
+    let before = rows[4].id;
+    rows.extend([remote.clone(), phone.clone()]);
+    src.on_event(&UiEvent::MessagesChanged {
+        conv: CONV,
+        ids: vec![before, remote.id, phone.id],
+    });
+    settle(&mut src, &sent, &store);
+    commands(&sent);
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(ch.draft, "the refusal of the send itself restores it");
+    assert_eq!(src.draft(CONV), "still mine");
+}
+
+/// After a refusal the text is in the composer again AND in core.db again: the composer cleared
+/// the stored draft before it sent, and its next `save_draft` of this very text would see
+/// nothing changed, so without the command a quit loses the text.
+#[test]
+fn a_refused_send_is_stored_as_the_draft_again() {
+    let store = store(5);
+    let (mut src, sent) = opened(&store);
+    src.save_draft(CONV, "a draft");
+    src.send_text(CONV, "a draft", None).expect("send");
+    commands(&sent);
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(ch.draft);
+    assert_eq!(
+        saved_drafts(&sent),
+        [(CONV, Some("a draft".to_owned()))],
+        "one SaveDraft, with the text"
+    );
+    // The composer's next save of the same text sends nothing more.
+    src.save_draft(CONV, "a draft");
+    assert!(saved_drafts(&sent).is_empty());
+    // Text typed meanwhile is not overwritten, by the draft or by the command.
+    src.save_draft(CONV, "");
+    src.send_text(CONV, "second", None).expect("send");
+    src.save_draft(CONV, "typed meanwhile");
+    commands(&sent);
+    let ch = src.on_action_failed("SendText", &core_no(), &ActionSubject::Conversation(CONV));
+    assert!(!ch.draft);
+    assert_eq!(src.draft(CONV), "typed meanwhile");
+    assert!(saved_drafts(&sent).is_empty());
 }
 
 fn quote(src: &CoreSource, message: MessageId) -> QuoteBlock {
@@ -755,8 +1063,15 @@ fn the_unread_divider_goes_once_we_answered() {
 
     // A picture as the answer does the same.
     let (mut src, _) = opened(&store);
-    src.send_files(CONV, vec!["/tmp/a.jpg".into()], Vec::new(), "", None)
-        .expect("send");
+    src.send_files(
+        CONV,
+        vec!["/tmp/a.jpg".into()],
+        Vec::new(),
+        Vec::new(),
+        "",
+        None,
+    )
+    .expect("send");
     assert!(!has_divider(&src));
 
     // An answer from our phone: the divider goes when its row arrives.
@@ -795,7 +1110,7 @@ fn preview(body_kind: &str) -> Preview {
         body_kind: body_kind.into(),
         text: None,
         sent_at: NOW,
-        deleted: false,
+        deleted: None,
         out_state: None,
         attachment: None,
         attachments: 0,
@@ -939,10 +1254,31 @@ fn list_previews_say_what_the_newest_message_is() {
     );
     assert_eq!(
         show(&Preview {
-            deleted: true,
+            deleted: Some(Deletion::ForEveryone { by: None }),
             ..media(AttachmentKind::Image, 1)
         }),
         pair("This message was deleted", "trash-empty")
+    );
+    // The list words a delete as the timeline's tombstone does (KT-2, review 1 M3): our own
+    // message deleted by nobody named is no "You deleted this message", the peer may have.
+    // Mutant: an own row's delete read as ours whatever it names.
+    let ours = |deleted: Deletion| Preview {
+        author: None,
+        author_name: None,
+        deleted: Some(deleted),
+        ..preview("Text")
+    };
+    assert_eq!(
+        show(&ours(Deletion::ForEveryone { by: None })),
+        pair("You deleted this message", "trash-empty")
+    );
+    assert_eq!(
+        show(&ours(Deletion::Unattributed)),
+        pair("This message was deleted", "trash-empty")
+    );
+    assert_eq!(
+        show(&ours(Deletion::ForEveryone { by: Some(user(2)) })),
+        pair("This message was deleted by an admin", "trash-empty")
     );
 }
 
@@ -1272,6 +1608,8 @@ fn account_states_show_a_banner() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     assert!(
@@ -1438,6 +1776,8 @@ fn link_again_starts_the_login_of_the_same_account() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     commands(&sent);
@@ -1488,6 +1828,8 @@ fn try_again_after_a_failed_relink_links_the_same_account() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     let _ = src.relink(AccountId(1)).expect("relink");
@@ -1551,6 +1893,8 @@ fn try_again_after_a_failed_relink_links_the_same_account() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     let _ = src.relink(AccountId(1)).expect("relink");
@@ -1749,6 +2093,22 @@ fn a_custom_timer_is_offered_within_the_range_the_chat_states() {
     assert!(header.timers.is_empty() && header.timer_range.is_none());
 }
 
+/// A network that cannot send yet (`CannotSend::NotYetBuilt`) closes the composer with its own
+/// line, and a chat that cannot be written to offers no timer either.
+#[test]
+fn a_chat_a_network_cannot_send_in_yet_says_so_in_the_composer() {
+    let mut store = store(3);
+    store.features.cannot_send = Some(CannotSend::NotYetBuilt);
+    let (src, _) = opened(&store);
+    let header = src.chat(CONV).expect("header");
+    assert!(!header.cannot_send.is_empty());
+    assert_eq!(
+        header.cannot_send,
+        "Sending is not available here yet; it comes in a later version of Kourier."
+    );
+    assert!(header.timers.is_empty() && header.timer_range.is_none());
+}
+
 #[test]
 fn clearing_and_deleting_send_their_commands_and_say_what_failed() {
     use kourier_core::facade::Refusal;
@@ -1811,6 +2171,8 @@ fn clearing_and_deleting_send_their_commands_and_say_what_failed() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     assert!(!src.chat(CONV).expect("header").deletes_sync);
@@ -2053,6 +2415,8 @@ fn a_chat_still_filling_is_not_cleared_or_deleted_and_says_why() {
         &mut src,
         ConnState::LoggedOut {
             reason: "unlinked".into(),
+            cause: Default::default(),
+            note: Default::default(),
         },
     );
     assert_eq!(src.chat(CONV).expect("header").still_filling, "");

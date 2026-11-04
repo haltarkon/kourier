@@ -3,7 +3,9 @@
 // memory to the system after the window is released. No logic beyond Qt calls.
 #pragma once
 
+#include <QtCore/QObject>
 #include <QtCore/QString>
+#include <QtCore/QUrl>
 
 #include <cstdint>
 
@@ -48,5 +50,18 @@ bool sessionEnding();
 
 // Sets or clears what sessionEnding() says (tests: no session manager is there to ask).
 void setSessionEnding(bool ending);
+
+// Every QDesktopServices::openUrl of the process with an http, https, mailto or file URL (Kirigami's
+// About page and link delegates call Qt.openUrlExternally themselves) goes to the slot
+// `openExternalUrl(QUrl)` of `receiver`, which starts the program with the environment the person
+// gave Kourier. The slot must never call QDesktopServices::openUrl again: Qt would then hand the
+// URL to its platform services, which start `xdg-open` with this process's environment. Other
+// schemes keep Qt's services. Qt keeps the receiver as a QPointer.
+// Qt thread, once the receiver exists.
+void registerUrlHandlers(QObject* receiver);
+
+// `url` as the program that opens it takes it on its command line (QUrl::FullyEncoded, as Qt's own
+// services pass it).
+QString urlForTheOpener(const QUrl& url);
 
 } // namespace kourier
