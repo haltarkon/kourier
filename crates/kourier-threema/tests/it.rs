@@ -16,6 +16,7 @@ mod connection;
 mod deferred;
 mod join;
 mod kill;
+mod leader;
 mod mock;
 mod network;
 mod open;

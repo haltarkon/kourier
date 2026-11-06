@@ -4,7 +4,9 @@
 //! rows with `AccountReady` first) and the Rebuild equality (`stated_events` over the file equals what
 //! zone 2 wrote AND what the import states in memory). Schema 4 (TH6a, `send_*`): each CHECK, the send queue's zones
 //! with literal rows, the two budgets at N and N+1, what may run next, the sweep's ages, the failed runs, the door; its
-//! kill loops are in `tests/kill.rs`.
+//! kill loops are in `tests/kill.rs`. Schema 5 (TH6 L1, `csp_inbound`, `inbound_*`): each CHECK at every state, ZONE
+//! RECEIVE and ZONE REFLECTED with literal rows, step 0, the sweep's ages, the door; the kill loops in `tests/kill.rs`, the
+//! plans of the statements in `src/leader/zone.rs`'s unit test.
 
 use std::rc::Rc;
 
@@ -12,6 +14,11 @@ use kourier_backend_api::{BackendEvent, decode_outbox_row};
 use kourier_db::rusqlite::Connection;
 use kourier_model::UserId;
 use kourier_threema::StoreError;
+use kourier_threema::store::{
+    Discarded, Inbound, InboundAck, InboundRow, InboundState, InboundSwept, Kept, NewBody, NewJob,
+    RULE_PENDING_EXPIRED, Received, Receiving, To, fail_inbound_zone, inbound_row, inbound_rows,
+    mark_inbound_reflected, receive_inbound, sweep_inbound,
+};
 use kourier_threema::store::{
     EVICT_AFTER_MS, Identity, Import, JOB_BUDGET, NewFate, NewOrigin, NewReceiver, NonceScope,
     RULE_JOB_EXPIRED, RULE_QUEUE_FULL, RULE_TRANSMIT_EVICTED, RULE_TRANSMIT_EXPIRED, ReceiverState,
@@ -506,7 +513,7 @@ fn a_schema_1_file_migrates_to_schema_2_with_every_new_table_empty() {
             .map_err(kourier_db::Error::from)
         })
         .expect("version");
-    assert_eq!(version, 4, "the file is not at the latest schema");
+    assert_eq!(version, 5, "the file is not at the latest schema");
     for table in SCHEMA_2_TABLES {
         assert_eq!(
             count(&db, table),
@@ -2963,4 +2970,851 @@ fn send_debug_prints_counts_and_nothing_of_a_row() {
             assert!(!text.contains(needle), "a Debug prints a row's content");
         }
     }
+}
+
+// THE LEADER'S ROWS (TH6 L1, schema 5, `migrations/0005_leader.sql`) -----------------------------------------------------
+
+/// The leader's synthetic IDs (8 characters, each a substring of no other test value).
+pub(crate) const IN_OWN: &str = "L1OWNID1";
+pub(crate) const IN_PEER: &str = "L1PEERA2";
+pub(crate) const IN_OTHER: &str = "L1PEERB3";
+/// The local time of the zones, and the messages' own time.
+pub(crate) const IN_T0: i64 = 1_761_600_000_000;
+pub(crate) const IN_AT: u64 = 1_761_590_000_000;
+
+/// A linked file: the identity, the marker and the two peers as direct contacts with real public keys (a job seals).
+pub(crate) fn inbound_linked(db: &kourier_db::ZoneDb) {
+    use crate::support::mock::crypto::x25519_public;
+    use crate::support::mock::envelope::ContactDelta;
+    use kourier_db::rusqlite::params;
+    use prost::Message as _;
+    let identity = Identity {
+        threema_id: IN_OWN.to_owned(),
+        client_key: Zeroizing::new([0x71; 32]),
+        server_group: "c".to_owned(),
+        device_group_key: Zeroizing::new([0x72; 32]),
+        device_cookie: Zeroizing::new([0x73; 16]),
+        d2m_device_id: 11,
+        csp_device_id: 12,
+        slot_state: SlotState::Existing,
+        device_label: "Kourier (l1-leader)".to_owned(),
+        linked_at_ms: IN_T0,
+    };
+    db.zone(|tx| {
+        save_identity(tx, &identity)?;
+        mark_join_ready(tx, IN_T0)
+    })
+    .expect("the identity");
+    db.zone(|tx| {
+        for (id, secret) in [(IN_PEER, [0x11; 32]), (IN_OTHER, [0x12; 32])] {
+            let sync = ContactDelta::create(id, x25519_public(&secret), IN_AT).build();
+            tx.execute(
+                "INSERT INTO contact (identity, sync, last_update_at) VALUES (?1, ?2, NULL)",
+                params![sync.identity, sync.encode_to_vec()],
+            )?;
+        }
+        Ok::<(), kourier_db::Error>(())
+    })
+    .expect("the contacts");
+}
+
+/// The id of message `n` (`[n; 8]`, as the fake writes it).
+pub(crate) fn inbound_id(n: u8) -> u64 {
+    u64::from_le_bytes([n; 8])
+}
+
+/// The plaintext `d2d.Envelope { incoming_message }` the leader reflects for message `n` of `sender`: type `ty`, `body`.
+pub(crate) fn inbound_plaintext(sender: &str, n: u8, ty: u8, body: Vec<u8>) -> Vec<u8> {
+    use crate::support::mock::envelope::{Author, Msg};
+    use prost::Message as _;
+    Author::new(0x0A11)
+        .incoming(sender, &Msg::raw([n; 8], IN_AT, ty, body).nonce([n; 24]))
+        .encode_to_vec()
+}
+
+/// A text of `sender`, message `n`.
+pub(crate) fn inbound_text(sender: &str, n: u8) -> Vec<u8> {
+    use crate::support::mock::envelope::{Author, Msg};
+    use prost::Message as _;
+    Author::new(0x0A11)
+        .incoming(
+            sender,
+            &Msg::text([n; 8], IN_AT, "leader text").nonce([n; 24]),
+        )
+        .encode_to_vec()
+}
+
+/// The synthetic sealed reflect of message `n`: `40 + n` bytes of `0xE0 + n`.
+pub(crate) fn inbound_reflect(n: u8) -> Vec<u8> {
+    vec![0xE0 + n; 40 + usize::from(n)]
+}
+
+/// Message `n` of `sender` kept: its CSP nonce hash `[0xC0 + n; 32]`, its reflect's D2D hash `[0xD0 + n; 32]`, flags 0
+/// (an ack owed), no contact, no job.
+pub(crate) fn inbound_kept<'a>(
+    sender: &'a str,
+    n: u8,
+    message: &'a [u8],
+    reflect: &'a [u8],
+    receipt: bool,
+) -> Kept<'a> {
+    Kept {
+        sender,
+        message_id: inbound_id(n),
+        message,
+        contact: None,
+        server_at: IN_AT,
+        flags: 0,
+        nonce_hash: [0xC0 + n; 32],
+        d2d_hash: [0xD0 + n; 32],
+        reflect_env: reflect,
+        ack: true,
+        receipt,
+        jobs: &[],
+    }
+}
+
+/// The context of the zones here, at `now_ms`.
+pub(crate) fn receiving(wake: &Rc<Notify>, now_ms: i64) -> Receiving<'_> {
+    Receiving {
+        own: IN_OWN,
+        now_ms,
+        catch_up: false,
+        bounds: kourier_threema::store::DeferredBounds::REAL,
+        wake,
+    }
+}
+
+/// A 1:1 text job to `to` (what a discard's steps send stands in for).
+pub(crate) fn inbound_job(to: &str) -> NewJob {
+    NewJob {
+        kind: "l1-job",
+        to: To::Contact(to.to_owned()),
+        body: NewBody::Text("a job".to_owned()),
+        only: None,
+    }
+}
+
+/// The delivery-receipt job ZONE REFLECTED makes for `sender` and `ids` (status 1, the ids little-endian).
+pub(crate) fn inbound_receipt(sender: &str, ids: &[u64]) -> NewJob {
+    let mut body = vec![1u8];
+    for id in ids {
+        body.extend(id.to_le_bytes());
+    }
+    NewJob {
+        kind: "receipt",
+        to: To::Contact(sender.to_owned()),
+        body: NewBody::Raw {
+            ty: 0x80,
+            body,
+            distributes: false,
+        },
+        only: None,
+    }
+}
+
+fn inbound_all(db: &kourier_db::ZoneDb) -> Vec<InboundRow> {
+    db.read(|conn: &Connection| inbound_rows(conn))
+        .expect("the rows")
+}
+
+fn has_nonce(db: &kourier_db::ZoneDb, scope: NonceScope, hash: [u8; 32]) -> bool {
+    db.read(|conn: &Connection| contains_nonce(conn, scope, &hash))
+        .expect("a nonce")
+}
+
+/// A literal `pending` row as RECEIVE writes it.
+fn pending_row(id: i64, sender: &str, n: u8, ack: bool, receipt: bool) -> InboundRow {
+    InboundRow {
+        id,
+        sender: sender.to_owned(),
+        message_id: inbound_id(n),
+        state: InboundState::Pending,
+        ack,
+        receipt,
+        received_at: IN_T0,
+        reflected_at: None,
+        nonce_hash: Some([0xC0 + n; 32]),
+        reflect_env: Some(Zeroizing::new(inbound_reflect(n))),
+    }
+}
+
+/// `INSERT INTO csp_inbound` with the good `pending` row (`reflected`: the good `reflected` row), `over` its columns.
+fn inbound_insert(reflected: bool, over: &[(&str, String)]) -> String {
+    let columns: [(&str, &str); 10] = [
+        ("sender", "'L1CHKID8'"),
+        ("message_id", "1"),
+        (
+            "state",
+            if reflected {
+                "'reflected'"
+            } else {
+                "'pending'"
+            },
+        ),
+        ("ack", "1"),
+        ("receipt", "1"),
+        ("received_at", "5"),
+        ("reflected_at", if reflected { "6" } else { "NULL" }),
+        (
+            "nonce_hash",
+            if reflected { "NULL" } else { "zeroblob(32)" },
+        ),
+        (
+            "reflect_env",
+            if reflected { "NULL" } else { "zeroblob(40)" },
+        ),
+        ("id", "NULL"),
+    ];
+    let names: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
+    let values: Vec<String> = columns
+        .iter()
+        .map(|(name, value)| {
+            over.iter()
+                .find(|(other, _)| other == name)
+                .map_or_else(|| (*value).to_owned(), |(_, value)| value.clone())
+        })
+        .collect();
+    format!(
+        "INSERT INTO csp_inbound ({}) VALUES ({})",
+        names.join(", "),
+        values.join(", ")
+    )
+}
+
+/// Each CHECK of schema 5 takes its good row and refuses the bad one AT EVERY STATE (`pending` and `reflected`), on both
+/// sides of each size (N and N+1), with the NULLs a CHECK alone would pass, the types STRICT refuses and the `UNIQUE` of
+/// step 0. Literal SQL on the real migration.
+#[test]
+fn inbound_each_check_of_schema_5_refuses_its_bad_row_and_takes_the_good_one() {
+    let s = |v: &str| v.to_owned();
+    let blob = |n: usize| format!("zeroblob({n})");
+    let text = |n: usize| format!("'{}'", "a".repeat(n));
+    // (name, the state it starts from: reflected?, the columns it changes, taken?)
+    type Case<'a> = (&'a str, bool, Vec<(&'a str, String)>, bool);
+    let mut cases: Vec<Case<'_>> = Vec::new();
+    for reflected in [false, true] {
+        cases.extend([
+            ("the good row", reflected, vec![], true),
+            (
+                "a sender of 7",
+                reflected,
+                vec![("sender", s("'L1CHKID'"))],
+                false,
+            ),
+            (
+                "a sender of 9",
+                reflected,
+                vec![("sender", s("'L1CHKID89'"))],
+                false,
+            ),
+            ("no sender", reflected, vec![("sender", s("NULL"))], false),
+            (
+                "a sender as a blob",
+                reflected,
+                vec![("sender", s("X'4C31434B49443838'"))],
+                false,
+            ),
+            (
+                "no message id",
+                reflected,
+                vec![("message_id", s("NULL"))],
+                false,
+            ),
+            (
+                "a message id of the high bit",
+                reflected,
+                vec![("message_id", s("-9223372036854775808"))],
+                true,
+            ),
+            (
+                "a message id as text",
+                reflected,
+                vec![("message_id", s("'x'"))],
+                false,
+            ),
+            (
+                "another state",
+                reflected,
+                vec![("state", s("'acked'"))],
+                false,
+            ),
+            (
+                "a state in capitals",
+                reflected,
+                vec![("state", s("'PENDING'"))],
+                false,
+            ),
+            ("no state", reflected, vec![("state", s("NULL"))], false),
+            ("no ack owed", reflected, vec![("ack", s("0"))], true),
+            ("an ack of 2", reflected, vec![("ack", s("2"))], false),
+            ("an ack of -1", reflected, vec![("ack", s("-1"))], false),
+            ("no ack", reflected, vec![("ack", s("NULL"))], false),
+            (
+                "no receipt owed",
+                reflected,
+                vec![("receipt", s("0"))],
+                true,
+            ),
+            (
+                "a receipt of 2",
+                reflected,
+                vec![("receipt", s("2"))],
+                false,
+            ),
+            ("no receipt", reflected, vec![("receipt", s("NULL"))], false),
+            (
+                "no received_at",
+                reflected,
+                vec![("received_at", s("NULL"))],
+                false,
+            ),
+            (
+                "a received_at as text",
+                reflected,
+                vec![("received_at", s("'x'"))],
+                false,
+            ),
+            ("an id as text", reflected, vec![("id", s("'x'"))], false),
+        ]);
+    }
+    cases.extend([
+        // pending: its reflect and its nonce's hash are there, no reflected time.
+        (
+            "pending with a reflected time",
+            false,
+            vec![("reflected_at", s("6"))],
+            false,
+        ),
+        (
+            "pending without its nonce",
+            false,
+            vec![("nonce_hash", s("NULL"))],
+            false,
+        ),
+        (
+            "pending with a nonce of 31",
+            false,
+            vec![("nonce_hash", blob(31))],
+            false,
+        ),
+        (
+            "pending with a nonce of 33",
+            false,
+            vec![("nonce_hash", blob(33))],
+            false,
+        ),
+        (
+            "pending with a nonce as text",
+            false,
+            vec![("nonce_hash", text(32))],
+            false,
+        ),
+        (
+            "pending without its reflect",
+            false,
+            vec![("reflect_env", s("NULL"))],
+            false,
+        ),
+        (
+            "pending with a reflect of 39",
+            false,
+            vec![("reflect_env", blob(39))],
+            false,
+        ),
+        (
+            "pending with a reflect of 40",
+            false,
+            vec![("reflect_env", blob(40))],
+            true,
+        ),
+        (
+            "pending with a reflect of 65516",
+            false,
+            vec![("reflect_env", blob(65_516))],
+            true,
+        ),
+        (
+            "pending with a reflect of 65517",
+            false,
+            vec![("reflect_env", blob(65_517))],
+            false,
+        ),
+        (
+            "pending with a reflect as text",
+            false,
+            vec![("reflect_env", text(40))],
+            false,
+        ),
+        // reflected: its time is there, its reflect and its nonce's hash are gone.
+        (
+            "reflected without its time",
+            true,
+            vec![("reflected_at", s("NULL"))],
+            false,
+        ),
+        (
+            "reflected with a nonce",
+            true,
+            vec![("nonce_hash", blob(32))],
+            false,
+        ),
+        (
+            "reflected with a reflect",
+            true,
+            vec![("reflect_env", blob(40))],
+            false,
+        ),
+        (
+            "reflected with a time as text",
+            true,
+            vec![("reflected_at", s("'x'"))],
+            false,
+        ),
+    ]);
+    for (name, reflected, over, taken) in &cases {
+        let state = if *reflected { "reflected" } else { "pending" };
+        assert_eq!(
+            takes(&[inbound_insert(*reflected, over).as_str()]),
+            *taken,
+            "{name} ({state})"
+        );
+    }
+    // UNIQUE (sender, message_id), at every state: a second row of the same message is refused, whatever its state; the
+    // same id of another sender, and another id of the same sender, are taken.
+    let good = |reflected: bool| inbound_insert(reflected, &[]);
+    for (first, second) in [(false, false), (false, true), (true, false), (true, true)] {
+        assert!(
+            !takes(&[good(first).as_str(), good(second).as_str()]),
+            "a message twice ({first}, {second})"
+        );
+    }
+    assert!(takes(&[
+        good(false).as_str(),
+        inbound_insert(false, &[("sender", s("'L1CHKID9'"))]).as_str(),
+        inbound_insert(true, &[("message_id", s("2"))]).as_str(),
+    ]));
+    // `state` moves only with its columns: REFLECTED's update is taken, a half move is refused.
+    let moved = |set: &str| {
+        takes(&[
+            good(false).as_str(),
+            format!("UPDATE csp_inbound SET {set} WHERE id = 1").as_str(),
+        ])
+    };
+    assert!(moved(
+        "state = 'reflected', reflected_at = 9, nonce_hash = NULL, reflect_env = NULL"
+    ));
+    assert!(!moved(
+        "state = 'reflected', reflected_at = 9, reflect_env = NULL"
+    ));
+    assert!(!moved(
+        "state = 'reflected', reflected_at = 9, nonce_hash = NULL"
+    ));
+    assert!(!moved(
+        "state = 'reflected', nonce_hash = NULL, reflect_env = NULL"
+    ));
+}
+
+/// ZONE RECEIVE with literal rows: a kept text (a receipt owed), a discard with its nonce and a job, a kept poll vote of
+/// the other peer (flag 0x04: no ack; deferred as `csp`), a discard before decryption (nothing). ONE zone: the two
+/// `pending` rows, the text's events in ONE `core_outbox` row, the vote's `deferred` row of source `csp`, the three CSP
+/// nonces and the two reflects' D2D nonces, the job's row; step 0 then finds each kept message by (sender, id) and no
+/// other.
+#[test]
+fn inbound_receive_writes_a_batch_in_one_zone_with_literal_rows() {
+    use kourier_threema::store::{DeferredSource, deferred_page};
+    let t = temp_store();
+    let db = &t.db;
+    inbound_linked(db);
+    let wake = Rc::new(Notify::new());
+    let text = inbound_text(IN_PEER, 1);
+    let vote = inbound_plaintext(IN_OTHER, 3, 0x16, vec![7; 20]);
+    let (r1, r3) = (inbound_reflect(1), inbound_reflect(3));
+    let jobs = [inbound_job(IN_OTHER)];
+    let vote_kept = Kept {
+        flags: 0x04,
+        ack: false,
+        ..inbound_kept(IN_OTHER, 3, &vote, &r3, false)
+    };
+    let received = receive_inbound(
+        db,
+        &receiving(&wake, IN_T0),
+        &[
+            Inbound::Keep(inbound_kept(IN_PEER, 1, &text, &r1, true)),
+            Inbound::Discard(Discarded {
+                nonce_hash: Some([0xC2; 32]),
+                jobs: &jobs,
+                contact: None,
+            }),
+            Inbound::Keep(vote_kept),
+            Inbound::Discard(Discarded {
+                nonce_hash: None,
+                jobs: &[],
+                contact: None,
+            }),
+        ],
+    )
+    .expect("the zone");
+    assert_eq!(
+        received,
+        [
+            Received::Kept(1),
+            Received::Discarded,
+            Received::Kept(2),
+            Received::Discarded
+        ]
+    );
+    assert_eq!(
+        inbound_all(db),
+        [
+            pending_row(1, IN_PEER, 1, true, true),
+            pending_row(2, IN_OTHER, 3, false, false)
+        ]
+    );
+    let events = outbox_events(db);
+    let peer = kourier_model::ConvKey::Direct(UserId::from_parts("threema", IN_PEER).expect("id"));
+    assert!(
+        matches!(events.as_slice(), [row] if matches!(row.as_slice(), [BackendEvent::Message(m)] if m.conv == peer)),
+        "the text's events are not ONE row with its message"
+    );
+    let deferred = db
+        .read(|conn: &Connection| deferred_page(conn, u32::MAX, 0))
+        .expect("the deferred rows");
+    assert!(
+        deferred.len() == 1
+            && deferred[0].source == DeferredSource::Csp
+            && deferred[0].kind == "poll-vote"
+            && deferred[0].server_at == IN_AT
+            && deferred[0].flags == 0x04
+            && deferred[0].received_at == IN_T0
+            && deferred[0].envelope.as_slice() == vote.as_slice(),
+        "the vote is not ONE csp row with its plaintext"
+    );
+    for hash in [[0xC1; 32], [0xC2; 32], [0xC3; 32]] {
+        assert!(
+            has_nonce(db, NonceScope::Csp, hash),
+            "a CSP nonce is missing"
+        );
+    }
+    for hash in [[0xD1; 32], [0xD3; 32]] {
+        assert!(
+            has_nonce(db, NonceScope::D2d, hash),
+            "a reflect's nonce is missing"
+        );
+    }
+    let jobs = tasks(db);
+    assert!(
+        jobs.len() == 1 && jobs[0].kind == "l1-job" && jobs[0].origin == SendOrigin::Job,
+        "the discard's job is not one row"
+    );
+    let step_0 = |sender: &str, n: u8| {
+        db.read(|conn: &Connection| inbound_row(conn, sender, inbound_id(n)))
+            .expect("step 0")
+    };
+    assert_eq!(
+        step_0(IN_PEER, 1),
+        Some(pending_row(1, IN_PEER, 1, true, true))
+    );
+    assert_eq!(step_0(IN_OTHER, 1), None, "another sender's id");
+    assert_eq!(step_0(IN_PEER, 3), None, "another id of the sender");
+    assert_eq!(step_0(IN_PEER, 2), None, "a discard has no row");
+}
+
+/// What a decision before the zone could not see: a second copy of a kept message in the same batch (another nonce)
+/// writes nothing (`Known`: held, step 0 resumes it), a kept message whose CSP nonce the first one used writes nothing
+/// (`NonceUsed`: step 2's discard); a reflect whose D2D nonce is in the store fails the whole zone, and nothing of it
+/// stays.
+#[test]
+fn inbound_a_copy_or_a_used_nonce_writes_nothing_of_it_and_a_used_reflect_nonce_fails_the_zone() {
+    let t = temp_store();
+    let db = &t.db;
+    inbound_linked(db);
+    let wake = Rc::new(Notify::new());
+    let (text, again, other) = (
+        inbound_text(IN_PEER, 1),
+        inbound_text(IN_PEER, 1),
+        inbound_text(IN_OTHER, 2),
+    );
+    let (r1, r9, r2) = (inbound_reflect(1), inbound_reflect(9), inbound_reflect(2));
+    let copy = Kept {
+        nonce_hash: [0xC9; 32],
+        d2d_hash: [0xD9; 32],
+        ..inbound_kept(IN_PEER, 1, &again, &r9, true)
+    };
+    let reused = Kept {
+        nonce_hash: [0xC1; 32],
+        ..inbound_kept(IN_OTHER, 2, &other, &r2, true)
+    };
+    let received = receive_inbound(
+        db,
+        &receiving(&wake, IN_T0),
+        &[
+            Inbound::Keep(inbound_kept(IN_PEER, 1, &text, &r1, true)),
+            Inbound::Keep(copy),
+            Inbound::Keep(reused),
+        ],
+    )
+    .expect("the zone");
+    assert_eq!(
+        received,
+        [Received::Kept(1), Received::Known, Received::NonceUsed]
+    );
+    assert_eq!(inbound_all(db), [pending_row(1, IN_PEER, 1, true, true)]);
+    assert_eq!(outbox_events(db).len(), 1, "only the first copy's events");
+    for (scope, hash) in [
+        (NonceScope::Csp, [0xC9; 32]),
+        (NonceScope::D2d, [0xD9; 32]),
+        (NonceScope::D2d, [0xD2; 32]),
+    ] {
+        assert!(
+            !has_nonce(db, scope, hash),
+            "a message written not at all left a nonce"
+        );
+    }
+    // A reflect nonce in the store: the zone fails by its content, nothing of it stays (the other message neither).
+    let fresh = inbound_text(IN_OTHER, 4);
+    let r4 = inbound_reflect(4);
+    let used = Kept {
+        d2d_hash: [0xD1; 32],
+        ..inbound_kept(IN_OTHER, 4, &fresh, &r4, true)
+    };
+    let error = receive_inbound(
+        db,
+        &receiving(&wake, IN_T0 + 1),
+        &[
+            Inbound::Keep(inbound_kept(IN_OTHER, 2, &other, &r2, true)),
+            Inbound::Keep(used),
+        ],
+    )
+    .expect_err("a used reflect nonce");
+    assert!(
+        matches!(error, StoreError::Failed(_)),
+        "not the content's failure: {error:?}"
+    );
+    assert_eq!(inbound_all(db), [pending_row(1, IN_PEER, 1, true, true)]);
+    assert_eq!(outbox_events(db).len(), 1);
+    assert!(
+        !has_nonce(db, NonceScope::Csp, [0xC2; 32]),
+        "a rolled-back zone left a nonce"
+    );
+}
+
+/// ZONE REFLECTED with literal rows: four `pending` rows of two senders (three owe a receipt, one no ack), the reflect-
+/// acks of all four and of a row that is not there: each row `reflected` at the zone's time with its reflect and its
+/// nonce's hash dropped, ONE receipt job per sender (the ids in arrival order), the acks returned in the order given
+/// (the missing row not among them); a second ack of a moved row moves nothing and enqueues nothing.
+#[test]
+fn inbound_reflected_moves_the_rows_and_coalesces_one_receipt_per_sender() {
+    use std::cell::RefCell;
+    let t = temp_store();
+    let db = &t.db;
+    inbound_linked(db);
+    let wake = Rc::new(Notify::new());
+    let texts: Vec<(Vec<u8>, Vec<u8>)> = (1..=4u8)
+        .map(|n| {
+            let sender = if n % 2 == 1 { IN_PEER } else { IN_OTHER };
+            (inbound_text(sender, n), inbound_reflect(n))
+        })
+        .collect();
+    let kept: Vec<Inbound<'_>> = texts
+        .iter()
+        .zip(1u8..)
+        .map(|((text, reflect), n)| {
+            let sender = if n % 2 == 1 { IN_PEER } else { IN_OTHER };
+            Inbound::Keep(Kept {
+                ack: n != 4,
+                ..inbound_kept(sender, n, text, reflect, n != 4)
+            })
+        })
+        .collect();
+    receive_inbound(db, &receiving(&wake, IN_T0), &kept).expect("the rows before");
+    let calls: RefCell<Vec<(String, Vec<u64>)>> = RefCell::new(Vec::new());
+    let receipt = |sender: &str, ids: &[u64]| {
+        calls.borrow_mut().push((sender.to_owned(), ids.to_vec()));
+        inbound_receipt(sender, ids)
+    };
+    let acks =
+        mark_inbound_reflected(db, &[1, 2, 3, 4, 99], IN_T0 + 7, &receipt).expect("the zone");
+    let ack = |id: i64, sender: &str, n: u8, ack: bool| InboundAck {
+        id,
+        sender: sender.to_owned(),
+        message_id: inbound_id(n),
+        ack,
+    };
+    assert_eq!(
+        acks,
+        [
+            ack(1, IN_PEER, 1, true),
+            ack(2, IN_OTHER, 2, true),
+            ack(3, IN_PEER, 3, true),
+            ack(4, IN_OTHER, 4, false)
+        ]
+    );
+    assert_eq!(
+        *calls.borrow(),
+        [
+            (IN_PEER.to_owned(), vec![inbound_id(1), inbound_id(3)]),
+            (IN_OTHER.to_owned(), vec![inbound_id(2)])
+        ],
+        "not one receipt per sender, its ids in arrival order"
+    );
+    let rows = inbound_all(db);
+    for (row, n) in rows.iter().zip(1u8..) {
+        let sender = if n % 2 == 1 { IN_PEER } else { IN_OTHER };
+        assert_eq!(
+            *row,
+            InboundRow {
+                id: i64::from(n),
+                sender: sender.to_owned(),
+                message_id: inbound_id(n),
+                state: InboundState::Reflected,
+                ack: n != 4,
+                receipt: n != 4,
+                received_at: IN_T0,
+                reflected_at: Some(IN_T0 + 7),
+                nonce_hash: None,
+                reflect_env: None,
+            }
+        );
+    }
+    let jobs = tasks(db);
+    assert!(
+        jobs.len() == 2
+            && jobs
+                .iter()
+                .all(|j| j.kind == "receipt" && j.origin == SendOrigin::Job),
+        "not two receipt jobs"
+    );
+    // The nonces of a reflected row stay for good.
+    assert!(has_nonce(db, NonceScope::Csp, [0xC1; 32]));
+    let again = mark_inbound_reflected(db, &[1], IN_T0 + 8, &receipt).expect("again");
+    assert!(again.is_empty(), "a moved row moved again");
+    assert_eq!(tasks(db).len(), 2, "a second ack enqueued a receipt");
+    assert_eq!(calls.borrow().len(), 2);
+}
+
+/// THE SWEEP goes by each row's own age and state: a `pending` row past 30 days goes WITH its CSP nonce (T-L5 (b)), one
+/// at exactly 30 days stays with its nonce; a `reflected` row past 14 days goes, one at exactly 14 days stays, and the
+/// nonce of a reflected message stays for good; a young `pending` row stays. A second sweep finds nothing.
+#[test]
+fn inbound_the_sweep_goes_by_each_rows_own_age_and_takes_a_pending_rows_nonce() {
+    const NOW: i64 = 1_800_000_000_000;
+    const DAY14: i64 = 1_209_600_000;
+    const DAY30: i64 = 2_592_000_000;
+    let t = temp_store();
+    let db = &t.db;
+    let pending = |sender: &str, received_at: i64, nonce: u8| {
+        inbound_insert(
+            false,
+            &[
+                ("sender", format!("'{sender}'")),
+                ("received_at", received_at.to_string()),
+                (
+                    "nonce_hash",
+                    format!("X'{}'", format!("{nonce:02X}").repeat(32)),
+                ),
+            ],
+        )
+    };
+    let reflected = |sender: &str, reflected_at: i64| {
+        inbound_insert(
+            true,
+            &[
+                ("sender", format!("'{sender}'")),
+                ("received_at", "1".to_owned()),
+                ("reflected_at", reflected_at.to_string()),
+            ],
+        )
+    };
+    let nonce = |byte: u8| {
+        format!(
+            "INSERT INTO csp_nonce (hash) VALUES (X'{}')",
+            format!("{byte:02X}").repeat(32)
+        )
+    };
+    db.zone(|tx| {
+        for statement in [
+            pending("L1SWEEP1", NOW - DAY30 - 1, 0xA1),
+            pending("L1SWEEP2", NOW - DAY30, 0xA2),
+            reflected("L1SWEEP3", NOW - DAY14 - 1),
+            reflected("L1SWEEP4", NOW - DAY14),
+            pending("L1SWEEP5", NOW, 0xA5),
+            nonce(0xA1),
+            nonce(0xA2),
+            nonce(0xA5),
+            // The nonce of the reflected messages: no row names it.
+            nonce(0xA3),
+        ] {
+            tx.execute(&statement, [])?;
+        }
+        Ok::<(), kourier_db::Error>(())
+    })
+    .expect("the rows");
+    assert_eq!(
+        sweep_inbound(db, NOW).expect("the sweep"),
+        InboundSwept {
+            reflected: 1,
+            pending: 1
+        }
+    );
+    let left: Vec<String> = inbound_all(db).into_iter().map(|r| r.sender).collect();
+    assert_eq!(left, ["L1SWEEP2", "L1SWEEP4", "L1SWEEP5"]);
+    assert!(
+        !has_nonce(db, NonceScope::Csp, [0xA1; 32]),
+        "the expired row's nonce stayed"
+    );
+    for byte in [0xA2, 0xA3, 0xA5] {
+        assert!(
+            has_nonce(db, NonceScope::Csp, [byte; 32]),
+            "a nonce that stays went"
+        );
+    }
+    assert_eq!(
+        sweep_inbound(db, NOW).expect("again"),
+        InboundSwept::default()
+    );
+    assert_eq!(RULE_PENDING_EXPIRED, "inbound-pending-expired");
+}
+
+/// The test door fails the zone it names with its code after the zone's writes, and nothing of the zone stays: RECEIVE
+/// (the store's 13), REFLECTED (the content's 275), the sweep (13); an empty point turns it off.
+#[test]
+fn inbound_the_door_fails_each_zone_and_nothing_of_it_stays() {
+    use kourier_threema::failpoints as fp;
+    let t = temp_store();
+    let db = &t.db;
+    inbound_linked(db);
+    let wake = Rc::new(Notify::new());
+    let text = inbound_text(IN_PEER, 1);
+    let r1 = inbound_reflect(1);
+    let batch = [Inbound::Keep(inbound_kept(IN_PEER, 1, &text, &r1, true))];
+    let code = |e: StoreError| match e {
+        StoreError::Sql { code, .. } => code,
+        _ => None,
+    };
+    fail_inbound_zone(fp::INSIDE_INBOUND_RECEIVE, 13);
+    let error = receive_inbound(db, &receiving(&wake, IN_T0), &batch).expect_err("the door");
+    assert_eq!(code(error), Some(13));
+    assert!(inbound_all(db).is_empty() && outbox_events(db).is_empty());
+    assert!(!has_nonce(db, NonceScope::Csp, [0xC1; 32]));
+    fail_inbound_zone("", 0);
+    receive_inbound(db, &receiving(&wake, IN_T0), &batch).expect("the door is off");
+    fail_inbound_zone(fp::INSIDE_INBOUND_REFLECTED, 275);
+    let error =
+        mark_inbound_reflected(db, &[1], IN_T0 + 1, &inbound_receipt).expect_err("the door");
+    assert_eq!(code(error), Some(275));
+    assert_eq!(inbound_all(db), [pending_row(1, IN_PEER, 1, true, true)]);
+    assert!(tasks(db).is_empty(), "a failed zone left its receipt");
+    fail_inbound_zone(fp::INSIDE_INBOUND_SWEEP, 13);
+    let error = sweep_inbound(db, i64::MAX).expect_err("the door");
+    assert_eq!(code(error), Some(13));
+    assert_eq!(inbound_all(db).len(), 1, "a failed sweep took a row");
+    fail_inbound_zone("", 0);
+    assert_eq!(
+        sweep_inbound(db, i64::MAX).expect("the door is off"),
+        InboundSwept {
+            reflected: 0,
+            pending: 1
+        }
+    );
 }

@@ -247,6 +247,13 @@ SPDX-FileCopyrightText = ["Threema AG", "2026 The Kourier developers"]
 SPDX-License-Identifier = "AGPL-3.0-only"
 precedence = "override"
 
+# TH6 L7: Desktop's incoming specs as sequence oracles (behaviour ported, no code copied; the same holders as the file above).
+[[annotations]]
+path = "crates/kourier-threema/tests/connection/leader_desktop.rs"
+SPDX-FileCopyrightText = ["Threema AG", "2026 The Kourier developers"]
+SPDX-License-Identifier = "AGPL-3.0-only"
+precedence = "override"
+
 # The blake2 manifest patch P3 renames: RustCrypto's file with Kourier's change. After the
 # patches/blake2/** block, so this one wins.
 [[annotations]]

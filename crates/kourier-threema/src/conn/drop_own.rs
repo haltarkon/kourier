@@ -125,7 +125,7 @@ pub(crate) async fn alone(a: Alone<'_>) -> Dropped {
         Answer::Absent if !a.file_new => Dropped::Removed,
         Answer::Absent => again(&a).await,
     };
-    tracing::info!(outcome = ?dropped, "the own device's drop on a socket of its own");
+    tracing::info!(outcome = ?dropped, "{}", super::lines::D4_DROP_ALONE);
     dropped
 }
 
@@ -244,7 +244,7 @@ impl AloneSocket<'_> {
                     return Answer::NotReached;
                 }
                 () = self.clock.sleep_until(self.until) => {
-                    tracing::info!(written = self.written, "the mediator did not answer the drop in time");
+                    tracing::info!(written = self.written, "{}", super::lines::D4_DROP_NO_ANSWER);
                     self.close(1000).await;
                     return Answer::NotReached;
                 }
@@ -254,7 +254,7 @@ impl AloneSocket<'_> {
                 Ok(WsEvent::Binary(datagram)) => {
                     if let Err(error) = self.proto.add_datagrams(vec![datagram]) {
                         let code = refusal(&error);
-                        tracing::warn!(what = "d2m", code, "the server's message was refused");
+                        refused(code, &error);
                         self.close(code).await;
                         return Answer::NotReached;
                     }
@@ -289,7 +289,7 @@ impl AloneSocket<'_> {
                 Ok(None) => return Turn::Waits,
                 Err(error) => {
                     let code = refusal(&error);
-                    tracing::warn!(what = "d2m", code, "the server's message was refused");
+                    refused(code, &error);
                     return Turn::Failed(code);
                 }
             }
@@ -329,6 +329,21 @@ enum Turn {
     Broken,
     /// Nothing more to do until the server says something.
     Waits,
+}
+
+/// E4 of the D2M-only socket: `what=d2m`, the close code, then the error's fixed words ([`super::lines::Refusal`], RT1
+/// attempt 1), never its text.
+fn refused(code: u16, error: &D2mProtocolError) {
+    let why = super::lines::Refusal::of_d2m(error);
+    tracing::warn!(
+        what = "d2m",
+        code,
+        kind = %why.kind,
+        name = why.name.map(tracing::field::display),
+        payload_type = why.payload_type,
+        "{}",
+        super::lines::E4_REFUSED
+    );
 }
 
 /// The close code of a refusal of what the server sent (`TP/md-d2m.struct.yml:71-73`: 4110 for a version Kourier does not

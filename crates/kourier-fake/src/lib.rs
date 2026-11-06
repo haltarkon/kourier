@@ -76,6 +76,7 @@ mod safety;
 mod script;
 pub mod scripts;
 pub mod telegram;
+pub mod threema;
 mod upload;
 
 pub use actor::{

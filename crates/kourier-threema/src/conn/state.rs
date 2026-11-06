@@ -12,6 +12,9 @@ use tokio::sync::watch;
 use crate::NetError;
 use crate::close::{Backoff, CloseError, LoggedOut, Next as Pace, Stop, Verdict, verdict};
 
+/// Critic T-H1: how long a socket that stepped aside for the phone waits before the next (the critic's 2 min).
+pub(crate) const YIELD_PAUSE: Duration = Duration::from_secs(2 * 60);
+
 /// How one socket ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -66,6 +69,22 @@ pub(crate) enum Outcome {
     /// RP-b: the mediator dropped the own device at the actor's ask (its ack, or its 4113 / 4114 after the ask); the
     /// task ends (`conn::End::Dropped`) before the table is asked.
     Dropped,
+    /// THE H1 GUARD (TH6 C1, `TP/csp.struct.yml:688-689`): the chat server sent a message on a socket that may not take
+    /// one (not the leader, or its unblock has not gone): the client closed with 1000 and acked nothing; the server keeps
+    /// the message for the device that leads. Not the row's failure: through the backoff as a lost network.
+    Unasked {
+        /// How long the socket had been up since `ServerInfo`.
+        up_for: Duration,
+    },
+    /// TH6 FIX-B, P-L6: the leader recycled the socket because boxes were refused for room (critic T-H2) although NOT ONE
+    /// message was acked on it (everything it took was held): the client closed with 1000, and the next socket comes
+    /// after one backoff step ([`Backoff::STEP`]), not counted, as [`Outcome::HeldFull`]'s: a backlog the leader cannot
+    /// get through must not make it reconnect in a tight loop. With an ack on the socket the recycle is [`Outcome::Stale`].
+    NoProgress,
+    /// TH6 L6, critic T-H1's STEP-ASIDE: the leader socket held a message only the phone resolves and the mediator showed
+    /// another device connected: the client closed with 1000 ONCE so the mediator can promote that device. Not a failed
+    /// run, not counted; the next socket after [`YIELD_PAUSE`] (a hint connects at once, as after any wait).
+    Yield,
     /// The server closed the socket (1006: it ended without a close frame).
     Closed {
         /// The close code.
@@ -120,9 +139,12 @@ impl Outcome {
             | Self::Protocol { .. }
             | Self::ClockSkew { .. }
             | Self::HeldFull
+            | Self::NoProgress
             | Self::Store { .. }
             | Self::JoinRefused
-            | Self::Dropped => false,
+            | Self::Dropped
+            | Self::Unasked { .. }
+            | Self::Yield => false,
         }
     }
 }
@@ -134,9 +156,13 @@ pub(crate) fn next(outcome: &Outcome, backoff: &mut Backoff) -> Next {
         // A refused join and a dropped device end the task before the table (`conn::run`).
         Outcome::Stopped | Outcome::JoinRefused | Outcome::Dropped => return Next::Stopped,
         Outcome::Stale => return Next::After(Duration::ZERO),
+        // T-H1: the phone gets its moment to take the lead; not counted.
+        Outcome::Yield => return Next::After(YIELD_PAUSE),
         // S10: not a tight loop while zone 2 is pending: one backoff step at most (`conn::run` also
         // connects as soon as the file is ready); not counted.
         Outcome::HeldFull => return Next::After(Backoff::STEP),
+        // P-L6: a recycle with nothing acked on the socket: the same one step, not counted.
+        Outcome::NoProgress => return Next::After(Backoff::STEP),
         // C2: held; a `Connect` or a hint measures again (a clock NTP fixed after a wake).
         Outcome::ClockSkew { skew_ms } => {
             return Next::Hold {
@@ -145,7 +171,7 @@ pub(crate) fn next(outcome: &Outcome, backoff: &mut Backoff) -> Next {
             };
         }
         Outcome::NotReached(NetError::Untrusted(kind)) => {
-            tracing::warn!(?kind, "the server's certificate is not one Kourier trusts");
+            tracing::warn!(?kind, "{}", super::lines::E3_UNTRUSTED);
             return Next::Hold {
                 action: UserAction::UpdateApp,
                 hints: true,
@@ -159,9 +185,10 @@ pub(crate) fn next(outcome: &Outcome, backoff: &mut Backoff) -> Next {
         Outcome::NotReached(NetError::Failed(_) | NetError::Refused(_)) | Outcome::TimedOut => {
             (again, Duration::ZERO)
         }
-        Outcome::Dead { up_for } | Outcome::NoAck { up_for } | Outcome::Store { up_for } => {
-            (again, *up_for)
-        }
+        Outcome::Dead { up_for }
+        | Outcome::NoAck { up_for }
+        | Outcome::Store { up_for }
+        | Outcome::Unasked { up_for } => (again, *up_for),
         Outcome::Protocol {
             unsupported: true, ..
         } => {
@@ -351,9 +378,12 @@ mod tests {
             },
             Outcome::ClockSkew { skew_ms: 1 },
             Outcome::HeldFull,
+            Outcome::NoProgress,
             Outcome::Store { up_for },
             Outcome::JoinRefused,
             Outcome::Dropped,
+            Outcome::Unasked { up_for },
+            Outcome::Yield,
         ] {
             assert!(!not.is_failed_run(), "{not:?}");
         }
@@ -381,6 +411,47 @@ mod tests {
         assert_eq!(next(&short, &mut b), Next::After(Duration::from_secs(10)));
     }
 
+    /// TH6 C1: an unasked chat server message goes through the backoff as a lost network does: counted under a minute up
+    /// (5 s, then 10 s), and after a minute up the count starts again.
+    #[test]
+    fn an_unasked_message_goes_through_the_backoff_like_a_dead_socket() {
+        let mut b = Backoff::default();
+        let mut dead = Backoff::default();
+        let short = Duration::from_secs(1);
+        for want in [5, 10] {
+            assert_eq!(
+                next(&Outcome::Unasked { up_for: short }, &mut b),
+                Next::After(Duration::from_secs(want))
+            );
+            assert_eq!(
+                next(&Outcome::Dead { up_for: short }, &mut dead),
+                Next::After(Duration::from_secs(want))
+            );
+        }
+        let long = Outcome::Unasked {
+            up_for: Duration::from_secs(60),
+        };
+        assert_eq!(next(&long, &mut b), Next::After(Duration::from_secs(5)));
+    }
+
+    /// TH6 L6 (critic T-H1): a socket that stepped aside waits two minutes, every time, and does not move the count of
+    /// failures.
+    #[test]
+    fn a_step_aside_waits_two_minutes_and_does_not_count() {
+        let mut b = Backoff::default();
+        for _ in 0..20 {
+            assert_eq!(
+                next(&Outcome::Yield, &mut b),
+                Next::After(Duration::from_secs(120))
+            );
+        }
+        assert_eq!(
+            next(&Outcome::TimedOut, &mut b),
+            Next::After(Backoff::STEP),
+            "a step-aside moved the count of failures"
+        );
+    }
+
     /// S10: a socket that ended over step 0's bound reconnects after ONE backoff step at most (the
     /// connection also connects as soon as the file is ready), never at once in a tight loop, and the
     /// count of failures does not move; a stale socket still reconnects at once.
@@ -398,6 +469,29 @@ mod tests {
             next(&Outcome::TimedOut, &mut b),
             Next::After(Backoff::STEP),
             "a held-full socket moved the count of failures"
+        );
+        assert_eq!(
+            next(&Outcome::Stale, &mut Backoff::default()),
+            Next::After(Duration::ZERO)
+        );
+    }
+
+    /// P-L6: a recycle for room with nothing acked on the socket waits ONE backoff step, as a held-full one does, and
+    /// the count of failures does not move; with an ack on the socket the recycle stays at once (`Outcome::Stale`).
+    #[test]
+    fn a_recycle_with_nothing_acked_waits_one_backoff_step_and_does_not_count() {
+        let mut b = Backoff::default();
+        for _ in 0..20 {
+            assert_eq!(
+                next(&Outcome::NoProgress, &mut b),
+                Next::After(Backoff::STEP),
+                "the wait of a socket that recycled with nothing acked"
+            );
+        }
+        assert_eq!(
+            next(&Outcome::TimedOut, &mut b),
+            Next::After(Backoff::STEP),
+            "a no-progress recycle moved the count of failures"
         );
         assert_eq!(
             next(&Outcome::Stale, &mut Backoff::default()),

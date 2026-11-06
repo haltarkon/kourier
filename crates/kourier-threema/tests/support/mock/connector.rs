@@ -6,9 +6,10 @@
 //!
 //! Hosts are `.invalid` (RFC 6761): the mediator is `mediator-<p4>.invalid`, the rendezvous relay
 //! (TH4 J2, [`super::relay`]) `rendezvous-<p4>.invalid` (asked for as `WsKind::Rendezvous`, the
-//! client is its RID); every other host (the directory and the blob mirror later) is REFUSED,
-//! counted and recorded as a violation, and so is every HTTPS request. A misrouted real dial could
-//! not resolve. The scripted joiners of the world ([`super::joiner`]) are pumped at every
+//! client is its RID); every other host (the blob mirror later) is REFUSED, counted and recorded as a
+//! violation, and so is every HTTPS request but those to the DIRECTORY (TH6 L2b, [`super::directory`]:
+//! `https://directory.invalid/`, served from the world's identity table, delayed by
+//! [`Net::hold_directory`]). A misrouted real dial could not resolve. The scripted joiners of the world ([`super::joiner`]) are pumped at every
 //! [`Net::flush`], so a client that speaks to the relay gets the joiner's answer at once.
 
 use std::collections::BTreeMap;
@@ -23,6 +24,7 @@ use kourier_threema::{
 };
 
 use super::d2m::{ConnId, Mediator, Out};
+use super::directory::{Directory, is_directory};
 use super::joiner::Joiner;
 use super::relay::{RELAY_URL, Relay, Role, SideId, is_relay_host};
 use super::{MockWorld, Violations, lock};
@@ -32,8 +34,9 @@ pub const MEDIATOR_URL: &str =
     "wss://mediator-{deviceGroupIdPrefix4}.invalid/{deviceGroupIdPrefix8}/";
 /// The rendezvous relay's URL template (TH4 J2: served by [`super::relay`]).
 pub const RENDEZVOUS_URL: &str = RELAY_URL;
-/// The other servers of the parts: hosts the fake does not serve yet (refused and counted).
+/// The directory's base URL (TH6 L2b: served by [`super::directory`]).
 pub const DIRECTORY_URL: &str = "https://directory.invalid/";
+/// The other server of the parts: a host the fake does not serve yet (refused and counted).
 pub const BLOB_URL: &str = "https://blob.invalid/";
 
 /// The host of a `wss://` or `https://` URL (between the scheme and the first `/`), if it has one.
@@ -55,6 +58,15 @@ fn is_mediator_host(host: &str) -> bool {
 struct Inner {
     mediator: Mediator,
     relay: Relay,
+    /// TH6 L2b: the directory the HTTPS client serves.
+    directory: Directory,
+    /// TH6 L2b: while `true`, every directory request pends (a directory that is slow to answer) until it is set back;
+    /// the client's own deadline drops a pending request.
+    hold_directory: tokio::sync::watch::Sender<bool>,
+    /// How many directory requests started to pend.
+    directory_held: AtomicUsize,
+    /// How many directory requests pend NOW (neither served nor dropped by the client).
+    directory_pending: AtomicUsize,
     violations: Violations,
     /// The connector's open relay sides (the client is the RID) and each one's event channel.
     relay_open: Mutex<BTreeMap<SideId, async_channel::Sender<WsEvent>>>,
@@ -114,10 +126,19 @@ impl std::fmt::Debug for Net {
 }
 
 impl Net {
-    pub fn new(mediator: Mediator, relay: Relay, violations: Violations) -> Self {
+    pub fn new(
+        mediator: Mediator,
+        relay: Relay,
+        directory: Directory,
+        violations: Violations,
+    ) -> Self {
         Self(Arc::new(Inner {
             mediator,
             relay,
+            directory,
+            hold_directory: tokio::sync::watch::channel(false).0,
+            directory_held: AtomicUsize::new(0),
+            directory_pending: AtomicUsize::new(0),
             violations,
             relay_open: Mutex::new(BTreeMap::new()),
             relay_opened: Mutex::new(Vec::new()),
@@ -148,6 +169,30 @@ impl Net {
 
     pub fn relay(&self) -> &Relay {
         &self.0.relay
+    }
+
+    /// TH6 L2b: the world's directory (its knobs and the requests it took).
+    pub fn directory(&self) -> &Directory {
+        &self.0.directory
+    }
+
+    /// TH6 L2b: while `held`, every directory request pends (counted in [`Net::directory_held`] when it starts) until
+    /// this is called with `false`, then it is served by the knobs of that moment; a request the client gave up on is
+    /// dropped.
+    pub fn hold_directory(&self, held: bool) {
+        self.0.hold_directory.send_replace(held);
+    }
+
+    /// TH6 L2b: how many directory requests started to pend ([`Net::hold_directory`]).
+    pub fn directory_held(&self) -> usize {
+        self.0.directory_held.load(Ordering::SeqCst)
+    }
+
+    /// How many directory requests pend at this moment ([`Net::hold_directory`]): one that was served, or that the client
+    /// gave up on (its future dropped), no longer counts. A client's lookup that pends keeps a timer of its own on the
+    /// actor's clock (its bound), which [`Net::directory_held`] cannot tell from a lookup that ended.
+    pub fn directory_pending(&self) -> usize {
+        self.0.directory_pending.load(Ordering::SeqCst)
     }
 
     /// Pumps `joiner` at every [`Net::flush`] from now on.
@@ -263,7 +308,7 @@ impl Net {
         self.0.refused_hosts.load(Ordering::SeqCst)
     }
 
-    /// How many HTTPS requests were refused (every one, in TH2).
+    /// How many HTTPS requests were refused (every one but the directory's, TH6 L2b).
     pub fn refused_https(&self) -> usize {
         self.0.refused_https.load(Ordering::SeqCst)
     }
@@ -367,7 +412,7 @@ impl Net {
         MockConnector(self.clone())
     }
 
-    /// The fake's HTTPS client: refuses every request (TH2 serves no HTTPS host).
+    /// The fake's HTTPS client: serves the directory (TH6 L2b) and refuses every other request.
     pub fn https(&self) -> MockHttps {
         MockHttps(self.clone())
     }
@@ -552,13 +597,43 @@ impl WsSender for MockSender {
     }
 }
 
-/// The in-process `HttpsClient`: TH2 serves no HTTPS host (directory TH6a, blob mirror TH8), so
-/// every request is refused, counted and recorded.
+/// One request in [`Net::directory_pending`] while it lives: counted when made, uncounted when dropped (served, or the
+/// client's future dropped).
+struct Pending<'a>(&'a AtomicUsize);
+
+impl<'a> Pending<'a> {
+    fn count(gauge: &'a AtomicUsize) -> Self {
+        gauge.fetch_add(1, Ordering::SeqCst);
+        Self(gauge)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The in-process `HttpsClient`: the directory's host is served by [`super::directory`] (TH6 L2b; a request pends while
+/// [`Net::hold_directory`] holds); every other request (the blob mirror: TH8) is refused, counted and recorded.
 pub struct MockHttps(Net);
 
 #[async_trait]
 impl HttpsClient for MockHttps {
-    async fn execute(&self, _request: HttpsRequest) -> Result<HttpsResponse, NetError> {
+    async fn execute(&self, request: HttpsRequest) -> Result<HttpsResponse, NetError> {
+        let net = &self.0.0;
+        if is_directory(&request.url) {
+            let mut hold = net.hold_directory.subscribe();
+            if *hold.borrow() {
+                net.directory_held.fetch_add(1, Ordering::SeqCst);
+                let _pending = Pending::count(&net.directory_pending);
+                net.changed.notify_waiters();
+                let _ = hold.wait_for(|held| !*held).await;
+            }
+            let answer = net.directory.serve(&request);
+            net.changed.notify_waiters();
+            return answer;
+        }
         self.0.0.refused_https.fetch_add(1, Ordering::SeqCst);
         self.0
             .0

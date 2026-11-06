@@ -737,6 +737,7 @@ fn the_builders_identity_logs_in_to_the_fake_mediator() {
         ),
         csp_device_id: Some(0x0bad_cafe),
         split_hello: false,
+        early_hello: false,
     };
     let d = csp_connect(&w, &g, new_device(0x1234), &setup);
     assert!(d.logged_in(), "the joined identity did not log in");

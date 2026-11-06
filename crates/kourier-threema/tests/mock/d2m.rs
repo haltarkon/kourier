@@ -667,12 +667,13 @@ fn a_short_message_or_a_servers_type_from_the_client_is_a_protocol_error() {
 
 // --- Proof 12 (first half): a Proxy before the ClientHello ------------------------------------
 
-/// A Proxy the client sends before its ClientHello (Desktop sends its CSP client-hello so early)
-/// is held and handed on, in order, when the handshake ends.
+/// THE OLD HOLD (`Knobs::hold_early_proxy`, off by default since RT1 attempt 1): a Proxy the client sends before its
+/// ClientHello is held and handed on, in order, when the handshake ends.
 #[test]
 fn a_proxy_before_the_client_hello_is_held_not_lost() {
     let w = world(121);
     let g = group(&w);
+    w.mediator().knobs(|k| k.hold_early_proxy = true);
     let mut c = client(g.dgk, new_device(1));
     let m = w.mediator();
     c.conn = Some(m.connect(&c.url).expect("connect"));
@@ -707,6 +708,56 @@ fn a_proxy_before_the_client_hello_is_held_not_lost() {
         )),
         "the fake sent the client something unexpected"
     );
+    w.violations().assert_empty();
+}
+
+/// RT1 attempt 1, the real mediator's order and the fake's default: a Proxy before the ClientHello (a CSP client-hello)
+/// goes to the chat server AT ONCE, and the chat server's answer (the server-hello) reaches the client BEFORE
+/// `ServerInfo`; libthreema's handshake, which reads the datagram after its ClientHello as `ServerInfo`, refuses it.
+/// Nothing is held, and the fake records no violation (the server did what the real one does).
+#[test]
+fn a_proxy_before_the_client_hello_reaches_the_chat_server_at_once_and_its_answer_comes_before_server_info()
+ {
+    let w = world(122);
+    let g = group(&w);
+    let mut c = client(g.dgk, new_device(1));
+    let m = w.mediator();
+    let conn = m.connect(&c.url).expect("connect");
+    c.conn = Some(conn);
+    // A CSP client-hello: TCK (a public key) and CCK, 48 bytes.
+    let hello: Vec<u8> = (0..48u8)
+        .map(|i| i.wrapping_mul(5).wrapping_add(9))
+        .collect();
+    let d = c
+        .proto
+        .create_payload(OutgoingPayload::Proxy(hello.clone()))
+        .expect("the client may proxy before the handshake")
+        .outgoing_datagram
+        .expect("a datagram");
+    m.receive(conn, d.0);
+    assert_eq!(m.held_proxy_count(conn), 0, "held");
+    assert_eq!(m.proxied(conn), vec![hello], "not handed on at once");
+    pump(m, &mut c);
+    let out: Vec<String> = w
+        .trace()
+        .lines()
+        .iter()
+        .filter_map(|l| {
+            let t: Vec<&str> = l.split(' ').collect();
+            // The mediator's frames only (the chat server traces its own, `csp-*`).
+            (t.get(1) == Some(&conn.0.to_string().as_str())
+                && t.get(2) == Some(&"out")
+                && t.get(3).is_some_and(|k| !k.starts_with("csp-")))
+            .then(|| t[3].to_owned())
+        })
+        .collect();
+    assert_eq!(
+        out.iter().take(3).map(String::as_str).collect::<Vec<_>>(),
+        ["server-hello", "proxy", "server-info"],
+        "the chat server's answer did not come before ServerInfo: {out:?}"
+    );
+    assert!(c.failed, "libthreema took a Proxy before ServerInfo");
+    assert!(!c.online(), "the handshake ended");
     w.violations().assert_empty();
 }
 

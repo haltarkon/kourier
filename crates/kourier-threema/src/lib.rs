@@ -76,6 +76,10 @@
 //!   `encode` naming the three seals (rule 14); `receivers`, `prepare`: each receiver's fate and ZONE PREPARE;
 //!   `machine`: one row on one socket, sans-I/O; `shared`: what the actor and the socket share, with the cooling;
 //!   `attempt`: a `Transmit` behind the test door and every answer to the core. Nothing in a real build reaches it.
+//! - `leader` (TH6, being built): the leader's receive. `zone` (L1): schema 5's `csp_inbound`, ZONE RECEIVE (a batch
+//!   of messages taken from the chat server, kept ones mapped through the follower's own mapper with their sealed
+//!   reflect, in one zone), ZONE REFLECTED (with the delivery receipts as jobs), the sweep and the step-0 read. Nothing
+//!   in a real build calls it yet.
 //! - `logs`: which log records are libthreema's (by module path) and the level rule for them (WARN and
 //!   up, whatever the user's filter says); the app's log calls it (TH4 chunk L, C11).
 //! - `join` (TH4): the device join; the offer and the text of its QR code, the emoji of the rendezvous path
@@ -92,6 +96,7 @@ mod db;
 pub mod dial;
 mod error;
 mod join;
+mod leader;
 pub mod logs;
 mod msg_id;
 mod network;
@@ -202,6 +207,32 @@ pub mod failpoints {
     pub const INSIDE_SEND_GIVE_UP: &str = "threema_inside_send_give_up";
     /// A job's give-up: right after `COMMIT`.
     pub const AFTER_SEND_GIVE_UP: &str = "threema_after_send_give_up";
+    /// TH6, ZONE RECEIVE of the leader (`store::receive_inbound`: a batch of messages taken from the chat server, each
+    /// kept one with its events, jobs, both nonces and its `csp_inbound` row `pending` with the sealed reflect; each
+    /// discarded one with its nonce and jobs): inside the transaction, before any frame.
+    pub const INSIDE_INBOUND_RECEIVE: &str = "threema_inside_inbound_receive";
+    /// ZONE RECEIVE: right after `COMMIT`, before the reflects and the acks of the discards.
+    pub const AFTER_INBOUND_RECEIVE: &str = "threema_after_inbound_receive";
+    /// TH6, ZONE REFLECTED of the leader (`store::mark_inbound_reflected`: the rows whose reflect-ack came, `reflected`,
+    /// with the delivery-receipt jobs): inside the transaction, before any CSP ack.
+    pub const INSIDE_INBOUND_REFLECTED: &str = "threema_inside_inbound_reflected";
+    /// ZONE REFLECTED: right after `COMMIT`, before the CSP acks.
+    pub const AFTER_INBOUND_REFLECTED: &str = "threema_after_inbound_reflected";
+    /// TH6, the leader's sweep (`store::sweep_inbound`: `reflected` rows past 14 days, `pending` rows past 30 days with
+    /// their CSP nonces): inside the transaction.
+    pub const INSIDE_INBOUND_SWEEP: &str = "threema_inside_inbound_sweep";
+    /// The leader's sweep: right after `COMMIT`.
+    pub const AFTER_INBOUND_SWEEP: &str = "threema_after_inbound_sweep";
+    /// TH6 L4b: the k-th inbound `Reflect` of a socket is written, its ack not heard (`threema_after_inbound_reflect:k`).
+    pub const AFTER_INBOUND_REFLECT: &str = "threema_after_inbound_reflect";
+    /// TH6 L4b: the k-th CSP `message-ack` of an incoming message is written (`threema_after_inbound_ack:k`).
+    pub const AFTER_INBOUND_ACK: &str = "threema_after_inbound_ack";
+    /// TH6 L5: the leader's `BeginTransaction` (scope `CONTACT_SYNC`) is written, its answer not heard.
+    pub const AFTER_TX_BEGIN: &str = "threema_after_tx_begin";
+    /// TH6 L5: the `ContactSync` reflect inside the transaction is written, its ack not heard.
+    pub const AFTER_TX_REFLECT: &str = "threema_after_tx_reflect";
+    /// TH6 L5: `CommitTransaction` is written, its ack not heard.
+    pub const AFTER_TX_COMMIT: &str = "threema_after_tx_commit";
 }
 /// "Connect Anyway, until restart" of the clock warning (his Q4, decision C2): the account's
 /// connections ignore a clock that is off by more than 20 minutes until the Kourier process ends.

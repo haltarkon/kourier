@@ -96,7 +96,11 @@ frame count staying at 0; then, in starts with `--for-send`, the resend (killed 
 after a restart), the five send steps (the fake acks each frame and counts it: 9 of the 10 a start
 allows) and the refusal of the eleventh; a start with `--call-builtin` that the app's own warning
 line confirms and the plain starts around it that show none; `wipe` without its flag deletes nothing;
-`report`. The rehearsal's user types the fake's WHOLE number with a plus, as the
+`report`. Since the test phone came, the read-only steps and the peer's acts run against a SIMULATED TEST phone
+(`start --test-phone fake:rehearsal`, accepted in a rehearsal's place only): the steps check its screens and do its acts,
+the acts are mirrored into the fake that plays WhatsApp, the lead's relayed word (`answer --relayed`) and the resend's
+consent flag (`--user-said-yes`) are walked, and one run of `step groups` with the serial taken away keeps the typed path
+proven. The rehearsal's user types the fake's WHOLE number with a plus, as the
 user will. Last it greps every file it wrote (and the backup and everything the commands printed)
 for what the fake is made of and ends with `REHEARSAL PASS` and the app's memory. It searches for
 exactly this: the three synthetic names (the other person, the group, the account), the two
@@ -198,6 +202,65 @@ archives on the TEST phone; the tool sends nothing.
 answered, how many answers the server flagged `missing_participant_identification`, how many were truncated, and
 so how many groups state no member list from that fetch: a flagged answer leaves admin deletes in the group parked).
 Counts only, never an id.
+
+## With a test phone (the automated path)
+
+`start --confirmed-by-user --test-phone <serial>` (for example `--test-phone 192.0.2.19:5555`, an adb serial and never
+the number) turns the TEST phone into something the steps use themselves. The serial is kept beside the run state
+(a later start without the flag keeps it, a flag wins), `wa-run state` says `test phone: <serial> (reachable)` or
+`(unreachable)`, and a start without a test phone works exactly as described above: every question is then put to the user
+in `wa-run answer` in his own terminal, and nothing here changes it.
+
+What changes with a test phone:
+
+- Every question about the TEST phone is answered by a CHECK the step makes on its screen (over adb, with `uiautomator`
+  dumps; no screenshot is taken). The check FAILS CLOSED: a screen that cannot be read, a node that is missing, a tap
+  that took no effect or a timeout is a "no" or the step's own FAIL ("run `step <name>` again"), never a pass. A chat on
+  the phone is picked by kind and rank (the n-th group or 1:1 chat of the list, ordered the way Kourier orders its list)
+  and the pick is checked on the phone (the row is taken from a fresh dump right before the press, and the selected row
+  must be the one asked for, else the selection is backed out and the step fails; two rows with one name and kind fail
+  closed) and by its effect in Kourier; a pick that is not the chat Kourier knows can read as "the archive did not
+  reach Kourier", which the step words as "or the wrong chat" (check by hand). The step's record and `wa-run report` name where each answer came
+  from: `checked on the TEST phone`, `typed by the user`, `relayed by the lead` or `not looked at`.
+- The TEST phone's acts are done by the step: it archives, unarchives, pins and mutes through the selection toolbar
+  (a long press of about two seconds; no chat row is ever tapped, the delete button and the "Keep chats archived" switch
+  are never touched), answers and ends a call, and checks each act afterwards on the phone's own lists. It puts the chats
+  back before it ends, and an act that fails after it may have taken effect is undone and noted in fixed words; if an undo
+  cannot be confirmed the note says to put that chat back by hand. WhatsApp's registration block screen stops every act with one sentence
+  (`the TEST phone shows WhatsApp's registration block screen: stop and tell the user`). No message is sent from the phone; what does go out is the phone app's own traffic for an archive, a pin or a mute, and
+  the audio of an answered call. The step answers a call ONLY when the caller on the call screen is the 1:1 chat of the run
+  (the name compared by hash in memory); any other caller is never answered (`a call from someone else`). If the end of an
+  answered call cannot be confirmed the step prints `ASK-USER: Hang up the call on the TEST phone now`, fails, and `state`
+  warns that a call may still be open.
+- Nothing a name, a number or a text on the phone says is printed, logged, written or put on a command line: a chat is
+  known by a hash made in memory, counts are parsed in memory, the notes say fixed sentences.
+- Which questions the lead may relay is the SUPERVISOR's fixed table (`resend-once`, `resend-shows`), taken only in a run
+  the supervisor knows has a test phone (the profile's serial file at its start); a client's word never makes a question
+  relayable. Consent is a flag. `step resend` with a test phone stops before the act ("needs the user's consent") unless the lead
+  passes `--user-said-yes`, and he does that only after the user said yes in chat to the question the message names.
+- A look that only the PERSONAL phone can make is ONE line `ASK-USER: <words>`; the lead asks the user in chat and
+  relays the word with `wa-run answer --relayed y` or `--relayed n` (no terminal; taken only for those two questions in a
+  run with a test phone, recorded as `relayed by the lead`). The user's own terminal answer stays possible.
+- An act of the PERSONAL phone stays his: one line `DO-USER: <words>`, then the step waits for the arrival in Kourier.
+
+What each question became:
+
+| Step | Before | With a test phone |
+|---|---|---|
+| `step groups` | he opens the group's info and answers y or n | the step opens it, counts members and admins in memory, equal to the printed counts is the yes |
+| `step call` | he answers the call and says whether the phone rang | `DO-USER: Call the test number from your personal phone now`; the step sees the ring on the TEST phone, answers there, holds about 15 s, ends the call there, and the Calls tab's newest row must be an incoming call, not missed |
+| `step settings` | he archives, pins and mutes | the step does the three acts and undoes them |
+| `step archive-message` | he archives, and says whether the phone brought the chat back | "Keep chats archived" is read (ON stops the step; the tool never flips a setting), the step archives, `DO-USER` for the text from the personal phone, the answer is read from the phone's lists |
+| `step call-then-archive`, `step call-into-archived` | he archives and answers | `DO-USER` for the call; the step archives, reads the phone's lists, and puts the chat back |
+| `step resend` | y or n to `resend-ok` in his terminal | `--user-said-yes` on the step |
+| `step resend` (call 2) | y or n to `resend-once` or `resend-shows` | `ASK-USER` and `answer --relayed y|n` |
+| `step peer-react`, `step peer-edit`, `step peer-delete` | `PHONE:` line | `DO-USER` line, same waits |
+
+UNPROVEN on the real phone until its first run: the incoming-call screen (found by a WhatsApp call activity or an
+Answer control anywhere on the screen, answered by that control or a swipe up, ended by an End call control), the
+"Archived" entry of the chat list, the pin and mute states read from the selection toolbar's button descriptions, and the
+rank pick of a chat. The rehearsal walks all of it against a simulated TEST phone (`--test-phone fake:rehearsal`, in a
+rehearsal's place only), which proves the tool and not the screens.
 
 ## The send steps of R2 (T2, T-3a)
 

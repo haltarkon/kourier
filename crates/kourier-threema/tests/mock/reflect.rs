@@ -484,6 +484,8 @@ fn an_ack_for_an_id_the_slot_does_not_hold_is_closed_with_4012() {
 #[test]
 fn dry_comes_before_the_promotion_and_the_leader_moves_when_the_leader_goes() {
     let w = world(701);
+    // The unblock assertions below are about the knob turned OFF (its default is on since TH6 L4b).
+    w.mediator().knobs(|k| k.leader_mode = false);
     let g = group(&w);
     let mut phone = phone_online(&w, &g);
     assert_eq!(
@@ -857,6 +859,134 @@ fn the_mediator_lists_its_reflects_in_order_ephemeral_ones_too() {
         w.mediator().reflect_acks_held(conn),
         2,
         "the ephemeral one is not owed an ack"
+    );
+    w.violations().assert_empty();
+}
+
+/// RT1 attempt 2, the fake's phone reads the linked-devices list as Threema for Android 6.6.0 does (`phone_row`,
+/// `Phone::linked_devices`): a device info that opens under DGDIK and names a platform shows its label and
+/// `<version> · <details>`; one that states UNSPECIFIED, a platform number the app lacks, a box under another key or
+/// bytes that are no box show "Device" and "Information could not be obtained" whatever the label; an empty label
+/// stays empty; the asker is not listed; a device that left is no longer active. `set_device_info` replaces a slot's
+/// stored info and finds no slot that is not there.
+#[test]
+fn the_phones_list_reads_a_device_info_as_threema_for_android_does() {
+    use crate::support::mock::crypto::seal_nonce_ahead;
+    use crate::support::mock::phone::{INVALID_DETAILS, INVALID_TITLE, PHONE_LABEL};
+    use d2d::device_info::Platform;
+    use prost::Message as _;
+
+    let w = world(533);
+    let g = group(&w);
+    let mut phone = phone_online(&w, &g);
+    let mut other = w.phone(&g.dgk, SERVER_GROUP, OTHER_ID);
+    other.connect();
+    let rows = phone.linked_devices();
+    assert_eq!(rows.len(), 1, "the asker is listed or the other is not");
+    let row = &rows[0];
+    assert!(
+        row.device == OTHER_ID
+            && row.platform == Platform::Android
+            && row.valid
+            && row.active
+            && row.title == PHONE_LABEL
+            && row.details == "0 · fake",
+        "the other phone's own info does not read as its label, version and details"
+    );
+
+    let info = |platform: i32, label: &str| {
+        d2d::DeviceInfo {
+            #[expect(deprecated, reason = "the spec's padding field; a few bytes here")]
+            padding: vec![0x33; 5],
+            platform,
+            platform_details: "Kourier 1.2 (linux)".to_owned(),
+            app_version: "1.2".to_owned(),
+            label: label.to_owned(),
+        }
+        .encode_to_vec()
+    };
+    let keys = phone.keys().clone();
+    let m = w.mediator().clone();
+    let shown = |phone: &mut Phone, sealed: Vec<u8>| {
+        assert!(
+            m.set_device_info(&keys.path_public, OTHER_ID, sealed),
+            "the other device's slot is not there"
+        );
+        let rows = phone.linked_devices();
+        assert_eq!(rows.len(), 1, "not one other device");
+        rows[0].clone()
+    };
+    let desktop = shown(
+        &mut phone,
+        seal_nonce_ahead(
+            &keys.device_info,
+            &[1; 24],
+            &info(Platform::Desktop as i32, "Kourier (host)"),
+        ),
+    );
+    assert!(
+        desktop.platform == Platform::Desktop
+            && desktop.valid
+            && desktop.title == "Kourier (host)"
+            && desktop.details == "1.2 · Kourier 1.2 (linux)",
+        "a DESKTOP info does not read as its label, version and details"
+    );
+    let empty_label = shown(
+        &mut phone,
+        seal_nonce_ahead(
+            &keys.device_info,
+            &[2; 24],
+            &info(Platform::Desktop as i32, ""),
+        ),
+    );
+    assert!(
+        empty_label.valid && empty_label.title.is_empty(),
+        "an empty label does not stay empty"
+    );
+    let invalid = [
+        (
+            "UNSPECIFIED",
+            seal_nonce_ahead(
+                &keys.device_info,
+                &[3; 24],
+                &info(Platform::Unspecified as i32, "Kourier (host)"),
+            ),
+        ),
+        (
+            "a platform number the app lacks",
+            seal_nonce_ahead(&keys.device_info, &[4; 24], &info(9, "Kourier (host)")),
+        ),
+        (
+            "a box under DGRK",
+            seal_nonce_ahead(
+                &keys.reflect,
+                &[5; 24],
+                &info(Platform::Desktop as i32, "Kourier (host)"),
+            ),
+        ),
+        ("no box", vec![7; 30]),
+        ("nothing", Vec::new()),
+    ];
+    for (what, sealed) in invalid {
+        let row = shown(&mut phone, sealed);
+        assert!(
+            row.platform == Platform::Unspecified
+                && !row.valid
+                && row.title == INVALID_TITLE
+                && row.details == INVALID_DETAILS,
+            "{what}: not shown as a device whose information could not be obtained"
+        );
+    }
+    other.disconnect();
+    let rows = phone.linked_devices();
+    assert!(
+        rows.len() == 1 && !rows[0].active,
+        "a device that left is still currently active"
+    );
+    assert!(
+        !w.mediator()
+            .set_device_info(&keys.path_public, 0x77, vec![1]),
+        "a slot that is not there was found"
     );
     w.violations().assert_empty();
 }

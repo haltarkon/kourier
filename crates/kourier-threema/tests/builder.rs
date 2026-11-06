@@ -57,9 +57,11 @@
 //!    crypto and the phone builds every body from the spec); and in EVERY file under `tests/support/` a
 //!    `pub use` or `pub type` of anything of libthreema but its protobuf types
 //!    ([`mock_violations`], [`support_reexport_violations`]).
-//! 10. NO REQUEST FOR MESSAGES (TH3): no file of `src/` but a future [`LEADER_PREFIX`] names the CSP
-//!     payload that asks the chat server to deliver ([`unblock_name`], comments included): only a
-//!     leader that can take messages (TH6) may send it; `tests/` may build one for a fake test.
+//! 10. THE REQUEST FOR MESSAGES LIVES IN THE LEADER (TH3, TH6 L4b): no file of `src/` but [`LEADER_PREFIX`] names
+//!     the CSP payload that asks the chat server to deliver ([`unblock_name`], comments included): the leader's
+//!     stage builds it (`leader::unblock_payload`) and the connection only passes `CspSend::Unblock` on, once per
+//!     socket, when it leads and can take messages; `src/conn/csp.rs` itself does not name it (the test reads the real
+//!     files); `tests/` may build one for a fake test.
 //! 11. THE DIAL MODULE'S OWN TESTS (TH3, [`dial_test_violations`]): the test code of `src/dial/`
 //!     (its `tests.rs`, `tests/`, `#[cfg(test)]` blocks) names no socket or resolver
 //!     ([`socket_names`]), no entry to the real parts and no real dial ([`dial_test_names`]): those
@@ -92,7 +94,9 @@
 //!     `prepare_send_zone`, `mark_send_reflected`, `mark_send_acks`, `mark_send_done`, `count_failed_run`, `give_up_send_job`, `sweep_sends`, `next_send`,
 //!     `send_task`, `send_ledger`, `send_tasks`, `send_receivers`: they write or read the send queue's sealed rows outside the send core; and
 //!     `fail_send_zone` (a send zone of the test's choice fails with a SQLite code of its choice); TH6a S6: `with_send_open` (the
-//!     send core's door, rule 15)) are named ONLY under this crate's `src/` and `tests/` (and its build script): no file of
+//!     send core's door, rule 15); TH6 L1: `receive_inbound`, `mark_inbound_reflected`, `sweep_inbound`, `inbound_row`,
+//!     `inbound_rows`, `fail_inbound_zone`: they write or read the leader's `csp_inbound` rows outside the socket's leader
+//!     stage, or make one of its zones fail) are named ONLY under this crate's `src/` and `tests/` (and its build script): no file of
 //!     any other crate or of xtask names one of them ([`DOORS`], whole names, comments included: the
 //!     names belong to this crate alone), none names the module path `kourier_threema::store` (the brace
 //!     forms written out by [`flat_paths`]), and no other manifest renames the package
@@ -112,13 +116,25 @@
 //!     SEALS of a sent message ([`SEND_BOXES`]: `seal_reflected`, `encrypt_message`,
 //!     `encrypt_metadata`) and nothing else of the list: every open and decrypt stays refused in
 //!     `src/send/`, and `hash_with` is not named there (the send core hashes through the keys of
-//!     `src/reflect/`). The transactions (TH9) widen the list on purpose, with their own prefix, when
-//!     they need a box.
+//!     `src/reflect/`). TH6 (L3) gives the LEADER'S RECEIVE its own list: under [`LEADER_PREFIX`]
+//!     (`src/leader/`, the directory) the two OPENS of an incoming CSP message ([`LEADER_BOXES`]:
+//!     `decrypt_message`, `decrypt_metadata`), read with the sender's key; every seal and every other open
+//!     stays refused there, and `hash_with` too (the leader hashes through `src/reflect/`'s keys); the opens
+//!     stay refused everywhere else (`src/send/`, `src/conn/`, `src/leader.rs`). The transactions (TH9) widen
+//!     the list on purpose, with their own prefix, when they need a box.
 //! 15. THE SEND CORE'S DOOR STAYS SHUT (TH6a S6, decision C3, [`send_door_violations`]): only `src/parts.rs` and
 //!     `src/actor.rs` of `src/` name the flag ([`SEND_DOOR`]: `with_send_open`, `send_open`; whole names, comments and
 //!     test blocks included), so no other code of the crate opens `Command::Transmit` or asks whether it is open, and
 //!     the dial module's parts of a real build cannot. Rule 13 keeps the method out of every other crate. In a real build a `Transmit` stays
 //!     `Failed(unsupported)`.
+//!
+//! 16. ONLY THE DIRECTORY TALKS HTTPS (TH6 L4b, [`https_violations`]): in the production code of `src/` (comment
+//!     lines and `#[cfg(test)]` blocks left out) only [`HTTPS_HOMES`] name the parts' HTTPS client ([`https_names`]:
+//!     the trait, a call through the parts' field, a call with a request, and (TH6 FIX-B, P-L8) the request type
+//!     itself, so a call through a local binding of the client, `c.execute(req)`, still shows where `req` is built):
+//!     `src/leader/directory.rs` (the leader's
+//!     `fetch_bulk`, TH6 L5), `src/parts.rs` (the trait), `src/lib.rs` (its re-export) and the dial module (the real
+//!     client). So no other module talks to a Threema host by HTTPS, whatever the allow-list gate lets through.
 //!
 //! Names are assembled at run time with `concat()`, so this file does not contain them.
 
@@ -157,6 +173,36 @@ fn unblock_violations(path: &str, text: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// The files of `src/` that may name the parts' HTTPS client (rule 16): the directory's call, the trait, its
+/// re-export; the dial module (the real client) is [`DIAL_PREFIX`].
+const HTTPS_HOMES: &[&str] = &["src/leader/directory.rs", "src/parts.rs", "src/lib.rs"];
+
+/// The names of the parts' HTTPS client (rule 16): the trait, a call through the parts' field, a call with a request,
+/// and the request type (P-L8: building a request is the act; a call through a local binding names no field).
+fn https_names() -> [String; 4] {
+    [
+        ["Https", "Client"].concat(),
+        ["https", ".execute"].concat(),
+        ["execute(", "HttpsRequest"].concat(),
+        ["Https", "Request"].concat(),
+    ]
+}
+
+/// Rule 16: production code of `src/` outside [`HTTPS_HOMES`] and [`DIAL_PREFIX`] that names the HTTPS client.
+fn https_violations(path: &str, text: &str) -> Vec<String> {
+    if !path.starts_with("src/") || is_dial(path) || HTTPS_HOMES.contains(&path) {
+        return Vec::new();
+    }
+    let code = production_code(path, text);
+    https_names()
+        .iter()
+        .filter(|name| names(&code, name))
+        .map(|name| {
+            format!("{path} names {name}; only {HTTPS_HOMES:?} and {DIAL_PREFIX} may (rule 16)")
+        })
+        .collect()
 }
 
 /// What a test of the actor tests' directories calls to spawn an actor (rule 4, TH3 critic M2).
@@ -212,7 +258,7 @@ fn connect_violations(path: &str, text: &str) -> Vec<String> {
 
 /// The doc-hidden `pub` doors of this crate that exist for its integration tests (rule 13, S5). Whole
 /// names; each is unique to this crate in the workspace (a test checks that the others do not use it).
-const DOORS: [&str; 44] = [
+const DOORS: [&str; 52] = [
     "checked_for_tests",
     "import_join",
     "ready_join",
@@ -257,6 +303,14 @@ const DOORS: [&str; 44] = [
     "seal_sent_update",
     "enqueue_job",
     "with_send_open",
+    "receive_inbound",
+    "mark_inbound_reflected",
+    "sweep_inbound",
+    "inbound_row",
+    "inbound_rows",
+    "fail_inbound_zone",
+    "open_inbound",
+    "write_body",
 ];
 
 /// The flag of the send core's door and what asks it (rule 15).
@@ -357,6 +411,10 @@ const SEND_ENCODE_FILE: &str = "src/send/encode.rs";
 /// box and the two CSP boxes. Every open and decrypt of [`P5_BOXES`] stays out of `src/send/`.
 const SEND_BOXES: &[&str] = &["seal_reflected", "encrypt_message", "encrypt_metadata"];
 
+/// The P5 boxes [`LEADER_PREFIX`] may name (rule 14, TH6 L3): the two OPENS of an incoming CSP message, the leader's
+/// steps 6 and 7 with the sender's key. Every seal and every other open of [`P5_BOXES`] stays out of `src/leader/`.
+const LEADER_BOXES: &[&str] = &["decrypt_message", "decrypt_metadata"];
+
 /// Rule 14: a file of `src/` outside [`REFLECT_PREFIX`] whose production code names a P5 box (but
 /// [`SEND_ENCODE_FILE`], which may name [`SEND_BOXES`]), or outside [`REFLECT_PREFIX`] and [`STORE_FILE`]
 /// names `hash_with`. Comment lines and `#[cfg(test)]` blocks are not production code; a file below a
@@ -370,9 +428,10 @@ fn crypto_violations(path: &str, text: &str) -> Vec<String> {
         .iter()
         .filter(|name| names(&code, name))
         .filter(|name| !(path == SEND_ENCODE_FILE && SEND_BOXES.contains(name)))
+        .filter(|name| !(path.starts_with(LEADER_PREFIX) && LEADER_BOXES.contains(name)))
         .map(|name| {
             format!(
-                "{path} names {name}; only {REFLECT_PREFIX} may, and {SEND_ENCODE_FILE} the seals of a sent message (rule 14)"
+                "{path} names {name}; only {REFLECT_PREFIX} may, {SEND_ENCODE_FILE} the seals of a sent message and {LEADER_PREFIX} the opens of a received one (rule 14)"
             )
         })
         .collect();
@@ -704,6 +763,7 @@ fn violations(path: &str, text: &str) -> Vec<String> {
     found.extend(door_violations(path, text));
     found.extend(crypto_violations(path, text));
     found.extend(send_door_violations(path, text));
+    found.extend(https_violations(path, text));
     found.extend(entry_violations(path, text));
     found.extend(wildcard_arms(path, text));
     for name in whatsapp_entry_names() {
@@ -836,6 +896,9 @@ const MOCK_REFUSED_OWN: &[&str] = &[
     // TH6a S2: the send core's encode, bodies and queue. The fake's peer opens every box on its own crypto and the
     // phone builds the bodies from the spec; neither goes through the code that wrote them.
     "kourier_threema::send",
+    // TH6 L2a: the leader receive. The fake's peer seals what it sends to the user on its own crypto, and the
+    // guard oracle opens the leader's reflections with the phone's keys; neither goes through the leader's code.
+    "kourier_threema::leader",
 ];
 
 /// Rule 9, the re-export half: a `pub use` or `pub type` (any visibility, `pub(crate)` too) in a file
@@ -2318,6 +2381,11 @@ fn rule_nine_keeps_the_fake_off_sockets_and_off_libthreemas_protocol_code() {
         "use kourier_threema::{send::body, WsEvent};".to_owned(),
         "use ::kourier_threema::send;".to_owned(),
         "fn f() { let _ = kourier_threema::send::props::props; }".to_owned(),
+        // TH6 L2a: Kourier's leader receive, in every form.
+        "use kourier_threema::leader::zone::receive_inbound;".to_owned(),
+        "use kourier_threema::leader;".to_owned(),
+        "use ::kourier_threema::leader;".to_owned(),
+        "fn f() { let _ = kourier_threema::leader::zone::inbound_row; }".to_owned(),
     ] {
         assert!(!mock(&text).is_empty(), "not refused: {text}");
     }
@@ -2401,6 +2469,16 @@ fn rule_ten_keeps_the_request_for_messages_out_of_src_and_rule_four_sees_the_har
     }
     assert!(violations("src/leader/mod.rs", &format!("x::{name}")).is_empty());
     assert!(violations("tests/mock/csp.rs", &format!("x::{name}")).is_empty());
+    // TH6 L4b: the real leader names it (it builds the payload), the real connection does not (it passes it on).
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |path: &str| std::fs::read_to_string(root.join(path)).expect("read");
+    assert!(
+        names(&read("src/leader/mod.rs"), &name),
+        "src/leader/mod.rs no longer builds the unblock: the scan sees nothing there"
+    );
+    for path in ["src/conn/csp.rs", "src/conn/mod.rs"] {
+        assert!(!names(&read(path), &name), "{path} names the unblock");
+    }
 
     let spawn = "#[tokio::test]\nasync fn t() {\n    let h = harness::start(seed()).await;\n}";
     let v = violations("tests/connection/up.rs", spawn);
@@ -2421,6 +2499,126 @@ fn rule_ten_keeps_the_request_for_messages_out_of_src_and_rule_four_sees_the_har
         "a join harness test outside the child: {v:?}"
     );
     assert!(violations("tests/join/steps.rs", child).is_empty());
+}
+
+/// Rule 16 (TH6 L4b): only the directory's file (and the trait, its re-export and the dial module) names the parts'
+/// HTTPS client in the production code of `src/`; a comment, a test block and a test file may.
+#[test]
+fn rule_sixteen_lets_only_the_directory_talk_https() {
+    for name in https_names() {
+        let call = format!("fn f(&self) {{\n    let x = self.parts.{name};\n}}\n");
+        for path in [
+            "src/actor.rs",
+            "src/conn/mod.rs",
+            "src/leader/mod.rs",
+            "src/leader/steps.rs",
+            "src/leader/directory/call.rs",
+            "src/send/attempt.rs",
+            "src/join/mod.rs",
+        ] {
+            let v = violations(path, &call);
+            assert!(
+                v.iter().any(|m| m.contains("rule 16") && m.contains(&name)),
+                "{path} {name}: {v:?}"
+            );
+        }
+        for path in [
+            "src/leader/directory.rs",
+            "src/parts.rs",
+            "src/lib.rs",
+            "src/dial/https.rs",
+        ] {
+            assert!(
+                https_violations(path, &call).is_empty(),
+                "{path} {name} refused"
+            );
+        }
+        let comment = format!("// {name}\n");
+        assert!(https_violations("src/actor.rs", &comment).is_empty());
+        let test_block = format!("#[cfg(test)]\nmod tests {{\n    fn f() {{ {name} }}\n}}\n");
+        assert!(https_violations("src/actor.rs", &test_block).is_empty());
+        assert!(https_violations("tests/connection/leader.rs", &call).is_empty());
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let parts = std::fs::read_to_string(root.join("src/parts.rs")).expect("read");
+    assert!(
+        names(&production_code("src/parts.rs", &parts), &https_names()[0]),
+        "src/parts.rs no longer names the trait: the needle finds nothing"
+    );
+    assert!(
+        names(&production_code("src/parts.rs", &parts), &https_names()[3]),
+        "src/parts.rs no longer names the request type: the needle finds nothing"
+    );
+}
+
+/// Rule 16, P-L8 (TH6 FIX-B): an ordinary call that names neither the trait nor the field nor `execute(` with a request:
+/// the client cloned into a local binding, the request built in a line of its own, `c.execute(req)`. Only the request
+/// type's name shows it; a path, an alias and a `use` all name it. Home files, tests and comments stay free.
+#[test]
+fn rule_sixteen_sees_a_call_through_a_local_binding() {
+    let names_of = https_names();
+    let request = names_of[3].clone();
+    let through_binding = format!(
+        "async fn go(setup: &Setup) {{\n    let c = setup.transports.https.clone();\n    let req = crate::{request} {{ url, method, headers, body }};\n    c.execute(req).await;\n}}\n"
+    );
+    // The first three needles miss this text: that is the finding.
+    let code = production_code("src/actor.rs", &through_binding);
+    for old in &names_of[..3] {
+        assert!(!names(&code, old), "{old} found it: no gap to close");
+    }
+    for path in [
+        "src/actor.rs",
+        "src/conn/mod.rs",
+        "src/leader/mod.rs",
+        "src/leader/steps.rs",
+        "src/send/attempt.rs",
+        "src/join/mod.rs",
+    ] {
+        let v = https_violations(path, &through_binding);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("rule 16") && m.contains(&request)),
+            "{path}: {v:?}"
+        );
+        assert!(
+            violations(path, &through_binding)
+                .iter()
+                .any(|m| m.contains("rule 16")),
+            "{path}: the crate-wide check missed it"
+        );
+    }
+    // An alias or a `use` names the type as well.
+    for text in [
+        format!("use crate::{request} as Q;\n"),
+        format!("use crate::{{{request}, NetError}};\n"),
+        format!("fn f() -> Option<crate::parts::{request}> {{ None }}\n"),
+    ] {
+        assert!(
+            !https_violations("src/conn/mod.rs", &text).is_empty(),
+            "{text}"
+        );
+    }
+    // A longer name that merely contains the needle is not it.
+    assert!(
+        https_violations("src/conn/mod.rs", &format!("fn f(x: My{request}) {{}}\n")).is_empty()
+    );
+    // The homes, the dial module, a comment, a test block and a test file stay free.
+    for path in [
+        "src/leader/directory.rs",
+        "src/parts.rs",
+        "src/lib.rs",
+        "src/dial/https.rs",
+        "tests/connection/leader.rs",
+    ] {
+        assert!(
+            https_violations(path, &through_binding).is_empty(),
+            "{path}"
+        );
+    }
+    assert!(https_violations("src/actor.rs", &format!("// crate::{request}\n")).is_empty());
+    let in_test =
+        format!("#[cfg(test)]\nmod tests {{\n    fn f() {{ crate::{request} {{ url }}; }}\n}}\n");
+    assert!(https_violations("src/actor.rs", &in_test).is_empty());
 }
 
 /// Rule 12 (TH4 J3): only `src/conn/` and `src/join/` open a WebSocket through the parts' connector;
@@ -2706,6 +2904,9 @@ fn rule_fourteen_keeps_the_p5_crypto_in_the_reflect_directory() {
             "src/reflection.rs",
             "src/leader/mod.rs",
         ] {
+            if path.starts_with(LEADER_PREFIX) && LEADER_BOXES.contains(&name) {
+                continue;
+            }
             let v = rule(path, &call);
             assert!(
                 v.len() == 1 && v[0].contains(name) && v[0].contains(path),
@@ -2907,6 +3108,86 @@ fn rule_fourteen_keeps_the_p5_crypto_in_the_reflect_directory() {
         send_files.len()
     );
     for file in send_files {
+        let relative = file
+            .strip_prefix(root)
+            .expect("under the crate")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert!(rule(&relative, &text).is_empty(), "{relative}");
+    }
+
+    // THE LEADER SIDE (TH6 L3): the opens of a received message, under `src/leader/` only.
+    assert_eq!(LEADER_BOXES, ["decrypt_message", "decrypt_metadata"]);
+    assert!(LEADER_BOXES.iter().all(|name| P5_BOXES.contains(name)));
+    assert!(LEADER_BOXES.iter().all(|name| !SEND_BOXES.contains(name)));
+    // Refused: each open anywhere in `src/` but `src/leader/` and `src/reflect/`: the send core (its encode file too),
+    // the connection, the actor, the store, and the near misses of the prefix.
+    for name in LEADER_BOXES {
+        let call = format!("fn f(k: &Key) {{ let x = k.{name}(&n, &bytes)?; }}");
+        for path in [
+            SEND_ENCODE_FILE,
+            "src/send/prepare.rs",
+            "src/conn/mod.rs",
+            "src/conn/csp.rs",
+            "src/actor.rs",
+            "src/store.rs",
+            "src/leader.rs",
+            "src/leaders/open.rs",
+            "src/leader_open.rs",
+            "src/sub/leader/open.rs",
+        ] {
+            let v = rule(path, &call);
+            assert!(
+                v.len() == 1 && v[0].contains(name) && v[0].contains(path),
+                "{path} {name}: {v:?}"
+            );
+        }
+        // Allowed: in any file of the leader's directory, in code.
+        for path in [
+            "src/leader/open.rs",
+            "src/leader/mod.rs",
+            "src/leader/deep/x.rs",
+        ] {
+            assert!(rule(path, &call).is_empty(), "{path} {name}");
+        }
+    }
+    // Refused in `src/leader/`: every seal and every other open of the list, and `hash_with`.
+    for name in P5_BOXES.iter().filter(|name| !LEADER_BOXES.contains(name)) {
+        let call = format!("fn f(k: &Key) {{ let x = k.{name}(&bytes)?; }}");
+        for path in [
+            "src/leader/open.rs",
+            "src/leader/steps.rs",
+            "src/leader/mod.rs",
+        ] {
+            let v = rule(path, &call);
+            assert!(
+                v.len() == 1 && v[0].contains(name) && v[0].contains(path),
+                "{path} {name}: {v:?}"
+            );
+        }
+    }
+    let v = rule("src/leader/open.rs", "let h = nonce.hash_with(own).0;");
+    assert!(v.len() == 1 && v[0].contains("hash_with"), "{v:?}");
+    // The check sees the real open file: it names both opens (or the allowed place proves nothing), names no seal and no
+    // `hash_with`, and moved out of the directory it is refused once per open.
+    let open_file = "src/leader/open.rs";
+    let text = std::fs::read_to_string(root.join(open_file)).expect("read");
+    let code = production_code(open_file, &text);
+    for name in LEADER_BOXES {
+        assert!(names(&code, name), "{open_file} no longer names {name}");
+    }
+    assert!(rule(open_file, &code).is_empty());
+    assert_eq!(
+        rule("src/conn/mod.rs", &code).len(),
+        LEADER_BOXES.len(),
+        "the real open code, moved out, is refused once per open"
+    );
+    // And the whole of `src/leader/` as it stands is clean.
+    let mut leader_files = Vec::new();
+    collect(&root.join("src/leader"), &mut leader_files);
+    assert!(leader_files.len() >= 5, "the leader's files were not found");
+    for file in leader_files {
         let relative = file
             .strip_prefix(root)
             .expect("under the crate")

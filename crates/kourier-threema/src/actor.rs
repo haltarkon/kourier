@@ -235,6 +235,8 @@ struct Actor {
     expire_due: Rc<Cell<bool>>,
     /// What the actor and its socket share of the send queue (TH6a).
     send: Rc<Shared>,
+    /// TH6 L4b: what the actor keeps of the leader across its sockets (the inbound cooling, critic T-M4).
+    leader: Rc<crate::leader::Shared>,
 }
 
 impl Actor {
@@ -341,6 +343,7 @@ impl Actor {
             ready,
             expire_due: Rc::new(Cell::new(true)),
             send: Rc::new(Shared::default()),
+            leader: Rc::new(crate::leader::Shared::default()),
         })
     }
 
@@ -630,6 +633,7 @@ impl Actor {
             expire_due: self.expire_due.clone(),
             events: self.events.clone(),
             send: self.send.clone(),
+            leader: self.leader.clone(),
         }));
     }
 
@@ -865,7 +869,7 @@ impl Actor {
             // that refused for another reason (a contract error) ends the `Linking` account on this
             // `Failed` (a failed step while not linked is `LoginFailed`).
             Ok(true) => {
-                tracing::warn!("the core refused the joined account's first row; the link ends");
+                tracing::warn!("{}", crate::conn::lines::E8_FIRST_ROW);
                 let error = BackendError::internal("the core refused the account");
                 return self.link_failed(error).await;
             }

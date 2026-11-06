@@ -99,8 +99,8 @@ const MAX_DEPTH: usize = 6;
 /// The scheme of a Threema user.
 const SCHEME: &str = "threema";
 
-/// A group as a container header names it.
-#[derive(Clone, PartialEq, Eq)]
+/// A group as a container header names it (also the key of the leader's held groups, TH6).
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GroupRef {
     /// The creator's Threema ID (personal data: no `Debug`).
     pub(crate) creator: String,

@@ -65,13 +65,15 @@ const FULL_PREFIXES: [&str; 1] = [".cargo/"];
 
 /// Files outside every package that a test reads: (path, or directory with a trailing `/`,
 /// the packages whose tests read it).
-const READERS: [(&str, &[&str]); 6] = [
+const READERS: [(&str, &[&str]); 7] = [
     // The smoke tool's tests check the runbook against the tool.
     ("docs/smoke-run.md", &["xtask"]),
     // The same for the WhatsApp run tool and its runbook.
     ("docs/whatsapp-run.md", &["xtask"]),
     // The same for the Telegram run tool and its runbook.
     ("docs/telegram-run.md", &["xtask"]),
+    // The same for the Threema run tool and its runbook.
+    ("docs/threema-run.md", &["xtask"]),
     // `kourier`'s single-instance test reads the desktop file; the installer's tests all three.
     ("packaging/", &["kourier", "xtask"]),
     // The Signal mock the two mock suites run against.
@@ -1023,6 +1025,10 @@ mod tests {
             owns("docs/telegram-run.md"),
             Owner::Packages(strings(&["xtask"]))
         );
+        assert_eq!(
+            owns("docs/threema-run.md"),
+            Owner::Packages(strings(&["xtask"]))
+        );
         // The vendored libthreema is read by the Threema backend's build only.
         assert_eq!(
             owns("third_party/libthreema/lib/src/lib.rs"),
@@ -1451,6 +1457,7 @@ mod tests {
             "docs/smoke-run.md",
             "docs/whatsapp-run.md",
             "docs/telegram-run.md",
+            "docs/threema-run.md",
             "packaging/app.kourier.Kourier.desktop",
             "packaging/README.md",
             "tests/mock-harness/README.md",
@@ -1471,6 +1478,7 @@ mod tests {
             "docs/smoke-run.md",
             "docs/whatsapp-run.md",
             "docs/telegram-run.md",
+            "docs/threema-run.md",
             "packaging/README.md",
             "docs/architecture.md",
             "LICENSE",

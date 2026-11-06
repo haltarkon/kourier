@@ -910,6 +910,7 @@ mod tests {
         dir.write("docs/smoke-run.md", "# runbook");
         dir.write("docs/whatsapp-run.md", "# runbook");
         dir.write("docs/telegram-run.md", "# runbook");
+        dir.write("docs/threema-run.md", "# runbook");
         dir.write("packaging/app.desktop", "[Desktop Entry]");
         dir.write("tests/mock-harness/README.md", "# harness");
         dir.git(&["add", "-A"]);
@@ -937,6 +938,7 @@ mod tests {
             "docs/smoke-run.md",
             "docs/whatsapp-run.md",
             "docs/telegram-run.md",
+            "docs/threema-run.md",
             "packaging/app.desktop",
             "tests/mock-harness/README.md",
         ] {

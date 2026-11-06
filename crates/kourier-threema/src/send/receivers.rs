@@ -24,12 +24,14 @@ use libthreema::protobuf::d2d_sync;
 use super::props::{Exempt, GatewayCreator};
 use crate::error::Result;
 
-/// The contacts the spec marks _special_ (`csp.struct.yml`, "Predefined Contacts"): never blocked.
-const SPECIAL_CONTACTS: [&str; 2] = ["*3MAPUSH", "*3MAW0RK"];
+/// The contacts the spec marks _special_ (`csp.struct.yml`, "Predefined Contacts"): never blocked. The leader's receive
+/// steps 20 and 21 read the same list (`leader::steps`).
+pub(crate) const SPECIAL_CONTACTS: [&str; 2] = ["*3MAPUSH", "*3MAW0RK"];
 
 /// Every predefined contact of the pinned spec, the special ones too: not blocked by the unknown-contact policy.
-/// (Desktop lists four of the eight: its Work contacts are not in its build.)
-const PREDEFINED_CONTACTS: [&str; 8] = [
+/// (Desktop lists four of the eight: its Work contacts are not in its build.) Their public keys are
+/// `leader::directory::PREDEFINED` (a test holds both lists equal).
+pub(crate) const PREDEFINED_CONTACTS: [&str; 8] = [
     "*3MAPUSH", "*3MATOKN", "*3MAW0RK", "*3MAWORK", "*BETAFBK", "*MY3DATA", "*SUPPORT", "*THREEMA",
 ];
 
@@ -73,62 +75,73 @@ impl fmt::Debug for Fate {
     }
 }
 
-/// The two settings the Identity Blocked Steps read.
-struct Policy {
+/// THE IDENTITY BLOCKED STEPS (`csp.struct.yml`), ONE place for the send (step 2 of the Bundled Messages Send Steps,
+/// [`fates`]) and the receive (the leader's steps 18, 19 and the Common Group Receive Steps, `leader::steps`). It reads
+/// the settings once when made, and the look at the groups (step 9) at most once, on the first identity that gets that
+/// far, kept for the rest of its life: a group of 256 members is one walk of the groups, not 256 (S-M2).
+pub(crate) struct Blocking<'a> {
+    view: &'a dyn View,
     blocked: Vec<String>,
     block_unknown: bool,
+    in_groups: Option<HashSet<String>>,
 }
 
-impl Policy {
-    fn of(settings: Option<d2d_sync::Settings>) -> Self {
+impl<'a> Blocking<'a> {
+    /// The steps over `view`: its settings read now (a file with no settings row blocks nobody).
+    pub(crate) fn new(view: &'a dyn View) -> Result<Self> {
         use d2d_sync::settings::UnknownContactPolicy;
-        let settings = settings.unwrap_or_default();
-        Self {
+        let settings = view.settings()?.unwrap_or_default();
+        Ok(Self {
+            view,
             block_unknown: settings.unknown_contact_policy
                 == Some(UnknownContactPolicy::BlockUnknown as i32),
             blocked: settings
                 .blocked_identities
                 .map(|b| b.identities)
                 .unwrap_or_default(),
-        }
+            in_groups: None,
+        })
     }
-}
 
-/// THE IDENTITY BLOCKED STEPS (`csp.struct.yml`), step by step. `contact` is what the file holds of `identity`.
-/// `in_groups` is the look at the groups (step 9), made on the first receiver that gets that far and kept for the
-/// rest of the call: a group of 256 members is one walk of the groups, not 256 (S-M2).
-fn is_blocked(
-    view: &dyn View,
-    policy: &Policy,
-    in_groups: &mut Option<HashSet<String>>,
-    identity: &str,
-    contact: Option<&d2d_sync::Contact>,
-) -> Result<bool> {
-    use d2d_sync::contact::AcquaintanceLevel;
-    if SPECIAL_CONTACTS.contains(&identity) {
-        return Ok(false);
+    /// The steps for `identity`, step by step. `contact` is what the file holds of it (step 6).
+    pub(crate) fn is_blocked(
+        &mut self,
+        identity: &str,
+        contact: Option<&d2d_sync::Contact>,
+    ) -> Result<bool> {
+        use d2d_sync::contact::AcquaintanceLevel;
+        // 2. A special contact is never blocked.
+        if SPECIAL_CONTACTS.contains(&identity) {
+            return Ok(false);
+        }
+        // 3. Explicitly blocked.
+        if self.blocked.iter().any(|b| b == identity) {
+            return Ok(true);
+        }
+        // 4, 5. Unknown contacts are not blocked, or a predefined contact.
+        if !self.block_unknown || PREDEFINED_CONTACTS.contains(&identity) {
+            return Ok(false);
+        }
+        // 7. No contact.
+        let Some(contact) = contact else {
+            return Ok(true);
+        };
+        // 8. Direct (a contact that states no level counts as direct, as the follower's mapper reads it).
+        if contact
+            .acquaintance_level
+            .is_none_or(|level| level == AcquaintanceLevel::Direct as i32)
+        {
+            return Ok(false);
+        }
+        // 9. A member or the creator of a group the user is still in.
+        if self.in_groups.is_none() {
+            self.in_groups = Some(self.view.identities_in_groups()?);
+        }
+        Ok(!self
+            .in_groups
+            .as_ref()
+            .is_some_and(|identities| identities.contains(identity)))
     }
-    if policy.blocked.iter().any(|b| b == identity) {
-        return Ok(true);
-    }
-    if !policy.block_unknown || PREDEFINED_CONTACTS.contains(&identity) {
-        return Ok(false);
-    }
-    let Some(contact) = contact else {
-        return Ok(true);
-    };
-    if contact
-        .acquaintance_level
-        .is_none_or(|level| level == AcquaintanceLevel::Direct as i32)
-    {
-        return Ok(false);
-    }
-    if in_groups.is_none() {
-        *in_groups = Some(view.identities_in_groups()?);
-    }
-    Ok(!in_groups
-        .as_ref()
-        .is_some_and(|identities| identities.contains(identity)))
 }
 
 /// The key shared with a stored contact; `None` for a missing or malformed key, and for a non-contributory one.
@@ -148,8 +161,7 @@ pub(crate) fn fates(
     exempt_of: &dyn Fn(&str) -> Exempt,
 ) -> Result<Vec<(String, Fate)>> {
     use d2d_sync::contact::ActivityState;
-    let policy = Policy::of(view.settings()?);
-    let mut in_groups = None;
+    let mut blocking = Blocking::new(view)?;
     listed
         .iter()
         .map(|identity| {
@@ -162,7 +174,7 @@ pub(crate) fn fates(
                 if contact.and_then(|c| c.activity_state) == Some(ActivityState::Invalid as i32) {
                     Fate::Invalid
                 } else if exempt_of(identity.as_str()) != Exempt::Yes
-                    && is_blocked(view, &policy, &mut in_groups, identity, contact)?
+                    && blocking.is_blocked(identity, contact)?
                 {
                     Fate::Blocked
                 } else {

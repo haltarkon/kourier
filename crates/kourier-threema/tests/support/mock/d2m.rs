@@ -7,7 +7,13 @@
 //! then `ReflectionQueueDry` then `RolePromotedToLeader`, the scripted leader rule, the queue limit
 //! (4114), and the hook the chat server (M4) asks before it takes an unblock. RP-b: `DropDevice` with
 //! its `DropDeviceAck`, the freed slot and the 4113 of the dropped device; `Knobs::{withhold_drop_ack, close_at_next_drop,
-//! register_slot_after_next_4115}`. Written from the spec
+//! register_slot_after_next_4115}`. TH6 L2a: the record of the leader's work for the guard oracle (`leader.rs`:
+//! deliveries, `message-ack`s, reflects and their acks in one order), the peers' posted letters
+//! ([`Mediator::csp_post`]) and `GetDevicesInfo` served with `DevicesInfo` (T-H1's step-aside asks whether the
+//! phone is online). TH6 L2b: THE TRANSACTIONS (`txn.rs` holds their rules and types): `BeginTransaction` takes the
+//! group's one lock or is rejected with the holder's device and scope, the holder's reflects wait for its commit,
+//! `CommitTransaction` releases them and tells the other connections `TransactionEnded`, the holder's end drops them,
+//! the TTL closes the holder 4011. Written from the spec
 //! (`TP/md-d2m.proto`, `TP/md-d2m.struct.yml`) with the fake's own crypto; from libthreema only its
 //! generated protobuf types (rule 9). The chat server inside the Proxy payloads (TH2 M4) is
 //! `csp.rs`: every Proxy payload of a logged-in connection goes to it in order, and what it answers
@@ -36,6 +42,8 @@ use super::csp::{
     CHAT_SERVER_CLOSED, ChatServer, CspConn, CspKnobs, CspOut, Cx, DEFAULT_CSP_IDLE_TIMEOUT,
     LoginInfo, Queued, Sent, chunks, id_bytes,
 };
+use super::leader::{LeaderLog, Posted, Recorded};
+use super::txn::{Txn, TxnEnd, TxnSeen};
 use super::{Clock, Dir, Identities, Trace, Violations, lock};
 
 /// The most bytes one D2M message (a container: type, reserved, payload) may have
@@ -67,6 +75,11 @@ pub const VOLATILE_KEEP: Duration = Duration::from_secs(5 * 60);
 /// CHAT SERVER's, runs beside it for a connection whose CSP login finished: it is reset only by
 /// the client's CSP bytes and set by `set-connection-idle-timeout` (G2).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// TH6 L2b: the fake's maximum transaction TTL (what `BeginTransaction.ttl = 0` means, and the cap of a larger one).
+/// [U: real server] the real maximum is not in the spec.
+pub const DEFAULT_MAX_TRANSACTION_TTL: Duration = Duration::from_secs(60);
+/// TH6 L2b: the close code at a transaction's TTL (`TP/md-d2m.struct.yml`: "Transaction TTL reached").
+pub const TRANSACTION_TTL_REACHED: u16 = 4011;
 
 /// The container's payload types (`TP/md-d2m.struct.yml` `container.type`).
 pub mod kind {
@@ -220,8 +233,9 @@ pub struct Knobs {
     /// as Desktop asserts). [U: real server] the spec does not order them; a knob so that both
     /// orders can be tested.
     pub promote_before_dry: bool,
-    /// M5 (lane decisions): a test opts into LEADER MODE; until then an
-    /// `unblock-incoming-messages` from any connection is a violation (TH3-TH5 never send one).
+    /// M5 (lane decisions): LEADER MODE. On (the default since TH6 L4b, whose leader unblocks once per socket): the
+    /// leader's `unblock-incoming-messages` is served, a follower's is the violation `csp-unblock-from-a-follower`. Off
+    /// (a test opts out): an unblock from any connection is the violation `csp-unblock-outside-leader-mode`.
     pub leader_mode: bool,
     /// Whether the Proxy payloads reach the chat server (default on). Off: the mediator only keeps
     /// them (the D2M-only tests of M2 send Proxy payloads that are no CSP).
@@ -288,6 +302,17 @@ pub struct Knobs {
     /// an abandoned socket that the mediator processed late. The spec orders frames only within one connection.
     /// [U: real server] whether (and how late) the real mediator can do that. Default off.
     pub register_slot_after_next_4115: bool,
+    /// TH6 L2b: the server's maximum transaction TTL: a `BeginTransaction` with `ttl = 0` gets it, a larger TTL is cut
+    /// to it ([`DEFAULT_MAX_TRANSACTION_TTL`]). [U: real server]
+    pub max_transaction_ttl: Duration,
+    /// THE OLD HOLD (TH2 M2; off by default since RT1 attempt 1): a Proxy payload that comes before the handshake's end
+    /// (before the `ClientHello`, or while a withheld `ServerInfo` is owed) is HELD and handed to the chat server only
+    /// after `ServerInfo` (`Mediator::held_proxy_count`). OFF, as the real mediator behaved at RT1 attempt 1: such a
+    /// Proxy goes to the chat server AT ONCE and the chat server's answer (the CSP server-hello) is delivered BEFORE
+    /// `ServerInfo`, which libthreema's handshake refuses (`UnexpectedPayloadType(0x00)`, E4). [U: real server] whether
+    /// the real mediator ever holds one (the run's log fits "never"; Desktop routes an early Proxy to its CSP side,
+    /// `layer-3-codec.ts` ~293-297). On only where a test needs the old order (the fake's own proof of the hold).
+    pub hold_early_proxy: bool,
 }
 
 /// One `DropDevice` the mediator took (RP-b): the connection that sent it and the device it named.
@@ -371,7 +396,7 @@ impl Default for Knobs {
             queue_limit: DEFAULT_QUEUE_LIMIT,
             auto_leader: true,
             promote_before_dry: false,
-            leader_mode: false,
+            leader_mode: true,
             chat_server: true,
             csp: CspKnobs::default(),
             hold_dry: false,
@@ -385,6 +410,8 @@ impl Default for Knobs {
             withhold_drop_ack: false,
             close_at_next_drop: None,
             register_slot_after_next_4115: false,
+            max_transaction_ttl: DEFAULT_MAX_TRANSACTION_TTL,
+            hold_early_proxy: false,
         }
     }
 }
@@ -467,6 +494,8 @@ struct Group {
     shared_device_data: Vec<u8>,
     /// The one connection of the group that is leader (D13), if any.
     leader: Option<ConnId>,
+    /// TH6 L2b: the group's one transaction lock while a transaction runs (`txn.rs`).
+    txn: Option<Txn>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,9 +523,8 @@ struct Conn {
     /// The chat server's idle timeout of this connection: CSP's default until the client sends
     /// `set-connection-idle-timeout` (seconds).
     csp_idle_timeout: Duration,
-    /// Proxy payloads that came before the handshake ended: held, then handed on in order.
-    /// [U: real server] whether the real mediator holds a Proxy before the ClientHello (Desktop
-    /// sends its CSP client-hello that early, `layer-3-codec.ts:931-958`).
+    /// Proxy payloads that came before the handshake ended, held and then handed on in order, ONLY under
+    /// `Knobs::hold_early_proxy` (the old hold); by default such a Proxy goes to the chat server at once (RT1 attempt 1).
     held_proxy: Vec<Vec<u8>>,
     /// Proxy payloads for the chat server, in order (M4 hands them to the CSP server).
     proxied: Vec<Vec<u8>>,
@@ -523,6 +551,8 @@ struct Conn {
     /// TH6a S3 (`Knobs::withhold_reflect_acks`): the `ReflectAck`s owed to this connection, in order
     /// (the reflect-id and the payload as it was made when the reflect was stored).
     reflect_acks_held: Vec<(u32, Vec<u8>)>,
+    /// TH6 L2a: when the handshake ended (`ServerInfo` sent), the `connected_since` of `DevicesInfo`.
+    since_ms: Option<u64>,
 }
 
 struct State {
@@ -545,6 +575,10 @@ struct State {
     reflects: Vec<ReflectSeen>,
     /// Every `DropDevice` taken, in order (RP-b).
     drops: Vec<DropSeen>,
+    /// TH6 L2a: the record of the leader's work for the guard oracle (`leader.rs`).
+    leader: LeaderLog,
+    /// TH6 L2b: every moment of every transaction, in order (`Mediator::transactions`).
+    transactions: Vec<TxnSeen>,
 }
 
 /// The test's callback on every `ReflectedAck`.
@@ -653,6 +687,8 @@ impl Mediator {
             ack_calls: Vec::new(),
             reflects: Vec::new(),
             drops: Vec::new(),
+            leader: LeaderLog::default(),
+            transactions: Vec::new(),
         })))
     }
 
@@ -677,6 +713,7 @@ impl Mediator {
                     slots: BTreeMap::new(),
                     shared_device_data: Vec::new(),
                     leader: None,
+                    txn: None,
                 },
             )
             .is_none();
@@ -746,6 +783,7 @@ impl Mediator {
                 login_held: Vec::new(),
                 hello_held: None,
                 reflect_acks_held: Vec::new(),
+                since_ms: None,
             },
         );
         if s.knobs.withhold_server_hello {
@@ -897,6 +935,17 @@ impl Mediator {
             s.trace.frame(Dir::Out, id.0, "csp-idle-timeout", &[]);
             s.end(id, CHAT_SERVER_CLOSED, true);
         }
+        // TH6 L2b: a transaction past its TTL: the holder is closed 4011 and the transaction ends (`State::end`).
+        let expired: Vec<ConnId> = s
+            .groups
+            .values()
+            .filter_map(|g| g.txn.as_ref())
+            .filter(|t| now >= t.deadline_ms)
+            .map(|t| t.holder)
+            .collect();
+        for holder in expired {
+            s.end(holder, TRANSACTION_TTL_REACHED, true);
+        }
         s.chat.expire(now);
         let keep = millis(VOLATILE_KEEP);
         // G1: a slot with an open connection stays whatever its time says.
@@ -980,6 +1029,25 @@ impl Mediator {
             .get(path_public)
             .and_then(|g| g.slots.get(&device))
             .map(|s| s.device_info.clone())
+    }
+
+    /// A script call (RT1 attempt 2): the stored device info of a slot is replaced by `sealed` (what an older build of
+    /// the device sent at its join; every `ClientHello` replaces it, as the fake keeps the latest). Whether the slot
+    /// was there. [U: real server] that the mediator keeps the LATEST hello's info (Desktop renames its device and
+    /// reconnects, `DevicesSettings.svelte` `handleNewDeviceName`, so it relies on that).
+    pub fn set_device_info(&self, path_public: &[u8; 32], device: u64, sealed: Vec<u8>) -> bool {
+        let mut s = lock(&self.0);
+        match s
+            .groups
+            .get_mut(path_public)
+            .and_then(|g| g.slots.get_mut(&device))
+        {
+            Some(slot) => {
+                slot.device_info = sealed;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The Proxy payloads of `conn` for the chat server, in order (held ones first).
@@ -1096,11 +1164,18 @@ impl Mediator {
     /// order, each with the timestamp of the moment its reflect was stored. How many went. The knob
     /// itself is not changed.
     pub fn release_reflect_acks(&self, conn: ConnId) -> usize {
+        self.release_first_reflect_acks(conn, usize::MAX)
+    }
+
+    /// TH6 FIX-B (P-L5): like [`Mediator::release_reflect_acks`] for the first `n` of the held acks only, in order; the
+    /// rest stay held (a mediator that answered the reflects before one that it never answers).
+    pub fn release_first_reflect_acks(&self, conn: ConnId, n: usize) -> usize {
         let mut s = lock(&self.0);
         let Some(c) = s.conns.get_mut(&conn) else {
             return 0;
         };
-        let held = std::mem::take(&mut c.reflect_acks_held);
+        let take = n.min(c.reflect_acks_held.len());
+        let held: Vec<(u32, Vec<u8>)> = c.reflect_acks_held.drain(..take).collect();
         let count = held.len();
         for (reflect_id, ack) in held {
             s.send(
@@ -1109,6 +1184,7 @@ impl Mediator {
                 &ack,
                 &[("reflect-id", u64::from(reflect_id))],
             );
+            s.reflect_ack_sent(conn, reflect_id);
         }
         count
     }
@@ -1131,6 +1207,20 @@ impl Mediator {
     /// RP-b: every `DropDevice` the mediator took, in order (withheld ones too): the connection and the device named.
     pub fn drops(&self) -> Vec<DropSeen> {
         lock(&self.0).drops.clone()
+    }
+
+    /// TH6 L2b: every moment of every transaction, in order (`txn.rs`).
+    pub fn transactions(&self) -> Vec<TxnSeen> {
+        lock(&self.0).transactions.clone()
+    }
+
+    /// TH6 L2b: the device that holds the transaction lock of the group of `path_public`, if one does.
+    pub fn transaction_holder(&self, path_public: &[u8; 32]) -> Option<u64> {
+        lock(&self.0)
+            .groups
+            .get(path_public)
+            .and_then(|g| g.txn.as_ref())
+            .map(|t| t.device)
     }
 
     /// What the `ClientHello` of `conn` said, if one came and parsed.
@@ -1231,8 +1321,15 @@ fn receive_locked(s: &mut State, conn: ConnId, datagram: Vec<u8>) {
         .frame(Dir::In, conn.0, kind_name(t), &[("len", len(payload))]);
     let phase = s.conns[&conn].phase;
     match (phase, t) {
-        (Phase::AwaitingClientHello, kind::PROXY) => {
+        (Phase::AwaitingClientHello, kind::PROXY) if s.knobs.hold_early_proxy => {
             s.conn(conn).held_proxy.push(payload.to_vec());
+        }
+        // RT1 attempt 1 (`Knobs::hold_early_proxy`): the real mediator handed the early CSP hello to the chat server at
+        // once, and the chat server's answer reached the client BEFORE `ServerInfo`. [U: real server] that it always does.
+        (Phase::AwaitingClientHello, kind::PROXY) => {
+            let payload = payload.to_vec();
+            s.conn(conn).proxied.push(payload.clone());
+            s.hand_to_chat_server_early(conn, &payload);
         }
         (Phase::AwaitingClientHello, kind::CLIENT_HELLO) => {
             let payload = payload.to_vec();
@@ -1256,15 +1353,22 @@ fn receive_locked(s: &mut State, conn: ConnId, datagram: Vec<u8>) {
             let payload = payload.to_vec();
             s.drop_device(conn, &payload);
         }
-        // The client's post-handshake payloads that later steps of the fake serve
-        // (devices, shared data: TH10; transactions: TH6).
-        (
-            Phase::PostHandshake,
-            kind::GET_DEVICES_INFO
-            | kind::SET_SHARED_DEVICE_DATA
-            | kind::BEGIN_TRANSACTION
-            | kind::COMMIT_TRANSACTION,
-        ) => {
+        // TH6 L2a: the devices of the group and whether each is connected (T-H1's step-aside).
+        (Phase::PostHandshake, kind::GET_DEVICES_INFO) => {
+            let payload = payload.to_vec();
+            s.devices_info(conn, &payload);
+        }
+        // TH6 L2b: the transactions (`txn.rs`).
+        (Phase::PostHandshake, kind::BEGIN_TRANSACTION) => {
+            let payload = payload.to_vec();
+            s.begin_transaction(conn, &payload);
+        }
+        (Phase::PostHandshake, kind::COMMIT_TRANSACTION) => {
+            let payload = payload.to_vec();
+            s.commit_transaction(conn, &payload);
+        }
+        // The client's post-handshake payload that a later step of the fake serves (shared data: TH10).
+        (Phase::PostHandshake, kind::SET_SHARED_DEVICE_DATA) => {
             s.protocol_error(conn, "d2m-payload-not-in-the-fake-yet");
         }
         _ => s.protocol_error(conn, "d2m-unexpected-payload-type"),
@@ -1337,6 +1441,20 @@ impl State {
                 .and_then(|g| g.slots.get_mut(&device))
         {
             slot.last_disconnect_ms = Some(now);
+        }
+        // TH6 L2b: the holder's end ends its transaction (its held reflects dropped, the others told).
+        if self
+            .groups
+            .get(&group)
+            .and_then(|g| g.txn.as_ref())
+            .is_some_and(|t| t.holder == conn)
+        {
+            let how = if code == TRANSACTION_TTL_REACHED && by_server {
+                TxnEnd::Ttl
+            } else {
+                TxnEnd::Disconnected
+            };
+            self.end_transaction(group, how);
         }
         let Some(g) = self.groups.get_mut(&group) else {
             return;
@@ -1419,6 +1537,59 @@ impl State {
             flags,
             bytes: envelope.to_vec(),
         });
+        self.leader.events.push(Recorded::Reflect {
+            conn: conn.0,
+            reflect_id,
+            index: self.reflects.len() - 1,
+        });
+        self.leader.reflect_ms.push(now);
+        // TH6 L2b: a reflect of the transaction's holder waits for the commit (acked below as any other).
+        let held = !ephemeral
+            && self.groups[&group]
+                .txn
+                .as_ref()
+                .is_some_and(|t| t.holder == conn);
+        if held {
+            if let Some(t) = self.groups.get_mut(&group).and_then(|g| g.txn.as_mut()) {
+                t.held.push((reflect_id, flags, envelope.to_vec(), now));
+            }
+            self.transactions.push(TxnSeen::Held { conn, reflect_id });
+            self.trace.frame(
+                Dir::In,
+                conn.0,
+                "reflect-held-in-transaction",
+                &[("reflect-id", u64::from(reflect_id))],
+            );
+        } else {
+            self.fan_out(group, sender, flags, envelope, now);
+        }
+        if !ephemeral {
+            let ack = reflect_ack_payload(reflect_id, now);
+            if self.knobs.withhold_reflect_acks {
+                self.trace.frame(
+                    Dir::Out,
+                    conn.0,
+                    "reflect-ack-withheld",
+                    &[("reflect-id", u64::from(reflect_id))],
+                );
+                self.conn(conn).reflect_acks_held.push((reflect_id, ack));
+            } else {
+                self.send(
+                    conn,
+                    kind::REFLECT_ACK,
+                    &ack,
+                    &[("reflect-id", u64::from(reflect_id))],
+                );
+                self.reflect_ack_sent(conn, reflect_id);
+            }
+        }
+    }
+
+    /// D10: one reflection of device `sender` into the queue of every other slot of `group` (offline ones too) with
+    /// that slot's next `reflected-id`, sent at once to a slot that is online; an ephemeral one goes only to the devices
+    /// online now and is never queued. `now` is the time the mediator took it (the `Reflected` timestamp).
+    fn fan_out(&mut self, group: [u8; 32], sender: u64, flags: u16, envelope: &[u8], now: u64) {
+        let ephemeral = flags & EPHEMERAL != 0;
         let others: Vec<u64> = self.groups[&group]
             .slots
             .keys()
@@ -1469,25 +1640,216 @@ impl State {
                 self.send_reflected(c, &entry);
             }
         }
-        if !ephemeral {
-            let ack = reflect_ack_payload(reflect_id, now);
-            if self.knobs.withhold_reflect_acks {
-                self.trace.frame(
-                    Dir::Out,
-                    conn.0,
-                    "reflect-ack-withheld",
-                    &[("reflect-id", u64::from(reflect_id))],
-                );
-                self.conn(conn).reflect_acks_held.push((reflect_id, ack));
-            } else {
+    }
+
+    /// TH6 L2b: `BeginTransaction` (`txn.rs`): the group's lock, or `TransactionRejected` with the holder's device and
+    /// scope; a second begin of the holder is a violation.
+    fn begin_transaction(&mut self, conn: ConnId, payload: &[u8]) {
+        let Ok(begin) = d2m::BeginTransaction::decode(payload) else {
+            self.protocol_error(conn, "begin-transaction-malformed");
+            return;
+        };
+        let (group, device) = {
+            let c = &self.conns[&conn];
+            (
+                c.group,
+                c.device.expect("a logged-in connection has a device"),
+            )
+        };
+        let holder = self.groups[&group]
+            .txn
+            .as_ref()
+            .map(|t| (t.holder, t.device, t.scope.clone()));
+        match holder {
+            Some((holder, _, _)) if holder == conn => {
+                self.protocol_error(conn, "d2m-begin-while-holding");
+            }
+            Some((_, holder_device, holder_scope)) => {
+                self.transactions.push(TxnSeen::Rejected {
+                    conn,
+                    device,
+                    holder: holder_device,
+                    scope: begin.encrypted_scope,
+                });
+                let rejected = d2m::TransactionRejected {
+                    device_id: holder_device,
+                    encrypted_scope: holder_scope,
+                };
                 self.send(
                     conn,
-                    kind::REFLECT_ACK,
-                    &ack,
-                    &[("reflect-id", u64::from(reflect_id))],
+                    kind::TRANSACTION_REJECTED,
+                    &rejected.encode_to_vec(),
+                    &[("device", holder_device)],
+                );
+            }
+            None => {
+                let max = millis(self.knobs.max_transaction_ttl);
+                let ttl_ms = match u64::from(begin.ttl) * 1000 {
+                    0 => max,
+                    asked => asked.min(max),
+                };
+                let now = self.clock.now_ms();
+                self.groups.get_mut(&group).expect("a known group").txn = Some(Txn {
+                    holder: conn,
+                    device,
+                    scope: begin.encrypted_scope.clone(),
+                    deadline_ms: now + ttl_ms,
+                    held: Vec::new(),
+                });
+                self.transactions.push(TxnSeen::Begun {
+                    conn,
+                    device,
+                    ttl_ms,
+                    scope: begin.encrypted_scope,
+                });
+                self.send(
+                    conn,
+                    kind::BEGIN_TRANSACTION_ACK,
+                    &d2m::BeginTransactionAck {}.encode_to_vec(),
+                    &[("ttl-ms", ttl_ms)],
                 );
             }
         }
+    }
+
+    /// TH6 L2b: `CommitTransaction` of the holder: its held reflects go out in order, `CommitTransactionAck` to it,
+    /// `TransactionEnded` to the group's other logged-in connections. Without a transaction: a violation.
+    fn commit_transaction(&mut self, conn: ConnId, payload: &[u8]) {
+        if d2m::CommitTransaction::decode(payload).is_err() {
+            self.protocol_error(conn, "commit-transaction-malformed");
+            return;
+        }
+        let group = self.conns[&conn].group;
+        if !self.groups[&group]
+            .txn
+            .as_ref()
+            .is_some_and(|t| t.holder == conn)
+        {
+            self.protocol_error(conn, "d2m-commit-without-transaction");
+            return;
+        }
+        self.end_transaction(group, TxnEnd::Committed);
+    }
+
+    /// TH6 L2b: ends the transaction of `group` `how`: a commit releases the held reflects (in order, under the time each
+    /// was taken) and acks the holder; any other end drops them. Every other logged-in connection of the group gets
+    /// `TransactionEnded` with the holder's device and scope.
+    fn end_transaction(&mut self, group: [u8; 32], how: TxnEnd) {
+        let Some(txn) = self.groups.get_mut(&group).and_then(|g| g.txn.take()) else {
+            return;
+        };
+        let count = txn.held.len();
+        let (released, dropped) = if how == TxnEnd::Committed {
+            (count, 0)
+        } else {
+            (0, count)
+        };
+        if how == TxnEnd::Committed {
+            for (_, flags, envelope, at) in &txn.held {
+                self.fan_out(group, txn.device, *flags, envelope, *at);
+            }
+            self.send(
+                txn.holder,
+                kind::COMMIT_TRANSACTION_ACK,
+                &d2m::CommitTransactionAck {}.encode_to_vec(),
+                &[("released", u64::try_from(released).expect("a count"))],
+            );
+        } else if dropped > 0 {
+            self.trace.frame(
+                Dir::Out,
+                txn.holder.0,
+                "transaction-reflects-dropped",
+                &[("dropped", u64::try_from(dropped).expect("a count"))],
+            );
+        }
+        self.transactions.push(TxnSeen::Ended {
+            conn: txn.holder,
+            device: txn.device,
+            how,
+            released,
+            dropped,
+        });
+        let ended = d2m::TransactionEnded {
+            device_id: txn.device,
+            encrypted_scope: txn.scope.clone(),
+        }
+        .encode_to_vec();
+        let others: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(id, c)| {
+                **id != txn.holder && c.group == group && c.phase == Phase::PostHandshake
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for other in others {
+            self.send(
+                other,
+                kind::TRANSACTION_ENDED,
+                &ended,
+                &[("device", txn.device)],
+            );
+        }
+    }
+
+    /// TH6 L2a: records that the `ReflectAck` of `reflect_id` went to `conn` (only while it is open: an
+    /// ack owed to a closed connection never reaches its client).
+    fn reflect_ack_sent(&mut self, conn: ConnId, reflect_id: u32) {
+        if self
+            .conns
+            .get(&conn)
+            .is_some_and(|c| c.phase == Phase::PostHandshake && !c.black_hole)
+        {
+            self.leader.events.push(Recorded::ReflectAck {
+                conn: conn.0,
+                reflect_id,
+            });
+        }
+    }
+
+    /// TH6 L2a: `GetDevicesInfo` (`TP/md-d2m.proto:180-212`): `DevicesInfo` with every slot of the group: its
+    /// encrypted device info, its expiration policy, and `connected_since` (the login of its open connection) or
+    /// `last_disconnect_at` (when its last connection ended; neither for a slot never left). The asking device is in
+    /// the map too. [U: real server] whether the asking device is listed, and the time the mediator calls a login
+    /// (the fake: when it sent `ServerInfo`).
+    fn devices_info(&mut self, conn: ConnId, payload: &[u8]) {
+        use d2m::devices_info::AugmentedDeviceInfo;
+        use d2m::devices_info::augmented_device_info::ConnectionState;
+        if d2m::GetDevicesInfo::decode(payload).is_err() {
+            self.protocol_error(conn, "get-devices-info-malformed");
+            return;
+        }
+        let group = self.conns[&conn].group;
+        let mut info = d2m::DevicesInfo::default();
+        for (device, slot) in &self.groups[&group].slots {
+            let since = self
+                .conns
+                .values()
+                .filter(|c| {
+                    c.group == group && c.device == Some(*device) && c.phase == Phase::PostHandshake
+                })
+                .find_map(|c| c.since_ms);
+            let connection_state = match (since, slot.last_disconnect_ms) {
+                (Some(at), _) => Some(ConnectionState::ConnectedSince(at)),
+                (None, Some(at)) => Some(ConnectionState::LastDisconnectAt(at)),
+                (None, None) => None,
+            };
+            info.augmented_device_info.insert(
+                *device,
+                AugmentedDeviceInfo {
+                    encrypted_device_info: slot.device_info.clone(),
+                    connection_state,
+                    device_slot_expiration_policy: slot.expiration as i32,
+                },
+            );
+        }
+        let devices = u64::try_from(info.augmented_device_info.len()).expect("a count fits u64");
+        self.send(
+            conn,
+            kind::DEVICES_INFO,
+            &info.encode_to_vec(),
+            &[("devices", devices)],
+        );
     }
 
     fn send_reflected(&mut self, conn: ConnId, e: &Entry) {
@@ -1819,9 +2181,11 @@ impl State {
             encrypted_shared_device_data: shared,
             reflection_queue_length: u32::try_from(backlog.len()).expect("a queue fits u32"),
         };
+        let now = self.clock.now_ms();
         let c = self.conn(conn);
         c.device = Some(device);
         c.phase = Phase::PostHandshake;
+        c.since_ms = Some(now);
         let held = std::mem::take(&mut c.held_proxy);
         c.proxied.extend(held.iter().cloned());
         self.send(
@@ -1863,7 +2227,8 @@ impl State {
                 self.make_leader(group_id, conn);
             }
         }
-        // §3.2: a CSP client-hello that came before the handshake is answered only now.
+        // §3.2 (the old hold, `Knobs::hold_early_proxy` only): a CSP client-hello that came before the handshake is
+        // answered only now.
         for payload in held {
             self.hand_to_chat_server(conn, &payload);
         }
@@ -1876,6 +2241,16 @@ impl State {
         self.conn(conn).last_csp_ms = now;
         if self.knobs.chat_server {
             self.with_csp(conn, |chat, cc, cx| chat.receive(cc, cx, bytes));
+        }
+    }
+
+    /// Hands Proxy bytes of `conn` that came BEFORE its handshake's end to the chat server at once (the default since RT1
+    /// attempt 1, `Knobs::hold_early_proxy`): what the chat server answers goes to the client now, ahead of `ServerInfo`.
+    fn hand_to_chat_server_early(&mut self, conn: ConnId, bytes: &[u8]) {
+        let now = self.clock.now_ms();
+        self.conn(conn).last_csp_ms = now;
+        if self.knobs.chat_server {
+            self.with_csp_at(conn, true, |chat, cc, cx| chat.receive(cc, cx, bytes));
         }
     }
 
@@ -1897,10 +2272,22 @@ impl State {
         conn: ConnId,
         f: impl FnOnce(&mut ChatServer, &mut CspConn, &mut Cx<'_>),
     ) {
+        self.with_csp_at(conn, false, f);
+    }
+
+    /// [`State::with_csp`]; `early`: also on a connection before its handshake's end (the early Proxy, RT1 attempt 1).
+    fn with_csp_at(
+        &mut self,
+        conn: ConnId,
+        early: bool,
+        f: impl FnOnce(&mut ChatServer, &mut CspConn, &mut Cx<'_>),
+    ) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
-        if c.phase != Phase::PostHandshake {
+        let open =
+            c.phase == Phase::PostHandshake || (early && c.phase == Phase::AwaitingClientHello);
+        if !open {
             return;
         }
         let is_leader = self.groups.get(&c.group).and_then(|g| g.leader) == Some(conn);
@@ -1917,6 +2304,7 @@ impl State {
             leader_mode: self.knobs.leader_mode,
             is_leader,
             out: Vec::new(),
+            log: &mut self.leader,
         };
         f(&mut self.chat, &mut cc, &mut cx);
         let out = cx.out;
@@ -1940,6 +2328,31 @@ impl State {
         }
     }
 
+    /// Queues `message` for `receiver` and sends it at once on the receiver's unblocked connection (or, with
+    /// `CspKnobs::deliver_unasked`, its logged-in one). Whether it was queued.
+    fn queue_for(&mut self, receiver: &[u8; 8], message: Queued) -> bool {
+        let target = self.unblocked_conn(receiver).or_else(|| {
+            self.knobs
+                .csp
+                .deliver_unasked
+                .then(|| self.logged_in_conn(receiver))
+                .flatten()
+        });
+        let queued = self.chat.enqueue(receiver, message, target.is_some());
+        if queued && let Some(conn) = target {
+            self.with_csp(conn, |chat, cc, cx| chat.deliver(cc, cx));
+        }
+        queued
+    }
+
+    /// TH6 C1: the logged-in connection of the CSP identity `receiver`, unblocked or not (`CspKnobs::deliver_unasked`).
+    fn logged_in_conn(&self, receiver: &[u8; 8]) -> Option<ConnId> {
+        self.conns
+            .iter()
+            .find(|(_, c)| c.phase == Phase::PostHandshake && c.csp.identity() == Some(*receiver))
+            .map(|(id, _)| *id)
+    }
+
     /// The logged-in, unblocked connection of the CSP identity `receiver`.
     fn unblocked_conn(&self, receiver: &[u8; 8]) -> Option<ConnId> {
         self.conns
@@ -1956,7 +2369,8 @@ impl State {
 /// The chat server's script calls and queries (M4).
 impl Mediator {
     /// A message from `sender` for `receiver` arrives at the chat server: queued for the receiver
-    /// (C10) and sent at once on its unblocked connection, if one is. The message box is opaque
+    /// (C10) and sent at once on its unblocked connection, if one is (with `CspKnobs::deliver_unasked`,
+    /// on its logged-in one, TH6 C1). The message box is opaque
     /// test bytes (the peer builder of TH5 makes real ones). Returns `false` when it was dropped
     /// (flag "no server queuing" and nobody unblocked).
     #[track_caller]
@@ -1985,7 +2399,6 @@ impl Mediator {
             &nonce,
             message_box,
         );
-        let target = s.unblocked_conn(&receiver);
         let message = Queued {
             sender,
             message_id,
@@ -1993,11 +2406,96 @@ impl Mediator {
             queued_ms: now,
             payload,
         };
-        let queued = s.chat.enqueue(&receiver, message, target.is_some());
-        if queued && let Some(conn) = target {
-            s.with_csp(conn, |chat, cc, cx| chat.deliver(cc, cx));
+        s.queue_for(&receiver, message)
+    }
+
+    /// TH6 L2a: a letter a peer sealed (`Peer::send`) arrives at the chat server: queued for `posted.to` and sent at
+    /// once on its unblocked connection (as [`Mediator::csp_incoming`]), and kept for the guard oracle. Returns
+    /// the letter with `queued` set (false: a "no server queuing" letter with nobody unblocked was dropped).
+    #[track_caller]
+    pub fn csp_post(&self, mut posted: Posted) -> Posted {
+        let (Some(receiver), Some(sender)) = (id_bytes(&posted.to), id_bytes(&posted.sender))
+        else {
+            panic!("a test's identities have 8 bytes");
+        };
+        let mut s = lock(&self.0);
+        let message = Queued {
+            sender,
+            message_id: posted.message_id,
+            flags: posted.flags,
+            queued_ms: s.clock.now_ms(),
+            payload: posted.bytes.clone(),
+        };
+        posted.queued = s.queue_for(&receiver, message);
+        s.leader.posted.push(posted.clone());
+        posted
+    }
+
+    /// TH6 L2a: the guard oracle's input (`leader.rs`): the record of deliveries, `message-ack`s, reflects and
+    /// reflect-acks in order, the posted letters and the declared discards.
+    pub fn leader_log(&self) -> LeaderLog {
+        lock(&self.0).leader.clone()
+    }
+
+    /// TH6 L2a: the test declares that the receiver may ack the message (`sender`, `message_id`) without
+    /// reflecting it (a spec discard the letter itself does not show: a blocked sender, an unknown one
+    /// with a type that creates no contact, a group the user left).
+    #[track_caller]
+    pub fn declare_discard(&self, sender: &str, message_id: u64) {
+        let sender = id_bytes(sender).expect("a test's identities have 8 bytes");
+        lock(&self.0).leader.declared.insert((sender, message_id));
+    }
+
+    /// TH6 L2b, THE PHONE TAKES THE QUEUE (`Phone::lead_csp_queue`; [I]: the fake's phone has no CSP leg): when `conn`
+    /// is its group's leader, every message queued for `receiver`, in order, recorded as delivered on `conn` (the
+    /// "no server ack" ones leave the queue as when sent); `None` (nothing taken) when `conn` does not lead.
+    #[track_caller]
+    pub fn csp_take_for_leader(&self, conn: ConnId, receiver: &str) -> Option<Vec<Queued>> {
+        let receiver = id_bytes(receiver).expect("a test's identities have 8 bytes");
+        let mut s = lock(&self.0);
+        let leads = s.conns.get(&conn).is_some_and(|c| {
+            c.phase == Phase::PostHandshake
+                && s.groups.get(&c.group).and_then(|g| g.leader) == Some(conn)
+        });
+        if !leads {
+            return None;
         }
-        queued
+        let taken = s.chat.take_for_phone(&receiver);
+        for m in &taken {
+            s.trace.frame(
+                Dir::Out,
+                conn.0,
+                "message-taken-by-the-phone",
+                &[("flags", u64::from(m.flags))],
+            );
+            s.leader.events.push(Recorded::Delivered {
+                conn: conn.0,
+                sender: m.sender,
+                message_id: m.message_id,
+            });
+        }
+        Some(taken)
+    }
+
+    /// TH6 L2b: the phone's `message-ack` on `conn` for a message [`Mediator::csp_take_for_leader`] gave it: the entry
+    /// leaves `receiver`'s queue and the ack is recorded.
+    #[track_caller]
+    pub fn csp_ack_for_leader(
+        &self,
+        conn: ConnId,
+        receiver: &str,
+        sender: [u8; 8],
+        message_id: u64,
+    ) {
+        let receiver = id_bytes(receiver).expect("a test's identities have 8 bytes");
+        let mut s = lock(&self.0);
+        let known = s.chat.ack_for_phone(&receiver, &sender, message_id);
+        s.leader.events.push(Recorded::CspAck {
+            conn: conn.0,
+            sender,
+            message_id,
+            known,
+        });
     }
 
     /// How many incoming messages wait for `receiver` (sent or not, not acked).
@@ -2021,6 +2519,11 @@ impl Mediator {
     /// The server sends an `alert` on `conn`.
     pub fn csp_alert(&self, conn: ConnId) {
         lock(&self.0).with_csp(conn, |chat, cc, cx| chat.alert(cc, cx));
+    }
+
+    /// TH6 C1: the chat server sends a container of type `t` with `data` on `conn` (a kind the client does not handle).
+    pub fn csp_raw(&self, conn: ConnId, t: u8, data: &[u8]) {
+        lock(&self.0).with_csp(conn, |chat, cc, cx| chat.raw(cc, cx, t, data));
     }
 
     /// Whether `conn` finished the CSP login.

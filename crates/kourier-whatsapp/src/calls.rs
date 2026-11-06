@@ -34,15 +34,36 @@
 //! | `offer` with `group-jid` | `Remote` (the ringer) | incoming group call, ringing, in `wag:<group>` |
 //! | `terminate`, no reason, `timeout` or `group_call_ended`, no duration | `Remote` | incoming, missed |
 //! | `terminate` with `accepted_elsewhere` or `rejected_elsewhere` | | NOTHING (D2) |
-//! | `offer_notice`, `preaccept`, `accept`, `reject`, `transport`, relay latency, video, group update, rekey, waiting room, hand, screen share, an action this version does not know | | nothing (still claimed) |
+//! | `accept` SENT BY ONE OF OUR OWN DEVICES ([`own_sender`]) for a 1:1 call whose line Kourier filed (`call_lines`: a direct chat of the creator, either form) | `OwnOtherDevice` (that device) | incoming 1:1, ANSWERED (on another device), in the filed chat |
+//! | `accept` of anybody else, or of ours for a call Kourier filed no 1:1 line of | | nothing (still claimed) |
+//! | `offer_notice`, `preaccept`, `reject`, `transport`, relay latency, video, group update, rekey, waiting room, hand, screen share, an action this version does not know | | nothing (still claimed) |
 //!
 //! D2 (his words: "missed until the phone says"): a terminate that says `accepted_elsewhere` or
 //! `rejected_elsewhere` is the CALLER's word, sent by the caller's side to the callee's other devices
 //! (upstream: "the dismiss is caller-driven", `handlers/call.rs`), so it is not the user's own device
 //! speaking and is never labelled `OwnOtherDevice`. It reports nothing: the ring ends as a missed call at
-//! its deadline, until the phone's call log (W6a1, `calls/log.rs`) says what happened. A terminate of a call WE made
+//! its deadline, until one of OUR OWN devices says what happened: its `accept` (THE OWN ANSWER, below) or the
+//! phone's call log (W6a1, `calls/log.rs`), whose answer moves a missed line up to answered at any time (the core's
+//! `CallLine::join` only moves a line up). A terminate of a call WE made
 //! (`call-creator` is one of our ids) is not an incoming call and reports nothing either; so does any
 //! signal of a call made by one of our own ids.
+//!
+//! THE OWN ANSWER (R1 finding, 2026-11-04: a call answered on the test phone ended `missed` here). An `accept` is
+//! the answering device's word. `from` and `participant` are the server's routing, which the sender cannot write, so
+//! an accept whose every person among them is one of our ids ([`own_sender`]) is OUR device answering: the line
+//! becomes answered on another device (`OwnOtherDevice`, the only origin that may say so), and the caller's later
+//! terminate cannot take that back (missed is below answered). It only SETTLES a line Kourier shows: the accept
+//! names no group, so it goes to the chat the call's line was filed under (`calls::log::filed_chat_of`, read from
+//! the store like the LID mapping) when that is a 1:1 chat of the creator, and is nothing otherwise (no line seen, a
+//! group call, another person's chat: a call id is the caller's choice). The contract has no duration: an answered
+//! line is final, and the terminate's `duration` says nothing more. WHETHER A COMPANION EVER GETS ITS PRIMARY'S
+//! ACCEPT is NOT proven: upstream (the pin, `src/handlers/call.rs` `dismiss_outgoing_siblings`' doc, "the callee
+//! never dismisses its own siblings; verified vs WA Web + APK") says the callee's other devices hear only the
+//! caller's per-device `terminate reason="accepted_elsewhere"`. R1 saw two claimed stanzas within a second of each
+//! answer and none at the call's end; their kinds were not logged then. The interceptor's two DEBUG lines now say
+//! each signal's kind, reason and sender in fixed words ([`Words`]), so the next real run shows which came. A
+//! known limit: an accept handled before the commit of its offer's line (both replayed from the offline queue on
+//! tasks of their own) finds no filed line and says nothing; the phone's call log is the second word.
 //!
 //! The ring. A live offer rings for [`RING_MS`], the whole time: this computer's clock is not in it (a
 //! wrong local clock neither shortens nor lengthens a ring, as Signal's), and a live offer is seconds old.
@@ -69,12 +90,13 @@
 //!
 //! LOGS carry counts and kinds only: never a JID, a number, a name or a call id. A stanza that does not
 //! parse logs that fact and nothing of the error (an upstream parse error can print the JID that
-//! failed to parse).
+//! failed to parse). The kind, the reason and the sender of a signal are logged as words of this file's own
+//! ([`Words`]), never as the network's text.
 
 use std::sync::Arc;
 
 use kourier_backend_api::{BackendEvent, Clock, Envelope, IncomingMessage};
-use kourier_model::{CallDirection, CallLine, CallMedia, CallState, ConvKey, Origin};
+use kourier_model::{CallDirection, CallLine, CallMedia, CallState, ConvKey, Origin, UserId};
 use wacore::stanza::call::{
     TERMINATE_REASON_GROUP_CALL_ENDED, TERMINATE_REASON_TIMEOUT, parse_call_stanza,
 };
@@ -140,16 +162,114 @@ pub(crate) enum Read {
 /// one. Asked only when the stanza itself does not settle whether the creator is its sender.
 pub(crate) type NumberOf<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// Reads a `<call>` stanza into its line, if it has one.
-pub(crate) fn read(node: &NodeRef<'_>, now_ms: u64, own: &OwnIds, number_of: NumberOf<'_>) -> Read {
+/// What the store knows of a call's line: the chat the line of 1:1 call `call_id` was filed under, when it is a direct
+/// chat of the person in either form (`calls::log::filed_chat_of`). Asked only for an accept of one of our own devices.
+pub(crate) type FiledChat<'a> = &'a dyn Fn(&str, &UserId) -> Option<ConvKey>;
+
+/// What the store is asked while a stanza is read: each lookup only when the stanza alone does not settle it.
+#[derive(Clone, Copy)]
+pub(crate) struct Lookups<'a> {
+    pub(crate) number_of: NumberOf<'a>,
+    pub(crate) filed_chat: FiledChat<'a>,
+}
+
+/// Reads a `<call>` stanza into its line, if it has one (the tests' door; the interceptor reads with [`look`]).
+#[cfg(test)]
+pub(crate) fn read(node: &NodeRef<'_>, now_ms: u64, own: &OwnIds, store: Lookups<'_>) -> Read {
+    look(node, now_ms, own, store).0
+}
+
+/// What `read` gives, and the fixed words the log says of the signal.
+fn look(node: &NodeRef<'_>, now_ms: u64, own: &OwnIds, store: Lookups<'_>) -> (Read, Words) {
     match parse_call_stanza(node) {
-        Ok(Some(call)) => match line(&call, now_ms, own, number_of) {
-            Some(event) => Read::Line(Box::new(event)),
-            None => Read::Nothing,
-        },
-        Ok(None) => Read::Nothing,
+        Ok(Some(call)) => {
+            let words = Words::of(&call, own);
+            match line(&call, now_ms, own, store) {
+                Some(event) => (Read::Line(Box::new(event)), words),
+                None => (Read::Nothing, words),
+            }
+        }
+        Ok(None) => (Read::Nothing, Words::UNKNOWN),
         // The error is dropped on purpose: its text can name the JID that failed to parse.
-        Err(_) => Read::Unreadable,
+        Err(_) => (Read::Unreadable, Words::UNKNOWN),
+    }
+}
+
+/// What the log says of one signal, in this file's own fixed words: never an id, a number, a name or the network's
+/// own text (an unknown reason is `other`). For the run tool and a reader of R1's log: which kinds came, and from whom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Words {
+    /// The action: `offer`, `accept`, `terminate` ... (`other` for one this version does not name, `unknown` for no
+    /// action this version parses).
+    pub(crate) kind: &'static str,
+    /// A terminate's or a reject's reason (`none` when it has none), `-` for the other actions.
+    pub(crate) reason: &'static str,
+    /// `own` (one of our devices, [`own_sender`]), `creator` (the stanza's routed sender is the call's creator by the
+    /// stanza alone) or `other`.
+    pub(crate) sender: &'static str,
+    /// A terminate that carries a duration above nought.
+    pub(crate) connected: bool,
+}
+
+impl Words {
+    /// A stanza with no action this version parses, or one that does not parse.
+    const UNKNOWN: Self = Self {
+        kind: "unknown",
+        reason: "-",
+        sender: "-",
+        connected: false,
+    };
+
+    fn of(call: &IncomingCall, own: &OwnIds) -> Self {
+        let reason = |reason: &Option<String>| match reason.as_deref() {
+            None => "none",
+            Some("timeout") => "timeout",
+            Some("group_call_ended") => "group_call_ended",
+            Some("accepted_elsewhere") => "accepted_elsewhere",
+            Some("rejected_elsewhere") => "rejected_elsewhere",
+            Some("busy") => "busy",
+            Some("enc") => "enc",
+            Some(_) => "other",
+        };
+        let (kind, reason, connected) = match &call.action {
+            CallAction::Offer { .. } => ("offer", "-", false),
+            CallAction::OfferNotice { .. } => ("offer_notice", "-", false),
+            CallAction::PreAccept { .. } => ("preaccept", "-", false),
+            CallAction::Accept { .. } => ("accept", "-", false),
+            CallAction::Reject { reason: r, .. } => ("reject", reason(r), false),
+            CallAction::Terminate {
+                reason: r,
+                duration,
+                ..
+            } => ("terminate", reason(r), duration.is_some_and(|d| d > 0)),
+            CallAction::Transport { .. } => ("transport", "-", false),
+            CallAction::RelayLatency { .. } => ("relaylatency", "-", false),
+            CallAction::VideoState { .. } => ("video", "-", false),
+            CallAction::GroupUpdate { .. } => ("group_update", "-", false),
+            CallAction::EncRekey { .. } => ("enc_rekey", "-", false),
+            CallAction::WaitingRoomUpdate { .. } => ("waiting_room_update", "-", false),
+            CallAction::RaiseHand { .. } => ("user_action", "-", false),
+            CallAction::ScreenShare { .. } => ("screen_share", "-", false),
+            _ => ("other", "-", false),
+        };
+        let creator = call.action.call_creator();
+        let routed = call.participant.as_ref().unwrap_or(&call.from);
+        let sender = if own_sender(call, own).is_some() {
+            "own"
+        } else if map::scheme_of(routed.server).is_some()
+            && map::scheme_of(routed.server) == map::scheme_of(creator.server)
+            && routed.user == creator.user
+        {
+            "creator"
+        } else {
+            "other"
+        };
+        Self {
+            kind,
+            reason,
+            sender,
+            connected,
+        }
     }
 }
 
@@ -159,7 +279,7 @@ pub(crate) fn line(
     call: &IncomingCall,
     now_ms: u64,
     own: &OwnIds,
-    number_of: NumberOf<'_>,
+    store: Lookups<'_>,
 ) -> Option<BackendEvent> {
     let creator = call.action.call_creator();
     let caller = map::person_of(creator)?;
@@ -167,6 +287,11 @@ pub(crate) fn line(
         // A call our own phone made (or any signal of it): not an incoming call.
         return None;
     }
+    // An accept is the answering device's word: ours settles the line (THE OWN ANSWER), anybody else's says nothing.
+    if matches!(call.action, CallAction::Accept { .. }) {
+        return own_answer(call, caller, own, store.filed_chat, now_ms);
+    }
+    let number_of = store.number_of;
     // The creator is the sender or a stranger who names him (fix F1): nothing for a stranger.
     if !creator_is_sender(call, number_of) {
         return None;
@@ -223,13 +348,73 @@ pub(crate) fn line(
     }
     let signal = signal.with_by(caller.clone(), at);
     let device = (creator.device > 0).then_some(u32::from(creator.device));
+    let origin = Origin::Remote {
+        author: caller,
+        device,
+    };
+    message_of(call, conv, origin, signal, at, now_ms)
+}
+
+/// THE OWN ANSWER (the module doc): an accept that one of OUR devices sent answers the 1:1 line Kourier filed for the
+/// call, from that device. `None` for anybody else's accept (the store is not asked then), for one with no time, and for
+/// a call Kourier filed no 1:1 line of in the creator's chat.
+fn own_answer(
+    call: &IncomingCall,
+    caller: UserId,
+    own: &OwnIds,
+    filed_chat: FiledChat<'_>,
+    now_ms: u64,
+) -> Option<BackendEvent> {
+    let device = own_sender(call, own)?;
+    let at = call.timestamp?.timestamp_millis();
+    let conv = filed_chat(call.action.call_id(), &caller)?;
+    let signal = CallLine::signal(CallDirection::Incoming, false, CallState::Answered, at)
+        .with_by(caller, at);
+    message_of(
+        call,
+        conv,
+        Origin::OwnOtherDevice { device },
+        signal,
+        at,
+        now_ms,
+    )
+}
+
+/// Whether one of OUR devices sent the stanza, and which: `participant` and `from` are the server's routing (the sender
+/// cannot write them), and EVERY person among them is one of our ids, at least one (a call's own address or a group is
+/// no person). `Some(None)`: ours, the device not stated (the primary is device 0). `None`: not provably ours, also
+/// while our ids are not known.
+fn own_sender(call: &IncomingCall, own: &OwnIds) -> Option<Option<u32>> {
+    let mut ours = None;
+    for jid in [call.participant.as_ref(), Some(&call.from)]
+        .into_iter()
+        .flatten()
+    {
+        let Some(person) = map::person_of(jid) else {
+            continue;
+        };
+        if !own.is_own(&person) {
+            return None;
+        }
+        let device = (jid.device > 0).then_some(u32::from(jid.device));
+        ours = Some(ours.flatten().or(device));
+    }
+    ours
+}
+
+/// The message of one signal, as the interceptor writes it.
+fn message_of(
+    call: &IncomingCall,
+    conv: ConvKey,
+    origin: Origin,
+    signal: CallLine,
+    at: i64,
+    now_ms: u64,
+) -> Option<BackendEvent> {
     let mut message = IncomingMessage::call(
         conv,
         call.action.call_id(),
-        Origin::Remote {
-            author: caller,
-            device,
-        },
+        origin,
         signal,
         at,
         i64::try_from(now_ms).unwrap_or(i64::MAX),
@@ -378,7 +563,27 @@ impl StanzaInterceptor for CallInterceptor {
                 .ok()
                 .flatten()
         };
-        let read = read(node, self.clock.now_ms(), &self.own.own_known(), &number_of);
+        // The chat of a call's filed 1:1 line, read only for an accept of our own device (THE OWN ANSWER); a read
+        // that fails reads as "no line" (nothing is shown).
+        let store = self.writer.store().clone();
+        let filed_chat = move |call_id: &str, person: &UserId| -> Option<ConvKey> {
+            let (call_id, person) = (call_id.to_owned(), person.clone());
+            store
+                .read_blocking(move |conn| log::filed_chat_of(conn, &call_id, &person))
+                .ok()
+                .flatten()
+        };
+        let lookups = Lookups {
+            number_of: &number_of,
+            filed_chat: &filed_chat,
+        };
+        let (read, words) = look(node, self.clock.now_ms(), &self.own.own_known(), lookups);
+        let Words {
+            kind,
+            reason,
+            sender,
+            connected,
+        } = words;
         match read {
             Read::Line(event) => {
                 if self.writer.write_and_wait(&[*event]).is_err() {
@@ -391,10 +596,24 @@ impl StanzaInterceptor for CallInterceptor {
                     (self.on_failure)();
                     return Interception::Handled;
                 }
-                tracing::debug!(lines = 1, "a call line is durable");
+                tracing::debug!(
+                    lines = 1,
+                    kind,
+                    reason,
+                    sender,
+                    connected,
+                    "a call line is durable"
+                );
             }
             Read::Nothing => {
-                tracing::debug!(lines = 0, "a call signal that shows nothing");
+                tracing::debug!(
+                    lines = 0,
+                    kind,
+                    reason,
+                    sender,
+                    connected,
+                    "a call signal that shows nothing"
+                );
             }
             Read::Unreadable => {
                 tracing::warn!("a call stanza could not be read");

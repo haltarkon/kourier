@@ -26,7 +26,10 @@
 //! AT MOST 500 EVENTS (TH5b S-L3, `outbox::append_in_rows`): a re-mapped settings delta whose 1,202 events go
 //! into three `core_outbox` rows of the one zone, all or none; and THE SEND QUEUE's zones (TH6a S1, schema 4): PREPARE (the
 //! task, its receivers and both nonce stores), REFLECTED, ACKS (a batch of 3 of 5, and the last with the update and its nonce),
-//! DONE, a job's end (the delete with its cascade, at ACKS and at DONE), a job's give-up and the sweep.
+//! DONE, a job's end (the delete with its cascade, at ACKS and at DONE), a job's give-up and the sweep; and THE LEADER'S
+//! THREE ZONES (TH6 L1, schema 5): RECEIVE (a kept text, a discard with its nonce and a job sealed through
+//! `send::enqueue_job`, a kept vote deferred as `csp`: rows, events, nonces and the job all or nothing), REFLECTED (three
+//! rows and the coalesced receipt jobs) and the sweep (rows and a `pending` row's nonce).
 //! Nothing here runs an actor or makes a client.
 
 use std::os::unix::process::ExitStatusExt;
@@ -43,8 +46,10 @@ use tokio::sync::Notify;
 use zeroize::Zeroizing;
 
 use crate::store::{
-    JOIN_LABEL, JOIN_NOW_MS, SEND_LOCAL, SEND_QUEUED, SEND_T0, ZONE_1_TABLES, join_fixture,
-    sealed_update, send_id, send_rows, send_update, transmit,
+    IN_AT, IN_OTHER, IN_PEER, IN_T0, JOIN_LABEL, JOIN_NOW_MS, SEND_LOCAL, SEND_QUEUED, SEND_T0,
+    ZONE_1_TABLES, inbound_id, inbound_job, inbound_kept, inbound_linked, inbound_plaintext,
+    inbound_receipt, inbound_reflect, inbound_text, join_fixture, receiving, sealed_update,
+    send_id, send_rows, send_update, transmit,
 };
 use crate::support::{self, db_path, key};
 
@@ -232,6 +237,7 @@ fn assert_literal_state(op: &str, dir: &Path, after: bool) {
             lines == send_state(op, after),
             "{op}: the {when} state is not the rows written out"
         ),
+        (inbound, _) if inbound.starts_with("inbound_") => assert_inbound(op, dir, &lines, after),
         (other, _) => panic!("unknown operation {other} ({when})"),
     }
 }
@@ -745,6 +751,328 @@ fn assert_cleared(dir: &Path, after: bool) {
     );
 }
 
+// THE LEADER'S ZONES (TH6 L1, schema 5: `store::receive_inbound`, `mark_inbound_reflected`, `sweep_inbound`) -----------
+
+/// RECEIVE's local time, REFLECTED's, and the sweep's now with its ages written out (14 and 30 days).
+const INBOUND_RECEIVE_AT: i64 = IN_T0 + 2;
+const INBOUND_REFLECTED_AT: i64 = IN_T0 + 5;
+const INBOUND_SWEEP_NOW: i64 = 1_800_000_000_000;
+const INBOUND_DAY14: i64 = 1_209_600_000;
+const INBOUND_DAY30: i64 = 2_592_000_000;
+
+/// `byte` 32 times, as `hex()` prints it.
+fn hex32(byte: u8) -> String {
+    format!("{byte:02X}").repeat(32)
+}
+
+/// The `i:` line of a `pending` row RECEIVE wrote for message `n` of `sender` at `at`.
+fn inbound_pending_line(id: i64, sender: &str, n: u8, ack: bool, receipt: bool, at: i64) -> String {
+    format!(
+        "i:{id},{sender},{},pending,{},{},{at},null,{},{}",
+        i64::from_ne_bytes(inbound_id(n).to_ne_bytes()),
+        u8::from(ack),
+        u8::from(receipt),
+        hex32(0xC0 + n),
+        format!("{:02X}", 0xE0 + n).repeat(40 + usize::from(n))
+    )
+}
+
+/// The `i:` line of a row REFLECTED moved.
+fn inbound_reflected_line(id: i64, sender: &str, n: u8, at: i64) -> String {
+    format!(
+        "i:{id},{sender},{},reflected,1,1,{at},{INBOUND_REFLECTED_AT},,",
+        i64::from_ne_bytes(inbound_id(n).to_ne_bytes()),
+    )
+}
+
+/// The `i:` line of a sweep's row: `sender`, `pending` or not, its two times, its nonce byte.
+fn inbound_sweep_line(
+    id: i64,
+    sender: &str,
+    pending: Option<(i64, u8)>,
+    reflected_at: i64,
+) -> String {
+    match pending {
+        Some((received_at, nonce)) => format!(
+            "i:{id},{sender},1,pending,1,1,{received_at},null,{},{}",
+            hex32(nonce),
+            "00".repeat(40)
+        ),
+        None => format!("i:{id},{sender},1,reflected,1,1,1,{reflected_at},,"),
+    }
+}
+
+/// One row of the sweep's state before: (sender, `pending` with its received_at and nonce byte, or `None` for `reflected`,
+/// the reflected time).
+type SweepRow = (&'static str, Option<(i64, u8)>, i64);
+
+/// The sweep's rows before.
+fn inbound_sweep_rows() -> [SweepRow; 5] {
+    let now = INBOUND_SWEEP_NOW;
+    [
+        ("L1KSWEP1", Some((now - INBOUND_DAY30 - 1, 0xA1)), 0),
+        ("L1KSWEP2", Some((now - INBOUND_DAY30, 0xA2)), 0),
+        ("L1KSWEP3", None, now - INBOUND_DAY14 - 1),
+        ("L1KSWEP4", None, now - INBOUND_DAY14),
+        ("L1KSWEP5", Some((now, 0xA5)), 0),
+    ]
+}
+
+/// The plaintext of RECEIVE's vote (message 3 of the other peer).
+fn inbound_vote() -> Vec<u8> {
+    inbound_plaintext(IN_OTHER, 3, 0x16, vec![7; 20])
+}
+
+fn inbound_before(op: &str, db: &kourier_db::ZoneDb) {
+    match op {
+        "inbound_receive" => inbound_linked(db),
+        "inbound_reflected" => {
+            inbound_linked(db);
+            let texts: Vec<(Vec<u8>, Vec<u8>)> = (1..=3u8)
+                .map(|n| {
+                    let sender = if n == 2 { IN_OTHER } else { IN_PEER };
+                    (inbound_text(sender, n), inbound_reflect(n))
+                })
+                .collect();
+            let kept: Vec<store::Inbound<'_>> = texts
+                .iter()
+                .zip(1u8..)
+                .map(|((text, reflect), n)| {
+                    let sender = if n == 2 { IN_OTHER } else { IN_PEER };
+                    store::Inbound::Keep(inbound_kept(sender, n, text, reflect, true))
+                })
+                .collect();
+            let wake = Rc::new(Notify::new());
+            store::receive_inbound(db, &receiving(&wake, IN_T0), &kept).expect("the rows before");
+        }
+        "inbound_sweep" => db
+            .zone(|tx| {
+                for (sender, pending, reflected_at) in inbound_sweep_rows() {
+                    let statement = match pending {
+                        Some((received_at, nonce)) => format!(
+                            "INSERT INTO csp_inbound (sender, message_id, state, ack, receipt, received_at, nonce_hash, \
+                             reflect_env) VALUES ('{sender}', 1, 'pending', 1, 1, {received_at}, X'{}', zeroblob(40)); \
+                             INSERT INTO csp_nonce (hash) VALUES (X'{}');",
+                            hex32(nonce),
+                            hex32(nonce)
+                        ),
+                        None => format!(
+                            "INSERT INTO csp_inbound (sender, message_id, state, ack, receipt, received_at, reflected_at) \
+                             VALUES ('{sender}', 1, 'reflected', 1, 1, 1, {reflected_at});"
+                        ),
+                    };
+                    tx.execute_batch(&statement)?;
+                }
+                // The nonce of a reflected message: no row names it, it stays.
+                tx.execute_batch(&format!("INSERT INTO csp_nonce (hash) VALUES (X'{}');", hex32(0xA3)))?;
+                Ok::<(), kourier_db::Error>(())
+            })
+            .expect("the rows before"),
+        other => panic!("unknown operation {other}"),
+    }
+}
+
+fn inbound_operation(op: &str, db: &kourier_db::ZoneDb) {
+    match op {
+        "inbound_receive" => {
+            let wake = Rc::new(Notify::new());
+            let (text, vote) = (inbound_text(IN_PEER, 1), inbound_vote());
+            let (r1, r3) = (inbound_reflect(1), inbound_reflect(3));
+            let jobs = [inbound_job(IN_OTHER)];
+            let received = store::receive_inbound(
+                db,
+                &receiving(&wake, INBOUND_RECEIVE_AT),
+                &[
+                    store::Inbound::Keep(inbound_kept(IN_PEER, 1, &text, &r1, true)),
+                    store::Inbound::Discard(store::Discarded {
+                        nonce_hash: Some([0xC2; 32]),
+                        jobs: &jobs,
+                        contact: None,
+                    }),
+                    store::Inbound::Keep(store::Kept {
+                        flags: 0x04,
+                        ack: false,
+                        ..inbound_kept(IN_OTHER, 3, &vote, &r3, false)
+                    }),
+                ],
+            )
+            .expect("ZONE RECEIVE");
+            assert!(
+                received
+                    == [
+                        store::Received::Kept(1),
+                        store::Received::Discarded,
+                        store::Received::Kept(2)
+                    ],
+                "inbound_receive: not two kept and a discard"
+            );
+        }
+        "inbound_reflected" => {
+            let acks = store::mark_inbound_reflected(
+                db,
+                &[1, 2, 3],
+                INBOUND_REFLECTED_AT,
+                &inbound_receipt,
+            )
+            .expect("ZONE REFLECTED");
+            assert!(acks.len() == 3, "inbound_reflected: not three rows moved");
+        }
+        "inbound_sweep" => {
+            let swept = store::sweep_inbound(db, INBOUND_SWEEP_NOW).expect("the sweep");
+            assert!(
+                swept
+                    == store::InboundSwept {
+                        reflected: 1,
+                        pending: 1
+                    },
+                "inbound_sweep: not one row of each age"
+            );
+        }
+        other => panic!("unknown operation {other}"),
+    }
+}
+
+/// The leader's literal states (`lines`: the dump; its `o:` lines are checked by their decoded events).
+fn assert_inbound(op: &str, dir: &Path, lines: &[String], after: bool) {
+    let when = if after { "after" } else { "before" };
+    let rest: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.starts_with("o:"))
+        .collect();
+    let outbox = outbox_rows(dir);
+    let events: Vec<Vec<BackendEvent>> = outbox
+        .iter()
+        .map(|r| decode_outbox_row(&r.1).expect("the outbox row decodes"))
+        .collect();
+    let peer = kourier_model::ConvKey::Direct(UserId::from_parts("threema", IN_PEER).expect("id"));
+    let other =
+        kourier_model::ConvKey::Direct(UserId::from_parts("threema", IN_OTHER).expect("id"));
+    let messages = |row: &[BackendEvent]| -> Vec<kourier_model::ConvKey> {
+        row.iter()
+            .filter_map(|e| match e {
+                BackendEvent::Message(m) => Some(m.conv.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let other_hex: String = [&[0x0A, 0x08][..], IN_OTHER.as_bytes()]
+        .concat()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    match (op, after) {
+        ("inbound_receive", false) => assert!(
+            rest == ["n:0,0", "t:0,0"] && outbox.is_empty(),
+            "inbound_receive: the state before is not an empty leader's file"
+        ),
+        ("inbound_receive", true) => {
+            let vote = inbound_vote();
+            let deferred = format!(
+                "r:1,csp,poll-vote,2,{IN_AT},4,{INBOUND_RECEIVE_AT},{}",
+                vote.iter().map(|b| format!("{b:02X}")).collect::<String>()
+            );
+            let expected = [
+                format!("c:{}", hex32(0xC1)),
+                format!("c:{}", hex32(0xC2)),
+                format!("c:{}", hex32(0xC3)),
+                format!("e:1,{IN_OTHER},pending"),
+                inbound_pending_line(1, IN_PEER, 1, true, true, INBOUND_RECEIVE_AT),
+                inbound_pending_line(2, IN_OTHER, 3, false, false, INBOUND_RECEIVE_AT),
+                format!("m:{}", hex32(0xD1)),
+                format!("m:{}", hex32(0xD3)),
+                "n:4,3".to_owned(),
+                format!(
+                    "q:1,job,l1-job,prepared,{INBOUND_RECEIVE_AT},{INBOUND_RECEIVE_AT},{other_hex}"
+                ),
+                deferred,
+                format!("t:1,{}", vote.len()),
+            ];
+            assert!(
+                rest == expected,
+                "inbound_receive: the rows, nonces, deferred row and job after are not the ones written out"
+            );
+            assert!(
+                outbox.len() == 1
+                    && outbox[0].2 == INBOUND_RECEIVE_AT
+                    && messages(&events[0]) == [peer]
+                    && events[0].len() == 1,
+                "inbound_receive: core_outbox is not ONE row with the text's message, at the zone's time"
+            );
+        }
+        ("inbound_reflected", _) => {
+            let rows = if after {
+                vec![
+                    inbound_reflected_line(1, IN_PEER, 1, IN_T0),
+                    inbound_reflected_line(2, IN_OTHER, 2, IN_T0),
+                    inbound_reflected_line(3, IN_PEER, 3, IN_T0),
+                ]
+            } else {
+                vec![
+                    inbound_pending_line(1, IN_PEER, 1, true, true, IN_T0),
+                    inbound_pending_line(2, IN_OTHER, 2, true, true, IN_T0),
+                    inbound_pending_line(3, IN_PEER, 3, true, true, IN_T0),
+                ]
+            };
+            let peer_hex: String = [&[0x0A, 0x08][..], IN_PEER.as_bytes()]
+                .concat()
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            let mut expected: Vec<String> = (1..=3u8)
+                .map(|n| format!("c:{}", hex32(0xC0 + n)))
+                .collect();
+            if after {
+                expected.push(format!("e:1,{IN_PEER},pending"));
+                expected.push(format!("e:2,{IN_OTHER},pending"));
+            }
+            expected.extend(rows);
+            expected.extend((1..=3u8).map(|n| format!("m:{}", hex32(0xD0 + n))));
+            expected.push(if after { "n:5,5" } else { "n:3,3" }.to_owned());
+            if after {
+                expected.push(format!(
+                    "q:1,job,receipt,prepared,{INBOUND_REFLECTED_AT},{INBOUND_REFLECTED_AT},{peer_hex}"
+                ));
+                expected.push(format!(
+                    "q:2,job,receipt,prepared,{INBOUND_REFLECTED_AT},{INBOUND_REFLECTED_AT},{other_hex}"
+                ));
+            }
+            expected.push("t:0,0".to_owned());
+            assert!(
+                rest == expected,
+                "inbound_reflected: the {when} state is not the rows, nonces and receipt jobs written out"
+            );
+            assert!(
+                outbox.len() == 1 && messages(&events[0]) == [peer.clone(), other, peer],
+                "inbound_reflected: core_outbox is not RECEIVE's one row of three messages"
+            );
+        }
+        ("inbound_sweep", _) => {
+            let mut expected: Vec<String> = Vec::new();
+            let nonces: &[u8] = if after {
+                &[0xA2, 0xA3, 0xA5]
+            } else {
+                &[0xA1, 0xA2, 0xA3, 0xA5]
+            };
+            expected.extend(nonces.iter().map(|b| format!("c:{}", hex32(*b))));
+            for (id, (sender, pending, reflected_at)) in (1i64..).zip(inbound_sweep_rows()) {
+                if after && (id == 1 || id == 3) {
+                    continue;
+                }
+                expected.push(inbound_sweep_line(id, sender, pending, reflected_at));
+            }
+            expected.push(format!("n:{},0", nonces.len()));
+            expected.push("t:0,0".to_owned());
+            assert!(
+                rest == expected,
+                "inbound_sweep: the {when} state is not the rows and nonces written out"
+            );
+            assert!(outbox.is_empty(), "inbound_sweep: core_outbox holds a row");
+        }
+        (other, _) => panic!("unknown operation {other} ({when})"),
+    }
+}
+
 // THE SEND QUEUE'S ZONES (TH6a S1, schema 4: `store::prepare_send_zone`, `mark_send_*`, `sweep_sends`) --------------
 
 /// ZONE DONE's update reflect-ack time and its local time.
@@ -1236,6 +1564,7 @@ fn before(op: &str, db: &kourier_db::ZoneDb) {
         "split" => split_before(db),
         "cleared" => cleared_before(db),
         send if send.starts_with("send_") => send_before(op, db),
+        inbound if inbound.starts_with("inbound_") => inbound_before(op, db),
         other => panic!("unknown operation {other}"),
     }
 }
@@ -1300,6 +1629,7 @@ fn operation(op: &str, db: &kourier_db::ZoneDb) {
             );
         }
         send if send.starts_with("send_") => send_operation(op, db),
+        inbound if inbound.starts_with("inbound_") => inbound_operation(op, db),
         other => panic!("unknown operation {other}"),
     }
 }
@@ -1371,6 +1701,27 @@ fn dump(dir: &Path, op: &str) -> Vec<String> {
              UNION ALL SELECT 't:' || row_count || ',' || byte_sum FROM deferred_total \
              UNION ALL SELECT 'c:' || identity || hex(sync) FROM contact \
              UNION ALL SELECT 'o:' || seq || '=' || hex(envelope) || ',' || created_at FROM core_outbox \
+             ORDER BY 1"
+        }
+        // THE LEADER'S ZONES: every column of `csp_inbound`, every core_outbox row WITH its events, the deferred rows
+        // and the kept sum, the nonces the test wrote (a hash of 32 equal bytes) and the counts of both stores, and the
+        // send rows without what a seal draws at random (message id, sealed bytes, their sizes, their nonces).
+        inbound if inbound.starts_with("inbound_") => {
+            "SELECT 'i:' || id || ',' || sender || ',' || message_id || ',' || state || ',' || ack || ',' || receipt \
+               || ',' || received_at || ',' || ifnull(reflected_at, 'null') || ',' || hex(nonce_hash) || ',' \
+               || hex(reflect_env) FROM csp_inbound \
+             UNION ALL SELECT 'o:' || seq || '=' || hex(envelope) || ',' || created_at FROM core_outbox \
+             UNION ALL SELECT 'r:' || id || ',' || source || ',' || kind || ',' || map_version || ',' \
+               || server_at || ',' || flags || ',' || received_at || ',' || hex(envelope) FROM deferred \
+             UNION ALL SELECT 't:' || row_count || ',' || byte_sum FROM deferred_total \
+             UNION ALL SELECT 'c:' || hex(hash) FROM csp_nonce \
+               WHERE hex(hash) = replace(hex(zeroblob(32)), '00', substr(hex(hash), 1, 2)) \
+             UNION ALL SELECT 'm:' || hex(hash) FROM d2d_nonce \
+               WHERE hex(hash) = replace(hex(zeroblob(32)), '00', substr(hex(hash), 1, 2)) \
+             UNION ALL SELECT 'n:' || (SELECT count(*) FROM csp_nonce) || ',' || (SELECT count(*) FROM d2d_nonce) \
+             UNION ALL SELECT 'q:' || id || ',' || origin || ',' || kind || ',' || state || ',' || created_at || ',' \
+               || queued_at || ',' || hex(conversation) FROM send_task \
+             UNION ALL SELECT 'e:' || task || ',' || identity || ',' || state FROM send_receiver \
              ORDER BY 1"
         }
         // Who the sweep leaves.
@@ -1650,4 +2001,42 @@ fn send_prepare_with_an_eviction_takes_the_old_row_and_writes_the_new_one_all_or
 fn send_sweep_deletes_every_row_past_its_age_all_or_nothing() {
     kill_at_every_hit("send_sweep", fp::INSIDE_SEND_SWEEP, Expect::Before);
     kill_at_every_hit("send_sweep", fp::AFTER_SEND_SWEEP, Expect::After);
+}
+
+/// THE LEADER'S ZONE RECEIVE (TH6 L1; `INSIDE_INBOUND_RECEIVE` / `AFTER_INBOUND_RECEIVE`): a kept text, a discard with its
+/// nonce and a job sealed through `send::enqueue_job` in the zone, a kept vote deferred as `csp`: the two `pending` rows with
+/// their sealed reflects, the text's events, the vote's deferred row, the three CSP and two D2D nonces and the job, ALL OR
+/// NOTHING. A second zone for the events (mutant M3) leaves rows without their events and dies here.
+#[test]
+fn inbound_receive_writes_rows_events_nonces_and_jobs_all_or_nothing() {
+    kill_at_every_hit(
+        "inbound_receive",
+        fp::INSIDE_INBOUND_RECEIVE,
+        Expect::Before,
+    );
+    kill_at_every_hit("inbound_receive", fp::AFTER_INBOUND_RECEIVE, Expect::After);
+}
+
+/// THE LEADER'S ZONE REFLECTED (`INSIDE_INBOUND_REFLECTED` / `AFTER_INBOUND_REFLECTED`): three rows `reflected` with their
+/// sealed reflects and nonce hashes dropped, and the two coalesced receipt jobs, all or nothing.
+#[test]
+fn inbound_reflected_moves_the_rows_with_their_receipts_all_or_nothing() {
+    kill_at_every_hit(
+        "inbound_reflected",
+        fp::INSIDE_INBOUND_REFLECTED,
+        Expect::Before,
+    );
+    kill_at_every_hit(
+        "inbound_reflected",
+        fp::AFTER_INBOUND_REFLECTED,
+        Expect::After,
+    );
+}
+
+/// THE LEADER'S SWEEP (`INSIDE_INBOUND_SWEEP` / `AFTER_INBOUND_SWEEP`): the old `pending` row with its CSP nonce and the old
+/// `reflected` row, all or nothing.
+#[test]
+fn inbound_sweep_takes_the_old_rows_and_a_pending_rows_nonce_all_or_nothing() {
+    kill_at_every_hit("inbound_sweep", fp::INSIDE_INBOUND_SWEEP, Expect::Before);
+    kill_at_every_hit("inbound_sweep", fp::AFTER_INBOUND_SWEEP, Expect::After);
 }

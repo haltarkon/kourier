@@ -24,7 +24,11 @@
 //! never made and nothing of WhatsApp is contacted. For `cargo xtask wa-run rehearse` only.
 //! `KOURIER_DEV_REHEARSAL=telegram` (debug builds with the `fake` and `telegram` features) does the
 //! same for Telegram (`kourier_fake::FakeNetwork::rehearsal_telegram`): the real parts are never
-//! made, no API pair and no helper files are needed. One value at a time ([`Rehearsal`]).
+//! made, no API pair and no helper files are needed.
+//! `KOURIER_DEV_REHEARSAL=threema` (debug builds with the `fake` and `threema` features) does the
+//! same for Threema (`kourier_fake::FakeNetwork::rehearsal_threema`): `dial::live_parts` is never
+//! called, so no dialer, client or socket exists, whatever the run profile's list of test IDs says
+//! (the fake judges no ID). One value at a time ([`Rehearsal`]).
 //!
 //! `KOURIER_DEV_DEMO_STATE=challenge|offline|clock`: the state the fake network's demo account
 //! ends in once it is linked.
@@ -62,7 +66,7 @@ pub fn demo_state(env: impl Fn(&str) -> Option<OsString>) -> crate::FixtureState
 }
 
 /// The environment variable that puts a scripted rehearsal fake in the slot of the network it names
-/// (`whatsapp` or `telegram`; see the module documentation). Every debug build reads it: one that
+/// (`whatsapp`, `telegram` or `threema`; see the module documentation). Every debug build reads it: one that
 /// holds no rehearsal network refuses a start that sets it ([`rehearsal_refused`]).
 pub const REHEARSAL_ENV: &str = "KOURIER_DEV_REHEARSAL";
 
@@ -70,7 +74,11 @@ pub const REHEARSAL_ENV: &str = "KOURIER_DEV_REHEARSAL";
 /// a rehearsal plays. Without it a start that asks for a rehearsal is refused, not ignored.
 pub const HAS_REHEARSAL_NETWORK: bool = cfg!(all(
     feature = "fake",
-    any(feature = "whatsapp", feature = "telegram")
+    any(
+        feature = "whatsapp",
+        feature = "telegram",
+        feature = "threema"
+    )
 ));
 
 /// The words of the refusal when a rehearsal is asked for in a build without a rehearsal network.
@@ -104,20 +112,32 @@ fn rehearsal_refused_as(
 
 /// The values [`rehearsal_requested`] takes in this build, for its refusal's words: a build
 /// without a network's backend does not name that network.
-#[cfg(all(feature = "fake", any(feature = "whatsapp", feature = "telegram")))]
-const REHEARSAL_WORDS: &str = if cfg!(all(feature = "whatsapp", feature = "telegram")) {
-    "`whatsapp`, `telegram` or unset"
-} else if cfg!(feature = "whatsapp") {
-    "`whatsapp` or unset"
-} else {
-    "`telegram` or unset"
+#[cfg(all(
+    feature = "fake",
+    any(feature = "whatsapp", feature = "telegram", feature = "threema")
+))]
+const REHEARSAL_WORDS: &str = match (
+    cfg!(feature = "whatsapp"),
+    cfg!(feature = "telegram"),
+    cfg!(feature = "threema"),
+) {
+    (true, true, true) => "`whatsapp`, `telegram`, `threema` or unset",
+    (true, true, false) => "`whatsapp`, `telegram` or unset",
+    (true, false, true) => "`whatsapp`, `threema` or unset",
+    (false, true, true) => "`telegram`, `threema` or unset",
+    (true, false, false) => "`whatsapp` or unset",
+    (false, true, false) => "`telegram` or unset",
+    (false, false, _) => "`threema` or unset",
 };
 
-/// Which network `env` asks to rehearse: exactly `whatsapp` or exactly `telegram` (each only in a
+/// Which network `env` asks to rehearse: exactly `whatsapp`, `telegram` or `threema` (each only in a
 /// build that holds that backend and the test network), unset or empty is none, anything else is an
 /// error that does not repeat the value (a typo must not start a run against the real backend while
 /// the person thinks it is a rehearsal). A release build never reads the variable.
-#[cfg(all(feature = "fake", any(feature = "whatsapp", feature = "telegram")))]
+#[cfg(all(
+    feature = "fake",
+    any(feature = "whatsapp", feature = "telegram", feature = "threema")
+))]
 pub fn rehearsal_requested(
     env: impl Fn(&str) -> Option<OsString>,
 ) -> Result<crate::app::Rehearsal, String> {
@@ -126,7 +146,10 @@ pub fn rehearsal_requested(
 
 /// [`rehearsal_requested`] with the kind of build as an argument (`debug` false reads nothing and
 /// asks for none), so the release rule has a test: this module itself exists in debug builds only.
-#[cfg(all(feature = "fake", any(feature = "whatsapp", feature = "telegram")))]
+#[cfg(all(
+    feature = "fake",
+    any(feature = "whatsapp", feature = "telegram", feature = "threema")
+))]
 fn rehearsal_requested_as(
     debug: bool,
     env: impl Fn(&str) -> Option<OsString>,
@@ -141,6 +164,8 @@ fn rehearsal_requested_as(
         Some("whatsapp") => Ok(Rehearsal::WhatsApp),
         #[cfg(feature = "telegram")]
         Some("telegram") => Ok(Rehearsal::Telegram),
+        #[cfg(feature = "threema")]
+        Some("threema") => Ok(Rehearsal::Threema),
         Some(_) => Err(format!("{REHEARSAL_ENV} must be {REHEARSAL_WORDS}")),
     }
 }
@@ -353,7 +378,10 @@ mod tests {
     /// blanks around, a list, another network, a flag word) is an error that does not repeat the
     /// value and states the accepted words; a release build reads nothing. Mutant: any value taken as
     /// Telegram (or as WhatsApp), or the release check dropped.
-    #[cfg(all(feature = "fake", any(feature = "whatsapp", feature = "telegram")))]
+    #[cfg(all(
+        feature = "fake",
+        any(feature = "whatsapp", feature = "telegram", feature = "threema")
+    ))]
     #[test]
     fn rehearsal_names_one_network() {
         use crate::app::Rehearsal;
@@ -379,13 +407,22 @@ mod tests {
         assert_eq!(with(Some("whatsapp")), Ok(Rehearsal::WhatsApp));
         #[cfg(feature = "telegram")]
         assert_eq!(with(Some("telegram")), Ok(Rehearsal::Telegram));
-        #[cfg_attr(all(feature = "whatsapp", feature = "telegram"), allow(unused_mut))]
+        #[cfg(feature = "threema")]
+        assert_eq!(with(Some("threema")), Ok(Rehearsal::Threema));
+        #[cfg_attr(
+            all(feature = "whatsapp", feature = "telegram", feature = "threema"),
+            allow(unused_mut)
+        )]
         let mut bad = vec![
             "WhatsApp",
             "Telegram",
             "TELEGRAM",
+            "Threema",
+            "THREEMA",
+            "threema ",
+            " threema",
+            "threema,telegram",
             "signal",
-            "threema",
             "1",
             "true",
             "real",
@@ -404,6 +441,8 @@ mod tests {
         bad.push("whatsapp");
         #[cfg(not(feature = "telegram"))]
         bad.push("telegram");
+        #[cfg(not(feature = "threema"))]
+        bad.push("threema");
         for bad in bad {
             // The refusal is the fixed sentence and nothing else: the value is not repeated.
             assert_eq!(
@@ -421,8 +460,18 @@ mod tests {
             REHEARSAL_WORDS.contains("`telegram`"),
             cfg!(feature = "telegram")
         );
+        assert_eq!(
+            REHEARSAL_WORDS.contains("`threema`"),
+            cfg!(feature = "threema")
+        );
         // A release build reads nothing: no network, and no error for a typo either.
-        for value in [Some("whatsapp"), Some("telegram"), Some("signal"), None] {
+        for value in [
+            Some("whatsapp"),
+            Some("telegram"),
+            Some("threema"),
+            Some("signal"),
+            None,
+        ] {
             assert_eq!(with_in(false, value), Ok(Rehearsal::None), "{value:?}");
         }
     }
@@ -447,6 +496,7 @@ mod tests {
         for value in [
             word("telegram"),
             word("whatsapp"),
+            word("threema"),
             word("real"),
             word("1"),
             word(" "),

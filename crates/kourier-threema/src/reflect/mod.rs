@@ -39,8 +39,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use kourier_backend_api::BackendEvent;
-use kourier_db::ZoneDb;
 use kourier_db::rusqlite::Connection;
+use kourier_db::{Tx, ZoneDb};
 use kourier_model::ConvKey;
 use libthreema::common::keys::DeviceGroupKey;
 use libthreema::common::{Nonce, ThreemaId};
@@ -57,7 +57,7 @@ use crate::store::{
     self, DeferredBounds, DeferredSource, Dropped, Identity, NewDeferred, NonceScope,
 };
 
-mod body;
+pub(crate) mod body;
 pub(crate) mod classify;
 mod map;
 mod notice;
@@ -194,6 +194,19 @@ pub(crate) fn open_ephemeral(keys: &Keys, reflected: &Reflected) -> Option<Backe
     None
 }
 
+/// TH6 L4b: what an incoming typing indicator the LEADER took from the chat server states (the follower's own rule,
+/// [`map::typing`] over the `IncomingMessage` the leader reflects ephemerally): `Some` only for a typing indicator from
+/// a Threema ID with ONE byte 0 or 1; else `None` with a DEBUG line naming its rule.
+pub(crate) fn typing_of(envelope: &d2d::Envelope) -> Option<BackendEvent> {
+    match map::typing(envelope) {
+        Ok(event) => Some(event),
+        Err(rule) => {
+            tracing::debug!(rule, "an incoming typing indicator states nothing");
+            None
+        }
+    }
+}
+
 /// What opens and hashes a connection's reflected envelopes: DGK (DGRK is derived from it) and the
 /// own ID (the HMAC key of the nonce stores).
 pub(crate) struct Keys {
@@ -216,6 +229,18 @@ impl Keys {
     /// rule is applied for the reflection loop and for the send core (rule 14: `src/send/` never names `hash_with`).
     pub(crate) fn hash(&self, nonce: &Nonce) -> [u8; 32] {
         nonce.hash_with(self.own).0
+    }
+
+    /// TH6 L5: an encoded `d2d.TransactionScope` sealed with DGTSK and a random nonce ahead (`BeginTransaction`'s
+    /// `encrypted_scope`). Here because rule 14 keeps every P5 seal in this directory; `None` when the cipher refuses.
+    pub(crate) fn seal_scope(&self, scope: Vec<u8>) -> Option<Vec<u8>> {
+        self.dgk.seal_transaction_scope(scope).ok()
+    }
+
+    /// The keys of `dgk` and `own`, for the crate's unit tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(dgk: DeviceGroupKey, own: ThreemaId) -> Self {
+        Self { dgk, own }
     }
 
     /// The keys of the stored identity; `Err` names the field that does not convert.
@@ -415,51 +440,102 @@ fn zone(ctx: &Ctx<'_>, entries: &[Entry]) -> Result<Counts> {
             if let Some(error) = door_error(plaintext.len(), "defer an envelope failed") {
                 return Err(error);
             }
-            // What it IS (classify, map): reads see this zone's earlier writes (one transaction).
+            // C10 (TH6): a message this device took from the chat server as the leader, which the phone now reflects
+            // as ITS leader's: the phone took it over, so the `pending` row of it goes (its nonce stays).
+            if let Some(d2d::envelope::Content::IncomingMessage(m)) = &envelope.content {
+                crate::leader::zone::forget_pending(tx, &m.sender_identity, m.message_id)?;
+            }
             let mut notice_tag = [0; 8];
             notice_tag.copy_from_slice(&hash[..8]);
-            let cx = map::Cx {
-                own: ctx.own.as_str(),
-                now_ms: ctx.now_ms,
+            let one = One {
+                envelope,
+                plaintext,
                 server_at: entry.server_at,
-                catch_up: ctx.catch_up,
+                flags: entry.flags,
                 notice_tag,
-                remap: false,
             };
-            let mapped = map::map(envelope, &cx, &StoreView(tx))?;
-            if let Some(rule) = mapped.dropped {
-                counts.add(rule);
-            }
-            if let Some(rule) = mapped.warned {
-                counts.warn_applied(rule);
-            }
-            for &(rule, n) in &mapped.skipped {
-                counts.skip(rule, n);
-            }
-            let created_ms = i64::try_from(entry.server_at).unwrap_or(ctx.now_ms);
-            apply_writes(tx, &mapped.writes, created_ms)?;
+            let events = map_one(
+                tx,
+                ctx,
+                &one,
+                DeferredSource::Reflected,
+                &mut counts,
+                &mut dropped,
+            )?;
             // The envelope's events in order, durable before the ack: ONE row, or rows of at most 500
             // (S-L3: a settings delta over many stored contacts), all in this zone.
-            outbox::append_in_rows(tx, &mapped.events, ctx.now_ms, ctx.wake)?;
-            if let Some(kind) = mapped.deferred {
-                let row = NewDeferred {
-                    source: DeferredSource::Reflected,
-                    kind,
-                    map_version: classify::MAP_VERSION,
-                    server_at: entry.server_at,
-                    flags: entry.flags,
-                    envelope: plaintext,
-                };
-                let d = store::add_deferred(tx, &row, ctx.now_ms, &ctx.bounds)?;
-                dropped.full += d.full;
-                dropped.expired += d.expired;
-            }
+            outbox::append_in_rows(tx, &events, ctx.now_ms, ctx.wake)?;
         }
         store::warn_dropped(tx, dropped);
         Ok(counts)
     })?;
     ZONES.fetch_add(1, Ordering::SeqCst);
     Ok(counts)
+}
+
+/// One opened `d2d.Envelope` for [`map_one`]: the envelope, its plaintext exactly as it came (what a `deferred` row
+/// keeps: never a prost re-encode) and what the transport said with it.
+pub(crate) struct One<'a> {
+    pub(crate) envelope: &'a d2d::Envelope,
+    pub(crate) plaintext: &'a [u8],
+    /// `server_at` of its events and of a `deferred` row: the mediator's `Reflected.timestamp` for a reflection, the
+    /// message's own time for a message the leader took from the chat server (TH6, critic T-L3).
+    pub(crate) server_at: u64,
+    /// `Reflected.flags`, or the CSP message's flags: a `deferred` row's `flags`.
+    pub(crate) flags: u16,
+    /// A notice's stable id (`map::Cx::notice_tag`).
+    pub(crate) notice_tag: [u8; 8],
+}
+
+/// WHAT AN ENVELOPE IS, inside the caller's zone (TH6: factored out of the batch zone, so the follower's zone and the
+/// leader's ZONE RECEIVE map through ONE mapper): [`classify`] and [`map`] over the file as this zone sees it, its BLOB
+/// writes (a later envelope of the zone reads them), a `deferred` row of `source` with the plaintext as it came under
+/// [`classify::MAP_VERSION`], and the rules it dropped, warned or skipped counted into `counts` (the owner writes the
+/// lines once per zone) and the bounds' drops into `dropped` (likewise). Returns its EVENTS, in order, for the owner
+/// to write into `core_outbox` in the same zone (`outbox::append_in_rows`). Nonces and acks are the owner's.
+pub(crate) fn map_one(
+    tx: &mut Tx<'_>,
+    ctx: &Ctx<'_>,
+    one: &One<'_>,
+    source: DeferredSource,
+    counts: &mut Counts,
+    dropped: &mut Dropped,
+) -> Result<Vec<BackendEvent>> {
+    // Reads see this zone's earlier writes (one transaction).
+    let cx = map::Cx {
+        own: ctx.own.as_str(),
+        now_ms: ctx.now_ms,
+        server_at: one.server_at,
+        catch_up: ctx.catch_up,
+        notice_tag: one.notice_tag,
+        remap: false,
+    };
+    let mapped = map::map(one.envelope, &cx, &StoreView(tx))?;
+    if let Some(rule) = mapped.dropped {
+        counts.add(rule);
+    }
+    if let Some(rule) = mapped.warned {
+        counts.warn_applied(rule);
+    }
+    for &(rule, n) in &mapped.skipped {
+        counts.skip(rule, n);
+    }
+    let created_ms = i64::try_from(one.server_at).unwrap_or(ctx.now_ms);
+    apply_writes(tx, &mapped.writes, created_ms)?;
+    if let Some(kind) = mapped.deferred {
+        let row = NewDeferred {
+            source,
+            kind,
+            map_version: classify::MAP_VERSION,
+            server_at: one.server_at,
+            flags: one.flags,
+            envelope: one.plaintext,
+        };
+        let d = store::add_deferred(tx, &row, ctx.now_ms, &ctx.bounds)?;
+        dropped.full += d.full;
+        dropped.expired += d.expired;
+    }
+    Ok(mapped.events)
 }
 
 /// The BLOBs a mapped envelope writes ([`map::Write`]), in order, inside the caller's zone (the batch's,
@@ -538,7 +614,7 @@ fn nonce_alone(db: &ZoneDb, hash: &[u8; 32]) -> Result<()> {
 /// The dropped envelopes of one batch per rule, in the order first seen, the envelopes applied with a
 /// counted WARN (H6 `contact-key-change`), and the parts of update envelopes skipped (R10, R11).
 #[derive(Default)]
-struct Counts(
+pub(crate) struct Counts(
     Vec<(&'static str, u32)>,
     Vec<(&'static str, u32)>,
     Vec<(&'static str, u32)>,
@@ -581,6 +657,49 @@ impl Counts {
         }
         for (rule, n) in other.2 {
             self.skip(rule, n);
+        }
+    }
+
+    /// TH6: the same lines for the messages the LEADER took from the chat server (ZONE RECEIVE): a message the map
+    /// drops is still reflected and acked by the leader (the phone maps it as its own), so the words say "mapped to
+    /// nothing", not "acked and dropped". Rule names and counts only.
+    pub(crate) fn warn_received(self) {
+        for (rule, n) in self.1 {
+            tracing::warn!(
+                rule,
+                applied = n,
+                "received syncs applied without a field: {n} by {rule}"
+            );
+        }
+        for (rule, n) in self.2 {
+            if classify::is_quiet(rule) {
+                tracing::debug!(
+                    rule,
+                    skipped = n,
+                    "received message updates skipped: {n} by {rule}"
+                );
+            } else {
+                tracing::warn!(
+                    rule,
+                    skipped = n,
+                    "received message updates skipped: {n} by {rule}"
+                );
+            }
+        }
+        for (rule, n) in self.0 {
+            if classify::is_quiet(rule) {
+                tracing::debug!(
+                    rule,
+                    dropped = n,
+                    "received messages mapped to nothing: {n} by {rule}"
+                );
+            } else {
+                tracing::warn!(
+                    rule,
+                    dropped = n,
+                    "received messages mapped to nothing: {n} by {rule}"
+                );
+            }
         }
     }
 

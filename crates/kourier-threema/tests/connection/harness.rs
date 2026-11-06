@@ -78,6 +78,9 @@ pub struct Scene {
     pub jobs: Vec<NewJob>,
     /// TH6a S6: the actor's parts open the send core's door (`Scene::send_open`).
     pub send_open: bool,
+    /// TH6 L5: a seeded contact's nickname and whether it is only a group's (`GROUP_OR_DELETED`), by ID
+    /// (`Scene::with_contact_as`); a contact without an entry has no nickname and is direct.
+    pub contact_shapes: std::collections::BTreeMap<String, (Option<String>, bool)>,
 }
 
 pub fn scene(seed: u64) -> Scene {
@@ -107,6 +110,7 @@ pub fn scene(seed: u64) -> Scene {
         settings: None,
         jobs: Vec::new(),
         send_open: false,
+        contact_shapes: std::collections::BTreeMap::new(),
     }
 }
 
@@ -161,6 +165,16 @@ impl Scene {
             (creator.to_owned(), group_id),
             members.iter().map(|id| (*id).to_owned()).collect(),
         );
+        self
+    }
+
+    /// TH6 L5: the seeded contact `id` (a peer, [`Scene::with_peer`]) has this nickname and, when `hidden`, the
+    /// acquaintance level `GROUP_OR_DELETED`.
+    #[track_caller]
+    pub fn with_contact_as(mut self, id: &str, nickname: Option<&str>, hidden: bool) -> Self {
+        self = self.with_peer(id);
+        self.contact_shapes
+            .insert(id.to_owned(), (nickname.map(str::to_owned), hidden));
         self
     }
 
@@ -219,7 +233,16 @@ impl Scene {
         db.zone(|tx| {
             for id in &self.contacts {
                 let key = self.contact_keys.get(id).copied().unwrap_or([7; 32]);
-                let sync = ContactDelta::create(id, key, START_MS).build();
+                let mut delta = ContactDelta::create(id, key, START_MS);
+                if let Some((nickname, hidden)) = self.contact_shapes.get(id) {
+                    if let Some(nickname) = nickname {
+                        delta = delta.nickname(nickname);
+                    }
+                    if *hidden {
+                        delta = delta.hidden();
+                    }
+                }
+                let sync = delta.build();
                 tx.execute(
                     "INSERT INTO contact (identity, sync, last_update_at) VALUES (?1, ?2, NULL)",
                     params![id, sync.encode_to_vec()],
@@ -464,6 +487,48 @@ impl H {
         );
     }
 
+    /// Waits (a wall BOUND) until the actor is PARKED, and returns what it waits for on its clock (earliest first):
+    /// exactly one timer of its own (the socket's select, the handshake's, or the pause between two sockets) and, beside
+    /// it, the bound of each directory lookup that pends at the fake ([`Net::directory_pending`]). WHY: [`H::sync`]
+    /// alone is no barrier for the connection. The actor's command loop is the MAIN future of its `LocalSet`, which
+    /// tokio polls BEFORE the spawned connection task, so `sync` can be answered while a wake the clock gave the
+    /// connection is still queued and its timer not armed again; a list read then held only a pending lookup's bound
+    /// (30 s ahead), and moving the clocks there skipped the keep-alive (the fake's chat server closes a socket silent
+    /// for 30 s with 4000: TH6's post-rebase strike of `leader_contacts`). A SECOND `sync` is answered only in the
+    /// `LocalSet`'s next round, after the round that ran every task queued before the first one, so the reads around
+    /// it see no wake of the clock still unhandled; the two reads must agree (a pass that was running during the first
+    /// shows a transient timer: `Session::close`'s unbiased 1 s bound) and hold one timer plus the pending lookups'.
+    /// A test that reads the next deadline from the list instead of naming it ([`H::advance_to`] with an expected
+    /// time) reads it here.
+    pub async fn wait_parked(&self) -> Vec<u64> {
+        let read = || (self.net().directory_pending(), self.clock.deadlines());
+        let reached = tokio::time::timeout(WALL, async {
+            loop {
+                self.sync().await;
+                let first = read();
+                self.sync().await;
+                let (pending, deadlines) = read();
+                if first == (pending, deadlines.clone()) && deadlines.len() == 1 + pending {
+                    return deadlines;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        match reached {
+            Ok(deadlines) => deadlines,
+            Err(_) => panic!(
+                "the actor never parked: it waits for {:?}, {} lookups pend",
+                self.clock
+                    .deadlines()
+                    .iter()
+                    .map(|d| d.saturating_sub(START_MS))
+                    .collect::<Vec<_>>(),
+                self.net().directory_pending()
+            ),
+        }
+    }
+
     /// Waits (a wall BOUND) until the actor waits for `deadline` on its clock, then moves BOTH
     /// clocks there in steps of at most 1 s, the fake's first (critic M5: an EXPECTED deadline,
     /// never "any sleep").
@@ -577,6 +642,41 @@ impl H {
         got
     }
 
+    /// TH6 L4b: the core side that ACKS everything it gets (a durable envelope is applied; an ephemeral one has no ack)
+    /// until the published state is `what` (a wall BOUND); the events it got, in order.
+    pub async fn ack_until(
+        &mut self,
+        what: &str,
+        done: impl Fn(&ConnState) -> bool,
+    ) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        let ends = &mut self.ends;
+        let reached = tokio::time::timeout(WALL, async {
+            loop {
+                if done(&ends.conn.borrow_and_update()) {
+                    return;
+                }
+                tokio::select! {
+                    envelope = ends.events.recv() => {
+                        let Some(envelope) = envelope else { return };
+                        if let Some(ack) = envelope.ack {
+                            ack.complete(Ok(()));
+                        }
+                        events.extend(envelope.events);
+                    }
+                    _ = ends.conn.changed() => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok() && done(&self.ends.conn.borrow()),
+            "the state never became {what}; it is {:?}",
+            self.state()
+        );
+        events
+    }
+
     /// Nothing waits for the core (call after `sync()`).
     pub fn nothing_for_the_core(&mut self) {
         assert!(
@@ -682,7 +782,7 @@ impl H {
     /// violations are empty (the LAST check).
     pub async fn finish(mut self) {
         self.shut_down().await;
-        self.s.world.violations().assert_empty();
+        self.violations_checked();
     }
 
     /// Waits (a wall BOUND) until the fake's mediator finished the handshake of this device (it
@@ -709,7 +809,7 @@ impl H {
         if let Some(thread) = self.handle.thread.take() {
             thread.join().expect("the actor's thread joins");
         }
-        self.s.world.violations().assert_empty();
+        self.violations_checked();
     }
 
     /// Waits until the actor ended BY ITSELF with `Exit::Shutdown` (the core's token was cancelled:
@@ -753,7 +853,7 @@ impl H {
             self.handle.thread.is_none(),
             "finish_after_shutdown before wait_shutdown"
         );
-        self.s.world.violations().assert_empty();
+        self.violations_checked();
     }
 
     /// The actor ended by itself with `Exit::LoggedOut { reason }`; then the fake's violations are
@@ -763,6 +863,18 @@ impl H {
             reason: reason.to_owned(),
         })
         .await;
+        self.violations_checked();
+    }
+}
+
+impl H {
+    /// THE LAST CHECK of every finisher: THE GUARD ORACLE over the leader's work (TH6 L4b: every `message-ack` the actor
+    /// sent follows the reflect-ack of its message's reflection, or the message is a declared discard; L2a's
+    /// `leader_violations`, the phone of the tests' scenes skipped), then the fake's violations are empty.
+    fn violations_checked(&self) {
+        self.s
+            .world
+            .leader_violations(&self.s.keys, super::reflect::PHONE);
         self.s.world.violations().assert_empty();
     }
 }

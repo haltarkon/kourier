@@ -1,10 +1,10 @@
 //! The CSP leg inside the mediator's Proxy payloads (brief §2.6): libthreema's context from the
 //! stored identity, and [`CspSend`], EVERYTHING Kourier's connection may send to the chat server.
 //!
-//! [`CspSend`] has no value that asks the chat server to start delivering messages: only a leader
-//! that can take them (TH6) may send that, so in TH3-TH5 the chat server keeps the ID's messages
-//! for the next leader. Its one conversion into libthreema's payload is an exhaustive `match`, and
-//! the source check's rule 10 keeps the payload's name out of `src/` but a future `src/leader/`.
+//! [`CspSend::Unblock`] asks the chat server to start delivering messages: only a leader that can take
+//! them sends it (TH6 L4b, once per socket, `conn`'s leader stage). Its payload is built in `src/leader/`
+//! (`leader::unblock_payload`): the source check's rule 10 keeps the payload's name out of every other file
+//! of `src/`, this one included. The one conversion into libthreema's payload is an exhaustive `match`.
 
 use std::fmt;
 
@@ -13,10 +13,12 @@ use libthreema::common::{CspDeviceId, DeviceCookie, MessageFlags, MessageId, Thr
 use libthreema::csp::CspProtocolContext;
 use libthreema::csp::CspProtocolContextInit;
 use libthreema::csp::payload::{
-    ConnectionIdleTimeout, EchoPayload, MessageWithMetadataBox, OutgoingPayload,
+    ConnectionIdleTimeout, EchoPayload, MessageAck, MessageWithMetadataBox, OutgoingPayload,
 };
 
+use super::lines::Out;
 use crate::ServerParams;
+use crate::send::queue::SendOrigin;
 use crate::store::Identity;
 
 /// Where the fields of a stored `message-with-metadata-box` are (`csp.struct.yml`): the sender's ID, the message id, the
@@ -47,6 +49,15 @@ pub(crate) enum CspSend {
         /// The whole box.
         bytes: Vec<u8>,
     },
+    /// TH6 L4b: the leader asks the chat server to deliver (once per socket, after Dry was counted).
+    Unblock,
+    /// TH6 L4b: the `message-ack` of an incoming message, after the zone that makes it true.
+    MessageAck {
+        /// The message's sender.
+        sender: ThreemaId,
+        /// The message id.
+        message_id: u64,
+    },
 }
 
 impl CspSend {
@@ -62,6 +73,18 @@ impl CspSend {
             flags,
             bytes,
         })
+    }
+
+    /// What the count line calls this frame (TH6 C1, [`super::lines`]): a box by the `origin` of its row (TR's D5), `other`
+    /// when none is known. Exhaustive: a new value must say how it is counted.
+    pub(crate) fn counted(&self, origin: Option<SendOrigin>) -> Out {
+        match self {
+            Self::EchoRequest(_) | Self::EchoResponse(_) => Out::Echo,
+            Self::SetConnectionIdleTimeout(_) => Out::Idle,
+            Self::Box { .. } => origin.map_or(Out::Other, Out::Box),
+            Self::Unblock => Out::Unblock,
+            Self::MessageAck { .. } => Out::MessageAck,
+        }
     }
 
     /// libthreema's payload. Exhaustive: a new value must say what it sends.
@@ -83,6 +106,11 @@ impl CspSend {
                 flags: MessageFlags(flags),
                 bytes,
             }),
+            Self::Unblock => crate::leader::unblock_payload(),
+            Self::MessageAck { sender, message_id } => OutgoingPayload::MessageAck(MessageAck {
+                sender_identity: sender,
+                message_id: MessageId(message_id),
+            }),
         }
     }
 }
@@ -101,6 +129,8 @@ impl fmt::Debug for CspSend {
                 .field("flags", flags)
                 .field("len", &bytes.len())
                 .finish_non_exhaustive(),
+            Self::Unblock => f.write_str("Unblock"),
+            Self::MessageAck { .. } => f.write_str("MessageAck"),
         }
     }
 }

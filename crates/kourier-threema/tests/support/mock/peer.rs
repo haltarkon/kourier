@@ -13,6 +13,15 @@
 //! that is no PKCS#7) the peer records a VIOLATION by a `peer-*` rule name in the world's list, which
 //! every test ends by checking, and reports no [`Opened`] for that message.
 //!
+//! TH6 L2a: the peer also SENDS to the user ([`Peer::send`] of a [`Letter`]): a real
+//! `message-with-metadata-box` from the spec (head, metadata box under the MMK, the container with its
+//! PKCS#7 padding under the shared key S, one nonce for both boxes), sealed with the fake's own crypto
+//! and queued at the chat server for the user's identity (`Mediator::csp_post`), which delivers it to
+//! the device group's unblocked leader and redelivers it at every login until it is acked. A letter
+//! can be bent the ways the receive steps discard (a reused nonce, another receiver in the head, a box
+//! that does not open, a metadata id that differs, no metadata, a type the spec does not know, an FS
+//! envelope written by hand, any padding); what it was is kept for the guard oracle (`leader.rs`).
+//!
 //! Marks: `[I]` where the peer reads the spec's "should" or a recommendation as a rule (the
 //! oracle is not more forgiving than the real receiver), `[U: real phone]` where the pinned spec
 //! does not say what a real app does. Nothing here prints a key, an ID, a nonce or a body: the
@@ -23,11 +32,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use libthreema::protobuf::{common, csp_e2e};
 use prost::Message as _;
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::{RngCore as _, SeedableRng as _};
 
-use super::crypto::{KeyPair, blake2b_mac, hsalsa_shared, open};
+use super::crypto::{KeyPair, blake2b_mac, hsalsa_shared, open, seal};
 use super::csp::{Sent, flag};
 use super::d2m::Mediator;
-use super::{Identities, MockWorld, Violations, lock};
+use super::leader::Posted;
+use super::{Clock, Identities, MockWorld, Violations, lock};
 
 /// The fixed head of a `message-with-metadata-box`: sender (8), receiver (8), message id (8),
 /// created-at (4), flags (1), reserved (1), metadata-length (2), legacy nickname (32).
@@ -110,6 +122,9 @@ pub struct Peer {
     seen_ids: BTreeSet<(String, u64)>,
     /// Everything opened so far, in order (discarded ones too).
     opened: Vec<Opened>,
+    /// TH6 L2a: the world's clock (a letter's `created-at`) and the nonces of what it sends.
+    clock: Clock,
+    rng: ChaCha20Rng,
 }
 
 impl std::fmt::Debug for Peer {
@@ -138,11 +153,282 @@ impl MockWorld {
             used_nonces: BTreeMap::new(),
             seen_ids: BTreeSet::new(),
             opened: Vec::new(),
+            clock: self.clock().clone(),
+            // From the world's seed and the ID, not from the world's RNG: a peer made for sending does not move
+            // the nonces and ids of the rest of the world.
+            rng: ChaCha20Rng::seed_from_u64(id.bytes().fold(self.seed() ^ 0x5045_4552, |h, b| {
+                h.rotate_left(8) ^ u64::from(b)
+            })),
         }
     }
 }
 
+/// How a [`Letter`]'s metadata box is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LetterMeta {
+    /// Sealed under the MMK, a `csp_e2e.MessageMetadata` with the letter's id, time and nickname.
+    Normal,
+    /// `metadata-length` 0 and no box (an old client's form; the receiver goes on without it).
+    Absent,
+    /// Sealed under the MMK, but the plaintext is no protobuf.
+    Garbage,
+}
+
+/// A message a peer sends TO the user (TH6 L2a; module doc): every field of the struct the spec names,
+/// each one a test may bend. Build with [`Letter::new`] / [`Letter::text`] and the methods; `Debug`
+/// prints the id, the type, the flags and the length only.
+#[derive(Clone)]
+pub struct Letter {
+    /// The identity whose queue at the chat server takes it (the user).
+    pub to: String,
+    pub message_id: u64,
+    /// The metadata's `created-at` (ms); the head carries it in seconds. `None`: the world's clock now.
+    pub created_ms: Option<u64>,
+    /// The head's `created-at` in seconds when it is not the metadata's.
+    pub head_s: Option<u32>,
+    pub flags: u8,
+    /// The container's type (any byte: 0x7e is a type the pinned spec does not know, 0xff the reserved one).
+    pub ty: u8,
+    /// The container's data before the padding.
+    pub data: Vec<u8>,
+    /// The padding bytes when they are not PKCS#7 up to 32 bytes of padded data.
+    pub padding: Option<Vec<u8>>,
+    /// The metadata's nickname (`None`: absent, `Some("")`: cleared).
+    pub nickname: Option<String>,
+    pub meta: LetterMeta,
+    /// The metadata's message id when it is not the head's.
+    pub meta_id: Option<u64>,
+    /// The head's receiver when it is not `to`.
+    pub head_receiver: Option<String>,
+    /// The head's legacy nickname when it is not all zeros (the rule for a receiver that is no Gateway ID).
+    pub legacy: Option<[u8; LEGACY_NICKNAME]>,
+    /// The nonce of both boxes; `None`: a fresh one from the peer's RNG. A nonce of an earlier letter
+    /// reuses it (the receiver's step 2).
+    pub nonce: Option<[u8; NONCE]>,
+    /// One byte of the message box flipped: the box does not open (the receiver's step 7).
+    pub broken_box: bool,
+    /// The test declares that the receiver may ack it without a reflect (a spec discard); the bending
+    /// methods that make one set it.
+    pub discard: bool,
+}
+
+impl std::fmt::Debug for Letter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Letter(id {}, type {:#04x}, flags {:#04x}, {} B)",
+            self.message_id,
+            self.ty,
+            self.flags,
+            self.data.len()
+        )
+    }
+}
+
+impl Letter {
+    /// A letter of type `ty` with `data` to `to`, flags "send push" (0x01), metadata with no nickname,
+    /// PKCS#7 padding, a fresh nonce, the world's time.
+    pub fn new(to: &str, message_id: u64, ty: u8, data: &[u8]) -> Self {
+        Self {
+            to: to.to_owned(),
+            message_id,
+            created_ms: None,
+            head_s: None,
+            flags: flag::SEND_PUSH,
+            ty,
+            data: data.to_vec(),
+            padding: None,
+            nickname: None,
+            meta: LetterMeta::Normal,
+            meta_id: None,
+            head_receiver: None,
+            legacy: None,
+            nonce: None,
+            broken_box: false,
+            discard: false,
+        }
+    }
+
+    /// A text message (type 0x01, `text` as UTF-8).
+    pub fn text(to: &str, message_id: u64, text: &str) -> Self {
+        Self::new(to, message_id, 0x01, text.as_bytes())
+    }
+
+    #[must_use]
+    pub fn flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    #[must_use]
+    pub fn created_ms(mut self, ms: u64) -> Self {
+        self.created_ms = Some(ms);
+        self
+    }
+
+    #[must_use]
+    pub fn nickname(mut self, nickname: &str) -> Self {
+        self.nickname = Some(nickname.to_owned());
+        self
+    }
+
+    #[must_use]
+    pub fn padding(mut self, padding: &[u8]) -> Self {
+        self.padding = Some(padding.to_vec());
+        self
+    }
+
+    #[must_use]
+    pub fn meta(mut self, meta: LetterMeta) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    #[must_use]
+    pub fn legacy(mut self, legacy: [u8; LEGACY_NICKNAME]) -> Self {
+        self.legacy = Some(legacy);
+        self
+    }
+
+    /// The nonce of an earlier letter again (step 2: a spec discard).
+    #[must_use]
+    pub fn reused_nonce(mut self, nonce: [u8; NONCE]) -> Self {
+        self.nonce = Some(nonce);
+        self.discard = true;
+        self
+    }
+
+    /// The head names `receiver`, not the user (step 3: a spec discard).
+    #[must_use]
+    pub fn wrong_receiver(mut self, receiver: &str) -> Self {
+        self.head_receiver = Some(receiver.to_owned());
+        self.discard = true;
+        self
+    }
+
+    /// The message box does not open (step 7: a spec discard).
+    #[must_use]
+    pub fn broken_box(mut self) -> Self {
+        self.broken_box = true;
+        self.discard = true;
+        self
+    }
+
+    /// The metadata names another message id (step 13: a spec discard).
+    #[must_use]
+    pub fn meta_id(mut self, id: u64) -> Self {
+        self.meta_id = Some(id);
+        self.discard = true;
+        self
+    }
+
+    /// The test declares the letter a spec discard (any other reason).
+    #[must_use]
+    pub fn discarded(mut self) -> Self {
+        self.discard = true;
+        self
+    }
+}
+
 impl Peer {
+    /// This peer's Threema ID.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// TH6 L2a: seals `letter` from this peer to `letter.to` by the spec (module doc) and hands it to the chat
+    /// server, which queues it for that identity and delivers it to its unblocked leader. Returns what was
+    /// posted (the nonce, the unpadded body, the bytes; `queued`).
+    #[track_caller]
+    pub fn send(&mut self, letter: &Letter) -> Posted {
+        let receiver_key = lock(&self.identities)
+            .get(&letter.to)
+            .map(|i| i.ck.public)
+            .expect("a letter goes to an identity of the world's table");
+        // S = X25519HSalsa20(<sender.CK>.secret, <receiver.CK>.public)
+        let shared = hsalsa_shared(&self.ck.secret, &receiver_key).expect("contributory keys");
+        let nonce = letter.nonce.unwrap_or_else(|| {
+            let mut n = [0u8; NONCE];
+            self.rng.fill_bytes(&mut n);
+            n
+        });
+        let created_ms = letter.created_ms.unwrap_or_else(|| self.clock.now_ms());
+        // The container: type, then the data and its padding (PKCS#7, the padded data at least 32 bytes).
+        let mut container = vec![letter.ty];
+        container.extend_from_slice(&letter.data);
+        match &letter.padding {
+            Some(padding) => container.extend_from_slice(padding),
+            None => {
+                let pad = PADDED_FLOOR.saturating_sub(letter.data.len()).max(1);
+                container.extend(std::iter::repeat_n(
+                    u8::try_from(pad).expect("a pad of at most 32"),
+                    pad,
+                ));
+            }
+        }
+        let mut message_box = seal(&shared, &nonce, &container);
+        if letter.broken_box
+            && let Some(last) = message_box.last_mut()
+        {
+            *last ^= 0x01;
+        }
+        let metadata = csp_e2e::MessageMetadata {
+            #[expect(
+                deprecated,
+                reason = "the spec's padding field: 16 bytes, ignored by the receiver"
+            )]
+            padding: vec![0; 16],
+            message_id: letter.meta_id.unwrap_or(letter.message_id),
+            created_at: created_ms,
+            nickname: letter.nickname.clone(),
+        }
+        .encode_to_vec();
+        let metadata_box = match letter.meta {
+            LetterMeta::Absent => Vec::new(),
+            LetterMeta::Normal => seal(&metadata_key(&shared), &nonce, &metadata),
+            LetterMeta::Garbage => seal(&metadata_key(&shared), &nonce, &[0x0a, 0xff]),
+        };
+        let head_s = letter
+            .head_s
+            .unwrap_or_else(|| u32::try_from(created_ms / 1000).expect("seconds fit u32"));
+        let head_receiver = letter.head_receiver.as_deref().unwrap_or(&letter.to);
+        let mut bytes = Vec::with_capacity(HEAD + metadata_box.len() + NONCE + message_box.len());
+        bytes.extend_from_slice(self.id.as_bytes());
+        bytes.extend_from_slice(head_receiver.as_bytes());
+        bytes.extend_from_slice(&letter.message_id.to_le_bytes());
+        bytes.extend_from_slice(&head_s.to_le_bytes());
+        bytes.push(letter.flags);
+        bytes.push(0);
+        bytes.extend_from_slice(
+            &u16::try_from(metadata_box.len())
+                .expect("a metadata box fits u16")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&letter.legacy.unwrap_or([0; LEGACY_NICKNAME]));
+        assert_eq!(bytes.len(), HEAD, "the head is 64 bytes");
+        bytes.extend_from_slice(&metadata_box);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&message_box);
+        // What `IncomingMessage.created_at` carries: the metadata's ms, the head's seconds x 1000 without it.
+        let created_ms = match letter.meta {
+            LetterMeta::Normal => created_ms,
+            LetterMeta::Absent | LetterMeta::Garbage => u64::from(head_s) * 1000,
+        };
+        self.mediator.csp_post(Posted {
+            sender: self.id.clone(),
+            to: letter.to.clone(),
+            message_id: letter.message_id,
+            created_ms,
+            flags: letter.flags,
+            ty: letter.ty,
+            body: letter.data.clone(),
+            nonce,
+            bytes,
+            discard: letter.discard,
+            queued: false,
+        })
+    }
+
     /// Opens what the chat server kept for this peer since the last call, in order; the messages
     /// for other IDs are skipped. A message that broke a rule is a violation and not in the list.
     pub fn drain(&mut self) -> Vec<Opened> {

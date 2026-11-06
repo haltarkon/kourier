@@ -31,8 +31,8 @@ use crate::support::mock::d2m::{DEFAULT_IDLE_TIMEOUT, Out, datagram, kind};
 use crate::support::mock::peer::{Discard, Opened};
 use crate::support::mock::{MockWorld, START_MS, TestIdentity, world};
 
-const ME: &str = "KOURIER1";
-const PEER: &str = "PEER0001";
+pub(super) const ME: &str = "KOURIER1";
+pub(super) const PEER: &str = "PEER0001";
 
 /// How the CSP client of a test logs in.
 #[derive(Clone)]
@@ -47,9 +47,14 @@ pub(super) struct Setup {
     pub(super) csp_device_id: Option<u64>,
     /// Send the client-hello in two Proxy payloads.
     pub(super) split_hello: bool,
+    /// Send the client-hello at once, BEFORE the D2M handshake ended (as Desktop does). Off (the default since RT1
+    /// attempt 1): it goes at the D2M `ServerInfo`, as Kourier's connection sends it, because the real mediator answers an
+    /// early hello before `ServerInfo` and libthreema refuses that order (the fake does the same unless
+    /// `Knobs::hold_early_proxy`).
+    pub(super) early_hello: bool,
 }
 
-fn setup(w: &MockWorld, me: &TestIdentity) -> Setup {
+pub(super) fn setup(w: &MockWorld, me: &TestIdentity) -> Setup {
     Setup {
         identity: me.id.clone(),
         ck_secret: me.ck.secret,
@@ -57,18 +62,22 @@ fn setup(w: &MockWorld, me: &TestIdentity) -> Setup {
         cookie: Some([0x5c; 16]),
         csp_device_id: Some(0x0123_4567_89ab_cdef),
         split_hello: false,
+        early_hello: false,
     }
 }
 
 /// One device: the real D2M client, the real CSP client inside it, and what each saw.
 pub(super) struct Device {
-    d2m: Client,
+    pub(super) d2m: Client,
     csp: CspProtocol,
-    login: Option<LoginAckData>,
-    payloads: Vec<IncomingPayload>,
+    pub(super) login: Option<LoginAckData>,
+    pub(super) payloads: Vec<IncomingPayload>,
     csp_failed: bool,
     /// The fake's Proxy payloads, as they came (for the independent checks).
     raw: Vec<Vec<u8>>,
+    /// The CSP client-hello while it waits for the D2M `ServerInfo` (`Setup::early_hello` off), and whether it goes split.
+    hello: Option<Vec<u8>>,
+    split_hello: bool,
 }
 
 impl Device {
@@ -91,6 +100,17 @@ fn csp_client(s: &Setup) -> (CspProtocol, Vec<u8>) {
     (proto, hello.0)
 }
 
+/// Sends the CSP client-hello, in one Proxy payload or (`split`) in two.
+fn send_hello(w: &MockWorld, d: &mut Device, hello: Vec<u8>, split: bool) {
+    if split {
+        let (a, b) = hello.split_at(17);
+        proxy(w, d, a.to_vec());
+        proxy(w, d, b.to_vec());
+    } else {
+        proxy(w, d, hello);
+    }
+}
+
 /// Sends CSP bytes of the client in one D2M Proxy payload.
 fn proxy(w: &MockWorld, d: &mut Device, bytes: Vec<u8>) {
     match d.d2m.proto.create_payload(D2mOutgoing::Proxy(bytes)) {
@@ -103,7 +123,7 @@ fn proxy(w: &MockWorld, d: &mut Device, bytes: Vec<u8>) {
 }
 
 /// Moves bytes every way (fake -> D2M client -> CSP client and back) until nothing moves.
-fn pump(w: &MockWorld, d: &mut Device) {
+pub(super) fn pump(w: &MockWorld, d: &mut Device) {
     let m = w.mediator();
     let conn = d.d2m.conn();
     loop {
@@ -125,6 +145,12 @@ fn pump(w: &MockWorld, d: &mut Device) {
                 Ok(Some(i)) => {
                     if let Some(D2mStateUpdate::PostHandshake(info)) = i.state_update {
                         d.d2m.post_handshake = Some(info);
+                        // RT1 attempt 1: the held client-hello goes now (Kourier's order).
+                        if let Some(hello) = d.hello.take() {
+                            let split = d.split_hello;
+                            send_hello(w, d, hello, split);
+                            sent = true;
+                        }
                     }
                     match i.incoming_payload {
                         Some(D2mIncoming::Proxy(bytes)) => {
@@ -172,8 +198,9 @@ fn pump(w: &MockWorld, d: &mut Device) {
     }
 }
 
-/// Connects a device and sends its CSP client-hello at once (before the D2M handshake ended, as
-/// Desktop does), then runs both handshakes as far as they go.
+/// Connects a device and runs both handshakes as far as they go; its CSP client-hello goes at the D2M `ServerInfo`
+/// (Kourier's order since RT1 attempt 1), or at once with `Setup::early_hello` (before the D2M handshake ended, as Desktop
+/// does).
 pub(super) fn connect(w: &MockWorld, g: &Group, o: Opts, s: &Setup) -> Device {
     let mut d2m = client(g.dgk, o);
     d2m.conn = Some(
@@ -189,27 +216,27 @@ pub(super) fn connect(w: &MockWorld, g: &Group, o: Opts, s: &Setup) -> Device {
         payloads: Vec::new(),
         csp_failed: false,
         raw: Vec::new(),
+        hello: None,
+        split_hello: s.split_hello,
     };
-    if s.split_hello {
-        let (a, b) = hello.split_at(17);
-        proxy(w, &mut d, a.to_vec());
-        proxy(w, &mut d, b.to_vec());
+    if s.early_hello {
+        send_hello(w, &mut d, hello, s.split_hello);
     } else {
-        proxy(w, &mut d, hello);
+        d.hello = Some(hello);
     }
     pump(w, &mut d);
     d
 }
 
 #[track_caller]
-fn logged_in(w: &MockWorld, g: &Group, o: Opts, s: &Setup) -> Device {
+pub(super) fn logged_in(w: &MockWorld, g: &Group, o: Opts, s: &Setup) -> Device {
     let d = connect(w, g, o, s);
     assert!(d.logged_in(), "the CSP client did not finish its login");
     d
 }
 
 /// Sends one CSP payload of the client.
-fn send(w: &MockWorld, d: &mut Device, p: OutgoingPayload) {
+pub(super) fn send(w: &MockWorld, d: &mut Device, p: OutgoingPayload) {
     let frame = d
         .csp
         .create_payload(&p)
@@ -221,7 +248,7 @@ fn send(w: &MockWorld, d: &mut Device, p: OutgoingPayload) {
 }
 
 /// The CSP payload names a device got, in order.
-fn names(d: &Device) -> Vec<&'static str> {
+pub(super) fn names(d: &Device) -> Vec<&'static str> {
     d.payloads
         .iter()
         .map(|p| match p {
@@ -239,7 +266,7 @@ fn names(d: &Device) -> Vec<&'static str> {
 }
 
 /// The (sender, message id) of the messages a device got, in order.
-fn messages(d: &Device) -> Vec<(String, u64)> {
+pub(super) fn messages(d: &Device) -> Vec<(String, u64)> {
     d.payloads
         .iter()
         .filter_map(|p| match p {
@@ -251,7 +278,7 @@ fn messages(d: &Device) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn ack(w: &MockWorld, d: &mut Device, sender: &str, message_id: u64) {
+pub(super) fn ack(w: &MockWorld, d: &mut Device, sender: &str, message_id: u64) {
     send(
         w,
         d,
@@ -263,7 +290,7 @@ fn ack(w: &MockWorld, d: &mut Device, sender: &str, message_id: u64) {
 }
 
 /// A world with Kourier's identity and the peer, one device group, leader mode as asked.
-fn scene(seed: u64, leader_mode: bool) -> (MockWorld, Group, Setup) {
+pub(super) fn scene(seed: u64, leader_mode: bool) -> (MockWorld, Group, Setup) {
     let w = world(seed);
     let me = w.add_identity(ME);
     w.add_identity(PEER);
@@ -508,7 +535,11 @@ fn incoming_messages_go_out_in_the_metadata_box_form() {
 /// `ServerInfo`.
 #[test]
 fn a_csp_client_hello_before_the_d2m_handshake_is_answered_after_server_info() {
-    let (w, g, s) = scene(214, false);
+    let (w, g, mut s) = scene(214, false);
+    // THE OLD HOLD (TH2): the fake holds the early hello; without it the real order refuses the login (RT1 attempt 1,
+    // `mock::d2m::a_proxy_before_the_client_hello_reaches_the_chat_server_at_once_and_its_answer_comes_before_server_info`).
+    w.mediator().knobs(|k| k.hold_early_proxy = true);
+    s.early_hello = true;
     let d = logged_in(&w, &g, new_device(1), &s);
     let conn = d.d2m.conn().0;
     let lines = w.trace().lines();

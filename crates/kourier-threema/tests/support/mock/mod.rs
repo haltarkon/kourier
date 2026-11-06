@@ -24,6 +24,18 @@
 //!   order (nonce used, metadata id, message id received); the knobs `CspKnobs::{close_on_box_to,
 //!   withhold_message_ack_of, drop_repeats}`, `Knobs::withhold_reflect_acks` with
 //!   `Mediator::{release_reflect_acks, reflects, release_message_acks}` and `Net::stall_mediator_sends`.
+//! - TH6 L2a adds the LEADER's side: a peer SENDS to the user (`peer::Letter`, `Peer::send`: a real
+//!   `message-with-metadata-box` on the fake's crypto, queued at the chat server for the device group's
+//!   unblocked leader, redelivered at every login until acked), the phone's FOLLOWER VIEW
+//!   (`Phone::incoming`, `Phone::view`: open, ack, a D2D nonce filter) and its TAKEOVER under the mediator's
+//!   leader rule (`Phone::leads`), `GetDevicesInfo` served, and THE GUARD ORACLE ([`leader`]: the record
+//!   of deliveries, acks, reflects and reflect-acks in one order; `MockWorld::leader_violations`).
+//! - TH6 L2b adds THE TRANSACTIONS of the mediator ([`txn`]: one lock per device group, the holder's reflects
+//!   released at the commit, `TransactionEnded` to the others, the holder's end and the TTL's 4011; the phone begins
+//!   and holds one), THE DIRECTORY ([`directory`]: `identity/fetch_bulk` from the world's identity table through the
+//!   HTTPS client, the pipes too; knobs to fail, delay, answer a status, leave an ID out, give a wrong key), and THE
+//!   PHONE TAKES THE QUEUE (`Phone::lead_csp_queue`: the leading phone runs the takeover's receive steps on what the
+//!   chat server queued for the user).
 //! - The fake is NOT more forgiving than the real server: what the client does wrong is recorded in
 //!   [`Violations`] and every mock test ENDS (its last statement) with
 //!   `world.violations().assert_empty()` or a comparison of `violations().rules()`; the sweep
@@ -39,14 +51,17 @@ pub mod crypto;
 pub mod csp;
 pub mod d2m;
 pub mod desktop_vectors;
+pub mod directory;
 pub mod envelope;
 pub mod essential;
 pub mod joiner;
+pub mod leader;
 pub mod peer;
 pub mod phone;
 pub mod pipe;
 pub mod relay;
 pub mod script;
+pub mod txn;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -258,7 +273,13 @@ pub fn world(seed: u64) -> MockWorld {
         identities.clone(),
     );
     let relay = Relay::new(clock.clone(), violations.clone(), trace.clone());
-    let net = Net::new(mediator.clone(), relay.clone(), violations.clone());
+    let directory = directory::Directory::new(identities.clone(), violations.clone());
+    let net = Net::new(
+        mediator.clone(),
+        relay.clone(),
+        directory,
+        violations.clone(),
+    );
     MockWorld {
         seed,
         rng: Mutex::new(rng),

@@ -1,6 +1,7 @@
 //! N4: the connection up and down. `Connect` with a stored identity reaches `Online`; `Syncing` holds
 //! while the mediator's Dry is held (critic H2: stable states only, never a sequence read from the
-//! watch); the ClientHello and the CSP login carry the stored device; a reflected envelope is acked
+//! watch); the ClientHello and the CSP login carry the stored device; the phone lists the device by its label as a
+//! desktop device, also after a start that replaces what the join sent (RT1 attempt 2); a reflected envelope is acked
 //! once it is durable and not sent again (TH5 A5a; TH3 dropped it un-acked); a promoted Kourier never asks for messages; `Disconnect` and `Shutdown` close with 1000;
 //! an account without an identity makes nothing.
 
@@ -10,13 +11,15 @@ use libthreema::protobuf::{d2d, d2m};
 use prost::Message as _;
 
 use super::harness::{self, DEVICE, H, LABEL, ME, SERVER_GROUP, scene, traced};
+use super::reflect::PHONE;
 use crate::support;
 use crate::support::mock::START_MS;
 use crate::support::mock::body;
-use crate::support::mock::crypto::open_nonce_ahead;
+use crate::support::mock::crypto::{open_nonce_ahead, seal_nonce_ahead};
 use crate::support::mock::csp::SeenCookie;
 use crate::support::mock::d2m::HelloSeen;
 use crate::support::mock::envelope::{Author, Msg};
+use crate::support::mock::phone::{INVALID_DETAILS, INVALID_TITLE, LinkedRow, phone_row};
 
 /// The first echo of a connection that logged in at the start goes out 10 s later.
 const FIRST_ECHO: u64 = START_MS + 10_000;
@@ -54,6 +57,80 @@ async fn a_connect_reaches_online_as_a_follower_child() {
     let mut h = harness::start(s);
     connect(&mut h, "follower").await;
     assert_eq!(h.net().made(), 1, "the transports were made once");
+    assert_eq!(h.net().opened().len(), 1, "one connection");
+    h.finish().await;
+}
+
+/// The positions in the fake's trace of `conn`'s `ServerInfo` and of the client's FIRST Proxy (its CSP client-hello).
+fn hello_after_server_info(world: &crate::support::mock::MockWorld, conn: u64) -> (usize, usize) {
+    let lines = world.trace().lines();
+    let at = |dir: &str, kind: &str| {
+        lines.iter().position(|l| {
+            let mut t = l.split(' ').skip(1);
+            t.next() == Some(conn.to_string().as_str())
+                && t.next() == Some(dir)
+                && t.next() == Some(kind)
+        })
+    };
+    (
+        at("out", "server-info").expect("the mediator sent ServerInfo"),
+        at("in", "proxy").expect("the client sent its CSP client-hello"),
+    )
+}
+
+#[test]
+fn the_csp_hello_waits_for_server_info_so_a_real_like_mediator_logs_in() {
+    support::offline::run_child(
+        module_path!(),
+        "the_csp_hello_waits_for_server_info_so_a_real_like_mediator_logs_in_child",
+    );
+}
+
+/// RT1 attempt 1: the fake's mediator is the real one's order by default (a Proxy before the handshake's end goes to
+/// the chat server AT ONCE and its answer comes BEFORE `ServerInfo`, which libthreema refuses). Kourier writes its CSP
+/// client-hello only at `ServerInfo`, so a plain login reaches `Online`, the hello stands after `ServerInfo` in the
+/// fake's trace, and nothing was refused (no 4010). The mutant that writes the hello at the socket's open dies here
+/// with the refusal (E4, 4010, the backoff's `Offline`).
+#[tokio::test]
+async fn the_csp_hello_waits_for_server_info_so_a_real_like_mediator_logs_in_child() {
+    if !support::offline::in_child() {
+        return;
+    }
+    let s = scene(321);
+    s.world.mediator().knobs(|k| {
+        k.auto_leader = false;
+        assert!(
+            !k.hold_early_proxy,
+            "the fake holds an early Proxy by default"
+        );
+    });
+    let mut h = harness::start(s);
+    h.send(Command::Connect).await;
+    let state = h
+        .wait_state("Online or the backoff of a refusal", |s| {
+            online("follower")(s)
+                || matches!(
+                    s,
+                    ConnState::Offline {
+                        retry_at_ms: Some(_)
+                    }
+                )
+        })
+        .await;
+    let conn = h.net().opened()[0];
+    assert!(
+        online("follower")(&state),
+        "the login did not reach Online: {state:?}, the mediator's close {:?} (4010: the chat server's answer came \
+         before ServerInfo and was refused)",
+        h.s.world.mediator().closed(conn)
+    );
+    let (info, hello) = hello_after_server_info(&h.s.world, conn.0);
+    assert!(info < hello, "the CSP client-hello went before ServerInfo");
+    assert_eq!(
+        h.s.world.mediator().closed(conn),
+        None,
+        "the socket was closed"
+    );
     assert_eq!(h.net().opened().len(), 1, "one connection");
     h.finish().await;
 }
@@ -129,9 +206,9 @@ fn the_hello_and_the_login_carry_the_stored_device() {
     );
 }
 
-/// The ClientHello: REJECT, PERSISTENT, the STORED expected state (`new`), the stored label and
-/// P4's client info in the device info; the CSP login: Kourier's client info with the fixed
-/// locale (C14), the CSP device id and the device cookie.
+/// The ClientHello: REJECT, PERSISTENT, the STORED expected state (`new`), the stored label,
+/// Kourier's details and the platform DESKTOP in the device info; the CSP login: P4's client info with
+/// the fixed locale (C14), the CSP device id and the device cookie.
 #[tokio::test]
 async fn the_hello_and_the_login_carry_the_stored_device_child() {
     if !support::offline::in_child() {
@@ -165,6 +242,10 @@ async fn the_hello_and_the_login_carry_the_stored_device_child() {
             && info.app_version == version,
         "the device info does not name Kourier"
     );
+    assert!(
+        info.platform == d2d::device_info::Platform::Desktop as i32,
+        "the device info does not state the platform DESKTOP"
+    );
     let login = m.csp_login(conn).expect("the CSP login came");
     assert!(
         login.client_info
@@ -189,6 +270,117 @@ async fn the_hello_and_the_login_carry_the_stored_device_child() {
         m.csp_session(conn).is_some() && h.s.world.identity(ME).is_some(),
         "no CSP session"
     );
+    h.finish().await;
+}
+
+/// What the phone shows of Kourier's device when Kourier's info is right: the stored label, the platform DESKTOP,
+/// `<version> · Kourier <version> (linux)`, currently active.
+fn assert_listed_as_kourier(row: &LinkedRow) {
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        row.device == DEVICE && row.active,
+        "the phone does not list Kourier's device as currently active"
+    );
+    assert_eq!(
+        row.platform,
+        d2d::device_info::Platform::Desktop,
+        "the phone does not read the platform DESKTOP"
+    );
+    assert!(
+        row.valid && row.title != INVALID_TITLE && row.details != INVALID_DETAILS,
+        "the phone shows Kourier's device as one whose information could not be obtained"
+    );
+    assert!(
+        row.title == LABEL,
+        "the phone does not show the stored label"
+    );
+    assert!(
+        row.details == format!("{version} · Kourier {version} (linux)"),
+        "the phone does not show Kourier's version and details"
+    );
+}
+
+#[test]
+fn the_phone_lists_kourier_by_its_label_as_a_desktop_device() {
+    support::offline::run_child(
+        module_path!(),
+        "the_phone_lists_kourier_by_its_label_as_a_desktop_device_child",
+    );
+}
+
+/// RT1 attempt 2: the phone listed Kourier as "Device" with "Information could not be obtained": P4's client info
+/// states the platform UNSPECIFIED, and Threema for Android 6.6.0 shows every device of that platform so, whatever its
+/// label (`target/threema/devinfo/report.md`). The fake's phone asks `GetDevicesInfo` and reads Kourier's entry as that
+/// app does, with the fake's own DGDIK: the stored label, DESKTOP, Kourier's version and details. The mutants that give
+/// the D2M context P4's client info, or an empty label, die here.
+#[tokio::test]
+async fn the_phone_lists_kourier_by_its_label_as_a_desktop_device_child() {
+    if !support::offline::in_child() {
+        return;
+    }
+    let mut h = harness::start(scene(346));
+    connect(&mut h, "leader").await;
+    let mut phone = h.s.world.phone(&h.s.dgk, SERVER_GROUP, PHONE);
+    h.net().act(|_| phone.connect());
+    let rows = h.net().act(|_| phone.linked_devices());
+    assert_eq!(rows.len(), 1, "the phone lists not one other device");
+    assert_listed_as_kourier(&rows[0]);
+    h.finish().await;
+}
+
+#[test]
+fn a_later_start_replaces_the_device_info_the_join_left() {
+    support::offline::run_child(
+        module_path!(),
+        "a_later_start_replaces_the_device_info_the_join_left_child",
+    );
+}
+
+/// The KEPT link of RT1 attempt 2: its slot holds what the older build sent at the join (the same label and
+/// details, the platform UNSPECIFIED: the phone's "Device"); the next ordinary start's `ClientHello` replaces it, so the
+/// phone lists Kourier by its label without a relink. [U: real server] the fake keeps the LATEST hello's info, as
+/// Desktop relies on (it reconnects after a rename).
+#[tokio::test]
+async fn a_later_start_replaces_the_device_info_the_join_left_child() {
+    if !support::offline::in_child() {
+        return;
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let mut h = harness::start(scene(347));
+    connect(&mut h, "leader").await;
+    let mut h = h.restart().await;
+    let old = d2d::DeviceInfo {
+        #[expect(deprecated, reason = "the spec's padding field; empty here")]
+        padding: vec![],
+        platform: d2d::device_info::Platform::Unspecified as i32,
+        platform_details: format!("Kourier {version} (linux)"),
+        app_version: version.to_owned(),
+        label: LABEL.to_owned(),
+    };
+    let keys = h.s.keys.clone();
+    let sealed = seal_nonce_ahead(&keys.device_info, &[5; 24], &old.encode_to_vec());
+    let m = h.s.world.mediator().clone();
+    assert!(
+        m.set_device_info(&keys.path_public, DEVICE, sealed),
+        "Kourier's slot is not there after the restart"
+    );
+    let before = phone_row(
+        &keys,
+        DEVICE,
+        &m.device_info(&keys.path_public, DEVICE)
+            .expect("the slot keeps the device info"),
+        false,
+    );
+    assert!(
+        !before.valid && before.title == INVALID_TITLE && before.details == INVALID_DETAILS,
+        "the kept link's info does not read as the phone showed it"
+    );
+    connect(&mut h, "leader").await;
+    let mut phone = h.s.world.phone(&h.s.dgk, SERVER_GROUP, PHONE);
+    h.net().act(|_| phone.connect());
+    let rows = h.net().act(|_| phone.linked_devices());
+    assert_eq!(rows.len(), 1, "the phone lists not one other device");
+    assert_listed_as_kourier(&rows[0]);
     h.finish().await;
 }
 
@@ -267,23 +459,22 @@ async fn a_reflected_envelope_is_acked_once_durable_and_not_sent_again_child() {
 }
 
 #[test]
-fn a_promoted_kourier_never_asks_for_messages() {
+fn a_promoted_kourier_asks_for_messages_once_per_socket() {
     support::offline::run_child(
         module_path!(),
-        "a_promoted_kourier_never_asks_for_messages_child",
+        "a_promoted_kourier_asks_for_messages_once_per_socket_child",
     );
 }
 
-/// Leader mode on (the fake would take the request), Kourier promoted for 10 virtual minutes: no
-/// request for messages, one connection all along (the echoes keep both idle timers away).
+/// TH6 L4b (it was TH3's "never asks"): leader mode on (the fake's default), Kourier promoted for 10 virtual minutes: ONE
+/// request for messages on its one connection, right after Dry (the echoes keep both idle timers away), and `Online` as
+/// leader once the chat server said its queue was sent.
 #[tokio::test]
-async fn a_promoted_kourier_never_asks_for_messages_child() {
+async fn a_promoted_kourier_asks_for_messages_once_per_socket_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(306);
-    s.world.mediator().knobs(|k| k.leader_mode = true);
-    let mut h = harness::start(s);
+    let mut h = harness::start(scene(306));
     connect(&mut h, "leader").await;
     let conn = h.conn();
     for n in 1..=60 {
@@ -292,8 +483,13 @@ async fn a_promoted_kourier_never_asks_for_messages_child() {
     h.sync().await;
     assert_eq!(
         traced(&h.s.world, conn, "in", "csp-unblock-incoming-messages"),
-        0,
-        "Kourier asked the chat server for messages"
+        1,
+        "Kourier did not ask the chat server for messages exactly once"
+    );
+    assert_eq!(
+        traced(&h.s.world, conn, "out", "csp-queue-send-complete"),
+        1,
+        "the chat server did not end its queue"
     );
     assert!(
         h.state()

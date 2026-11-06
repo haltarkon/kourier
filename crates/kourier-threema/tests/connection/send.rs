@@ -1935,8 +1935,8 @@ async fn order_a_job_waits_for_online_on_a_follower_child() {
     h.finish().await;
 }
 
-/// The same on a device the mediator promotes with Dry: the send path does not care, and nothing asks the chat server for
-/// messages (the fake's `csp-unblock-*` rules stay armed for the last check).
+/// The same on a device the mediator promotes with Dry: the send path does not care; only the leader stage asks the chat
+/// server for messages, once per socket (TH6; the fake's `csp-unblock-*` rules stay armed for the last check).
 #[test]
 fn order_a_job_waits_for_online_on_a_promoted_device() {
     support::offline::run_child(
@@ -1973,10 +1973,11 @@ async fn waited_for_online(s: Scene, detail: &str) -> H {
     h.wait_state(detail, online_as(detail)).await;
     wait_rows(&h, 0).await;
     assert_eq!(order_on(&h, conn), ONE_TO_ONE);
+    // The send path never asks for messages; a leader's stage asks once per socket (TH6 L4b), a follower never.
     assert_eq!(
         traced(&h.s.world, conn, "in", "csp-unblock-incoming-messages"),
-        0,
-        "the send path asked for messages"
+        usize::from(detail == "leader"),
+        "the requests for messages on the socket"
     );
     h
 }
@@ -2597,7 +2598,7 @@ fn held(s: &ConnState) -> bool {
 
 /// Moves both clocks to `target`, a time the actor waits for, stopping at each echo of the socket logged in at `login` on the
 /// way (every 10 s, each answered). The actor waits for one thing at a time, so each stop is what it says.
-async fn through_echoes(h: &H, login: u64, target: u64) {
+pub(super) async fn through_echoes(h: &H, login: u64, target: u64) {
     while h.now() < target {
         let echo = login + (h.now() - login) / 10_000 * 10_000 + 10_000;
         h.advance_to(echo.min(target)).await;

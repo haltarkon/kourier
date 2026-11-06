@@ -43,7 +43,9 @@ mod shots;
 mod slow;
 mod smoke;
 mod tdlib;
+mod test_phone;
 mod tg_run;
+mod threema_run;
 mod wa_run;
 mod workspace;
 
@@ -102,6 +104,14 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
+        Some("threema-run") => {
+            // 0, 2 for the usage, or 1 when a step failed; a command that could not run is an error (1).
+            let status = threema_run::threema_run(&args[1..])?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
         Some("tdlib") => {
             // 0, 1 when a detached build still runs or a check failed, 2 for the usage.
             let status = tdlib::tdlib(&args[1..])?;
@@ -116,7 +126,7 @@ fn real_main() -> Result<()> {
         Some("uninstall") => install::uninstall(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
+                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|threema-run <start|id|answer|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
             );
             std::process::exit(2);
         }

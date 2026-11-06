@@ -53,7 +53,8 @@
 //!   newer delta.
 //! - THE CANCEL (round A, S5): the actor's cancel token is checked before every page, so a Shutdown during a
 //!   large re-map is answered within the core's budget (the pages done stay done; the next start goes on).
-//! - A row of source `csp` (TH6's leader receive; TH5 writes none) has no mapper here: left as it is.
+//! - A row of source `csp` (TH6's leader receive) holds the `d2d.Envelope { incoming_message }` the leader reflected, the
+//!   same form as a reflection: it is mapped like a `reflected` row (TH6 decided).
 //!
 //! Nothing here logs a body, an ID or a key: rule names and counts.
 
@@ -71,7 +72,7 @@ use super::{RULE_UNDECODABLE, StoreView, apply_writes, classify, map};
 use crate::db;
 use crate::error::{Result, StoreError};
 use crate::outbox;
-use crate::store::{self, Deferred, DeferredBounds, DeferredSource};
+use crate::store::{self, Deferred, DeferredBounds};
 
 /// Rule: a row whose own zone failed (left as it is; the next start tries again).
 const RULE_REMAP_FAILED: &str = "remap-failed";
@@ -90,7 +91,7 @@ pub struct Remapped {
     pub deferred_again: u32,
     /// Rows the map now drops: deleted with a counted WARN.
     pub dropped: u32,
-    /// Rows left as they are (another source, or a zone that failed).
+    /// Rows left as they are (a zone that failed).
     pub left: u32,
 }
 
@@ -298,10 +299,7 @@ fn zone(
         let mut page = Page::default();
         let mut events = PageEvents::default();
         for row in rows {
-            if row.source != DeferredSource::Reflected {
-                page.left += 1;
-                continue;
-            }
+            // Both sources: a `csp` row (TH6, the leader's) holds the `d2d.Envelope` it reflected, the same form.
             // The test door (`store::fail_deferred_of_length`): this row's zone fails with its code.
             if let Some(error) =
                 super::door_error(row.envelope.len(), "re-map a deferred row failed")

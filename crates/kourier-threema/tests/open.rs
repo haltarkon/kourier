@@ -43,10 +43,10 @@ fn version(conn: &Connection, component: &str) -> Option<i64> {
     .ok()
 }
 
-/// The tables of schema 4 that start empty (1: the identity and the nonce stores; 2: the join's import;
-/// 3: the deferred envelopes; 4: what is being sent) and the outbox. Schema 3's `deferred_total` starts with
-/// its one row.
-const TABLES: [&str; 14] = [
+/// The tables of schema 5 that start empty (1: the identity and the nonce stores; 2: the join's import;
+/// 3: the deferred envelopes; 4: what is being sent; 5: what the leader took from the chat server) and the outbox.
+/// Schema 3's `deferred_total` starts with its one row.
+const TABLES: [&str; 15] = [
     "identity",
     "csp_nonce",
     "d2d_nonce",
@@ -60,6 +60,7 @@ const TABLES: [&str; 14] = [
     "deferred",
     "send_task",
     "send_receiver",
+    "csp_inbound",
     "core_outbox",
 ];
 
@@ -83,15 +84,15 @@ fn deferred_total_rows(conn: &Connection) -> Vec<(i64, i64, i64)> {
         .expect("rows")
 }
 
-/// A new file is at schema 4 with its tables, all empty but the kept sum's one row `(1, 0, 0)`, and
+/// A new file is at schema 5 with its tables, all empty but the kept sum's one row `(1, 0, 0)`, and
 /// `core_outbox` at kourier-db's latest.
 #[test]
-fn a_new_file_is_at_schema_4_with_empty_tables() {
+fn a_new_file_is_at_schema_5_with_empty_tables() {
     let t = temp_store();
     let dir = t.close();
     let conn = raw(dir.path());
     let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
-    assert_eq!(version(&conn, "threema"), Some(4), "threema schema");
+    assert_eq!(version(&conn, "threema"), Some(5), "threema schema");
     assert_eq!(version(&conn, "core_outbox"), Some(outbox), "outbox schema");
     for table in TABLES {
         assert!(has_table(&conn, table), "table {table} is missing");
@@ -117,7 +118,7 @@ fn opening_twice_gives_one_schema() {
     }
     let conn = raw(dir.path());
     let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
-    assert_eq!(version(&conn, "threema"), Some(4));
+    assert_eq!(version(&conn, "threema"), Some(5));
     assert_eq!(version(&conn, "core_outbox"), Some(outbox));
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM schema_version", [], |r| r.get(0))
@@ -143,9 +144,9 @@ const SCHEMA_3: kourier_db::Migrations = kourier_db::Migrations::new(
     ],
 );
 
-/// A file of schema 3 (with a nonce, a contact and a deferred row) opens, is at schema 4 after, keeps its rows, the send
-/// tables and their three indexes are there and empty. The last two columns of `send_task` are the BLOBs (critic L2),
-/// and a second open changes nothing.
+/// A file of schema 3 (with a nonce, a contact and a deferred row) opens, is at the latest schema after (5 since TH6),
+/// keeps its rows, the send tables and their three indexes are there and empty. The last two columns of `send_task` are
+/// the BLOBs (critic L2), and a second open changes nothing.
 #[test]
 fn a_schema_3_file_migrates_to_schema_4_with_the_send_tables_empty() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -169,7 +170,7 @@ fn a_schema_3_file_migrates_to_schema_4_with_the_send_tables_empty() {
     for _ in 0..2 {
         drop(open(&db_path(dir.path()), &key()).expect("open migrates"));
         let conn = raw(dir.path());
-        assert_eq!(version(&conn, "threema"), Some(4));
+        assert_eq!(version(&conn, "threema"), Some(5));
         for (table, rows) in [
             ("csp_nonce", 1),
             ("contact", 1),
@@ -231,6 +232,118 @@ fn a_schema_3_file_migrates_to_schema_4_with_the_send_tables_empty() {
     }
 }
 
+/// Schema 4's migrations, as a file of TH6a has them.
+const SCHEMA_4: kourier_db::Migrations = kourier_db::Migrations::new(
+    "threema",
+    &[
+        kourier_db::migration!(1, "0001_init"),
+        kourier_db::migration!(2, "0002_join"),
+        kourier_db::migration!(3, "0003_receive"),
+        kourier_db::migration!(4, "0004_send"),
+    ],
+);
+
+/// The names of `table`'s columns, in order.
+fn columns(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+        ))
+        .expect("the columns");
+    stmt.query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+}
+
+/// TH6 L1: a file of schema 4 (a nonce, a deferred row and a send row with its receiver) opens, is at schema 5 after,
+/// keeps every row, and `csp_inbound` is there and empty with its frozen columns (the two BLOBs last), its two partial
+/// indexes and the `UNIQUE` index of step 0, STRICT and with a rowid; a second open changes nothing.
+#[test]
+fn a_schema_4_file_migrates_to_schema_5_with_csp_inbound_empty() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    {
+        let mut conn = kourier_db::open(&db_path(dir.path()), &key()).expect("open");
+        kourier_db::migrate(&mut conn, &kourier_db::outbox::MIGRATIONS).expect("outbox");
+        kourier_db::migrate(&mut conn, &SCHEMA_4).expect("schema 4");
+        assert_eq!(version(&conn, "threema"), Some(4));
+        assert!(
+            !has_table(&conn, "csp_inbound"),
+            "csp_inbound exists at schema 4"
+        );
+        conn.execute_batch(
+            "INSERT INTO csp_nonce (hash) VALUES (zeroblob(32));
+             INSERT INTO deferred (source, kind, map_version, server_at, flags, received_at, envelope)
+               VALUES ('reflected', 'envelope', 1, 5, 0, 6, X'0a00');
+             INSERT INTO send_task (origin, kind, message_id, conversation, created_at, state, has_update, bytes,
+               queued_at, reflect_env) VALUES ('job', 'receipt', 1, X'0a00', 1, 'prepared', 0, 128, 1, zeroblob(40));
+             INSERT INTO send_receiver (task, identity, state, payload) VALUES (1, 'L1MIGR05', 'pending', zeroblob(88));",
+        )
+        .expect("schema 4's rows");
+    }
+    for _ in 0..2 {
+        drop(open(&db_path(dir.path()), &key()).expect("open migrates"));
+        let conn = raw(dir.path());
+        assert_eq!(version(&conn, "threema"), Some(5));
+        for (table, rows) in [
+            ("csp_nonce", 1),
+            ("deferred", 1),
+            ("send_task", 1),
+            ("send_receiver", 1),
+            ("csp_inbound", 0),
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .expect(table);
+            assert_eq!(n, rows, "{table}");
+        }
+        assert_eq!(deferred_total_rows(&conn), vec![(1, 1, 2)], "the kept sum");
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'csp_inbound' ORDER BY name",
+            )
+            .expect("the indexes");
+        let indexes: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            indexes,
+            [
+                "csp_inbound_done",
+                "csp_inbound_pending",
+                "sqlite_autoindex_csp_inbound_1"
+            ],
+            "the two partial indexes and step 0's UNIQUE"
+        );
+        assert_eq!(
+            columns(&conn, "csp_inbound"),
+            [
+                "id",
+                "sender",
+                "message_id",
+                "state",
+                "ack",
+                "receipt",
+                "received_at",
+                "reflected_at",
+                "nonce_hash",
+                "reflect_env"
+            ],
+            "the frozen columns, the BLOBs last"
+        );
+        let (strict, without_rowid): (i64, i64) = conn
+            .query_row(
+                "SELECT strict, wr FROM pragma_table_list('csp_inbound')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the table's kind");
+        assert_eq!((strict, without_rowid), (1, 0), "STRICT, with a rowid");
+    }
+}
+
 #[test]
 fn a_wrong_key_fails_and_the_files_do_not_change() {
     let dir = temp_store().close();
@@ -266,7 +379,7 @@ fn a_newer_schema_is_refused_and_not_touched() {
             component,
             found,
             supported,
-        }) => assert_eq!((component.as_str(), found, supported), ("threema", 999, 4)),
+        }) => assert_eq!((component.as_str(), found, supported), ("threema", 999, 5)),
         _ => panic!("a newer threema schema must be refused as TooNew"),
     }
     assert_eq!(files_hash(dir.path()), before, "a newer file was written");

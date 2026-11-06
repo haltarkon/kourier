@@ -11,7 +11,7 @@ use crate::error::{OpenError, StoreError};
 /// crate's own: each network has its own file. A committed migration is FROZEN: a change is a new
 /// number. 1: the identity and the two nonce stores (TH1); 2: what a device join imports (TH4); 3:
 /// the envelopes the receive path defers for a later build, with their kept sum (TH5); 4: what is being
-/// sent, sealed (TH6a).
+/// sent, sealed (TH6a); 5: what the leader took from the chat server (TH6).
 pub(crate) const MIGRATIONS: Migrations = Migrations::new(
     "threema",
     &[
@@ -19,6 +19,7 @@ pub(crate) const MIGRATIONS: Migrations = Migrations::new(
         migration!(2, "0002_join"),
         migration!(3, "0003_receive"),
         migration!(4, "0004_send"),
+        migration!(5, "0005_leader"),
     ],
 );
 

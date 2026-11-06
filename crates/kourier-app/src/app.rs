@@ -644,6 +644,9 @@ pub enum Rehearsal {
     /// The Telegram slot holds `kourier_fake::FakeNetwork::rehearsal_telegram`.
     #[cfg(all(feature = "fake", feature = "telegram"))]
     Telegram,
+    /// The Threema slot holds `kourier_fake::FakeNetwork::rehearsal_threema`.
+    #[cfg(all(feature = "fake", feature = "threema"))]
+    Threema,
 }
 
 /// The kind of chat [`AppHandle::rehearsal_arrive`] writes into.
@@ -743,8 +746,8 @@ struct AppInfo {
     /// The fake network's control, in fixture mode (what its accounts were told).
     #[cfg(feature = "fake")]
     fake: Option<Arc<kourier_fake::FakeControl>>,
-    /// The control of the rehearsal network that plays WhatsApp or Telegram in this run (T1a,
-    /// `KOURIER_DEV_REHEARSAL=whatsapp|telegram`); `None` in every other run.
+    /// The control of the rehearsal network that plays WhatsApp, Telegram or Threema in this run (T1a,
+    /// `KOURIER_DEV_REHEARSAL=whatsapp|telegram|threema`); `None` in every other run.
     #[cfg(feature = "fake")]
     rehearsal: Option<Arc<kourier_fake::FakeControl>>,
     /// What seeding the reference profile took, when this start seeded it.
@@ -960,8 +963,8 @@ impl AppHandle {
         }
     }
 
-    /// Whether this run plays WhatsApp or Telegram with the rehearsal fake
-    /// (`KOURIER_DEV_REHEARSAL=whatsapp|telegram`): that network's real backend is not in it and
+    /// Whether this run plays WhatsApp, Telegram or Threema with the rehearsal fake
+    /// (`KOURIER_DEV_REHEARSAL=whatsapp|telegram|threema`): that network's real backend is not in it and
     /// nothing of it is contacted. Always false in a build without the test network.
     pub fn is_rehearsal(&self) -> bool {
         #[cfg(feature = "fake")]
@@ -993,8 +996,8 @@ impl AppHandle {
     /// kind of its running account, as a live message (what the phone does on cue in a real run).
     ///
     /// # Errors
-    /// [`RehearsalArriveError::NotARehearsal`] unless this run plays WhatsApp or Telegram with the
-    /// rehearsal fake (both fakes share the control, whose `arrive` is network-neutral), else
+    /// [`RehearsalArriveError::NotARehearsal`] unless this run plays WhatsApp, Telegram or Threema with the
+    /// rehearsal fake (the fakes share the control, whose `arrive` is network-neutral), else
     /// [`RehearsalArriveError::Refused`] (no running account, no chat of that kind).
     #[cfg_attr(not(feature = "fake"), allow(unused_variables))]
     pub fn rehearsal_arrive(&self, kind: RehearsalKind) -> Result<(), RehearsalArriveError> {
@@ -1680,9 +1683,9 @@ struct Experimental {
 }
 
 /// The experimental networks of this build ([`Experimental`]). With `rehearsal` (the debug switch
-/// `KOURIER_DEV_REHEARSAL=whatsapp|telegram`, T1a, TR) the named network's slot holds the scripted
-/// rehearsal fake INSTEAD of the real backend and that network's parts maker (`seams.whatsapp_parts`,
-/// `seams.telegram_parts`) is never called: no real client, helper or dialer is made.
+/// `KOURIER_DEV_REHEARSAL=whatsapp|telegram|threema`, T1a, TR) the named network's slot holds the
+/// scripted rehearsal fake INSTEAD of the real backend and that network's parts maker
+/// (`seams.whatsapp_parts`, `seams.telegram_parts`, `seams.threema_parts`) is never called: no real client, helper or dialer is made.
 #[cfg_attr(
     not(all(feature = "whatsapp", feature = "fake")),
     allow(unused_variables, unused_mut)
@@ -1768,11 +1771,34 @@ fn compiled_in_experimental(
         crate::threema::linking(&threema_allowed),
     ) != crate::threema::ThreemaRegistration::Absent
     {
-        let parts = (seams.threema_parts)();
-        networks.push(Arc::new(crate::threema::threema_network(
-            parts,
-            threema_allowed,
-        )));
+        // THE REHEARSAL ARM (TR, T8): the slot holds the scripted fake and `seams.threema_parts` is
+        // NOT CALLED (no `live_parts`, no dialer, no client): nothing of Threema exists in a
+        // rehearsal, whatever the list says (the fake judges no ID, `kourier_fake::threema`).
+        #[cfg(feature = "fake")]
+        let fake =
+            (rehearsal == Rehearsal::Threema).then(kourier_fake::FakeNetwork::rehearsal_threema);
+        #[cfg(feature = "fake")]
+        if let Some(fake) = fake {
+            tracing::warn!(
+                "the Threema network is the REHEARSAL fake (KOURIER_DEV_REHEARSAL): the real backend is not made and nothing of Threema is contacted"
+            );
+            rehearsal_control = Some(fake.control());
+            networks.push(Arc::new(fake));
+        } else {
+            let parts = (seams.threema_parts)();
+            networks.push(Arc::new(crate::threema::threema_network(
+                parts,
+                threema_allowed,
+            )));
+        }
+        #[cfg(not(feature = "fake"))]
+        {
+            let parts = (seams.threema_parts)();
+            networks.push(Arc::new(crate::threema::threema_network(
+                parts,
+                threema_allowed,
+            )));
+        }
     }
     Experimental {
         networks,
@@ -1839,7 +1865,7 @@ struct Setup {
     backend: BackendConfig,
     #[cfg(feature = "fake")]
     fake: Option<kourier_fake::FakeNetwork>,
-    /// The control of the rehearsal network in the WhatsApp or Telegram slot
+    /// The control of the rehearsal network in the WhatsApp, Telegram or Threema slot
     /// (`KOURIER_DEV_REHEARSAL`).
     #[cfg(feature = "fake")]
     rehearsal: Option<Arc<kourier_fake::FakeControl>>,
@@ -2311,7 +2337,7 @@ struct StartNetworks {
     networks_off: Vec<NetworkInfo>,
     #[cfg(feature = "fake")]
     fake: Option<kourier_fake::FakeNetwork>,
-    /// The control of the rehearsal network that plays WhatsApp or Telegram
+    /// The control of the rehearsal network that plays WhatsApp, Telegram or Threema
     /// (`KOURIER_DEV_REHEARSAL`).
     #[cfg(feature = "fake")]
     rehearsal: Option<Arc<kourier_fake::FakeControl>>,
@@ -2344,14 +2370,14 @@ fn start_networks(
     #[cfg(all(
         debug_assertions,
         feature = "fake",
-        any(feature = "whatsapp", feature = "telegram")
+        any(feature = "whatsapp", feature = "telegram", feature = "threema")
     ))]
     let rehearsal = crate::dev::rehearsal_requested(env)
         .map_err(|e| AppError::Config(ConfigError::Rehearsal(e)))?;
     #[cfg(not(all(
         debug_assertions,
         feature = "fake",
-        any(feature = "whatsapp", feature = "telegram")
+        any(feature = "whatsapp", feature = "telegram", feature = "threema")
     )))]
     let rehearsal = Rehearsal::None;
     let mut registry = NetworkRegistry::new();
@@ -4423,6 +4449,284 @@ mod threema_registration_tests {
             }
         }
     }
+
+    /// The seams of a rehearsal test: [`seams`] whose Threema maker counts into `calls` how often it
+    /// was called (the maker of the real backend's parts) and into `made` how often a client was made.
+    #[cfg(all(debug_assertions, feature = "fake"))]
+    fn counting_seams(build: Build, calls: &Arc<AtomicUsize>, made: &Arc<AtomicUsize>) -> Seams {
+        let mut seams = seams(build, made);
+        let (calls, made) = (calls.clone(), made.clone());
+        seams.threema_parts = Box::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            kourier_threema::ThreemaParts::refusing(made)
+        });
+        seams
+    }
+
+    /// What a normal start of a profile (`prepared`: a kept run profile with a list of test IDs) with
+    /// `rehearsal` as the value of `KOURIER_DEV_REHEARSAL` (or none) did: the result, how often the
+    /// real parts' maker was called, how often a client was made.
+    #[cfg(all(debug_assertions, feature = "fake"))]
+    async fn start_rehearsing_threema(
+        build: Build,
+        on: bool,
+        prepared: bool,
+        rehearsal: Option<&'static str>,
+    ) -> (Result<super::Setup, super::AppError>, usize, usize) {
+        use super::normal_setup_with;
+        use crate::dev::{DEV_KEYRING_ENV, REHEARSAL_ENV};
+        use crate::paths::{Paths, Profile};
+
+        let scratch = Scratch::new(prepared);
+        let env = |k: &str| -> Option<OsString> {
+            match k {
+                DEV_KEYRING_ENV => Some("passphrase".into()),
+                REHEARSAL_ENV => rehearsal.map(OsString::from),
+                _ => scratch.env(k),
+            }
+        };
+        let paths = Paths::from_env(Profile::default(), env).expect("paths");
+        paths.create_dirs().expect("dirs");
+        prefs(on).save(&paths.config_file()).expect("save prefs");
+        let (calls, made) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let result = normal_setup_with(paths, env, counting_seams(build, &calls, &made)).await;
+        (
+            result,
+            calls.load(Ordering::SeqCst),
+            made.load(Ordering::SeqCst),
+        )
+    }
+
+    /// TR T8, THE REHEARSAL SEAM: with `KOURIER_DEV_REHEARSAL=threema` in a debug build the Threema
+    /// slot holds the scripted fake (`rehearsal_threema`: Threema's descriptor without the risk
+    /// notice) INSTEAD of the real backend, and the real parts' maker (`dial::live_parts` in a real
+    /// start) is never called: no dialer, client or socket exists in a rehearsal, whatever the run
+    /// profile's list says. The rule of WHEN Threema is offered is the real one (the switch's
+    /// registration, E1's listing in a prepared profile only): the rehearsal changes WHAT is
+    /// registered or listed, never whether. It hands the dev channel the fake's control
+    /// (`state.rehearsal`). A release build offers nothing of it; the control (no switch) calls the
+    /// maker once and has the real descriptor. Mutants: the rehearsal arm also calls
+    /// `seams.threema_parts` -> `calls` is 1 -> fails; the arm taken without the switch -> the control
+    /// has no risk notice -> fails.
+    #[cfg(all(debug_assertions, feature = "fake"))]
+    #[tokio::test]
+    async fn a_rehearsal_start_never_makes_the_real_threema_parts() {
+        // The control: without the switch the real parts' maker IS called (once), and the network
+        // is the real one, which asks first.
+        let (real, calls, made) = start_rehearsing_threema(Build::Debug, true, false, None).await;
+        let real = real.expect("a normal setup");
+        assert_eq!(
+            (calls, made),
+            (1, 0),
+            "the real maker is called without the switch"
+        );
+        assert!(real.rehearsal.is_none());
+        let network = real.registry.get(NetworkKind::Threema).expect("registered");
+        assert!(
+            network.descriptor().risk_notice.is_some(),
+            "the real one asks first"
+        );
+
+        // The rehearsal, switched on, in a plain and in a prepared profile: registered, no risk
+        // notice, a control, no maker call.
+        for prepared in [false, true] {
+            let case = format!("on, prepared={prepared}");
+            let (setup, calls, made) =
+                start_rehearsing_threema(Build::Debug, true, prepared, Some("threema")).await;
+            let setup = setup.expect("a rehearsal setup");
+            assert_eq!(
+                calls, 0,
+                "{case}: the real parts' maker was called in a rehearsal"
+            );
+            assert_eq!(made, 0, "{case}");
+            let network = setup
+                .registry
+                .get(NetworkKind::Threema)
+                .unwrap_or_else(|| panic!("{case}: not registered"));
+            assert_eq!(network.descriptor().display_name, "Threema", "{case}");
+            assert!(network.descriptor().experimental, "{case}");
+            assert!(
+                network.descriptor().risk_notice.is_none(),
+                "{case}: the rehearsal asks nothing"
+            );
+            assert!(
+                setup.rehearsal.is_some(),
+                "{case}: the dev channel needs the control"
+            );
+            assert!(
+                !setup
+                    .networks_off
+                    .iter()
+                    .any(|n| n.kind == NetworkKind::Threema),
+                "{case}"
+            );
+        }
+
+        // Turned off: a plain profile keeps Threema absent (E1), a prepared one lists it as off, and
+        // what is listed is the fake; still no maker call.
+        let (plain, calls, made) =
+            start_rehearsing_threema(Build::Debug, false, false, Some("threema")).await;
+        let plain = plain.expect("a rehearsal setup with the network off");
+        assert_eq!((calls, made), (0, 0));
+        assert!(plain.registry.get(NetworkKind::Threema).is_none());
+        assert!(
+            plain
+                .networks_off
+                .iter()
+                .all(|n| n.kind != NetworkKind::Threema),
+            "a plain profile lists nothing of Threema"
+        );
+        assert!(plain.rehearsal.is_none());
+        let (prepared, calls, made) =
+            start_rehearsing_threema(Build::Debug, false, true, Some("threema")).await;
+        let prepared = prepared.expect("a rehearsal setup with the network off");
+        assert_eq!((calls, made), (0, 0));
+        assert!(prepared.registry.get(NetworkKind::Threema).is_none());
+        let listed: Vec<_> = prepared
+            .networks_off
+            .iter()
+            .filter(|n| n.kind == NetworkKind::Threema)
+            .collect();
+        assert_eq!(listed.len(), 1, "listed as off once");
+        assert!(
+            listed[0].risk_notice.is_none(),
+            "the fake is what is listed"
+        );
+        assert!(prepared.rehearsal.is_some());
+
+        // Another network's word leaves Threema real.
+        #[cfg(feature = "whatsapp")]
+        {
+            let (other, calls, _) =
+                start_rehearsing_threema(Build::Debug, true, false, Some("whatsapp")).await;
+            let other = other.expect("a WhatsApp rehearsal setup");
+            assert_eq!(calls, 1, "Threema stays real in a WhatsApp rehearsal");
+            let network = other
+                .registry
+                .get(NetworkKind::Threema)
+                .expect("registered");
+            assert!(network.descriptor().risk_notice.is_some());
+        }
+
+        // A release build offers nothing of Threema, the rehearsal's either, prepared or not.
+        for prepared in [false, true] {
+            let (release, calls, made) =
+                start_rehearsing_threema(Build::Release, true, prepared, Some("threema")).await;
+            let release = release.expect("a release setup");
+            assert_eq!((calls, made), (0, 0), "prepared={prepared}");
+            assert!(release.registry.get(NetworkKind::Threema).is_none());
+            assert!(
+                release
+                    .networks_off
+                    .iter()
+                    .all(|n| n.kind != NetworkKind::Threema)
+            );
+            assert!(release.rehearsal.is_none());
+        }
+    }
+
+    /// A value other than exactly `threema` (or another network's word) fails the start before
+    /// anything of Threema is made (the same error as the other networks': a typo must not start the
+    /// real backend while the person believes it is a rehearsal), and the error does not repeat the
+    /// value.
+    #[cfg(all(debug_assertions, feature = "fake"))]
+    #[tokio::test]
+    async fn a_rehearsal_value_that_is_not_a_network_fails_the_start_before_threema_is_made() {
+        let mut words = std::collections::BTreeSet::new();
+        for bad in [
+            "Threema",
+            "threema ",
+            "thr",
+            "real",
+            "1",
+            "threema,telegram",
+        ] {
+            let (result, calls, made) =
+                start_rehearsing_threema(Build::Debug, true, true, Some(bad)).await;
+            let error = match result {
+                Err(e) => e,
+                Ok(_) => panic!("{bad:?}: the start went on"),
+            };
+            assert!(
+                matches!(
+                    error,
+                    super::AppError::Config(super::ConfigError::Rehearsal(_))
+                ),
+                "{bad:?}: {error}"
+            );
+            assert_eq!((calls, made), (0, 0), "{bad:?}: something was made");
+            words.insert(error.to_string());
+        }
+        // One sentence for every value: nothing of the value is repeated.
+        assert_eq!(words.len(), 1, "{words:?}");
+    }
+
+    /// TR T8, `--print-networks` (the run tool's probe) with the rehearsal switch: Threema is in
+    /// `registered=` and `on=` while `networks-on` names it, in `off=` while it is off in a PREPARED
+    /// profile (the run tool writes the switch off at every end: between runs the profile connects to
+    /// nothing, and a hand start finds Threema off) and in neither list in a plain profile, with the
+    /// switch and without it alike: the rehearsal changes which network stands in the slot, never
+    /// whether the slot is offered. The real parts' maker is called only without the switch, and no
+    /// client is made, a database opened or a preference changed in any case. Mutants: the rehearsal
+    /// arm lists Threema regardless of the registration rule (a plain profile's `off=`); the maker
+    /// called in the arm.
+    #[cfg(all(debug_assertions, feature = "fake"))]
+    #[test]
+    fn the_networks_line_of_a_rehearsal_follows_the_switch_and_the_profile_and_makes_nothing() {
+        use super::networks_line_in;
+        use crate::dev::REHEARSAL_ENV;
+        use crate::paths::{Paths, Profile};
+
+        for (on, prepared) in [(false, false), (false, true), (true, false), (true, true)] {
+            for rehearsal in [None, Some("threema")] {
+                let scratch = Scratch::new(prepared);
+                let env = |k: &str| -> Option<OsString> {
+                    match k {
+                        REHEARSAL_ENV => rehearsal.map(OsString::from),
+                        _ => scratch.env(k),
+                    }
+                };
+                let paths = Paths::from_env(Profile::default(), env).expect("paths");
+                paths.create_dirs().expect("dirs");
+                prefs(on).save(&paths.config_file()).expect("save prefs");
+                let file = std::fs::read_to_string(paths.config_file()).expect("prefs file");
+                let (calls, made) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+                let line =
+                    networks_line_in(&paths, env, counting_seams(Build::Debug, &calls, &made))
+                        .expect("the line");
+                let case =
+                    format!("on={on}, prepared={prepared}, rehearsal={rehearsal:?}: {line:?}");
+                let (registered_here, listed_here) = expected(Build::Debug, on, prepared);
+                assert_eq!(
+                    listed(&line, "registered").contains(&"Threema"),
+                    registered_here,
+                    "{case}"
+                );
+                assert_eq!(
+                    listed(&line, "off").contains(&"Threema"),
+                    listed_here,
+                    "{case}"
+                );
+                assert_eq!(
+                    listed(&line, "on"),
+                    if on { vec!["Threema"] } else { vec![] },
+                    "{case}"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(rehearsal.is_none() && (registered_here || listed_here)),
+                    "{case}: the real parts' maker"
+                );
+                assert_eq!(made.load(Ordering::SeqCst), 0, "{case}: a client was made");
+                assert!(!paths.core_db().exists(), "{case}: a database was opened");
+                assert_eq!(
+                    std::fs::read_to_string(paths.config_file()).expect("prefs file"),
+                    file,
+                    "{case}: the preferences were changed"
+                );
+            }
+        }
+    }
 }
 
 /// W2b B2: the WhatsApp backend is registered by a debug build while it is on, listed while it is
@@ -6363,13 +6667,16 @@ mod dial_fence_tests {
 }
 
 /// TR R0a fix G-5, the start-level wiring: only a debug build WITHOUT a rehearsal network (no
-/// `fake`, or neither WhatsApp nor Telegram) holds this test, so ci's default build never runs it;
-/// the judgment itself is a pure function with its own test in `dev.rs`. Run once with
+/// `fake`, or none of WhatsApp, Telegram and Threema) holds this test, so ci's default build never
+/// runs it; the judgment itself is a pure function with its own test in `dev.rs`. Run once with
 /// `--no-default-features --features telegram -E 'test(/rehearsal/)'`.
 #[cfg(all(
     test,
     debug_assertions,
-    not(all(feature = "fake", any(feature = "whatsapp", feature = "telegram")))
+    not(all(
+        feature = "fake",
+        any(feature = "whatsapp", feature = "telegram", feature = "threema")
+    ))
 ))]
 mod fakeless_rehearsal_tests {
     use std::ffi::OsString;

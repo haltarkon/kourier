@@ -318,8 +318,9 @@ impl Stage2 {
             Ok(n) => tracing::info!(rows = n, "stage 2 finishes old deferred newsletter rows"),
             Err(e) => tracing::error!(error = %e, "stage 2: finishing old newsletter rows failed"),
         }
+        // Once per start, with `rows=0` too: `wa-run`'s receive steps wait for this line as the sign
+        // that stage 2 began.
         match self.take_up_deferred().await {
-            Ok(0) => {}
             Ok(n) => tracing::info!(rows = n, "stage 2 takes up deferred rows"),
             Err(e) => tracing::error!(error = %e, "stage 2: taking up deferred rows failed"),
         }

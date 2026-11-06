@@ -49,6 +49,8 @@ struct Device {
     closed: Option<u16>,
     ended: bool,
     failed: bool,
+    /// The CSP client-hello while it waits for the D2M `ServerInfo` (RT1 attempt 1: Kourier's order).
+    hello: Option<Vec<u8>>,
 }
 
 /// The real D2M client of `o` with the URL template of the fake's PARTS.
@@ -88,8 +90,9 @@ fn csp_client(w: &MockWorld, me: &TestIdentity) -> (CspProtocol, Vec<u8>) {
     (proto, hello.0)
 }
 
-/// Opens the device's WebSocket through the connector; with `me`, its CSP client-hello goes out
-/// at once in a Proxy payload (before the D2M handshake ended, as Desktop does).
+/// Opens the device's WebSocket through the connector; with `me`, its CSP client-hello goes out in a Proxy payload at
+/// the D2M `ServerInfo` (Kourier's order since RT1 attempt 1: the real mediator answers an early hello before
+/// `ServerInfo`, which libthreema refuses).
 async fn open(w: &MockWorld, g: &Group, o: Opts, me: Option<&TestIdentity>) -> Device {
     let (d2m, url) = d2m_client(w, g, o);
     let (tx, rx) = w
@@ -113,11 +116,12 @@ async fn open(w: &MockWorld, g: &Group, o: Opts, me: Option<&TestIdentity>) -> D
         closed: None,
         ended: false,
         failed: false,
+        hello: None,
     };
     if let Some(me) = me {
         let (csp, hello) = csp_client(w, me);
         d.csp = Some(csp);
-        d.proxy(hello).await;
+        d.hello = Some(hello);
     }
     d
 }
@@ -169,6 +173,10 @@ impl Device {
                     Ok(Some(i)) => {
                         if let Some(D2mStateUpdate::PostHandshake(_)) = i.state_update {
                             self.online = true;
+                            if let Some(hello) = self.hello.take() {
+                                self.proxy(hello).await;
+                                moved = true;
+                            }
                         }
                         if let Some(D2mIncoming::Proxy(bytes)) = i.incoming_payload {
                             proxied.push(bytes);
@@ -408,8 +416,9 @@ async fn the_clients_close_reaches_the_mediator() {
 }
 
 /// Only the mediator's host is served: another host, the rendezvous relay (TH4) and every HTTPS
-/// request are REFUSED, counted and recorded; a mediator URL of a group the world does not know
-/// fails at the mediator (recorded there).
+/// request but the directory's (TH6 L2b, `tests/mock/directory.rs`; here the blob mirror's) are REFUSED,
+/// counted and recorded; a mediator URL of a group the world does not know fails at the mediator
+/// (recorded there).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn other_hosts_and_https_are_refused_and_counted() {
     let w = world(305);
@@ -439,7 +448,7 @@ async fn other_hosts_and_https_are_refused_and_counted() {
         .https()
         .execute(HttpsRequest {
             method: HttpsMethod::Get,
-            url: "https://directory.invalid/identity/ABCDEFGH".to_owned(),
+            url: "https://blob.invalid/upload".to_owned(),
             headers: Vec::new(),
             body: Vec::new(),
             max_body: None,

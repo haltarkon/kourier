@@ -32,7 +32,8 @@
 //! call id the log already filed goes to the chat the log chose (when it fits), so log-then-interceptor makes ONE line.
 //!
 //! WHAT IT SAYS (D12's table; every line `Origin::OwnOtherDevice`, the only origin that may say answered, and the state
-//! only moves up, so a late log never turns answered into missed): incoming CONNECTED or ACCEPTEDELSEWHERE -> answered,
+//! only moves up, so a late log never turns answered into missed, and a late ANSWERED moves a line the ring's deadline
+//! made missed up to answered, whenever it comes: D2's "missed until the phone says"): incoming CONNECTED or ACCEPTEDELSEWHERE -> answered,
 //! REJECTED -> declined, MISSED or CANCELLED -> missed; outgoing CONNECTED -> answered, REJECTED -> declined, MISSED,
 //! CANCELLED or UNAVAILABLE -> unanswered; every other result says nothing (a count).
 //!
@@ -72,7 +73,7 @@
 //! Nothing here formats an upstream value: no JID, number or id reaches a log or an error.
 
 use kourier_backend_api::{BackendEvent, Envelope, IncomingMessage};
-use kourier_db::rusqlite::Transaction;
+use kourier_db::rusqlite::{Connection, Transaction};
 use kourier_model::{CallDirection, CallLine, CallMedia, CallState, ConvKey, Origin, UserId};
 use wacore::store::error::StoreError;
 use wacore::types::events::CallLogSync;
@@ -278,18 +279,32 @@ struct Home {
 
 /// Whether `filed`, the conversation `call_lines` holds for a call, is a direct chat of one of `persons`, in either form
 /// of that person (INTEROP-7, DUR-9).
-fn is_chat_of(
-    tx: &Transaction<'_>,
-    filed: &ConvKey,
-    persons: &[&UserId],
-) -> Result<bool, StoreError> {
+fn is_chat_of(conn: &Connection, filed: &ConvKey, persons: &[&UserId]) -> Result<bool, StoreError> {
     if !matches!(filed, ConvKey::Direct(_)) {
         return Ok(false);
     }
-    let forms = started::forms(tx, filed)?;
+    let forms = started::forms(conn, filed)?;
     Ok(persons
         .iter()
         .any(|person| forms.contains(&ConvKey::Direct((*person).clone()))))
+}
+
+/// The chat the line of 1:1 call `call_id` was filed under (`call_lines`), when it is a direct chat of `person` in
+/// either form of him; `None` for no line, a group's line and another person's chat (a call id is the caller's
+/// choice, INTEROP-7). The interceptor asks it for an accept of one of OUR devices (`calls::own_answer`): our device's
+/// word settles the line Kourier shows and makes no new one.
+pub(crate) fn filed_chat_of(
+    conn: &Connection,
+    call_id: &str,
+    person: &UserId,
+) -> Result<Option<ConvKey>, StoreError> {
+    let Some(key) = call_lines::conv_of(conn, call_id)? else {
+        return Ok(None);
+    };
+    let Ok(filed) = ConvKey::parse(&key) else {
+        return Ok(None);
+    };
+    Ok(is_chat_of(conn, &filed, &[person])?.then_some(filed))
 }
 
 /// The conversation `call_lines` holds for the record's call, when it FITS the record (the module doc's first rule).

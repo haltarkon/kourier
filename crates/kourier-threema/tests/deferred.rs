@@ -138,7 +138,7 @@ fn a_schema_2_file_migrates_to_schema_3_with_deferred_empty() {
             .map_err(kourier_db::Error::from)
         })
         .expect("read");
-    assert_eq!(version, 4, "the file is not at the latest schema");
+    assert_eq!(version, 5, "the file is not at the latest schema");
     assert_eq!(contacts, 1, "the schema-2 row is gone");
     assert_eq!(deferred, 0, "deferred is not empty after the migration");
     assert_eq!(total(&db), DeferredTotal { rows: 0, bytes: 0 });
@@ -1441,9 +1441,9 @@ fn the_door_of_two_pairs_fails_both_lengths_and_a_call_replaces_the_pairs() {
 
 /// TH5b R1, THE CLEAR at the store (`store::clear_deferred`, the zone of the actor's `ClearConversation` arm):
 /// 70 rows over three pages, every other one a vote of the cleared chat (of both versions and two arrival
-/// times: WHATEVER its time), the rest votes of another chat, and a `csp` row of the cleared chat (TH6's source:
-/// not this mapper's, kept). One zone deletes the 35 rows of the chat on every page and writes ONE `core_outbox`
-/// row with the command's `CommandPersisted`; the kept sum stays exact. A second clear of the same chat deletes
+/// times: WHATEVER its time), the rest votes of another chat, and a `csp` row of the cleared chat (TH6's source, the
+/// leader's `IncomingMessage` in the same form: TH6 decided it goes too). One zone deletes the 36 rows of the chat on
+/// every page and writes ONE `core_outbox` row with the command's `CommandPersisted`; the kept sum stays exact. A second clear of the same chat deletes
 /// nothing and confirms its own command.
 #[test]
 fn a_clear_deletes_the_rows_of_its_chat_on_every_page_and_confirms_in_the_same_zone() {
@@ -1485,13 +1485,12 @@ fn a_clear_deletes_the_rows_of_its_chat_on_every_page_and_confirms_in_the_same_z
     let wake = std::rc::Rc::new(tokio::sync::Notify::new());
     let deleted = clear_deferred(db, &direct(RM_PEER), None, &[], CmdId(41), RM_NOW, &wake)
         .expect("the clear");
-    assert_eq!(deleted, 35, "not every row of the chat on every page");
-    let kept: Vec<i64> = (2..=70).step_by(2).chain([71]).collect();
     assert_eq!(
-        ids(db),
-        kept,
-        "the other chat's rows and the csp row are kept"
+        deleted, 36,
+        "not every row of the chat on every page, the csp row too"
     );
+    let kept: Vec<i64> = (2..=70).step_by(2).collect();
+    assert_eq!(ids(db), kept, "only the other chat's rows are kept");
     assert_eq!(
         outbox(db),
         [vec![BackendEvent::CommandPersisted { cmd: CmdId(41) }]],
@@ -1510,6 +1509,93 @@ fn a_clear_deletes_the_rows_of_its_chat_on_every_page_and_confirms_in_the_same_z
         ],
         "the second clear is not confirmed on its own"
     );
+}
+
+/// TH6: a `csp` row (the leader's `IncomingMessage`, the same envelope form as a reflection) is mapped by the re-map like a
+/// `reflected` one: deleted in the zone of its ONE history row; nothing is left.
+#[test]
+fn a_csp_row_is_remapped_like_a_reflected_one() {
+    use kourier_backend_api::BackendEvent;
+    use kourier_threema::store::remap_with;
+    let store = linked_store();
+    let db = &store.db;
+    let text = rm_text(RM_PEER, 1);
+    add(
+        db,
+        &[NewDeferred {
+            source: DeferredSource::Csp,
+            ..rm_row(&text, 1, 1)
+        }],
+        T0,
+        &WIDE,
+    );
+    let wake = std::rc::Rc::new(tokio::sync::Notify::new());
+    let done = remap_with(db, 2, RM_NOW, &wake).expect("the re-map");
+    assert_eq!((done.zones, done.mapped, done.left), (1, 1, 0));
+    assert!(ids(db).is_empty(), "the csp row was left");
+    let rows = outbox(db);
+    assert!(
+        rows.len() == 1
+            && matches!(rows[0].as_slice(), [BackendEvent::HistoryBatch { conv, messages, .. }]
+                if messages.len() == 1 && *conv == direct(RM_PEER)),
+        "the csp row is not ONE history row of its chat"
+    );
+    assert_sum_exact(db, "after the csp row's re-map");
+}
+
+/// TH6 FIX-B, S-L2 (T-L7's duplicate `deferred` rows): after a takeover the phone's reflection of a message that
+/// Kourier took as the leader adds a `reflected` row beside the `csp` row of the SAME message (C10 deletes the
+/// `pending` row, not the `deferred` one), and the re-map maps both sources. Whatever build maps the kind (a text stands
+/// in for it here, as in the test above), the two rows must reach the core as ONE message: each event names the same
+/// conversation and the same `local` (the message id), the key the core's ingest drops a second copy by
+/// (`MsgIdScope::Conversation`: Threema ids are unique per conversation; the core's idempotence is pinned by
+/// `kourier-core/tests/ingest.rs`, `every_script_applied_twice_gives_the_same_state`), and both rows are deleted. The
+/// two envelopes are those of two devices (the phone's and Kourier's own) with different server times.
+#[test]
+fn a_csp_and_a_reflected_row_of_the_same_message_reach_the_core_as_one_message() {
+    use crate::support::mock::envelope::{Author, Msg};
+    use kourier_backend_api::BackendEvent;
+    use kourier_threema::store::remap_with;
+    use prost::Message as _;
+    let store = linked_store();
+    let db = &store.db;
+    let msg = Msg::text([9; 8], RM_AT, "remapped text");
+    let ours = Author::new(0x0A08).incoming(RM_PEER, &msg).encode_to_vec();
+    let phones = Author::new(0x0B09).incoming(RM_PEER, &msg).encode_to_vec();
+    assert_ne!(ours, phones, "two devices wrote the same bytes");
+    add(
+        db,
+        &[
+            NewDeferred {
+                source: DeferredSource::Csp,
+                ..rm_row(&ours, 1, 1)
+            },
+            rm_row(&phones, 2, 1),
+        ],
+        T0,
+        &WIDE,
+    );
+    assert_eq!(ids(db).len(), 2, "two rows of one message");
+    let wake = std::rc::Rc::new(tokio::sync::Notify::new());
+    let done = remap_with(db, 2, RM_NOW, &wake).expect("the re-map");
+    assert_eq!((done.mapped, done.left), (2, 0), "both rows are mapped");
+    assert!(ids(db).is_empty(), "a row was left");
+    let mut keys = std::collections::BTreeSet::new();
+    let mut copies = 0;
+    for event in outbox(db).iter().flatten() {
+        let BackendEvent::HistoryBatch { conv, messages, .. } = event else {
+            continue;
+        };
+        for m in messages {
+            assert_eq!(*conv, direct(RM_PEER), "another chat");
+            assert_eq!(m.conv, *conv, "another chat");
+            copies += 1;
+            keys.insert((m.conv.clone(), m.local.to_string()));
+        }
+    }
+    assert!(copies >= 1, "the message never reached the core");
+    assert_eq!(keys.len(), 1, "two messages for the core: {keys:?}");
+    assert_sum_exact(db, "after the two rows' re-map");
 }
 
 /// S5 (round A): the re-map checks the actor's cancel token before every page. A token that is already

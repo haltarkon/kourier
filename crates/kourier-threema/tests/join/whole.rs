@@ -21,6 +21,7 @@ use crate::support::mock::crypto::open_nonce_ahead;
 use crate::support::mock::d2m::HelloSeen;
 use crate::support::mock::essential::Spec;
 use crate::support::mock::joiner::JoinStep;
+use crate::support::mock::phone::phone_row;
 use crate::support::mock::{MockWorld, START_MS};
 use crate::support::warns::Warns;
 
@@ -201,6 +202,18 @@ async fn the_whole_join_registers_the_device_and_is_done_after_the_ack_child() {
             && identity.device_label == j.label,
         "the device info's label is not Kourier's"
     );
+    // RT1 attempt 2: what the phone lists for the join's device (Threema for Android 6.6.0's reading, the fake's
+    // own DGDIK): the label, the platform DESKTOP, Kourier's version and details; not "Device" with "Information
+    // could not be obtained".
+    let row = phone_row(&j.keys, identity.d2m_device_id, &sealed, true);
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        row.valid
+            && row.platform == d2d::device_info::Platform::Desktop
+            && row.title == j.label
+            && row.details == format!("{version} · Kourier {version} (linux)"),
+        "the phone would not list the joined device by its label as a desktop device"
+    );
     assert_eq!(
         identity.slot_state,
         SlotState::Existing,
@@ -216,6 +229,64 @@ async fn the_whole_join_registers_the_device_and_is_done_after_the_ack_child() {
     )
     .await;
     j.no_more_steps().await;
+    j.finish().await;
+}
+
+#[test]
+fn a_join_sends_its_csp_hello_only_after_server_info_to_a_real_like_mediator() {
+    support::offline::run_child(
+        module_path!(),
+        "a_join_sends_its_csp_hello_only_after_server_info_to_a_real_like_mediator_child",
+    );
+}
+
+/// RT1 attempt 1, the join's first socket: the fake's mediator hands a Proxy before the handshake's end to the chat
+/// server at once and delivers its answer BEFORE `ServerInfo` (the real order, the default), so a CSP client-hello at
+/// the socket's open is refused by libthreema (E4, 4010) and the join fails "not registered". Kourier writes the hello at
+/// `ServerInfo`: the join reaches `Done` and `Online`, the hello stands after `ServerInfo` in the fake's trace, and the
+/// socket was not refused. The mutant that writes the hello at the open dies here.
+#[tokio::test]
+async fn a_join_sends_its_csp_hello_only_after_server_info_to_a_real_like_mediator_child() {
+    if !support::offline::in_child() {
+        return;
+    }
+    let mut j = harness::start(setup(531));
+    j.world.mediator().knobs(|k| {
+        k.auto_leader = false;
+        assert!(
+            !k.hold_early_proxy,
+            "the fake holds an early Proxy by default"
+        );
+    });
+    j.nominated().await;
+    j.expect_step("linking", 3).await;
+    let conn = mediator_opened(&j).await;
+    let (first, ack) = j.durable().await;
+    account_ready_first(&first);
+    ack.complete(Ok(()));
+    let _ = j.ack_until_done(first, 4).await;
+    let lines = tokens(&j.world);
+    let side = conn.0.to_string();
+    let at = |dir: &str, kind: &str| {
+        lines.iter().position(|t| {
+            t.get(1) == Some(&side)
+                && t.get(2).map(String::as_str) == Some(dir)
+                && t.get(3).map(String::as_str) == Some(kind)
+        })
+    };
+    let info = at("out", "server-info").expect("the mediator sent ServerInfo");
+    let hello = at("in", "proxy").expect("the client sent its CSP client-hello");
+    assert!(info < hello, "the CSP client-hello went before ServerInfo");
+    assert_eq!(
+        j.world.mediator().closed(conn),
+        None,
+        "the join's socket was closed"
+    );
+    j.wait_state(
+        "Online follower",
+        |s| matches!(s, ConnState::Online { detail: Some(d) } if d == "follower"),
+    )
+    .await;
     j.finish().await;
 }
 

@@ -422,6 +422,25 @@ pub fn delivery_receipt(status: u8, ids: &[MsgId]) -> Vec<u8> {
     out
 }
 
+/// `e2e.group-setup` (`TP/csp.struct.yml:4700`, its `members: b8[]`): the members' Threema IDs, 8 ASCII
+/// bytes each, one after the other, nothing else ("The group creator ... must not be included in the
+/// member list"). An empty list disbands the group, or tells a sender it is no member.
+#[track_caller]
+pub fn group_setup(members: &[&str]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 * members.len());
+    for member in members {
+        assert!(member.len() == 8, "a member identity has 8 bytes");
+        out.extend_from_slice(member.as_bytes());
+    }
+    out
+}
+
+/// `e2e.group-name` (`TP/csp.struct.yml:4860`, its `name: b*`): "UTF-8 encoded string containing the
+/// group's name", nothing else.
+pub fn group_name(name: &str) -> Vec<u8> {
+    name.as_bytes().to_vec()
+}
+
 /// `e2e.typing-indicator` (`TP/csp.struct.yml:4388`): `is-typing`, one byte, "`1` in case the contact is
 /// currently typing or `0` in case the contact stopped typing. Other values are invalid" (a test may
 /// pass another one on purpose).

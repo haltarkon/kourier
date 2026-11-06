@@ -10,6 +10,7 @@ mod pair_code;
 mod rehearsal;
 mod telegram;
 mod telegram_rehearsal;
+mod threema_rehearsal;
 mod transfer;
 
 /// With `autotests = false` a forgotten `mod` line would silently drop a file's tests.

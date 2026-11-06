@@ -45,6 +45,12 @@ use crate::reflect::classify::{EXEMPT_KINDS, LOW_VALUE_KINDS};
 pub use crate::db::open;
 pub use crate::error::SendRefused;
 pub use crate::join::essential::Import;
+pub use crate::leader::zone::{
+    Discarded, Inbound, InboundAck, InboundRow, InboundState, InboundSwept, Kept, RECEIPT_IDS,
+    RULE_PENDING_EXPIRED, Received, Receiving, fail_inbound_zone, inbound_row, inbound_rows,
+    mark_inbound_reflected, receive_inbound, sweep_inbound,
+};
+pub use crate::leader::{BodyOf, OpenedInbound, open_inbound, write_body};
 pub use crate::reflect::remap::Remapped;
 pub use crate::reflect::{fail_deferred_of_length, fail_deferred_of_lengths, reflected_zones};
 pub use crate::send::prepare::{
@@ -1196,8 +1202,8 @@ pub fn set_deferred_version(
 }
 
 /// TH5b R1, THE CLEAR: the user cleared (or deleted) the conversation `conv` on this device, and the core sends
-/// `Command::ClearConversation` for it. ONE zone ([`CLEAR_POINTS`]): every `deferred` row of source `reflected`
-/// whose envelope belongs to `conv` ([`delete_deferred_of`]) is DELETED, whatever its time (every row there
+/// `Command::ClearConversation` for it. ONE zone ([`CLEAR_POINTS`]): every `deferred` row (of either source: TH6 decided
+/// that a `csp` row of the chat goes too) whose envelope belongs to `conv` ([`delete_deferred_of`]) is DELETED, whatever its time (every row there
 /// arrived before the command is handled: a clear means "what came before this"), and `CommandPersisted { cmd }`
 /// is written to `core_outbox` in the SAME zone, so a kill leaves both or neither and the core's command stays
 /// pending until both are there (the core sends it again at the next start). Threema's D2D syncs no clear, so
@@ -1231,7 +1237,8 @@ pub fn clear_deferred(
     })
 }
 
-/// The deletes of [`clear_deferred`] inside the caller's zone: the `reflected` rows in pages of
+/// The deletes of [`clear_deferred`] inside the caller's zone: the rows of both sources (TH6 decided: a `csp` row holds
+/// the same `d2d.Envelope` form, the leader's `IncomingMessage`) in pages of
 /// [`REMAP_PAGE`] by id (a page of 64 KiB rows is 2 MiB: the 256 MiB table is never read at once), each
 /// decoded and placed by `reflect::row_conversation` (the rules of the map's `place`; a list, a sync, an
 /// update, a row that does not decode: no conversation, KEPT), the rows of `conv` deleted one by one.
@@ -1244,13 +1251,10 @@ fn delete_deferred_of(tx: &Tx<'_>, conv: &ConvKey) -> Result<u32> {
         let page: Vec<(i64, Zeroizing<Vec<u8>>)> = {
             let mut stmt = tx
                 .prepare_cached(
-                    "SELECT id, envelope FROM deferred WHERE source = ?1 AND id > ?2 \
-                     ORDER BY id LIMIT ?3",
+                    "SELECT id, envelope FROM deferred WHERE id > ?1 ORDER BY id LIMIT ?2",
                 )
                 .map_err(sql(OP))?;
-            let mut rows = stmt
-                .query(params![DeferredSource::Reflected.as_str(), after, limit])
-                .map_err(sql(OP))?;
+            let mut rows = stmt.query(params![after, limit]).map_err(sql(OP))?;
             let mut page = Vec::new();
             while let Some(r) = rows.next().map_err(sql(OP))? {
                 let id: i64 = r.get(0).map_err(sql(OP))?;

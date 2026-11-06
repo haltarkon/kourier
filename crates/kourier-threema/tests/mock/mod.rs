@@ -7,13 +7,16 @@ mod connector;
 mod crypto;
 mod csp;
 pub(crate) mod d2m;
+mod directory;
 mod envelope;
 mod envelope_reflect;
 mod joiner;
+mod leader;
 mod peer;
 mod piped;
 mod reflect;
 mod relay;
+mod txn;
 mod world;
 
 /// The bytes of a hex string (test data only).
@@ -36,12 +39,15 @@ const SWEPT: &[&str] = &[
     "connector.rs",
     "csp.rs",
     "d2m.rs",
+    "directory.rs",
     "envelope_reflect.rs",
     "joiner.rs",
+    "leader.rs",
     "peer.rs",
     "piped.rs",
     "reflect.rs",
     "relay.rs",
+    "txn.rs",
 ];
 
 /// The files of this directory that are not swept, each with its reason. A file of `tests/mock/` in

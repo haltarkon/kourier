@@ -119,7 +119,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
+use super::test_phone::{AdbPhone, Phone};
 use super::{cargo, lock, root, run, target_dir};
+
+mod phone;
+mod sim;
 
 const USAGE: &str = "usage: cargo xtask wa-run <command> [options]
 
@@ -146,12 +150,20 @@ commands:
              --allow-second-link-today  a second link within a day (the user's call)
              --after-halt               start again after the run halted (the user's go)
              --no-build                 reuse the stamped copy of the app
+             --test-phone <serial>      the TEST phone's adb serial (host:port or a device id): the steps then check
+                                        the TEST phone's screen and do its acts themselves; kept beside the run
+                                        state, the flag wins (docs/whatsapp-run.md, \"With a test phone\")
   tail       the user types the TEST phone's whole number (country code, 8 to 15 digits; a plus,
              spaces and dashes are fine) here, in his own terminal, with nothing shown; run the
              built binary: target/debug/xtask wa-run tail [--profile <name>]
   answer     the user types y or n to the question a step asks (`step call`, `step groups`, the archive steps) here, in
              his own terminal, one key; run the built binary: target/debug/xtask wa-run answer
              [--profile <name>]
+             --relayed y|n              in a run with a test phone only: the lead relays the user's word, said in
+                                        chat, for a question that only the PERSONAL phone can answer (the step
+                                        printed `ASK-USER: ...`); recorded as \"relayed by the lead\"
+  step <name> --user-said-yes           the lead's flag after the user's word in chat on the step's consent question
+                                        (`resend`); without it a step with a test phone stops before the act
   step <name> [--wait <s>] [--seconds <s>]
              one named step (see `steps`)
   steps      list the steps in their order
@@ -596,6 +608,15 @@ struct Args {
     yes_delete: bool,
     wait: Option<u64>,
     seconds: Option<u64>,
+    /// `--test-phone <serial>`: the TEST phone's adb serial; the steps answer their questions about it by checks
+    /// of their own on its screen and do its acts (`docs/whatsapp-run.md`, "With a test phone"). It is an adb
+    /// serial, never the number.
+    test_phone: Option<String>,
+    /// `--user-said-yes`: the lead's word that the user said yes in chat to the consent question of THIS step.
+    user_said_yes: bool,
+    /// `answer --relayed y|n`: the lead relays the user's y or n, said in chat, for a question about the PERSONAL
+    /// phone (no terminal needed, only in a run with a test phone).
+    relayed: Option<bool>,
 }
 
 /// The refusal of anything that looks like the digits on a command line. It names no value.
@@ -604,7 +625,9 @@ const NO_DIGITS_ON_A_COMMAND_LINE: &str = "wa-run takes no digits of the test nu
 /// Whether a flag is one that would carry the digits.
 fn is_a_digits_flag(arg: &str) -> bool {
     let flag = arg.split('=').next().unwrap_or(arg).to_ascii_lowercase();
-    flag.starts_with("--")
+    // `--test-phone` carries an adb serial (a host:port or a device id), never the number.
+    flag != "--test-phone"
+        && flag.starts_with("--")
         && ["tail", "digit", "number", "phone", "msisdn"]
             .iter()
             .any(|w| flag.contains(w))
@@ -672,6 +695,23 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--reset-frame-budget" => a.reset_frame_budget = true,
             "--forget-owed-frames" => a.forget_owed_frames = true,
             "--call-builtin" => a.call_builtin = true,
+            "--user-said-yes" => a.user_said_yes = true,
+            "--test-phone" => {
+                let serial = value("an adb serial")?;
+                if !valid_serial(&serial) {
+                    bail!(
+                        "--test-phone takes an adb serial (letters, digits, '.', ':', '_' and '-'; it is never the number)"
+                    );
+                }
+                a.test_phone = Some(serial);
+            }
+            "--relayed" => {
+                a.relayed = Some(match value("y or n")?.as_str() {
+                    "y" => true,
+                    "n" => false,
+                    _ => bail!("--relayed takes y or n"),
+                });
+            }
             "--confirmed-by-user" => a.confirmed = true,
             "--allow-schema-change" => a.allow_schema_change = true,
             "--allow-unencrypted-disk" => a.allow_unencrypted = true,
@@ -710,6 +750,22 @@ fn parse_args(args: &[String]) -> Result<Args> {
         }
     }
     Ok(a)
+}
+
+/// An adb serial: a device id or `host:port`.
+fn valid_serial(serial: &str) -> bool {
+    // A serial is a device id or host:port, never a number: a run of seven digits is refused (review M4; an IP
+    // address or a port never has one).
+    let long_digits = serial
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() >= 7);
+    !long_digits
+        && !serial.is_empty()
+        && serial.len() <= 64
+        && !serial.starts_with('-')
+        && serial
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '_' | '-'))
 }
 
 /// `cargo xtask wa-run …`. Returns the exit status: 0, 2 for the usage, 1 when a step failed.
@@ -839,6 +895,14 @@ impl ProfileDir {
     }
     fn state_file(&self) -> PathBuf {
         self.tool().join("state.json")
+    }
+    /// Present while a call answered on the TEST phone may still be open (`state` says so).
+    fn call_open_file(&self) -> PathBuf {
+        self.tool().join("call-open")
+    }
+    /// The TEST phone's adb serial (`start --test-phone`), kept beside the run state.
+    fn test_phone_file(&self) -> PathBuf {
+        self.tool().join("test-phone")
     }
     /// The app's own tree inside the profile (`KOURIER_HOME`'s `kourier` directory).
     fn app_home(&self) -> PathBuf {
@@ -2477,9 +2541,31 @@ fn type_answer(socket: &Path) -> Result<String> {
     Ok(format!("taken ({})", if yes { "yes" } else { "no" }))
 }
 
+/// `wa-run answer --relayed y|n`: the lead relays the user's word, said in chat, for a question about the PERSONAL
+/// phone (the step printed `ASK-USER: ...`). No terminal is read; the supervisor takes it only for a question a step
+/// in a run with a test phone asked as relayable.
+fn relayed_answer(socket: &Path, yes: bool) -> Result<String> {
+    let client = Client::at(socket);
+    let info = client
+        .info()
+        .context("no run is up on this profile: there is nothing to answer. Nothing was asked.")?;
+    let name = info["question"]
+        .as_str()
+        .ok_or_else(|| anyhow!(NO_QUESTION))?
+        .to_owned();
+    client.answer_relayed(&name, yes)?;
+    Ok(format!(
+        "taken ({}), relayed by the lead",
+        if yes { "yes" } else { "no" }
+    ))
+}
+
 fn answer_command(a: &Args) -> Result<i32> {
     let dir = a.place.resolve(&vars, &target_dir())?;
-    println!("{}", type_answer(&dir.socket_file())?);
+    match a.relayed {
+        Some(yes) => println!("{}", relayed_answer(&dir.socket_file(), yes)?),
+        None => println!("{}", type_answer(&dir.socket_file())?),
+    }
     Ok(0)
 }
 
@@ -2624,6 +2710,35 @@ impl Client {
             Duration::from_secs(5),
         )
         .map(|_| ())
+    }
+
+    /// The lead's relayed word for the open question (`answer --relayed`).
+    fn answer_relayed(&self, name: &str, yes: bool) -> Result<()> {
+        self.call(
+            &json!({"op": "answer", "name": name, "yes": yes, "origin": "relayed"}),
+            Duration::from_secs(10),
+        )
+        .map(|_| ())
+    }
+
+    /// The resend's consent: the step's own `--user-said-yes`, recorded by the supervisor (never an `answer`).
+    fn consent(&self) -> Result<()> {
+        self.call(
+            &json!({"op": "consent", "name": "resend-ok"}),
+            Duration::from_secs(5),
+        )
+        .map(|_| ())
+    }
+
+    /// Where the answer to `name` came from (`typed`, `relayed`, `flag`); `None` while unanswered.
+    fn origin_of(&self, name: &str) -> Result<Option<String>> {
+        let answer = self.call(
+            &json!({"op": "answer_of", "name": name}),
+            Duration::from_secs(5),
+        )?;
+        Ok(answer["answer"]
+            .as_bool()
+            .and(answer["origin"].as_str().map(str::to_owned)))
     }
 
     /// The user's answer to the question `name`: `None` while he has not answered it.
@@ -2864,6 +2979,9 @@ const QUESTIONS: [(&str, &str); 7] = [
         "Does the PERSONAL phone show the fixed text of the resend step at all (y: it shows, n: it does not)?",
     ),
 ];
+/// The questions about the PERSONAL phone that the lead may relay (`answer --relayed`) in a run the SUPERVISOR knows
+/// was started with a test phone. A fixed table: a client's word never makes a question relayable (review B1).
+const RELAYABLE_QUESTIONS: [&str; 2] = ["resend-once", "resend-shows"];
 /// The answers that close the resend record after his look at the personal phone (T2 F5, H3): the once/twice question
 /// and the shows-at-all question.
 const RESEND_CLOSING_ANSWERS: [&str; 2] = ["resend-once", "resend-shows"];
@@ -3079,6 +3197,16 @@ struct Shared {
     /// adds to the words; `None` when none is open. The user answers it with `wa-run answer` in
     /// his own terminal, the one place a y or n is read from.
     question: Option<(String, String)>,
+    /// The open question may be answered without a terminal (the lead's `--relayed` word or a consent flag): only
+    /// in a run with a test phone, and only for a question the step asked so.
+    question_relayable: bool,
+    /// The run has a test phone: the profile's serial file existed when the supervisor began. Only then are a relayed
+    /// word and the consent op taken.
+    test_phone: bool,
+    /// The resend's consent: recorded by the `consent` op from the step's own `--user-said-yes` (never by `answer`).
+    consent_resend: bool,
+    /// Where the last answer came from: `typed`, `relayed` or `flag`.
+    answer_origin: String,
     /// The latest answer: the question's name and the user's y (`true`) or n.
     answer: Option<(String, bool)>,
     /// The run was started with `--for-send` (T2 T-2): the only run that forwards a send or an act,
@@ -3144,6 +3272,7 @@ impl Shared {
 
     /// A start for a link waits for the digits; any other gives the app the sentinel.
     fn new(dir: ProfileDir, launch: &Value, state: State) -> Self {
+        let has_test_phone = saved_test_phone(&dir).is_some();
         let tail_state = if launch["for_link"] == json!(true) {
             TailState::Waiting
         } else {
@@ -3179,6 +3308,10 @@ impl Shared {
             login_closed: None,
             link_end_wait: LINK_END_WAIT,
             question: None,
+            question_relayable: false,
+            test_phone: has_test_phone,
+            consent_resend: false,
+            answer_origin: String::new(),
             answer: None,
             for_send: launch["for_send"] == json!(true),
             call_builtin: launch["call_builtin"] == json!(true),
@@ -4379,7 +4512,9 @@ fn handle(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
             };
             let mut s = locked(shared);
             s.question = Some((name.to_owned(), detail.to_owned()));
+            s.question_relayable = s.test_phone && RELAYABLE_QUESTIONS.contains(&name);
             s.answer = None;
+            s.answer_origin.clear();
             s.push_event(
                 json!({"type": "event", "event": "question_asked", "data": {"name": name}}),
             );
@@ -4390,6 +4525,13 @@ fn handle(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
             let Some(yes) = request["yes"].as_bool() else {
                 return refuse("badRequest", "an answer is a yes or a no");
             };
+            let origin = match request["origin"].as_str() {
+                None | Some("typed") => "typed",
+                Some("relayed") => "relayed",
+                Some(_) => {
+                    return refuse("badRequest", "an answer comes typed or relayed");
+                }
+            };
             let mut s = locked(shared);
             if s.question.as_ref().map(|(open, _)| open.as_str()) != Some(name) {
                 return refuse(
@@ -4397,11 +4539,36 @@ fn handle(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
                     "no such question is open: an answer is taken only for a question a step asked",
                 );
             }
+            if origin != "typed" && !s.question_relayable {
+                return refuse(
+                    "notRelayable",
+                    "this question is answered only by his key in `wa-run answer` in his own terminal: it is not one a test phone leaves to the lead",
+                );
+            }
             s.question = None;
+            s.question_relayable = false;
+            s.answer_origin = origin.to_owned();
             s.answer = Some((name.to_owned(), yes));
             s.push_event(
                 json!({"type": "event", "event": "question_answered", "data": {"name": name, "yes": yes}}),
             );
+            json!({"ok": true})
+        }
+        Some("consent") => {
+            let mut s = locked(shared);
+            if !s.test_phone {
+                return refuse(
+                    "refused",
+                    "a consent flag counts only in a run with a test phone",
+                );
+            }
+            if request["name"].as_str() != Some("resend-ok") {
+                return refuse(
+                    "badRequest",
+                    "the only consent there is belongs to `resend-ok`",
+                );
+            }
+            s.consent_resend = true;
             json!({"ok": true})
         }
         Some("answer_of") => {
@@ -4412,7 +4579,7 @@ fn handle(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
                 .as_ref()
                 .filter(|(answered, _)| answered == name)
                 .map(|(_, yes)| *yes);
-            json!({"ok": true, "answer": answer})
+            json!({"ok": true, "answer": answer, "origin": s.answer_origin})
         }
         Some("kill_app") => {
             let mut s = locked(shared);
@@ -4511,10 +4678,17 @@ fn resend_arm(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
             "a resend is armed or owed already: the step closes it before another is armed",
         );
     }
-    if s.answer.as_ref() != Some(&("resend-ok".to_owned(), true)) {
+    // With a test phone the consent is the lead's flag on the step (the `consent` op); a typed or relayed `answer` arms
+    // nothing there. Without one it is his y in `wa-run answer`.
+    let consented = if s.test_phone {
+        s.consent_resend
+    } else {
+        s.answer.as_ref() == Some(&("resend-ok".to_owned(), true))
+    };
+    if !consented {
         return refuse(
             "not-allowed",
-            "his y to the question `resend-ok` was not given in this start: nothing is armed",
+            "the consent to `resend-ok` was not given in this start: nothing is armed",
         );
     }
     let used = s.state.num("frames_used").unwrap_or(0);
@@ -4529,6 +4703,7 @@ fn resend_arm(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
         return refusal;
     }
     s.answer = None;
+    s.consent_resend = false;
     s.push_event(json!({"type": "event", "event": "resend_armed", "data": {}}));
     json!({"ok": true})
 }
@@ -5034,7 +5209,28 @@ fn serve(shared: &Arc<Mutex<Shared>>, stream: UnixStream) {
     } else {
         let request: Value = serde_json::from_slice(&line).unwrap_or(Value::Null);
         // T2 F5: his y or n and his digits come from a process on a terminal, whoever else can write to the socket.
+        // The one exception: an answer the lead relays, for a question of the supervisor's own fixed table
+        // (`RELAYABLE_QUESTIONS`) in a run it knows has a test phone (D5). `handle` checks it again. The consent op is
+        // taken from the process of `step resend --user-said-yes` only.
+        if request["op"].as_str() == Some("consent")
+            && locked(shared).terminal_rule()
+            && !peer_is_the_flagged_resend(&stream)
+        {
+            let mut stream = stream;
+            let _ = writeln!(
+                stream,
+                "{}",
+                refuse(
+                    "refused",
+                    "a consent comes only from `wa-run step resend --user-said-yes`"
+                )
+            );
+            return;
+        }
+        let relayed_for_a_test_phone =
+            relayed_without_a_terminal(&request, locked(shared).question_relayable);
         let from_a_terminal = !matches!(request["op"].as_str(), Some("answer" | "tail"))
+            || relayed_for_a_test_phone
             || !locked(shared).terminal_rule()
             || peer_is_on_a_terminal(&stream);
         if from_a_terminal {
@@ -5045,6 +5241,25 @@ fn serve(shared: &Arc<Mutex<Shared>>, stream: UnixStream) {
     };
     let mut stream = stream;
     let _ = writeln!(stream, "{answer}");
+}
+
+/// Whether the process at the other end is `wa-run step resend ... --user-said-yes` (its command line).
+fn peer_is_the_flagged_resend(stream: &UnixStream) -> bool {
+    peer_pid(stream)
+        .and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .is_some_and(|raw| {
+            let args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+            let has = |w: &str| args.contains(&w.as_bytes());
+            has("step") && has("resend") && has("--user-said-yes")
+        })
+}
+
+/// Whether a request is the lead's relayed word or a consent flag for a question that a step in a run with a test phone
+/// asked as relayable: the one answer taken without a terminal (D4, D5). A typed answer and the digits are never.
+fn relayed_without_a_terminal(request: &Value, question_relayable: bool) -> bool {
+    question_relayable
+        && request["op"].as_str() == Some("answer")
+        && request["origin"].as_str() == Some("relayed")
 }
 
 /// What a refused `answer` or `tail` says (T2 F5): nothing was taken, a question stays open.
@@ -5825,6 +6040,12 @@ fn start(a: &Args) -> Result<i32> {
         binary: &binary,
     };
     let cleared = start_in(a, &ctx, &seams)?;
+    if let Some(serial) = &a.test_phone {
+        save_test_phone(&cleared.dir, serial)?;
+        eprintln!(
+            "test phone: {serial} (the steps check its screen and do its acts; `wa-run state` says whether it answers)"
+        );
+    }
     for line in &cleared.warnings {
         eprintln!("warning: {line}");
     }
@@ -6474,6 +6695,15 @@ fn memory_of(status: &str) -> Option<(u64, u64)> {
 /// counts, kinds and times and never a title, a number or the digits. A profile that is not this
 /// tool's is not touched: nothing is made, not even its lock file.
 fn state_in(dir: &ProfileDir, now: u64) -> Result<Vec<String>> {
+    state_with(dir, now, &phone_reachable)
+}
+
+/// `state` with the look at the test phone injected (the tests never run adb).
+fn state_with(
+    dir: &ProfileDir,
+    now: u64,
+    reach: &dyn Fn(&ProfileDir, &str) -> bool,
+) -> Result<Vec<String>> {
     let Some(state) = State::load(dir)? else {
         return Ok(vec![format!(
             "{} is not a wa-run profile (no start so far); nothing was made",
@@ -6517,6 +6747,22 @@ fn state_in(dir: &ProfileDir, now: u64) -> Result<Vec<String>> {
         ));
     }
     lines.push(format!("frames:   {}", frames_words(&state)));
+    if dir.call_open_file().exists() {
+        lines.push(
+            "WARNING:  a call answered on the TEST phone may still be open: hang it up there"
+                .to_owned(),
+        );
+    }
+    if let Some(serial) = saved_test_phone(dir) {
+        lines.push(format!(
+            "test phone: {serial} ({})",
+            if reach(dir, &serial) {
+                "reachable"
+            } else {
+                "unreachable"
+            }
+        ));
+    }
     let steps = recorded_steps(dir);
     let passed = steps.iter().filter(|s| s["result"] == "PASS").count();
     lines.push(format!(
@@ -6881,6 +7127,110 @@ fn manage(a: &Args) -> Result<i32> {
     Ok(status)
 }
 
+// ---- The TEST phone (the automated path) -------------------------------------------------------------
+
+/// The serial `start --test-phone` kept for this profile.
+fn saved_test_phone(dir: &ProfileDir) -> Option<String> {
+    std::fs::read_to_string(dir.test_phone_file())
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| valid_serial(t))
+}
+
+fn save_test_phone(dir: &ProfileDir, serial: &str) -> Result<()> {
+    std::fs::create_dir_all(dir.tool())?;
+    write_private(&dir.test_phone_file(), &format!("{serial}\n"))
+}
+
+/// The serial a step uses: the flag wins, else the profile's.
+fn test_phone_serial(a: &Args, dir: &ProfileDir) -> Option<String> {
+    a.test_phone.clone().or_else(|| saved_test_phone(dir))
+}
+
+/// Whether the test phone answers adb (`state`). A serial `fake:..` is the rehearsal's stand-in.
+fn phone_reachable(dir: &ProfileDir, serial: &str) -> bool {
+    if serial.starts_with("fake:") {
+        return dir.rehearsal;
+    }
+    AdbPhone::new(serial).is_ok_and(|mut p| p.connect().is_ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test hands its phone to the next step run on this thread (serial `test-inject`).
+    static INJECTED_PHONE: std::cell::RefCell<Option<Box<dyn Phone>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make the phone a step uses: adb for a real serial, the simulated phone for the rehearsal's `fake:rehearsal`
+/// (a rehearsal's place only, with the call arriving 2 s after the step looks).
+fn open_phone(serial: &str, dir: &ProfileDir) -> Result<Box<dyn Phone>> {
+    #[cfg(test)]
+    if serial == "test-inject" {
+        return INJECTED_PHONE
+            .with(|p| p.borrow_mut().take())
+            .ok_or_else(|| anyhow!("no phone was injected"));
+    }
+    if serial == "fake:rehearsal" {
+        if !dir.rehearsal {
+            bail!("the serial fake:rehearsal is for the rehearsal's place only");
+        }
+        // The fake that plays WhatsApp has a group of two (the phone's owner, an admin, and the other person).
+        return Ok(Box::new(
+            sim::WaSim::standard()
+                .with_members(vec![(100, true), (101, false)])
+                .ring_len(Duration::from_secs(8)),
+        ));
+    }
+    if serial.starts_with("fake:") {
+        bail!("unknown simulated phone");
+    }
+    let mut phone = AdbPhone::new(serial)?;
+    phone.connect().context(
+        "the TEST phone does not answer adb (`wa-run state` says whether it is reachable)",
+    )?;
+    phone.wake()?;
+    Ok(Box::new(phone))
+}
+
+/// Where an answer to a step's question came from (D2); the step's record and the report name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// A check the step made on the TEST phone's own screen.
+    Checked,
+    /// His y or n, typed in his terminal.
+    Typed,
+    /// The lead relayed his word (`answer --relayed`, or a consent flag).
+    Relayed,
+    /// Nothing looked: the question stayed unanswered.
+    NotLooked,
+}
+
+impl Origin {
+    fn words(self) -> &'static str {
+        match self {
+            Self::Checked => "checked on the TEST phone",
+            Self::Typed => "typed by the user",
+            Self::Relayed => "relayed by the lead",
+            Self::NotLooked => "not looked at",
+        }
+    }
+    fn of_word(word: &str) -> Self {
+        match word {
+            "relayed" => Self::Relayed,
+            "typed" => Self::Typed,
+            _ => Self::NotLooked,
+        }
+    }
+}
+
+/// The fixed sentence of a check that could not be made.
+fn unchecked(question: &str, why: &anyhow::Error, step: &str) -> anyhow::Error {
+    anyhow!(
+        "the question `{question}` could not be answered by a check on the TEST phone ({}): nothing is taken as a yes. Run `step {step}` again",
+        safe_text(&format!("{why:#}"))
+    )
+}
+
 // ---- The steps (C5) -----------------------------------------------------------------------------
 
 /// The longest one call of `step` waits (M3: well under the ten minutes one shell call may last; a
@@ -6945,6 +7295,11 @@ struct StepRun<'a> {
     /// Structured facts a later step reads from the step log (T-4: which call handler answered and
     /// whether the TEST phone rang, for D9); written as `facts` of the step's record.
     facts: Option<Value>,
+    /// The TEST phone (`--test-phone` or the profile's), opened on first use.
+    phone: Option<Box<dyn Phone>>,
+    phone_serial: Option<String>,
+    /// Every answer to a question of this step and where it came from (D2): written as `answers` of the record.
+    answers: Vec<Value>,
 }
 
 impl StepRun<'_> {
@@ -6961,6 +7316,86 @@ impl StepRun<'_> {
     /// What the user does on a phone.
     fn phone(&mut self, what: &str) {
         self.say(format!("PHONE: {what}"));
+    }
+
+    /// Whether this step has a TEST phone to check and act on.
+    fn has_phone(&self) -> bool {
+        self.phone_serial.is_some()
+    }
+
+    /// An act of HIS on the personal phone: one line `DO-USER: ..` (with a test phone; else the old `PHONE:` line).
+    fn personal(&mut self, what: &str) {
+        if self.has_phone() {
+            self.say(format!("DO-USER: {what}"));
+        } else {
+            self.phone(what);
+        }
+    }
+
+    /// A look only the personal phone can make: ONE line `ASK-USER: ..`; the lead relays his word with
+    /// `answer --relayed y|n`.
+    fn ask_user(&mut self, what: &str) {
+        self.say(format!("ASK-USER: {what}"));
+    }
+
+    /// The TEST phone, opened on first use. Every use is `connect` and `wake` first (the phone dozes between steps).
+    fn phone_mut(&mut self) -> Result<&mut dyn Phone> {
+        if self.phone.is_none() {
+            let serial = self
+                .phone_serial
+                .clone()
+                .ok_or_else(|| anyhow!("this run has no test phone"))?;
+            self.phone = Some(open_phone(&serial, self.dir)?);
+        }
+        match self.phone.as_mut() {
+            Some(p) => Ok(p.as_mut()),
+            None => bail!("the test phone is not open"),
+        }
+    }
+
+    /// In a rehearsal the fake that plays WhatsApp must follow what the simulated phone did: the same act, on cue.
+    /// In a real run the phone's own acts reach Kourier through WhatsApp, and this does nothing.
+    fn mirror(&self, kind: &str, act: &str) -> Result<()> {
+        if self.dir.rehearsal {
+            self.client.ctl(
+                "rehearsal_act",
+                json!({"kind": kind, "act": act}),
+                Duration::from_secs(30),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// In a rehearsal the personal phone's call reaches the simulated TEST phone when the step says the user calls now.
+    fn the_rehearsals_personal_phone_calls(&self) {
+        if self.dir.rehearsal {
+            sim::ring_now();
+        }
+    }
+
+    /// Record where an answer came from (D2): a fixed sentence in the notes (so the report has it) and the record's
+    /// `answers`.
+    fn answered(&mut self, question: &str, yes: Option<bool>, origin: Origin) {
+        let word = match yes {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "none",
+        };
+        self.notes
+            .push(format!("answer {question}: {word} ({})", origin.words()));
+        self.answers
+            .push(json!({"question": question, "answer": word, "origin": origin.words()}));
+    }
+
+    /// The user's answer to `name` (typed in his terminal, or relayed by the lead), waited for, with its origin written.
+    fn take_answer(&mut self, name: &str, wait: Duration) -> Result<Option<bool>> {
+        let answer = answer_to(self, name, wait)?;
+        let origin = match answer {
+            Some(_) => Origin::of_word(&self.client.origin_of(name)?.unwrap_or_default()),
+            None => Origin::NotLooked,
+        };
+        self.answered(name, answer, origin);
+        Ok(answer)
     }
 
     /// What the user does in the Kourier window.
@@ -8063,7 +8498,7 @@ fn settled_baseline(run: &mut StepRun<'_>) -> Result<Snap> {
 fn one_arrives(run: &mut StepRun<'_>, kind: &str, instruction: &str) -> Result<i64> {
     let base = settled_baseline(run)?;
     let base_newest = newest_message(&base.rows);
-    run.phone(instruction);
+    run.personal(instruction);
     run.waiting("for the message");
     let seen = poll(
         run.wait_for(300),
@@ -8466,67 +8901,169 @@ fn step_settings(run: &mut StepRun<'_>) -> Result<()> {
             base.iter().filter(|(_, f)| f.muted).count(),
             base.iter().filter(|(_, f)| f.archived).count()
         ));
-        run.phone("on the TEST phone: archive ONE chat, then pin ANOTHER chat and mute that pinned chat (any length of time). Two chats: a pinned chat is never shown archived");
-        run.waiting("for the archive, the pin and the mute to show in Kourier (2 minutes)");
-        let mut seen = SettingsSeen::default();
-        let mut streak = 0;
-        let found = poll(run.wait_for(120), run.timing.poll, || {
-            halted_now(run.client)?;
-            seen = settings_look(run.client, &base)?;
-            // A disagreement of the two views is a finding only when it stands: they are read a
-            // moment apart, so a change lands in one of them first.
-            match &seen.conflict {
-                Some(conflict) => {
-                    streak += 1;
-                    if streak >= CONFLICT_LOOKS {
-                        bail!("{conflict}");
-                    }
-                }
-                None => streak = 0,
-            }
-            Ok((seen.conflict.is_none() && settings_done(&seen)).then_some(()))
-        })?;
-        let word = |ids: &[i64]| {
-            if ids.is_empty() {
-                "none".to_owned()
-            } else {
-                ids.iter()
-                    .map(|i| format!("#{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
+        let keys = if run.has_phone() {
+            Some(settings_acts_on_the_phone(run, &base)?)
+        } else {
+            run.phone("on the TEST phone: archive ONE chat, then pin ANOTHER chat and mute that pinned chat (any length of time). Two chats: a pinned chat is never shown archived");
+            run.waiting("for the archive, the pin and the mute to show in Kourier (2 minutes)");
+            None
         };
+        let judged = settings_judge(run, &base);
+        if let Some(keys) = keys {
+            settings_undo_on_the_phone(run, keys);
+        }
+        judged
+    })
+}
+
+/// `settings` with a test phone (D3): the step archives the group, pins the 1:1 chat and mutes it on the TEST phone
+/// through the selection toolbar; each act is checked afterwards on the phone's own lists. Two chats, so the archive
+/// does not hide the pin. Returns the keys and how many acts were done (an act that fails ends the list there, and the
+/// undo covers what was done).
+fn settings_acts_on_the_phone(
+    run: &mut StepRun<'_>,
+    base: &[(Chat, Facts)],
+) -> Result<(phone::ChatKey, phone::ChatKey, usize)> {
+    let group = base
+        .iter()
+        .find(|(c, _)| c.kind == "group")
+        .map(|(c, _)| c.id);
+    let direct = base
+        .iter()
+        .find(|(c, _)| c.kind == "direct")
+        .map(|(c, _)| c.id);
+    let (Some(group), Some(direct)) = (group, direct) else {
+        bail!(
+            "the step needs a group and a 1:1 chat in the shown list: nothing was done on the TEST phone"
+        );
+    };
+    let group_key = phone_key(run, group, true)?;
+    let direct_key = phone_key(run, direct, false)?;
+    let mut done = 0;
+    let acts = (|| -> Result<()> {
+        archive_on_the_phone(run, group_key)?;
+        done = 1;
+        run.mirror("group", "archive")?;
+        run.note("archived the group on the TEST phone (checked: it is under Archived there)");
+        act_with_undo(run, direct_key, "pin", |p| phone::pin(p, direct_key, true))?;
+        done = 2;
+        run.mirror("direct", "pin")?;
+        run.note("pinned the 1:1 chat on the TEST phone (checked on its toolbar)");
+        act_with_undo(run, direct_key, "mute", |p| {
+            phone::mute(p, direct_key, true)
+        })?;
+        done = 3;
+        run.mirror("direct", "mute")?;
+        run.note("muted the 1:1 chat on the TEST phone (checked on its toolbar)");
+        Ok(())
+    })();
+    match acts {
+        Ok(()) => Ok((group_key, direct_key, done)),
+        Err(e) => {
+            settings_undo_on_the_phone(run, (group_key, direct_key, done));
+            Err(e)
+        }
+    }
+}
+
+/// Put the chats back the way they were (what was done is undone, each undo checked on the phone); a failure is a
+/// fixed note, never a pass or a mask of the step's own verdict.
+fn settings_undo_on_the_phone(
+    run: &mut StepRun<'_>,
+    keys: (phone::ChatKey, phone::ChatKey, usize),
+) {
+    let (group_key, direct_key, done) = keys;
+    let mut undone = Vec::new();
+    // The last act first.
+    for step in (0..done).rev() {
+        let (what, kind, act) = [
+            ("unarchive", "group", "unarchive"),
+            ("unpin", "direct", "unpin"),
+            ("unmute", "direct", "unmute"),
+        ][step];
+        let outcome = match run.phone_mut() {
+            Err(e) => Err(e),
+            Ok(p) => match step {
+                0 => phone::ensure_unarchived(p, group_key).map(|_| ()),
+                1 => phone::ensure_unpinned(p, direct_key).map(|_| ()),
+                _ => phone::ensure_unmuted(p, direct_key).map(|_| ()),
+            },
+        };
+        match outcome.and_then(|()| run.mirror(kind, act)) {
+            Ok(()) => undone.push(what),
+            Err(_) => run.note(format!(
+                "could NOT {what} on the TEST phone: put that chat back by hand before the next step"
+            )),
+        }
+    }
+    if !undone.is_empty() {
         run.note(format!(
-            "archived (the core's row): {}; pinned: {}; muted: {}",
+            "put the chats back on the TEST phone ({}) and checked each",
+            undone.join(", ")
+        ));
+    }
+}
+
+/// The judging half of `settings`: Kourier shows the archive, the pin and the mute within the wait.
+fn settings_judge(run: &mut StepRun<'_>, base: &[(Chat, Facts)]) -> Result<()> {
+    let mut seen = SettingsSeen::default();
+    let mut streak = 0;
+    let found = poll(run.wait_for(120), run.timing.poll, || {
+        halted_now(run.client)?;
+        seen = settings_look(run.client, base)?;
+        // A disagreement of the two views is a finding only when it stands: they are read a
+        // moment apart, so a change lands in one of them first.
+        match &seen.conflict {
+            Some(conflict) => {
+                streak += 1;
+                if streak >= CONFLICT_LOOKS {
+                    bail!("{conflict}");
+                }
+            }
+            None => streak = 0,
+        }
+        Ok((seen.conflict.is_none() && settings_done(&seen)).then_some(()))
+    })?;
+    let word = |ids: &[i64]| {
+        if ids.is_empty() {
+            "none".to_owned()
+        } else {
+            ids.iter()
+                .map(|i| format!("#{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    run.note(format!(
+        "archived (the core's row): {}; pinned: {}; muted: {}",
+        word(&seen.archived),
+        word(&seen.pinned),
+        word(&seen.muted)
+    ));
+    if found.is_none() {
+        let missing: Vec<&str> = [
+            ("an archive", seen.archived.is_empty()),
+            ("a pin", seen.pinned.is_empty()),
+            ("a mute", seen.muted.is_empty()),
+        ]
+        .iter()
+        .filter(|(_, none)| *none)
+        .map(|(what, _)| *what)
+        .collect();
+        bail!(
+            "Kourier did not show {} in time (archived {}, pinned {}, muted {}). Read wa-run/app.log; the app-state mutations of the phone arrive through the linked device's sync",
+            if missing.is_empty() {
+                "the pin and the mute on a chat other than the archived one".to_owned()
+            } else {
+                missing.join(" and ")
+            },
             word(&seen.archived),
             word(&seen.pinned),
             word(&seen.muted)
-        ));
-        if found.is_none() {
-            let missing: Vec<&str> = [
-                ("an archive", seen.archived.is_empty()),
-                ("a pin", seen.pinned.is_empty()),
-                ("a mute", seen.muted.is_empty()),
-            ]
-            .iter()
-            .filter(|(_, none)| *none)
-            .map(|(what, _)| *what)
-            .collect();
-            bail!(
-                "Kourier did not show {} in time (archived {}, pinned {}, muted {}). Read wa-run/app.log; the app-state mutations of the phone arrive through the linked device's sync",
-                if missing.is_empty() {
-                    "the pin and the mute on a chat other than the archived one".to_owned()
-                } else {
-                    missing.join(" and ")
-                },
-                word(&seen.archived),
-                word(&seen.pinned),
-                word(&seen.muted)
-            );
-        }
-        run.note("the archived chat is gone from the shown list and the core's row says archived; the shown list and the core's row agree on the pin and the mute");
-        Ok(())
-    })
+        );
+    }
+    run.note("the archived chat is gone from the shown list and the core's row says archived; the shown list and the core's row agree on the pin and the mute");
+    Ok(())
 }
 
 /// The yes or no the user typed for the question `name` (`wa-run answer`), waited for up to `wait`.
@@ -8571,6 +9108,9 @@ fn step_groups(run: &mut StepRun<'_>) -> Result<()> {
                 "group #{group} shows {members} members and {admins} admins: the test group holds both phones and has an admin"
             );
         }
+        if run.has_phone() {
+            return groups_checked_on_the_phone(run, group, members, admins);
+        }
         let detail = format!("members={members}, admins={admins}");
         run.client.ask("group-counts", &detail)?;
         run.terminal(
@@ -8580,7 +9120,7 @@ fn step_groups(run: &mut StepRun<'_>) -> Result<()> {
             "open this group's info on the TEST phone: it should list {members} participants, {admins} of them admins. Then answer y or n in your terminal"
         ));
         run.waiting("for your y or n (2 minutes)");
-        match answer_to(run, "group-counts", run.wait_for(120))? {
+        match run.take_answer("group-counts", run.wait_for(120))? {
             Some(true) => {
                 run.note("he confirmed the TEST phone shows the same member and admin counts");
                 Ok(())
@@ -8593,6 +9133,118 @@ fn step_groups(run: &mut StepRun<'_>) -> Result<()> {
             ),
         }
     })
+}
+
+// ---- The picks on the TEST phone: which row is which chat -------------------------------------------------
+//
+// The dev channel names no chat (D6: no titles), so a chat is picked on the phone by KIND and RANK: the n-th group
+// (or 1:1 chat) of the phone's list, counted the way Kourier's shown list orders them (pinned first, then the newest
+// activity). The pick is then proved by its EFFECT in Kourier (the archive reaches the very conversation the run
+// knows), and a chat that is not the one fails the step.
+
+/// The position of conversation `id` among the shown chats of its kind (pinned first, then by activity).
+fn kourier_rank(run: &StepRun<'_>, id: i64, group: bool) -> Result<usize> {
+    let mut chats: Vec<Chat> = parse_chats(&run.client.ctl(
+        "chats",
+        json!({}),
+        Duration::from_secs(30),
+    )?)
+    .into_iter()
+    .filter(|c| !c.is_self && (c.kind == "group") == group && (group || c.kind == "direct"))
+    .collect();
+    chats.sort_by_key(|c| {
+        (
+            std::cmp::Reverse(c.pinned),
+            std::cmp::Reverse(c.last_activity),
+        )
+    });
+    chats.iter().position(|c| c.id == id).ok_or_else(|| {
+        anyhow!("conversation #{id} is not in Kourier's shown list: its place on the TEST phone cannot be told")
+    })
+}
+
+/// The TEST phone's key for conversation `id`: by rank in the main list when the chat is shown, else (an archived
+/// chat) the one archived chat of that kind.
+fn phone_key(run: &mut StepRun<'_>, id: i64, group: bool) -> Result<phone::ChatKey> {
+    let rank = kourier_rank(run, id, group);
+    let p = run.phone_mut()?;
+    match rank {
+        Ok(rank) => phone::key_by_rank(p, group, rank, false),
+        Err(_) => {
+            let archived = phone::archived_list(p)?;
+            let of_kind: Vec<_> = archived.iter().filter(|(_, g)| *g == group).collect();
+            match of_kind.as_slice() {
+                [(key, _)] => Ok(*key),
+                _ => bail!(
+                    "the TEST phone's Archived list does not hold exactly one chat of that kind: the chat cannot be picked"
+                ),
+            }
+        }
+    }
+}
+
+/// An act on the TEST phone with its undo (review H1): when the act fails after it may have taken effect, the state is
+/// read and put back (archive -> unarchive, pin -> unpin, mute -> unmute), and the note says what happened in fixed words.
+fn act_with_undo(
+    run: &mut StepRun<'_>,
+    key: phone::ChatKey,
+    act: &str,
+    f: impl FnOnce(&mut dyn Phone) -> Result<()>,
+) -> Result<()> {
+    let outcome = f(run.phone_mut()?);
+    if outcome.is_err() {
+        let undone = match run.phone_mut() {
+            Err(e) => Err(e),
+            Ok(p) => match act {
+                "archive" => phone::ensure_unarchived(p, key),
+                "pin" => phone::ensure_unpinned(p, key),
+                _ => phone::ensure_unmuted(p, key),
+            },
+        };
+        match undone {
+            Ok(true) => run.note(format!("an {act} that did not verify was undone on the TEST phone (checked)")),
+            Ok(false) => {}
+            Err(_) => run.note(format!(
+                "could NOT confirm that a failed {act} was undone on the TEST phone: look at that chat there and put it back by hand"
+            )),
+        }
+    }
+    outcome
+}
+
+fn archive_on_the_phone(run: &mut StepRun<'_>, key: phone::ChatKey) -> Result<()> {
+    act_with_undo(run, key, "archive", |p| phone::archive(p, key))
+}
+
+/// `groups` with a test phone (D2): the step opens the group's info on the TEST phone and counts the members and the
+/// admins in memory; equal to the printed counts is the yes.
+fn groups_checked_on_the_phone(
+    run: &mut StepRun<'_>,
+    group: i64,
+    members: u64,
+    admins: u64,
+) -> Result<()> {
+    let counted = (|| -> Result<(u64, u64)> {
+        let key = phone_key(run, group, true)?;
+        phone::group_counts(run.phone_mut()?, key)
+    })();
+    match counted {
+        Err(e) => {
+            run.answered("group-counts", None, Origin::NotLooked);
+            Err(unchecked("group-counts", &e, "groups"))
+        }
+        Ok((m, a)) if (m, a) == (members, admins) => {
+            run.answered("group-counts", Some(true), Origin::Checked);
+            run.note("the TEST phone's group info shows the same member and admin counts (opened and counted by the step)");
+            Ok(())
+        }
+        Ok(_) => {
+            run.answered("group-counts", Some(false), Origin::Checked);
+            bail!(
+                "the TEST phone's group info does NOT show {members} members and {admins} admins (checked on the phone by the step): a finding for W6a2 (the roles or the member list differ from the phone's)"
+            )
+        }
+    }
 }
 
 /// The newest call line of a chat that is new since `known` lines, if any.
@@ -8716,6 +9368,104 @@ fn record_call_evidence(run: &mut StepRun<'_>, handler: CallHandler, rang: bool)
     }
 }
 
+/// How long the TEST phone gets to show the incoming call after the user's call.
+const RING_WAIT_SECS: u64 = 90;
+/// How long the user has to answer, hold and end a call the tool could not answer itself (its screen not readable).
+const CALL_OVER_WAIT: Duration = Duration::from_secs(120);
+/// How long the step holds the call it answered on the TEST phone.
+const CALL_HOLD: Duration = Duration::from_secs(15);
+
+/// The call, on the TEST phone's own screen (D3, D2): the step waits for the incoming call and records the ring as
+/// SEEN, answers it there, holds about 15 s and ends it there; the Calls tab's newest row must then be an incoming
+/// call that was not missed. A ring that does not show, a screen that cannot be read or a call that cannot be answered
+/// or ended fails the step (nothing is taken as a yes). UNPROVEN on the real phone until the first real call.
+fn call_on_the_test_phone(
+    run: &mut StepRun<'_>,
+    prep: (phone::ChatKey, Option<phone::CallsHead>),
+) -> Result<bool> {
+    let (caller, before) = prep;
+    let wait = run.wait_for(RING_WAIT_SECS);
+    let p = run.phone_mut()?;
+    if !phone::wait_for_ring(p, wait) {
+        run.answered("call-rang", None, Origin::NotLooked);
+        bail!(
+            "the TEST phone showed no incoming call within {} s, or its screen could not be read: the ring is not taken as seen. Run `step call` again and call again",
+            wait.as_secs()
+        );
+    }
+    run.note("the TEST phone showed the incoming call (seen on its screen by the step)");
+    // A marker for `state` while a call may be open; removed once the end is confirmed.
+    let marker = run.dir.call_open_file();
+    let _ = write_private(&marker, "a call was answered on the TEST phone\n");
+    let outcome = phone::answer_hold_and_end(run.phone_mut()?, CALL_HOLD, caller);
+    let mut user_answered = false;
+    match outcome {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&marker);
+        }
+        Err(e) if e.downcast_ref::<phone::CallFromSomeoneElse>().is_some() => {
+            let _ = std::fs::remove_file(&marker);
+            run.answered("call-rang", None, Origin::NotLooked);
+            run.note("a call from someone else: it was not answered");
+            bail!(
+                "the incoming call on the TEST phone is not from the 1:1 chat: it was NOT answered and the ring is not taken as seen. Run `step call` again and call from the personal phone"
+            );
+        }
+        Err(e) if e.downcast_ref::<phone::CallScreenUnreadable>().is_some() => {
+            // Nothing was tapped: the user answers on the TEST phone himself (R1: the ringing screen cannot be
+            // dumped); the Calls tab below judges whether the call was answered.
+            user_answered = true;
+            run.personal(
+                "Answer the call on the TEST phone yourself now (swipe up), keep it about 15 seconds, then hang up on either phone",
+            );
+            if !phone::wait_call_over(run.phone_mut()?, CALL_OVER_WAIT) {
+                run.ask_user("Hang up the call on the TEST phone now");
+                run.answered("call-rang", None, Origin::NotLooked);
+                bail!(
+                    "the call screen could not be read and the call did not end in time: a call may still be open on the TEST phone (`wa-run state` says so until a step ends one)"
+                );
+            }
+            let _ = std::fs::remove_file(&marker);
+            run.note(
+                "the call screen could not be read (it animates): the tool tapped nothing, the user answered on the TEST phone and the call ended there",
+            );
+        }
+        Err(e) if e.downcast_ref::<phone::CallMayBeOpen>().is_some() => {
+            run.ask_user("Hang up the call on the TEST phone now");
+            run.answered("call-rang", None, Origin::NotLooked);
+            bail!(
+                "the call was answered on the TEST phone and its end could not be confirmed: a call may still be open there (`wa-run state` says so until a step ends one)"
+            );
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&marker);
+            return Err(e);
+        }
+    }
+    if !user_answered {
+        run.note("answered the call on the TEST phone, held it about 15 s and ended it there (checked on its screen)");
+    }
+    let p = run.phone_mut()?;
+    if !phone::newest_call_is_new_and_answered(p, &before)? {
+        bail!(
+            "the TEST phone's Calls tab does not show a NEW newest row as an answered incoming call"
+        );
+    }
+    run.note("the TEST phone's Calls tab shows a new newest row as an incoming call, not missed");
+    Ok(true)
+}
+
+/// Before the user is asked to call: the 1:1 chat's name on the phone (who may be answered) and the Calls tab's head
+/// (so a new row can be told from an old one).
+fn prepare_call(
+    run: &mut StepRun<'_>,
+    peer: i64,
+) -> Result<(phone::ChatKey, Option<phone::CallsHead>)> {
+    let caller = phone_key(run, peer, false)?;
+    let before = phone::calls_head(run.phone_mut()?)?;
+    Ok((caller, before))
+}
+
 /// Step `call` (READ-ONLY): he calls the test number from the personal phone and answers on the
 /// TEST phone; Kourier shows a call line in the 1:1 chat `receive` found, and the step waits until
 /// it says `answered` (answered on another device: Kourier never answers or rings). Then he says
@@ -8732,6 +9482,7 @@ fn step_call(run: &mut StepRun<'_>) -> Result<()> {
             .previous
             .as_ref()
             .is_some_and(|p| p["line_answered"] == json!(true) && p["chat"].as_i64() == Some(peer));
+        let mut rang_now: Option<bool> = None;
         if !line_seen {
             let before = facts_of(run.client, peer)?.ok_or_else(|| {
                 anyhow!("the core has no conversation #{peer} (remembered as peer_conv)")
@@ -8740,8 +9491,18 @@ fn step_call(run: &mut StepRun<'_>) -> Result<()> {
             run.note(format!(
                 "1:1 chat #{peer}: {known} call lines before the call"
             ));
-            run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call) and let the TEST phone ring; then ANSWER it on the TEST phone. Hang up on either phone after a few seconds");
-            run.waiting("for the call line in Kourier (it should ring, then say answered on another device)");
+            let mut rang_on_the_phone = None;
+            if run.has_phone() {
+                let prep = prepare_call(run, peer)?;
+                run.personal("Call the test number from your personal phone now");
+                run.the_rehearsals_personal_phone_calls();
+                run.waiting("for the call to ring on the TEST phone (the step looks at its screen, answers there, holds about 15 s and ends the call there)");
+                rang_on_the_phone = Some(call_on_the_test_phone(run, prep)?);
+                rang_now = rang_on_the_phone;
+            } else {
+                run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call) and let the TEST phone ring; then ANSWER it on the TEST phone. Hang up on either phone after a few seconds");
+                run.waiting("for the call line in Kourier (it should ring, then say answered on another device)");
+            }
             let mut states: Vec<String> = Vec::new();
             let mut ended: Option<String> = None;
             let found = poll(run.wait_for(300), run.timing.poll, || {
@@ -8786,13 +9547,32 @@ fn step_call(run: &mut StepRun<'_>) -> Result<()> {
             if states.first().map(String::as_str) != Some("incoming ringing") {
                 run.note("the line was not seen ringing: it came from the call log after the call (quiet, history-like), not from the interceptor");
             }
-            run.resume = Some(json!({"line_answered": true, "chat": peer}));
+            run.resume =
+                Some(json!({"line_answered": true, "chat": peer, "rang": rang_on_the_phone}));
         } else {
             run.note("the call line was already seen answered by the earlier call of this step; only your answer is left");
             run.resume = run.previous.clone();
         }
         // An answer typed after the earlier call gave up is his answer to this very question
         // (only a resumed call can have one: a first call asks afresh, which clears any old one).
+        if run.has_phone() {
+            // The ring was SEEN on the TEST phone by the step itself; a resumed call takes it from its record.
+            let seen = run
+                .previous
+                .as_ref()
+                .filter(|_| line_seen)
+                .and_then(|p| p["rang"].as_bool())
+                .or(rang_now);
+            let Some(rang) = seen else {
+                bail!(
+                    "the earlier call of this step did not record the ring seen on the TEST phone: nothing is taken as a yes. Run `step call` again with a new call"
+                );
+            };
+            run.answered("call-rang", Some(rang), Origin::Checked);
+            run.resume = None;
+            record_call_evidence(run, handler, rang);
+            return Ok(());
+        }
         let late = if line_seen {
             run.client.answer_of("call-rang")?
         } else {
@@ -8806,7 +9586,7 @@ fn step_call(run: &mut StepRun<'_>) -> Result<()> {
                 "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
             );
             run.waiting("for your y or n: did the TEST phone ring? (2 minutes)");
-            answer_to(run, "call-rang", run.wait_for(120))?
+            run.take_answer("call-rang", run.wait_for(120))?
         };
         match answer {
             Some(rang) => {
@@ -8901,9 +9681,72 @@ fn phone_unarchived(run: &mut StepRun<'_>, cause: &str) -> Result<bool> {
     run.terminal("in a terminal of your own: target/debug/xtask wa-run answer --profile <name>");
     run.phone("look at the TEST phone: is the chat back in the main chat list, or still under Archived? Then answer y (back in the list) or n (still archived) in your terminal");
     run.waiting("for your y or n (2 minutes)");
-    answer_to(run, "phone-unarchived", run.wait_for(ARCHIVE_WAIT_SECS))?.ok_or_else(|| {
+    run.take_answer("phone-unarchived", run.wait_for(ARCHIVE_WAIT_SECS))?.ok_or_else(|| {
         anyhow!("no answer was typed in time. Run the step again, and answer with `wa-run answer` in your own terminal")
     })
+}
+
+/// "Keep chats archived" must be OFF before an archive case (D3): read from the TEST phone's settings; if it is ON the
+/// step stops with a fixed sentence (it never flips a setting).
+fn require_keep_archived_off(run: &mut StepRun<'_>) -> Result<()> {
+    if phone::keep_chats_archived(run.phone_mut()?)? {
+        bail!(
+            "\"Keep chats archived\" is ON on the TEST phone: turn it OFF there (the tool never flips a setting) and run the step again. Nothing was done"
+        );
+    }
+    run.note("\"Keep chats archived\" is OFF on the TEST phone (read from its settings)");
+    Ok(())
+}
+
+/// `phone-unarchived` as a CHECK (D2): the chat is in the phone's main list (yes) or under Archived (no). A list that
+/// cannot be read, or a chat found in neither, is no answer at all and the step fails (run it again).
+fn phone_unarchived_checked(
+    run: &mut StepRun<'_>,
+    key: phone::ChatKey,
+    step: &str,
+) -> Result<bool> {
+    match phone::locate(run.phone_mut()?, key) {
+        Ok(phone::Where::Main) => {
+            run.answered("phone-unarchived", Some(true), Origin::Checked);
+            Ok(true)
+        }
+        Ok(phone::Where::Archived) => {
+            run.answered("phone-unarchived", Some(false), Origin::Checked);
+            Ok(false)
+        }
+        Ok(phone::Where::Nowhere) => {
+            run.answered("phone-unarchived", None, Origin::NotLooked);
+            bail!(
+                "the chat is in neither list of the TEST phone: the question `phone-unarchived` is not taken as a yes. Run `step {step}` again"
+            )
+        }
+        Err(e) => {
+            run.answered("phone-unarchived", None, Origin::NotLooked);
+            Err(unchecked("phone-unarchived", &e, step))
+        }
+    }
+}
+
+/// After an archive case: the chat goes back to the main list on the TEST phone (checked there), so the next case
+/// starts from the list it expects. A failure is a fixed note.
+fn restore_unarchived(run: &mut StepRun<'_>, key: phone::ChatKey) {
+    let outcome = (|| -> Result<bool> {
+        match phone::locate(run.phone_mut()?, key)? {
+            phone::Where::Archived => {}
+            phone::Where::Main => return Ok(false),
+            phone::Where::Nowhere => bail!("the chat is in neither list"),
+        }
+        phone::unarchive(run.phone_mut()?, key)?;
+        run.mirror("direct", "unarchive")?;
+        Ok(true)
+    })();
+    match outcome {
+        Ok(true) => run.note("put the 1:1 chat back in the main list on the TEST phone (checked there)"),
+        Ok(false) => {}
+        Err(_) => run.note(
+            "could NOT put the 1:1 chat back in the main list on the TEST phone: unarchive it by hand before the next step",
+        ),
+    }
 }
 
 /// The verdict of the two cases that compare the phone with Kourier: Kourier follows the phone.
@@ -8987,13 +9830,16 @@ fn archive_case_chat(run: &StepRun<'_>, must_be_archived: bool) -> Result<(i64, 
 fn step_archive_message(run: &mut StepRun<'_>) -> Result<()> {
     read_only(run, |run| {
         let (peer, _) = archive_case_chat(run, false)?;
+        if run.has_phone() {
+            return archive_message_on_the_phone(run, peer);
+        }
         run.phone(KEEP_ARCHIVED_OFF);
         run.phone("then ARCHIVE the 1:1 chat with the personal phone on the TEST phone");
         run.waiting("for Kourier to show the chat archived (2 minutes)");
         let Some(archived) = wait_archive_flag(run, peer, true, run.wait_for(ARCHIVE_WAIT_SECS))?
         else {
             bail!(
-                "Kourier did not show chat #{peer} archived in time: if the TEST phone shows it archived, the archive did not reach Kourier (a finding; read wa-run/app.log)"
+                "Kourier did not show chat #{peer} archived in time: if the TEST phone shows it archived, the archive did not reach Kourier, or the chat picked on the phone is not the one Kourier knows (a finding to check by hand; read wa-run/app.log)"
             );
         };
         run.note(format!("chat #{peer} is archived in the core's row"));
@@ -9016,6 +9862,44 @@ fn step_archive_message(run: &mut StepRun<'_>) -> Result<()> {
     })
 }
 
+/// `archive-message` with a test phone: the step checks "Keep chats archived" is OFF, archives the 1:1 chat on the TEST
+/// phone itself (checked on its lists), asks only the personal phone's text from the user (`DO-USER`), and reads the
+/// phone's answer to "did it bring the chat back" off its own lists.
+fn archive_message_on_the_phone(run: &mut StepRun<'_>, peer: i64) -> Result<()> {
+    require_keep_archived_off(run)?;
+    let key = phone_key(run, peer, false)?;
+    archive_on_the_phone(run, key)?;
+    run.mirror("direct", "archive")?;
+    run.note("archived the 1:1 chat on the TEST phone (checked: it is under Archived there)");
+    let verdict = (|| -> Result<()> {
+        let Some(archived) = wait_archive_flag(run, peer, true, run.wait_for(ARCHIVE_WAIT_SECS))?
+        else {
+            bail!(
+                "Kourier did not show chat #{peer} archived in time, although the TEST phone shows it archived: the archive did not reach Kourier, or the chat picked on the phone is not the one Kourier knows (a finding to check by hand; read wa-run/app.log)"
+            );
+        };
+        run.note(format!("chat #{peer} is archived in the core's row"));
+        run.personal("write ONE text from your personal phone into the 1:1 chat with the test number (it is the first thing after the archive)");
+        run.waiting("for the text to arrive in Kourier (2 minutes)");
+        let Some(after) = settled_archive(
+            run,
+            peer,
+            archived.last_activity,
+            run.wait_for(ARCHIVE_WAIT_SECS),
+        )?
+        else {
+            bail!(
+                "no new text showed in chat #{peer} in time. Read wa-run/app.log; was the text sent to the TEST number's chat?"
+            );
+        };
+        let kourier = !after.archived;
+        let phone_moved = phone_unarchived_checked(run, key, "archive-message")?;
+        follows_the_phone(run, phone_moved, kourier)
+    })();
+    restore_unarchived(run, key);
+    verdict
+}
+
 /// Step `call-then-archive` (READ-ONLY, W6a1 re-check NEW-1): the personal phone calls into the
 /// 1:1 chat, then he archives it on the TEST phone; Kourier must show it archived although a call
 /// line is newer than the archive's range. If it does not, he is asked whether the phone shows it
@@ -9024,8 +9908,19 @@ fn step_call_then_archive(run: &mut StepRun<'_>) -> Result<()> {
     read_only(run, |run| {
         let (peer, before) = archive_case_chat(run, false)?;
         let known = before.calls.len();
-        run.phone(KEEP_ARCHIVED_OFF);
-        run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call); do NOT answer on the TEST phone; hang up on the personal phone after a few seconds");
+        let key = if run.has_phone() {
+            require_keep_archived_off(run)?;
+            Some(phone_key(run, peer, false)?)
+        } else {
+            None
+        };
+        if key.is_some() {
+            run.personal("Call the test number from your personal phone now; do NOT answer on the TEST phone; hang up after a few seconds");
+            run.the_rehearsals_personal_phone_calls();
+        } else {
+            run.phone(KEEP_ARCHIVED_OFF);
+            run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call); do NOT answer on the TEST phone; hang up on the personal phone after a few seconds");
+        }
         run.waiting("for the call line in Kourier (2 minutes)");
         let line = poll(run.wait_for(ARCHIVE_WAIT_SECS), run.timing.poll, || {
             halted_now(run.client)?;
@@ -9039,6 +9934,9 @@ fn step_call_then_archive(run: &mut StepRun<'_>) -> Result<()> {
         run.note(format!(
             "a call line appeared in chat #{peer} ({known} lines before)"
         ));
+        if let Some(key) = key {
+            return call_then_archive_on_the_phone(run, peer, key);
+        }
         run.phone("now ARCHIVE the 1:1 chat on the TEST phone (the archive comes after the call)");
         run.waiting("for Kourier to show the chat archived (2 minutes)");
         if wait_archive_flag(run, peer, true, run.wait_for(ARCHIVE_WAIT_SECS))?.is_some() {
@@ -9053,7 +9951,7 @@ fn step_call_then_archive(run: &mut StepRun<'_>) -> Result<()> {
         );
         run.phone("is the chat archived on the TEST phone? Answer y or n in your terminal");
         run.waiting("for your y or n (2 minutes)");
-        match answer_to(run, "phone-archived", run.wait_for(ARCHIVE_WAIT_SECS))? {
+        match run.take_answer("phone-archived", run.wait_for(ARCHIVE_WAIT_SECS))? {
             Some(true) => bail!(
                 "chat #{peer} is archived on the TEST phone but Kourier does not show it archived: a call line newer than the archive's range keeps it out (W6a1 NEW-1: a finding; the smallest fix is to leave call lines out of the archive's counting time)"
             ),
@@ -9063,6 +9961,53 @@ fn step_call_then_archive(run: &mut StepRun<'_>) -> Result<()> {
             None => bail!("no answer was typed in time. Run the step again"),
         }
     })
+}
+
+/// The end of `call-then-archive` with a test phone (the call line was seen): once the TEST phone has stopped ringing
+/// the step archives the 1:1 chat on it (checked on its lists); Kourier must show it archived; if not, the phone's own
+/// lists decide whether this is the finding (archived there, not here).
+fn call_then_archive_on_the_phone(
+    run: &mut StepRun<'_>,
+    peer: i64,
+    key: phone::ChatKey,
+) -> Result<()> {
+    let quiet_wait = run.wait_for(ARCHIVE_WAIT_SECS);
+    if !phone::wait_until_quiet(run.phone_mut()?, quiet_wait) {
+        bail!(
+            "the TEST phone still shows the call after the wait: nothing was archived. Run the step again"
+        );
+    }
+    archive_on_the_phone(run, key)?;
+    run.mirror("direct", "archive")?;
+    run.note("archived the 1:1 chat on the TEST phone after the call (checked: it is under Archived there)");
+    let verdict = (|| -> Result<()> {
+        if wait_archive_flag(run, peer, true, run.wait_for(ARCHIVE_WAIT_SECS))?.is_some() {
+            run.note(
+                "Kourier shows the chat archived although a call line is newer than the archive",
+            );
+            return Ok(());
+        }
+        match phone::locate(run.phone_mut()?, key) {
+            Ok(phone::Where::Archived) => {
+                run.answered("phone-archived", Some(true), Origin::Checked);
+                bail!(
+                    "chat #{peer} is archived on the TEST phone (checked on its list) but Kourier does not show it archived: a call line newer than the archive's range keeps it out (W6a1 NEW-1: a finding; the smallest fix is to leave call lines out of the archive's counting time)"
+                )
+            }
+            Ok(_) => {
+                run.answered("phone-archived", Some(false), Origin::Checked);
+                bail!(
+                    "the chat is not under Archived on the TEST phone after the act: nothing to compare. Run the step again"
+                )
+            }
+            Err(e) => {
+                run.answered("phone-archived", None, Origin::NotLooked);
+                Err(unchecked("phone-archived", &e, "call-then-archive"))
+            }
+        }
+    })();
+    restore_unarchived(run, key);
+    verdict
 }
 
 /// Step `call-into-archived` (READ-ONLY, W6a1 re-check case c): the 1:1 chat is archived on the
@@ -9079,20 +10024,61 @@ fn step_call_into_archived(run: &mut StepRun<'_>) -> Result<()> {
                 here.kind
             );
         }
+        // With a test phone the step archives the chat on it itself (when it is not archived yet), after reading
+        // "Keep chats archived" OFF; the key then serves the check afterwards.
+        let mut key = None;
+        if run.has_phone() {
+            if !here.archived {
+                require_keep_archived_off(run)?;
+                let k = phone_key(run, peer, false)?;
+                archive_on_the_phone(run, k)?;
+                run.mirror("direct", "archive")?;
+                run.note(
+                    "archived the 1:1 chat on the TEST phone (checked: it is under Archived there)",
+                );
+                key = Some(k);
+            } else {
+                key = Some(phone_key(run, peer, false)?);
+            }
+        }
         if !here.archived {
-            run.phone(KEEP_ARCHIVED_OFF);
-            run.phone("then ARCHIVE the 1:1 chat with the personal phone on the TEST phone");
-            run.waiting("for Kourier to show the chat archived (2 minutes)");
+            if key.is_none() {
+                run.phone(KEEP_ARCHIVED_OFF);
+                run.phone("then ARCHIVE the 1:1 chat with the personal phone on the TEST phone");
+                run.waiting("for Kourier to show the chat archived (2 minutes)");
+            }
             here = wait_archive_flag(run, peer, true, run.wait_for(ARCHIVE_WAIT_SECS))?.ok_or_else(|| {
-                anyhow!("Kourier did not show chat #{peer} archived in time: if the TEST phone shows it archived, the archive did not reach Kourier (a finding; read wa-run/app.log)")
+                anyhow!("Kourier did not show chat #{peer} archived in time: if the TEST phone shows it archived, the archive did not reach Kourier, or the chat picked on the phone is not the one Kourier knows (a finding to check by hand; read wa-run/app.log)")
             })?;
         }
         let known = here.calls.len();
         run.note(format!(
             "chat #{peer} is archived in the core's row ({known} call lines)"
         ));
-        run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call); do NOT answer on the TEST phone; hang up on the personal phone after a few seconds");
+        if key.is_some() {
+            run.personal("Call the test number from your personal phone now; do NOT answer on the TEST phone; hang up after a few seconds");
+            run.the_rehearsals_personal_phone_calls();
+        } else {
+            run.phone("from the PERSONAL phone, call the TEST number (a WhatsApp voice call); do NOT answer on the TEST phone; hang up on the personal phone after a few seconds");
+        }
         run.waiting("for the call line in Kourier (2 minutes)");
+        let verdict = call_into_archived_verdict(run, peer, known, key);
+        if let Some(key) = key {
+            restore_unarchived(run, key);
+        }
+        verdict
+    })
+}
+
+/// The second half of `call-into-archived`: the call line, the settled flag, and the phone's side (his key, or the
+/// check on the TEST phone's lists).
+fn call_into_archived_verdict(
+    run: &mut StepRun<'_>,
+    peer: i64,
+    known: usize,
+    key: Option<phone::ChatKey>,
+) -> Result<()> {
+    {
         let after = poll(run.wait_for(ARCHIVE_WAIT_SECS), run.timing.poll, || {
             halted_now(run.client)?;
             let facts = core_archived(run, peer)?;
@@ -9119,9 +10105,19 @@ fn step_call_into_archived(run: &mut StepRun<'_>) -> Result<()> {
             }
         }
         let kourier = !after.archived;
+        if let Some(key) = key {
+            let quiet_wait = run.wait_for(ARCHIVE_WAIT_SECS);
+            if !phone::wait_until_quiet(run.phone_mut()?, quiet_wait) {
+                bail!(
+                    "the TEST phone still shows the call after the wait: the question is not taken as a yes. Run `step call-into-archived` again"
+                );
+            }
+            let phone_moved = phone_unarchived_checked(run, key, "call-into-archived")?;
+            return follows_the_phone(run, phone_moved, kourier);
+        }
         let phone = phone_unarchived(run, "cause=call")?;
         follows_the_phone(run, phone, kourier)
-    })
+    }
 }
 
 /// What a step needs of the supervisor before it starts: the run is not halted, the app is not
@@ -9297,7 +10293,7 @@ fn the_peer_writes_first(run: &mut StepRun<'_>, chat: i64, what: &str) -> Result
         ));
         return Ok(());
     }
-    run.phone(what);
+    run.personal(what);
     run.waiting("for the peer's message: the tool sends nothing before it");
     let seen = poll(run.wait_for(PEER_WAIT_SECS), run.timing.poll, || {
         halted_now(run.client)?;
@@ -9544,7 +10540,7 @@ fn step_peer_react(run: &mut StepRun<'_>) -> Result<()> {
         // The base is a settled look: a state taken before the rows are loaded would make every
         // reaction the chat already holds a new one.
         let base = others_reactions(rows_in(&settled_chat(run, peer)?));
-        run.phone("from the PERSONAL phone, in the 1:1 chat with the test number: react to one of the newest messages (when it already carries your reaction, react with another emoji)");
+        run.personal("from the PERSONAL phone, in the 1:1 chat with the test number: react to one of the newest messages (when it already carries your reaction, react with another emoji)");
         run.waiting("for the peer's reaction to show in Kourier");
         let seen = poll(run.wait_for(PEER_ACT_WAIT_SECS), run.timing.poll, || {
             halted_now(run.client)?;
@@ -9622,7 +10618,7 @@ fn peer_text_act(run: &mut StepRun<'_>, act: PeerText) -> Result<()> {
             message
         } else {
             let floor = newest_message(rows_in(&state));
-            run.phone("from the PERSONAL phone, send ONE short text into the 1:1 chat with the test number");
+            run.personal("from the PERSONAL phone, send ONE short text into the 1:1 chat with the test number");
             run.waiting("for the peer's text to show in Kourier (then the step asks for the act)");
             let found = poll(run.wait_for(PEER_ACT_WAIT_SECS), run.timing.poll, || {
                 halted_now(run.client)?;
@@ -9650,7 +10646,7 @@ fn peer_text_act(run: &mut StepRun<'_>, act: PeerText) -> Result<()> {
             message
         };
         run.resume = Some(json!({"chat": peer, "message": message}));
-        run.phone(act.asks());
+        run.personal(act.asks());
         run.waiting(&format!(
             "for the {} to show on that text in Kourier",
             act.word()
@@ -9730,18 +10726,29 @@ fn resend_send_and_kill(run: &mut StepRun<'_>, armed: bool) -> Result<()> {
     if armed {
         run.note("an earlier call armed the resend (both frames are counted, his OK is used): going on to the send");
     } else {
-        run.client.ask("resend-ok", "frames=2")?;
-        run.terminal(
-            "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
-        );
-        run.say("QUESTION: may the tool send ONE fixed text into the 1:1 chat, kill the app at once, and let the app send that same message again, with the same id, at the next start? WhatsApp very likely drops the repeat. It takes two frames of the budget. Answer y or n in your terminal".to_owned());
-        run.waiting("for your y or n (2 minutes): nothing is sent before it");
-        match answer_to(run, "resend-ok", run.wait_for(120))? {
-            Some(true) => {}
-            Some(false) => bail!("he said no: nothing was armed, sent or killed"),
-            None => bail!(
-                "no answer was typed in time: nothing was armed, sent or killed. Run the step again and answer with `wa-run answer` in your own terminal"
-            ),
+        if run.has_phone() {
+            // CONSENT is the lead's flag after the user's word in chat (D4): without it the step stops before the act.
+            if !run.args.user_said_yes {
+                bail!(
+                    "the resend needs the user's consent first: ask him in chat whether the tool may send ONE fixed text into the 1:1 chat, kill the app at once, and let the app send that same message again with the same id at the next start (WhatsApp very likely drops the repeat; it takes two frames of the budget), then run `step resend --user-said-yes` only after his yes. Nothing was armed, sent or killed"
+                );
+            }
+            run.client.consent()?;
+            run.answered("resend-ok", Some(true), Origin::Relayed);
+        } else {
+            run.client.ask("resend-ok", "frames=2")?;
+            run.terminal(
+                "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
+            );
+            run.say("QUESTION: may the tool send ONE fixed text into the 1:1 chat, kill the app at once, and let the app send that same message again, with the same id, at the next start? WhatsApp very likely drops the repeat. It takes two frames of the budget. Answer y or n in your terminal".to_owned());
+            run.waiting("for your y or n (2 minutes): nothing is sent before it");
+            match run.take_answer("resend-ok", run.wait_for(120))? {
+                Some(true) => {}
+                Some(false) => bail!("he said no: nothing was armed, sent or killed"),
+                None => bail!(
+                    "no answer was typed in time: nothing was armed, sent or killed. Run the step again and answer with `wa-run answer` in your own terminal"
+                ),
+            }
         }
         // The supervisor saw his y itself and takes both frames' room; a step cannot claim it.
         run.client.resend_arm(chat).map_err(|e| {
@@ -9973,13 +10980,19 @@ fn ask_whether_the_text_shows_at_all_and_close(run: &mut StepRun<'_>) -> Result<
     let shows = if late.is_some() {
         late
     } else {
-        run.client.ask("resend-shows", "")?;
-        run.terminal(
-            "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
-        );
-        run.phone("look at the 1:1 chat on the PERSONAL phone: does the fixed text of this step show there at all? Then answer y (it shows) or n (it does not) in your terminal");
-        run.waiting("for your y or n (2 minutes)");
-        answer_to(run, "resend-shows", run.wait_for(120))?
+        if run.has_phone() {
+            run.client.ask("resend-shows", "")?;
+            run.ask_user("does the fixed text of the resend step show at all in the 1:1 chat on the PERSONAL phone? (y: it shows, n: it does not)");
+            run.waiting("for the user's word, relayed with `answer --relayed y|n` (2 minutes)");
+        } else {
+            run.client.ask("resend-shows", "")?;
+            run.terminal(
+                "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
+            );
+            run.phone("look at the 1:1 chat on the PERSONAL phone: does the fixed text of this step show there at all? Then answer y (it shows) or n (it does not) in your terminal");
+            run.waiting("for your y or n (2 minutes)");
+        }
+        run.take_answer("resend-shows", run.wait_for(120))?
     };
     match shows {
         Some(yes) => {
@@ -10000,13 +11013,19 @@ fn ask_whether_it_shows_once_and_close(run: &mut StepRun<'_>) -> Result<()> {
     let once = if late.is_some() {
         late
     } else {
-        run.client.ask("resend-once", "")?;
-        run.terminal(
-            "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
-        );
-        run.phone("look at the 1:1 chat on the PERSONAL phone: does the fixed text of this step show exactly ONCE? Then answer y (once) or n (twice) in your terminal");
-        run.waiting("for your y or n (2 minutes)");
-        answer_to(run, "resend-once", run.wait_for(120))?
+        if run.has_phone() {
+            run.client.ask("resend-once", "")?;
+            run.ask_user("does the fixed text of the resend step show exactly ONCE in the 1:1 chat on the PERSONAL phone? (y: once, n: twice)");
+            run.waiting("for the user's word, relayed with `answer --relayed y|n` (2 minutes)");
+        } else {
+            run.client.ask("resend-once", "")?;
+            run.terminal(
+                "in a terminal of your own: target/debug/xtask wa-run answer --profile <name>",
+            );
+            run.phone("look at the 1:1 chat on the PERSONAL phone: does the fixed text of this step show exactly ONCE? Then answer y (once) or n (twice) in your terminal");
+            run.waiting("for your y or n (2 minutes)");
+        }
+        run.take_answer("resend-once", run.wait_for(120))?
     };
     match once {
         Some(true) => {
@@ -10065,6 +11084,9 @@ fn run_step(
         previous: resume_of(&recorded_steps(dir), def.name),
         resume: None,
         facts: None,
+        phone: None,
+        phone_serial: test_phone_serial(a, dir),
+        answers: Vec::new(),
     };
     let result = ready_for_a_step(client, Duration::from_secs(120), timing.poll)
         .and_then(|_| (def.run)(&mut run));
@@ -10101,6 +11123,7 @@ fn run_step(
             "log": {"from": from, "to": to},
             "resume": run.resume,
             "facts": run.facts,
+            "answers": run.answers,
         })
         .to_string(),
     )?;
@@ -10215,6 +11238,8 @@ enum Cue {
     Act(&'static str, &'static str),
     /// He types `y` (true) or `n` (false) for the open question of this name.
     Answer(&'static str, bool),
+    /// The lead relays his word with `answer --relayed y|n` (no terminal): for a question about the personal phone.
+    Relayed(&'static str, bool),
 }
 
 /// The acts the rehearsal's phone plays on cue (T-5): the names of `kourier_fake::PhoneAct`, which
@@ -10439,15 +11464,43 @@ impl Tool {
                 )?;
             }
             Cue::Answer(question, yes) => self.type_the_answer(question, yes)?,
+            Cue::Relayed(question, yes) => self.relay_the_answer(question, yes)?,
         }
         Ok(())
     }
 
-    /// The phone acts outside any step (the walk puts a chat back the way it was): the acts go in
-    /// order and the walk goes on.
-    fn phone(&mut self, cues: &[Cue]) -> Result<()> {
-        for cue in cues {
-            self.send_cue(*cue)?;
+    /// The lead's part at a question about the personal phone (`ASK-USER`): `wa-run answer --relayed y|n`, run as a
+    /// plain command with no terminal. The supervisor must take it (the step asked the question as relayable).
+    fn relay_the_answer(&mut self, question: &str, yes: bool) -> Result<()> {
+        let client = Client::at(&self.socket());
+        let open = poll(Duration::from_secs(60), Duration::from_millis(200), || {
+            Ok((client.info()?["question"].as_str() == Some(question)).then_some(()))
+        })?;
+        if open.is_none() {
+            bail!("the question `{question}` never opened in 60 s: nothing was relayed");
+        }
+        let word = if yes { "y" } else { "n" };
+        println!(
+            "\n$ cargo xtask wa-run answer --relayed {word}   (the lead relays his word, no terminal)"
+        );
+        let out = self
+            .command(&["answer", "--relayed", word], true)
+            .output()
+            .context("run `wa-run answer --relayed`")?;
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        );
+        for line in stdout.lines().chain(stderr.lines()) {
+            println!("  | {line}");
+        }
+        self.transcript.push_str(&stdout);
+        self.transcript.push_str(&stderr);
+        if !out.status.success() || !stdout.contains("relayed by the lead") {
+            bail!(
+                "`wa-run answer --relayed` did not take the word (exit {:?})",
+                out.status.code()
+            );
         }
         Ok(())
     }
@@ -11062,75 +12115,75 @@ fn chats_back_as_they_were(chats: &[Chat]) -> bool {
 /// the fake's phone. Returns how many checks passed.
 fn read_only_steps(tool: &mut Tool) -> Result<usize> {
     let mut passed = 0;
-    // The phone archives the group, pins the 1:1 chat and mutes it: two chats, so the archive does
-    // not hide the pin.
-    tool.step_ok_cued(
-        &["settings", "--wait", "60"],
-        &[&[
-            Cue::Act("group", "archive"),
-            Cue::Act("direct", "pin"),
-            Cue::Act("direct", "mute"),
-        ]],
-    )?;
-    tool.phone(&[
-        Cue::Act("group", "unarchive"),
-        Cue::Act("direct", "unpin"),
-        Cue::Act("direct", "unmute"),
-    ])?;
+    // The step archives the group, pins the 1:1 chat and mutes it ON THE SIMULATED TEST PHONE (two chats, so the
+    // archive does not hide the pin), mirrors each act into the fake that plays WhatsApp, and puts them back.
+    tool.step_ok(&["settings", "--wait", "60"])?;
     tool.wait_for_chats(
         "both chats back, neither pinned nor muted",
         chats_back_as_they_were,
     )?;
     passed += 1;
 
-    // The member and admin counts of the group; he says (y) that the phone shows the same.
-    tool.step_ok_cued(
-        &["groups", "--wait", "60"],
-        &[&[Cue::Answer("group-counts", true)]],
-    )?;
+    // The member and admin counts of the group: the step opens the group's info on the simulated phone and counts.
+    let printed = tool.step_ok(&["groups", "--wait", "60"])?;
+    if !printed.contains("answer group-counts: yes (checked on the TEST phone)") {
+        bail!("`step groups` did not name the check on the TEST phone as the origin of its answer");
+    }
     passed += 1;
 
-    // The call: it rings, then the phone answers it; he says (y) that the test phone rang.
-    tool.step_ok_cued(
-        &["call", "--wait", "60"],
-        &[
-            &[Cue::Act("direct", "call")],
-            &[Cue::Answer("call-rang", true)],
-        ],
-    )?;
+    // Without a test phone nothing changed: the same step, with the profile's serial taken away for one run, asks
+    // him and takes his key in `wa-run answer` on a terminal of its own (the origin is named: typed by the user).
+    let place = ProfileDir {
+        dir: tool.place.clone(),
+        rehearsal: true,
+    };
+    let serial = saved_test_phone(&place).context("the rehearsal's profile has no test phone")?;
+    std::fs::remove_file(place.test_phone_file())?;
+    let typed = tool.step_ok_cued(
+        &["groups", "--wait", "60"],
+        &[&[Cue::Answer("group-counts", true)]],
+    );
+    save_test_phone(&place, &serial)?;
+    if !typed?.contains("answer group-counts: yes (typed by the user)") {
+        bail!(
+            "`step groups` without a test phone did not name the user's key as the origin of its answer"
+        );
+    }
+    passed += 1;
+
+    // The call: the user's personal phone rings the test number (the cue), the step sees the ring on the simulated
+    // TEST phone, answers there, holds, ends, and records the ring as seen.
+    let printed = tool.step_ok_cued(&["call", "--wait", "60"], &[&[Cue::Act("direct", "call")]])?;
+    if !printed.contains("answer call-rang: yes (checked on the TEST phone)") {
+        bail!("`step call` did not name the check on the TEST phone as the origin of the ring");
+    }
     passed += 1;
 
     // The archive cases of the W6a1 re-check. (b) a call, then the archive; (c) a call into the
-    // archived chat; (a) the archive, then a text. The fake's phone brings no chat back by itself,
-    // so the phone's answer is "no" and Kourier must agree (it follows the phone).
+    // archived chat; (a) the archive, then a text. The simulated phone brings no chat back by itself,
+    // so the phone's answer is "no" and Kourier must agree (it follows the phone). Each step puts the chat back.
     tool.step_ok_cued(
         &["call-then-archive", "--wait", "60"],
-        &[
-            &[Cue::Act("direct", "call")],
-            &[Cue::Act("direct", "archive")],
-        ],
+        &[&[Cue::Act("direct", "call")]],
     )?;
     passed += 1;
-    tool.step_ok_cued(
+    tool.wait_for_chats("the 1:1 chat back in the list", chats_back_as_they_were)?;
+    let printed = tool.step_ok_cued(
         &["call-into-archived", "--wait", "60"],
-        &[
-            &[Cue::Act("direct", "call")],
-            &[Cue::Answer("phone-unarchived", false)],
-        ],
+        &[&[Cue::Act("direct", "call")]],
     )?;
+    if !printed.contains("answer phone-unarchived: no (checked on the TEST phone)") {
+        bail!(
+            "`step call-into-archived` did not name the check on the TEST phone as the origin of its answer"
+        );
+    }
     passed += 1;
-    tool.phone(&[Cue::Act("direct", "unarchive")])?;
     tool.wait_for_chats("the 1:1 chat back in the list", chats_back_as_they_were)?;
     tool.step_ok_cued(
         &["archive-message", "--wait", "60"],
-        &[
-            &[Cue::Act("direct", "archive")],
-            &[Cue::Arrive("direct")],
-            &[Cue::Answer("phone-unarchived", false)],
-        ],
+        &[&[Cue::Arrive("direct")]],
     )?;
     passed += 1;
-    tool.phone(&[Cue::Act("direct", "unarchive")])?;
     tool.wait_for_chats("the 1:1 chat back in the list", chats_back_as_they_were)?;
     Ok(passed)
 }
@@ -11164,9 +12217,10 @@ fn send_steps(tool: &mut Tool) -> Result<usize> {
     // The resend in a start of its own: his OK, one send, the kill; the next start sends it again.
     tool.ok(&["stop"])?;
     tool.ok(&["start", "--for-send"])?;
+    // The consent is the lead's flag (D4); the gate's peer message is the only wait.
     let printed = tool.step_ok_cued(
-        &["resend", "--wait", "60"],
-        &[&[Cue::Arrive("direct")], &[Cue::Answer("resend-ok", true)]],
+        &["resend", "--wait", "60", "--user-said-yes"],
+        &[&[Cue::Arrive("direct")]],
     )?;
     if !printed.contains("killed with SIGKILL") {
         bail!("`step resend` passed without killing the app");
@@ -11176,7 +12230,7 @@ fn send_steps(tool: &mut Tool) -> Result<usize> {
     tool.ok(&["start", "--for-send"])?;
     tool.step_ok_cued(
         &["resend", "--wait", "60"],
-        &[&[], &[Cue::Answer("resend-once", true)]],
+        &[&[], &[Cue::Relayed("resend-once", true)]],
     )?;
     passed += 1;
 
@@ -11202,13 +12256,7 @@ fn send_steps(tool: &mut Tool) -> Result<usize> {
     if !printed.contains("--call-builtin") {
         bail!("`start --call-builtin` did not say that it was ordered");
     }
-    let printed = tool.step_ok_cued(
-        &["call", "--wait", "60"],
-        &[
-            &[Cue::Act("direct", "call")],
-            &[Cue::Answer("call-rang", true)],
-        ],
-    )?;
+    let printed = tool.step_ok_cued(&["call", "--wait", "60"], &[&[Cue::Act("direct", "call")]])?;
     if !printed.contains("D9 FOR THE LEAD TO ASK HIM") {
         bail!("`step call` under upstream's handler printed no D9 question for the lead");
     }
@@ -11318,9 +12366,13 @@ fn rehearsal(tool: &mut Tool, base: &Path) -> Result<Rehearsed> {
     passed += 1;
     tool.ok(&["stop"])?;
     passed += 1;
-    let printed = tool.ok(&["start"])?;
+    let printed = tool.ok(&["start", "--test-phone", "fake:rehearsal"])?;
     if printed.contains("tail:       waiting") {
         bail!("a start of a linked profile waited for digits");
+    }
+    let (_, state) = tool.run(&["state"])?;
+    if !state.contains("test phone: fake:rehearsal (reachable)") {
+        bail!("`state` does not name the test phone as reachable");
     }
     passed += 1;
     tool.step_ok(&["history", "--wait", "150"])?;
@@ -15876,6 +16928,9 @@ mod tests {
             previous: None,
             resume: None,
             facts: None,
+            phone: None,
+            phone_serial: None,
+            answers: Vec::new(),
         };
         settled_chat(&run, 1).expect("the chat opens");
         // Two frames for a budget of one.
@@ -20885,7 +21940,9 @@ echo 'WAIT: again'; sleep 1; echo done"#;
                 .map(|cue| match cue {
                     Cue::Arrive(kind) => ("rehearsal_arrive", json!({"kind": kind})),
                     Cue::Act(kind, act) => ("rehearsal_act", json!({"kind": kind, "act": act})),
-                    Cue::Answer(..) => unreachable!("answers have a test of their own"),
+                    Cue::Answer(..) | Cue::Relayed(..) => {
+                        unreachable!("answers have a test of their own")
+                    }
                 })
                 .collect();
             for (request, (cmd, args)) in requests.iter().zip(&expected) {
@@ -21196,6 +22253,9 @@ echo 'WAIT: again'; sleep 1; echo done"#;
                 previous: None,
                 resume: None,
                 facts: None,
+                phone: None,
+                phone_serial: None,
+                answers: Vec::new(),
             };
             assert!(!close_the_link_page(&run));
             // The step's words for it never say closed.
@@ -23061,6 +24121,9 @@ echo 'WAIT: again'; sleep 1; echo done"#;
                 previous: None,
                 resume: None,
                 facts: None,
+                phone: None,
+                phone_serial: None,
+                answers: Vec::new(),
             };
             settled_chat(&run, 1).expect("the chat opens");
             let error = error_of(counted(&mut run, 1, |run| {
@@ -23138,6 +24201,557 @@ echo 'WAIT: again'; sleep 1; echo done"#;
                 FRAME_KINDS,
                 ["message", "reaction", "edit", "revoke", "timer", "other"]
             );
+        }
+    }
+
+    // ---- the automated path: a test phone (D1 to D8) ----
+
+    mod test_phone_path {
+        use super::super::sim::{SimFaults, WaSim};
+        use super::*;
+
+        fn run_with(
+            w: &LinkWorld,
+            name: &str,
+            wait: Option<u64>,
+            phone: WaSim,
+            yes: bool,
+        ) -> StepEnd {
+            INJECTED_PHONE.with(|p| *p.borrow_mut() = Some(Box::new(phone)));
+            // The supervisor knows the run has a test phone (it reads the profile's serial at its start).
+            locked(&w.shared).test_phone = true;
+            let def = STEPS.iter().find(|d| d.name == name).expect("a step");
+            let a = Args {
+                command: "step".to_owned(),
+                step: Some(name.to_owned()),
+                wait,
+                test_phone: Some("test-inject".to_owned()),
+                user_said_yes: yes,
+                ..Args::default()
+            };
+            run_step(&a, &w.dir, &w.client, def, fast_timing()).expect("the step runs")
+        }
+
+        fn relay_when_asked(w: &LinkWorld, name: &str, yes: bool) {
+            for _ in 0..200 {
+                if w.client.info().expect("info")["question"].as_str() == Some(name) {
+                    let said = relayed_answer(&w.dir.socket_file(), yes).expect("relayed");
+                    assert!(said.contains("relayed by the lead"), "{said}");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the question {name} was never asked");
+        }
+
+        fn last_answers(w: &LinkWorld) -> Vec<Value> {
+            recorded_steps(&w.dir)
+                .last()
+                .and_then(|s| s["answers"].as_array().cloned())
+                .unwrap_or_default()
+        }
+
+        #[test]
+        fn the_flags_parse_and_a_serial_is_never_taken_for_the_number() {
+            let a = args(&["start", "--test-phone", "192.0.2.19:5555"]).expect("parses");
+            assert_eq!(a.test_phone.as_deref(), Some("192.0.2.19:5555"));
+            assert!(
+                args(&["step", "resend", "--user-said-yes"])
+                    .expect("p")
+                    .user_said_yes
+            );
+            assert_eq!(
+                args(&["answer", "--relayed", "y"]).expect("p").relayed,
+                Some(true)
+            );
+            assert_eq!(
+                args(&["answer", "--relayed", "n"]).expect("p").relayed,
+                Some(false)
+            );
+            assert!(args(&["answer", "--relayed", "maybe"]).is_err());
+            assert!(args(&["answer", "--relayed"]).is_err());
+            // The number typed as a serial is refused, with or without a port.
+            for bad in [
+                "999000735193",
+                "999000735193:5555",
+                "+999000735193",
+                "dev-9990007",
+            ] {
+                assert!(args(&["start", "--test-phone", bad]).is_err(), "{bad:?}");
+            }
+            assert!(args(&["start", "--test-phone", "emulator-5554"]).is_ok());
+            for bad in ["", "-x", "a b", "a;b", "$(x)"] {
+                assert!(args(&["start", "--test-phone", bad]).is_err(), "{bad:?}");
+            }
+            assert!(args(&["start", "--test-phone"]).is_err());
+            // The digits flags stay refused.
+            for flag in ["--phone", "--phone-number", "--tail", "--number"] {
+                assert!(args(&["start", flag, "5"]).is_err(), "{flag}");
+            }
+        }
+
+        #[test]
+        fn state_names_the_test_phone_and_whether_it_answers_and_the_flag_wins() {
+            let w = settings_world("tp1");
+            let lines = |reach: bool| {
+                state_with(&w.dir, now_ms(), &move |_, _| reach)
+                    .expect("state")
+                    .join("\n")
+            };
+            assert!(!lines(true).contains("test phone:"));
+            save_test_phone(&w.dir, "10.0.0.7:5555").expect("saved");
+            assert!(lines(true).contains("test phone: 10.0.0.7:5555 (reachable)"));
+            assert!(lines(false).contains("test phone: 10.0.0.7:5555 (unreachable)"));
+            let mut a = Args::default();
+            assert_eq!(
+                test_phone_serial(&a, &w.dir).as_deref(),
+                Some("10.0.0.7:5555")
+            );
+            a.test_phone = Some("other".to_owned());
+            assert_eq!(test_phone_serial(&a, &w.dir).as_deref(), Some("other"));
+            // The serial is a file of the tool's own, mode 0600.
+            let mode = std::fs::metadata(w.dir.test_phone_file())
+                .expect("meta")
+                .permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn only_the_supervisors_own_table_makes_a_question_relayable_in_a_run_with_a_test_phone() {
+            let typed = json!({"op": "answer", "name": "q", "yes": true});
+            let relayed = json!({"op": "answer", "name": "q", "yes": true, "origin": "relayed"});
+            let flag = json!({"op": "answer", "name": "q", "yes": true, "origin": "flag"});
+            let tail = json!({"op": "tail", "origin": "relayed"});
+            for relayable in [false, true] {
+                assert!(!relayed_without_a_terminal(&typed, relayable));
+                assert!(!relayed_without_a_terminal(&tail, relayable));
+                assert!(!relayed_without_a_terminal(&flag, relayable));
+            }
+            assert!(!relayed_without_a_terminal(&relayed, false));
+            assert!(relayed_without_a_terminal(&relayed, true));
+            let ask = |shared: &Arc<Mutex<Shared>>, name: &str, relayable_bit: bool| {
+                handle(
+                    shared,
+                    &json!({"op": "ask", "name": name, "detail": "", "relayable": relayable_bit}),
+                )
+            };
+            let relay = |shared: &Arc<Mutex<Shared>>, name: &str| {
+                handle(
+                    shared,
+                    &json!({"op": "answer", "name": name, "yes": true, "origin": "relayed"}),
+                )
+            };
+            // A run WITHOUT a test phone: a relayed word is refused for every question, whatever the client's bit says.
+            let (_scratch, dir) = supervised_profile("tp2");
+            let shared = shared_for(&dir, true);
+            assert!(!locked(&shared).test_phone);
+            for name in ["resend-once", "resend-shows", "call-rang", "group-counts"] {
+                assert_eq!(ask(&shared, name, true)["ok"], json!(true));
+                assert!(!locked(&shared).question_relayable, "{name}");
+                assert_eq!(
+                    relay(&shared, name)["error"]["code"],
+                    json!("notRelayable"),
+                    "{name}"
+                );
+            }
+            // A run WITH a test phone: the fixed table decides, never the client's bit.
+            locked(&shared).test_phone = true;
+            for name in [
+                "call-rang",
+                "group-counts",
+                "phone-unarchived",
+                "phone-archived",
+                "resend-ok",
+            ] {
+                assert_eq!(ask(&shared, name, true)["ok"], json!(true));
+                assert!(
+                    !locked(&shared).question_relayable,
+                    "{name}: a client-marked question"
+                );
+                assert_eq!(
+                    relay(&shared, name)["error"]["code"],
+                    json!("notRelayable"),
+                    "{name}"
+                );
+                assert_eq!(
+                    locked(&shared).question.as_ref().map(|q| q.0.as_str()),
+                    Some(name)
+                );
+            }
+            // Even asked with no bit at all, the table's questions are relayable and name their origin.
+            assert_eq!(ask(&shared, "resend-once", false)["ok"], json!(true));
+            assert!(locked(&shared).question_relayable);
+            assert_eq!(relay(&shared, "resend-once")["ok"], json!(true));
+            let seen = handle(&shared, &json!({"op": "answer_of", "name": "resend-once"}));
+            assert_eq!(seen["origin"], json!("relayed"));
+            // The flag origin is gone; an unknown origin is refused; a typed answer says `typed`.
+            let _ = ask(&shared, "resend-shows", false);
+            for origin in ["flag", "magic"] {
+                let bad = handle(
+                    &shared,
+                    &json!({"op": "answer", "name": "resend-shows", "yes": true, "origin": origin}),
+                );
+                assert_eq!(bad["error"]["code"], json!("badRequest"), "{origin}");
+            }
+            let typed = handle(
+                &shared,
+                &json!({"op": "answer", "name": "resend-shows", "yes": true}),
+            );
+            assert_eq!(typed["ok"], json!(true));
+            let seen = handle(&shared, &json!({"op": "answer_of", "name": "resend-shows"}));
+            assert_eq!(seen["origin"], json!("typed"));
+        }
+
+        #[test]
+        fn a_yes_to_resend_ok_cannot_arm_the_resend_with_a_test_phone_only_the_consent_op_does() {
+            let arm = |shared: &Arc<Mutex<Shared>>| {
+                handle(shared, &json!({"op": "resend_arm", "conversation": 1}))
+            };
+            let (_scratch, dir) = supervised_profile("tp2b");
+            let (_app, shared) = sending_app(&dir, json!([peer_row(5)]));
+            {
+                let mut s = locked(&shared);
+                s.test_phone = true;
+                s.state.set("peer_conv", json!(1));
+                s.peer_first.insert(1);
+            }
+            // A typed or a relayed yes to `resend-ok`: nothing is armed.
+            ask_and_answer(&shared, "resend-ok", true);
+            let refused = arm(&shared);
+            assert_eq!(refused["error"]["code"], json!("not-allowed"), "{refused}");
+            let asked = handle(
+                &shared,
+                &json!({"op": "ask", "name": "resend-ok", "detail": "", "relayable": true}),
+            );
+            assert_eq!(asked["ok"], json!(true));
+            let relayed = handle(
+                &shared,
+                &json!({"op": "answer", "name": "resend-ok", "yes": true, "origin": "relayed"}),
+            );
+            assert_eq!(relayed["error"]["code"], json!("notRelayable"));
+            assert_eq!(arm(&shared)["error"]["code"], json!("not-allowed"));
+            // The consent op (the step's own flag) arms it, once.
+            let bad = handle(&shared, &json!({"op": "consent", "name": "resend-once"}));
+            assert_eq!(bad["error"]["code"], json!("badRequest"));
+            assert_eq!(
+                handle(&shared, &json!({"op": "consent", "name": "resend-ok"}))["ok"],
+                json!(true)
+            );
+            assert_eq!(arm(&shared)["ok"], json!(true), "the consent arms it");
+            assert!(
+                !locked(&shared).consent_resend,
+                "one consent arms one resend"
+            );
+            // Without a test phone the consent op is refused.
+            let (_scratch2, dir2) = supervised_profile("tp2c");
+            let shared2 = shared_for(&dir2, true);
+            let refused = handle(&shared2, &json!({"op": "consent", "name": "resend-ok"}));
+            assert_eq!(refused["error"]["code"], json!("refused"), "{refused}");
+        }
+
+        fn a_run_with_a_sim<'a>(w: &'a LinkWorld, args: &'a Args, sim: WaSim) -> StepRun<'a> {
+            StepRun {
+                client: &w.client,
+                dir: &w.dir,
+                args,
+                timing: fast_timing(),
+                notes: Vec::new(),
+                said: Vec::new(),
+                previous: None,
+                resume: None,
+                facts: None,
+                phone: Some(Box::new(sim)),
+                phone_serial: Some("test-inject".to_owned()),
+                answers: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn the_step_answers_only_the_chats_call_and_says_when_a_call_may_stay_open() {
+            let ring = || WaSim::standard().ring_at(Duration::ZERO);
+            let args = Args::default();
+            // The 1:1 chat calls: answered, held, ended, the Calls tab shows a new answered row, no marker left.
+            let w = settings_world("tp15");
+            let mut run = a_run_with_a_sim(&w, &args, ring());
+            let prep = prepare_call(&mut run, 1).expect("prepared");
+            assert!(call_on_the_test_phone(&mut run, prep).expect("the call"));
+            assert!(!w.dir.call_open_file().exists());
+            // Someone else calls: never answered, the step says so and records nothing as seen.
+            let w = settings_world("tp16");
+            let faults = SimFaults {
+                stranger_calls: true,
+                ..Default::default()
+            };
+            let mut run = a_run_with_a_sim(&w, &args, ring().faults(faults));
+            let prep = prepare_call(&mut run, 1).expect("prepared");
+            let e = call_on_the_test_phone(&mut run, prep)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("is not from the 1:1 chat") && e.contains("NOT answered"),
+                "{e}"
+            );
+            assert!(run.notes.join("\n").contains("a call from someone else"));
+            assert!(
+                run.notes
+                    .join("\n")
+                    .contains("answer call-rang: none (not looked at)")
+            );
+            assert!(!w.dir.call_open_file().exists());
+            // The call cannot be ended: ASK-USER to hang up, the step fails, `state` says a call may be open.
+            let w = settings_world("tp17");
+            let faults = SimFaults {
+                end_does_nothing: true,
+                ..Default::default()
+            };
+            let mut run = a_run_with_a_sim(&w, &args, ring().faults(faults));
+            let prep = prepare_call(&mut run, 1).expect("prepared");
+            let e = call_on_the_test_phone(&mut run, prep)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("may still be open"), "{e}");
+            assert!(
+                run.said
+                    .iter()
+                    .any(|l| l == "ASK-USER: Hang up the call on the TEST phone now"),
+                "{:?}",
+                run.said
+            );
+            assert!(w.dir.call_open_file().exists());
+            let state = state_with(&w.dir, now_ms(), &|_, _| true)
+                .expect("state")
+                .join("\n");
+            assert!(
+                state.contains("a call answered on the TEST phone may still be open"),
+                "{state}"
+            );
+        }
+
+        #[test]
+        fn a_failed_archive_leaves_no_false_note_of_an_undo() {
+            let args = Args::default();
+            let w = settings_world("tp18");
+            let faults = SimFaults {
+                phantom_acts: true,
+                ..Default::default()
+            };
+            let mut run = a_run_with_a_sim(&w, &args, WaSim::standard().faults(faults));
+            let key = phone_key(&mut run, 1, false).expect("key");
+            assert!(archive_on_the_phone(&mut run, key).is_err());
+            // Nothing had changed, so there was nothing to undo and no note claims one.
+            assert!(
+                !run.notes.join("\n").contains("could NOT"),
+                "{:?}",
+                run.notes
+            );
+        }
+
+        #[test]
+        fn groups_is_answered_by_a_check_on_the_test_phone_and_asks_nobody() {
+            let w = settings_world("tp3");
+            w.client.remember("group_conv", 2).expect("remembered");
+            facts_file(&w, 2, &group_facts(2, 3, 2));
+            let end = run_with(&w, "groups", Some(10), WaSim::standard(), false);
+            assert_eq!(end.status, 0, "{end:?}");
+            let notes = end.notes.join("\n");
+            assert!(
+                notes.contains("answer group-counts: yes (checked on the TEST phone)"),
+                "{notes}"
+            );
+            let events = std::fs::read_to_string(w.dir.events_log()).unwrap_or_default();
+            assert!(!events.contains("question_asked"), "{events}");
+            assert_eq!(w.client.info().expect("info")["question"], Value::Null);
+            let answers = last_answers(&w);
+            assert_eq!(answers[0]["origin"], json!("checked on the TEST phone"));
+            assert_eq!(answers[0]["answer"], json!("yes"));
+            assert!(
+                !end.said.iter().any(|l| l.starts_with("TERMINAL:")),
+                "{end:?}"
+            );
+        }
+
+        #[test]
+        fn groups_with_other_counts_on_the_phone_is_a_finding_checked_not_typed() {
+            let w = settings_world("tp4");
+            w.client.remember("group_conv", 2).expect("remembered");
+            facts_file(&w, 2, &group_facts(2, 4, 2));
+            let end = run_with(&w, "groups", Some(10), WaSim::standard(), false);
+            assert_eq!(end.status, 1, "{end:?}");
+            assert!(end.reason.contains("does NOT show"), "{}", end.reason);
+            assert!(
+                end.notes
+                    .join("\n")
+                    .contains("answer group-counts: no (checked on the TEST phone)")
+            );
+        }
+
+        #[test]
+        fn groups_fails_closed_on_an_unreadable_screen_a_short_list_and_the_block_screen() {
+            for (name, faults, needle) in [
+                (
+                    "tp5",
+                    SimFaults {
+                        unreadable: true,
+                        ..Default::default()
+                    },
+                    "could not be answered by a check",
+                ),
+                (
+                    "tp6",
+                    SimFaults {
+                        short_member_list: true,
+                        ..Default::default()
+                    },
+                    "could not be answered by a check",
+                ),
+                (
+                    "tp7",
+                    SimFaults {
+                        blocked: true,
+                        ..Default::default()
+                    },
+                    "registration block screen",
+                ),
+            ] {
+                let w = settings_world(name);
+                w.client.remember("group_conv", 2).expect("remembered");
+                facts_file(&w, 2, &group_facts(2, 3, 2));
+                let end = run_with(
+                    &w,
+                    "groups",
+                    Some(2),
+                    WaSim::standard().faults(faults),
+                    false,
+                );
+                assert_eq!(end.status, 1, "{name}: {end:?}");
+                assert!(end.reason.contains(needle), "{name}: {}", end.reason);
+                let all = format!("{} {}", end.reason, end.notes.join(" "));
+                assert!(
+                    !all.contains("Sim Chat") && !all.contains("Sim Sender"),
+                    "{all}"
+                );
+                assert!(end.notes.join("\n").contains("(not looked at)"), "{name}");
+                assert_eq!(w.client.info().expect("info")["question"], Value::Null);
+            }
+        }
+
+        #[test]
+        fn the_resend_with_a_test_phone_stops_before_the_act_without_the_flag() {
+            let w = sending_world("tp8");
+            let end = std::thread::scope(|scope| {
+                scope.spawn(|| the_peer_writes_after_the_mark(&w, 1, 9));
+                run_with(&w, "resend", Some(10), WaSim::standard(), false)
+            });
+            assert_eq!(end.status, 1, "{end:?}");
+            assert!(end.reason.contains("--user-said-yes"), "{}", end.reason);
+            assert!(
+                end.reason.contains("Nothing was armed, sent or killed"),
+                "{}",
+                end.reason
+            );
+            let info = w.client.info().expect("info");
+            assert_eq!(info["resend"], Value::Null, "{info}");
+            assert_eq!(info["frames_this_start"], json!(0), "{info}");
+            assert!(frames_seen(&w.dir).is_empty());
+            assert!(!locked(&w.shared).kill_now);
+        }
+
+        #[test]
+        fn the_resend_with_the_flag_arms_sends_one_text_and_names_the_leads_word() {
+            let w = sending_world("tp9");
+            let end = std::thread::scope(|scope| {
+                scope.spawn(|| the_peer_writes_after_the_mark(&w, 1, 9));
+                run_with(&w, "resend", Some(10), WaSim::standard(), true)
+            });
+            assert_eq!(end.status, 0, "{end:?}");
+            assert!(locked(&w.shared).kill_now, "the app was not killed");
+            assert!(
+                end.notes
+                    .join("\n")
+                    .contains("answer resend-ok: yes (relayed by the lead)")
+            );
+            assert!(
+                !end.said
+                    .iter()
+                    .any(|l| l.starts_with("TERMINAL:") || l.starts_with("QUESTION:"))
+            );
+            let told = frames_seen(&w.dir);
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(w.client.info().expect("info")["resend"], json!("sent"));
+        }
+
+        #[test]
+        fn the_resends_look_at_the_personal_phone_is_one_ask_user_line_and_a_relayed_word() {
+            let sent_again = |w: &LinkWorld| {
+                later(500, || {
+                    the_app_resends(w, true);
+                    rows_file(w, &[with(own_row(7), "state", json!("sent")), peer_row(5)]);
+                    put(w, "frames", "1");
+                });
+            };
+            for (name, yes) in [("tp10", true), ("tp11", false)] {
+                let w = after_the_kill(name, "sending");
+                let end = std::thread::scope(|scope| {
+                    scope.spawn(|| sent_again(&w));
+                    scope.spawn(|| relay_when_asked(&w, "resend-once", yes));
+                    run_with(&w, "resend", Some(10), WaSim::standard(), false)
+                });
+                assert_eq!(end.status, i32::from(!yes), "{end:?}");
+                let asks: Vec<&String> = end
+                    .said
+                    .iter()
+                    .filter(|l| l.starts_with("ASK-USER: "))
+                    .collect();
+                assert_eq!(asks.len(), 1, "{end:?}");
+                assert!(
+                    !end.said.iter().any(|l| l.starts_with("TERMINAL:")),
+                    "{end:?}"
+                );
+                assert!(end.notes.join("\n").contains(&format!(
+                    "answer resend-once: {} (relayed by the lead)",
+                    if yes { "yes" } else { "no" }
+                )));
+                assert_eq!(w.client.info().expect("info")["resend"], Value::Null);
+            }
+        }
+
+        #[test]
+        fn the_peers_acts_are_do_user_lines_with_a_test_phone_and_phone_lines_without() {
+            let w = sending_world("tp12");
+            let with_phone = run_with(&w, "peer-react", Some(1), WaSim::standard(), false);
+            assert!(
+                with_phone.said.iter().any(|l| l.starts_with("DO-USER: ")),
+                "{with_phone:?}"
+            );
+            assert!(!with_phone.said.iter().any(|l| l.starts_with("PHONE: ")));
+            let w = sending_world("tp13");
+            let without = run_named(&w, "peer-react", Some(1), None);
+            assert!(
+                without.said.iter().any(|l| l.starts_with("PHONE: ")),
+                "{without:?}"
+            );
+            assert!(!without.said.iter().any(|l| l.starts_with("DO-USER: ")));
+        }
+
+        #[test]
+        fn a_typed_answer_is_recorded_as_typed_by_the_user() {
+            let w = settings_world("tp14");
+            w.client.remember("group_conv", 2).expect("remembered");
+            facts_file(&w, 2, &group_facts(2, 3, 1));
+            let end = std::thread::scope(|scope| {
+                scope.spawn(|| answer_when_asked(&w, "group-counts", true));
+                run_named(&w, "groups", Some(10), None)
+            });
+            assert_eq!(end.status, 0, "{end:?}");
+            assert!(
+                end.notes
+                    .join("\n")
+                    .contains("answer group-counts: yes (typed by the user)")
+            );
+            assert_eq!(last_answers(&w)[0]["origin"], json!("typed by the user"));
         }
     }
 }

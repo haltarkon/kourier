@@ -32,6 +32,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::RngCore as _;
 
 use super::crypto::{CspNonces, KeyPair, csp_nonce, hsalsa_shared, open, seal, server_vouch};
+use super::leader::{LeaderLog, Recorded};
 use super::{Dir, Identities, Trace, Violations, lock};
 
 /// The most bytes of one CSP frame (`TP/csp.struct.yml` "Size Limitations": "up to 8192 bytes
@@ -157,6 +158,15 @@ pub struct CspKnobs {
     /// memory of ids). [U: real server] whether the real chat server acks a byte-identical repeat or
     /// drops it silently; no client on disk proves it (Desktop's repeat has a fresh nonce).
     pub drop_repeats: bool,
+    /// TH6 C1 (THE H1 GUARD's test, an evil server): the chat server sends what it queues for the receiver to its
+    /// LOGGED-IN connection whether or not that connection unblocked: a new message at once (`Mediator::csp_incoming`),
+    /// and what waits at every login of the receiver. Off (the default): only an unblocked connection gets messages
+    /// (C9, C10). The client must not ack such a message (`TP/csp.struct.yml:688-689`: a device that is not the leader
+    /// closes the connection).
+    pub deliver_unasked: bool,
+    /// TH6 L4b (critic T-M2's fallback): the chat server never sends `queue-send-complete` after an unblock. Off (the
+    /// default): it sends it once per connection, right after what waited. [U: real server] whether it always comes.
+    pub withhold_queue_send_complete: bool,
 }
 
 /// One rule of [`CspKnobs::close_on_box`]: the receiver (never printed) and the D2M close code.
@@ -325,6 +335,8 @@ pub struct Cx<'a> {
     pub leader_mode: bool,
     pub is_leader: bool,
     pub out: Vec<CspOut>,
+    /// TH6 L2a: the record of the leader's work (the deliveries and the `message-ack`s, in order).
+    pub log: &'a mut LeaderLog,
 }
 
 impl Cx<'_> {
@@ -549,6 +561,31 @@ impl ChatServer {
         self.queues.get(receiver).map_or(0, Vec::len)
     }
 
+    /// TH6 L2b (`Phone::lead_csp_queue`): what `receiver`'s queue holds, in order; the "no server ack" ones leave the
+    /// queue as they would once sent.
+    pub fn take_for_phone(&mut self, receiver: &[u8; 8]) -> Vec<Queued> {
+        let queued = self.queues.get(receiver).cloned().unwrap_or_default();
+        if let Some(queue) = self.queues.get_mut(receiver) {
+            queue.retain(|m| m.flags & flag::NO_SERVER_ACK == 0);
+        }
+        queued
+    }
+
+    /// TH6 L2b: the phone's ack of (`sender`, `message_id`) for `receiver`: the entry leaves the queue. Whether it was
+    /// there.
+    pub fn ack_for_phone(&mut self, receiver: &[u8; 8], sender: &[u8; 8], message_id: u64) -> bool {
+        let Some(queue) = self.queues.get_mut(receiver) else {
+            return false;
+        };
+        let at = queue
+            .iter()
+            .position(|m| m.sender == *sender && m.message_id == message_id);
+        if let Some(at) = at {
+            queue.remove(at);
+        }
+        at.is_some()
+    }
+
     /// Queues an incoming message for `receiver`. `deliverable` says whether a connection of the
     /// receiver is unblocked now (the mediator then calls [`Self::deliver`] for it). A message with
     /// "no server queuing" is dropped when none is (`false` returned).
@@ -618,11 +655,17 @@ impl ChatServer {
         self.send(cc, cx, kind::ALERT, b"an alert of the test");
     }
 
+    /// A script call (TH6 C1): a container of type `t` with `data`, as the next frame: a kind the client does not
+    /// handle (`device-cookie-change-indication`, a type the spec does not name).
+    pub fn raw(&self, cc: &mut CspConn, cx: &mut Cx<'_>, t: u8, data: &[u8]) {
+        self.send(cc, cx, t, data);
+    }
+
     /// Sends what the identity's queue holds and this connection has not sent yet, in order, if
     /// the connection is unblocked (C9, C10). What expects no ack ("no server ack") leaves the
     /// queue once it went out.
     pub fn deliver(&mut self, cc: &mut CspConn, cx: &mut Cx<'_>) {
-        if !cc.unblocked() {
+        if !cc.unblocked() && !(cx.knobs.deliver_unasked && cc.logged_in()) {
             return;
         }
         let Some(identity) = cc.identity else {
@@ -640,6 +683,11 @@ impl ChatServer {
             .unwrap_or_default();
         for m in &pending {
             self.send(cc, cx, kind::INCOMING_MESSAGE, &m.payload);
+            cx.log.events.push(Recorded::Delivered {
+                conn: cx.conn,
+                sender: m.sender,
+                message_id: m.message_id,
+            });
             cc.sent.insert((m.sender, m.message_id));
             if m.flags & flag::NO_SERVER_ACK == 0 {
                 cc.awaiting_ack.insert((m.sender, m.message_id));
@@ -879,6 +927,10 @@ impl ChatServer {
         if changed {
             self.send(cc, cx, kind::DEVICE_COOKIE_CHANGE_INDICATION, &[]);
         }
+        // TH6 C1: the evil server pushes what waits without an unblock.
+        if cx.knobs.deliver_unasked {
+            self.deliver(cc, cx);
+        }
     }
 
     /// C6: one frame of the payload phase (strict CSN), then its payload.
@@ -953,7 +1005,14 @@ impl ChatServer {
                 // [U: real server] what the server does with an ack for a message it did not send
                 // on this connection, one that expected none (0x04: "No acknowledgement should be
                 // sent", `:617-620`) or a second ack: recorded here.
-                if cc.awaiting_ack.remove(&(sender, id)) {
+                let known = cc.awaiting_ack.remove(&(sender, id));
+                cx.log.events.push(Recorded::CspAck {
+                    conn: cx.conn,
+                    sender,
+                    message_id: id,
+                    known,
+                });
+                if known {
                     let queue = self.queues.entry(identity).or_default();
                     if let Some(at) = queue
                         .iter()
@@ -977,7 +1036,7 @@ impl ChatServer {
                 }
                 cc.unblocked = true;
                 self.deliver(cc, cx);
-                if !cc.queue_send_complete {
+                if !cc.queue_send_complete && !cx.knobs.withhold_queue_send_complete {
                     cc.queue_send_complete = true;
                     self.send(cc, cx, kind::QUEUE_SEND_COMPLETE, &[]);
                 }

@@ -52,8 +52,8 @@ pub enum ConfigError {
     /// What a first link must find is not usable (log-safe: the value is not repeated).
     #[error("{0}")]
     Expectation(String),
-    /// The rehearsal switch (`KOURIER_DEV_REHEARSAL`) has a value other than `whatsapp` or
-    /// `telegram`, or is set in a debug build that has no rehearsal network (log-safe: the value is
+    /// The rehearsal switch (`KOURIER_DEV_REHEARSAL`) has a value other than `whatsapp`, `telegram`
+    /// or `threema` (the ones this build holds), or is set in a debug build that has no rehearsal network (log-safe: the value is
     /// not repeated). Only a debug build reads it.
     #[error("{0}")]
     Rehearsal(String),

@@ -14,9 +14,10 @@
 //!
 //! THE FRAMING: one frame = `u32` little-endian length of what follows, a tag byte, the body. A
 //! WebSocket message is one frame. Child -> parent: `CONNECT id kind url`, `SEND id bytes`,
-//! `CLOSE id code reason`, `HTTPS id`. Parent -> child: `SETUP` (the servers' parameters and the
-//! fake's clock, first), `CONNECTED id`, `FAILED id error`, `BINARY id bytes`, `CLOSED id code reason`
-//! (the stream of that connection ends after it), `HTTPS_FAILED id error`.
+//! `CLOSE id code reason`, `HTTPS id request` (TH6 L2b: the whole request, [`encode_request`]). Parent -> child:
+//! `SETUP` (the servers' parameters and the fake's clock, first), `CONNECTED id`, `FAILED id error`, `BINARY id
+//! bytes`, `CLOSED id code reason` (the stream of that connection ends after it), `HTTPS_FAILED id error` and
+//! `HTTPS_OK id response` (TH6 L2b: the fake's HTTPS client answered, [`encode_response`]; the directory).
 //!
 //! THE PARENT'S LOOP ([`serve`]): a thread of its own with a current-thread runtime (I/O only, no
 //! timer) reads the child's frames and drives the world's in-process connector ([`Net::open`]),
@@ -71,6 +72,7 @@ mod tag {
     pub const BINARY: u8 = 13;
     pub const CLOSED: u8 = 14;
     pub const HTTPS_FAILED: u8 = 15;
+    pub const HTTPS_OK: u8 = 16;
 }
 
 /// The operation names a [`NetError`] of the fake carries (they are `&'static str`).
@@ -155,6 +157,88 @@ fn take_bytes<'a>(body: &mut &'a [u8]) -> &'a [u8] {
     let (bytes, rest) = body[4..].split_at(len);
     *body = rest;
     bytes
+}
+
+/// TH6 L2b: an HTTPS request as the child writes it: method (0 GET, 1 POST, 2 PUT), the URL, the headers (count,
+/// then name and value each), the body, `max_body` (a flag byte, then a `u64`).
+fn encode_request(request: &HttpsRequest) -> Vec<u8> {
+    let mut out = vec![match request.method {
+        HttpsMethod::Get => 0,
+        HttpsMethod::Post => 1,
+        HttpsMethod::Put => 2,
+    }];
+    put_bytes(&mut out, request.url.as_bytes());
+    put_headers(&mut out, &request.headers);
+    put_bytes(&mut out, &request.body);
+    match request.max_body {
+        None => out.push(0),
+        Some(most) => {
+            out.push(1);
+            out.extend_from_slice(&u64::try_from(most).expect("fits u64").to_le_bytes());
+        }
+    }
+    out
+}
+
+fn decode_request(mut body: &[u8]) -> HttpsRequest {
+    let method = match body[0] {
+        0 => HttpsMethod::Get,
+        1 => HttpsMethod::Post,
+        _ => HttpsMethod::Put,
+    };
+    body = &body[1..];
+    let url = String::from_utf8_lossy(take_bytes(&mut body)).into_owned();
+    let headers = take_headers(&mut body);
+    let request_body = take_bytes(&mut body).to_vec();
+    let max_body = (body[0] == 1).then(|| {
+        usize::try_from(u64::from_le_bytes(body[1..9].try_into().expect("a u64"))).expect("fits")
+    });
+    HttpsRequest {
+        method,
+        url,
+        headers,
+        body: request_body,
+        max_body,
+    }
+}
+
+/// TH6 L2b: an HTTPS response as the parent writes it: the status, the headers, the body.
+fn encode_response(response: &HttpsResponse) -> Vec<u8> {
+    let mut out = response.status.to_le_bytes().to_vec();
+    put_headers(&mut out, &response.headers);
+    put_bytes(&mut out, &response.body);
+    out
+}
+
+fn decode_response(mut body: &[u8]) -> HttpsResponse {
+    let status = u16::from_le_bytes(body[..2].try_into().expect("a status"));
+    body = &body[2..];
+    let headers = take_headers(&mut body);
+    HttpsResponse {
+        status,
+        headers,
+        body: take_bytes(&mut body).to_vec(),
+    }
+}
+
+fn put_headers(out: &mut Vec<u8>, headers: &[(String, String)]) {
+    out.extend_from_slice(&u32::try_from(headers.len()).expect("fits").to_le_bytes());
+    for (name, value) in headers {
+        put_bytes(out, name.as_bytes());
+        put_bytes(out, value.as_bytes());
+    }
+}
+
+fn take_headers(body: &mut &[u8]) -> Vec<(String, String)> {
+    let count = u32::from_le_bytes(body[..4].try_into().expect("a count"));
+    *body = &body[4..];
+    (0..count)
+        .map(|_| {
+            let name = String::from_utf8_lossy(take_bytes(body)).into_owned();
+            let value = String::from_utf8_lossy(take_bytes(body)).into_owned();
+            (name, value)
+        })
+        .collect()
 }
 
 /// What the parent sends first: the servers' parameters the child's parts carry, and the fake's
@@ -476,27 +560,23 @@ async fn parent_loop(net: Net, reads: OwnedFd, writes: OwnedFd, first: Vec<u8>) 
                 }
             }
             tag::HTTPS => {
-                let error = net
-                    .https()
-                    .execute(HttpsRequest {
-                        method: HttpsMethod::Get,
-                        url: String::new(),
-                        headers: Vec::new(),
-                        body: Vec::new(),
-                        max_body: None,
-                    })
-                    .await
-                    .err()
-                    .unwrap_or(NetError::Refused("https"));
-                let _ = out
-                    .send((
-                        frame(
+                // TH6 L2b: the child's whole request to the world's HTTPS client (the directory, or a refusal), in a
+                // task: a held directory request (`Net::hold_directory`) must not hold the other frames.
+                let request = decode_request(&body[4..]);
+                let (net, out) = (net.clone(), out.clone());
+                tokio::spawn(async move {
+                    let answer = match net.https().execute(request).await {
+                        Ok(response) => frame(
+                            tag::HTTPS_OK,
+                            &[&id.to_le_bytes(), &encode_response(&response)],
+                        ),
+                        Err(error) => frame(
                             tag::HTTPS_FAILED,
                             &[&id.to_le_bytes(), &encode_error(&error)],
                         ),
-                        None,
-                    ))
-                    .await;
+                    };
+                    let _ = out.send((answer, None)).await;
+                });
             }
             _ => panic!("a frame the child never writes"),
         }
@@ -529,7 +609,7 @@ struct Shared {
     out: Mutex<Option<async_channel::Sender<Queued>>>,
     next: AtomicU32,
     connects: Mutex<BTreeMap<u32, oneshot::Sender<Result<(), NetError>>>>,
-    https: Mutex<BTreeMap<u32, oneshot::Sender<NetError>>>,
+    https: Mutex<BTreeMap<u32, oneshot::Sender<Result<HttpsResponse, NetError>>>>,
     streams: Mutex<BTreeMap<u32, async_channel::Sender<WsEvent>>>,
     open: Mutex<BTreeSet<u32>>,
 }
@@ -617,7 +697,12 @@ pub async fn open_child() -> ChildPipe {
                 }
                 tag::HTTPS_FAILED => {
                     if let Some(tx) = lock(&shared.https).remove(&id) {
-                        let _ = tx.send(decode_error(&body[4..]));
+                        let _ = tx.send(Err(decode_error(&body[4..])));
+                    }
+                }
+                tag::HTTPS_OK => {
+                    if let Some(tx) = lock(&shared.https).remove(&id) {
+                        let _ = tx.send(Ok(decode_response(&body[4..])));
                     }
                 }
                 _ => panic!("a frame the parent never writes"),
@@ -637,6 +722,17 @@ impl ChildPipe {
     /// The parent's setup (the fake's clock at the spawn, the servers' parameters).
     pub fn setup(&self) -> &Setup {
         &self.setup
+    }
+
+    /// TH6 L2b: the child's HTTPS client over the pipes (what the parts' maker hands the actor), for a child that calls
+    /// the parent's directory itself.
+    pub fn https(&self) -> PipedHttps {
+        PipedHttps(self.inner.clone())
+    }
+
+    /// TH6 L2b: ends the child's side: the writer stops, so the parent reads its EOF (as at the child's exit).
+    pub fn finish(self) {
+        lock(&self.inner.out).take();
     }
 }
 
@@ -730,19 +826,27 @@ impl WsSender for PipedSender {
     }
 }
 
-/// The child's `HttpsClient`: every request goes to the parent's fake, which refuses and records it.
+/// The child's `HttpsClient`: every request goes whole to the parent's fake (the directory answers, anything else is
+/// refused and recorded there), and its answer comes back.
 pub struct PipedHttps(Arc<Shared>);
 
 #[async_trait]
 impl HttpsClient for PipedHttps {
-    async fn execute(&self, _request: HttpsRequest) -> Result<HttpsResponse, NetError> {
+    async fn execute(&self, request: HttpsRequest) -> Result<HttpsResponse, NetError> {
         let shared = &self.0;
         let id = shared.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         lock(&shared.https).insert(id, tx);
-        shared
-            .write(frame(tag::HTTPS, &[&id.to_le_bytes()]))
-            .await?;
-        Err(rx.await.unwrap_or(NetError::Failed("https")))
+        let sent = shared
+            .write(frame(
+                tag::HTTPS,
+                &[&id.to_le_bytes(), &encode_request(&request)],
+            ))
+            .await;
+        if let Err(error) = sent {
+            lock(&shared.https).remove(&id);
+            return Err(error);
+        }
+        rx.await.unwrap_or(Err(NetError::Failed("https")))
     }
 }

@@ -106,8 +106,21 @@ fn nothing_mapped(_lid: &str) -> Option<String> {
     None
 }
 
+/// The store of a device that filed no call line.
+fn nothing_filed(_call_id: &str, _person: &UserId) -> Option<ConvKey> {
+    None
+}
+
 fn read_of(node: &Node, ids: &OwnIds) -> Read {
-    read(owned(node).get(), NOW, ids, &nothing_mapped)
+    read(
+        owned(node).get(),
+        NOW,
+        ids,
+        Lookups {
+            number_of: &nothing_mapped,
+            filed_chat: &nothing_filed,
+        },
+    )
 }
 
 /// The one line `node` stands for, which must pass the contract's own check.
@@ -117,7 +130,19 @@ fn line_of(node: &Node, ids: &OwnIds) -> Option<IncomingMessage> {
 
 /// [`line_of`] on a device whose store maps LIDs as `number_of` says.
 fn line_with(node: &Node, ids: &OwnIds, number_of: NumberOf<'_>) -> Option<IncomingMessage> {
-    match read(owned(node).get(), NOW, ids, number_of) {
+    line_in(
+        node,
+        ids,
+        Lookups {
+            number_of,
+            filed_chat: &nothing_filed,
+        },
+    )
+}
+
+/// [`line_of`] on a device whose store answers as `store` says.
+fn line_in(node: &Node, ids: &OwnIds, store: Lookups<'_>) -> Option<IncomingMessage> {
+    match read(owned(node).get(), NOW, ids, store) {
         Read::Line(event) => {
             let (envelope, _waiter) = Envelope::durable(vec![(*event).clone()]);
             envelope.validate().expect("the row is a valid envelope");
@@ -478,6 +503,189 @@ fn a_call_answered_or_declined_elsewhere_reports_nothing() {
     assert!(line_of(&node, &own()).is_some());
 }
 
+/// An `<accept>` of the call `CALL` by `creator`.
+fn accept(creator: &str) -> Node {
+    NodeBuilder::new("accept")
+        .attr("call-id", CALL)
+        .attr("call-creator", creator)
+        .children([NodeBuilder::new("audio")
+            .attr("enc", "opus")
+            .attr("rate", "16000")
+            .build()])
+        .build()
+}
+
+/// A store that filed the line of `CALL` in the peer's number chat: the chat for the peer in either form, nothing for
+/// anybody else or another call. It counts how often it is asked.
+fn peer_filed(asked: &AtomicUsize) -> impl Fn(&str, &UserId) -> Option<ConvKey> + '_ {
+    move |call_id: &str, person: &UserId| {
+        asked.fetch_add(1, Ordering::SeqCst);
+        let peer = [user("pn", "15550100101"), user("lid", "99900100101")];
+        (call_id == CALL && peer.contains(person))
+            .then(|| ConvKey::Direct(user("pn", "15550100101")))
+    }
+}
+
+/// THE OWN ANSWER (R1's finding: a call answered on the test phone ended `missed`): an accept that one of OUR devices
+/// sent (every person among `from` and `participant` is one of our ids, the server's routing) answers the 1:1 line
+/// Kourier filed for the call, from that device; the caller's later terminate cannot take it back, and a call never
+/// answered by our own word still ends missed at its deadline (D2 unchanged). Mutant: the accept's arm of `line` removed
+/// (an accept then goes the creator's way and says nothing).
+#[test]
+fn an_accept_of_our_own_phone_answers_the_filed_line_on_another_device() {
+    let asked = AtomicUsize::new(0);
+    let filed = peer_filed(&asked);
+    let store = Lookups {
+        number_of: &nothing_mapped,
+        filed_chat: &filed,
+    };
+    let peer = user("pn", "15550100101");
+    let mine = format!("{OWN_PN}@s.whatsapp.net");
+    for (from, participant, device) in [
+        (mine.as_str(), None, None),
+        ("99900100999@lid", None, None),
+        ("99900100999:4@lid", None, Some(4)),
+        // Routed through a participant: both ours, the device the participant's.
+        (mine.as_str(), Some("99900100999:2@lid"), Some(2)),
+        // A call-scoped wrapper: the call's own address is no person, the participant is our device.
+        ("CALL0A1B2C3D@call", Some("99900100999:2@lid"), Some(2)),
+    ] {
+        let mut node = call_node(from, false, accept(PEER_PN));
+        if let Some(participant) = participant {
+            node.attrs.insert("participant", participant);
+        }
+        let m = line_in(&node, &own(), store).expect("our phone answered");
+        assert_eq!(m.conv, ConvKey::Direct(peer.clone()), "{from}");
+        assert_eq!(&*m.local, format!("call:{CALL}"));
+        assert_eq!(m.origin, Origin::OwnOtherDevice { device }, "{from}");
+        let line = call_line(&m);
+        assert_eq!(line.state, CallState::Answered);
+        assert_eq!(line.direction, CallDirection::Incoming);
+        assert!(!line.group);
+        assert_eq!(line.by, Some(peer.clone()));
+        assert_eq!((m.sent_at, m.server_at), (AT, Some(AT)));
+        assert!(!m.catch_up);
+    }
+    // From the offline queue it is a catch-up, still answered.
+    let m = line_in(&call_node(&mine, true, accept(PEER_PN)), &own(), store).expect("a line");
+    assert!(m.catch_up);
+
+    // The whole call: the ring, our phone's accept, then the caller's dismiss and hang-up in any order. Answered is the
+    // top of the order: the dismiss says nothing, a hang-up without a duration says "missed" and cannot lower it, and
+    // the ring's deadline passing changes nothing.
+    let ring = line_of(
+        &call_node(PEER_PN, false, offer(PEER_PN, false, None).build()),
+        &own(),
+    )
+    .expect("the ring");
+    let answer = line_in(&call_node(&mine, false, accept(PEER_PN)), &own(), store).expect("ours");
+    assert!(matches!(
+        read_of(
+            &call_node(
+                PEER_PN,
+                false,
+                terminate(PEER_PN, Some("accepted_elsewhere"), None)
+            ),
+            &own()
+        ),
+        Read::Nothing
+    ));
+    // The hang-up after a connected call carries its duration: nothing more to say (the contract has no duration).
+    assert!(matches!(
+        read_of(
+            &call_node(PEER_PN, false, terminate(PEER_PN, None, Some(20))),
+            &own()
+        ),
+        Read::Nothing
+    ));
+    let hang_up = line_of(
+        &call_node(PEER_PN, false, terminate(PEER_PN, None, None)),
+        &own(),
+    )
+    .expect("a hang-up with no duration");
+    let (ring, answer, hang_up) = (
+        call_line(&ring).clone(),
+        call_line(&answer).clone(),
+        call_line(&hang_up).clone(),
+    );
+    for joined in [
+        ring.join(&answer).join(&hang_up),
+        hang_up.join(&ring).join(&answer),
+        answer.join(&hang_up).join(&ring),
+    ] {
+        assert_eq!(joined.state, CallState::Answered);
+        assert_eq!(joined.settled(AT + RING_MS + 1).state, CallState::Answered);
+        assert_eq!(joined.media, Some(CallMedia::Voice));
+    }
+
+    // D2 unchanged: with no word of ours, the caller's "accepted elsewhere" leaves the ring to its deadline: missed.
+    assert_eq!(
+        ring.settled(AT + RING_MS).state,
+        CallState::Missed,
+        "the caller's dismiss is not our word"
+    );
+}
+
+/// Only OUR device's accept says anything, and only for a 1:1 line Kourier filed in the creator's chat: the caller's or
+/// a stranger's accept, an accept routed for a person who is not us, an accept while our ids are not known, of a call
+/// we made, or for a call with no filed line (none seen, a group's, another person's chat) shows nothing, and the store
+/// is asked only for ours. Mutant: `own_sender` takes any sender (its `is_own` check dropped).
+#[test]
+fn an_accept_of_anybody_else_or_of_a_call_kourier_filed_no_line_of_says_nothing() {
+    let asked = AtomicUsize::new(0);
+    let filed = peer_filed(&asked);
+    let store = Lookups {
+        number_of: &nothing_mapped,
+        filed_chat: &filed,
+    };
+    let mine = format!("{OWN_PN}@s.whatsapp.net");
+    const OTHER_PN: &str = "15550100102@s.whatsapp.net";
+    // The caller's own accept (as on a call WE made, but the creator is the peer), a stranger's, and our id routed beside
+    // somebody else's.
+    let mut beside = call_node(&mine, false, accept(PEER_PN));
+    beside.attrs.insert("participant", PEER_PN);
+    let mut routed_for_peer = call_node(PEER_PN, false, accept(PEER_PN));
+    routed_for_peer
+        .attrs
+        .insert("participant", "99900100999:2@lid");
+    for (what, node) in [
+        ("the caller", call_node(PEER_PN, false, accept(PEER_PN))),
+        ("a stranger", call_node(OTHER_PN, false, accept(PEER_PN))),
+        ("ours beside the peer", beside),
+        ("the peer beside ours", routed_for_peer),
+    ] {
+        assert!(line_in(&node, &own(), store).is_none(), "{what}");
+    }
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "the store is asked only for ours"
+    );
+    // Our ids not known yet: nothing can be told apart, nothing is said.
+    assert!(
+        line_in(
+            &call_node(&mine, false, accept(PEER_PN)),
+            &OwnIds::default(),
+            store
+        )
+        .is_none()
+    );
+    // A call we made: the creator is us.
+    assert!(line_in(&call_node(&mine, false, accept(&mine)), &own(), store).is_none());
+    // Ours, but Kourier filed no line in this creator's chat (the store answers for the peer only).
+    assert!(line_in(&call_node(&mine, false, accept(OTHER_PN)), &own(), store).is_none());
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // And ours with no filed line at all.
+    assert!(
+        line_with(
+            &call_node(&mine, false, accept(PEER_PN)),
+            &own(),
+            &nothing_mapped
+        )
+        .is_none()
+    );
+}
+
 #[test]
 fn nothing_says_it_was_one_of_our_own_devices() {
     // Whatever the caller sends, no line ever has the origin of our own device.
@@ -544,6 +752,7 @@ fn a_group_calls_own_address_and_a_server_place_no_terminate() {
 fn the_rest_of_a_calls_signalling_shows_nothing_and_is_still_read() {
     let kinds = [
         ("preaccept", None),
+        // The caller's accept (only OUR device's says something: THE OWN ANSWER).
         ("accept", None),
         ("reject", Some("busy")),
         ("transport", None),
@@ -906,6 +1115,198 @@ fn the_interceptor_asks_the_store_which_number_a_creator_has() {
     assert_eq!(outbox_events(&store).len(), 2, "no third line");
     assert_eq!(w.failures.load(Ordering::SeqCst), 0);
     w.owner.close();
+}
+
+/// A `<call>` from `from` whose one action `tag` names call `id` by `creator`, with the action's `extra` attributes.
+fn signal_of(
+    from: &str,
+    tag: &'static str,
+    id: &str,
+    creator: &str,
+    extra: &[(&'static str, &str)],
+) -> Node {
+    let mut action = NodeBuilder::new(tag)
+        .attr("call-id", id)
+        .attr("call-creator", creator);
+    for &(key, value) in extra {
+        action = action.attr(key, value);
+    }
+    call_node(from, false, action.build())
+}
+
+/// THE OWN ANSWER over the real store: the interceptor's own line of the ring is filed (`call_lines`), and our phone's
+/// accept is read against it: answered in the SAME chat under the same id, in either form of the caller (the store's
+/// mapping); nothing for a call with no filed line, a group call's line, or a line in another person's chat; the
+/// caller's dismiss writes nothing. Mutant: `filed_chat_of` takes the filed chat whoever it belongs to.
+#[test]
+fn the_interceptor_answers_the_filed_line_with_our_own_phones_accept() {
+    let w = world(Claim::Calls);
+    let store = w.owner.store();
+    let send =
+        |node: &Node| assert_eq!(w.interceptor.intercept(&owned(node)), Interception::Handled);
+    let mine = format!("{OWN_PN}@s.whatsapp.net");
+    // The call lines written so far (a chat's statement beside one is left out).
+    let lines = || -> Vec<IncomingMessage> {
+        outbox_events(&store)
+            .into_iter()
+            .filter_map(|event| match event {
+                BackendEvent::Message(message) if message.body.call_line().is_some() => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    // The ring (from the peer's LID, the creator his LID), then our phone's accept, which names the creator by his
+    // NUMBER: the store maps the two, so the accept goes to the LID chat the ring was filed in.
+    learn(&store, "99900100101", "15550100101");
+    send(&signal_of(
+        PEER_LID,
+        "offer",
+        "CALL-A-71100011",
+        PEER_LID,
+        &[],
+    ));
+    assert_eq!(lines().len(), 1, "the ring");
+    send(&signal_of(
+        "99900100999@lid",
+        "accept",
+        "CALL-A-71100011",
+        PEER_PN,
+        &[],
+    ));
+    let all = lines();
+    assert_eq!(all.len(), 2, "{all:?}");
+    let answer = &all[1];
+    assert_eq!(answer.conv, ConvKey::Direct(user("lid", "99900100101")));
+    assert_eq!(&*answer.local, "call:CALL-A-71100011");
+    assert_eq!(answer.origin, Origin::OwnOtherDevice { device: None });
+    assert_eq!(call_line(answer).state, CallState::Answered);
+    // The caller's dismiss after it writes nothing.
+    send(&signal_of(
+        PEER_LID,
+        "terminate",
+        "CALL-A-71100011",
+        PEER_LID,
+        &[("reason", "accepted_elsewhere")],
+    ));
+    assert_eq!(lines().len(), 2, "the caller's word writes nothing");
+
+    // Nothing filed for this id: nothing.
+    send(&signal_of(&mine, "accept", "CALL-B-71100012", PEER_PN, &[]));
+    assert_eq!(lines().len(), 2, "no line seen, none made");
+    // A group call's line: the accept names no group and makes no line of its own.
+    send(&signal_of(
+        PEER_PN,
+        "offer",
+        "CALL-C-71100013",
+        PEER_PN,
+        &[("group-jid", GROUP)],
+    ));
+    assert_eq!(lines().len(), 3, "the group's ring");
+    send(&signal_of(&mine, "accept", "CALL-C-71100013", PEER_PN, &[]));
+    assert_eq!(lines().len(), 3, "no answer for a group's line");
+    // A line filed in another person's chat: the id is the caller's choice, the creator our accept names is someone else.
+    send(&signal_of(
+        "15550100102@s.whatsapp.net",
+        "offer",
+        "CALL-D-71100014",
+        "15550100102@s.whatsapp.net",
+        &[],
+    ));
+    assert_eq!(lines().len(), 4, "the other person's ring");
+    send(&signal_of(&mine, "accept", "CALL-D-71100014", PEER_PN, &[]));
+    assert_eq!(
+        lines().len(),
+        4,
+        "no answer outside a filed 1:1 line of its creator"
+    );
+    assert_eq!(w.failures.load(Ordering::SeqCst), 0);
+    w.owner.close();
+}
+
+/// The interceptor's two DEBUG lines say each signal's kind, reason and sender in fixed words (R1 could not tell which
+/// kinds came), never an id, a number or the network's own text. Mutant: the sender's word `own` for every sender.
+#[test]
+fn the_log_says_each_signals_kind_reason_and_sender_in_fixed_words() {
+    let mine = format!("{OWN_PN}@s.whatsapp.net");
+    let words = |node: &Node| {
+        let call = parse_call_stanza(owned(node).get())
+            .expect("parses")
+            .expect("a known action");
+        Words::of(&call, &own())
+    };
+    let w =
+        |kind: &'static str, reason: &'static str, sender: &'static str, connected: bool| Words {
+            kind,
+            reason,
+            sender,
+            connected,
+        };
+    let odd = "15550100777 a reason with a number";
+    for (node, want) in [
+        (
+            call_node(PEER_PN, false, offer(PEER_PN, false, None).build()),
+            w("offer", "-", "creator", false),
+        ),
+        (
+            call_node(
+                PEER_PN,
+                false,
+                terminate(PEER_PN, Some("accepted_elsewhere"), None),
+            ),
+            w("terminate", "accepted_elsewhere", "creator", false),
+        ),
+        (
+            call_node(PEER_PN, false, terminate(PEER_PN, None, Some(20))),
+            w("terminate", "none", "creator", true),
+        ),
+        (
+            call_node(PEER_PN, false, terminate(PEER_PN, Some(odd), None)),
+            w("terminate", "other", "creator", false),
+        ),
+        (
+            call_node(&mine, false, accept(PEER_PN)),
+            w("accept", "-", "own", false),
+        ),
+        (
+            call_node("15550100102@s.whatsapp.net", false, accept(PEER_PN)),
+            w("accept", "-", "other", false),
+        ),
+    ] {
+        assert_eq!(words(&node), want);
+    }
+
+    // What the interceptor logs: the words, the count, nothing of the ids.
+    let lines = crate::test_log::Lines::default();
+    let _guard = tracing::subscriber::set_default(lines.clone());
+    let calls = world(Claim::Calls);
+    for node in [
+        call_node(PEER_PN, false, offer(PEER_PN, false, None).build()),
+        call_node(&mine, false, accept(PEER_PN)),
+        call_node(PEER_PN, false, terminate(PEER_PN, Some(odd), None)),
+    ] {
+        assert_eq!(
+            calls.interceptor.intercept(&owned(&node)),
+            Interception::Handled
+        );
+    }
+    calls.owner.close();
+    let said: Vec<String> = lines
+        .all()
+        .into_iter()
+        .filter(|l| l.contains("a call line is durable") || l.contains("shows nothing"))
+        .collect();
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said[0].contains("kind=\"offer\"") && said[0].contains("sender=\"creator\""));
+    assert!(said[1].contains("kind=\"accept\"") && said[1].contains("sender=\"own\""));
+    assert!(said[1].contains("lines=1"), "our phone's accept is a line");
+    assert!(said[2].contains("reason=\"other\""));
+    for line in &said {
+        for secret in ["15550100", "99900100", CALL, "a reason with"] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
 }
 
 #[test]

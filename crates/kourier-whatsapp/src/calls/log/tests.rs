@@ -832,6 +832,115 @@ async fn a_log_signal_for_a_line_already_there_settles_it_live_and_unread() {
     assert!(message.silent && message.read);
 }
 
+/// R1 (2026-11-04): a call answered on the phone whose ring the core's deadline already made MISSED. The phone's log
+/// is our own side's word, and it may come long after the ring (R1 saw none within ten minutes): CONNECTED (answered
+/// on the phone itself) or ACCEPTEDELSEWHERE is an answered line from our own device in the chat and under the id of the
+/// interceptor's line, quiet (the call is no news), and the core's join moves the missed line up to answered (the
+/// order only moves up; `kourier-core/tests/calls.rs` `a_ring_past_its_deadline_is_missed_until_it_is_answered`, and
+/// `ingest/call.rs` joins a history signal into the line that is there like a live one). Nothing here is new: it pins
+/// the path R1's call step relies on.
+#[tokio::test]
+async fn a_late_log_answer_settles_a_line_the_ring_deadline_made_missed() {
+    let (_dir, owner) = open();
+    let store = owner.store();
+    // The interceptor's ring, filed under the peer's number (the record names his LID: the mapping ties the two).
+    learn(&store, PEER_LID, PEER_PN).await;
+    let chat = direct("pn", PEER_PN);
+    let events = vec![
+        ring(&chat, "LATE-58810211", user("pn", PEER_PN)),
+        ring(&chat, "LATE-58810212", user("pn", PEER_PN)),
+    ];
+    let rung = events.clone();
+    store
+        .write("test: note", move |tx| note_lines(tx, &events, NOW))
+        .await
+        .expect("note");
+    for (id, result, rang) in [
+        ("LATE-58810211", CallResult::CONNECTED, &rung[0]),
+        ("LATE-58810212", CallResult::ACCEPTEDELSEWHERE, &rung[1]),
+    ] {
+        // Ten minutes after the call: the ring's deadline passed long ago.
+        let mut seen = incoming(id, result);
+        seen.started_s = Some(NOW / 1000 - 600);
+        let (conv, message) = the_line(&run(&store, &seen).await);
+        assert_eq!(conv, chat, "{result:?}: the interceptor's chat");
+        assert_eq!(&*message.local, format!("call:{id}"));
+        assert_eq!(message.origin, Origin::OwnOtherDevice { device: None });
+        assert!(message.silent && message.read, "an old call is no news");
+        let answered = call_of(&message);
+        assert_eq!(answered.state, CallState::Answered, "{result:?}");
+        // What the core makes of it: the ring settled as missed at its deadline, then this signal.
+        let BackendEvent::Message(rang) = rang else {
+            panic!("a ring")
+        };
+        let missed = call_of(rang).settled(NOW);
+        assert_eq!(missed.state, CallState::Missed);
+        assert_eq!(missed.join(answered).state, CallState::Answered);
+        assert_eq!(answered.join(&missed).state, CallState::Answered);
+    }
+}
+
+/// THE OWN ANSWER's lookup (`calls::own_answer`): the chat a 1:1 call's line was filed under, only when it is a direct
+/// chat of the person the accept names, in either form of him; nothing for no line, a group's line or another person's
+/// chat. Mutant: the fit dropped (`Ok(Some(filed))`; `calls::tests::the_interceptor_answers_the_filed_line_...` dies too).
+#[tokio::test]
+async fn the_filed_chat_of_an_own_answer_is_a_direct_chat_of_its_creator_or_none() {
+    let (_dir, owner) = open();
+    let store = owner.store();
+    learn(&store, PEER_LID, PEER_PN).await;
+    let peer_chat = direct("lid", PEER_LID);
+    let events = vec![
+        ring(&peer_chat, "OWN-66120311", user("lid", PEER_LID)),
+        ring(
+            &direct("pn", THIRD_PN),
+            "OWN-66120312",
+            user("pn", THIRD_PN),
+        ),
+        BackendEvent::Message(IncomingMessage::call(
+            group(),
+            "OWN-66120313",
+            Origin::Remote {
+                author: user("lid", PEER_LID),
+                device: None,
+            },
+            CallLine::signal(
+                CallDirection::Incoming,
+                true,
+                CallState::Ringing { deadline: 70_000 },
+                10_000,
+            ),
+            10_000,
+            10_000,
+        )),
+    ];
+    store
+        .write("test: note", move |tx| note_lines(tx, &events, NOW))
+        .await
+        .expect("note");
+    let ask = |id: &'static str, person: UserId| {
+        let store = store.clone();
+        async move {
+            store
+                .read(move |conn| super::filed_chat_of(conn, id, &person))
+                .await
+                .expect("filed")
+        }
+    };
+    // His LID chat, asked with either form of him.
+    assert_eq!(
+        ask("OWN-66120311", user("lid", PEER_LID)).await,
+        Some(peer_chat.clone())
+    );
+    assert_eq!(
+        ask("OWN-66120311", user("pn", PEER_PN)).await,
+        Some(peer_chat)
+    );
+    // Another person's chat, a group's line, no line.
+    assert_eq!(ask("OWN-66120312", user("pn", PEER_PN)).await, None);
+    assert_eq!(ask("OWN-66120313", user("lid", PEER_LID)).await, None);
+    assert_eq!(ask("OWN-66120314", user("lid", PEER_LID)).await, None);
+}
+
 /// INTEROP-7: the conversation `call_lines` holds for a call id is taken only when it FITS the record. Call ids are
 /// chosen by the calling side and every member of a group sees a group call's id, so a 1:1 offer that names the id of a
 /// group call must not pull the group's log record into his chat. A group record takes only the group it names; a 1:1
