@@ -109,8 +109,6 @@ const NOT_DONE: &str = "WhatsApp does not do this yet";
 /// How long a "typing" lasts without a refresh before the core clears it (an estimate in the range
 /// of WhatsApp Web's own timeout; the contact's next chat state refreshes it).
 pub(crate) const TYPING_TTL: Duration = Duration::from_secs(25);
-/// What a download request is answered with until W7: the file cannot be fetched yet, but may be later.
-const DOWNLOAD_NOT_DONE: &str = "downloads from WhatsApp are not done yet";
 
 /// How long a stopping actor lets the forwarder hand the core what it still has.
 #[cfg(not(test))]
@@ -234,6 +232,13 @@ pub(crate) fn run_with(
             && let Err(error) = state_ready_again(&store, clock.now_ms()).await
         {
             return Exit::Failed(error);
+        }
+        if start == StartMode::Rebuild
+            && crate::avatars::forget_all(&store, &blob_dir).await.is_err()
+        {
+            return Exit::Failed(BackendError::internal(
+                "the profile pictures could not be reset",
+            ));
         }
         // The start-up resync (W6a1, D2, critic B1): its reasons are the dirty set READ NOW, before the client or
         // the handler exist, so nothing this run writes can be one. A link asks nothing of Kourier's own: the books
@@ -521,6 +526,14 @@ struct Actor {
     /// for them within [`QUIT_ACK_WAIT`] (D19), after telling the ones still before their frame to end (fix F16); what
     /// is left after the wait is ended before the client stops.
     attempts: tokio::task::JoinSet<()>,
+    /// The files being fetched (W7). Dropped with the actor: an unanswered request is sent again at the next start.
+    downloads: tokio::task::JoinSet<()>,
+    /// How many files are fetched at once.
+    download_slots: Arc<tokio::sync::Semaphore>,
+    /// The walk over the chats' profile pictures (W8): at most one, for as long as the connection is `Online`.
+    avatars: tokio::task::JoinSet<()>,
+    /// Until when (ms) the server asked picture lookups to rest. As long as the actor, not the connection.
+    avatars_pause: Arc<std::sync::atomic::AtomicU64>,
     /// The stop states of the attempts under way, by message (W5b, G2): filled before an attempt is spawned, emptied by
     /// its guard.
     transmits: send::stop::Transmits,
@@ -682,6 +695,10 @@ impl Actor {
             refused_logout: None,
             unreleased: None,
             attempts: tokio::task::JoinSet::new(),
+            downloads: tokio::task::JoinSet::new(),
+            download_slots: Arc::new(tokio::sync::Semaphore::new(crate::download::SLOTS)),
+            avatars: tokio::task::JoinSet::new(),
+            avatars_pause: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             transmits: send::stop::Transmits::default(),
             blob_dir,
             upload_tmp,
@@ -827,6 +844,11 @@ impl Actor {
             Command::Resolve { reply, .. } => {
                 let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             }
+            Command::GroupInvite {
+                group,
+                action,
+                reply,
+            } => self.group_invite(group, action, reply),
             Command::ListOwnDevices { reply, .. } => {
                 let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             }
@@ -844,8 +866,10 @@ impl Actor {
             Command::DownloadAttachment {
                 attachment,
                 request,
+                remote,
+                dest,
                 ..
-            } => self.answer_download(attachment, request).await,
+            } => self.start_download(attachment, request, remote, dest),
             // Receipts (D10, `send::receipts`): the job and its confirmation in one zone; the runner sends it.
             Command::SendReceipts {
                 cmd,
@@ -1075,21 +1099,74 @@ impl Actor {
         });
     }
 
-    /// `DownloadAttachment`: nothing downloads before W7, and a request that is never answered would leave the
-    /// attachment waiting. The answer is a failure the user can try again after W7 (a transient error: the
-    /// core marks the attachment `Failed { retryable: true }`), in one `core_outbox` zone (the core resends an
-    /// unanswered request at its next start, so a kill before the commit loses nothing).
-    async fn answer_download(&mut self, attachment: AttachmentId, request: DownloadId) {
-        let answer = BackendEvent::AttachmentDone {
-            attachment,
-            request: Some(request),
-            result: Err(BackendError::transient(DOWNLOAD_NOT_DONE)),
+    /// A group's invite link: asked on a task of its own, so a slow answer holds nothing else
+    /// up. WhatsApp's link always stands, it cannot be turned off.
+    fn group_invite(
+        &self,
+        group: kourier_model::ConvKey,
+        action: kourier_model::GroupInviteAction,
+        reply: kourier_backend_api::Reply<Option<kourier_model::Redacted<String>>>,
+    ) {
+        use kourier_model::GroupInviteAction as Action;
+        let reset = match action {
+            Action::Read => false,
+            Action::Reset => true,
+            Action::TurnOn | Action::TurnOff => {
+                let _ = reply.send(Err(BackendError::unsupported(
+                    "a WhatsApp invite link cannot be turned off",
+                )));
+                return;
+            }
         };
-        let now = i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX);
-        match outbox::append_download_answer(&self.store, answer, now).await {
-            Ok(_) => self.wake.notify_one(),
-            Err(e) => tracing::warn!(error = %e, "a download request could not be answered"),
-        }
+        let Ok(jid) = crate::send::address::jid_of(&group) else {
+            let _ = reply.send(Err(BackendError::new(
+                kourier_model::ErrorKind::InvalidInput,
+                "not a WhatsApp group key",
+            )));
+            return;
+        };
+        let Some(session) = self.client.as_ref().map(|client| client.session.clone()) else {
+            let _ = reply.send(Err(BackendError::transient("no client runs")));
+            return;
+        };
+        tokio::spawn(async move {
+            let answer = session
+                .group_invite_link(jid, reset)
+                .await
+                .map(|link| Some(kourier_model::Redacted::new(link)))
+                .map_err(|failure| {
+                    tracing::warn!(
+                        kind = failure.kind(),
+                        reset,
+                        "the invite link of a group was not answered"
+                    );
+                    BackendError::transient("the invite link of a group was not answered")
+                });
+            let _ = reply.send(answer);
+        });
+    }
+
+    /// `DownloadAttachment` (W7): runs beside everything else and ends with the actor; [`crate::download`] answers it. A
+    /// request cut off by the end of the actor stays unanswered, so the core sends it again.
+    fn start_download(
+        &mut self,
+        attachment: AttachmentId,
+        request: DownloadId,
+        remote: kourier_model::BackendBlob,
+        dest: kourier_backend_api::BlobTarget,
+    ) {
+        while self.downloads.try_join_next().is_some() {}
+        let parts = crate::download::Parts {
+            store: self.store.clone(),
+            session: self.client.as_ref().map(|client| client.session.clone()),
+            events: self.events.clone(),
+            wake: self.wake.clone(),
+            clock: self.clock.clone(),
+            slots: self.download_slots.clone(),
+        };
+        self.downloads.spawn(crate::download::run(
+            parts, attachment, request, remote, dest,
+        ));
     }
 
     // ----- the connection -----
@@ -1641,6 +1718,7 @@ impl Actor {
                     self.start_blocklist().await;
                     self.start_groups();
                     self.start_merges();
+                    self.start_avatars();
                 }
             }
         }
@@ -1741,6 +1819,28 @@ impl Actor {
             self.receive.stage2.clone(),
             self.receive.writer.merges(),
         );
+    }
+
+    /// The connection came `Online`: the walk over the chats' pictures starts, unless one is still on its way out. Nothing
+    /// for a paused client.
+    fn start_avatars(&mut self) {
+        while self.avatars.try_join_next().is_some() {}
+        let Some(client) = self.client.as_ref().filter(|client| !client.paused) else {
+            return;
+        };
+        if !self.avatars.is_empty() {
+            return;
+        }
+        let parts = crate::avatars::Parts {
+            store: self.store.clone(),
+            session: client.session.clone(),
+            conn: self.conn.subscribe(),
+            clock: self.clock.clone(),
+            blob_dir: self.blob_dir.clone(),
+            wake: self.wake.clone(),
+            pause: self.avatars_pause.clone(),
+        };
+        self.avatars.spawn(crate::avatars::run(parts));
     }
 
     /// The machine's timer ran out. In the backlog phase upstream's completion did not come: the

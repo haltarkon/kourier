@@ -29,6 +29,9 @@ your computer's address, as with any Signal client.
   libsignal/<version>`) and the linked device's name, which you choose when you link. The device
   shows in the list of linked devices in the Signal app on your phone, where you can remove it at
   any time.
+- When an account's switch "Sync chat changes with my phone" (Settings > Accounts, off until you turn it on) is on,
+  Kourier writes a chat's Archive, Pin, Mute and Mark as Unread to Signal's Storage Service, encrypted with the
+  account's storage key, so your phone and other devices show them too. With it off, Kourier only reads them.
 - A link in a message is never fetched for a preview, and a link you drop on the composer is not
   fetched. A link opens in your browser only after you click it, and only when it is an `https`
   address.

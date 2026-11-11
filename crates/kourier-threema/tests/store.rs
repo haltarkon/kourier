@@ -28,7 +28,7 @@ use kourier_threema::store::{
     import_join, is_join_ready, load_identity, mark_join_ready, mark_send_acks, mark_send_done,
     mark_send_reflected, next_send, prepare_send, prepare_send_zone, ready_join, record_link,
     save_identity, send_ledger, send_receivers, send_task, send_tasks, set_slot_existing,
-    stated_events, sweep_sends,
+    state_features_again, stated_events, sweep_sends,
 };
 use tokio::sync::Notify;
 use zeroize::Zeroizing;
@@ -513,7 +513,7 @@ fn a_schema_1_file_migrates_to_schema_2_with_every_new_table_empty() {
             .map_err(kourier_db::Error::from)
         })
         .expect("version");
-    assert_eq!(version, 5, "the file is not at the latest schema");
+    assert_eq!(version, 6, "the file is not at the latest schema");
     for table in SCHEMA_2_TABLES {
         assert_eq!(
             count(&db, table),
@@ -859,6 +859,49 @@ fn import_join_writes_every_table_and_no_core_outbox_row() {
             "{table} after the refused second import"
         );
     }
+}
+
+/// TH8: a file an older build joined says once what its chats can do now, in rows of chats and nothing else; a file this
+/// build joined has nothing to say.
+#[test]
+fn the_chats_say_again_what_they_can_do_once_on_a_file_of_an_older_build() {
+    let fixture = join_fixture("J4BFEAT1");
+    let store = temp_store();
+    let wake = Rc::new(Notify::new());
+    import_join(&store.db, &fixture.import, JOIN_LABEL, JOIN_NOW_MS).expect("zone 1");
+    ready_join(&store.db, JOIN_NOW_MS, &wake).expect("zone 2");
+    let joined = outbox_events(&store.db).len();
+
+    state_features_again(&store.db, JOIN_NOW_MS + 1, &wake).expect("nothing to state");
+    assert_eq!(
+        outbox_events(&store.db).len(),
+        joined,
+        "a file this build joined was stated again"
+    );
+
+    store
+        .db
+        .zone(|tx| {
+            tx.execute("DELETE FROM features_stated", [])
+                .map_err(kourier_db::Error::from)?;
+            Ok::<_, StoreError>(())
+        })
+        .expect("a file of an older build");
+    state_features_again(&store.db, JOIN_NOW_MS + 2, &wake).expect("the statement");
+    let rows = outbox_events(&store.db);
+    let stated = &rows[joined..];
+    assert_eq!(stated.len(), 1, "one row of chats");
+    assert_eq!(stated[0].len(), 4, "the 2 direct chats and the 2 groups");
+    for event in &stated[0] {
+        let BackendEvent::ConversationUpsert(patch) = event else {
+            panic!("not a chat: {event:?}");
+        };
+        let features = patch.features.as_ref().expect("the chat's features");
+        assert_eq!(features.cannot_send, None);
+    }
+
+    state_features_again(&store.db, JOIN_NOW_MS + 3, &wake).expect("said once");
+    assert_eq!(outbox_events(&store.db).len(), rows.len(), "said twice");
 }
 
 #[test]

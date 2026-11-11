@@ -876,6 +876,7 @@ impl Fixture {
             self.accounts
                 .iter()
                 .map(|(a, _, label)| conversations::TableAccount {
+                    tint: conversations::network_tint(a.network).to_owned(),
                     id: a.id,
                     network: a.network,
                     name: (*label).to_owned(),

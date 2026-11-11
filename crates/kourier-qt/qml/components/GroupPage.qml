@@ -18,6 +18,51 @@ import app.kourier
 Item {
     id: root
 
+    // A button of the invite link's part; Return and Enter press it as Space does.
+    component InviteButton: QQC2.Button {
+        id: inviteButton
+        width: parent ? parent.width : 0
+        flat: true
+        Accessible.name: inviteButton.text
+        Keys.onReturnPressed: event => {
+            inviteButton.clicked();
+            event.accepted = true;
+        }
+        Keys.onEnterPressed: event => {
+            inviteButton.clicked();
+            event.accepted = true;
+        }
+    }
+
+    // Replacing or turning off a link is asked first: people who hold it are cut off.
+    Kirigami.PromptDialog {
+        id: inviteDialog
+        objectName: "groupInviteDialog"
+        // "reset" or "off".
+        property string action: ""
+        parent: QQC2.Overlay.overlay
+        title: inviteDialog.action === "reset" ? L10n.i18nc("@title:dialog", "Reset the Invite Link?") : L10n.i18nc("@title:dialog", "Turn Off the Invite Link?")
+        subtitle: inviteDialog.action === "reset" ? L10n.i18nc("@info", "The current link stops working. Nobody can join with it any more.") : L10n.i18nc("@info", "Nobody can join with the link while it is off. Turning it on again brings the same link back.")
+        preferredWidth: Kirigami.Units.gridUnit * 24
+        maximumWidth: Kirigami.Units.gridUnit * 24
+        standardButtons: Kirigami.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action {
+                text: inviteDialog.action === "reset" ? L10n.i18nc("@action:button", "Reset Link") : L10n.i18nc("@action:button", "Turn Off")
+                icon.name: inviteDialog.action === "reset" ? "view-refresh" : "process-stop"
+                onTriggered: {
+                    App.groupInvite(inviteDialog.action, root.group.id ?? 0);
+                    inviteDialog.close();
+                }
+            },
+            Kirigami.Action {
+                text: L10n.i18nc("@action:button", "Cancel")
+                icon.name: "dialog-cancel"
+                onTriggered: inviteDialog.close()
+            }
+        ]
+    }
+
     readonly property var group: App.group
     // The page has arrived (an empty map before).
     readonly property bool loaded: root.group.name !== undefined
@@ -116,17 +161,14 @@ Item {
                     width: implicitWidth
                     height: implicitHeight
                 }
-                QQC2.Label {
+                CopyableText {
                     objectName: "groupName"
                     width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
                     text: root.group.name ?? ""
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold,
                         "pointSize": Kirigami.Theme.defaultFont.pointSize * 1.3
                     })
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
                 }
                 // The description: three lines, "More" for the rest; selectable, with links in an accepted chat.
                 DescriptionText {
@@ -255,6 +297,7 @@ Item {
                                 "isSelf": row.isSelf
                             })
                         adminLabel: root.group.adminLabel ?? ""
+                        account: root.group.account ?? 0
                         width: membersPart.width
                         // A row of the keyboard: Tab reaches it, Return, Enter and Space open the
                         // member's page, and the frame of the keyboard's focus shows which.
@@ -285,6 +328,64 @@ Item {
                         root.opener = "showAll";
                         root.showAllRequested();
                     }
+                }
+            }
+
+            // ---- the invite link: an administrator, on a network that has links. The link
+            // itself stays in Rust (`App.groupInvite`); `App.copyTold` says what came of a click. ----
+            Column {
+                id: invitePart
+                objectName: "groupInvite"
+                readonly property string kind: root.loaded ? (root.group.invites ?? "") : ""
+                // WhatsApp's link always stands; Signal's can be off.
+                readonly property bool linkOn: invitePart.kind === "reset" || (root.group.inviteOn ?? false)
+                visible: invitePart.kind !== ""
+                x: Kirigami.Units.largeSpacing
+                width: parent.width - Kirigami.Units.largeSpacing * 2
+                spacing: Kirigami.Units.smallSpacing
+
+                QQC2.Label {
+                    width: parent.width
+                    text: L10n.i18nc("@title:group the invite link part of a group's page", "Invite Link")
+                    font: Style.styled(Kirigami.Theme.defaultFont, {
+                        "weight": Font.DemiBold
+                    })
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                }
+                InviteButton {
+                    objectName: "groupInviteCopy"
+                    visible: invitePart.linkOn
+                    icon.name: "edit-copy"
+                    text: L10n.i18nc("@action:button", "Copy Invite Link")
+                    onClicked: App.groupInvite("read", root.group.id ?? 0)
+                }
+                InviteButton {
+                    objectName: "groupInviteReset"
+                    visible: invitePart.linkOn
+                    icon.name: "view-refresh"
+                    text: L10n.i18nc("@action:button", "Reset Invite Link…")
+                    onClicked: {
+                        inviteDialog.action = "reset";
+                        inviteDialog.open();
+                    }
+                }
+                InviteButton {
+                    objectName: "groupInviteOff"
+                    visible: invitePart.kind === "switch" && invitePart.linkOn
+                    icon.name: "process-stop"
+                    text: L10n.i18nc("@action:button", "Turn Off Invite Link…")
+                    onClicked: {
+                        inviteDialog.action = "off";
+                        inviteDialog.open();
+                    }
+                }
+                InviteButton {
+                    objectName: "groupInviteOn"
+                    visible: invitePart.kind === "switch" && !invitePart.linkOn
+                    icon.name: "insert-link"
+                    text: L10n.i18nc("@action:button", "Turn On Invite Link")
+                    onClicked: App.groupInvite("on", root.group.id ?? 0)
                 }
             }
 

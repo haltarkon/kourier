@@ -1031,9 +1031,9 @@ fn message(msg: &Msg<'_>, class: Class, cx: &Cx<'_>, view: &dyn View) -> Result<
 
 /// E5 (TH5 A8; the lead's call after A7b): a 1:1 chat whose contact the file holds as NOT direct (the phone
 /// HIDES it, acquaintance `GROUP_OR_DELETED`) was never stated (E1 states only direct contacts' chats), so the
-/// core would create it from the message alone, without features: no `NotYetBuilt`, a composer shown. Such a
+/// core would create it from the message alone, without features: no limits, a composer shown. Such a
 /// message states the chat's WHOLE patch from the stored record (`join::events::one_to_one_patch`: features,
-/// `NotYetBuilt`, protected, archive / pin, mute) FIRST in the same row. `brought_back`: H5 sets the record
+/// protected, archive / pin, mute) FIRST in the same row. `brought_back`: H5 sets the record
 /// NORMAL in the same zone, so the patch says so too. A direct contact's chat was stated: `None`.
 fn hidden_chat(
     identity: &str,
@@ -1141,7 +1141,7 @@ fn group_place<'a>(
         return Ok(Err(RULE_GROUP_UNKNOWN));
     }
     // L-3: a group that is not shown (never stated) must not get a chat from a message: the core would
-    // make one without the features and `NotYetBuilt` (E5's problem, for a group).
+    // make one without the features (E5's problem, for a group).
     if view
         .stored_group(&group.creator, group.group_id)?
         .is_some_and(|stored| !is_visible(&stored))
@@ -2059,8 +2059,8 @@ mod tests {
                     );
                     assert_eq!(
                         patch.features.as_ref().and_then(|f| f.cannot_send.clone()),
-                        Some(kourier_model::CannotSend::NotYetBuilt),
-                        "the hidden contact's chat does not say NotYetBuilt"
+                        None,
+                        "the hidden contact's chat says it cannot be sent in"
                     );
                     assert_eq!(patch.protected, Some(true), "the protected flag is lost");
                     assert_eq!(

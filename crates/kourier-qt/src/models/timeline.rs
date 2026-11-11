@@ -12,7 +12,7 @@ use kourier_model::MessageId;
 use kourier_viewmodel::diff::RoleSet;
 use kourier_viewmodel::media_layout::AlbumRow;
 use kourier_viewmodel::timeline::{Block, ImageBlock, ReactionChip, RowActions, UploadView};
-use kourier_viewmodel::{ChatHeader, MessageRow, Paging, RevisionList, RowKey};
+use kourier_viewmodel::{ChatHeader, ChatOffer, MessageRow, Paging, RevisionList, RowKey};
 
 use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject::{self, App};
@@ -63,6 +63,8 @@ pub struct TimelineRust {
     pub(crate) is_self: bool,
     pub(crate) muted: bool,
     pub(crate) avatar_url: QString,
+    /// The color of the chat's account (`#rrggbb`), for what is drawn behind the messages.
+    pub(crate) tint: QString,
     pub(crate) cannot_send: QString,
     pub(crate) attach_kinds: QString,
     pub(crate) timer_label: QString,
@@ -79,6 +81,11 @@ pub struct TimelineRust {
     pub(crate) still_filling: QString,
     /// Why the timer cannot be changed now (the account is under a send hold); empty when it can.
     pub(crate) timer_held: QString,
+    /// What the chat's menu offers of Archive, Pin, Mute and Mark as Unread
+    /// ([`offer_variant`]); an empty map while no chat is open.
+    pub(crate) chat_offer: QVariant,
+    /// The offer behind `chat_offer` (to tell when it changes); `None` while no chat is open.
+    offered: Option<ChatOffer>,
     /// The timers behind `timer_options` (to tell when they change).
     timer_offered: Vec<kourier_viewmodel::conversations::TimerOption>,
     /// Whether the header of `conversation_id` is loaded. While it is not, the properties
@@ -140,6 +147,33 @@ fn list(items: impl IntoIterator<Item = QVariant>) -> QVariant {
         l.append(v);
     }
     QVariant::from(&l)
+}
+
+/// What a chat's menu offers (`ChatOffer`) as the map `TimelineModel.chatOffer` and
+/// `App.chatOffer(id)` hold: `shown on archived pinned pinAtLimit pinWhy markedUnread hasUnread
+/// muteOffered muted mutedLabel why`. QML shows the flags; it decides none of them. The texts are
+/// the app's own words (no contact's text is in them).
+pub fn offer_variant(o: &ChatOffer) -> QVariant {
+    map(vec![
+        ("shown", QVariant::from(&o.shown)),
+        ("on", QVariant::from(&o.on)),
+        ("archived", QVariant::from(&o.archived)),
+        ("pinned", QVariant::from(&o.pinned)),
+        ("pinAtLimit", QVariant::from(&o.pin_at_limit)),
+        ("pinWhy", s(&o.pin_why)),
+        ("markedUnread", QVariant::from(&o.marked_unread)),
+        ("hasUnread", QVariant::from(&o.has_unread)),
+        ("muteOffered", QVariant::from(&o.mute_offered)),
+        ("muted", QVariant::from(&o.muted)),
+        ("mutedLabel", s(&o.muted_label)),
+        ("why", s(&o.why)),
+    ])
+}
+
+/// The value of `TimelineModel.chatOffer` while no chat is open: an empty map (QML reads
+/// `undefined` for every key, so nothing is shown), never an invalid variant.
+pub fn no_offer() -> QVariant {
+    map(Vec::new())
 }
 
 /// A picture or video as a `QVariantMap`: an image block, or one tile of an album.
@@ -540,6 +574,9 @@ pub fn group_variant(v: &kourier_viewmodel::group::GroupView) -> QVariant {
         ("membersTitle", s(&v.members_title)),
         ("invited", s(&v.invited)),
         ("requests", s(&v.requests)),
+        // What the page may do with the invite link; the link itself stays in Rust.
+        ("invites", s(&v.invites)),
+        ("inviteOn", QVariant::from(&v.invite_on)),
         ("adminLabel", s(&v.admin_label)),
         // The rows themselves are the two member models' (`App.groupMembers`, `App.groupPreview`).
         (
@@ -565,6 +602,7 @@ pub fn block_variant(b: &Block) -> QVariant {
             ty,
             ("html", s(&t.html)),
             ("plain", s(t.full_plain())),
+            ("links", list(t.links.iter().map(|l| s(l)))),
             ("jumbo", QVariant::from(&t.jumbo)),
             ("more", QVariant::from(&t.more)),
             (
@@ -882,6 +920,19 @@ impl qobject::TimelineModel {
         let timer_held = text(|h| &h.timer_held);
         if *self.timer_held() != timer_held {
             self.as_mut().set_timer_held(timer_held);
+        }
+        let tint = text(|h| &h.tint);
+        if *self.tint() != tint {
+            self.as_mut().set_tint(tint);
+        }
+        // The offer is compared as the Rust value: the map is built (and QML's bindings
+        // re-evaluated) only when it changed, also the first time (an unset property is an
+        // invalid variant, which QML must never read).
+        let offer = header.map(|h| h.offer.clone());
+        if self.offered != offer || !self.chat_offer().is_valid() {
+            let shown = offer.as_ref().map_or_else(no_offer, offer_variant);
+            self.as_mut().rust_mut().offered = offer;
+            self.as_mut().set_chat_offer(shown);
         }
         let cannot = text(|h| &h.cannot_send);
         if *self.cannot_send() != cannot {

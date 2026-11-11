@@ -76,8 +76,6 @@ pub struct Scene {
     pub settings: Option<d2d_sync::Settings>,
     /// TH6a S5a: the jobs of the seeded file (`Scene::job`), in queue order.
     pub jobs: Vec<NewJob>,
-    /// TH6a S6: the actor's parts open the send core's door (`Scene::send_open`).
-    pub send_open: bool,
     /// TH6 L5: a seeded contact's nickname and whether it is only a group's (`GROUP_OR_DELETED`), by ID
     /// (`Scene::with_contact_as`); a contact without an entry has no nickname and is direct.
     pub contact_shapes: std::collections::BTreeMap<String, (Option<String>, bool)>,
@@ -109,7 +107,6 @@ pub fn scene(seed: u64) -> Scene {
         nickname: None,
         settings: None,
         jobs: Vec::new(),
-        send_open: false,
         contact_shapes: std::collections::BTreeMap::new(),
     }
 }
@@ -195,12 +192,6 @@ impl Scene {
     /// world's start. Its conversation must be in the file: call this after `with_peer` and `with_members`.
     pub fn job(mut self, job: NewJob) -> Self {
         self.jobs.push(job);
-        self
-    }
-
-    /// TH6a S6: the actor's parts open the send core's door, so a `Transmit` reaches it.
-    pub fn send_open(mut self) -> Self {
-        self.send_open = true;
         self
     }
 
@@ -399,11 +390,7 @@ fn begin_with(
         ui: Default::default(),
         local_prefs: Default::default(),
     });
-    let network = if s.send_open {
-        ThreemaNetwork::new(mock::parts(&s.world).with_send_open())
-    } else {
-        ThreemaNetwork::new(mock::parts(&s.world))
-    };
+    let network = ThreemaNetwork::new(mock::parts(&s.world));
     let handle = network.spawn(ctx).expect("the actor starts");
     H {
         s,

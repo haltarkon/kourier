@@ -1848,3 +1848,163 @@ async fn a_record_with_another_key_keeps_the_phones_key_and_the_phone_hears_by_s
 //   `three_conflicts_in_a_row_count_up_and_a_landing_starts_over` and
 //   `a_click_during_the_conflict_back_off_sends_no_put_before_it_ends` (job tests) pin that the
 //   runner returns `RepeatAt` and sleeps nowhere, and what a click does meanwhile.
+
+// ---------------------------------------------------------------------------------------------
+// BQ11's counts (A10d D8; the lead's calls H3 and M1): `kourier_signal::storage_counts`, the
+// numbers the debug-only dev-control line shows. They are PROCESS-WIDE, so each test runs in a
+// process of its own (`in_own_process!`: under nextest it always is).
+// ---------------------------------------------------------------------------------------------
+
+impl World {
+    /// Waits until this process's Storage Service counts satisfy `done`; returns them.
+    async fn wait_counts(
+        &self,
+        what: &str,
+        done: impl Fn(&kourier_signal::StorageCounts) -> bool,
+    ) -> kourier_signal::StorageCounts {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let counts = kourier_signal::storage_counts();
+            if let Some(counts) = counts.filter(|c| done(c)) {
+                return counts;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}; the counts: {counts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// How many identifiers the phone's manifest lists, as the phone reads it.
+    async fn identifiers(&self) -> u64 {
+        let listed = self
+            .harness
+            .storage_identifiers(&self.phone.device_ref)
+            .await
+            .expect("the phone reads its manifest");
+        u64::try_from(listed.ids.len()).expect("a count")
+    }
+}
+
+/// BQ11 (M1): the counts follow our own write. The switch on through the real command, one
+/// click: once the server applied it, the counts name the WRITTEN manifest (its version and its
+/// identifier count equal the phone's), no identifier of it is unknown here (the 200 stored what
+/// it wrote) and one write was answered 200. A 200 queues no fetch, so without the counts set at
+/// the 200 the line would stay one version behind. Mutants: the 200 counts no write; the counts
+/// are not set at the 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_counts_follow_a_write() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (core, _device) = world.link(&world.spec(), false).await;
+    world.switch_on(&core).await;
+
+    click(&core, &World::direct(&world.ada), archive(true)).await;
+    let view = world
+        .wait_phone("Ada archived", |v| {
+            v.contacts
+                .get(&world.ada.device_ref)
+                .is_some_and(|c| c.archived)
+        })
+        .await;
+    assert_eq!(
+        view.version,
+        Some(2),
+        "one write on the phone's first version"
+    );
+    let counts = world
+        .wait_counts("one write answered 200", |c| c.writes >= 1)
+        .await;
+    assert_eq!(
+        Some(counts.version),
+        view.version,
+        "the counts name the version on the server: {counts:?}"
+    );
+    assert_eq!(
+        counts.identifiers,
+        world.identifiers().await,
+        "the counts name as many identifiers as the phone's manifest lists: {counts:?}"
+    );
+    assert_eq!(
+        counts.unknown, 0,
+        "our own write is all known here: {counts:?}"
+    );
+    assert_eq!(counts.writes, 1, "one write: {counts:?}");
+    assert_eq!(world.writes().await, (1, 0), "the server counts the same");
+
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}
+
+/// BQ11 (H3): the counts show a phone change. A fresh profile's first read has every
+/// identifier unknown (the baseline of the real check's stop rule); the phone then changes one
+/// record (a new identifier, one version on), and the fetch that merges it counts exactly that
+/// one identifier as unknown. Nothing was written. Mutant: `unknown` is not set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_counts_show_a_phone_change() {
+    if support::in_own_process!() {
+        return;
+    }
+    let Some(world) = World::start().await else {
+        return;
+    };
+    let (core, device) = world.link(&world.spec(), false).await;
+    let first = world
+        .wait_counts("the first manifest read", |c| c.version == 1)
+        .await;
+    assert!(first.identifiers > 0, "the phone lists records: {first:?}");
+    assert_eq!(
+        first.unknown, first.identifiers,
+        "a fresh profile knows none of them: {first:?}"
+    );
+    assert_eq!(first.writes, 0, "{first:?}");
+
+    let (bruno, phone) = (&world.bruno.device_ref, world.phone.device_ref.as_str());
+    let version = world
+        .harness
+        .update_storage_record(
+            phone,
+            StorageSubject::Contact(bruno),
+            &PhoneChange {
+                archived: Some(true),
+                ..PhoneChange::default()
+            },
+        )
+        .await
+        .expect("the phone archives Bruno");
+    assert_eq!(version, 2);
+    world
+        .harness
+        .send_fetch_latest(phone, &device.device_ref, "storageManifest")
+        .await
+        .expect("fetch latest");
+    world
+        .wait_count(
+            "the manifest is merged",
+            "SELECT manifest_version FROM account",
+            2,
+        )
+        .await;
+    let counts = world
+        .wait_counts("the phone's new manifest", |c| c.version == 2)
+        .await;
+    assert_eq!(
+        counts.identifiers,
+        world.identifiers().await,
+        "the counts name as many identifiers as the phone's manifest lists: {counts:?}"
+    );
+    assert_eq!(
+        counts.unknown, 1,
+        "the one record the phone rewrote is new here: {counts:?}"
+    );
+    assert_eq!(counts.writes, 0, "we wrote nothing: {counts:?}");
+    assert_eq!(world.writes().await, (0, 0), "the server counts no write");
+
+    assert_eq!(core.shutdown().await, Exit::Shutdown);
+    world.harness.shutdown().await.expect("harness shutdown");
+}

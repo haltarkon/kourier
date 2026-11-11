@@ -103,7 +103,7 @@ fn the_card_is_the_profile_name_and_the_shown_number() {
         ("+1555000111x", false),
     ] {
         let d = named(BOB, Some(true), Some(value), Some("Bob"));
-        let link = LinkState::of(&d, true, |n| {
+        let link = LinkState::of(&d, true, None, |n| {
             kourier_backend_api::is_e164(n).then(|| n.to_owned())
         });
         assert_eq!(

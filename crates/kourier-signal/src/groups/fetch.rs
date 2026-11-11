@@ -29,7 +29,7 @@ use crate::proto;
 /// Most log pages one fetch follows.
 const MAX_PAGES: usize = 64;
 /// Timeout of one group request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest group avatar accepted (Desktop's limit is far below).
 const MAX_AVATAR_BYTES: u64 = crate::avatar::MAX_AVATAR_LEN;
 
@@ -78,18 +78,22 @@ fn request(
 }
 
 /// A non-success answer: 401 forgets the credentials; everything else is a status error.
-fn status_error<T: SignalTransport>(shared: &Shared<T>, status: StatusCode) -> Result<Error> {
+pub(super) fn status_error<T: SignalTransport>(
+    shared: &Shared<T>,
+    what: &'static str,
+    status: StatusCode,
+) -> Result<Error> {
     if status == StatusCode::UNAUTHORIZED {
         shared.db.zone(|tx| credentials::forget(tx))?;
     }
     Ok(Error::Status {
-        what: "group fetch",
+        what,
         status: status.as_u16(),
     })
 }
 
 /// `GET /v2/groups`: the current state.
-async fn state<T: SignalTransport>(
+pub(super) async fn state<T: SignalTransport>(
     shared: &Shared<T>,
     auth: &HeaderValue,
     endorsements_expire_at: Option<i64>,
@@ -115,7 +119,7 @@ async fn state<T: SignalTransport>(
         }
         StatusCode::FORBIDDEN => Ok(Fetched::NotMember),
         StatusCode::NOT_FOUND => Ok(Fetched::Gone),
-        status => Err(status_error(shared, status)?),
+        status => Err(status_error(shared, "group fetch", status)?),
     }
 }
 
@@ -170,7 +174,7 @@ pub(crate) async fn fetch<T: SignalTransport>(
             // tells which.
             StatusCode::FORBIDDEN => return state(shared, &auth, endorsements_expire_at).await,
             StatusCode::NOT_FOUND => return Ok(Fetched::Gone),
-            status => return Err(status_error(shared, status)?),
+            status => return Err(status_error(shared, "group fetch", status)?),
         };
         let page = proto::GroupChanges::decode(&response.body[..])
             .map_err(|_| Error::Decode("group logs"))?;

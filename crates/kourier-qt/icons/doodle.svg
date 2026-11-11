@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="480" height="480" viewBox="0 0 480 480">
+<defs>
+<g id="plane"><path d="M3 21 37 6 27 35 18 25Z"/><path d="M37 6 18 25v9l5-5"/></g>
+<g id="letter"><rect x="4" y="9" width="32" height="23" rx="2.5"/><path d="M5 11l15 12 15-12"/></g>
+<g id="stamp"><path d="M7 5 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 h0.70 a1.3 1.3 0 0 0 2.6 0 h0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 v0.70 a1.3 1.3 0 0 0 0 2.6 v0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 h-0.70 a1.3 1.3 0 0 0 -2.6 0 h-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70 v-0.70 a1.3 1.3 0 0 0 0 -2.6 v-0.70Z"/><path d="M12 28l5-8 4 5 3-3 5 6"/><circle cx="25" cy="13" r="2.6"/></g>
+<g id="star"><path d="M20.0 6.0 L23.8 15.8 L34.3 16.4 L26.1 23.0 L28.8 33.1 L20.0 27.4 L11.2 33.1 L13.9 23.0 L5.7 16.4 L16.2 15.8Z"/></g>
+<g id="spark"><path d="M20 5Q21.5 18.5 35 20 21.5 21.5 20 35 18.5 21.5 5 20 18.5 18.5 20 5Z"/></g>
+<g id="postmark"><circle cx="16" cy="20" r="12"/><circle cx="16" cy="20" r="7.5"/><path d="M26 11q3-2 6 0t6 0M28.5 17q3-2 6 0t3.5 0M28.5 23q3-2 6 0t3.5 0M26 29q3-2 6 0t6 0"/></g>
+<g id="bubble"><path d="M8 7h24a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4H19l-8 7v-7H8a4 4 0 0 1-4-4V11a4 4 0 0 1 4-4Z"/><path d="M13 18h.01M20 18h.01M27 18h.01"/></g>
+<g id="parcel"><path d="M5 13 20 6l15 7v16l-15 7-15-7Z"/><path d="M5 13l15 7 15-7M20 20v16M12.5 9.5l15 7"/></g>
+<g id="feather"><path d="M33 6C21 6 11 14 10 27l-1 3 3-1C25 28 33 19 33 6Z"/><path d="M6 35 25 15M15 25h9M19 19h9"/></g>
+<g id="heart"><path d="M20 34S5 25 5 15a8 8 0 0 1 15-4 8 8 0 0 1 15 4c0 10-15 19-15 19Z"/></g>
+<g id="bird"><path d="M4 23Q12 9 20 21 28 9 36 23"/><path d="M12 30Q16 25 20 29 24 25 28 30"/></g>
+<g id="route"><path stroke-dasharray="1 5" d="M5 33Q8 12 22 18T36 6"/><circle cx="5" cy="33" r="2.4"/></g>
+</defs>
+<g fill="none" stroke="#000" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+<use xlink:href="#stamp" transform="translate(34.8 48.6) rotate(-17) scale(1.02) translate(-20 -20)"/>
+<use xlink:href="#plane" transform="translate(131.1 33.6) rotate(8) scale(0.77) translate(-20 -20)"/>
+<use xlink:href="#parcel" transform="translate(198.1 41.5) rotate(-7) scale(1.00) translate(-20 -20)"/>
+<use xlink:href="#spark" transform="translate(293.2 31.3) rotate(11) scale(0.85) translate(-20 -20)"/>
+<use xlink:href="#route" transform="translate(368.0 31.5) rotate(-19) scale(0.93) translate(-20 -20)"/>
+<use xlink:href="#star" transform="translate(447.9 38.8) rotate(7) scale(0.81) translate(-20 -20)"/>
+<use xlink:href="#heart" transform="translate(51.7 109.2) rotate(-17) scale(0.89) translate(-20 -20)"/>
+<use xlink:href="#letter" transform="translate(126.1 105.6) rotate(6) scale(0.76) translate(-20 -20)"/>
+<use xlink:href="#bird" transform="translate(211.4 133.9) rotate(18) scale(0.80) translate(-20 -20)"/>
+<use xlink:href="#feather" transform="translate(284.5 124.7) rotate(9) scale(0.90) translate(-20 -20)"/>
+<use xlink:href="#bubble" transform="translate(359.8 129.2) rotate(14) scale(0.94) translate(-20 -20)"/>
+<use xlink:href="#postmark" transform="translate(433.1 129.3) rotate(-18) scale(0.85) translate(-20 -20)"/>
+<use xlink:href="#plane" transform="translate(46.3 197.0) rotate(17) scale(0.72) translate(-20 -20)"/>
+<use xlink:href="#star" transform="translate(113.2 207.6) rotate(-4) scale(0.92) translate(-20 -20)"/>
+<use xlink:href="#letter" transform="translate(212.1 192.8) rotate(21) scale(0.91) translate(-20 -20)"/>
+<use xlink:href="#heart" transform="translate(288.6 211.1) rotate(-3) scale(0.81) translate(-20 -20)"/>
+<use xlink:href="#route" transform="translate(365.8 207.9) rotate(2) scale(0.73) translate(-20 -20)"/>
+<use xlink:href="#bird" transform="translate(431.4 209.9) rotate(-12) scale(0.83) translate(-20 -20)"/>
+<use xlink:href="#feather" transform="translate(37.6 272.9) rotate(14) scale(0.86) translate(-20 -20)"/>
+<use xlink:href="#parcel" transform="translate(117.8 279.9) rotate(21) scale(0.85) translate(-20 -20)"/>
+<use xlink:href="#bubble" transform="translate(192.2 277.9) rotate(-11) scale(0.84) translate(-20 -20)"/>
+<use xlink:href="#spark" transform="translate(275.1 276.5) rotate(25) scale(0.78) translate(-20 -20)"/>
+<use xlink:href="#stamp" transform="translate(367.7 291.0) rotate(17) scale(0.88) translate(-20 -20)"/>
+<use xlink:href="#postmark" transform="translate(441.1 276.6) rotate(-4) scale(1.01) translate(-20 -20)"/>
+<use xlink:href="#bird" transform="translate(42.9 355.4) rotate(-3) scale(0.89) translate(-20 -20)"/>
+<use xlink:href="#parcel" transform="translate(127.6 369.1) rotate(7) scale(0.88) translate(-20 -20)"/>
+<use xlink:href="#star" transform="translate(209.0 350.1) rotate(11) scale(0.91) translate(-20 -20)"/>
+<use xlink:href="#heart" transform="translate(275.6 353.0) rotate(9) scale(0.91) translate(-20 -20)"/>
+<use xlink:href="#feather" transform="translate(367.1 361.5) rotate(-21) scale(1.00) translate(-20 -20)"/>
+<use xlink:href="#postmark" transform="translate(442.9 355.8) rotate(10) scale(0.84) translate(-20 -20)"/>
+<use xlink:href="#bubble" transform="translate(49.9 438.1) rotate(20) scale(0.81) translate(-20 -20)"/>
+<use xlink:href="#letter" transform="translate(119.6 449.0) rotate(-9) scale(0.85) translate(-20 -20)"/>
+<use xlink:href="#spark" transform="translate(193.1 444.8) rotate(17) scale(0.99) translate(-20 -20)"/>
+<use xlink:href="#route" transform="translate(293.4 435.9) rotate(2) scale(0.87) translate(-20 -20)"/>
+<use xlink:href="#stamp" transform="translate(366.7 438.4) rotate(27) scale(0.82) translate(-20 -20)"/>
+<use xlink:href="#plane" transform="translate(427.3 430.0) rotate(-19) scale(0.88) translate(-20 -20)"/>
+</g></svg>

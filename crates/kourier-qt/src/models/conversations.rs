@@ -9,7 +9,7 @@ use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 22] = [
+pub const ROLES: [&str; 23] = [
     "conversationId",
     "accountId",
     "title",
@@ -32,6 +32,7 @@ pub const ROLES: [&str; 22] = [
     "previewSource",
     "archived",
     "badgeNumber",
+    "tint",
 ];
 
 /// Rust side of `ConversationListModel`.
@@ -67,6 +68,8 @@ pub struct ConversationQt {
     archived: bool,
     /// The account's place among its network's accounts (0: no number on the badge).
     badge_number: i32,
+    /// The account's color (`#rrggbb`).
+    tint: QString,
 }
 
 fn n(v: u32) -> i32 {
@@ -98,6 +101,7 @@ impl ConversationQt {
             preview_source: QString::from(v.preview_source.as_str()),
             archived: v.archived,
             badge_number: n(v.badge_number),
+            tint: QString::from(v.tint.as_str()),
         }
     }
 
@@ -124,6 +128,7 @@ impl ConversationQt {
             .with_if(19, a.preview_source != b.preview_source)
             .with_if(20, a.archived != b.archived)
             .with_if(21, a.badge_number != b.badge_number)
+            .with_if(22, a.tint != b.tint)
     }
 
     fn key(v: &ConversationRow) -> ConversationId {
@@ -160,7 +165,8 @@ impl qobject::ConversationListModel {
             18 => QVariant::from(&r.is_self),
             19 => QVariant::from(&r.preview_source),
             20 => QVariant::from(&r.archived),
-            _ => QVariant::from(&r.badge_number),
+            21 => QVariant::from(&r.badge_number),
+            _ => QVariant::from(&r.tint),
         }
     }
 

@@ -46,6 +46,7 @@ fn detail(members: Vec<GroupMember>) -> GroupDetail {
         },
         blocked: false,
         members,
+        invites: kourier_model::GroupInvites::None,
     }
 }
 

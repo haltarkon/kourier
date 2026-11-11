@@ -841,6 +841,14 @@ impl IngestHarness {
         query::person(&self.conn, self.account, user)
     }
 
+    /// Who a chat or an account stands for, as the facade resolves `Query::PersonOf`.
+    pub fn person_of(
+        &self,
+        target: crate::facade::PersonRef,
+    ) -> Result<Option<(AccountId, UserId)>> {
+        query::person_of(&self.conn, target)
+    }
+
     /// One group for its page, as the facade answers `Query::Group`.
     pub fn group(
         &self,

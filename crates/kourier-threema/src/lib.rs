@@ -20,10 +20,7 @@
 //!
 //! THE SEND CORE (TH6a, `send`'s module doc): the Bundled Messages Send Steps as a persistent queue of sealed rows,
 //! resumed by window, with the contract's answers, the cooling of a row the server will not take and the user's clear
-//! of what is unsent. NOTHING IN A REAL BUILD REACHES IT: a `Command::Transmit` is refused (`Failed(unsupported)`)
-//! unless the parts carry the doc-hidden test door, which only tests make (`tests/builder.rs` rules 13 and 15), and
-//! every chat says it cannot be sent in (`CannotSend::NotYetBuilt`). So a real build still sends nothing, and the
-//! first real send waits for the steps after this one. libthreema types stay inside this crate: no public item names
+//! of what is unsent. Since TH8 every chat can be sent in: a text, or one file per message (`send::files`). libthreema types stay inside this crate: no public item names
 //! one.
 //!
 //! WHAT CAN CONTACT THREEMA. Building the network, or calling a maker, dials nothing: every WebSocket
@@ -31,12 +28,11 @@
 //! thread, only for an account with a stored identity that connects, or for a link that passed the
 //! gate of `StartLogin` (B1: an EMPTY [`AllowList`] fails the login at step `qr` before the maker is
 //! called). `dial/` holds the REAL connectors and the application's one entry to them; only
-//! `kourier-app` makes them, and it registers Threema in a debug build only. Kourier links Threema
-//! only in a prepared run profile (a kept profile under `<data>/kourier-threema-run/` with a
-//! `threema-allowed-ids` file): that list of test IDs is the one gate before the first socket of a
-//! link, and the ID check at `EssentialData` is the second line; a plain debug start does not even list
-//! Threema and a release build never does. Tests hand in parts that refuse and count, or the offline
-//! fake.
+//! `kourier-app` makes them. A normal start of the application has Threema on and takes any ID
+//! ([`AllowList::any`]); a start by the run tool links only in a prepared run profile (a kept profile
+//! under `<data>/kourier-threema-run/` with a `threema-allowed-ids` file): that list of test IDs is the
+//! one gate before the first socket of a link, and the ID check at `EssentialData` is the second line.
+//! Tests hand in parts that refuse and count, or the offline fake.
 //!
 //! Modules:
 //! - `network`: [`ThreemaNetwork`], the descriptor, the device label and the id of an own message;
@@ -89,6 +85,7 @@
 
 mod actor;
 mod allow;
+mod blob;
 #[doc(hidden)]
 pub mod close;
 mod conn;
@@ -102,6 +99,7 @@ mod msg_id;
 mod network;
 mod outbox;
 mod parts;
+mod pictures;
 mod proto;
 mod reflect;
 mod send;

@@ -47,6 +47,7 @@ pub mod person;
 pub mod preview;
 pub mod readmore;
 pub mod richtext;
+pub mod roaming;
 pub mod safety;
 pub mod save_name;
 pub mod share;
@@ -76,6 +77,10 @@ pub use login::{LoginView, LoginViewKind, NetworkChoice, NetworkEntry, NetworkMi
 pub use names::{NameMap, Names};
 pub use readmore::ReadMore;
 pub use richtext::{RichText, Span16};
+pub use roaming::{
+    AccountFacts, ChatOffer, ChatTold, LocalPick, MuteChoice, local_to_ms, mute_end,
+    offer_in_account, offer_of, until_allowed, until_start,
+};
 pub use shown_accounts::ShownAccounts;
 pub use source::{
     EmptySource, FinishedSend, FixtureSource, MediaAnswer, RefusedSend, ReplaceNews, ReturnedFile,

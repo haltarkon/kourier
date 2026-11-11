@@ -17,8 +17,8 @@ use wacore::store::traits::DeviceStore;
 use whatsapp_rust::GroupMetadataResult;
 
 use super::{
-    AskFailure, Outgoing, PairCodeFailure, ReadKind, Receive, Released, SendFailure, Session,
-    SessionFactory, UploadFailure, Uploaded, Wiring,
+    AskFailure, DownloadFailure, Outgoing, PairCodeFailure, PictureAnswer, ReadKind, Receive,
+    Released, SendFailure, Session, SessionFactory, UploadFailure, Uploaded, Wiring,
 };
 use crate::appstate::ResyncReport;
 use crate::send::address::Namespace;
@@ -58,6 +58,10 @@ pub(crate) enum Call {
     PrivacyKnown,
     /// A file was handed to the upload (W5b), under this shape's upload type.
     Upload(Shape),
+    /// A file was asked for (W7).
+    Download,
+    /// A profile picture was looked up (W8), naming this id of the one already held.
+    Picture(Option<String>),
     /// A snapshot of these collections was asked for (W6a1, the start-up resync).
     Resync(Vec<String>),
     /// The overview of every group was asked for (W6a2, B3): one IQ.
@@ -69,6 +73,10 @@ pub(crate) enum Call {
     FetchGroup,
     /// The phone's blocklist was asked for (W6a2, B3): one IQ.
     Blocklist,
+    /// A group's invite link was asked for, `reset` replacing it first.
+    GroupInvite {
+        reset: bool,
+    },
 }
 
 /// Where the double's `upload` stands still while a gate is set ([`FakeSession::hold_uploads`]).
@@ -172,6 +180,8 @@ pub(crate) struct FakeSession {
     fetched: Mutex<Vec<Vec<wacore_binary::Jid>>>,
     /// The answers of `fetch_group`, one per call (`NotFound` when none is left).
     singles: Mutex<VecDeque<Result<GroupMetadataResult, AskFailure>>>,
+    /// The answers of `group_invite_link`, one per call (`NotConnected` when none is left).
+    invite_links: Mutex<VecDeque<Result<String, AskFailure>>>,
     /// The groups every `fetch_group` was asked for, in order.
     fetched_single: Mutex<Vec<wacore_binary::Jid>>,
     /// The answers of `blocklist`, one per call (an empty list when none is left).
@@ -179,6 +189,10 @@ pub(crate) struct FakeSession {
     /// The answers of `upload` after its read, one per call (the CDN's pointer when none is left).
     upload_answers: Mutex<VecDeque<Result<(), UploadFailure>>>,
     /// While set, `upload` stands still at the place it names until a permit of the gate.
+    /// What the next picture lookups give, in order (after them: [`AskFailure::NotConnected`]).
+    pictures: Mutex<std::collections::VecDeque<Result<PictureAnswer, AskFailure>>>,
+    /// What the next `download`s give, in order (after them: [`DownloadFailure::Unreachable`]).
+    downloads: Mutex<std::collections::VecDeque<Result<Vec<u8>, DownloadFailure>>>,
     upload_gate: Mutex<Option<(Arc<tokio::sync::Notify>, UploadHold)>>,
     /// Every upload whose source read to its end, in order.
     uploads: Mutex<Vec<UploadSeen>>,
@@ -195,6 +209,16 @@ impl FakeSession {
     /// when none is left). A source whose read fails answers `Incomplete` whatever is scripted.
     pub(crate) fn script_upload(&self, answer: Result<(), UploadFailure>) {
         self.upload_answers.lock().expect("lock").push_back(answer);
+    }
+
+    /// What the next picture lookup gives (one entry per call; [`AskFailure::NotConnected`] when none is left).
+    pub(crate) fn script_picture(&self, answer: Result<PictureAnswer, AskFailure>) {
+        self.pictures.lock().expect("lock").push_back(answer);
+    }
+
+    /// What the next `download` gives (one entry per call; [`DownloadFailure::Unreachable`] when none is left).
+    pub(crate) fn script_download(&self, answer: Result<Vec<u8>, DownloadFailure>) {
+        self.downloads.lock().expect("lock").push_back(answer);
     }
 
     /// From now on every `upload` stands still at `at` until a permit of the returned gate.
@@ -260,6 +284,12 @@ impl FakeSession {
     /// The next `fetch_group` answers `answer` (one entry per call; `NotFound` when none is left).
     pub(crate) fn script_group(&self, answer: Result<GroupMetadataResult, AskFailure>) {
         self.singles.lock().expect("lock").push_back(answer);
+    }
+
+    /// The next `group_invite_link` answers `answer` (one entry per call; `NotConnected` when
+    /// none is left).
+    pub(crate) fn script_invite_link(&self, answer: Result<String, AskFailure>) {
+        self.invite_links.lock().expect("lock").push_back(answer);
     }
 
     /// The groups every `fetch_group` was asked for, in order.
@@ -556,6 +586,32 @@ impl Session for FakeSession {
             .unwrap_or(Ok(()))
     }
 
+    async fn profile_picture(
+        &self,
+        _chat: wacore_binary::Jid,
+        _group: bool,
+        known: Option<String>,
+    ) -> Result<PictureAnswer, AskFailure> {
+        self.record(Call::Picture(known));
+        self.pictures
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or(Err(AskFailure::NotConnected))
+    }
+
+    async fn download(
+        &self,
+        _params: whatsapp_rust::download::DownloadParams,
+        mut sink: crate::download::BlobSink,
+    ) -> Result<crate::download::BlobSink, DownloadFailure> {
+        self.record(Call::Download);
+        let answer = self.downloads.lock().expect("lock").pop_front();
+        let bytes = answer.unwrap_or(Err(DownloadFailure::Unreachable))?;
+        std::io::Write::write_all(&mut sink, &bytes).map_err(|_| DownloadFailure::Sink)?;
+        Ok(sink)
+    }
+
     async fn upload(
         &self,
         source: SealedSource,
@@ -736,6 +792,19 @@ impl Session for FakeSession {
             .unwrap_or_else(|| Ok(Vec::new()))
     }
 
+    async fn group_invite_link(
+        &self,
+        _group: wacore_binary::Jid,
+        reset: bool,
+    ) -> Result<String, AskFailure> {
+        self.record(Call::GroupInvite { reset });
+        self.invite_links
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or(Err(AskFailure::NotConnected))
+    }
+
     async fn fetch_group(
         &self,
         group: wacore_binary::Jid,
@@ -865,6 +934,12 @@ impl FakeSession {
             release_pending: AtomicBool::new(false),
             sends: Mutex::new(std::mem::take(&mut *scripted.sends.lock().expect("lock"))),
             sent: Mutex::new(Vec::new()),
+            downloads: Mutex::new(std::mem::take(
+                &mut *scripted.downloads.lock().expect("lock"),
+            )),
+            pictures: Mutex::new(std::mem::take(
+                &mut *scripted.pictures.lock().expect("lock"),
+            )),
             receipts: Mutex::new(Vec::new()),
             typed: Mutex::new(Vec::new()),
             receipt_answers: Mutex::new(std::mem::take(
@@ -883,6 +958,9 @@ impl FakeSession {
             batches: Mutex::new(std::mem::take(&mut *scripted.batches.lock().expect("lock"))),
             fetched: Mutex::new(Vec::new()),
             singles: Mutex::new(std::mem::take(&mut *scripted.singles.lock().expect("lock"))),
+            invite_links: Mutex::new(std::mem::take(
+                &mut *scripted.invite_links.lock().expect("lock"),
+            )),
             fetched_single: Mutex::new(Vec::new()),
             blocklists: Mutex::new(std::mem::take(
                 &mut *scripted.blocklists.lock().expect("lock"),

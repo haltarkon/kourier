@@ -27,6 +27,7 @@ pub(crate) mod credentials;
 pub(crate) mod decode;
 pub(crate) mod endorsements;
 pub(crate) mod fetch;
+pub(crate) mod invite;
 pub(crate) mod lane;
 
 #[cfg(test)]
@@ -194,6 +195,12 @@ pub(crate) struct Access {
 }
 
 impl Access {
+    /// Joining by the invite link is on (with or without an administrator's approval).
+    pub(crate) fn invite_link_on(&self) -> bool {
+        self.add_from_invite_link == invite::ACCESS_ANY
+            || self.add_from_invite_link == ACCESS_ADMINISTRATOR
+    }
+
     /// Only administrators may change the title, avatar, timer and description.
     pub(crate) fn attributes_admin_only(&self) -> bool {
         self.attributes == ACCESS_ADMINISTRATOR

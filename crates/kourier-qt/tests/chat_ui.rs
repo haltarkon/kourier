@@ -1831,6 +1831,7 @@ MainWindow {
                 if (!about || !about.visible || about.text.length === 0) return win.fail("the about text is not shown");
                 const number = win.inPanel("detailsNumber");
                 if (!number || !number.visible || number.text.length === 0) return win.fail("the number she shares is not shown");
+                if (number.button !== true || name.button !== false) return win.fail("the copy button stands by the number, not by the name");
                 if (!win.inPanel("detailsTimer").visible) return win.fail("the disappearing-message part is not shown");
                 const groups = win.findAll(panel, c => c.objectName === "detailsGroup" && c.visible);
                 if (groups.length < 2 || groups.length !== Math.min(5, App.person.groups.length)) return win.fail("the groups in common: " + groups.length + " of " + App.person.groups.length);
@@ -1877,20 +1878,20 @@ MainWindow {
                 // fixture's about text is short enough to need no "More", which would be another stop.)
                 if (!win.shown("detailsAbout") || win.shown("detailsAboutMore")) return win.fail("the person page needs an about text that fits its three lines, whose one stop the Tab count is made for");
                 win.inPanel("detailsClose").forceActiveFocus();
-                // (18 presses, one whole cycle of the page since F1's about text (17 with P5c's "Share Contact…", 16 with
+                // (19 presses, one whole cycle of the page since the copy button by the number (18 with F1's about text, 17 with P5c's "Share Contact…", 16 with
                 // P5b's "Copy Link", 15 with P5a's "View Safety Number", 14 in P4): the walk ends on the close button again,
                 // where the count of Tab presses below starts.)
-                for (let i = 0; i < 18; i++) {
+                for (let i = 0; i < 19; i++) {
                     win.key(Qt.Key_Backtab, Qt.ShiftModifier);
                     if (win.inChat(win.activeFocusItem)) return win.fail("Shift+Tab reached the covered chat (" + win.focusName() + ", press " + (i + 1) + ")");
                 }
                 win.chat.panel.forceActiveFocus();
-                // (34 presses, not 24: the media part of the person page has one more stop, "All Media and Files" (P4: 26),
-                // P5a adds "View Safety Number" (28), P5b "Copy Link" (30), P5c "Share Contact…" (32) and F1 the about text,
-                // so the cycle is 18 stops and 34 ends on the same item as 24 did in 13 (count = 2 x cycle - 2): the first
-                // unnamed toolbar item after the header, where the Space typed below is harmless.)
+                // (36 presses, not 24: the media part of the person page has one more stop, "All Media and Files" (P4: 26),
+                // P5a adds "View Safety Number" (28), P5b "Copy Link" (30), P5c "Share Contact…" (32), F1 the about text (34)
+                // and the copy button by the number (36), so the cycle is 19 stops and 36 ends on the same item as 24 did in 13
+                // (count = 2 x cycle - 2): the first unnamed toolbar item after the header, where the Space typed below is harmless.)
                 const names = [];
-                for (let i = 0; i < 34; i++) {
+                for (let i = 0; i < 36; i++) {
                     win.key(Qt.Key_Tab, Qt.NoModifier);
                     names.push(win.focusName());
                     if (win.inChat(win.activeFocusItem)) return win.fail("Tab reached the covered chat (" + win.focusName() + ", press " + (i + 1) + ")");
@@ -1899,7 +1900,7 @@ MainWindow {
                 // later in `groupTabs` after the typed Space closed the panel.
                 const endsOn = names[names.length - 1];
                 const after = names[names.length - 2];
-                if (names.length !== 34 || after !== "chatHeader" || endsOn !== "(unnamed)") return win.fail(names.length + " presses of Tab end on '" + endsOn + "' after '" + after + "', not on the unnamed item right after chatHeader, where the count of 34 was made; the cycle of the page is: " + names.slice(0, 20).join(", "));
+                if (names.length !== 36 || after !== "chatHeader" || endsOn !== "(unnamed)") return win.fail(names.length + " presses of Tab end on '" + endsOn + "' after '" + after + "', not on the unnamed item right after chatHeader, where the count of 36 was made; the cycle of the page is: " + names.slice(0, 20).join(", "));
                 // Typing wherever the keyboard is does not write into the composer under the panel.
                 for (const k of [Qt.Key_H, Qt.Key_I, Qt.Key_Space]) win.key(k, Qt.NoModifier);
                 if (win.composerItem.text !== before) return win.fail("typed text landed in the covered composer");
@@ -4294,6 +4295,8 @@ MainWindow {
                     // (F1: the about text is one stop, before its "More".)
                     if (win.shown("detailsAbout")) want.push("detailsAboutText");
                     if (win.shown("detailsAboutMore")) want.push("detailsAboutMore");
+                    // (The copy button by the number or ID, a stop of its own.)
+                    if (win.shown("copyButton")) want.push("copyButton");
                     if (win.shown("detailsTimerBox")) want.push("detailsTimerBox");
                     want.push("detailsSafety");
                     // (P5b: "Copy Link" right under it, a stop when it is enabled: a disabled button takes no Tab.)

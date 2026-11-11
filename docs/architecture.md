@@ -285,7 +285,7 @@ is in the release gate now: §14.2 item 14.)
 | `kourier-whatsapp` | WhatsApp backend (§7.1): the store contract of whatsapp-rust over `backend.db` (W1), the link and the connection of one account (W2a), the pre-pair refusal of a wrong phone (W2c), the receive path (W3a), the history at the link (W4), the send path (W5a), the media send (W5b), the phone's chat settings and calls from app state (W6a1) and the groups and people (W6a2: the group fetch, roles, names, the address book, merges, admin deletes and the 1:1 timer set); registered by `kourier-app` from W2b (debug builds, while turned on) | model, backend-api, db, blob, media (W5b: the core's encrypted files, the sealed temporary upload file, the re-encode of pictures) | whatsapp-rust, whatsapp-rust-tokio-transport, whatsapp-rust-ureq-http-client, wacore, wacore-binary, waproto (ONE git rev, `default-features = false`), tokio, tokio-util, ureq 3 (rustls only: Kourier's own HTTPS agent, W5b) | core, app, desktop, Qt, other backends |
 | `kourier-telegram` | Telegram backend (§7.5): `TelegramNetwork`, the account actor (an explicit arm for every `Command`), its `backend.db` (component `telegram`), the app's end of the helper protocol (`link`), the required seam `TgParts` that only `kourier-app` fills (`real::helper_parts`; the pinned TDLib it expects, `pin::PIN`, with the patch tag); the SOCKS5 gate (`gate/`), the helper supervisor (start to WaitPhoneNumber, stop, back-off, watchdog); TG-2: the login machine (TDLib's auth states -> login steps, QR first), the session (connection states, the freeze hold, logout), presence and network hints, `AccountReady` through `core_outbox`; TG-3: the receive path (backend.db schema 2, the chat and message machines, the sync lane, the start sync, the reconcile of gaps, group-committed rows shipped through `core_outbox`, the read act, the clean stop's drain; sends nothing yet); the app reads an API pair only in a debug build inside a kept run profile; the gate refuses every dial unless the run tool's one-shot confirmation stands (§7.5, "The dialing mode and the run tool"). Test only (TD-4a): the fake-DC cases and the recording cases (`supervisor/tests/fakedc*`, `testdata/rec-*.jsonl`) over `fakedc/`, the fake data centre, a workspace of its own (never a member, never in a shipped binary) | model, backend-api, db, tdlib | tokio, tokio-util, serde, serde_json, thiserror, tracing, hkdf, sha2, base64, rand, zeroize | core, app, desktop, Qt, other backends |
 | `kourier-tdlib` | The TDLib helper (lib + bin): the frame protocol, the serve loop (log and proxy hardening, one receiver, a control queue, heartbeat, one closer), `dlopen` of the pinned `libtdjson` (the one file naming TDLib's entry points), `spawn` (the one file naming a process command), the lock-down (`lockdown`: seccomp, Landlock network, scopes and filesystem, raw syscalls; `harden`: the core limit {1, 1} and the dumpable rule), the offline test child (`spawn::run_self_offline`), the fake DC's start inside it (`spawn::spawn_offline_companion`) and the trap listeners (`traps`), all behind the cargo feature `test-support` that only dev-dependencies turn on; feature `scripted`: a scripted TDLib with TDLib's request parking | — | libc, serde, serde_json | every other Kourier crate |
-| `kourier-threema` | Threema backend (§7.2, §7.4): the account's `backend.db` (schema component `threema`: schema 1 the identity row and the CSP and D2D nonce stores, schema 2 what a device join imports and the `join_ready` marker, schema 3 the `deferred` envelopes, schema 4 the send queue, sealed, schema 5 the messages the leader took from the chat server), the parts (`ThreemaParts`: the crate's own WebSocket and HTTPS traits, made lazily, with the allow-list of test IDs and the host name), `dial` (the one module that names the real connectors: pinned TLS, WebSocket, HTTPS; the application's entry to them), the connection to the mediator and the chat server (TH3), the device join by QR code (TH4: the rendezvous, the three emoji, the import in two zones), the follower's receive (TH5a, TH5b), the send core (TH6a), which nothing in a real build reaches, so a real build still sends no message, and the leader's receive (TH6: the unblock and the H1 guard, the receive steps with their holds, the directory and the CONTACT_SYNC transaction, the jobs), which a real socket reaches only in a prepared run profile; registered by `kourier-app` in debug builds only, while turned on, and listed only in a prepared run profile (§7.4) | model, backend-api, db (dev: fake) | libthreema (vendored at `third_party/libthreema`, path dependency, `default-features = false`; only this crate may name it), tokio, tokio-util, async-trait, async-channel, zeroize, prost (build: prost-build), rand, sha2, base64; only in `dial`: rustls with ring, tokio-rustls, webpki-roots, tokio-tungstenite, reqwest, http | core, app, desktop, Qt, other backends |
+| `kourier-threema` | Threema backend (§7.2, §7.4): the account's `backend.db` (schema component `threema`: schema 1 the identity row and the CSP and D2D nonce stores, schema 2 what a device join imports and the `join_ready` marker, schema 3 the `deferred` envelopes, schema 4 the send queue, sealed, schema 5 the messages the leader took from the chat server, schema 6 TH8's profile pictures), the parts (`ThreemaParts`: the crate's own WebSocket and HTTPS traits, made lazily, with the allow-list of test IDs and the host name), `dial` (the one module that names the real connectors: pinned TLS, WebSocket, HTTPS; the application's entry to them), the connection to the mediator and the chat server (TH3), the device join by QR code (TH4: the rendezvous, the three emoji, the import in two zones), the follower's receive (TH5a, TH5b), the send core (TH6a), which nothing in a real build reaches, so a real build still sends no message, and the leader's receive (TH6: the unblock and the H1 guard, the receive steps with their holds, the directory and the CONTACT_SYNC transaction, the jobs), which a real socket reaches only in a prepared run profile; registered by `kourier-app` in debug builds only, while turned on, and listed only in a prepared run profile (§7.4) | model, backend-api, db (dev: fake) | libthreema (vendored at `third_party/libthreema`, path dependency, `default-features = false`; only this crate may name it), tokio, tokio-util, async-trait, async-channel, zeroize, prost (build: prost-build), rand, sha2, base64; only in `dial`: rustls with ring, tokio-rustls, webpki-roots, tokio-tungstenite, reqwest, http | core, app, desktop, Qt, other backends |
 | `kourier-desktop` | zbus notification client (inline reply, activation token), `org.freedesktop.Application` single-instance server, tray (ksni), Secret Service (oo7), autostart file, logind `PrepareForSleep` and NetworkManager watchers | — | zbus 5, oo7 0.6, ksni (git) | core, Qt, protocol crates |
 | `kourier-app` | Composition root: tokio runtime, XDG paths, master key and per-account key wraps (§5.2), registry of compiled-in networks (cargo features `signal`, `fake`, `whatsapp`, `telegram`, `threema`; WhatsApp, Telegram and Threema are registered by a debug build only, §7.1, §7.4, §7.5), wiring of core + desktop; `AppHandle` and the media handle table for the UI (§8.6); the walk and the .zip of a folder given to the composer (`folders`, §8.3) | core, backend-api, model, desktop, blob, signal (feature), whatsapp (feature), telegram (feature), threema (feature), fake (feature) | tokio, tracing-subscriber, zip | Qt |
 | `kourier-viewmodel` | Qt-free UI projections: conversation rows, message rows with grouping flags, diff engine → `ListOp`, timestamp and preview formatting, typing text | core (`facade` module only), model | — | Qt, backend crates, `kourier_core` internals |
@@ -1073,6 +1073,9 @@ sharing.
    the build changed) is deleted by the core and not sent: no row is resent for ever; a clear
    whose account's caps this build cannot READ is kept, unsent, for a later start that can read
    them.
+   The UI offers the four roaming changes only through what the core states (`ConversationRow.roaming`,
+   `AccountRow`, §8.3): QML decides none of it, and a refusal the backend makes (a pin over the account's
+   limit, `TooLarge`, §4.2) is worded like the core's own.
 5. **Backends own their protocol view.** Sessions, keys, group secrets, nonce stores and
    decrypted-but-unprocessed envelopes live in the backend's `backend.db`; the core never reads it.
 6. **Transactional outbox (contract rule for every backend).** Every `backend.db` transaction that
@@ -1119,6 +1122,10 @@ pub trait Network: Send + Sync + 'static {
     /// default None). The result holds a third party's number: never a log field.
     fn contact_links(&self) -> bool;
     fn contact_link(&self, user: &UserId, number: &str) -> Option<String>;
+    /// Group invite links (copy-and-links): what an administrator can do with them here (default
+    /// `GroupInvites::None`: the group's page has no invite part; `Reset`: the link always stands;
+    /// `Switch`: it can also be off).
+    fn group_invites(&self) -> GroupInvites;
     /// Spawns the per-account actor (Signal: own OS thread + current_thread runtime + LocalSet).
     fn spawn(&self, ctx: AccountContext) -> Result<AccountHandle, BackendError>;
 }
@@ -1432,6 +1439,10 @@ Notes:
   does not show too) and is the real limit. The second line reads the account's caps strictly: a
   value this build cannot read refuses the click (the safe side), while the STATE the queries show
   treats such an account as one that states nothing (`Hidden`, §8.3).
+- `ErrorKind::TooLarge` on `ChangeConversation { SetPinned { pinned: true } }` means the account's pin limit. A
+  backend answers it for a pin the core could not count, because the network lists a chat the core does not; the
+  viewmodel words it as the core's own `Refusal::TooMany`: "You can pin up to N chats.". Signal:
+  `storage::intents::Refused::TooManyPins`.
 - Timer rows: the backend writes the `TimerChanged` timeline row for own changes and for incoming
   ones (`by: None` = our own account); the core never writes one and changes a conversation's
   timer only from the patch. For an own `SetTimer` the backend uses `id` as the id of the update
@@ -1480,7 +1491,9 @@ Notes:
   the number (`e164:` / `pn:`, `+` added); `Some(false)` -> `NotShared` (Signal states `false` also for a profile
   never fetched, so its sentence says only "not shown", Z1); `None` (never said, a profile not fetched yet) or a number
   the network does not link -> `NoNumber` (never a claim that the person does not share, critic F20); a network without
-  links and the user's own page (read-only, BQ-4) -> `Hidden`. Signal's only form is `#p/+E164` (`is_e164`: `+` and 7 to
+  links -> `Hidden`; the user's own page has a link when the own number or ID makes one (copy-and-links, 2026-11-09;
+  BQ-4 kept it read-only before), else `Hidden`. A network whose people have a link by ID (`contact_id_link`, Threema's
+  `https://threema.id/<ID>`) needs no number rule: `Link` at once. Signal's only form is `#p/+E164` (`is_e164`: `+` and 7 to
   15 digits, the log scrubber's bound, Z2: Niue's 7-digit numbers link): the `#eu/` username link needs entropy only its
   owner has. `Debug` hides the link; no log field carries it.
 - Share Contact (people pages P5c, 2026-10-26): `UiCommand::SendContact { conv, account, user }` sends `user`'s contact
@@ -3591,6 +3604,11 @@ every row ≤ boundary acked by the core → ConnState::Online; resume side-effe
   decides are queued (a chat the manifest does not list, a record this build cannot read) or no
   manifest exists, the job looks again in an hour; a fetched manifest older than the merged version (a
   server rollback) lands the write without storing its records until the next newer manifest.
+- **Counts for the real check (A10d).** The process keeps the counts of what it saw: the newest manifest's version
+  and identifier count, the identifiers with no record in `backend.db`, and our writes answered 200
+  (`kourier_signal::storage_counts`, memory only, no zone and no await). The debug-only dev control shows them as
+  `state.storage` and `cargo xtask smoke state` as its `storage:` line (`.claude/rules/dev-runs.md`). Nothing reads them in
+  the product.
 
 ### 6.10 Profiles
 
@@ -3965,7 +3983,7 @@ Log lines (D10): Kourier's new lines carry counts, arrival numbers and error kin
 | Ids | `msg_id_scope: Conversation`; `local` = u64 hex; reactions, quotes and receipts carry only the u64, so the backend emits `TargetAuthor::Unknown` and the core resolves within the conversation (as Threema Desktop's `getMessage(messageId)`, `TD/apps/desktop/src/common/network/protocol/task/common/message-reaction.ts:56`) |
 | Send | As built (TH6a, the send core; nothing in a real build reaches it): `allocate_message_id` = random u64 (`local` is the id); a `Transmit` is the Bundled Messages Send Steps over a persistent queue in `backend.db` schema 4 (`send_task`, `send_receiver`), SEALED ONCE and resumed by window. ZONE PREPARE (the task, one sealed box per receiver, the sealed reflect, every nonce; its commit is the point of no return) → reflect `OutgoingMessage` → its ack → ZONE REFLECTED → the boxes of every pending receiver in one pass → their acks → ZONE ACKS (per pass; the last one seals the `Sent` update) → reflect the update → its ack → ZONE DONE. A frame goes only after the zone that holds its bytes, an answer only after the zone that makes it true; a resend after a kill writes the stored bytes, byte for byte, and only where the outcome is not durable (a receiver with a durable ack gets nothing, after `done` no frame goes), so the peer opens one message per receiver and the phone maps one `OutgoingMessage`. A follower sends (no leader gate); a `transmit` row runs from the login-ack while the core's `Transmit` waits on it, a `job` row (the backend's own: a receipt, a creator's answer, from TH6) at `Online`, one row at a time. No ack in 60 s ends the socket (close 1000, through the backoff); a row whose frames stood unanswered at such an end or at the server's close has a failed run, the first is free and from the second it cools (2 min, doubling, 15 min), later rows go, and a job gives up at 12; the account never reaches `NeedsUserAction` through a row. Outcomes are read from the rows: `Sent { server_at }` when every receiver the core asked for is acked and the update is acked (blocked receivers are unnamed and count as sent, a notes group sends nothing but the reflects), `Partial` for a socket lost between receivers or an `invalid` (`PeerUnregistered`) or `no-key` (`Unsupported`) receiver, `Failed(Transient)` otherwise, `only` honoured; a second `Transmit` of a `local` finds its row and writes no frame. The user's clear deletes the chat's unsent rows. Plain text only; replies, expiry, ranges, files, edits, reactions and lists are TH7; the directory call and the transactions are the leader's (the Receive (leader) row), and the receipts and the other jobs (TH6) ride this queue. Design for the rest: groups are client-side fan-out and may end `Partial`; distribution lists send 1:1 copies and emit per-member `Message{linked_local}` (§4.2) |
 | Roaming state | As received (TH5a): the phone's archive, pin, mute and protected flag ride on the `ConversationUpsert` of every chat (QC: "only when mentioned" counts as not muted; not changeable here until TH9). Design: every contact/group/settings/profile change is a D2M transaction inside the backend (`ChangeConversation`, `ChangeContact`, `ChangeAccountSettings`, `ChangeProfile`); the core applies it only from the resulting events (principle 4.1.4) |
-| Features | As built (TH5a): receive windows OPEN for edit and delete (`Window { None, None }`: the spec says the receiver will always accept), the SEND side off until TH7 (no edit, delete for everyone, reply or reaction offered; `cannot_send: NotYetBuilt` on every Threema chat, so the composer says sending comes in a later version), `reactions_per_user: None` (a set), and `files` for every attachment kind with a caption and no size limit (TH5b, only so the core takes a received caption edit; sending stays off). Design for TH7: 6-hour edit/delete windows on send, receipts 1:1 only, typing 1:1 only; mentions and quotes are inline markup parsed by the backend (TH5a: `> quote #<id>` and `@[ID]`, `@[@@@@@@@@]`) |
+| Features | TH8 (§13) replaces the send side of this row for text and files: no `cannot_send`, 6,000 bytes of text, files up to 100 MiB with a caption. As built (TH5a): receive windows OPEN for edit and delete (`Window { None, None }`: the spec says the receiver will always accept), the SEND side off until TH7 (no edit, delete for everyone, reply or reaction offered; `cannot_send: NotYetBuilt` on every Threema chat, so the composer says sending comes in a later version), `reactions_per_user: None` (a set), and `files` for every attachment kind with a caption and no size limit (TH5b, only so the core takes a received caption edit; sending stays off). Design for TH7: 6-hour edit/delete windows on send, receipts 1:1 only, typing 1:1 only; mentions and quotes are inline markup parsed by the backend (TH5a: `> quote #<id>` and `@[ID]`, `@[@@@@@@@@]`) |
 
 ### 7.3 What the M1 contract already contains for them (so the core does not change)
 
@@ -4001,8 +4019,15 @@ flavours/OnPrem config in `BackendConfig` (Threema).
   in the lane `lane-threema` (TH1 the crate, the store and the parts; TH2 the offline fake; TH3 the
   connection and the pinned connectors; TH4 the device join; TH5a the follower's receive: messages are received, none is sent)
   behind the cargo feature `threema` of `kourier-app` and `kourier` (in `default`, so ci
-  builds and tests the wiring; `cargo xtask dist` builds `signal,whatsapp` without it).
-  `kourier-app` `threema_registration(build, on, linking)`: a RELEASE build neither registers nor
+  builds and tests the wiring; `cargo xtask dist` builds `signal,whatsapp,threema`).
+  THE USER'S DECISION of 2026-11-09 ("enable Threema by default globally", "Any ID, every build"): a normal start of every build has
+  Threema on until Settings turns it off (`Prefs::with_default_networks`, `networks-off`) and links any ID (`AllowList::any`). What follows
+  is the rule of a start by the run tool only (`KOURIER_THREEMA_RUN`, set by `cargo xtask threema-run`). A start that is
+  NOT the run tool's and is scripted (`--dev-control`, `Launch::Scripted`) or whose profile (`KOURIER_HOME` or the data directory)
+  holds anything at the run tool's `threema-run` name has Threema ABSENT (neither registered nor listed), whatever `networks-on` says
+  (`prefs::ThreemaStart::Shut`; a scripted start or an agent's run can never start a Threema login, and a run profile started by hand
+  never connects its linked account):
+  `kourier-app` `threema_registration(build, start, on, linking)`: a RELEASE build neither registers nor
   lists it; a DEBUG build registers it while `networks-on` names it, and lists it as off only when
   this start can link: `linking` is `kourier_threema::LINKING_BUILT` (true since TH4) AND the start's
   allow-list of test IDs is not empty (E1: an action that does nothing is not shown). Kourier links
@@ -4138,7 +4163,7 @@ flavours/OnPrem config in `BackendConfig` (Threema).
   as a history row, a modifier or a sync as a live event after it, a stranger's row dropped), with a REAL-start actor test and a test of
   the cancelled start. FILES and LOCATIONS: a file is one attachment (image, gif, video, voice or file by the rendering type and the
   media type; the animated flag makes a GIF of an image type only, and a sticker is an image type only, otherwise the file is read as media or a file) or a sticker, with a caption read as a text; its blob reference is kept as received (`remote`, state `Remote`) and the
-  download, the blurhash and the thumbnail are TH8's, so a download is answered as a failure meanwhile; the chats state `files` with a
+  download is TH8's (§13; until then it was answered as a failure), and the blurhash and the inline thumbnail stay unused; the chats state `files` with a
   caption for every kind and no size limit only so that the core takes a received caption edit. A location is its coordinates in
   degrees times ten million with a name and an address. A body that cannot be read is an unsupported line with the raw body, never a
   drop. MARKUP `*bold*` `_italic_` `~strike~` is read in texts, captions and edits (our rule: Desktop's library is not on disk; the
@@ -4183,7 +4208,7 @@ flavours/OnPrem config in `BackendConfig` (Threema).
   (R:whatsapp §5.1). If built: opt-in only, `risk_notice` with explicit consent, WA-Web-parity
   device props, no auto-resend after 463, behind a cargo feature and a switch of the user's: the
   descriptor's `experimental` flag, held in `kourier.toml` as `networks-on`, read once at the start,
-  with no runtime lifecycle in the core (§4.3 "Paused accounts"; K-A, 2026-10-16). The cargo feature `whatsapp` of `kourier-app` and `kourier` (in `default`; W2b) compiles the backend into every default build, `cargo xtask dist` included (it builds `signal,whatsapp`), but `kourier-app` REGISTERS it in a DEBUG build only and only while `networks-on` names it (`whatsapp_registration`, lane decision L1): a release build, so every archive, neither registers nor lists it until W3a, W4, W5 and the first real runs have landed and the user says so (`cargo xtask dist` proves it on the packed binary: the hidden flag `--print-networks` prints the kinds a start would register and list as off, and the verify step fails when a profile with `networks-on = ["whatsapp"]` gets WhatsApp in either list). A start builds the lazy `NetParts` only (the real transport and HTTP client are made at an account's first Connect or StartLogin), the descriptor carries a `risk_notice` so that K-A's page asks first, the device label comes from the app's one host name reader, and the core hands a login every own id of the other accounts (`StartLogin.taken`). The release profile optimises the WhatsApp crates for size (root `Cargo.toml`) and the binary budget is 80 MiB (§1.3).
+  with no runtime lifecycle in the core (§4.3 "Paused accounts"; K-A, 2026-10-16). The cargo feature `whatsapp` of `kourier-app` and `kourier` (in `default`; W2b) compiles the backend into every default build, `cargo xtask dist` included (it builds `signal,whatsapp,threema`), but `kourier-app` REGISTERS it in a DEBUG build only and only while `networks-on` names it (`whatsapp_registration`, lane decision L1): a release build, so every archive, neither registers nor lists it until W3a, W4, W5 and the first real runs have landed and the user says so (`cargo xtask dist` proves it on the packed binary: the hidden flag `--print-networks` prints the kinds a start would register and list as off, and the verify step fails when a profile with `networks-on = ["whatsapp"]` gets WhatsApp in either list). A start builds the lazy `NetParts` only (the real transport and HTTP client are made at an account's first Connect or StartLogin), the descriptor carries a `risk_notice` so that K-A's page asks first, the device label comes from the app's one host name reader, and the core hands a login every own id of the other accounts (`StartLogin.taken`). The release profile optimises the WhatsApp crates for size (root `Cargo.toml`) and the binary budget is 80 MiB (§1.3).
 
 ### 7.5 Telegram (TDLib in a helper process; TG-1)
 
@@ -4283,7 +4308,7 @@ flavours/OnPrem config in `BackendConfig` (Threema).
   the licence files' sha256, the exported symbols, the NEEDED list, the SONAME and the size range; `cargo xtask tdlib
   build` fetches the source by hash, applies the patches, builds, strips and checks it into
   `~/.cache/kourier/tdlib/<key>/` and copies it to `target/tdlib/`. No archive carries TDLib or Telegram code before
-  T9 (`cargo xtask dist` builds `signal,whatsapp`). Patch 0002 (`0002-no-incoming-calls.patch`): an incoming call gets
+  T9 (`cargo xtask dist` builds `signal,whatsapp,threema`). Patch 0002 (`0002-no-incoming-calls.patch`): an incoming call gets
   no call actor, so TDLib never sends `phone.receivedCall` or `phone.discardCall` (an account linked to Kourier never
   ends a caller's call as missed on its other devices); Kourier shows the call from the chat's `messageCall`. Its second
   hunk makes TDLib answer the synchronous option `kourier_patch_level` with "0002": the hello carries it and the app
@@ -4758,6 +4783,48 @@ one warn line per query naming the account id only); the chat's statement is `js
 switch turned on or off, withdrawn) the ingest names all the account's chats as changed
 (`UiEvent::ConversationsChanged`) so a front-end re-reads rows whose state changed with no event about them.
 
+**The menus of a chat's roaming settings (A10d).** A chat's Archive, Pin, Mute and Mark as Unread are never decided in
+QML. Both menus (the list's row menu and the chat page's menu) bind to one value, `ChatOffer`
+(`kourier-viewmodel/src/roaming.rs`, §8.4), which the viewmodel builds from the core's `ConversationRow.roaming` and
+`AccountRow`: `UiSource::chat_offer(conv)` for a list row, `ChatHeader.offer` for the open chat. The open chat need not be in the
+shown list (a blended filter or the archive view hides it), so the offer is read from the core's list rows of ALL accounts and
+both views, else from the open chat's detail. It is a value, not a role of the list row: a menu that holds `rowMenu.row` would
+empty itself when the list drops the row under it, and a per-row role is paid by every row made before the first frame.
+
+- *The list's row menu* (`ConversationListPage.qml`, `rowMenu`) reads `App.chatOffer(conv)` when it OPENS (the call has no change
+  signal) into `rowMenu.offer`. It opens for every chat, because the Copy entries (copy-and-links) are always there; the
+  entries of the offer sit above them and a separator shows only when one of them does. The entries, in order: Mark as Read (by
+  `offer.hasUnread`), Mark as Unread (when nothing is unread), Pin / Unpin (greyed at the stated limit: `offer.pinAtLimit`, its
+  words `offer.pinWhy`), Mute (a `QQC2.Menu` sub-menu with six times in Signal Desktop's order: 1 Hour, 8 Hours, 1 Day, 1 Week,
+  Until…, Always), the line "Muted until …" above a flat Unmute while the chat is muted, a flat greyed Mute while the sync is
+  off, Archive / Unarchive, and the offer's line (`offer.why`; a wrapping label in an `Item`, not a menu entry: a menu is as wide
+  as its widest entry and the sentence is long). Every greyed entry carries the offer's words in `Accessible.description`; an
+  open with nothing enabled (switch off, nothing unread) tells a screen reader the line, politely. The sub-menu is declared
+  inside the menu and never inserted or removed (`removeMenu` deletes it); its entry is found when the page is made and
+  hidden by height 0 (no Mute for Note to Self, where `offer.muteOffered` is false). `rowMenu.returnFocus` and `onClosed` give
+  the keyboard back to the list when the menu closes.
+- *The chat page's menu* (`ChatPage.qml` `actions`, in the overflow only, above Clear Chat History…): Mark as Unread, Pin /
+  Unpin, Mute with its six times (shown while the chat can be muted and is not), a flat disabled Mute for the off state, the
+  grey "Muted until …" line and a flat Unmute while muted, Archive / Unarchive, a separator, and after the "still filling" line the
+  offer's line. Greyed entries say why in their tooltip. They read `App.timeline.chatOffer`, which notifies.
+- *The pages' signals* `archiveAsked(conv)`, `unarchiveAsked(conv)` and `untilAsked(conv)` are connected in `MainWindow.qml`.
+  `archiveChat(conv)` is the one path of the menu and of the key: it remembers whether `conv` is the open chat and sends
+  `App.setArchived(conv, true)`; it tells nothing. The notice comes from `App.chatTold` (§8.5): "Chat archived" with an "Undo"
+  button for 8 seconds (Desktop's time), "Chat returned to inbox" and "Chat marked unread" short, "The setting could not be
+  saved." long, each also announced politely. `undoArchive()` runs once, sends `App.undoArchive(conv, wasPinned)` and
+  opens the chat again only when the archive had closed it.
+- *Keys.* Ctrl+Shift+A archives the open chat and Ctrl+Shift+U takes it back into the chats (Signal Desktop's pair; nothing
+  when it is so already). Both act only while the window's keys are on and a chat is really shown (`chatKeys`: in a wide
+  window with Settings over the chat, the chat page has left the stack but is still "shown"). Ctrl+Shift+U also works while an Undo
+  notice stands, whatever is open, once. With the sync off a key shows the offer's line as a passing notice and does nothing
+  else. Ctrl+Shift+U is IBus's Unicode entry on many Plasma setups: there the key never reaches the window.
+- *"Mute Until"* (`dialogs/MuteUntilDialog.qml`, a `Kirigami.Dialog`; his answer "Two fields"): a Date and a Time button that show
+  the value and open Kirigami Add-ons' `DatePopup` and `TimePopup`. It starts at `App.muteUntilStart()` (tomorrow 08:00),
+  "Mute" follows `App.muteUntilAllowed(...)`, and `App.muteUntil(...)` decides at the click: false keeps the dialog and shows
+  "Choose a time at least a minute from now.". A chat that goes away closes the dialog. Return presses Mute unless it is an
+  auto-repeat; Escape closes the open popup first, then the dialog. It is loaded by URL on first use
+  (`MainWindow.askMuteUntil`), so the Add-ons' date and time module is not loaded with the page.
+
 **Networks in the UI (K-A, 2026-10-16).** The welcome page and Add Account list every network that is
 in the build (`network_choices`, `kourier-viewmodel/src/login.rs`, from the app's registered list
 and its "compiled in but off" list, §4.3): WhatsApp's row says "Off · experimental" while it is off
@@ -4864,6 +4931,42 @@ A message to a hidden account notifies as usual and counts on its entry; a click
 the chat and the list stays as chosen. A newly linked account joins the list at once (with blending off
 the list switches to it); "Transfer History from Phone…" (a new uuid for the same account) keeps the
 choice.
+
+**Chat settings that roam (A10d).** The viewmodel holds what the menus of §8.3 show, so no front-end re-implements it.
+
+- `ChatOffer { shown, on, archived, pinned, marked_unread, has_unread, mute_offered, muted, muted_label, why, pin_at_limit, pin_why }`:
+  `shown` = the row's `Roaming` is `Off` or `On` (`Hidden` and `NotListed` show none of the four entries); `on` = `On` and the
+  account is linked; `why` = the line under the greyed entries: with the switch off, "To change this on your phone too, turn on
+  “Sync chat changes with my phone” for this account in Settings."; for an account that is not linked, "Available while this
+  account is linked." (in the Off state too, because the first sentence would point at a switch that is disabled). `archived` is
+  `shown_archived(archived, pinned_order)`, the one rule of every row builder, never the raw flag. `muted` reads `muted_until`
+  (what Unmute clears); `muted_label` is "Muted until %1" (`TimeContext::until`) or, for any end at or above Desktop's
+  `MAX_SAFE_DATE` (8,640,000,000,000,000 ms, which `i64::MAX` is too), "Muted always", tested before the time is written.
+  `mute_offered` is false for Note to Self. `pin_at_limit` / `pin_why`: the account states a pin limit, the chat is not pinned,
+  and the pinned chats of THAT account in the list reach the limit: "You can pin up to 4 chats." with the account's own number.
+- The account's facts (`AccountFacts`: linked = the condition of `offers_unlink`, pin limit, pinned count) are the source's;
+  `offer_of` (no account facts) and `offer_in_account` are pure and tested without a core. The viewmodel's `AccountRow` has
+  `roaming_writes: Option<bool>` (the core's statement; `None` = no switch row) and `roaming_note` ("Available while this
+  account is linked." while the switch cannot be flipped; an account that is only offline can flip it, the zone is local).
+- The times of "Mute" are computed here (`mute_end`, `until_start`, `local_to_ms`, `until_allowed`), never in QML: 1 Hour, 8
+  Hours, 1 Day and 1 Week from the source's clock, Always = `i64::MAX`; "Until…" starts tomorrow 08:00 local (his answer).
+  `local_to_ms` takes the offset in force AT the picked time (tomorrow 08:00 is another instant either side of a clock change);
+  a time the clock skips reads with the offset from before the change, a time it repeats is the first one; the earliest allowed
+  end is a minute from now.
+- Notices (`ChatTold`: `Archived { conv, was_pinned }`, `Unarchived`, `MarkedUnread`, `SwitchRefused`) are told from the core's
+  rows, not at the click: `CoreSource.awaited` holds a click (`set_archived` both ways, `set_marked_unread(.., true)`) with the
+  chat, what it waits for, whether the chat was pinned and the source's clock. The list read that replaces `list` turns an entry
+  into a notice when the row says so, forgets an entry older than 30 s and sets `Changes.told`; `UiSource::take_told()` hands the
+  notices over once. A refused `ChangeConversation` drops the entry of its chat (a refused archive tells nothing).
+  `undo_archive(conv, was_pinned)` sends `SetArchived false` and, when the archive took a pin, `SetPinned true`; it awaits nothing
+  (Desktop's Undo shows no second notice).
+- Refusals (`on_action_failed`): `ChangeConversation` says "The change could not be made."; the core's `Refusal::TooMany` or a
+  backend `ErrorKind::TooLarge` (§4.2) says "You can pin up to N chats." with N the pin limit of the subject chat's account (no
+  limit known: the generic line). A refused `SetRoamingWrites` tells `ChatTold::SwitchRefused` ("The setting could not be saved.",
+  a toast) and sets no composer notice: the composer is not on screen over Settings. `MarkRead` stays quiet.
+- Mark as Unread on the OPEN chat stays: `set_marked_unread(conv, true)` sets `last_marked = (conv, newest incoming message)`
+  before it sends, so the click's own echo does not run the reading that clears it; a newer incoming message (a real reading)
+  still does. `close()` resets `last_marked`, so a chat left and opened again reads the mark away, as on Desktop.
 
 **Archived chats (A1).** A chat the phone archived (Storage Service: `ConversationUpsert { archived }`;
 Kourier writes nothing back before A10) is out of the chat list and in the archive, which opens like a
@@ -5218,9 +5321,11 @@ own page, never a person known by their number alone). It opens a LEVEL of the p
   page; `groupTabs` and `keyGroup` reach the groups through "View Safety Number" (BQ-11). Fixture pages `safety` (a
   Default person) and `safetychanged` (a person whose key changed after it was verified), one synthetic key each. The fixture page `timerpending` shows the person's page with a time chosen and not applied.
 
+**Group invite links (copy-and-links, 2026-11-09).** His answer "Also manage links": an administrator on a network that has invite links (`Network::group_invites()`: `Reset` for WhatsApp, where the link always stands; `Switch` for Signal, where it can also be off; `None` elsewhere, Threema has no invite links) sees the part `groupInvite` on the group's page: "Copy Invite Link" (`groupInviteCopy`), "Reset Invite Link…" (`groupInviteReset`) and, on Signal, "Turn Off Invite Link…" (`groupInviteOff`) or "Turn On Invite Link" (`groupInviteOn`). Reset and Turn Off are asked first (`groupInviteDialog`): people who hold the link are cut off. `App.groupInvite(action, conversation)` -> `Query::GroupInvite` -> `Command::GroupInvite { group, action, reply }`; the link comes back as `Option<Redacted<String>>` and goes to the clipboard in Rust like Copy Link (`person::CopyAsked::Invite`), never through QML, the toast or a log. Read and Reset copy, TurnOn and TurnOff put nothing on the clipboard. `GroupDetail.invites` is set only when the own member row is Admin and the group is not terminated. Signal (`kourier-signal` `groups/invite.rs`, `https://signal.group/#<base64url of GroupInviteLink>`): TurnOn sets access ANY, TurnOff keeps the password so turning on brings the same link back, Reset makes a new password and ends the old link. WhatsApp (`https://chat.whatsapp.com/<code>`): TurnOn and TurnOff are refused. Known limits: a Signal link change does not push a group update message to the other members; the links have met only the fake networks.
+
 **Copy Link (people pages P5b, 2026-10-25).** His answer "Under the safety number": a flat button "Copy Link" (`detailsLink`,
 icon `edit-copy`) right under "View Safety Number" on another person's page of a network with links (`PersonView.link_shown`
-= `LinkState` not `Hidden`; never the own page, BQ-4). Without a link it is disabled with ONE quiet line under it
+= `LinkState` not `Hidden`; the own page only with a link, copy-and-links 2026-11-09). Without a link it is disabled with ONE quiet line under it
 (`PersonView.link_note`, also its `Accessible.description`): "%1's phone number is not shown." (`NotShared`; neutral on
 purpose, Z1: Signal states "not shown" also for a profile never fetched) or "Kourier does not know %1's phone number."
 (`NoNumber`); a disabled button is no Tab stop.
@@ -5421,6 +5526,25 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   works for at most 8 ms per run, coalesces repeated invalidations, and re-schedules itself. A
   lagged/overflowed channel triggers a reload of visible models (Delta Chat pattern).
 - Re-entrancy rule: mutate, then emit; QML handlers that call back use `Qt.callLater`.
+- Chat settings that roam (A10d; `kourier-qt/src/bridge.rs` beside `markRead`, implemented in `app.rs`): the `App` invokables
+  `setArchived(conv, on)`, `setPinned(conv, on)`, `setMarkedUnread(conv, on)`, `undoArchive(conv, wasPinned)`, `unmute(conv)`,
+  `muteFor(conv, choice)` (`choice` is `"hour"`, `"eight"`, `"day"`, `"week"` or `"always"`; any other word does nothing; the end is
+  computed in Rust from the source's clock), `muteUntil(conv, year, month, day, hour, minute) -> bool` (`false` = the fields are
+  no date or the end is inside the next minute: nothing is sent), `muteUntilAllowed(year, month, day, hour, minute) -> bool`,
+  `muteUntilStart() -> {year, month, day, hour, minute}`, `setRoamingWrites(account, on)` and `chatOffer(conv) -> map`. Each
+  takes the chat's id and does nothing for an id of 0 or less (the `markRead` form).
+- `chatOffer(conv)` and `TimelineModel.chatOffer` are the same map, built by one function (`models::timeline::offer_variant`):
+  `shown on archived pinned pinAtLimit pinWhy markedUnread hasUnread muteOffered muted mutedLabel why`. QML shows these flags and
+  decides none. `TimelineModel.chatOffer` is set in `set_header` from `ChatHeader.offer` only when the Rust value changed (or the
+  property is still unset: an invalid variant never reaches QML) and is an EMPTY map while no chat is open. The chat page binds
+  the property; a list row's menu calls `App.chatOffer(id)` when it opens (§8.3).
+- Signal `chatTold(kind, conversation, wasPinned, text)`: `kind` is `"archived"`, `"unarchived"`, `"marked-unread"` or
+  `"switch-refused"`; `conversation` is 0 for the switch's. It is emitted from `apply_pending` right AFTER `archive_moved`: an
+  archive of the open chat has closed it by then, so Undo opens the chat again from the closed state. QML turns the signal into
+  the passive notification and keeps no state of its own beyond the standing Undo.
+- `accountActions` (Settings > Accounts) has two more keys per account: `roaming` (`""` = the network states no switch, the row
+  is not shown; `"off"`; `"on"`) and `roamingNote` (empty when the switch can be flipped). The App's memory of what it last
+  showed (`ShownActions`) holds both, so a change of either refreshes the list.
 
 ### 8.6 Images, avatars, media
 
@@ -5669,6 +5793,13 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   `App.networkRisk`), or an account linked now would be paused at the next start (K-A fix U7). The page writes
   its preferences on top of the stored ones (`SettingsRust::prefs()`), so a page preference changed
   elsewhere does not lose the list.
+- Sync chat changes with my phone (A10d; §4.2, §6.9): Settings > Accounts, in each account's card under its text row, a switch "Sync
+  chat changes with my phone" with the description "Archive, pin, mute and unread marks made here also change on your phone and your
+  other devices.". It is shown only for an account whose network states the switch (`accountActions[].roaming` not `""`: Signal;
+  WhatsApp, Telegram and Threema today have none) and every account starts Off. It flips at once with no question and the mark
+  follows the core's echo, not the click, so a refused switch shows the old state and a toast "The setting could not be saved.".
+  While the account is not linked the row is disabled and says "Available while this account is linked.". The row that was clicked is
+  made again when the new state arrives; the new row takes the keyboard and the page does not scroll.
 - Account settings that the network syncs (read receipts, typing indicators, link previews) are
   shown read-only in M1 with "change on your phone"; Kourier-local ones (notifications per
   account, local mute) are editable.
@@ -7871,7 +8002,7 @@ revision history, the desktop side of S15; 2026-10-07):
   | Threema: an ack that does not come within 60 s closes the socket (1000); a row cools for 2 min, doubling to 15 min, from its second failed run in a row (a missing ack or a server close; a lost network does not count) and at once when it fails by its content; the backend's own job is given up after 12 failed runs; a socket write that stalls 10 s ends the socket; done rows are kept 14 days, open sends 30, jobs 14 (TH6a R2, C11, C14, C15) | `kourier-threema` `conn/mod.rs` `ACK_WITHIN`, `SEND_WITHIN`; `send/shared.rs` `COOL_FIRST`, `COOL_MOST`, `JOB_GIVES_UP_AT`; `send/queue.rs` `DONE_KEEP_MS`, `TRANSMIT_KEEP_MS`, `JOB_KEEP_MS` | Kourier's own: the spec names no wait for an ack and Desktop waits on the keep-alive only, so one silent ack would hold its queue for ever | Added: a row the server refuses can neither stop the account nor hold the rows behind it |
   | Threema: the leader holds at most 256 boxes or 8 MiB of the chat server's messages in memory and decides one batch of 30 at a time; a box over the bound is HELD un-acked (the server sends it again), so is every later box of that socket, and the socket reconnects once it drained; a receipt job names at most 30 ids; `csp_inbound` keeps a `reflected` row 14 days and a `pending` row 30 days together with its nonce (TH6 T-H2, S-B1, C3, T-L5) | `kourier-threema` `leader/mod.rs` `FIFO_BOXES`, `FIFO_BYTES`, `BATCH`; `leader/zone.rs` `RECEIPT_IDS`, `REFLECTED_KEEP_MS`, `PENDING_KEEP_MS` | Kourier's own: memory and disk; the chat server keeps what is not acked | Added: nothing is lost, a message waits for the next socket |
   | Threema: a directory lookup waits 30 s and reads at most 64 KiB, its positive answers are cached 30 min for 256 IDs, and after a failed one the socket reconnects 60 s after the first hold when idle (10 min at the latest); a contact transaction waits 2 min for another device's and is begun at most 3 times for one message; a group sync request and a creator's answer go at most once an hour per group (and sender); the leader steps aside for the phone at most once in 15 min and asks which devices are online every 60 s while it holds something for the phone; an inbound reflect left unanswered by two sockets is held for the rest of the run (TH6) | `kourier-threema` `leader/directory.rs` `LOOKUP_WITHIN`, `CACHE_FOR_MS`, `CACHE_IDS`; `leader/mod.rs` `DIRECTORY_RETRY`, `DIRECTORY_RECYCLE`, `ASK_AGAIN`, `YIELD_EVERY`, `COOL_AT`; `leader/txn.rs` `TX_WAIT`, `MOST_BEGINS`; `leader/jobs.rs` `THROTTLE` | Kourier's own (the TH6 design review's numbers): the spec names no cache lifetime or wait for a lookup (a 429 asks for 10 s) and Desktop throttles a group sync request to one an hour | Added: a dead directory or an absent phone costs a reconnect a minute at most, never the account |
-  | Pins: at most 4 per account (the remote config's `global.pinnedChatLimit`, default 4), counted from the stored account record's entries plus the queued pins (A10) | core `roaming::check` (`Refusal::TooMany`, per account, only when the network states `AccountCaps::max_pinned_chats`); `kourier-signal` `storage::intents::{pin_limit_of, intend}`, `storage::write::plan` (a rebase over the limit drops our newest addition) | the phones: Desktop and Android refuse a 5th pin in their UIs and the pin list is shared with them (interop) | Kept: the phone's number, read from the config |
+  | Pins: at most 4 per account (the remote config's `global.pinnedChatLimit`, default 4), counted from the stored account record's entries plus the queued pins (A10) | core `roaming::check` (`Refusal::TooMany`, per account, only when the network states `AccountCaps::max_pinned_chats`); `kourier-signal` `storage::intents::{pin_limit_of, intend}`, `storage::write::plan` (a rebase over the limit drops our newest addition), `Refused::TooManyPins` (answered `TooLarge`, A10d); `kourier-viewmodel` `roaming::offer_in_account` (Pin is greyed at the limit, the account's own count) | the phones: Desktop and Android refuse a 5th pin in their UIs and the pin list is shared with them (interop) | Kept: the phone's number, read from the config |
   | Storage Service writes: one write a second after the last change, at most 6 in 10 minutes and 30 in an hour per account, a 409 waits 1 s, 5 s, 30 s then the normal backoff (never under 30 s), a change not written in 30 days is dropped (A10c) | `kourier-signal` `storage::write::job` (`DEBOUNCE_MS`), `job/rate.rs` (`WINDOWS`), `intents::drop_stale` | nobody known: Kourier's own bound on the load it puts on the Storage Service and on the phone's merge work (BQ4) | Added |
 
   Not limits: the sticker send refusal (a missing feature), sender key needing two recipients
@@ -8060,7 +8191,8 @@ revision history, the desktop side of S15; 2026-10-07):
   waits, or null) and `banner`; `media` has one entry per picture of an album. New command
   `challenge {answer}` (`notFound` when no account waits). `attach` takes `path` or `paths`,
   returns `{added, attachments}` and no longer refuses a missing file (it is marked once the
-  core has looked). `send` may have no text when files wait. New `wait` conditions
+  core has looked). `send` may have no text when files wait; a `send` naming a chat may name
+  how many files must wait (`files`, default 0), and the composer must hold exactly those. New `wait` conditions
   `challenge`, `no_challenge`, `none_pending`, `files_planned`. `KOURIER_DEV_DEMO_STATE=
   challenge|offline|clock` (`kourier-app/src/dev.rs`) sets the state the fake demo account ends
   in on a normal profile; fixture mode claims no single-instance name, so a second-launch test
@@ -9942,9 +10074,13 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   safety number yet (`safety_numbers: false`).
 - People pages P5b (Copy Link, 2026-10-25): no schema change. The contract's `Network::contact_links` /
   `contact_link` and `is_e164` (§4.2), Signal's `https://signal.me/#p/<+E164>`, `PersonDetail.link: LinkState` with the
-  number rule (§4.2), the button under "View Safety Number" (§8.3). Known limits: no Copy Link on the own page (BQ-4; his
-  link of choice is the phone's username link, which only the phone can make); a person whose number was never said to
-  be shown gets no link even when the address book knows the number; WhatsApp, Telegram and Threema have no links yet.
+  number rule (§4.2), the button under "View Safety Number" (§8.3). Known limits: at P5b no Copy Link on the own page (BQ-4; his
+  link of choice is the phone's username link, which only the phone can make; since copy-and-links 2026-11-09 the own
+  number makes one); a person whose number was never said to
+  be shown gets no link even when the address book knows the number; WhatsApp, Telegram and Threema had no links yet (WhatsApp's `https://wa.me/<digits>` and Threema's `https://threema.id/<ID>`
+  came with copy-and-links, 2026-11-09).
+- Group invite links (copy-and-links, 2026-11-09): no schema change. `ConversationFeatures.invite_link_on` sits in the
+  features' serialised form (skipped while off, so the stable hash of other chats stays), the contract's `Network::group_invites` and `Command::GroupInvite`, the group page's invite part (§8.3).
 - People pages P5c (Share Contact, 2026-10-26): no schema change. `UiCommand::SendContact`, `PersonDetail.share:
   ShareState`, the core-built card (profile name + the shown number, §4.2), `ConversationRow.can_send`,
   `NetworkDescriptor.contact_cards` (§3.3), Signal's `DataMessage.contact` (§6.7), the button and the picker (§8.3),
@@ -9992,6 +10128,22 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   space, so a conversation that moved to another (a basic group upgraded to a supergroup) is not a plain merge, and no path does that
   today; no test pins that the fake commits the echo before the answer (the other order is proved from the other side). Not in KT-2: the
   Telegram mapping, history on demand (KT-3), T5's send path, any UI.
+- LOOK + MEDIA batch (2026-11-09, his "it feels a bit sad taht there is no support for images for profiles for threema nad wahtsapp and other media features"; nothing here contacted a network).
+  §2.2: new edge `kourier-threema -> kourier-blob`; it re-encodes no picture, so still no `kourier-media`. THREEMA TH8, backend.db schema 6 (`0006_pictures.sql`): `src/blob.rs` fetches and uploads
+  whole bodies at the blob mirror (100 MiB, 3 at once), the download sealed at the core's target; `src/send/files.rs` sends a file under a fresh key; `src/pictures.rs` walks profile pictures at every
+  `Online` and after a contact or group sync, with no standing timer. Text and files are on, stated again once on a file of an older build (`FEATURES_VERSION`); replies, reactions, edits, deletes for
+  everyone, typing and receipts stay off. WHATSAPP W7 + W8, backend.db schema 9 (`0009_avatars.sql`): `src/download.rs` (a 403, 404 or 410 is final), `src/avatars.rs` (one lookup at a time, recheck after
+  7 days; a `Rebuild` forgets them). LOOK: per-account row tint, chat wallpaper (both on, Settings switches off), green WhatsApp badge, the top band across the window with the rail below it.
+- A10d (the UI of the chat settings that roam, 2026-11; §4.1, §4.2, §6.9, §8.3, §8.4, §8.5, §8.9; no schema change, no new crate edge). Built as
+  designed: `ChatOffer` is a value the menus read, not a role of the list row; the notices come from the core's rows, not from the click;
+  the Mute sub-menu is declared once and never inserted or removed; "Mute Until" is loaded by URL on first use. Changed on the way: Ctrl+Shift+A
+  and Ctrl+Shift+U act only when the chat page is really shown (`chatKeys`; the window test `keys` found that in a wide window with Settings over
+  the chat the old term stayed true); a pin over the limit that the backend refuses is `ErrorKind::TooLarge` (§4.2), worded like the core's
+  `Refusal::TooMany`; the row menu opens for every chat since the Copy entries joined it. Debug-only counts of the Storage Service
+  (`state.storage`, §6.9) serve the real check. Tests: the window binary `roaming_ui` (26 cases) and six fixture pages (`rowmenu`, `rowmenuoff`,
+  `rowmenumuted`, `mutemenu`, `muteuntil`, `chatmenu`). Known limits: Ctrl+Shift+U can be taken by IBus's Unicode entry (a real run on the
+  user's session decides); after a click on the toast's Undo the keyboard stays in the overlay until it moves; the fixture's two accounts cannot
+  tell the first account's facts from the second's, so one mutant of the offer's account lookup is not killable with them.
 
 ## 14. FOSS readiness track (user requirement, 2026-10-06)
 
@@ -10813,7 +10965,7 @@ keep is §8.10):
   profile build (so never `strip = "symbols"` in the profile); an AppImage recipe (linuxdeploy strips
   every ELF with a `strip` older than RELR) uses `names::split` or `NO_STRIP=1` after the split;
   distro debuginfo tools work on the unstripped build as usual. The release binary is built in its
-  own target directory with `--no-default-features --features signal,whatsapp`, so it has no test
+  own target directory with `--no-default-features --features signal,whatsapp,threema`, so it has no test
   network, and with every private path mapped away (`--remap-path-prefix` and
   `-ffile-prefix-map` for the workspace, the cargo home, the build directory and the
   toolchain): a plain build names the maintainer's home directory 1,331 times, this one

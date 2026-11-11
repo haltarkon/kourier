@@ -1,5 +1,11 @@
 # The Threema run against the real service (RT1)
 
+Outside this tool Kourier has Threema on and links any ID: that was the user's decision of 2026-11-09.
+This tool sets `KOURIER_THREEMA_RUN` for the app it starts, and that start keeps every rule of this runbook:
+a debug build, a run profile, the list of test IDs, the switch that is off at every end. Never start a run
+profile by hand: the app itself shuts Threema out of a start that holds this tool's `threema-run/`
+directory (or is driven by `--dev-control`) without the tool, but only this tool's start may reach Threema.
+
 This is the runbook for the first run of Kourier's Threema backend against Threema's servers, with a
 test account. Two people work together: the lead types the commands, the user holds the TEST phone and
 the PERSONAL phone and types the one value only he may type, the test ID. The tool is
@@ -35,6 +41,15 @@ leader, and a restart. The link is kept at the end, unless the user says otherwi
   start that was killed leaves it on; `state` says so and `stop` puts it right.
 - The tool prints and writes counts, words and times only. It never prints a path (the profile's NAME
   only) and never a name, a text, an ID or a link.
+- A send from Kourier happens only inside the steps `send`, `group-send` and `send-file`. It is the user's
+  own act in the window, or, with `step <name> --lead-sends`, the step's own. Each step opens a window for
+  the judge BEFORE anything is sent: at most 4 reflects and 16 boxes of origin `transmit` per step and
+  socket. The window closes at the step's end. Any other such frame, in a step or outside one, halts the
+  run (`transmit`).
+- The lead passes `--lead-sends` only after the user's word in chat in the same session. Such a step makes
+  one send: its own marker text into the only chat of its kind (with two it sends nothing), and `send-file`
+  with the tool's own small picture as well. The supervisor takes it only from that step's process, only
+  while its window is open, and once per step and start. `ctl` still forwards no `send`, no `attach`.
 - The user's PERSONAL phone never opens Threema's linked-devices menu. Only the TEST phone does: it is the
   one that lists the device Kourier makes.
 
@@ -58,7 +73,7 @@ leader, and a restart. The link is kept at the end, unless the user says otherwi
 ANOTHER PC (after RT1 on this one). A run there needs the same things, made there: KDE neon on Ubuntu 24.04
 with the system Qt 6.11 and Kirigami (the build server's base; never a Qt from `/opt`), the Rust toolchain
 of `rust-toolchain.toml`, `kcap` and its `kourier.slice`, and a clean checkout whose HEAD is `main`, from
-which `cargo build -p kourier` makes the DEBUG binary (a release build has no Threema) and `cargo xtask
+which `cargo build -p kourier` makes the DEBUG binary (this tool takes no release build) and `cargo xtask
 threema-run` is the run tool, exactly as here. The prepared run profile is made THERE, under that PC's keeper
 root `~/.local/share/kourier-threema-run/<profile>`, by the tool's own `start --for-link`, as a NEW linked
 device that the test phone then lists beside this PC's: a kept profile is never copied from one PC to the
@@ -101,7 +116,9 @@ It ends with `REHEARSAL PASS: <N> checks in <S> s` and the list of what it did n
 the place; `--no-build` skips the build (the debug app must be there).
 
 What it cannot show: the real join and its warning page, Threema's own answers, a leader (the fake prints no
-count line and no leader line, so `sync` and `passive` say "not measured (rehearsal)" and `phone-sleep`,
+count line and no leader line, so `sync`, `passive` and the send steps say "not measured (rehearsal)" for
+their frame counts, no real file moves in `files` or `send-file` (it walks `group-send` and `send-file`
+with `--lead-sends`, and `send` with a cue for the user's own act), and `phone-sleep`,
 `flight-mode` and `kinds` are not walked), `mirror` (the fake's phone has no act that writes an own
 message), the removals (`removed-on-phone` and the real end of `unlink`), the refusal of a wrong ID (the
 fake judges no ID; the backend's own tests prove that gate), a search of the app's raw stderr, and the
@@ -244,13 +261,24 @@ runs out of time ends FAIL with "run `step <name>` again" and goes on from where
    existing chat arrives once), `group-receive` (the same into the group), `mirror` (one text from the
    TEST phone shows once as an own message, `sent`, then `read`), the optional `kinds` (the PERSONAL phone
    sends a quote, a mention, bold text, an edit, a reaction and a delete; Kourier counts, nothing more),
-   `passive --seconds 600` (online at every look, nothing sent), `phone-sleep` (the TEST phone locked for
+   `passive --seconds 600` (online at every look, nothing sent), `files` (ONE picture, ONE file and ONE
+   voice message from the PERSONAL phone raise the 1:1 chat's unread counter by three, and the user says
+   they opened and played in the window, and whether the profile picture shows), `send` (one text the
+   user sends in the Kourier window shows `sent` in the chat, reaches the PERSONAL phone exactly once and
+   shows on the TEST phone as its own), `group-send` (the same into the group), `send-file` (the same with
+   one small picture and a caption; with `--lead-sends` each of the three sends by itself),
+   `phone-sleep` (the TEST phone locked for
    10 minutes, one text at minute 5), `flight-mode` (the leader test). `steps` lists them with their
    words. A call watches at most 540 s: `phone-sleep` takes two calls, `flight-mode` two or three; each
    call that stops short says "run `step <name>` again" and the next goes on by the clock.
-   No step opens a chat in the app: opening one with unread messages would mark it read, and Kourier would
+   With `--lead-sends` a send step asks only what the phones show: the TEST phone's half can be checked
+   and relayed by the lead, the PERSONAL phone's half is the user's word.
+   Only a `--lead-sends` send opens a chat in the app. No other step does: opening one with unread messages would mark it read, and Kourier would
    send that receipt. What a chat shows is read from the list. If the user opens a chat himself, that is
-   his act and the step's record says so.
+   his act and the step's record says so. The send steps come after `passive`: `sync` and `passive` allow
+   no frame of a send on their socket. In a send step a call that stops short keeps the text and the window
+   and never asks for a second send; a call after the PERSONAL phone's yes does not wait for the chat's preview again, since the next message to arrive takes it over; a PERSONAL phone that did not show it exactly once halts the run
+   (`lost`). A `files` call needs that 1:1 chat closed in the window at its start.
 7. `stop`, `backup`, then, on his go, a start with no link and `step reconnect`:
 
        cargo xtask threema-run stop

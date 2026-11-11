@@ -31,6 +31,7 @@ mod expiry_policy;
 mod files;
 mod followups;
 mod followups_i;
+mod group_invite;
 mod group_page;
 mod history_rules;
 mod history_rules_review;

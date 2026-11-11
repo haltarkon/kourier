@@ -363,8 +363,12 @@ impl Refused {
             Self::NotMutable => {
                 BackendError::new(ErrorKind::InvalidInput, "this chat cannot be muted")
             }
+            // `TooLarge` (A10d L6, architecture §4.2): on `ChangeConversation` it means the pin
+            // limit, so the window names the account's limit as it does for the core's own
+            // `Refusal::TooMany` (a pin the core could not count: the phone lists a chat the core
+            // does not), never "the network failed".
             Self::TooManyPins => BackendError::new(
-                ErrorKind::InvalidInput,
+                ErrorKind::TooLarge,
                 "the account has pinned as many chats as it may",
             ),
         }

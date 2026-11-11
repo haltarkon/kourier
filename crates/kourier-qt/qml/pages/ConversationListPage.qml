@@ -37,6 +37,13 @@ Kirigami.ScrollablePage {
     // The menu of a chat and its entry (tests read them).
     readonly property alias rowMenu: rowMenu
     readonly property alias markReadEntry: markReadEntry
+    readonly property alias markUnreadEntry: markUnreadEntry
+    readonly property alias pinEntry: pinEntry
+    readonly property alias muteSub: muteSub
+    readonly property alias muteFlat: muteFlat
+    readonly property alias archiveMenuEntry: archiveMenuEntry
+    readonly property alias mutedLine: mutedLine
+    readonly property alias whyLine: whyLine
     // The account banner has a button the keyboard must reach: the search field then lets
     // Tab take its natural way.
     readonly property bool bannerShown: banner.visible
@@ -54,7 +61,18 @@ Kirigami.ScrollablePage {
     // The list's last row, the way into the archive (null while it is not shown; tests read it).
     property Item archiveEntry: null
 
+    // What the menu told a screen reader when it opened with nothing to choose, and how (tests
+    // read both; "" and -1 while it did not).
+    property string menuAnnounced: ""
+    property int menuAnnouncedPoliteness: -1
+
     signal openConversation(real id)
+    // The menu or the keys of the window ask: Archive, Unarchive, Mute "Until…" for chat `conv`.
+    // The window does the work (the Undo notice and the dialog are its own: `MainWindow`).
+    signal archiveAsked(real conv)
+    signal unarchiveAsked(real conv)
+    // `back`: the item that had the keyboard (the list, from the keyboard's menu), or null.
+    signal untilAsked(real conv, var back)
     // The quick switch chose a chat: it opens and the composer takes the keyboard.
     signal switchedByKeyboard(real id)
     // The banner's button (link again, solve the challenge, restart): the window decides
@@ -91,16 +109,30 @@ Kirigami.ScrollablePage {
     }
 
     // The menu of the chat `row` shows, at (`x`, `y`) of the row; with a negative `x` (the
-    // keyboard's Menu key), under the row's leading part, so the row stays in view. A chat
-    // the menu has nothing to offer for gets no menu (an empty popup is no answer).
+    // keyboard's Menu key), under the row's leading part, so the row stays in view. What the
+    // menu holds is read from the core's offer for the chat NOW (`App.chatOffer` has no change
+    // signal). Every chat opens a menu (the Copy entries are always there); the A10d entries and
+    // Mark as Read come and go above them.
     function openMenu(row: ConversationDelegate, x: real, y: real): void {
-        if (row === null || !row.hasUnread) {
+        if (row === null) {
             return;
         }
+        const offer = App.chatOffer(row.conversationId);
+        rowMenu.offer = offer;
         rowMenu.row = row;
         rowMenu.conversationId = row.conversationId;
+        // Whatever line the menu shows (the sync switch's reason, or the pin limit's) a screen
+        // reader hears too.
+        if (rowMenu.line !== "") {
+            page.menuAnnounced = rowMenu.line;
+            page.menuAnnouncedPoliteness = Accessible.Polite;
+            page.Accessible.announce(rowMenu.line, Accessible.Polite);
+        }
         // A point of the list, which stays while the list rebuilds rows under the menu.
         const at = row.mapToItem(list, x >= 0 ? x : Kirigami.Units.gridUnit * 2, x >= 0 ? y : row.height);
+        // The keyboard comes back to the list when the menu closes if it was there when it opened:
+        // with more entries (and a sub-menu) the focus fell to the timeline instead.
+        rowMenu.returnFocus = list.activeFocus;
         rowMenu.popup(list, at.x, at.y);
     }
 
@@ -133,8 +165,23 @@ Kirigami.ScrollablePage {
     }
 
     title: App.currentTitle
+    // Another choice of accounts is another list: it starts at its top. (Rows that join above
+    // the ones already shown would otherwise push the view far down. Later: the rows of the new
+    // choice arrive right after these properties.)
+    function listToTop(): void {
+        list.positionViewAtBeginning();
+    }
     Connections {
         target: App
+        function onCurrentAccountChanged(): void {
+            Qt.callLater(page.listToTop);
+        }
+        function onShownCountChanged(): void {
+            Qt.callLater(page.listToTop);
+        }
+        function onAllShownChanged(): void {
+            Qt.callLater(page.listToTop);
+        }
         function onArchiveShownChanged(): void {
             if (App.archiveShown) {
                 search.text = "";
@@ -588,8 +635,10 @@ Kirigami.ScrollablePage {
 
     // The menu of a chat of the list. It is made with the page: a menu made in the moment it
     // opens can stay as small as its padding. (After the list: a scroll view takes its first
-    // child as the view to scroll.) It holds what the chat offers; a chat that offers
-    // nothing gets no menu (`openMenu`).
+    // child as the view to scroll.) It holds what the chat offers (the core's offer for it, read
+    // when the menu opens) and the copy actions every chat has. Entries the chat does not offer
+    // are hidden (no room taken, no key reaches them); entries the sync switch greys say why
+    // (`Accessible.description`) and the line under them says it in words.
     QQC2.Menu {
         id: rowMenu
 
@@ -597,22 +646,234 @@ Kirigami.ScrollablePage {
         // and its chat.
         property ConversationDelegate row: null
         property real conversationId: 0
+        // `App.chatOffer` of that chat, when the menu opened.
+        property var offer: ({})
+        // The line under the entries: why they are grey, or why Pin is.
+        readonly property string why: rowMenu.offer.why ? rowMenu.offer.why : ""
+        readonly property string pinWhy: rowMenu.offer.pinWhy ? rowMenu.offer.pinWhy : ""
+        readonly property string line: rowMenu.why !== "" ? rowMenu.why : (rowMenu.offer.pinAtLimit === true && rowMenu.offer.pinned !== true ? rowMenu.pinWhy : "")
+        // Whether the list had the keyboard when the menu opened (`openMenu`).
+        property bool returnFocus: false
+        // The sub-menu's own entry of this menu, once the menu has made it (H1: found, never
+        // inserted or removed: `removeMenu` would delete the sub-menu).
+        property QQC2.MenuItem muteItem: null
 
         // In the window's scene (also on Wayland, and in headless screenshots).
         popupType: QQC2.Popup.Item
+
+        onClosed: {
+            if (rowMenu.returnFocus && !muteSub.visible) {
+                rowMenu.returnFocus = false;
+                list.forceActiveFocus();
+            }
+        }
+
+        Component.onCompleted: {
+            for (let i = 0; i < rowMenu.count; ++i) {
+                const item = rowMenu.itemAt(i) as QQC2.MenuItem;
+                if (item !== null && item.subMenu === muteSub) {
+                    rowMenu.muteItem = item;
+                    break;
+                }
+            }
+            if (rowMenu.muteItem === null) {
+                return;
+            }
+            rowMenu.muteItem.visible = Qt.binding(() => rowMenu.offer.on === true && rowMenu.offer.muteOffered === true && rowMenu.offer.muted !== true);
+            rowMenu.muteItem.enabled = Qt.binding(() => rowMenu.muteItem.visible);
+            rowMenu.muteItem.height = Qt.binding(() => rowMenu.muteItem.visible ? rowMenu.muteItem.implicitHeight : 0);
+            rowMenu.muteItem.icon.name = "player-volume-muted";
+        }
 
         QQC2.MenuItem {
             id: markReadEntry
 
             // Only while the chat has unread messages or was marked unread on another
             // device; no room taken otherwise.
-            visible: rowMenu.row !== null && rowMenu.row.hasUnread
+            visible: rowMenu.offer.hasUnread === true || (rowMenu.row !== null && rowMenu.row.hasUnread)
             // Disabled while hidden: the keyboard would reach an invisible item otherwise.
             enabled: visible
             height: visible ? implicitHeight : 0
             icon.name: "mail-mark-read"
             text: L10n.i18nc("@action:inmenu", "Mark as Read")
             onTriggered: App.markRead(rowMenu.conversationId)
+        }
+
+        QQC2.MenuItem {
+            id: markUnreadEntry
+
+            visible: rowMenu.offer.shown === true && !markReadEntry.visible
+            enabled: visible && rowMenu.offer.on === true
+            height: visible ? implicitHeight : 0
+            icon.name: "mail-mark-unread"
+            text: L10n.i18nc("@action:inmenu", "Mark as Unread")
+            Accessible.description: markUnreadEntry.enabled ? "" : rowMenu.why
+            onTriggered: App.setMarkedUnread(rowMenu.conversationId, true)
+        }
+
+        QQC2.MenuItem {
+            id: pinEntry
+
+            readonly property bool pinned: rowMenu.offer.pinned === true
+            visible: rowMenu.offer.shown === true
+            enabled: visible && rowMenu.offer.on === true && (pinEntry.pinned || rowMenu.offer.pinAtLimit !== true)
+            height: visible ? implicitHeight : 0
+            icon.name: pinEntry.pinned ? "window-unpin" : "pin"
+            text: pinEntry.pinned ? L10n.i18nc("@action:inmenu", "Unpin") : L10n.i18nc("@action:inmenu", "Pin")
+            Accessible.description: pinEntry.enabled ? "" : (rowMenu.offer.on === true ? rowMenu.pinWhy : rowMenu.why)
+            onTriggered: App.setPinned(rowMenu.conversationId, !pinEntry.pinned)
+        }
+
+        // Mute with its times (Signal Desktop's order). A sub-menu declared here, made with the
+        // page; `muteItem` above is its entry in this menu.
+        QQC2.Menu {
+            id: muteSub
+
+            title: L10n.i18nc("@title:menu", "Mute")
+            popupType: QQC2.Popup.Item
+
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "1 Hour")
+                onTriggered: App.muteFor(rowMenu.conversationId, "hour")
+            }
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "8 Hours")
+                onTriggered: App.muteFor(rowMenu.conversationId, "eight")
+            }
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "1 Day")
+                onTriggered: App.muteFor(rowMenu.conversationId, "day")
+            }
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "1 Week")
+                onTriggered: App.muteFor(rowMenu.conversationId, "week")
+            }
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "Until…")
+                onTriggered: {
+                    // The dialog is modal and takes the keyboard when it has opened: the menu
+                    // must not hand it to the list meanwhile (M5); the dialog gives it back.
+                    const back = rowMenu.returnFocus ? list : null;
+                    rowMenu.returnFocus = false;
+                    page.untilAsked(rowMenu.conversationId, back);
+                }
+            }
+            QQC2.MenuItem {
+                text: L10n.i18nc("@action:inmenu", "Always")
+                onTriggered: App.muteFor(rowMenu.conversationId, "always")
+            }
+        }
+
+        // When a mute ends (his answer to question 1): a quiet line above Unmute.
+        Item {
+            id: mutedLine
+
+            readonly property bool shown: rowMenu.offer.muted === true && rowMenu.offer.mutedLabel !== undefined && rowMenu.offer.mutedLabel !== ""
+            visible: mutedLine.shown
+            implicitWidth: Kirigami.Units.gridUnit * 18
+            implicitHeight: mutedLine.shown ? mutedLabel.implicitHeight + Kirigami.Units.smallSpacing * 2 : 0
+            height: implicitHeight
+            Accessible.role: Accessible.StaticText
+            Accessible.name: mutedLabel.text
+
+            QQC2.Label {
+                id: mutedLabel
+
+                anchors.fill: parent
+                anchors.leftMargin: Kirigami.Units.largeSpacing
+                anchors.rightMargin: Kirigami.Units.largeSpacing
+                verticalAlignment: Text.AlignVCenter
+                text: rowMenu.offer.mutedLabel ? rowMenu.offer.mutedLabel : ""
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+            }
+        }
+
+        // The flat entry beside the sub-menu: "Mute" greyed while the sync is off (a sub-menu's
+        // entry would not be reachable to say why), "Unmute" while the chat is muted.
+        QQC2.MenuItem {
+            id: muteFlat
+
+            readonly property bool muted: rowMenu.offer.muted === true
+            visible: rowMenu.offer.shown === true && rowMenu.offer.muteOffered === true && (muteFlat.muted || rowMenu.offer.on !== true)
+            enabled: visible && muteFlat.muted && rowMenu.offer.on === true
+            height: visible ? implicitHeight : 0
+            icon.name: muteFlat.muted ? "player-volume" : "player-volume-muted"
+            text: muteFlat.muted ? L10n.i18nc("@action:inmenu", "Unmute") : L10n.i18nc("@action:inmenu", "Mute")
+            Accessible.description: muteFlat.enabled ? "" : rowMenu.why
+            onTriggered: App.unmute(rowMenu.conversationId)
+        }
+
+        QQC2.MenuItem {
+            id: archiveMenuEntry
+
+            readonly property bool archived: rowMenu.offer.archived === true
+            visible: rowMenu.offer.shown === true
+            enabled: visible && rowMenu.offer.on === true
+            height: visible ? implicitHeight : 0
+            icon.name: archiveMenuEntry.archived ? "archive-remove" : "archive-insert"
+            text: archiveMenuEntry.archived ? L10n.i18nc("@action:inmenu", "Unarchive") : L10n.i18nc("@action:inmenu", "Archive")
+            Accessible.description: archiveMenuEntry.enabled ? "" : rowMenu.why
+            onTriggered: archiveMenuEntry.archived ? page.unarchiveAsked(rowMenu.conversationId) : page.archiveAsked(rowMenu.conversationId)
+        }
+
+        // The line: a wrapping label in an item of its own (a menu entry of 105 characters would
+        // make the whole menu that wide; this one is as wide as `implicitWidth` says and takes
+        // no key).
+        Item {
+            id: whyLine
+
+            readonly property bool shown: rowMenu.line !== ""
+            visible: whyLine.shown
+            implicitWidth: Kirigami.Units.gridUnit * 18
+            implicitHeight: whyLine.shown ? whyLabel.implicitHeight + Kirigami.Units.smallSpacing * 2 : 0
+            height: implicitHeight
+            Accessible.role: Accessible.StaticText
+            Accessible.name: whyLabel.text
+
+            QQC2.Label {
+                id: whyLabel
+
+                anchors.fill: parent
+                anchors.leftMargin: Kirigami.Units.largeSpacing
+                anchors.rightMargin: Kirigami.Units.largeSpacing
+                verticalAlignment: Text.AlignVCenter
+                text: rowMenu.line
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+            }
+        }
+
+        QQC2.MenuSeparator {
+            visible: markReadEntry.visible || rowMenu.offer.shown === true
+            height: visible ? implicitHeight : 0
+        }
+        QQC2.MenuItem {
+            objectName: "rowCopyName"
+            icon.name: "edit-copy"
+            text: L10n.i18nc("@action:inmenu", "Copy Name")
+            onTriggered: App.copyShown(Style.unmarked(rowMenu.row?.title ?? ""))
+        }
+        // A group, a channel or a list has no number and no link to a person.
+        QQC2.MenuItem {
+            objectName: "rowCopyNumber"
+            visible: rowMenu.row !== null && !rowMenu.row.isGroup
+            enabled: visible
+            height: visible ? implicitHeight : 0
+            icon.name: "edit-copy"
+            text: L10n.i18nc("@action:inmenu", "Copy Number or ID")
+            onTriggered: App.copyChat("number", rowMenu.conversationId)
+        }
+        QQC2.MenuItem {
+            objectName: "rowCopyLink"
+            visible: rowMenu.row !== null && !rowMenu.row.isGroup
+            enabled: visible
+            height: visible ? implicitHeight : 0
+            icon.name: "edit-copy"
+            text: L10n.i18nc("@action:inmenu", "Copy Link")
+            onTriggered: App.copyChat("link", rowMenu.conversationId)
         }
     }
 }

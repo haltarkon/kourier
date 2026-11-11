@@ -135,7 +135,7 @@ fn the_runbook_names_every_step_of_the_tool() {
             "the runbook names the step {n}"
         );
     }
-    assert_eq!(STEPS.len(), 12, "a new step needs its place in the runbook");
+    assert_eq!(STEPS.len(), 16, "a new step needs its place in the runbook");
 }
 
 /// Every stop word the runbook names is one the judge (or the supervisor's time limit) can say, and every

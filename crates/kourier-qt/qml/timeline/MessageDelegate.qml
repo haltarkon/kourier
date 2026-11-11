@@ -94,6 +94,16 @@ Item {
         return "";
     }
 
+    // The addresses of the links of the text that are shown ("Copy Link Address").
+    readonly property var copyLinks: {
+        for (const b of root.blocks) {
+            if (b.type === "text") {
+                return b.links ?? [];
+            }
+        }
+        return [];
+    }
+
     // Widest natural width of the bubble's content, clamped to the bubble's maximum.
     property real naturalWidth: 0
     // The widest picture or album box of the row (a sticker has none), 0 for a row without
@@ -331,6 +341,7 @@ Item {
             "pages": root.pages,
             "actions": root.actions,
             "copyText": root.copyText,
+            "links": root.copyLinks,
             "reactions": root.reactions,
             "failed": root.failed,
             "edited": root.edited && !root.deleted,

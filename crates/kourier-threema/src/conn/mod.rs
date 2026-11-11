@@ -171,6 +171,11 @@ use lines::{Frames, Out};
 pub(crate) use state::publish;
 use state::{Next, Outcome};
 
+/// The user agent of every HTTPS request of this client.
+pub(crate) fn user_agent() -> String {
+    d2m::client_info().to_user_agent()
+}
+
 /// The connect (DNS, TCP, TLS, the upgrade) and the D2M handshake up to `ServerInfo` must finish
 /// within this much of the actor's clock (Kourier's number; critic M10).
 const HANDSHAKE_WITHIN: Duration = Duration::from_secs(20);
@@ -227,6 +232,8 @@ pub(crate) struct Setup {
     pub(crate) ready: watch::Receiver<bool>,
     /// Wakes the actor's forwarder after a reflected batch with events committed (`core_outbox`, TH5 A6).
     pub(crate) wake: Rc<Notify>,
+    /// Tells the walk over the profile pictures that a contact or group sync was stored (TH8).
+    pub(crate) pictures: Rc<Notify>,
     /// The forwarder's last settled `core_outbox` seq (the actor's `acked` watch, `outbox::forward`):
     /// what the catch-up boundary waits for (TH5 A5b).
     pub(crate) acked: watch::Receiver<i64>,
@@ -684,6 +691,7 @@ async fn one_socket(
         keys,
         ready: setup.ready.clone(),
         wake: setup.wake.clone(),
+        pictures: setup.pictures.clone(),
         held: Vec::new(),
         held_bytes: 0,
         closing: false,
@@ -927,6 +935,8 @@ struct Session {
     ready: watch::Receiver<bool>,
     /// Wakes the forwarder ([`Setup::wake`]).
     wake: Rc<Notify>,
+    /// [`Setup::pictures`].
+    pictures: Rc<Notify>,
     /// Step 0 (B1): the reflected envelopes that wait for zone 2, in arrival order, and their bytes.
     held: Vec<Reflected>,
     held_bytes: usize,
@@ -1567,6 +1577,7 @@ impl Session {
                     },
                     own: self.keys.own(),
                     wake: &self.wake,
+                    pictures: Some(&self.pictures),
                     catch_up,
                 };
                 reflect::apply(&ctx, reflect::Batch::open(&self.keys, chunk))

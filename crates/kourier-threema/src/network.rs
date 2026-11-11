@@ -124,6 +124,17 @@ impl std::fmt::Debug for ThreemaNetwork {
     }
 }
 
+/// Threema's link to a person (`https://threema.id/<ID>`, Threema's "Share Link"): eight characters
+/// of `A-Z` and `0-9`, or a gateway ID's leading `*` and seven of them; `None` for anything else.
+fn id_link(id: &str) -> Option<String> {
+    let body = id.strip_prefix('*').unwrap_or(id);
+    let ok = id.len() == 8
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    ok.then(|| format!("https://threema.id/{id}"))
+}
+
 impl Network for ThreemaNetwork {
     fn kind(&self) -> NetworkKind {
         NetworkKind::Threema
@@ -131,6 +142,16 @@ impl Network for ThreemaNetwork {
 
     fn descriptor(&self) -> &NetworkDescriptor {
         &self.descriptor
+    }
+
+    fn contact_links(&self) -> bool {
+        true
+    }
+
+    fn contact_id_link(&self, user: &UserId) -> Option<String> {
+        (user.scheme() == "threema")
+            .then(|| id_link(user.value()))
+            .flatten()
     }
 
     /// A random message id (libthreema's generator) in libthreema's text form (`msg_id`): the
@@ -149,5 +170,29 @@ impl Network for ThreemaNetwork {
         let name = format!("threema-{}", ctx.uuid.short());
         let parts = self.parts.clone();
         spawn_account_thread(name, move || actor::run(ctx, parts))
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::id_link;
+
+    #[test]
+    fn a_person_link_is_the_id_on_threemas_share_link_host() {
+        assert_eq!(
+            id_link("ECHOECHO").as_deref(),
+            Some("https://threema.id/ECHOECHO")
+        );
+        assert_eq!(
+            id_link("*GATEWAY").as_deref(),
+            Some("https://threema.id/*GATEWAY")
+        );
+    }
+
+    #[test]
+    fn only_the_shape_of_an_id_makes_a_link() {
+        for not in ["ECHO", "ECHOECHOX", "echoecho", "", "ECHO/CHO", "*ECHO"] {
+            assert_eq!(id_link(not), None, "{not}");
+        }
     }
 }

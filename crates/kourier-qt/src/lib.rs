@@ -124,7 +124,15 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// of the test network and one that plays WhatsApp) of which the second is hidden and has unread
 /// messages; `accountsdrawer` = the side panel (wide: expanded, one account unticked; narrow: the
 /// open drawer with only the first account shown, its box greyed).
-pub const PAGES: [&str; 82] = [
+/// A10d: the chat list's own menus and the chat page's, on the fixture's first ordinary chat (no chat is
+/// added): `rowmenu` = the row menu of a list row (Mark as Unread, Pin, Mute, Archive); `rowmenuoff` =
+/// the same with the account's sync switch turned off through `App.setRoamingWrites` (every entry
+/// greyed, the reason under them); `rowmenumuted` = the row of a chat muted for an hour (the quiet
+/// line with its end above Unmute); `mutemenu` = the row menu with the Mute sub-menu open;
+/// `muteuntil` = the open chat with the "Mute Until" dialog; `chatmenu` = the open chat with its
+/// overflow menu; `chatmenuoff` = the same with the account's sync switch turned off (every entry
+/// greyed, the reason wrapped under Archive).
+pub const PAGES: [&str; 90] = [
     "welcome",
     "link",
     "qr",
@@ -196,6 +204,7 @@ pub const PAGES: [&str; 82] = [
     "archive",
     "person",
     "group",
+    "groupadmin",
     "chatmedia",
     "safety",
     "safetychanged",
@@ -207,11 +216,19 @@ pub const PAGES: [&str; 82] = [
     "locationnever",
     "accounts",
     "accountsdrawer",
+    "rowmenu",
+    "rowmenuoff",
+    "rowmenumuted",
+    "mutemenu",
+    "muteuntil",
+    "chatmenu",
+    "chatmenuoff",
 ];
 
-/// Registers the `image://kourier` provider on `engine` (before it loads QML; §8.6). [`run`]
-/// does it; tests that create their own engine call it too.
-pub fn install_image_provider(engine: std::pin::Pin<&mut QQmlApplicationEngine>) {
+/// Registers the `image://kourier` and `image://kourierart` providers on `engine` (before it
+/// loads QML; §8.6). [`run`] does it; tests that create their own engine call it too.
+pub fn install_image_provider(mut engine: std::pin::Pin<&mut QQmlApplicationEngine>) {
+    bridge::qobject::install_art_provider(engine.as_mut());
     bridge::qobject::install_image_provider(engine, media::read);
 }
 
@@ -507,9 +524,11 @@ mod qml_rules {
                     let t = l.trim();
                     if depth == 1 {
                         hides |= t.starts_with("visible:") || t.starts_with("height: visible ?");
-                        // (An action that has an `enabled:` of its own states when it works.)
-                        disables |=
-                            t == "enabled: visible" || (action && t.starts_with("enabled:"));
+                        // (An action that has an `enabled:` of its own states when it works; an
+                        // item may add its own condition behind `visible &&`.)
+                        disables |= t == "enabled: visible"
+                            || t.starts_with("enabled: visible && ")
+                            || (action && t.starts_with("enabled:"));
                     }
                     depth += i32::try_from(t.matches('{').count()).unwrap_or(0)
                         - i32::try_from(t.matches('}').count()).unwrap_or(0);

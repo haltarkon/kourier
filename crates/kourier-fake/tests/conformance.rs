@@ -1726,6 +1726,65 @@ fn the_roaming_switch_flips_the_stated_caps() {
     });
 }
 
+/// A script that rejects the person's changes (`Script::reject_changes`, a rejected Threema
+/// transaction) refuses the switch as it refuses a chat's change: `InvalidInput`, the answer
+/// the Settings page shows as "The setting could not be saved." (A10d D5). The refusal comes
+/// before anything else is looked at: also a fake that states no flag says "rejected", not
+/// "not scripted". The same fake without the knob accepts, so the refusal is the knob's.
+/// Mutant: the check in `set_roaming_writes` is gone.
+#[test]
+fn a_script_that_rejects_changes_refuses_the_switch() {
+    use kourier_model::ErrorKind;
+    async fn switch(run: &mut Running, on: bool) -> Result<(), kourier_model::BackendError> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        run.ends
+            .commands
+            .send(Command::SetRoamingWrites { on, reply })
+            .await
+            .expect("send");
+        answer.await.expect("answered")
+    }
+    let rt = runtime();
+    let clock = FakeClock::new(1_000_000);
+    // (name, the flag the script states, the knob, whether the switch to ON is refused)
+    let cases: [(&str, Option<bool>, bool, bool); 4] = [
+        ("rejects-off", Some(false), true, true),
+        ("rejects-on", Some(true), true, true),
+        // Nothing stated and the knob set: the knob is looked at first.
+        ("rejects-none", None, true, true),
+        // The control: the same script without the knob accepts.
+        ("accepts-off", Some(false), false, false),
+    ];
+    for (name, roaming, reject, refused) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut script = roaming_script(name, roaming, Vec::new());
+        script.reject_changes = reject;
+        let fake = FakeNetwork::new(Flavor::SignalLike, script);
+        rt.block_on(async {
+            let mut run = spawn(
+                &fake,
+                dir.path(),
+                AccountUuid::new_random(),
+                StartMode::Fresh,
+                &clock,
+                &rt,
+            );
+            roaming_link(&mut run).await;
+            let answer = switch(&mut run, true).await;
+            if refused {
+                let e = answer.expect_err("refused");
+                assert_eq!(e.kind, ErrorKind::InvalidInput, "{name}");
+                // Asked again, the answer is the same (the refusal changed nothing).
+                let again = switch(&mut run, false).await.expect_err("still refused");
+                assert_eq!(again.kind, ErrorKind::InvalidInput, "{name}");
+            } else {
+                answer.expect("accepted");
+            }
+            stop(run).await;
+        });
+    }
+}
+
 /// The durable change the core sends (the clearing of a mark when the chat is read) is applied
 /// like the plain command while the switch is on, in the row that acknowledges it, and once however
 /// often the core sends it; with the switch off it is acknowledged and dropped.

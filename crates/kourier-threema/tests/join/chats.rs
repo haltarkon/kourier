@@ -1,6 +1,6 @@
 //! TH5 A7b: THE JOIN STATES EVERY 1:1 CHAT AT ONCE (decision E1, his QB "All at once, empty") with the phone's
 //! archive, pin and mute (his QC; M8: "only when mentioned" is not muted) and its protected flag (his QA, E2),
-//! and Threema's features on every chat (H2 + his QD: `NotYetBuilt`). The phone hands three contacts (one
+//! and Threema's features on every chat (H2, TH8: text and files can be sent). The phone hands three contacts (one
 //! archived and muted until a time, one pinned and protected, one HIDDEN) and a pinned, protected group "only
 //! when mentioned"; zone 2's rows reach the core side, read LITERALLY: a 1:1 chat for each direct contact, none
 //! for the hidden one, after the contacts and before the group.

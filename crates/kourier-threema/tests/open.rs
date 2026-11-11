@@ -43,10 +43,12 @@ fn version(conn: &Connection, component: &str) -> Option<i64> {
     .ok()
 }
 
-/// The tables of schema 5 that start empty (1: the identity and the nonce stores; 2: the join's import;
+/// The tables of schema 6 that start empty (1: the identity and the nonce stores; 2: the join's import;
 /// 3: the deferred envelopes; 4: what is being sent; 5: what the leader took from the chat server) and the outbox.
 /// Schema 3's `deferred_total` starts with its one row.
-const TABLES: [&str; 15] = [
+const TABLES: [&str; 17] = [
+    "picture",
+    "features_stated",
     "identity",
     "csp_nonce",
     "d2d_nonce",
@@ -84,15 +86,15 @@ fn deferred_total_rows(conn: &Connection) -> Vec<(i64, i64, i64)> {
         .expect("rows")
 }
 
-/// A new file is at schema 5 with its tables, all empty but the kept sum's one row `(1, 0, 0)`, and
+/// A new file is at schema 6 with its tables, all empty but the kept sum's one row `(1, 0, 0)`, and
 /// `core_outbox` at kourier-db's latest.
 #[test]
-fn a_new_file_is_at_schema_5_with_empty_tables() {
+fn a_new_file_is_at_schema_6_with_empty_tables() {
     let t = temp_store();
     let dir = t.close();
     let conn = raw(dir.path());
     let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
-    assert_eq!(version(&conn, "threema"), Some(5), "threema schema");
+    assert_eq!(version(&conn, "threema"), Some(6), "threema schema");
     assert_eq!(version(&conn, "core_outbox"), Some(outbox), "outbox schema");
     for table in TABLES {
         assert!(has_table(&conn, table), "table {table} is missing");
@@ -118,7 +120,7 @@ fn opening_twice_gives_one_schema() {
     }
     let conn = raw(dir.path());
     let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
-    assert_eq!(version(&conn, "threema"), Some(5));
+    assert_eq!(version(&conn, "threema"), Some(6));
     assert_eq!(version(&conn, "core_outbox"), Some(outbox));
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM schema_version", [], |r| r.get(0))
@@ -170,7 +172,7 @@ fn a_schema_3_file_migrates_to_schema_4_with_the_send_tables_empty() {
     for _ in 0..2 {
         drop(open(&db_path(dir.path()), &key()).expect("open migrates"));
         let conn = raw(dir.path());
-        assert_eq!(version(&conn, "threema"), Some(5));
+        assert_eq!(version(&conn, "threema"), Some(6));
         for (table, rows) in [
             ("csp_nonce", 1),
             ("contact", 1),
@@ -284,7 +286,7 @@ fn a_schema_4_file_migrates_to_schema_5_with_csp_inbound_empty() {
     for _ in 0..2 {
         drop(open(&db_path(dir.path()), &key()).expect("open migrates"));
         let conn = raw(dir.path());
-        assert_eq!(version(&conn, "threema"), Some(5));
+        assert_eq!(version(&conn, "threema"), Some(6));
         for (table, rows) in [
             ("csp_nonce", 1),
             ("deferred", 1),
@@ -379,7 +381,7 @@ fn a_newer_schema_is_refused_and_not_touched() {
             component,
             found,
             supported,
-        }) => assert_eq!((component.as_str(), found, supported), ("threema", 999, 5)),
+        }) => assert_eq!((component.as_str(), found, supported), ("threema", 999, 6)),
         _ => panic!("a newer threema schema must be refused as TooNew"),
     }
     assert_eq!(files_hash(dir.path()), before, "a newer file was written");

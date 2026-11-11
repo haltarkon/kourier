@@ -51,6 +51,102 @@ msgstr ""
 
 #: crates/kourier-qt/qml/AccountsDrawer.qml
 #, kde-format
+msgctxt "@title:menu the color of an account's chats"
+msgid "Color"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color: the one of its network"
+msgid "Network Color"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Blue"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Green"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Teal"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Violet"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Pink"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Red"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Orange"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Yellow"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Gray"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Dark"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Name"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Number or ID"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Link"
+msgstr ""
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
 msgctxt "@option:check, %1 an account's name"
 msgid "Show %1 in the list"
 msgstr ""
@@ -153,11 +249,13 @@ msgid "Open"
 msgstr ""
 
 #: crates/kourier-qt/qml/MainWindow.qml
+#: crates/kourier-qt/qml/components/GroupPage.qml
 #: crates/kourier-qt/qml/components/TimerPart.qml
 #: crates/kourier-qt/qml/dialogs/AttachmentDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/ChatDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
 #: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
@@ -263,6 +361,12 @@ msgctxt "@action:button restart the application"
 msgid "Restart"
 msgstr ""
 
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Undo"
+msgstr ""
+
 #: crates/kourier-qt/qml/MediaActions.qml
 #, kde-format
 msgctxt "@info"
@@ -344,12 +448,20 @@ msgctxt "@info accessible"
 msgid "Pinned"
 msgstr ""
 
+#: crates/kourier-qt/qml/components/CopyableText.qml
+#, kde-format
+msgctxt "@action:button accessible, the small button after a number or an ID"
+msgid "Copy"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/CopyableText.qml
 #: crates/kourier-qt/qml/components/DescriptionText.qml
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Copy"
 msgstr ""
 
+#: crates/kourier-qt/qml/components/CopyableText.qml
 #: crates/kourier-qt/qml/components/DescriptionText.qml
 #, kde-format
 msgctxt "@action:inmenu"
@@ -363,6 +475,7 @@ msgid "Open Link…"
 msgstr ""
 
 #: crates/kourier-qt/qml/components/DescriptionText.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Copy Link Address"
@@ -392,6 +505,43 @@ msgstr ""
 
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #, kde-format
+msgctxt "@title:dialog"
+msgid "Reset the Invite Link?"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Turn Off the Invite Link?"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Nobody can join with the link while it is off. Turning it on again brings the same link back."
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "The current link stops working. Nobody can join with it any more."
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Reset Link"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn Off"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
 msgctxt "@info:accessible the group's description"
 msgid "Group description"
 msgstr ""
@@ -413,6 +563,36 @@ msgstr ""
 #, kde-format
 msgctxt "@title:group the members part of a group's page"
 msgid "Members"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@title:group the invite link part of a group's page"
+msgid "Invite Link"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Copy Invite Link"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Reset Invite Link…"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn Off Invite Link…"
+msgstr ""
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn On Invite Link"
 msgstr ""
 
 #: crates/kourier-qt/qml/components/MediaPage.qml
@@ -553,6 +733,7 @@ msgid "Copy Link"
 msgstr ""
 
 #: crates/kourier-qt/qml/components/PersonPage.qml
+#: crates/kourier-viewmodel/src/person.rs
 #, kde-format
 msgctxt "@info:status toast after Copy Link"
 msgid "Link copied"
@@ -1143,6 +1324,42 @@ msgctxt "@info:tooltip"
 msgid "Save As… (Ctrl+S)"
 msgstr ""
 
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Mute Until"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Mute"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label"
+msgid "Mute notifications from this chat until:"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label accessible, followed by the date"
+msgid "Date: %1"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label accessible, followed by the time"
+msgid "Time: %1"
+msgstr ""
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "Choose a time at least a minute from now."
+msgstr ""
+
 #: crates/kourier-qt/qml/dialogs/RevisionsDialog.qml
 #, kde-format
 msgctxt "@title:dialog"
@@ -1364,6 +1581,104 @@ msgstr ""
 #, kde-format
 msgctxt "@action:button"
 msgid "Disappearing Messages"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Mark as Unread"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Pin"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unpin"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@title:menu"
+msgid "Mute"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Hour"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "8 Hours"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Day"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Week"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Until…"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Always"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Mute"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unmute"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Archive"
+msgstr ""
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unarchive"
 msgstr ""
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
@@ -1658,12 +1973,6 @@ msgstr ""
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
-msgctxt "@action:button"
-msgid "Turn Off"
-msgstr ""
-
-#: crates/kourier-qt/qml/settings/SettingsPage.qml
-#, kde-format
 msgctxt "@title:group"
 msgid "General"
 msgstr ""
@@ -1774,6 +2083,30 @@ msgstr ""
 #, kde-format
 msgctxt "@info"
 msgid "Off: squares with your theme's corners."
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Tint chats with their account's color"
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Right-click an account in the side panel to choose its color."
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Drawings behind messages"
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "A faint pattern in the color of the chat's account."
 msgstr ""
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
@@ -1960,6 +2293,18 @@ msgstr ""
 #, kde-format
 msgctxt "@title:group"
 msgid "Accounts"
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Sync chat changes with my phone"
+msgstr ""
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Archive, pin, mute and unread marks made here also change on your phone and your other devices."
 msgstr ""
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
@@ -2200,6 +2545,18 @@ msgstr ""
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Copy Text"
+msgstr ""
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu accessible, %1 the address"
+msgid "Copy Link Address %1"
+msgstr ""
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu, %1 the address"
+msgid "Copy %1"
 msgstr ""
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
@@ -3173,6 +3530,7 @@ msgid "The account could not be created."
 msgstr ""
 
 #: crates/kourier-viewmodel/src/core_source.rs
+#: crates/kourier-viewmodel/src/roaming.rs
 #, kde-format
 msgctxt "@info:status"
 msgid "The setting could not be saved."
@@ -3182,6 +3540,12 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status a contact card was not sent"
 msgid "The contact card could not be sent."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "The change could not be made."
 msgstr ""
 
 #: crates/kourier-viewmodel/src/core_source.rs
@@ -3928,6 +4292,54 @@ msgstr[1] ""
 #, kde-format
 msgctxt "@info:status a group member who is an admin"
 msgid "Admin"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, a group's invite link could not be read"
+msgid "The invite link could not be read. Try again when the account is connected."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, a group's invite link could not be changed"
+msgid "The invite link could not be changed. Try again when the account is connected."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Copy Invite Link"
+msgid "Invite link copied"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, the group's invite link is off"
+msgid "The invite link is off"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Reset Invite Link"
+msgid "New invite link copied"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Reset Invite Link while it is off"
+msgid "The invite link was reset"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Turn On Invite Link"
+msgid "The invite link is on"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Turn Off Invite Link"
+msgid "The invite link is off"
 msgstr ""
 
 #: crates/kourier-viewmodel/src/login.rs
@@ -5515,6 +5927,24 @@ msgctxt "@info under the disabled Share Contact button, %1 the person's name"
 msgid "%1 has no name to share."
 msgstr ""
 
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast after a copy action"
+msgid "Copied"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast, the person has no number or ID Kourier may show"
+msgid "No number or ID to copy"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast, the person has no link Kourier may make"
+msgid "No link to copy"
+msgstr ""
+
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
 msgctxt "@info:preview, %1 how many photos"
@@ -6107,6 +6537,56 @@ msgstr ""
 #, kde-format
 msgctxt "@info:status chat notice, a call the user made from their phone"
 msgid "Outgoing group call"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status under the greyed entries of a chat's menu, the account's switch is off"
+msgid "To change this on your phone too, turn on “Sync chat changes with my phone” for this account in Settings."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status why a chat's entries and the sync switch are greyed, the account is not linked"
+msgid "Available while this account is linked."
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "You can pin up to %1 chat."
+msgid_plural "You can pin up to %1 chats."
+msgstr[0] ""
+msgstr[1] ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status a chat is muted with no end"
+msgid "Muted always"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status a chat is muted until a time, %1 the time (tomorrow at 09:00)"
+msgid "Muted until %1"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat archived"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat returned to inbox"
+msgstr ""
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat marked unread"
 msgstr ""
 
 #: crates/kourier-viewmodel/src/safety.rs

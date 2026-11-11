@@ -503,14 +503,24 @@ fn a_chat_the_phone_does_not_list_is_refused() {
     assert_eq!(w.seq(), 0);
     assert!(w.events().is_empty());
     assert_eq!(w.jobs(), 0);
-    for refused in [
-        Refused::NotListed,
-        Refused::Unreadable,
-        Refused::NotMutable,
-        Refused::TooManyPins,
-    ] {
+    // The pin limit is `TooLarge` (L6): `a_pin_over_the_limit_is_refused_as_too_large`.
+    for refused in [Refused::NotListed, Refused::Unreadable, Refused::NotMutable] {
         assert_eq!(refused.to_backend_error().kind, ErrorKind::InvalidInput);
     }
+}
+
+/// A pin over the account's limit is refused as `TooLarge` (A10d L6; architecture §4.2: on
+/// `ChangeConversation` that kind is the pin limit), so the window names the limit, as for the
+/// core's own `Refusal::TooMany`, and not "the network failed" (what `InvalidInput` reads as).
+/// Its fixed words stay and name no chat. Mutant: the kind back to `InvalidInput`.
+#[test]
+fn a_pin_over_the_limit_is_refused_as_too_large() {
+    let error = Refused::TooManyPins.to_backend_error();
+    assert_eq!(error.kind, ErrorKind::TooLarge);
+    assert_eq!(
+        error.detail,
+        "the account has pinned as many chats as it may"
+    );
 }
 
 /// Note to Self and a group are filed on their own records (`account`, `group:<hex>`), with the

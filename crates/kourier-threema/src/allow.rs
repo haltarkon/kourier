@@ -1,6 +1,8 @@
-//! [`AllowList`]: the Threema IDs a debug build may link (M6, TH4 decision B1). The list holds
-//! SHA-256 digests of the bytes `kourier-threema-allow-v1:` + the 8 ID characters, never an ID in
-//! plain text (the hash keeps the ID out of plain sight; it is not a secret: brief §2.8).
+//! [`AllowList`]: the Threema IDs a link may bring (M6, TH4 decision B1). A normal start of the
+//! application takes ANY ID ([`AllowList::any`], the user's decision of 2026-11-09: "Any ID, every
+//! build"); only a start by the run tool is held to a list. A list holds SHA-256 digests of the
+//! bytes `kourier-threema-allow-v1:` + the 8 ID characters, never an ID in plain text (the hash
+//! keeps the ID out of plain sight; it is not a secret: brief §2.8).
 //!
 //! An EMPTY list (the default of [`crate::ThreemaParts`]) refuses every link at once, before any
 //! transport is made (B1's gate in the actor's `StartLogin`); the ID check against a non-empty list
@@ -17,9 +19,20 @@ const DOMAIN: &[u8] = b"kourier-threema-allow-v1:";
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct AllowList {
     digests: BTreeSet<[u8; 32]>,
+    /// Every ID may link, whatever `digests` holds.
+    any: bool,
 }
 
 impl AllowList {
+    /// The list that takes every ID: what a normal start of the application uses.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            digests: BTreeSet::new(),
+            any: true,
+        }
+    }
+
     /// The list of these IDs (the tests' synthetic IDs; the application reads digests).
     #[must_use]
     pub fn from_ids(ids: &[&str]) -> Self {
@@ -31,6 +44,7 @@ impl AllowList {
     pub fn from_digests(digests: impl IntoIterator<Item = [u8; 32]>) -> Self {
         Self {
             digests: digests.into_iter().collect(),
+            any: false,
         }
     }
 
@@ -46,13 +60,13 @@ impl AllowList {
     /// Whether `id` is on the list.
     #[must_use]
     pub fn contains(&self, id: &str) -> bool {
-        self.digests.contains(&Self::digest(id))
+        self.any || self.digests.contains(&Self::digest(id))
     }
 
-    /// Whether the list holds no ID (every link is refused at once).
+    /// Whether the list takes no ID (every link is refused at once).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.digests.is_empty()
+        !self.any && self.digests.is_empty()
     }
 
     /// How many IDs the list holds.
@@ -65,6 +79,9 @@ impl AllowList {
 /// The count only: no digest (a digest of a known ID would name it).
 impl std::fmt::Debug for AllowList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.any {
+            return f.write_str("AllowList(any id)");
+        }
         write!(f, "AllowList({} ids)", self.digests.len())
     }
 }
@@ -110,6 +127,15 @@ mod tests {
         let list = AllowList::default();
         assert!(list.is_empty());
         assert!(!list.contains("TESTID01"));
+    }
+
+    #[test]
+    fn the_any_list_takes_every_id_and_is_not_empty() {
+        let list = AllowList::any();
+        assert!(!list.is_empty(), "an any list would refuse every link");
+        assert!(list.contains("TESTID01") && list.contains("TESTID02"));
+        assert_ne!(list, AllowList::default());
+        assert_eq!(format!("{list:?}"), "AllowList(any id)");
     }
 
     #[test]

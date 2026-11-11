@@ -348,8 +348,7 @@ opt-level = "s"
 # over). libthreema brings a second line of the dalek crates and a few ciphers only it uses; those
 # are named with their version so the rows never reach the first line Signal uses (cargo warns about
 # a name that matches nothing, but NOT about a `name@version` whose version is not in the graph:
-# after a bump, `cargo check --release -p kourier-threema -v` must show `opt-level=s` for each). The release
-# archive is built without Threema (`signal,whatsapp`), so these rows change only the default build.
+# after a bump, `cargo check --release -p kourier-threema -v` must show `opt-level=s` for each).
 [profile.release.package.kourier-threema]
 opt-level = "s"
 [profile.release.package.libthreema]

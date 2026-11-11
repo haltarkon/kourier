@@ -14,21 +14,19 @@ use std::path::{Path, PathBuf};
 use kourier_db::{DbKey, ZoneDb};
 
 /// Threema's features on every chat as TH5's decision H2 (with his QD) states them, written out with EVERY
-/// field named: the receive windows OPEN, the send side OFF (no edit, delete for everyone, reply or
-/// reactions; a delete for me stays local), `cannot_send: NotYetBuilt`, a set of reactions per user, the
-/// rest the contract's most restrictive values (TH5b B1: and every attachment kind with a caption and no size limit).
+/// field named: the receive windows OPEN, text and files can be sent (TH8: 6,000 bytes of text, every attachment kind
+/// with a caption up to the mirror's 100 MiB), the rest of the send side OFF (no edit, delete for everyone, reply or
+/// reactions; a delete for me stays local), a set of reactions per user, the rest the contract's most restrictive values.
 pub fn threema_features() -> kourier_model::ConversationFeatures {
-    use kourier_model::{
-        AttachmentKind, CannotSend, ConversationFeatures, FileLimits, Support, Window,
-    };
+    use kourier_model::{AttachmentKind, ConversationFeatures, FileLimits, Support, Window};
     let open = Window {
         max_age_secs: None,
         max_count: None,
     };
     ConversationFeatures {
-        max_text_bytes: None,
+        max_text_bytes: Some(6_000),
         formatting: std::collections::BTreeMap::new(),
-        // TH5b B1 (R3, F2): every kind with a caption and no size limit, so a received caption edit is taken.
+        // TH5b B1 (R3, F2): every kind with a caption, so a received caption edit is taken; TH8: the mirror's limit.
         files: [
             AttachmentKind::Image,
             AttachmentKind::Video,
@@ -42,7 +40,7 @@ pub fn threema_features() -> kourier_model::ConversationFeatures {
             (
                 kind,
                 FileLimits {
-                    max_size: 0,
+                    max_size: 100 * 1024 * 1024,
                     caption: true,
                 },
             )
@@ -67,8 +65,9 @@ pub fn threema_features() -> kourier_model::ConversationFeatures {
         history: kourier_model::HistorySource::None,
         group_actions: kourier_model::GroupActions::default(),
         group_info: None,
-        cannot_send: Some(CannotSend::NotYetBuilt),
+        cannot_send: None,
         roaming_listed: None,
+        invite_link_on: false,
     }
 }
 

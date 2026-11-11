@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kourier_threema::{
-    HttpsClient, HttpsRequest, HttpsResponse, NetError, ServerParams, ThreemaParts, WsConnector,
-    WsEvent, WsKind, WsRequest, WsSender,
+    HttpsClient, HttpsMethod, HttpsRequest, HttpsResponse, NetError, ServerParams, ThreemaParts,
+    WsConnector, WsEvent, WsKind, WsRequest, WsSender,
 };
 
 use super::d2m::{ConnId, Mediator, Out};
@@ -615,7 +615,7 @@ impl Drop for Pending<'_> {
 }
 
 /// The in-process `HttpsClient`: the directory's host is served by [`super::directory`] (TH6 L2b; a request pends while
-/// [`Net::hold_directory`] holds); every other request (the blob mirror: TH8) is refused, counted and recorded.
+/// [`Net::hold_directory`] holds); a GET of the blob mirror is 404 (it holds nothing); every other request is refused, counted and recorded.
 pub struct MockHttps(Net);
 
 #[async_trait]
@@ -633,6 +633,14 @@ impl HttpsClient for MockHttps {
             let answer = net.directory.serve(&request);
             net.changed.notify_waiters();
             return answer;
+        }
+        if request.method == HttpsMethod::Get && request.url.starts_with(BLOB_URL) {
+            // A blob a scene's sync names, a profile picture: this world holds none.
+            return Ok(HttpsResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            });
         }
         self.0.0.refused_https.fetch_add(1, Ordering::SeqCst);
         self.0
@@ -656,6 +664,8 @@ impl MockWorld {
             rendezvous_url: RENDEZVOUS_URL.to_owned(),
             directory_url: DIRECTORY_URL.to_owned(),
             blob_url: BLOB_URL.to_owned(),
+            blob_done_url: format!("{BLOB_URL}done"),
+            blob_upload_url: format!("{BLOB_URL}upload"),
             chat_server_keys: vec![self.server_key.public],
         }
     }

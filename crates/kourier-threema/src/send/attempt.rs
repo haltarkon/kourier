@@ -1,4 +1,4 @@
-//! THE ATTEMPT (TH6a S6): what a `Command::Transmit` becomes behind the parts' test door, and every answer to the core.
+//! THE ATTEMPT (TH6a S6): what a `Command::Transmit` becomes, and every answer to the core.
 //!
 //! A `Transmit` is a question about a `local`, so the LEDGER is asked first: a `done` row is answered from the file and
 //! writes no frame, and a row that stands is run again from where it stands. Only a `local` the file does not hold is
@@ -50,6 +50,8 @@ use crate::msg_id;
 
 /// The `kind` column of the core's text.
 const KIND_TEXT: &str = "text";
+/// The `kind` column of a file message (`files`).
+const KIND_FILE: &str = "file";
 /// How long a `Transmit` waits when its budget is spent (decision C10).
 const QUEUE_FULL_WAIT: Duration = Duration::from_secs(60);
 
@@ -117,7 +119,7 @@ enum Decided {
     Attach(i64, Option<Vec<String>>),
 }
 
-/// THE ACTOR'S `Transmit`, behind the door (module doc).
+/// THE ACTOR'S `Transmit` (module doc).
 pub(crate) fn transmit(
     db: &ZoneDb,
     shared: &Shared,
@@ -125,7 +127,42 @@ pub(crate) fn transmit(
     req: OutgoingRequest,
     reply: oneshot::Sender<TransmitOutcome>,
 ) {
-    match decide(db, shared, now_ms, req) {
+    run(db, shared, now_ms, req, None, reply);
+}
+
+/// A `Transmit` whose file went up: `made` names it (`files::message_of`).
+pub(crate) fn transmit_made(
+    db: &ZoneDb,
+    shared: &Shared,
+    now_ms: u64,
+    req: OutgoingRequest,
+    made: NewBody,
+    reply: oneshot::Sender<TransmitOutcome>,
+) {
+    run(db, shared, now_ms, req, Some(made), reply);
+}
+
+/// Whether `req` is a file that has yet to reach the blob server. A `local` on the ledger has been there: it runs on
+/// from its stored rows, and is answered from them.
+pub(crate) fn wants_upload(db: &ZoneDb, req: &OutgoingRequest) -> bool {
+    if super::files::file_of(req).is_none() {
+        return false;
+    }
+    let held = db.read(|conn: &Connection| {
+        Ok::<_, StoreError>(queue::send_ledger(conn, &req.local)?.is_some())
+    });
+    !matches!(held, Ok(true))
+}
+
+fn run(
+    db: &ZoneDb,
+    shared: &Shared,
+    now_ms: u64,
+    req: OutgoingRequest,
+    made: Option<NewBody>,
+    reply: oneshot::Sender<TransmitOutcome>,
+) {
+    match decide(db, shared, now_ms, req, made) {
         Decided::Answer(outcome) => {
             let _ = reply.send(outcome);
         }
@@ -138,7 +175,13 @@ pub(crate) fn transmit(
     }
 }
 
-fn decide(db: &ZoneDb, shared: &Shared, now_ms: u64, req: OutgoingRequest) -> Decided {
+fn decide(
+    db: &ZoneDb,
+    shared: &Shared,
+    now_ms: u64,
+    req: OutgoingRequest,
+    made: Option<NewBody>,
+) -> Decided {
     let OutgoingRequest {
         conv,
         local,
@@ -166,15 +209,21 @@ fn decide(db: &ZoneDb, shared: &Shared, now_ms: u64, req: OutgoingRequest) -> De
     match ledger {
         Ok(Some((task, receivers))) => on_the_ledger(shared, now_ms, &to, &task, &receivers, only),
         Ok(None) => {
-            let Some(body) = body_of(kind) else {
-                return refused(ErrorKind::Unsupported, NOT_BUILT);
+            let (body, row_kind) = match made {
+                Some(body) => (body, KIND_FILE),
+                None => {
+                    let Some(body) = body_of(kind) else {
+                        return refused(ErrorKind::Unsupported, NOT_BUILT);
+                    };
+                    (body, KIND_TEXT)
+                }
             };
             if !shared.live() {
                 return Decided::Answer(transient(NO_SOCKET));
             }
             let message = NewMessage {
                 local: local.to_string(),
-                kind: KIND_TEXT,
+                kind: row_kind,
                 to,
                 created_at: sent_at,
                 body,
@@ -302,7 +351,7 @@ fn only_of(only: Option<Vec<UserId>>) -> Result<Option<Vec<String>>, ()> {
     .transpose()
 }
 
-/// What TH6a sends: a plain text. A quote, a timer and the ranges of mentions and markup have no writer here, and a message
+/// What a `Transmit` with no file sends: a plain text. A quote, a timer and the ranges of mentions and markup have no writer here, and a message
 /// that lost them would say something else than the user wrote: refused until a later step writes them.
 fn body_of(kind: OutgoingKind) -> Option<NewBody> {
     match kind {

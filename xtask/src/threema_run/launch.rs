@@ -68,6 +68,10 @@ const NO_PIPEWIRE: &str = "kourier-threema-run-no-audio";
 /// The app's seam for the fake that plays Threema (T8) and the word it takes.
 pub(super) const REHEARSAL_ENV: &str = "KOURIER_DEV_REHEARSAL";
 pub(super) const REHEARSAL_WORD: &str = "threema";
+/// Tells the app it was started by this tool, so it keeps this tool's rules: the switch is
+/// `networks-on` alone and a link takes only the IDs on the list (`kourier-app` `prefs.rs`
+/// `THREEMA_RUN_TOOL_ENV`). Every other start has Threema on and takes any ID.
+pub(super) const RUN_TOOL_ENV: &str = "KOURIER_THREEMA_RUN";
 /// How long a launch order of `start` stays valid: the supervisor reads it within a moment.
 const LAUNCH_VALID_MS: u64 = 120_000;
 /// How long the profile's lock is asked for again while it looks held (a program another thread is
@@ -457,6 +461,7 @@ fn base_env(cmd: &mut Command, dir: &ProfileDir, inherited: &[OsString], rehears
         cmd.env_remove(key);
     }
     cmd.env("KOURIER_HOME", &dir.dir);
+    cmd.env(RUN_TOOL_ENV, "1");
     if rehearsal {
         if let Some(data_home) = dir.keeper().parent() {
             cmd.env("XDG_DATA_HOME", data_home);

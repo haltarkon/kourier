@@ -344,6 +344,9 @@ pub(crate) struct Ctx<'a> {
     pub(crate) own: ThreemaId,
     /// Wakes the forwarder once a zone with events committed (`outbox::append_events`).
     pub(crate) wake: &'a Rc<Notify>,
+    /// Told once a batch with a contact or group sync committed: a profile picture may differ now. `None` for the
+    /// messages a leader takes from the chat server, which are never a sync.
+    pub(crate) pictures: Option<&'a Notify>,
     /// The batch came before the connection's Dry (a catch-up message, not announced one by one).
     pub(crate) catch_up: bool,
 }
@@ -417,6 +420,7 @@ pub(crate) fn apply(ctx: &Ctx<'_>, batch: Batch) -> Applied {
 
 /// ONE zone over `entries` (the REFLECTED kill points); the rules of the envelopes it dropped.
 fn zone(ctx: &Ctx<'_>, entries: &[Entry]) -> Result<Counts> {
+    let mut synced = false;
     let counts = db::zone(ctx.db, store::REFLECTED_POINTS, |tx| {
         let mut counts = Counts::default();
         let mut dropped = Dropped::default();
@@ -445,6 +449,10 @@ fn zone(ctx: &Ctx<'_>, entries: &[Entry]) -> Result<Counts> {
             if let Some(d2d::envelope::Content::IncomingMessage(m)) = &envelope.content {
                 crate::leader::zone::forget_pending(tx, &m.sender_identity, m.message_id)?;
             }
+            synced |= matches!(
+                &envelope.content,
+                Some(d2d::envelope::Content::ContactSync(_) | d2d::envelope::Content::GroupSync(_))
+            );
             let mut notice_tag = [0; 8];
             notice_tag.copy_from_slice(&hash[..8]);
             let one = One {
@@ -470,6 +478,9 @@ fn zone(ctx: &Ctx<'_>, entries: &[Entry]) -> Result<Counts> {
         Ok(counts)
     })?;
     ZONES.fetch_add(1, Ordering::SeqCst);
+    if let (true, Some(pictures)) = (synced, ctx.pictures) {
+        pictures.notify_one();
+    }
     Ok(counts)
 }
 

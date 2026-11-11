@@ -123,6 +123,10 @@ name = "group_load_ui"
 harness = false
 
 [[test]]
+name = "group_invite_ui"
+harness = false
+
+[[test]]
 name = "settings_ui"
 harness = false
 
@@ -174,6 +178,11 @@ harness = false
 # The archive of the conversation list (A1): the entry, the view, the way back.
 [[test]]
 name = "archive_ui"
+harness = false
+
+# The menus, keys and dialog of the Signal Storage writes (A10d): the sub-menu made again, the dialog's opening.
+[[test]]
+name = "roaming_ui"
 harness = false
 
 # Save As, Save All and Show in Folder through the real main window (F3b): the dialog is a stand-in

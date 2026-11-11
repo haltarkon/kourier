@@ -36,7 +36,8 @@
 //!   `out_message_ack`, `out_reflect_inbound` or `out_ephemeral` above `in_csp_message`; boxes above
 //!   three per message; a job's reflects above two per box (one row in flight); `out_other`; `drop`
 //!   but while a removal is asked [`leader-burst`].
-//! - Any socket: a frame of origin `transmit` (no user send exists before TH7, `NotYetBuilt`)
+//! - Any socket: a frame of origin `transmit`, outside a send step's window or above its bounds
+//!   ([`SendWindow`]: a send from the window is the user's own act and only a send step expects one)
 //!   [`transmit`].
 //! - S5c: an L-KIND line [`unhandled-<kind>`] (and `in_other` > 0 without one [`unhandled-other`]).
 //! - S5d: a D2 line or `held` > 0 [`held-<rule>`]: a held group change (`group-sync-needed`,
@@ -176,6 +177,78 @@ pub(super) enum Seen<'a> {
     Said(Said),
 }
 
+/// The reflects one send step may add on one socket: one for a text or a file, the rest for a
+/// resend after a lost connection.
+pub(super) const SEND_REFLECTS: u64 = 4;
+
+/// The boxes one send step may add on one socket: one per member of a small test group, and a resend.
+pub(super) const SEND_BOXES: u64 = 16;
+
+/// The no-send rule's only opening: frames of origin `transmit` are allowed while a send step stands,
+/// within its bounds, and never otherwise. Count lines are cumulative per socket, so the bounds are
+/// the frames the socket had already written plus what the step may add. A socket's end starts the
+/// counters at zero, and the bounds with them.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SendWindow {
+    open: bool,
+    /// (reflects, boxes) of the socket that stands now, as its last count line said.
+    seen: (u64, u64),
+    /// (reflects, boxes) the socket that stands now may reach. The default is the old rule: none.
+    limit: (u64, u64),
+    /// The steps whose own send (`--lead-sends`) this start has made.
+    sent: Vec<String>,
+}
+
+impl SendWindow {
+    /// A send step begins. Idempotent: a step called again after a pause keeps its bounds.
+    pub(super) fn open(&mut self) {
+        if !self.open {
+            self.open = true;
+            self.limit = (self.seen.0 + SEND_REFLECTS, self.seen.1 + SEND_BOXES);
+        }
+    }
+
+    /// The step is over: what was written stays allowed, and nothing further is.
+    pub(super) fn close(&mut self) {
+        self.open = false;
+        self.limit = self.seen;
+    }
+
+    pub(super) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The one send of the step `what` in this start: `false` when it was made before.
+    pub(super) fn claim(&mut self, what: &str) -> bool {
+        if self.sent.iter().any(|w| w == what) {
+            return false;
+        }
+        self.sent.push(what.to_owned());
+        true
+    }
+
+    /// Nothing reached the app's `send`: the step may try again.
+    pub(super) fn give_back(&mut self, what: &str) {
+        self.sent.retain(|w| w != what);
+    }
+
+    fn allows(&self, reflects: u64, boxes: u64) -> bool {
+        reflects <= self.limit.0 && boxes <= self.limit.1
+    }
+
+    fn counted(&mut self, reflects: u64, boxes: u64, end: bool) {
+        self.seen = (reflects, boxes);
+        if end {
+            self.seen = (0, 0);
+            self.limit = if self.open {
+                (SEND_REFLECTS, SEND_BOXES)
+            } else {
+                (0, 0)
+            };
+        }
+    }
+}
+
 /// The run's context, as the earlier lines and events left it.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Judge {
@@ -200,6 +273,8 @@ pub(super) struct Judge {
     /// A removal is asked (T7's `unlink` or `removed-on-phone`, R-L2): 4113, `logged_out` and the
     /// drop frame are its own.
     pub removal_asked: bool,
+    /// What a send step lets through (nothing, outside one).
+    pub send: SendWindow,
     /// A tolerated hold stands on the socket that stands now (a D2 line or a count line said so).
     phone_hold: bool,
     /// When the socket's first tolerated hold was seen: the step-aside's asks are bounded from it.
@@ -446,6 +521,8 @@ fn count(j: &mut Judge, c: &Count, at_ms: u64) -> Option<String> {
         j.tolerate_hold(at_ms);
     }
     let halt = judged_counts(j, c, &n, at_ms);
+    j.send
+        .counted(n("out_reflect_transmit"), n("out_box_transmit"), c.end);
     if c.end {
         // MEDIUM-2: what this socket took as the leader and wrote as boxes goes into the run's
         // budget (a socket's counters never add up to another's line, but its END does).
@@ -484,7 +561,10 @@ fn count(j: &mut Judge, c: &Count, at_ms: u64) -> Option<String> {
 
 fn judged_counts(j: &Judge, c: &Count, n: &dyn Fn(&str) -> u64, at_ms: u64) -> Option<String> {
     let halt = |kind: &str| Some(kind.to_owned());
-    if n("out_reflect_transmit") > 0 || n("out_box_transmit") > 0 {
+    if !j
+        .send
+        .allows(n("out_reflect_transmit"), n("out_box_transmit"))
+    {
         return halt("transmit");
     }
     if n("held") > 0 {

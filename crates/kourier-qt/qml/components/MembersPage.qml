@@ -200,6 +200,7 @@ Item {
                         "isSelf": row.isSelf
                     })
                 adminLabel: root.group.adminLabel ?? ""
+                account: root.group.account ?? 0
                 width: list.width
                 focusPolicy: Qt.NoFocus
                 highlighted: list.activeFocus && ListView.isCurrentItem

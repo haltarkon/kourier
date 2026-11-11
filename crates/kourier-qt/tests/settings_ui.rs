@@ -38,6 +38,10 @@
 //!   with Telegram listed but OFF (`tgoff`) there is no second line: the sentence follows the
 //!   networks that are on.
 //!
+//! - "Sync chat changes with my phone" (A10d D5, two more processes of their own, `roaming` and
+//!   `roaming-refused`): see `ROAMING_SCRIPT`. `KOURIER_SETTINGS_UI_ONLY=a,b` runs only the named
+//!   child cases (and not the long first session).
+//!
 //! The core is asked directly at the end: the option it holds, whether it shows quiet notices
 //! (not), and what its timeline has.
 
@@ -533,6 +537,273 @@ MainWindow {
 }
 "##;
 
+/// "Sync chat changes with my phone" on the account cards (A10d D5), in a process of its own per
+/// case (`CASE`):
+///
+/// - `roaming`: three linked accounts (`FixtureOptions::accounts: 3`: the fixture account, a second
+///   one of the test network and one that plays WhatsApp). The two accounts of the test network
+///   show the row On, with its words and an accessible description that names the account; the
+///   WhatsApp account has the card and no row (a hidden row has no place and takes no key). A REAL
+///   click on the fixture account's row turns it off through the fake: the card is made again
+///   (the echo remakes every card), the new row says Off, HAS THE KEYBOARD and the page did not
+///   move; a real Space on it turns it on again the same way; the other accounts' rows never moved.
+///   The row's key filter takes the repeats of a held key (stand-in events: `TestEvent` has none).
+/// - `roaming-refused`: the fake rejects every change (`FixtureOptions::reject_changes`). A real
+///   click on the row: the mark is On again at once and stays, the SAME row (no card was made),
+///   the toast "The setting could not be saved." is on screen and was told politely, the keyboard
+///   is still on the row and `roamingFocus` is clear.
+const ROAMING_SCRIPT: &str = r##"
+import QtQuick
+import QtQml
+import app.kourier
+
+MainWindow {
+    id: win
+
+    width: 520
+    height: 760
+    visible: true
+
+    readonly property bool refusal: "CASE" === "roaming-refused"
+    property string step: "start"
+    property int waits: 0
+    property int quiet: 0
+    property bool busy: false
+    property var ev: null
+    // The accounts by what they are, the row that was clicked and the view's place before it.
+    property real fx: 0
+    property real work: 0
+    property real phone: 0
+    property var row: null
+    property real top: 0
+
+    function fail(msg: string): void {
+        console.error("FAIL [CASE/" + step + "]: " + msg);
+        Qt.exit(1);
+    }
+
+    function later(what: string): void {
+        win.waits += 1;
+        if (win.waits > 1500) {
+            fail("never happened: " + what);
+        }
+    }
+
+    function next(step: string): void {
+        win.step = step;
+        win.waits = 0;
+        win.quiet = 0;
+    }
+
+    function find(root: Item, pred: var): Item {
+        if (pred(root)) {
+            return root;
+        }
+        for (const child of root.children) {
+            const hit = win.find(child, pred);
+            if (hit) {
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    function findAll(root: Item, pred: var): var {
+        const hits = [];
+        const walk = item => {
+            if (pred(item)) {
+                hits.push(item);
+            }
+            for (const child of item.children) {
+                walk(child);
+            }
+        };
+        walk(root);
+        return hits;
+    }
+
+    // The account's sync row (an item also for an account that has none: it is hidden then).
+    function rowOf(account: real): Item {
+        return win.settingsPage ? win.find(win.settingsPage, i => i.objectName === "roaming-" + account) : null;
+    }
+
+    // What the page was told of the account.
+    function actionOf(account: real): var {
+        return App.accountActions.find(a => a.account === account);
+    }
+
+    // A toast with exactly this text on screen.
+    function toasted(text: string): bool {
+        const same = c => c.text === text && c.visible;
+        return win.findAll(win.contentItem, same).concat(win.findAll(win.overlay, same)).length > 0;
+    }
+
+    // The row in the middle of the view (the click is a real one: the row must lie in the window).
+    function reveal(item: Item): void {
+        const flick = win.settingsPage.flickable;
+        const y = item.mapToItem(flick.contentItem, 0, 0).y;
+        flick.contentY = Math.max(0, Math.min(y - (flick.height - item.height) / 2, flick.contentHeight - flick.height));
+    }
+
+    Timer {
+        interval: 40
+        repeat: true
+        running: true
+        onTriggered: {
+            if (win.busy) {
+                return;
+            }
+            win.busy = true;
+            try {
+                win.tick();
+            } finally {
+                win.busy = false;
+            }
+        }
+    }
+
+    function tick(): void {
+        switch (win.step) {
+        case "start": {
+            if (!win.started || !App.hasAccounts) return win.later("the start page and the accounts");
+            if (App.accountActions.length !== (win.refusal ? 1 : 3)) return win.later("the accounts");
+            win.ev = Qt.createQmlObject("import QtTest\nTestEvent {}", win.contentItem, "settings_ui_roaming_events.qml");
+            win.openSettings();
+            win.next("page");
+            return;
+        }
+        case "page": {
+            const page = win.settingsPage;
+            if (!page) return win.later("the settings page");
+            const acts = App.accountActions;
+            if (win.refusal) {
+                win.fx = acts[0].account;
+            } else {
+                const works = acts.filter(a => a.about.startsWith("Demo Work"));
+                const phones = acts.filter(a => a.about.startsWith("Demo Phone"));
+                if (works.length !== 1 || phones.length !== 1) return win.fail("the accounts are the fixture account, a second one and one that plays WhatsApp");
+                win.work = works[0].account;
+                win.phone = phones[0].account;
+                win.fx = acts.find(a => a.account !== win.work && a.account !== win.phone).account;
+            }
+            const mine = win.actionOf(win.fx);
+            const row = win.rowOf(win.fx);
+            // The viewmodel states the switch once the network has said its caps.
+            if (mine.roaming !== "on" || !row || !row.visible) return win.later("the fixture account's switch row shows On (the page was told '" + mine.roaming + "')");
+            if (mine.roamingNote !== "") return win.fail("a note under a switch that can be flipped");
+            if (row.text !== "Sync chat changes with my phone") return win.fail("the row's words: " + row.text);
+            if (row.description !== "Archive, pin, mute and unread marks made here also change on your phone and your other devices.") return win.fail("the row's description: " + row.description);
+            if (!row.checked) return win.fail("the row says On");
+            // (`enabled` is false while a page above is disabled, such as during the push: wait for it.)
+            if (!row.enabled) return win.later("the row can be flipped (the page takes input)");
+            if (row.height <= 0) return win.fail("the row has no height");
+            // A screen reader hears which account this is, then what the switch does (L1).
+            const said = row.Accessible.description;
+            if (said.indexOf(mine.about) !== 0 || said.indexOf(row.description) < 0) return win.fail("the accessible description names the account and the effect");
+            // A held key is filtered by every key but Tab and Backtab (TestEvent sends no auto-repeat).
+            const held = { isAutoRepeat: true, accepted: false, key: Qt.Key_Space };
+            row.holdKey(held);
+            if (!held.accepted) return win.fail("a held Space reaches the switch");
+            const first = { isAutoRepeat: false, accepted: false, key: Qt.Key_Space };
+            row.holdKey(first);
+            if (first.accepted) return win.fail("the first press of Space was taken");
+            const tab = { isAutoRepeat: true, accepted: false, key: Qt.Key_Tab };
+            row.holdKey(tab);
+            if (tab.accepted) return win.fail("a held Tab was taken");
+            if (!win.refusal) {
+                const other = win.actionOf(win.work);
+                const otherRow = win.rowOf(win.work);
+                if (other.roaming !== "on" || !otherRow || !otherRow.visible || !otherRow.checked) return win.later("the second account's row shows On");
+                // The account that plays WhatsApp has its card and no row.
+                const phoneAct = win.actionOf(win.phone);
+                const card = win.find(page, i => i.objectName === "account-" + win.phone);
+                const phoneRow = win.rowOf(win.phone);
+                if (!card || !card.visible) return win.later("the WhatsApp account's card");
+                if (phoneAct.roaming !== "") return win.fail("the WhatsApp account states a switch");
+                if (!phoneRow) return win.fail("the card has no place for the row at all");
+                if (phoneRow.visible) return win.fail("the WhatsApp account shows the sync row");
+            }
+            win.reveal(row);
+            win.next("reveal");
+            return;
+        }
+        case "reveal": {
+            // A few ticks for the view to settle where it was put, then the click.
+            win.quiet += 1;
+            if (win.quiet < 8) return;
+            const page = win.settingsPage;
+            const row = win.rowOf(win.fx);
+            const at = row.mapToItem(page.flickable, 0, 0).y;
+            if (at < 0 || at + row.height > page.flickable.height) return win.fail("the row cannot be brought on screen");
+            win.row = row;
+            win.top = page.flickable.contentY;
+            if (!win.ev.mouseClick(row, row.width / 2, row.height / 2, Qt.LeftButton, Qt.NoModifier, -1)) return win.fail("the window took no mouse event");
+            win.next("clicked");
+            return;
+        }
+        case "clicked": {
+            const page = win.settingsPage;
+            if (Math.abs(page.flickable.contentY - win.top) > 0.5) return win.fail("the page moved by " + Math.round(page.flickable.contentY - win.top) + " px");
+            const row = win.rowOf(win.fx);
+            if (win.refusal) {
+                // No card is made for a refusal; the mark is what it was, at once and for good.
+                if (row !== win.row) return win.fail("a card was made again for a refusal");
+                // The handle may stay at the clicked value until the refusal comes (L5); once the
+                // toast is up the old state is back, and a refused switch never stays Off.
+                if (!win.toasted("The setting could not be saved.")) return win.later("the toast 'The setting could not be saved.'");
+                if (!row.checked) return win.fail("the mark followed the click, not the echo (a refused switch shows Off)");
+                if (win.chatToldAnnounced !== "The setting could not be saved." || win.chatToldPoliteness !== Accessible.Polite) return win.fail("the refusal was not told politely to a screen reader");
+                if (page.roamingFocus !== 0) return win.fail("the refused row still waits for the keyboard");
+                if (!row.activeFocus) return win.fail("the keyboard left the row");
+                win.quiet += 1;
+                if (win.quiet < 10) return;
+                if (win.actionOf(win.fx).roaming !== "on" || !row.checked) return win.fail("a refusal changed the switch");
+                Qt.exit(0);
+                return;
+            }
+            // The echo: the account states the switch off, every card is made again.
+            if (win.actionOf(win.fx).roaming !== "off") return win.later("the echo: the account states the switch off");
+            if (!row || row === win.row) return win.later("the cards are made again");
+            if (!row.visible || row.checked) return win.fail("the new row says Off: " + row.visible + " " + row.checked);
+            if (!row.activeFocus || page.roamingFocus !== 0) return win.later("the new row has the keyboard (" + row.activeFocus + ", waiting " + page.roamingFocus + ")");
+            const other = win.rowOf(win.work);
+            if (!other || !other.visible || !other.checked) return win.fail("the second account's row moved with the first");
+            win.quiet += 1;
+            if (win.quiet < 10) return;
+            win.row = row;
+            // The keyboard is on the row: Space turns it on again, the same way.
+            if (!win.ev.keyClick(Qt.Key_Space, Qt.NoModifier, -1)) return win.fail("no key event");
+            win.next("space");
+            return;
+        }
+        case "space": {
+            const page = win.settingsPage;
+            if (Math.abs(page.flickable.contentY - win.top) > 0.5) return win.fail("the page moved by " + Math.round(page.flickable.contentY - win.top) + " px");
+            if (win.actionOf(win.fx).roaming !== "on") return win.later("the key turned the switch on");
+            const row = win.rowOf(win.fx);
+            if (!row || row === win.row) return win.later("the cards are made again");
+            if (!row.visible || !row.checked) return win.fail("the new row says On: " + row.visible + " " + row.checked);
+            if (!row.activeFocus || page.roamingFocus !== 0) return win.later("the new row has the keyboard again");
+            const other = win.rowOf(win.work);
+            if (!other || !other.visible || !other.checked) return win.fail("the second account's row moved with the first");
+            const phoneRow = win.rowOf(win.phone);
+            if (!phoneRow || phoneRow.visible) return win.fail("the WhatsApp account shows the sync row");
+            win.quiet += 1;
+            if (win.quiet < 10) return;
+            Qt.exit(0);
+            return;
+        }
+        }
+    }
+
+    Timer {
+        interval: 60000
+        running: true
+        onTriggered: win.fail("timeout in step " + win.step)
+    }
+}
+"##;
+
 /// The texts of the timer chat as the core has them.
 #[allow(clippy::disallowed_methods)] // The test's main thread, not the Qt thread.
 fn texts(app: &kourier_app::AppHandle, conv: ConversationId) -> Vec<String> {
@@ -571,22 +842,11 @@ fn policy(app: &kourier_app::AppHandle) -> ExpiryPolicy {
     }
 }
 
-/// One case of the Privacy card's second line in this process: the exit code.
-fn run_privacy(case: &str) -> i32 {
-    let (network, telegram_off, second) = match case {
-        "tgprivacy" => (FixtureNetwork::Telegram, false, "Always sent for Telegram."),
-        "plainprivacy" => (FixtureNetwork::Fake, false, ""),
-        // Telegram is listed and OFF: it does not send anything for this start.
-        "tgoff" => (FixtureNetwork::Fake, true, ""),
-        other => panic!("unknown case {other}"),
-    };
+/// Starts the fixture with `options` and runs `script` as the window, in this process: the exit
+/// code (`name` is the script's file name in the QML module).
+fn run_window(options: FixtureOptions, script: &str, name: &str) -> i32 {
     let app = App::start(StartOptions {
-        launch: Launch::Fixture(FixtureOptions {
-            messages_per_conversation: 6,
-            network,
-            telegram_off,
-            ..FixtureOptions::default()
-        }),
+        launch: Launch::Fixture(options),
         ..StartOptions::default()
     })
     .expect("start the app");
@@ -597,15 +857,12 @@ fn run_privacy(case: &str) -> i32 {
     });
     kourier_qt::set_options(UiOptions::default());
     let mut qt = QGuiApplication::new();
-    let script = PRIVACY_SCRIPT
-        .replace("CASE", case)
-        .replace("SECOND", second);
     let mut engine = QQmlApplicationEngine::new();
     if let Some(mut engine) = engine.as_mut() {
         kourier_qt::install_image_provider(engine.as_mut());
         engine.load_data(
-            &QByteArray::from(script.as_str()),
-            &QUrl::from("qrc:/qt/qml/app/kourier/qml/settings_ui_privacy_test.qml"),
+            &QByteArray::from(script),
+            &QUrl::from(format!("qrc:/qt/qml/app/kourier/qml/{name}").as_str()),
         );
     }
     let code = qt.as_mut().map_or(3, |qt| qt.exec());
@@ -615,18 +872,56 @@ fn run_privacy(case: &str) -> i32 {
     code
 }
 
-fn main() {
-    support::answer_list("settings_ui");
-    // This test shows a window: always offscreen, whatever the session's platform is.
-    // SAFETY: single-threaded test binary, before the app and Qt start.
-    unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };
-    // What the script says when it fails must reach the test's output.
-    // SAFETY: as above.
-    unsafe { std::env::set_var("QT_FORCE_STDERR_LOGGING", "1") };
-    // The Privacy card's second line: each case in a process of its own.
-    if let Ok(case) = std::env::var("KOURIER_SETTINGS_UI_CASE") {
-        std::process::exit(run_privacy(&case));
-    }
+/// One case of the Privacy card's second line in this process: the exit code.
+fn run_privacy(case: &str) -> i32 {
+    let (network, telegram_off, second) = match case {
+        "tgprivacy" => (FixtureNetwork::Telegram, false, "Always sent for Telegram."),
+        "plainprivacy" => (FixtureNetwork::Fake, false, ""),
+        // Telegram is listed and OFF: it does not send anything for this start.
+        "tgoff" => (FixtureNetwork::Fake, true, ""),
+        other => panic!("unknown case {other}"),
+    };
+    let script = PRIVACY_SCRIPT
+        .replace("CASE", case)
+        .replace("SECOND", second);
+    run_window(
+        FixtureOptions {
+            messages_per_conversation: 6,
+            network,
+            telegram_off,
+            ..FixtureOptions::default()
+        },
+        &script,
+        "settings_ui_privacy_test.qml",
+    )
+}
+
+/// One case of "Sync chat changes with my phone" in this process (`ROAMING_SCRIPT`): the exit code.
+fn run_roaming(case: &str) -> i32 {
+    let refused = match case {
+        "roaming" => false,
+        "roaming-refused" => true,
+        other => panic!("unknown case {other}"),
+    };
+    let script = ROAMING_SCRIPT.replace("CASE", case);
+    run_window(
+        FixtureOptions {
+            messages_per_conversation: 6,
+            // Three accounts (the fixture's, a second of the test network and one that plays
+            // WhatsApp) to see the row come and not come; one for the refusal, whose knob is
+            // the fixture account's own script.
+            accounts: if refused { 0 } else { 3 },
+            reject_changes: refused,
+            ..FixtureOptions::default()
+        },
+        &script,
+        "settings_ui_roaming_test.qml",
+    )
+}
+
+/// The first session: the choice for disappearing messages and the page's other switches, in the
+/// real main window over the real core (this process).
+fn first_session() {
     let app = App::start(StartOptions {
         launch: Launch::Fixture(FixtureOptions {
             messages_per_conversation: 20,
@@ -707,12 +1002,52 @@ fn main() {
 
     app.shutdown();
     println!("test the choice for disappearing messages ... ok");
+}
 
-    // The Privacy card's second line, each case in a process of its own.
+fn main() {
+    support::answer_list("settings_ui");
+    // This test shows a window: always offscreen, whatever the session's platform is.
+    // SAFETY: single-threaded test binary, before the app and Qt start.
+    unsafe { std::env::set_var("QT_QPA_PLATFORM", "offscreen") };
+    // What the script says when it fails must reach the test's output.
+    // SAFETY: as above.
+    unsafe { std::env::set_var("QT_FORCE_STDERR_LOGGING", "1") };
+    // The Privacy card's second line and the sync switch: each case in a process of its own.
+    if let Ok(case) = std::env::var("KOURIER_SETTINGS_UI_CASE") {
+        let code = match case.as_str() {
+            "roaming" | "roaming-refused" => run_roaming(&case),
+            _ => run_privacy(&case),
+        };
+        std::process::exit(code);
+    }
+
+    // `KOURIER_SETTINGS_UI_ONLY=a,b` runs only the named child cases (and not the first session).
+    let only: Vec<String> = std::env::var("KOURIER_SETTINGS_UI_ONLY")
+        .map(|v| v.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let first = only.is_empty();
+    if first {
+        first_session();
+    }
+
+    // The Privacy card's second line and the sync switch, each case in a process of its own.
     let exe = std::env::current_exe().expect("the test binary");
     let mut failed = 0;
-    let cases = ["tgprivacy", "plainprivacy", "tgoff"];
-    for case in cases {
+    let cases: Vec<&str> = [
+        "tgprivacy",
+        "plainprivacy",
+        "tgoff",
+        "roaming",
+        "roaming-refused",
+    ]
+    .into_iter()
+    .filter(|c| first || only.iter().any(|o| o == c))
+    .collect();
+    assert!(
+        first || !cases.is_empty(),
+        "KOURIER_SETTINGS_UI_ONLY names no case"
+    );
+    for case in &cases {
         let out = std::process::Command::new(&exe)
             .env("KOURIER_SETTINGS_UI_CASE", case)
             .output()
@@ -725,13 +1060,13 @@ fn main() {
             println!("    script error: {line}");
         }
         if out.status.success() && errors.is_empty() {
-            println!("test the privacy card: {case} ... ok");
+            println!("test the settings page: {case} ... ok");
         } else {
-            println!("test the privacy card: {case} ... FAILED ({})", out.status);
+            println!("test the settings page: {case} ... FAILED ({})", out.status);
             failed += 1;
         }
     }
-    let passed = 1 + cases.len() - failed;
+    let passed = usize::from(first) + cases.len() - failed;
     if failed == 0 {
         println!("\ntest result: ok. {passed} passed; 0 failed");
     } else {

@@ -144,6 +144,9 @@ pub enum Command {
         text: String,
         /// The chat that must be the open one (an id from `chats`), or no check.
         conversation: Option<i64>,
+        /// With a named chat: the files the composer's strip must hold, which go with the text as
+        /// its caption (0: it must hold none).
+        files: i32,
     },
     /// Answers the challenge an account waits on with what the browser would hand back (the
     /// solution token or the whole `signalcaptcha://` link), through the invokable the
@@ -534,9 +537,24 @@ fn parse_request(obj: &Map<String, Value>) -> Result<Command, ParseError> {
                     ));
                 }
             };
+            let conversation = optional_id(args, "conversation", cmd)?;
+            let files = match args.get("files") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .filter(|n| *n >= 0 && (*n == 0 || conversation.is_some()))
+                    .ok_or_else(|| {
+                        ParseError::BadRequest(
+                            "send: \"files\" must be a count, and it goes with a \"conversation\""
+                                .into(),
+                        )
+                    })?,
+            };
             Command::Send {
                 text,
-                conversation: optional_id(args, "conversation", cmd)?,
+                conversation,
+                files,
             }
         }
         "challenge" => {
@@ -940,14 +958,24 @@ mod tests {
             cmd(r#"{"cmd":"send","args":{"text":"hi","conversation":7}}"#),
             Command::Send {
                 text: "hi".into(),
-                conversation: Some(7)
+                conversation: Some(7),
+                files: 0,
+            }
+        );
+        assert_eq!(
+            cmd(r#"{"cmd":"send","args":{"text":"hi","conversation":7,"files":1}}"#),
+            Command::Send {
+                text: "hi".into(),
+                conversation: Some(7),
+                files: 1,
             }
         );
         assert_eq!(
             cmd(r#"{"cmd":"send","args":{"text":"hi","conversation":null}}"#),
             Command::Send {
                 text: "hi".into(),
-                conversation: None
+                conversation: None,
+                files: 0,
             }
         );
         assert_eq!(
@@ -981,6 +1009,10 @@ mod tests {
             r#"{"cmd":"send","args":{"text":"hi","conversation":7.5}}"#,
             r#"{"cmd":"send","args":{"text":"hi","conversation":true}}"#,
             r#"{"cmd":"send","args":{"text":"hi","conversation":[7]}}"#,
+            // A count of files goes with a named chat, and it is a count.
+            r#"{"cmd":"send","args":{"text":"hi","files":1}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":7,"files":-1}}"#,
+            r#"{"cmd":"send","args":{"text":"hi","conversation":7,"files":"1"}}"#,
             r#"{"cmd":"act","args":{"on":"own","action":"delete","conversation":0}}"#,
             r#"{"cmd":"act","args":{"on":"own","action":"delete","conversation":"7"}}"#,
             r#"{"cmd":"act","args":{"on":"own","action":"delete","message":0}}"#,
@@ -1045,7 +1077,8 @@ mod tests {
             cmd(r#"{"cmd":"send","args":{"text":"hi"}}"#),
             Command::Send {
                 text: "hi".into(),
-                conversation: None
+                conversation: None,
+                files: 0,
             }
         );
         // Files without a caption.
@@ -1053,7 +1086,8 @@ mod tests {
             cmd(r#"{"cmd":"send"}"#),
             Command::Send {
                 text: String::new(),
-                conversation: None
+                conversation: None,
+                files: 0,
             }
         );
         assert_eq!(

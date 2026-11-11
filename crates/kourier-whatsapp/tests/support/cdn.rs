@@ -212,6 +212,8 @@ struct Inner {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     /// The `direct_path` of a finished upload, by its token.
     by_token: Mutex<HashMap<String, String>>,
+    /// The host of every GET so far.
+    gets: Mutex<Vec<String>>,
     /// What broken POSTs got, by token (from byte 0).
     partials: Mutex<HashMap<String, Vec<u8>>>,
     next: AtomicUsize,
@@ -292,6 +294,20 @@ impl Cdn {
     /// Every resume check so far.
     pub fn checks(&self) -> Vec<Checked> {
         self.0.checked.lock().expect("lock").clone()
+    }
+
+    /// Puts a file on the servers at `direct_path`, as a phone's upload would (W7).
+    pub fn plant(&self, direct_path: &str, bytes: Vec<u8>) {
+        self.0
+            .blobs
+            .lock()
+            .expect("lock")
+            .insert(direct_path.to_owned(), bytes);
+    }
+
+    /// Every download asked so far: its host.
+    pub fn gets(&self) -> Vec<String> {
+        self.0.gets.lock().expect("lock").clone()
     }
 
     /// The bytes of the finished upload at `direct_path` (what a download of it gives).
@@ -413,6 +429,33 @@ fn read_up_to(body: &mut UploadBody, got: &mut Vec<u8>, limit: u64) -> Result<()
 
 #[async_trait]
 impl HttpClient for Cdn {
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// A download (W7), on the path the real client takes: 200 with the file planted at the URL's direct path, else 404.
+    fn execute_streaming(
+        &self,
+        request: HttpRequest,
+    ) -> anyhow::Result<wacore::net::StreamingHttpResponse> {
+        let url = parse(&request.url);
+        self.0.gets.lock().expect("lock").push(url.host);
+        let found = self
+            .0
+            .blobs
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(direct_path, _)| request.url.contains(direct_path.as_str()))
+            .map(|(_, bytes)| bytes.clone());
+        Ok(match found {
+            Some(bytes) => {
+                wacore::net::StreamingHttpResponse::new(200, Box::new(std::io::Cursor::new(bytes)))
+            }
+            None => wacore::net::StreamingHttpResponse::new(404, Box::new(std::io::empty())),
+        })
+    }
+
     async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
         let url = parse(&request.url);
         let answer = self

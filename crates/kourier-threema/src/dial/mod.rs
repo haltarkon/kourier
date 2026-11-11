@@ -56,10 +56,15 @@ pub(crate) fn production_params() -> ServerParams {
             .map(|md| md.rendezvous_server_url.as_str().to_owned())
             .unwrap_or_default(),
         directory_url: config.directory_server_url.as_str().to_owned(),
-        // The blob MIRROR (multi-device): its download URL template. [I] TH8 decides whether the
-        // parts need the upload and done URLs as well.
+        // The blob MIRROR (multi-device): its URL templates.
         blob_url: multi_device
             .map(|md| md.blob_mirror_server.download_url.as_str().to_owned())
+            .unwrap_or_default(),
+        blob_done_url: multi_device
+            .map(|md| md.blob_mirror_server.done_url.as_str().to_owned())
+            .unwrap_or_default(),
+        blob_upload_url: multi_device
+            .map(|md| md.blob_mirror_server.upload_url.as_str().to_owned())
             .unwrap_or_default(),
         // A key libthreema prints as anything but 64 lowercase hex digits is left out (none is).
         chat_server_keys: config

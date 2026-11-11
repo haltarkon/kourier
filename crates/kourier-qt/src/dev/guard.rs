@@ -44,6 +44,26 @@ pub(crate) fn the_composer_is_plain(
     }
 }
 
+/// Refuses a guarded `send` unless the composer holds exactly the `wanted` files, none of them still being prepared,
+/// with no edit or reply in progress (the rule of [`the_composer_is_plain`] when `wanted` is 0). A driver that sends
+/// files says how many, so a file of the user's in the strip is never taken along with the tool's.
+pub(crate) fn the_composer_holds(
+    edit_id: i64,
+    reply_to_id: i64,
+    files: i32,
+    preparing: i32,
+    wanted: i32,
+) -> Result<(), DevError> {
+    if edit_id == 0 && reply_to_id == 0 && files == wanted && preparing == 0 {
+        Ok(())
+    } else {
+        Err(DevError::Refused(
+            "refused: the composer is replying / editing / holds other files than the send names"
+                .into(),
+        ))
+    }
+}
+
 /// The message an `act` takes. `rows` are the messages of the open conversation that are not
 /// deleted, newest first, as `(message id if the row has one, own)`. Without `message` it is the
 /// newest one of the kind `on` names (the command's old rule: a newest row with no id yet is
@@ -114,6 +134,24 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(why.contains("replying") && why.contains("editing") && why.contains("files"));
+    }
+
+    #[test]
+    fn a_guarded_send_takes_exactly_the_files_it_names() {
+        assert!(the_composer_holds(0, 0, 0, 0, 0).is_ok());
+        assert!(the_composer_holds(0, 0, 1, 0, 1).is_ok());
+        assert!(
+            refused(&the_composer_holds(0, 0, 1, 0, 0)),
+            "a file it does not name"
+        );
+        assert!(refused(&the_composer_holds(0, 0, 0, 0, 1)), "no file");
+        assert!(refused(&the_composer_holds(0, 0, 2, 0, 1)), "one too many");
+        assert!(
+            refused(&the_composer_holds(0, 0, 1, 1, 1)),
+            "still preparing"
+        );
+        assert!(refused(&the_composer_holds(5, 0, 1, 0, 1)), "an edit");
+        assert!(refused(&the_composer_holds(0, 9, 1, 0, 1)), "a reply");
     }
 
     #[test]

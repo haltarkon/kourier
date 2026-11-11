@@ -62,7 +62,7 @@ pub use app::{
     App, AppError, AppHandle, Arrivals, EXPIRING_TEXT, FixtureInfo, FixtureNetwork, FixtureOptions,
     FixtureSecondLink, FixtureSends, FixtureState, FixtureTransfer, FixtureUpload, FixtureWhatsApp,
     Launch, NetworkInfo, RehearsalAct, RehearsalArriveError, RehearsalKind, StartOptions,
-    TelegramMissing, hostname, networks_line, set_private_umask,
+    StorageCounts, TelegramMissing, hostname, networks_line, set_private_umask,
 };
 pub use keys::{KeyError, KeyMode, Keyring, PassphraseConfig};
 pub use kourier_core::facade;

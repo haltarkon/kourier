@@ -24,6 +24,11 @@ using MediaReader = rust::Fn<rust::Vec<uint8_t>(rust::Str, int32_t, int32_t)>;
 // Registers the provider as `image://kourier` on `engine` (which takes ownership).
 void installImageProvider(QQmlApplicationEngine& engine, MediaReader reader);
 
+// Registers `image://kourierart/<art>/<rrggbb>` on `engine`: the app's own drawings in a color
+// (`doodle`: the tile behind a chat's messages; `swatch`: a dot of that color). Nothing from the
+// network comes through here.
+void installArtProvider(QQmlApplicationEngine& engine);
+
 // How many requests of the provider are not finished (queued or being decoded). A screenshot
 // waits for 0: a view that was re-created while its request was in flight shows no "loading"
 // of its own, but the request is still counted here.

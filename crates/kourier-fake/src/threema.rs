@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use kourier_backend_api::BackendEvent;
 use kourier_model::{
-    CannotSend, ConvKey, ConversationFeatures, MemberRole, NetworkKind, UserId, Window,
+    AttachmentKind, ConvKey, ConversationFeatures, FileLimits, MemberRole, NetworkKind, UserId,
+    Window,
 };
 
 use crate::network::FakeNetwork;
@@ -81,7 +82,7 @@ impl Timings {
 
 /// The features the Threema backend states for every chat in TH5b (its `join::events::features`,
 /// without the `files` limits the rehearsal never uses): edits and deletes are taken without a
-/// window, the send side is off and says `NotYetBuilt` until TH7. `kourier-threema` cannot be
+/// window, and the send side is on (TH7, TH8) with the backend's text limit. `kourier-threema` cannot be
 /// compared here (the edge is the other way round), so a change of the backend's own statement is
 /// for its twin test to catch; the rehearsal's chats then only differ in what no step of the run
 /// tool reads.
@@ -93,7 +94,26 @@ pub fn threema_features() -> ConversationFeatures {
     ConversationFeatures {
         edit_receive: Some(open),
         delete_receive: Some(open),
-        cannot_send: Some(CannotSend::NotYetBuilt),
+        max_text_bytes: Some(MAX_TEXT_BYTES),
+        files: [
+            AttachmentKind::Image,
+            AttachmentKind::Video,
+            AttachmentKind::Audio,
+            AttachmentKind::Voice,
+            AttachmentKind::Gif,
+            AttachmentKind::File,
+        ]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                FileLimits {
+                    max_size: MAX_FILE_BYTES,
+                    caption: true,
+                },
+            )
+        })
+        .collect(),
         ..ConversationFeatures::default()
     }
 }
@@ -101,6 +121,12 @@ pub fn threema_features() -> ConversationFeatures {
 fn id(value: &str) -> Result<UserId, ScriptError> {
     Ok(UserId::from_parts("threema", value)?)
 }
+
+/// The text limit the backend states for a chat.
+const MAX_TEXT_BYTES: u32 = 6_000;
+
+/// The file limit the backend states for a chat (one file per message).
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// The conversation key of the rehearsal's group (`threema:<creator ID>.<16 hex digits>`).
 fn group_key() -> ConvKey {
@@ -294,7 +320,15 @@ mod tests {
     fn the_chats_state_what_the_backend_states_and_the_descriptor_is_threemas_without_its_warning()
     {
         let features = threema_features();
-        assert_eq!(features.cannot_send, Some(CannotSend::NotYetBuilt));
+        assert_eq!(features.cannot_send, None);
+        assert_eq!(features.max_text_bytes, Some(MAX_TEXT_BYTES));
+        assert_eq!(
+            features.files[&AttachmentKind::Image],
+            FileLimits {
+                max_size: MAX_FILE_BYTES,
+                caption: true,
+            }
+        );
         assert!(features.edit_receive.is_some() && features.delete_receive.is_some());
         assert!(features.edit.is_none() && features.delete_for_everyone.is_none());
 

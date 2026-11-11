@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
+import QtQuick.Controls as QQC2
 import org.kde.kirigami as Kirigami
 import app.kourier
 
@@ -26,6 +27,11 @@ Kirigami.ApplicationWindow {
     signal closedForGood()
     // The chat column is on screen with a conversation (read markers, notifications).
     readonly property bool chatShown: App.timeline.conversationId !== 0 && root.chatPage !== null && root.chatPage.Kirigami.ColumnView.inViewport && !root.chatPage.panelCovers && (root.wideScreen || root.pageStack.currentItem === root.chatPage)
+    // What the keys Ctrl+Shift+A and Ctrl+Shift+U need (A10d, H2): the chat is shown AND its page is a page of
+    // the stack. A wide window with Settings over the chat keeps the page counted "in the viewport" after it
+    // left the stack (`chatShown` stays true; found by `roaming_ui` `keys`), and a key must not archive a
+    // chat nobody sees.
+    readonly property bool chatKeys: root.chatShown && root.inStack(root.chatPage)
     // The first frame was presented.
     property bool framed: false
     // The chat page takes its column right after the first frame (see `showListWith`).
@@ -81,6 +87,9 @@ Kirigami.ApplicationWindow {
         showsNotice: !root.wideScreen || App.timeline.conversationId === 0 || App.timeline.cannotSend !== ""
         searchKeys: root.searchKeys
         onOpenConversation: id => root.pickedChat(id)
+        onArchiveAsked: conv => root.archiveChat(conv)
+        onUnarchiveAsked: conv => root.unarchiveChat(conv)
+        onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
         onSwitchedByKeyboard: id => root.switchTo(id)
         onBannerActivated: root.bannerPressed()
     }
@@ -98,6 +107,9 @@ Kirigami.ApplicationWindow {
             visible: false
             // A group in common (or "Message") on the details panel opens that chat.
             onConversationRequested: id => root.pickedChat(id)
+            onArchiveAsked: conv => root.archiveChat(conv)
+            onUnarchiveAsked: conv => root.unarchiveChat(conv)
+            onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
         }
     }
     // The chat column of the first frame: the chat page's empty state without the chat page
@@ -574,6 +586,9 @@ Kirigami.ApplicationWindow {
         } else if (page === "archive") {
             // The list at "Archived Chats", once it says there is one.
             archiveSetup.start();
+        } else if (root.rowMenuPages.indexOf(page) >= 0) {
+            // The chat list with the menu of one row open (the real path of a right click).
+            pageSetup.start();
         } else if (root.accountsPages.indexOf(page) >= 0) {
             // Blended chats: the fixture's three accounts, the second hidden by the page (the
             // choice goes through `App.toggleAccount`, as a click does); `pageSetup` waits for it.
@@ -701,6 +716,18 @@ Kirigami.ApplicationWindow {
         sequences: ["Alt+Up", "Ctrl+PgUp", "Ctrl+Shift+Tab", "Ctrl+Backtab"]
         enabled: root.keysActive
         onActivated: root.stepConversation(-1)
+    }
+    // Archive the open chat; take it back into the chats. Ctrl+Shift+U is IBus's Unicode entry
+    // on some setups (it then never reaches the window).
+    Shortcut {
+        sequences: ["Ctrl+Shift+A"]
+        enabled: root.keysActive && root.chatKeys
+        onActivated: root.keyArchive(true)
+    }
+    Shortcut {
+        sequences: ["Ctrl+Shift+U"]
+        enabled: root.keysActive && (root.chatKeys || root.undoStanding !== null)
+        onActivated: root.undoStanding !== null ? root.undoArchive(root.undoStanding) : root.keyArchive(false)
     }
     Shortcut {
         id: settingsKey
@@ -1078,6 +1105,15 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // A copy action is done: the toast says what came of it (it holds no number and no link).
+    Connections {
+        target: App
+        function onCopyTold(text: string): void {
+            root.showPassiveNotification(Style.plain(text), "short");
+            root.Accessible.announce(text, Accessible.Polite);
+        }
+    }
+
     // The copy for another application is ready.
     Connections {
         target: App
@@ -1310,6 +1346,20 @@ Kirigami.ApplicationWindow {
             root.transferNotices += 1;
             // (The text can carry an account's name.)
             root.showPassiveNotification(Style.plain(text), "long");
+        }
+        // A change of a chat the person made was made (archived, back in the inbox, marked
+        // unread: told once the row says so, never at the click), or the sync switch of Settings
+        // was refused, "The setting could not be saved.", or a change of a chat was refused
+        // ("refused": the pin limit, or that it was not made; a toast, because the click came from the
+        // list as often as from the open chat) (A10d).
+        function onChatTold(kind: string, conversation: var, wasPinned: bool, text: string): void {
+            if (kind === "archived") {
+                root.tellArchived(conversation, wasPinned, text);
+            } else if (kind === "unarchived" || kind === "marked-unread") {
+                root.tellChat(text, "short");
+            } else if (kind === "switch-refused" || kind === "refused") {
+                root.tellChat(text, "long");
+            }
         }
         // "Transfer History from Phone…", or "Try Again…" of a failed transfer.
         function onReplaceAsked(question: var): void {
@@ -1590,12 +1640,146 @@ Kirigami.ApplicationWindow {
     // How many passing notices about ended transfers were shown (tests count them).
     property int transferNotices: 0
 
+    // What the last chat notice told a screen reader and how (tests read both).
+    property string chatToldAnnounced: ""
+    property int chatToldPoliteness: -1
+
+    // A chat notice (A10d): a passing notice that stays as long as the others of its kind, and
+    // the same words told to a screen reader politely, because the focus stays where the
+    // person's action left it and nothing else says that it did not work. The text is the
+    // viewmodel's own sentence; it goes through `Style.plain` like every other notice.
+    function tellChat(text: string, duration: var): void {
+        root.chatToldAnnounced = text;
+        root.chatToldPoliteness = Accessible.Polite;
+        root.showPassiveNotification(Style.plain(text), duration);
+        root.contentItem.Accessible.announce(text, Accessible.Polite);
+    }
+
+    // "Chat archived" with its Undo, for Desktop's 8 seconds (Kirigami's "short" is 4). What
+    // undoing needs stands in `undoStanding` for as long as the notice does: the chat, whether
+    // it was pinned (archiving unpinned it) and whether the archive closed it (the Undo opens
+    // it again then, as a chat he chose: through `openingChat`).
+    property var undoStanding: null
+    // The chat the last archive asked for, if it was the open one (`archiveChat` sets it,
+    // the notice takes it: the archive closes the open chat before the notice comes).
+    property real archivedOpen: 0
+    Timer {
+        id: undoTimer
+        interval: 8000
+        onTriggered: root.undoStanding = null
+    }
+
+    // Each toast has its OWN standing `s`: its Undo undoes its own archive (Kirigami keeps up to
+    // four toasts, each with its callback) and works for as long as the toast stands, however
+    // long the pointer rests on it. `undoStanding` is the newest one, for Ctrl+Shift+U, and
+    // `undoTimer` only bounds the key's window.
+    function tellArchived(conv: real, wasPinned: bool, text: string): void {
+        const s = {
+            "conv": conv,
+            "wasPinned": wasPinned,
+            "reopen": root.archivedOpen === conv,
+            "done": false
+        };
+        root.undoStanding = s;
+        root.archivedOpen = 0;
+        undoTimer.restart();
+        root.chatToldAnnounced = text;
+        root.chatToldPoliteness = Accessible.Polite;
+        root.showPassiveNotification(Style.plain(text), 8000, L10n.i18nc("@action:button", "Undo"), () => root.undoArchive(s));
+        root.contentItem.Accessible.announce(text, Accessible.Polite);
+    }
+
+    // Undo of the archive `standing` (a toast's own, or the newest for the key): once (a notice
+    // left standing does nothing on a second press). The chat opens again only when it was
+    // the open one and nothing else has been opened since (L1).
+    function undoArchive(standing: var): void {
+        if (standing === null || standing === undefined || standing.done) {
+            return;
+        }
+        standing.done = true;
+        if (root.undoStanding === standing) {
+            root.undoStanding = null;
+            undoTimer.stop();
+        }
+        App.undoArchive(standing.conv, standing.wasPinned);
+        if (standing.reopen && App.timeline.conversationId === 0) {
+            root.openingChat(standing.conv, null);
+        }
+    }
+
+    // The ONE path of the menu's Archive and the key: the notice comes when the row says so.
+    function archiveChat(conv: real): void {
+        root.archivedOpen = conv === App.timeline.conversationId ? conv : 0;
+        App.setArchived(conv, true);
+    }
+
+    function unarchiveChat(conv: real): void {
+        App.setArchived(conv, false);
+    }
+
+    // "Mute Until": the dialog is loaded by URL the first time it is asked for and kept (a file a
+    // page names loads its imports with the page; this one needs KDE's calendar and clock, which
+    // nothing before it does). One instance; it starts at the day after and the core's 8:00.
+    property var muteUntilDialog: null
+    // `returnTo`: the item that had the keyboard when the question was asked (the list, when
+    // the row menu's Until… was chosen by key); it gets the keyboard back when the dialog closes.
+    function askMuteUntil(conv: real, returnTo: var): void {
+        if (root.muteUntilDialog === null) {
+            const component = Qt.createComponent(Qt.resolvedUrl("dialogs/MuteUntilDialog.qml"));
+            if (component.status !== Component.Ready) {
+                console.error("MuteUntilDialog: " + component.errorString());
+                return;
+            }
+            root.muteUntilDialog = component.createObject(root);
+        }
+        if (root.muteUntilDialog !== null) {
+            root.muteUntilDialog.conversation = conv;
+            root.muteUntilDialog.returnTo = returnTo ? returnTo : null;
+            // The fields are right before the first frame of the fade-in (M6).
+            root.muteUntilDialog.startAgain();
+            root.muteUntilDialog.open();
+        }
+    }
+
+    // Ctrl+Shift+A (`archive`) and Ctrl+Shift+U on the open chat, as Signal Desktop's: nothing
+    // when it already is so. With the sync switch off the greyed line's words are the answer.
+    function keyArchive(archive: bool): void {
+        const conv = App.timeline.conversationId;
+        if (conv === 0) {
+            return;
+        }
+        const offer = App.timeline.chatOffer;
+        if (!offer.shown) {
+            return;
+        }
+        if (!offer.on) {
+            root.tellChat(offer.why, "long");
+            return;
+        }
+        if (offer.archived === archive) {
+            return;
+        }
+        if (archive) {
+            root.archiveChat(conv);
+        } else {
+            root.unarchiveChat(conv);
+        }
+    }
+
     // The fixture pages of the message actions: each opens a chat (`App` does that) and, for
     // `setupPages`, one of its popups or composer modes once the rows are there.
-    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save"]
-    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media"]
+    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin"]
+    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media", "rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin"]
     // The fixture pages of blended chats: no chat opens, the list stands with its accounts.
     readonly property list<string> accountsPages: ["accounts", "accountsdrawer"]
+    // The fixture pages of the chat list's own menus (A10d): no chat opens; `rowMenuPageReady` opens the
+    // menu of a fixed row (the first ordinary chat) through the list's own `openMenu`.
+    readonly property list<string> rowMenuPages: ["rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu"]
+    // How far that page has come (0: nothing done yet) and the chat it stands on.
+    property int rowMenuStage: 0
+    // The page `chatmenuoff` asked for the switch off (once).
+    property bool chatMenuOffAsked: false
+    property real rowMenuChat: 0
     // The fixture pages of a link in a state of a history transfer, with that state.
     readonly property list<string> transferLinkPages: ["transferwait", "transferdownload", "transferread"]
     readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "wahistory", "walost"]
@@ -1810,6 +1994,126 @@ Kirigami.ApplicationWindow {
     // hides the second account once (the same call a click on its checkbox makes), waits for
     // the list to follow and for its unread count on the panel; `accountsdrawer` then shows the
     // side panel (wide: expanded; narrow: opened over the list). True when the page is final.
+    // The first ordinary chat of the list that stands whole on screen: nothing unread, not
+    // marked, pinned, muted or Note to Self. 0 while there is none.
+    // (A row of the list as an untyped value: its delegate's own properties are not on `Item`.)
+    function listRow(l: var, i: int): var {
+        return l.itemAtIndex(i);
+    }
+
+    function plainRowId(): real {
+        const l = listPage.conversations;
+        for (let i = 0; i < l.count; ++i) {
+            const r = root.listRow(l, i);
+            if (r && !r.isSelf && r.unread === 0 && !r.markedUnread && !r.pinned && !r.muted && r.y >= l.contentY && r.y + r.height <= l.contentY + l.height) {
+                return r.conversationId;
+            }
+        }
+        return 0;
+    }
+
+    function rowOfConversation(id: real): var {
+        const l = listPage.conversations;
+        for (let i = 0; i < l.count; ++i) {
+            const r = root.listRow(l, i);
+            if (r && r.conversationId === id) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    // The pages `rowmenu`, `rowmenuoff`, `rowmenumuted` and `mutemenu`: one step per call (the
+    // timer calls again while this says false). `rowmenuoff` turns the first account's switch off
+    // and `rowmenumuted` mutes the row for an hour, both through the real invokables, and wait for
+    // the echo before the menu opens; `mutemenu` opens the Mute sub-menu of the open menu.
+    function rowMenuPageReady(): bool {
+        const page = App.startPage;
+        if (!listPage.rowsShown || App.accountActions.length === 0) {
+            return false;
+        }
+        if (root.rowMenuChat === 0) {
+            root.rowMenuChat = root.plainRowId();
+            return false;
+        }
+        const id = root.rowMenuChat;
+        const offer = App.chatOffer(id);
+        if (root.rowMenuStage === 0) {
+            if (page === "rowmenuoff") {
+                App.setRoamingWrites(App.accountActions[0].account, false);
+            } else if (page === "rowmenumuted") {
+                App.muteFor(id, "hour");
+            }
+            root.rowMenuStage = 1;
+            return false;
+        }
+        if (root.rowMenuStage === 1) {
+            if (page === "rowmenuoff" && offer.on !== false) {
+                return false;
+            }
+            if (page === "rowmenumuted" && offer.muted !== true) {
+                return false;
+            }
+            const row = root.rowOfConversation(id);
+            if (row === null || (page === "rowmenumuted" && !row.muted)) {
+                return false;
+            }
+            listPage.openMenu(row, -1, -1);
+            root.rowMenuStage = 2;
+            return false;
+        }
+        if (!listPage.rowMenu.opened) {
+            return false;
+        }
+        if (page === "mutemenu") {
+            if (!listPage.muteSub.opened) {
+                listPage.rowMenu.currentIndex = 0;
+                for (let i = 0; i < listPage.rowMenu.count; ++i) {
+                    if (listPage.rowMenu.itemAt(i) === listPage.rowMenu.muteItem) {
+                        listPage.rowMenu.currentIndex = i;
+                    }
+                }
+                listPage.muteSub.open();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The chat page's overflow menu: the shown toolbar button that holds actions (found as
+    // `handleIn` finds the drawer's button; every toolbar button has a `menuActions` list, the
+    // timer's is empty), its menu in the window's scene, opened. True once it is open.
+    function menuButtonIn(item: var): var {
+        if (item === null) {
+            return null;
+        }
+        if (item.menuActions !== undefined && item.visible && item.menuActions.length > 0) {
+            return item;
+        }
+        for (const child of item.children) {
+            const found = root.menuButtonIn(child);
+            if (found !== null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    function openChatMenu(chatPage: var): bool {
+        const button = root.menuButtonIn(chatPage.globalToolBarItem);
+        if (button === null || !button.menu) {
+            return false;
+        }
+        button.menu.popupType = QQC2.Popup.Item;
+        if (!button.checked) {
+            // `toggle()` does not emit `toggled`, and the button opens its menu only there: do
+            // what a click does.
+            button.checked = true;
+            button.toggled();
+        }
+        return button.menu.opened;
+    }
+
     function accountsPageReady(): bool {
         const actions = App.accountActions;
         if (actions.length < 3 || App.conversations.count === 0 || App.shownCount === 0) {
@@ -1857,6 +2161,14 @@ Kirigami.ApplicationWindow {
             // for `accountsdrawer` the side panel is shown.
             if (root.accountsPages.indexOf(App.startPage) >= 0) {
                 if (root.accountsPageReady()) {
+                    pageSetup.stop();
+                    root.pageReady = true;
+                }
+                return;
+            }
+            // The pages of the list's own menus need no chat either.
+            if (root.rowMenuPages.indexOf(App.startPage) >= 0) {
+                if (root.rowMenuPageReady()) {
                     pageSetup.stop();
                     root.pageReady = true;
                 }
@@ -2013,6 +2325,7 @@ Kirigami.ApplicationWindow {
                 }
                 break;
             case "group":
+            case "groupadmin":
                 // The details panel on the group's page, once the core has answered: the group
                 // level's own flag (`App.group`), not the person's.
                 if (!chatPage.panelOpen) {
@@ -2052,6 +2365,40 @@ Kirigami.ApplicationWindow {
                 } else {
                     // (The buttons are dead for a second after the number appeared, X1: the picture waits for them.)
                     done = chatPage.panel !== null && chatPage.panel.level === "safety" && chatPage.panel.loaded && !chatPage.panel.safetyCooling;
+                }
+                break;
+            case "muteuntil":
+                // "Mute Until": the dialog the chat's menu opens, once it says it is open.
+                if (App.timeline.chatOffer.shown !== true || App.timeline.chatOffer.on !== true) {
+                    done = false;
+                } else {
+                    if (root.muteUntilDialog === null || !root.muteUntilDialog.opened) {
+                        root.askMuteUntil(conv);
+                    }
+                    done = root.muteUntilDialog !== null && root.muteUntilDialog.opened;
+                }
+                break;
+            case "chatmenu":
+                // The chat page's overflow menu, open (the toolbar button that holds `menuActions`).
+                if (App.timeline.chatOffer.shown !== true || App.timeline.chatOffer.on !== true) {
+                    done = false;
+                } else {
+                    done = root.openChatMenu(chatPage);
+                }
+                break;
+            case "chatmenuoff":
+                // The same menu after the account's sync switch was turned off through the real invokable
+                // (once; the page waits for the echo): every entry greyed, the reason wrapped under Archive.
+                if (App.timeline.chatOffer.shown !== true) {
+                    done = false;
+                } else if (App.timeline.chatOffer.on !== false) {
+                    if (!root.chatMenuOffAsked) {
+                        root.chatMenuOffAsked = true;
+                        App.setRoamingWrites(App.accountActions[0].account, false);
+                    }
+                    done = false;
+                } else {
+                    done = root.openChatMenu(chatPage);
                 }
                 break;
             case "timerpending":

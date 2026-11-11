@@ -577,6 +577,10 @@ impl Network for FakeNetwork {
         self.flavor == Flavor::SignalLike && self.kind == NetworkKind::Fake
     }
 
+    fn group_invites(&self) -> kourier_model::GroupInvites {
+        self.flavor.group_invites(self.kind)
+    }
+
     fn contact_link(&self, _user: &UserId, number: &str) -> Option<String> {
         (self.contact_links() && kourier_backend_api::is_e164(number))
             .then(|| format!("https://signal.me/#p/{number}"))

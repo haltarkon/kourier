@@ -1178,6 +1178,24 @@ pub(crate) fn with_group_timers(script: Script, key: &ConvKey) -> Script {
     deliver_before_final_state(script, vec![BackendEvent::ConversationUpsert(patch)])
 }
 
+/// The account is an administrator of the group of the group page
+/// (`FixtureOptions::group_admin`, for the invite link's part of the page).
+pub(crate) fn with_group_admin(script: Script, key: &ConvKey) -> Script {
+    let Some(me) = script.own_ids.first().cloned() else {
+        return script;
+    };
+    let mut patch = ConversationPatch::new(key.clone());
+    patch.members = Some(kourier_model::MemberList {
+        full: false,
+        upsert: vec![kourier_model::Member {
+            user: me,
+            role: kourier_model::MemberRole::Admin,
+        }],
+        remove: Vec::new(),
+    });
+    deliver_before_final_state(script, vec![BackendEvent::ConversationUpsert(patch)])
+}
+
 /// A Note to Self chat with one message (`FixtureOptions::note_to_self`, for the tests of the
 /// user's own page): the account's own id as a direct chat. It is a chat more, so the list's
 /// pictures move: never on a fixture page. Returns the script and the chat's peer (the user).

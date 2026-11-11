@@ -29,9 +29,9 @@ use kourier_core::facade::{
 };
 use kourier_model::{
     AccountHold, AccountId, AccountState, AttachmentId, AttachmentKind, AttachmentState, Body,
-    ConnState, ConvKind, ConversationId, ErrorKind, FailReason, HistoryTransfer, LoginStep,
-    LoginStepKind, MessageId, NetworkKind, OutgoingState, ReadState, Redacted, SendPhase, Text,
-    UserAction, UserId,
+    ConnState, ConvKind, ConversationChange, ConversationId, ErrorKind, FailReason,
+    HistoryTransfer, LoginStep, LoginStepKind, MessageId, NetworkKind, OutgoingState, ReadState,
+    Redacted, SendPhase, Text, UserAction, UserId,
 };
 
 use crate::account_actions::{AccountAction, LogoutNotice};
@@ -39,8 +39,8 @@ use crate::conversations::{
     AccountRow, AccountStatus, AccountTable, Banner, BannerContext, BannerKind, Banners,
     ChatHeader, ConversationFilter, ConversationRow, Hidden, PreviewSource, TableAccount,
     account_banner, history_lost_banner, hold_banner, network_icon, network_missing_banner,
-    network_name, network_off_banner, shown_archived, timer_menu, timer_secs, timer_span,
-    typing_label,
+    network_name, network_off_banner, network_tint, shown_archived, timer_menu, timer_secs,
+    timer_span, typing_label,
 };
 use crate::edit::EditForm;
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules, refused_notice};
@@ -50,6 +50,7 @@ use crate::media::{self, MediaVariant};
 use crate::names::{NameMap, Names, fallback_name, first_name, single_line};
 use crate::preview::{self, Summary};
 use crate::readmore::ReadMore;
+use crate::roaming::{self, AccountFacts, ChatOffer, ChatTold};
 use crate::source::{
     EditTarget, FinishedSend, GroupUpdate, MediaAnswer, PersonUpdate, RefusedSend, ReplaceNews,
     ReturnedFile, RevisionList, RevisionRow, SaveAnswer, SaveFailure, SaveOutcome, SendOutcome,
@@ -90,7 +91,17 @@ pub const MODEL_GROUP: u32 = 10;
 pub const MODEL_SAFETY: u32 = 16;
 /// The facts a saved file's name is made of (F3b): one query per file, none of them coalesced.
 pub const MODEL_SAVE: u32 = 17;
+/// What a chat's header needs, read ahead of the chat being opened ([`READ_AHEAD_ROWS`]).
+pub const MODEL_READ_AHEAD: u32 = 18;
+/// Token model id of a copy action's person.
+pub const MODEL_COPY: u32 = 19;
 pub use media_slots::MODEL_CHAT_MEDIA;
+
+/// How many rows from the top of the list have their chat's features read ahead, so the chat
+/// opens with its composer already right. Rows with features already seen cost nothing.
+const READ_AHEAD_ROWS: usize = 60;
+/// Chats whose details are remembered for the next time they are opened.
+const KNOWN_DETAILS: usize = 256;
 
 /// Rows per timeline page.
 pub const TIMELINE_PAGE: u32 = 50;
@@ -189,6 +200,8 @@ pub struct Changes {
     pub revisions: bool,
     /// The person's page changed or ended ([`UiSource::take_person`]).
     pub person: bool,
+    /// A copy action is answered ([`UiSource::take_copy`]).
+    pub copy: bool,
     /// The group's page changed or ended ([`UiSource::take_group`]).
     pub group: bool,
     /// The safety-number level has a new answer ([`UiSource::take_safety`]).
@@ -208,6 +221,9 @@ pub struct Changes {
     /// A notice about the device of a removed or unlinked account waits
     /// ([`UiSource::take_logout_notices`]).
     pub account_notice: bool,
+    /// A short notice about a change of a chat or of the sync switch waits
+    /// ([`UiSource::take_told`]).
+    pub told: bool,
 }
 
 impl Changes {
@@ -231,6 +247,7 @@ impl Changes {
         plan: false,
         revisions: false,
         person: false,
+        copy: false,
         group: false,
         safety: false,
         chat_media: false,
@@ -238,6 +255,7 @@ impl Changes {
         merged: false,
         transfer: true,
         account_notice: true,
+        told: false,
     };
 
     /// Whether anything changed.
@@ -260,12 +278,14 @@ impl Changes {
             || self.plan
             || self.revisions
             || self.person
+            || self.copy
             || self.group
             || self.safety
             || self.chat_media
             || self.settings
             || self.merged
             || self.transfer
+            || self.told
     }
 
     /// Adds `other`.
@@ -285,6 +305,7 @@ impl Changes {
         self.plan |= other.plan;
         self.revisions |= other.revisions;
         self.person |= other.person;
+        self.copy |= other.copy;
         self.group |= other.group;
         self.safety |= other.safety;
         self.chat_media |= other.chat_media;
@@ -292,6 +313,7 @@ impl Changes {
         self.merged |= other.merged;
         self.transfer |= other.transfer;
         self.account_notice |= other.account_notice;
+        self.told |= other.told;
         if other.switch_to.is_some() {
             self.switch_to = other.switch_to;
         }
@@ -590,6 +612,18 @@ pub struct CoreSource {
     open: Option<ConversationId>,
     detail_q: QueryTracker,
     detail: Option<ConversationDetail>,
+    /// `detail` is what was known before the chat opened and its own answer is not in yet.
+    detail_seeded: bool,
+    /// The last detail seen of each chat, what a chat opens with until its answer arrives.
+    known_details: HashMap<ConversationId, ConversationDetail>,
+    /// Features by `features_hash`: most direct chats of a network share them, so a chat
+    /// never opened yet still opens with the composer it is going to have.
+    features_seen: HashMap<u64, kourier_model::ConversationFeatures>,
+    /// The hashes already read ahead (answered or not): each is asked for once.
+    features_asked: HashSet<u64>,
+    /// The colors the person gave accounts (the preference `account-tints`).
+    own_tints: HashMap<kourier_model::AccountUuid, String>,
+    read_ahead_q: QueryTracker,
     timeline_q: QueryTracker,
     fetching: Option<(u64, Fetch)>,
     want_reload: bool,
@@ -659,6 +693,10 @@ pub struct CoreSource {
     chat_visible: bool,
     presence_sent: Option<(bool, Option<ConversationId>)>,
     last_marked: Option<(ConversationId, MessageId)>,
+    /// Clicks whose notice waits for the list to show the change ([`Awaited`]).
+    awaited: Vec<Awaited>,
+    /// Notices ready for the front end ([`UiSource::take_told`]).
+    told: Vec<ChatTold>,
     typing_sent: Option<(ConversationId, i64)>,
     drafts: HashMap<ConversationId, String>,
     /// The last text the composer sent, given back to the composer if the core refuses that
@@ -731,6 +769,11 @@ pub struct CoreSource {
     /// conversation changes.
     revisions_shown: Option<MessageId>,
     person_q: QueryTracker,
+    /// The copy action asked last: its generation (one a counter of its own, every action is
+    /// sent) and what it takes. An older action's answer is dropped.
+    copy_asked: Option<(u64, crate::person::CopyAsked)>,
+    copy_generation: u64,
+    copy_answer: Option<crate::person::CopyUpdate>,
     /// The person the details panel shows, as asked (the canonical id once an answer named it).
     person_shown: Option<(AccountId, UserId)>,
     /// The chat the person's page was opened from (the open chat): the page ends with it, and a
@@ -787,6 +830,44 @@ pub struct CoreSource {
     /// tells the ones that came before the front-end was ready once more at `UiReady`, and an
     /// outcome told live in between may have a higher number than ones only the replay brings.
     logout_seen: std::collections::BTreeSet<u64>,
+}
+
+/// How long a click on Archive, Unarchive or Mark as Unread waits for the core's row to say it
+/// happened before it is forgotten (the notice would arrive for a change nobody remembers).
+const TOLD_WAIT_MS: i64 = 30_000;
+
+/// What a click waits for before it is told ([`Awaited`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AwaitedKind {
+    /// The chat is to be in the archive.
+    Archive,
+    /// The chat is to be in the inbox.
+    Unarchive,
+    /// The chat is to be marked unread.
+    MarkUnread,
+}
+
+impl AwaitedKind {
+    /// Whether two kinds are the same question: an archive and an unarchive of one chat
+    /// replace each other, a mark is its own.
+    fn same_family(self, other: Self) -> bool {
+        (self == Self::MarkUnread) == (other == Self::MarkUnread)
+    }
+}
+
+/// A click whose notice waits for the core's row to show the change ("Chat archived" only once
+/// the chat IS archived, never at the click: a refusal tells nothing, and a narrow window may
+/// show nothing of the change). Memory only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Awaited {
+    /// The chat (the survivor of a merge).
+    conv: ConversationId,
+    /// What it waits for.
+    kind: AwaitedKind,
+    /// The chat was pinned when the click came (an archive takes the pin with it).
+    was_pinned: bool,
+    /// The source's clock at the click, ms.
+    asked_at: i64,
 }
 
 /// One `SendFiles` the core is importing: nothing of it is in the timeline yet. It ends with
@@ -858,6 +939,12 @@ impl CoreSource {
             open: None,
             detail_q: QueryTracker::new(MODEL_CONVERSATION),
             detail: None,
+            detail_seeded: false,
+            known_details: HashMap::new(),
+            features_seen: HashMap::new(),
+            features_asked: HashSet::new(),
+            own_tints: HashMap::new(),
+            read_ahead_q: QueryTracker::new(MODEL_READ_AHEAD),
             timeline_q: QueryTracker::new(MODEL_TIMELINE),
             fetching: None,
             want_reload: false,
@@ -887,6 +974,8 @@ impl CoreSource {
             chat_visible: false,
             presence_sent: None,
             last_marked: None,
+            awaited: Vec::new(),
+            told: Vec::new(),
             typing_sent: None,
             drafts: HashMap::new(),
             last_sent: None,
@@ -922,6 +1011,9 @@ impl CoreSource {
             revisions_answer: None,
             revisions_shown: None,
             person_q: QueryTracker::new(MODEL_PERSON),
+            copy_asked: None,
+            copy_generation: 0,
+            copy_answer: None,
             safety_q: QueryTracker::new(MODEL_SAFETY),
             safety_shown: None,
             safety_sent: HashMap::new(),
@@ -1026,6 +1118,60 @@ impl CoreSource {
         let Some(conv) = self.open else { return };
         let t = self.detail_q.request();
         self.query(t, || Query::Conversation(conv));
+    }
+
+    /// Reads the details of the next chat near the top of the list whose features were not
+    /// seen yet (one query at a time, after the list is on screen).
+    fn read_ahead(&mut self) {
+        if self.read_ahead_q.pending() {
+            return;
+        }
+        let next = self
+            .list
+            .iter()
+            .take(READ_AHEAD_ROWS)
+            .find(|c| {
+                !self.features_seen.contains_key(&c.features_hash)
+                    && !self.features_asked.contains(&c.features_hash)
+            })
+            .map(|c| (c.id, c.features_hash));
+        let Some((conv, hash)) = next else { return };
+        self.features_asked.insert(hash);
+        let t = self.read_ahead_q.request();
+        self.query(t, || Query::Conversation(conv));
+    }
+
+    /// Remembers what a read of a chat said, for the next time it opens.
+    fn remember_detail(&mut self, d: &ConversationDetail) {
+        self.features_seen
+            .insert(d.row.features_hash, d.features.clone());
+        if self.known_details.len() >= KNOWN_DETAILS && !self.known_details.contains_key(&d.row.id)
+        {
+            self.known_details.clear();
+        }
+        self.known_details.insert(d.row.id, d.clone());
+    }
+
+    /// What is known of a chat before it opens: its own last detail, else its list row with
+    /// the features of a chat that has the same ones. `None`: nothing to go by yet.
+    fn seed_detail(&self, id: ConversationId) -> Option<ConversationDetail> {
+        let row = self.list.iter().find(|c| c.id == id);
+        if let Some(known) = self.known_details.get(&id) {
+            let mut seed = known.clone();
+            if let Some(row) = row {
+                seed.row = row.clone();
+            }
+            return Some(seed);
+        }
+        let row = row?;
+        let features = self.features_seen.get(&row.features_hash)?;
+        Some(ConversationDetail {
+            row: row.clone(),
+            members: Vec::new(),
+            features: features.clone(),
+            timer: None,
+            draft: None,
+        })
     }
 
     /// Issues the next wanted timeline query unless one is in flight.
@@ -1366,10 +1512,12 @@ impl CoreSource {
                             // (A gallery follows the list's `protected`: S-P, media_slots.rs.)
                             let withheld = self.hidden_media_slots();
                             self.list = rows;
+                            ch.told |= self.settle_awaited();
                             ch.chat_media |= self.rerun_media_slots(&withheld);
                             self.list_restarts = 0;
                             ch.conversations = true;
                             ch.accounts = true;
+                            self.read_ahead();
                             let again = std::mem::take(&mut self.list_again);
                             let t = overtaken
                                 .or_else(|| again.then(|| self.list_q.request()).flatten());
@@ -1398,7 +1546,9 @@ impl CoreSource {
                                 self.drafts.insert(id, draft.body.clone());
                                 ch.draft = true;
                             }
+                            self.remember_detail(d);
                             self.detail = Some((**d).clone());
+                            self.detail_seeded = false;
                             ch.header = true;
                         }
                         Some(_) => {}
@@ -1411,6 +1561,14 @@ impl CoreSource {
                     let t = self.detail_q.follow_up();
                     self.query(t, || Query::Conversation(conv));
                 }
+            }
+            MODEL_READ_AHEAD => {
+                if self.read_ahead_q.complete(token) == Completion::Apply
+                    && let Ok(QueryData::Conversation(Some(d))) = result
+                {
+                    self.remember_detail(d);
+                }
+                self.read_ahead();
             }
             MODEL_TIMELINE => {
                 let fetch = match self.fetching {
@@ -1550,6 +1708,33 @@ impl CoreSource {
                 }
                 let t = self.person_q.follow_up();
                 self.send_person(t);
+            }
+            MODEL_COPY => {
+                if let Some((generation, asked)) = self.copy_asked
+                    && generation == token.generation
+                {
+                    use crate::person::CopyAsked;
+                    self.copy_asked = None;
+                    self.copy_answer = Some(match asked {
+                        CopyAsked::Person(part) => {
+                            let detail = match result {
+                                Ok(QueryData::Person(d)) => d.as_deref(),
+                                _ => None,
+                            };
+                            let network = detail
+                                .and_then(|d| self.accounts.iter().find(|a| a.id == d.account))
+                                .map_or(NetworkKind::Signal, |a| a.network);
+                            crate::person::copy_update(detail, part, network)
+                        }
+                        CopyAsked::Invite(action) => match result {
+                            Ok(QueryData::GroupInvite(link)) => {
+                                crate::group::invite_update(action, false, link.clone())
+                            }
+                            _ => crate::group::invite_update(action, true, None),
+                        },
+                    });
+                    ch.copy = true;
+                }
             }
             MODEL_SAFETY => {
                 let asked = self.safety_sent.remove(&token.generation);
@@ -2186,6 +2371,95 @@ impl CoreSource {
         self.send(UiCommand::MarkRead { conv });
     }
 
+    /// The core's row of `conv`: the list's, else the open chat's detail (a chat the list does not
+    /// show: another account's under the filter, a search hit).
+    fn row_of(&self, conv: ConversationId) -> Option<&CoreConversation> {
+        self.list.iter().find(|c| c.id == conv).or_else(|| {
+            self.detail
+                .as_ref()
+                .map(|d| &d.row)
+                .filter(|row| row.id == conv)
+        })
+    }
+
+    /// What a click on a chat's menu waits for before it is told.
+    fn await_told(&mut self, conv: ConversationId, kind: AwaitedKind, was_pinned: bool) {
+        // A newer click on the same question replaces the older one.
+        self.awaited
+            .retain(|a| !(a.conv == conv && a.kind.same_family(kind)));
+        let asked_at = self.now_ms();
+        self.awaited.push(Awaited {
+            conv,
+            kind,
+            was_pinned,
+            asked_at,
+        });
+    }
+
+    /// Turns the clicks whose change the list shows now into notices, and forgets the ones older
+    /// than [`TOLD_WAIT_MS`]. `true` when a notice is ready.
+    fn settle_awaited(&mut self) -> bool {
+        if self.awaited.is_empty() {
+            return false;
+        }
+        let now = self.now_ms();
+        let list = &self.list;
+        let mut ready = Vec::new();
+        self.awaited.retain(|a| {
+            if now.saturating_sub(a.asked_at) > TOLD_WAIT_MS {
+                return false;
+            }
+            let Some(row) = list.iter().find(|c| c.id == a.conv) else {
+                return true;
+            };
+            let (done, told) = match a.kind {
+                AwaitedKind::Archive => (
+                    archived_row(row),
+                    ChatTold::Archived {
+                        conv: a.conv,
+                        was_pinned: a.was_pinned,
+                    },
+                ),
+                AwaitedKind::Unarchive => {
+                    (!archived_row(row), ChatTold::Unarchived { conv: a.conv })
+                }
+                AwaitedKind::MarkUnread => {
+                    (row.marked_unread, ChatTold::MarkedUnread { conv: a.conv })
+                }
+            };
+            if done {
+                ready.push(told);
+            }
+            !done
+        });
+        let any = !ready.is_empty();
+        self.told.extend(ready);
+        any
+    }
+
+    /// What `account` says about itself for the menu of one of its chats: whether it is linked
+    /// and running (the condition of "Unlink…"), its pin limit and how many chats of it the list
+    /// holds pinned. The list holds no hidden row (the read drops them), so the count is the
+    /// core's own (`roaming::check` counts `hidden = 0`).
+    fn account_facts(&self, account: AccountId) -> AccountFacts {
+        let row = self.accounts.iter().find(|a| a.id == account);
+        let pinned = self
+            .list
+            .iter()
+            .filter(|c| c.account == account && c.pinned_order.is_some())
+            .count();
+        AccountFacts {
+            linked: row.is_some_and(|a| self.offers_unlink(a)),
+            pin_limit: row.and_then(|a| a.pin_limit),
+            pinned: u32::try_from(pinned).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The offer of the core's row `c`, with its account's facts.
+    fn offer_for(&self, c: &CoreConversation, time: &TimeContext<'_>) -> ChatOffer {
+        roaming::offer_in_account(c, time, self.account_facts(c.account))
+    }
+
     fn send_presence(&mut self) {
         let visible = if self.chat_visible { self.open } else { None };
         let now = (self.focused, visible);
@@ -2207,9 +2481,14 @@ impl CoreSource {
         }
         self.open = None;
         self.detail = None;
+        self.detail_seeded = false;
         self.window = Window::default();
         self.read_more.clear();
         self.unread_from = None;
+        // A chat opened again is read again, and that clears a mark the user put on it
+        // (Desktop's): `last_marked` says "the newest message was marked already" for a chat
+        // that was open, and would keep a mark the chat in between never touched.
+        self.last_marked = None;
         self.timeline_q.reset();
         self.detail_q.reset();
         self.fetching = None;
@@ -2631,6 +2910,51 @@ impl CoreSource {
                 )
                 .into_owned(),
             ),
+            // A roaming change the core or the network refused (A10d). The click's notice never
+            // comes (the entry is dropped), and the words say what is known: a pin beyond the
+            // account's limit names the limit (the core's `TooMany`, or the network's own count,
+            // which can list chats this device does not), anything else says the change was not
+            // made. The pin limit is the account's, never a constant.
+            "ChangeConversation" => {
+                let conv = match subject {
+                    ActionSubject::Conversation(conv) => Some(self.survivor(*conv)),
+                    _ => None,
+                };
+                if let Some(conv) = conv {
+                    self.awaited.retain(|a| a.conv != conv);
+                }
+                let too_many = matches!(error.refusal(), Some(Refusal::TooMany))
+                    || matches!(error, CoreError::Backend(e) if e.kind == ErrorKind::TooLarge);
+                let limit = conv
+                    .and_then(|c| self.row_of(c))
+                    .and_then(|c| self.accounts.iter().find(|a| a.id == c.account))
+                    .and_then(|a| a.pin_limit);
+                let text = match limit {
+                    Some(limit) if too_many => roaming::pin_limit_text(limit),
+                    _ => trc("@info:status", "The change could not be made.").into_owned(),
+                };
+                // A toast, not the composer: the click came from the list as often as from
+                // the open chat, and the composer may be off screen or another chat's.
+                match conv {
+                    Some(conv) => {
+                        self.told.push(ChatTold::Refused { conv, words: text });
+                        Changes {
+                            told: true,
+                            ..Changes::default()
+                        }
+                    }
+                    None => self.notice_change(text),
+                }
+            }
+            // The sync switch was refused: a notice of its own, no composer notice (the
+            // composer is not on screen over Settings).
+            "SetRoamingWrites" => {
+                self.told.push(ChatTold::SwitchRefused);
+                Changes {
+                    told: true,
+                    ..Changes::default()
+                }
+            }
             // Drafts, typing and read markers fail quietly (they are retried by the next use).
             _ => Changes::default(),
         }
@@ -3049,6 +3373,8 @@ impl CoreSource {
                     network: a.network,
                     network_icon: network_icon(a.network).to_owned(),
                     network_name,
+                    tint: self.tint_of(a),
+                    own_tint: self.own_tints.get(&a.uuid).cloned().unwrap_or_default(),
                     status,
                     status_label: status.label(),
                     unread,
@@ -3059,6 +3385,8 @@ impl CoreSource {
                     device: self.twin_label(a).unwrap_or_default(),
                     shown: true,
                     place: 0,
+                    roaming_writes: a.roaming_writes,
+                    roaming_note: self.roaming_note(a),
                 }
             })
             .collect()
@@ -3126,6 +3454,18 @@ impl CoreSource {
             // Unlinking asks the network to forget the device; a network that is turned off
             // cannot be asked (the core refuses it too). "Remove Account…" stays.
             && !self.network_paused(a.network)
+    }
+
+    /// Why the sync switch of `a` cannot be flipped now; empty when it can, or when the account
+    /// has no such switch. The condition is "Unlink…"'s without its wording: the zone that
+    /// stores the switch is local, so an account that is only offline can flip it, but one that
+    /// is not linked (logged out, its link still going on, its network turned off) cannot.
+    fn roaming_note(&self, a: &CoreAccount) -> String {
+        if a.roaming_writes.is_some() && !self.offers_unlink(a) {
+            roaming::not_linked_text()
+        } else {
+            String::new()
+        }
     }
 
     /// Whether a login of `account` runs: on the link page or left to the background. A
@@ -3244,6 +3584,17 @@ impl CoreSource {
             };
             end.map(|t| i64::try_from(t).unwrap_or(i64::MAX))
         })
+    }
+
+    /// The end (ms) of the open chat's own mute, when it has a bounded one: "always" (the
+    /// largest instant) never ends and needs no tick.
+    fn open_mute_end(&self) -> Option<i64> {
+        let row = self.row_of(self.open?)?;
+        [row.muted_until, row.local_muted_until]
+            .into_iter()
+            .flatten()
+            .filter(|t| *t != i64::MAX)
+            .max()
     }
 
     /// Whether the account's network pushes its message history after a link (WhatsApp: the
@@ -3561,6 +3912,7 @@ impl CoreSource {
             // call: `account_table`)
             account_badge: String::new(),
             badge_icon: String::new(),
+            tint: String::new(),
             badge_number: 0,
             account_order: 0,
             protected: c.protected,
@@ -3581,10 +3933,19 @@ impl CoreSource {
                 id: a.id,
                 network: a.network,
                 name: Self::account_label(a),
+                tint: self.tint_of(a),
             }),
             hidden,
             searching,
         )
+    }
+
+    /// The color of `a`: the one the person gave it, else its network's.
+    fn tint_of(&self, a: &CoreAccount) -> String {
+        self.own_tints
+            .get(&a.uuid)
+            .cloned()
+            .unwrap_or_else(|| network_tint(a.network).to_owned())
     }
 
     fn header(&self, d: &ConversationDetail, time: &TimeContext<'_>) -> ChatHeader {
@@ -3599,6 +3960,9 @@ impl CoreSource {
                 "Messages to yourself",
             )
             .into_owned()
+        } else if is_group && self.detail_seeded && d.members.is_empty() {
+            // Opening: the count comes with the chat's own answer.
+            String::new()
         } else if is_group {
             crate::conversations::members_line(crate::conversations::full_member_count(
                 d.members.iter().map(|m| m.role),
@@ -3646,6 +4010,14 @@ impl CoreSource {
             subtitle,
             typing: !typing.is_empty(),
             avatar_url: self.avatar_url(c.account, c.avatar.as_ref()),
+            tint: self
+                .accounts
+                .iter()
+                .find(|a| a.id == c.account)
+                .map_or_else(
+                    || network_tint(self.account_network(c.account)).to_owned(),
+                    |a| self.tint_of(a),
+                ),
             is_group,
             is_self: c.is_self,
             peer: c.peer.clone(),
@@ -3670,6 +4042,7 @@ impl CoreSource {
             deletes_sync: d.features.delete_for_me && !self.logged_out(c.account),
             still_filling: self.still_filling(c.id, c.account),
             timer_held: self.timer_held(c.account, time.now_ms),
+            offer: self.offer_for(c, time),
         }
     }
 
@@ -4743,6 +5116,16 @@ impl UiSource for CoreSource {
         TimeContext::new(self.now_ms(), self.calendar.as_ref())
     }
 
+    fn set_account_tints(&mut self, tints: HashMap<kourier_model::AccountUuid, String>) -> Changes {
+        self.own_tints = tints;
+        Changes {
+            accounts: true,
+            conversations: true,
+            header: self.detail.is_some(),
+            ..Changes::default()
+        }
+    }
+
     fn accounts(&self) -> Vec<AccountRow> {
         self.account_rows()
     }
@@ -5217,6 +5600,57 @@ impl UiSource for CoreSource {
         self.person_q.reset();
     }
 
+    fn request_copy(
+        &mut self,
+        part: crate::person::CopyPart,
+        target: crate::person::CopyTarget,
+    ) -> bool {
+        use crate::person::{CopyAsked, CopyTarget};
+        use kourier_core::facade::PersonRef;
+        self.copy_generation += 1;
+        self.copy_asked = Some((self.copy_generation, CopyAsked::Person(part)));
+        let query = match target {
+            CopyTarget::Person { account, user } => Query::Person { account, user },
+            CopyTarget::Chat(id) => Query::PersonOf(PersonRef::Chat(id)),
+            CopyTarget::Account(id) => Query::PersonOf(PersonRef::Own(id)),
+        };
+        self.send(UiCommand::Query {
+            token: QueryToken {
+                model: MODEL_COPY,
+                generation: self.copy_generation,
+            },
+            query,
+        });
+        true
+    }
+
+    fn request_group_invite(
+        &mut self,
+        conversation: ConversationId,
+        action: kourier_model::GroupInviteAction,
+    ) -> bool {
+        self.copy_generation += 1;
+        self.copy_asked = Some((
+            self.copy_generation,
+            crate::person::CopyAsked::Invite(action),
+        ));
+        self.send(UiCommand::Query {
+            token: QueryToken {
+                model: MODEL_COPY,
+                generation: self.copy_generation,
+            },
+            query: Query::GroupInvite {
+                conversation,
+                action,
+            },
+        });
+        true
+    }
+
+    fn take_copy(&mut self) -> Option<crate::person::CopyUpdate> {
+        self.copy_answer.take()
+    }
+
     fn request_safety(&mut self, account: AccountId, user: UserId) -> bool {
         self.safety_shown = Some((account, user));
         self.safety_answer = None;
@@ -5471,6 +5905,108 @@ impl UiSource for CoreSource {
         self.send(UiCommand::MarkRead { conv })
     }
 
+    fn chat_offer(&self, conv: ConversationId) -> ChatOffer {
+        let conv = self.survivor(conv);
+        match self.row_of(conv) {
+            Some(row) => self.offer_for(row, &UiSource::time(self)),
+            None => ChatOffer::default(),
+        }
+    }
+
+    fn set_archived(&mut self, conv: ConversationId, archived: bool) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        let was_pinned = self.row_of(conv).is_some_and(|c| c.pinned_order.is_some());
+        let sent = self.send(UiCommand::ChangeConversation {
+            conv,
+            change: ConversationChange::SetArchived { archived },
+        });
+        if sent {
+            let kind = if archived {
+                AwaitedKind::Archive
+            } else {
+                AwaitedKind::Unarchive
+            };
+            self.await_told(conv, kind, was_pinned);
+        }
+        sent
+    }
+
+    fn set_pinned(&mut self, conv: ConversationId, pinned: bool) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        self.send(UiCommand::ChangeConversation {
+            conv,
+            change: ConversationChange::SetPinned { pinned },
+        })
+    }
+
+    fn set_muted(&mut self, conv: ConversationId, until: Option<i64>) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        self.send(UiCommand::ChangeConversation {
+            conv,
+            change: ConversationChange::SetMuted { until },
+        })
+    }
+
+    fn set_marked_unread(&mut self, conv: ConversationId, marked: bool) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        // The click's own echo runs `maybe_mark_read`, which reads an open chat that is marked
+        // away at once. The mark is the user's word that this chat is not read yet: say the
+        // newest incoming message is marked already, so only a newer one (a real reading)
+        // clears it, as on Desktop.
+        if marked
+            && self.open == Some(conv)
+            && let Some(newest) = self
+                .window
+                .rows
+                .iter()
+                .rev()
+                .find(|r| r.origin == OriginKind::Remote)
+                .map(|r| r.id)
+        {
+            self.last_marked = Some((conv, newest));
+        }
+        let sent = self.send(UiCommand::ChangeConversation {
+            conv,
+            change: ConversationChange::SetMarkedUnread {
+                marked_unread: marked,
+            },
+        });
+        if sent && marked {
+            self.await_told(conv, AwaitedKind::MarkUnread, false);
+        }
+        sent
+    }
+
+    fn undo_archive(&mut self, conv: ConversationId, was_pinned: bool) -> bool {
+        let conv = self.survivor(conv);
+        self.notice.clear();
+        // (No notice of its own, and nothing awaited: Desktop's Undo shows no second toast.)
+        let sent = self.send(UiCommand::ChangeConversation {
+            conv,
+            change: ConversationChange::SetArchived { archived: false },
+        });
+        if was_pinned {
+            return self.send(UiCommand::ChangeConversation {
+                conv,
+                change: ConversationChange::SetPinned { pinned: true },
+            }) && sent;
+        }
+        sent
+    }
+
+    fn set_roaming_writes(&mut self, account: AccountId, on: bool) -> bool {
+        self.notice.clear();
+        self.send(UiCommand::SetRoamingWrites { account, on })
+    }
+
+    fn take_told(&mut self) -> Vec<ChatTold> {
+        std::mem::take(&mut self.told)
+    }
+
     fn delete_attachment(&mut self, attachment: AttachmentId) -> bool {
         self.notice.clear();
         self.send(UiCommand::DeleteAttachment { attachment })
@@ -5509,6 +6045,7 @@ impl UiSource for CoreSource {
             &self.accounts_q,
             &self.list_q,
             &self.detail_q,
+            &self.read_ahead_q,
             &self.timeline_q,
         ]
         .into_iter()
@@ -6272,6 +6809,9 @@ impl UiSource for CoreSource {
         let mut ch = self.close();
         let Some(id) = id else { return ch };
         self.open = Some(id);
+        // The first frame already has the chat's title and composer; the answer corrects them.
+        self.detail = self.seed_detail(id);
+        self.detail_seeded = self.detail.is_some();
         self.request_detail();
         self.pump_timeline();
         self.send_presence();
@@ -6514,10 +7054,23 @@ impl UiSource for CoreSource {
         }
         // A banner that is written for a time (a ban's end, a hold's end) changes when the
         // time comes: the core sends no event for it.
-        if let Some(before) = self.last_tick.replace(now)
+        let before = self.last_tick.replace(now);
+        if let Some(before) = before
             && self.banner_instants().any(|t| t > before && t <= now)
         {
             ch.accounts = true;
+        }
+        // The open chat's menu words its mute against now ("Muted until tomorrow at 08:00"),
+        // and a mute that ends offers Mute again: the core sends no event for either, so the
+        // header (which carries the offer) is raised when the end passed between two ticks or
+        // the local date changed under a muted chat (M2).
+        if let Some(before) = before
+            && let Some(end) = self.open_mute_end()
+        {
+            let time = TimeContext::new(now, self.calendar.as_ref());
+            if (end > before && end <= now) || time.day_number(before) != time.day_number(now) {
+                ch.header = true;
+            }
         }
         // A pushed history nobody has heard of for a while is over for the person: the
         // banner and the hold on Clear and Delete let go.
@@ -6559,6 +7112,7 @@ impl UiSource for CoreSource {
             || self.sends_waiting()
             || !self.fills.is_empty()
             || self.banner_instants().any(|t| t > now)
+            || self.open_mute_end().is_some_and(|t| t > now)
     }
 
     fn unread_total(&self) -> u32 {
@@ -6615,3 +7169,6 @@ mod rows_tests;
 
 #[cfg(test)]
 mod telegram_tests;
+
+#[cfg(test)]
+mod roaming_tests;

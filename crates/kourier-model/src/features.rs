@@ -417,6 +417,11 @@ pub struct ConversationFeatures {
     /// hash and is stated once at the next start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_info: Option<GroupInfo>,
+    /// Joining this group by its invite link is on, on a network where that can be turned off
+    /// ([`GroupInvites::Switch`]). Skipped from the serialised form when off, so a conversation
+    /// without one keeps the [`Self::stable_hash`] it had before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invite_link_on: bool,
     /// Set when the user cannot send here.
     pub cannot_send: Option<CannotSend>,
     /// Whether the network LISTS this chat for its roaming settings, the ones it keeps for the
@@ -431,6 +436,31 @@ pub struct ConversationFeatures {
     /// states the features again. Read it through [`Self::lists_for_roaming`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roaming_listed: Option<bool>,
+}
+
+/// What a network offers for the invite link of a group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupInvites {
+    /// No invite links.
+    #[default]
+    None,
+    /// The link always stands: it can be copied or replaced by a new one (WhatsApp).
+    Reset,
+    /// The link can also be turned off and on again (Signal).
+    Switch,
+}
+
+/// One thing asked about the invite link of a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupInviteAction {
+    /// The link as it stands.
+    Read,
+    /// A new link; the old one stops working.
+    Reset,
+    /// Joining by the link is turned on.
+    TurnOn,
+    /// Joining by the link is turned off.
+    TurnOff,
 }
 
 impl ConversationFeatures {

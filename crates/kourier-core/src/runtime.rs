@@ -950,6 +950,18 @@ async fn run_core(
                     let _ = reply.send(answer.await);
                 });
             }
+            Internal::Query(
+                Query::GroupInvite {
+                    conversation,
+                    action,
+                },
+                reply,
+            ) => {
+                let answer = ask_group_invite(&sh, &slots, conversation, action);
+                tokio::spawn(async move {
+                    let _ = reply.send(answer.await);
+                });
+            }
             Internal::Query(q, reply) => {
                 let sh = sh.clone();
                 tokio::spawn(async move {
@@ -989,6 +1001,41 @@ async fn run_core(
             }
         }
     }
+}
+
+/// The answer to [`Query::Person`]: the person, with what their network offers for them.
+async fn person_answer(sh: &Arc<Shared>, account: AccountId, user: UserId) -> Result<QueryData> {
+    let (detail, kind) = sh
+        .store
+        .read(move |c| {
+            Ok((
+                query::person(c, account, &user)?,
+                query::account_network(c, account)?,
+            ))
+        })
+        .await?;
+    // A static capability of the network (P5a critic F5); a network that is not
+    // registered at this start (turned off) offers nothing.
+    let net = kind.and_then(|k| network(sh, k).ok());
+    let safety = net.as_ref().is_some_and(|n| n.descriptor().safety_numbers);
+    Ok(QueryData::Person(detail.map(|mut d| {
+        d.safety_numbers = safety;
+        d.safety_waits = sends_wait_for(sh, d.account, &d.user);
+        // P5b: the number rule is `LinkState::of`'s; the network only formats.
+        d.link = match net.as_ref() {
+            Some(n) => {
+                let by_id = n.contact_id_link(&d.user);
+                LinkState::of(&d, n.contact_links(), by_id, |num| {
+                    n.contact_link(&d.user, num)
+                })
+            }
+            None => LinkState::Hidden,
+        };
+        // P5c: the same number rule, and the profile name (SC1).
+        let cards = net.as_ref().is_some_and(|n| n.descriptor().contact_cards);
+        d.share = ShareState::of(&d, cards);
+        Box::new(d)
+    })))
 }
 
 async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
@@ -1056,41 +1103,41 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .read(move |c| query::conversation(c, id))
             .await
             .map(|d| QueryData::Conversation(d.map(Box::new))),
-        Query::Person { account, user } => {
+        Query::Person { account, user } => person_answer(sh, account, user).await,
+        Query::PersonOf(target) => {
+            let who = sh.store.read(move |c| query::person_of(c, target)).await?;
+            match who {
+                Some((account, user)) => person_answer(sh, account, user).await,
+                None => Ok(QueryData::Person(None)),
+            }
+        }
+        Query::Group(id) => {
             let (detail, kind) = sh
                 .store
                 .read(move |c| {
-                    Ok((
-                        query::person(c, account, &user)?,
-                        query::account_network(c, account)?,
-                    ))
+                    let detail = query::group(c, id)?;
+                    let kind = match &detail {
+                        Some(d) => query::account_network(c, d.account)?,
+                        None => None,
+                    };
+                    Ok((detail, kind))
                 })
                 .await?;
-            // A static capability of the network (P5a critic F5); a network that is not
-            // registered at this start (turned off) offers nothing.
-            let net = kind.and_then(|k| network(sh, k).ok());
-            let safety = net.as_ref().is_some_and(|n| n.descriptor().safety_numbers);
-            Ok(QueryData::Person(detail.map(|mut d| {
-                d.safety_numbers = safety;
-                d.safety_waits = sends_wait_for(sh, d.account, &d.user);
-                // P5b: the number rule is `LinkState::of`'s; the network only formats.
-                d.link = match net.as_ref() {
-                    Some(n) => {
-                        LinkState::of(&d, n.contact_links(), |num| n.contact_link(&d.user, num))
-                    }
-                    None => LinkState::Hidden,
-                };
-                // P5c: the same number rule, and the profile name (SC1).
-                let cards = net.as_ref().is_some_and(|n| n.descriptor().contact_cards);
-                d.share = ShareState::of(&d, cards);
+            let offered = kind
+                .and_then(|k| network(sh, k).ok())
+                .map_or(kourier_model::GroupInvites::None, |n| n.group_invites());
+            Ok(QueryData::Group(detail.map(|mut d| {
+                let admin = d
+                    .members
+                    .iter()
+                    .any(|m| m.is_self && m.role == kourier_model::MemberRole::Admin);
+                let ended = d.features.group_info.is_some_and(|i| i.terminated);
+                if admin && !ended {
+                    d.invites = offered;
+                }
                 Box::new(d)
             })))
         }
-        Query::Group(id) => sh
-            .store
-            .read(move |c| query::group(c, id))
-            .await
-            .map(|d| QueryData::Group(d.map(Box::new))),
         Query::ChatMedia(q) => {
             let (page, media) = sh
                 .store
@@ -1204,6 +1251,8 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .await
             .map(QueryData::Revisions),
         Query::ExpiryPolicy => Ok(QueryData::ExpiryPolicy(sh.expiry_policy())),
+        // Answered through the account's actor (`ask_group_invite`) before `run_query`.
+        Query::GroupInvite { .. } => Ok(QueryData::GroupInvite(None)),
         // Answered through the account's actor (`ask_safety`) before `run_query`.
         Query::SafetyNumber { .. } => Ok(QueryData::SafetyNumber {
             answer: Err(SafetyUnavailable::NotRunning),
@@ -2063,6 +2112,22 @@ async fn ui_command(
                 sh2.emit(UiEvent::QueryResult { token, result });
             });
         }
+        // As the safety number: the account's backend answers.
+        UiCommand::Query {
+            token,
+            query:
+                Query::GroupInvite {
+                    conversation,
+                    action,
+                },
+        } => {
+            let answer = ask_group_invite(sh, slots, conversation, action);
+            let sh2 = sh.clone();
+            tokio::spawn(async move {
+                let result = answer.await.map_err(Arc::new);
+                sh2.emit(UiEvent::QueryResult { token, result });
+            });
+        }
         UiCommand::Query { token, query } => {
             let sh2 = sh.clone();
             tokio::spawn(async move {
@@ -2119,6 +2184,41 @@ fn ask_safety(
             }
             Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
             Err(_) => Ok(not_running),
+        }
+    }
+}
+
+/// The answer to [`Query::GroupInvite`]: the account's backend asks its network. An account that
+/// does not run is a failure of the query, as a network that cannot be reached is.
+fn ask_group_invite(
+    sh: &Arc<Shared>,
+    slots: &HashMap<AccountId, Slot>,
+    conversation: ConversationId,
+    action: kourier_model::GroupInviteAction,
+) -> impl Future<Output = Result<QueryData>> + Send + 'static {
+    let sh = sh.clone();
+    let senders = senders(slots);
+    async move {
+        let (account, group) = sh
+            .store
+            .read(move |c| query::conversation_key(c, conversation))
+            .await?
+            .ok_or(CoreError::UnknownConversation(conversation))?;
+        let sender = senders
+            .get(&account)
+            .ok_or(CoreError::UnknownAccount(account))?;
+        let (reply, answer) = oneshot::channel();
+        sender
+            .send(Control::Backend(Command::GroupInvite {
+                group,
+                action,
+                reply,
+            }))
+            .map_err(|_| CoreError::UnknownAccount(account))?;
+        match answer.await {
+            Ok(Ok(link)) => Ok(QueryData::GroupInvite(link)),
+            Ok(Err(e)) => Err(CoreError::Backend(Box::new(e))),
+            Err(_) => Err(CoreError::UnknownAccount(account)),
         }
     }
 }

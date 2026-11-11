@@ -138,7 +138,7 @@ fn a_schema_2_file_migrates_to_schema_3_with_deferred_empty() {
             .map_err(kourier_db::Error::from)
         })
         .expect("read");
-    assert_eq!(version, 5, "the file is not at the latest schema");
+    assert_eq!(version, 6, "the file is not at the latest schema");
     assert_eq!(contacts, 1, "the schema-2 row is gone");
     assert_eq!(deferred, 0, "deferred is not empty after the migration");
     assert_eq!(total(&db), DeferredTotal { rows: 0, bytes: 0 });
@@ -842,8 +842,8 @@ fn a_newer_version_maps_old_rows_again_and_a_row_at_the_version_stays() {
             );
             assert_eq!(
                 patch.features.as_ref().and_then(|f| f.cannot_send.clone()),
-                Some(kourier_model::CannotSend::NotYetBuilt),
-                "E5's patch does not say NotYetBuilt"
+                None,
+                "E5's patch says the chat cannot be sent in"
             );
             assert_history_rows(hidden_batch, &direct(RM_HIDDEN), &[5]);
         }

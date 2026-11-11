@@ -25,7 +25,7 @@ fn main() {
     }
     cxx_qt::init_crate!(kourier_qt);
     let _app = QGuiApplication::new();
-    let checks: [Check; 15] = [
+    let checks: [Check; 18] = [
         (
             "timeline rows, roles and an appended message",
             timeline_rows_and_roles,
@@ -79,6 +79,18 @@ fn main() {
         (
             "the safety level takes answers only while it is open",
             the_safety_level_takes_answers_only_while_it_is_open,
+        ),
+        (
+            "the offer map carries every key",
+            the_offer_map_carries_every_key,
+        ),
+        (
+            "the switch key says the state",
+            the_switch_key_says_the_state,
+        ),
+        (
+            "an Until time that is no date is refused",
+            an_until_time_that_is_no_date_is_refused,
         ),
     ];
     let mut failed = 0;
@@ -997,4 +1009,151 @@ fn the_safety_level_takes_answers_only_while_it_is_open() {
     let map = level.receive(k2).expect("the next level takes its answer");
     assert!(!swapped(&map), "the next level starts over");
     assert!(level.target(SafetyAction::Mark).is_some());
+}
+
+/// A10d D2: what a chat's menu offers reaches QML as a map with every key, each from its own
+/// field. One offer per flag (only that flag set) tells a key taken from another field (`on` from
+/// `shown`) apart: a key must be true for its own offer and for no other. The timeline model holds
+/// the same map as `chatOffer`, an empty one while no chat is open.
+fn the_offer_map_carries_every_key() {
+    use cxx_qt_lib::{QMap, QMapPair_QString_QVariant};
+    use kourier_viewmodel::ChatOffer;
+    type Offer = QMap<QMapPair_QString_QVariant>;
+    let read = |v: &QVariant| v.value::<Offer>().expect("the offer is a map");
+    let key = |m: &Offer, name: &str| {
+        m.get(&QString::from(name))
+            .unwrap_or_else(|| panic!("the offer lacks the key {name}"))
+    };
+    type Flag = (&'static str, fn(&mut ChatOffer));
+    let flags: [Flag; 9] = [
+        ("shown", |o| o.shown = true),
+        ("on", |o| o.on = true),
+        ("archived", |o| o.archived = true),
+        ("pinned", |o| o.pinned = true),
+        ("pinAtLimit", |o| o.pin_at_limit = true),
+        ("markedUnread", |o| o.marked_unread = true),
+        ("hasUnread", |o| o.has_unread = true),
+        ("muteOffered", |o| o.mute_offered = true),
+        ("muted", |o| o.muted = true),
+    ];
+    for (own, set) in flags {
+        let mut offer = ChatOffer::default();
+        set(&mut offer);
+        let map = read(&models::timeline::offer_variant(&offer));
+        for (name, _) in flags {
+            assert_eq!(
+                key(&map, name).value::<bool>(),
+                Some(name == own),
+                "the key {name} follows its own flag only (offer with {own} set)"
+            );
+        }
+    }
+    let words = ChatOffer {
+        pin_why: "pin-why".into(),
+        muted_label: "muted-label".into(),
+        why: "why".into(),
+        ..ChatOffer::default()
+    };
+    let map = read(&models::timeline::offer_variant(&words));
+    for (name, text) in [
+        ("pinWhy", "pin-why"),
+        ("mutedLabel", "muted-label"),
+        ("why", "why"),
+    ] {
+        assert_eq!(
+            string(key(&map, name)),
+            text,
+            "the key {name} carries its own text"
+        );
+    }
+
+    // The timeline model: an empty map (never an invalid value) before and while no chat is
+    // open, the offer of the open chat, and the empty map again when it closes.
+    let src = FixtureSource::new().expect("fixture");
+    let conv = src.fixture().long_chat;
+    let mut header = src.chat(conv).expect("the fixture's chat has a header");
+    header.offer = ChatOffer {
+        shown: true,
+        on: false,
+        why: "greyed".into(),
+        ..ChatOffer::default()
+    };
+    let mut model = qobject::new_timeline_model();
+    let mut m: Pin<&mut TimelineModel> = model.pin_mut();
+    assert!(
+        !m.chat_offer().is_valid(),
+        "the property starts unset, so the first header must set it"
+    );
+    m.as_mut().set_header(0, None);
+    let closed = read(m.chat_offer());
+    assert!(
+        closed.get(&QString::from("shown")).is_none(),
+        "no chat open: the empty map says nothing is shown"
+    );
+    m.as_mut().set_header(conv.0, Some(&header));
+    let open = read(m.chat_offer());
+    assert_eq!(key(&open, "shown").value::<bool>(), Some(true));
+    assert_eq!(
+        key(&open, "on").value::<bool>(),
+        Some(false),
+        "a greyed chat is shown and not on"
+    );
+    assert_eq!(string(key(&open, "why")), "greyed");
+    header.offer.on = true;
+    m.as_mut().set_header(conv.0, Some(&header));
+    assert_eq!(
+        key(&read(m.chat_offer()), "on").value::<bool>(),
+        Some(true),
+        "a changed offer is shown"
+    );
+    m.as_mut().set_header(0, None);
+    assert!(
+        read(m.chat_offer()).get(&QString::from("shown")).is_none(),
+        "the chat closed: the empty map again"
+    );
+}
+
+/// A10d D2: `accountActions` names the sync switch's state by a key, `""` for an account whose
+/// network states no switch (the row is not shown), `off` and `on`. The real row's kill is
+/// `settings_ui`'s `roaming` (D5).
+fn the_switch_key_says_the_state() {
+    use kourier_qt::app::roaming_key;
+    assert_eq!(
+        roaming_key(None),
+        "",
+        "a network that writes no settings shows no switch row"
+    );
+    assert_eq!(roaming_key(Some(false)), "off", "a switch that is off");
+    assert_eq!(roaming_key(Some(true)), "on", "a switch that is on");
+}
+
+/// A10d D2: the "Until…" dialog's fields become a local time only when they are a date the
+/// pickers can give; anything else is refused before a time is computed (a year beyond 9999 would
+/// overflow the millisecond count).
+fn an_until_time_that_is_no_date_is_refused() {
+    use kourier_qt::app::local_pick;
+    let pick = local_pick(2026, 11, 2, 8, 30).expect("a date and a time");
+    assert_eq!(
+        (pick.year, pick.month, pick.day, pick.hour, pick.minute),
+        (2026, 11, 2, 8, 30),
+        "the fields arrive as picked"
+    );
+    for (year, month, day, hour, minute) in [
+        (1969, 11, 2, 8, 0),
+        (10_000, 11, 2, 8, 0),
+        (i32::MAX, 11, 2, 8, 0),
+        (2026, 0, 2, 8, 0),
+        (2026, 13, 2, 8, 0),
+        (2026, 11, 0, 8, 0),
+        (2026, 11, 32, 8, 0),
+        (2026, 11, 2, -1, 0),
+        (2026, 11, 2, 24, 0),
+        (2026, 11, 2, 8, -1),
+        (2026, 11, 2, 8, 60),
+    ] {
+        assert!(
+            local_pick(year, month, day, hour, minute).is_none(),
+            "a time outside the calendar is refused ({year}-{month}-{day} {hour}:{minute})"
+        );
+    }
 }

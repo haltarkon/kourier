@@ -297,6 +297,131 @@ fn one_whole_post(fake: &Cdn, path: &str) {
     assert_eq!(post.status, Some(200));
 }
 
+/// A file sealed as a phone seals it, planted on the fake servers, and the `remote` of the message that names it.
+fn file_on_the_servers(
+    fake: &Cdn,
+    direct_path: &str,
+    plain: &[u8],
+    media_type: MediaType,
+    name: &str,
+    tamper: bool,
+) -> kourier_model::BackendBlob {
+    let sealed = wacore::upload::encrypt_media(plain, media_type).expect("sealed");
+    // What a message from a phone would carry: the log check of `media_child` looks for these too.
+    cdn::learn(Some(&sealed.media_key[..]));
+    cdn::learn(Some(&sealed.file_sha256[..]));
+    cdn::learn(Some(&sealed.file_enc_sha256[..]));
+    let mut data = sealed.data_to_upload.clone();
+    if tamper {
+        data[0] ^= 1;
+    }
+    fake.plant(direct_path, data);
+    let pointer = serde_json::json!({
+        "media_type": name,
+        "direct_path": direct_path,
+        "media_key": hex(&sealed.media_key),
+        "file_sha256": hex(&sealed.file_sha256),
+        "file_enc_sha256": hex(&sealed.file_enc_sha256),
+        "file_length": plain.len() as u64,
+    });
+    kourier_model::BackendBlob::new(1, serde_json::to_vec(&pointer).expect("json"))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The core's target of a download in `dir`.
+fn target(dir: &Path) -> kourier_backend_api::BlobTarget {
+    kourier_backend_api::BlobTarget {
+        path: dir.join("blobs/core/ab/synthetic-target"),
+        key: kourier_model::BlobKey::new([0x42; 32]),
+    }
+}
+
+/// W7: a file a phone sent comes through upstream's real download path (a `w:m` IQ, a GET, the MAC, the two hashes, the
+/// decryption) into the core's sealed blob, whole, and no temporary file is left.
+async fn a_file_from_a_phone_arrives_sealed_and_whole() {
+    let (dir, device) = account_dir().await;
+    let fake = Cdn::default();
+    let (rig, _peer) = started(dir.path(), &device, media_server(), &fake).await;
+    let plain = pattern(300_000, 31);
+    let remote = file_on_the_servers(
+        &fake,
+        "/v/t62.7114-24/synthetic-download-58102937",
+        &plain,
+        MediaType::Document,
+        "document",
+        false,
+    );
+    let dest = target(dir.path());
+    let meta = rig
+        .download(remote, dest.clone())
+        .await
+        .expect("downloaded");
+    assert_eq!(meta.size, plain.len() as u64);
+    let key = kourier_blob::FileKey::from_bytes(*dest.key.expose());
+    assert!(
+        *kourier_blob::read_all(&dest.path, &key).expect("a sealed file") == *plain,
+        "the file differs"
+    );
+    assert_eq!(fake.gets().len(), 1, "one GET for one file");
+    let parent = dest.path.parent().expect("a directory");
+    let left = std::fs::read_dir(parent).expect("listed").count();
+    assert_eq!(left, 1, "only the file is left");
+    rig.finish().await;
+}
+
+/// W7: a file that fails its hashes never appears at the target, on any host, and can be tried again.
+async fn a_file_that_does_not_verify_never_appears() {
+    let (dir, device) = account_dir().await;
+    let fake = Cdn::default();
+    let (rig, _peer) = started(dir.path(), &device, media_server(), &fake).await;
+    let remote = file_on_the_servers(
+        &fake,
+        "/v/t62.7118-24/synthetic-download-69213048",
+        &pattern(40_000, 47),
+        MediaType::Image,
+        "image",
+        true,
+    );
+    let dest = target(dir.path());
+    let error = rig
+        .download(remote, dest.clone())
+        .await
+        .expect_err("refused");
+    assert!(error.is_retryable(), "{error:?}");
+    assert!(!dest.path.exists(), "an unverified file is in place");
+    assert_eq!(fake.gets().len(), 2, "both hosts were tried");
+    rig.finish().await;
+}
+
+/// W7: a reference the servers do not know (any more) is `Expired` at once: a 404 is final, the library asks for no
+/// fresh `media_conn`.
+async fn a_file_the_servers_do_not_have_is_expired() {
+    let (dir, device) = account_dir().await;
+    let fake = Cdn::default();
+    let (rig, _peer) = started(dir.path(), &device, media_server(), &fake).await;
+    let remote = file_on_the_servers(
+        &fake,
+        "/v/t62.7118-24/synthetic-download-70324159",
+        &pattern(4_000, 53),
+        MediaType::Image,
+        "image",
+        false,
+    );
+    let pointer: serde_json::Value = serde_json::from_slice(&remote.bytes).expect("json");
+    let mut moved = pointer.clone();
+    moved["direct_path"] = "/v/t62.7118-24/synthetic-elsewhere-81435260".into();
+    let remote = kourier_model::BackendBlob::new(1, serde_json::to_vec(&moved).expect("json"));
+    let dest = target(dir.path());
+    let error = rig.download(remote, dest.clone()).await.expect_err("gone");
+    assert!(matches!(error.kind, ErrorKind::Expired), "{error:?}");
+    assert!(!dest.path.exists());
+    assert_eq!(rig.server.answered("w:m"), 1, "a 404 is final");
+    rig.finish().await;
+}
+
 /// `a_picture_is_uploaded_then_sent_and_the_peer_decrypts_it`: ONE `w:m` IQ, ONE POST to `/mms/image` with its exact
 /// length, no `<message>` while the CDN reads the body, then ONE `type="media"` frame whose `<enc>` says
 /// `mediatype="image"`; the peer's download (G18) gives the RE-ENCODE: a JPEG without the original's EXIF block, its
@@ -1183,6 +1308,21 @@ fn parent(case: &str) {
 }
 
 #[test]
+fn a_file_from_a_phone_arrives_sealed_and_whole_over_the_wire() {
+    parent("download");
+}
+
+#[test]
+fn a_file_that_does_not_verify_never_appears_over_the_wire() {
+    parent("tampered");
+}
+
+#[test]
+fn a_file_the_servers_do_not_have_is_expired_over_the_wire() {
+    parent("expired");
+}
+
+#[test]
 fn a_picture_is_uploaded_then_sent_and_the_peer_decrypts_it_over_the_wire() {
     parent("picture");
 }
@@ -1253,6 +1393,9 @@ async fn media_child() {
     let case = std::env::var(CASE).expect("the parent names the case");
     eprintln!("case {case}");
     match case.as_str() {
+        "download" => a_file_from_a_phone_arrives_sealed_and_whole().await,
+        "tampered" => a_file_that_does_not_verify_never_appears().await,
+        "expired" => a_file_the_servers_do_not_have_is_expired().await,
         "picture" => a_picture_is_uploaded_then_sent_and_the_peer_decrypts_it().await,
         "document" => a_document_keeps_its_bytes_and_its_name().await,
         "video" => a_video_carries_its_seconds_and_sidecar().await,
@@ -1285,6 +1428,24 @@ async fn media_child() {
     }
     let mut targets = media_secrets();
     targets.extend(learned.iter().map(String::as_str));
+    if case == "tampered" {
+        // Fix F14 holds for what is WRITTEN: upstream's one line for a file that fails its hashes names the host it tried
+        // (its `Debug` of the request keeps the URL's host, in quotes, and hides the path, the query and the key: read at
+        // the pin), and that line reaches the log only through `redact_upstream`.
+        let hosts = [cdn::HOST_A, cdn::HOST_B];
+        targets.retain(|target| !hosts.contains(target));
+        let lines = log.lines();
+        let tried = lines
+            .iter()
+            .filter(|line| line.target == "log:whatsapp_rust::download:WARN");
+        for line in tried {
+            let written = kourier_whatsapp::logs::redact_upstream(&line.text);
+            assert!(
+                !hosts.iter().any(|host| written.contains(host)),
+                "the app would write the media host"
+            );
+        }
+    }
     assert_eq!(
         log.leaks(&targets),
         Vec::<String>::new(),

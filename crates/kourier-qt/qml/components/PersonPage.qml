@@ -255,27 +255,21 @@ Item {
                     width: implicitWidth
                     height: implicitHeight
                 }
-                QQC2.Label {
+                CopyableText {
                     objectName: "detailsName"
                     width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
                     text: root.person.name ?? ""
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold,
                         "pointSize": Kirigami.Theme.defaultFont.pointSize * 1.3
                     })
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
                 }
-                QQC2.Label {
+                CopyableText {
                     objectName: "detailsProfileName"
                     visible: (root.person.profileName ?? "") !== ""
                     width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
                     text: root.person.profileName ?? ""
                     color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
                 }
                 // About text: three lines, "More" for the rest; selectable, with links where her chat is accepted.
                 DescriptionText {
@@ -295,14 +289,13 @@ Item {
                     text: about.expanded ? L10n.i18nc("@action:button show less of the about text", "Less") : L10n.i18nc("@action:button show the rest of the about text", "More")
                     onClicked: about.expanded = !about.expanded
                 }
-                QQC2.Label {
+                CopyableText {
                     objectName: "detailsNumber"
                     visible: (root.person.number ?? "") !== ""
                     width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
                     text: root.person.number ?? ""
                     color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
-                    textFormat: Text.PlainText
+                    button: true
                 }
                 Repeater {
                     model: root.person.notes ?? []
@@ -397,7 +390,7 @@ Item {
             }
 
             // ---- Copy Link (P5b: right under View Safety Number, his answer 2) ----
-            // Shown when the network has links to people (`linkShown`: never on the own page, BQ-4). Disabled with one
+            // Shown when the network has links to people (`linkShown`). Disabled with one
             // quiet line saying why when the page may use no number of theirs. Rust copies the link it holds for this
             // page: the URL never passes through QML; the toast carries no number.
             Column {

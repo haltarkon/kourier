@@ -44,6 +44,16 @@ QtObject {
     // opacity, with that set's text on it.
     readonly property real overlayOpacity: 0.6
 
+    // The side of one tile of the drawings behind a chat's messages.
+    readonly property int doodleSide: 480
+
+    // How strongly `tint` must lie on `ground` to differ from it by about `amount`: a bright
+    // color needs little, one close to the ground (a dark tint on a dark theme) more, up to `most`.
+    function tintStrength(tint: color, ground: color, amount: real, most: real): real {
+        const distance = Math.hypot(tint.r - ground.r, tint.g - ground.g, tint.b - ground.b);
+        return distance <= 0 ? most : Math.min(most, amount / distance);
+    }
+
     // URL of a bundled icon (`icons/<name>.svg`).
     // Whether the PREFERENCE has the experimental network `kind` on (what the next start does;
     // a network switched off in Settings stays registered until Kourier restarts).

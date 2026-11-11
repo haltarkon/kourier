@@ -45,6 +45,30 @@ fn the_keeper_root_and_the_list_file_match_the_apps() {
     );
 }
 
+/// Mutant: the variable that holds the app to this tool's rules renamed: every run would start
+/// with Threema on and any ID allowed.
+#[test]
+fn the_run_tools_variable_matches_the_apps() {
+    let app = source("crates/kourier-app/src/prefs.rs");
+    assert_eq!(
+        string_const(&app, "THREEMA_RUN_TOOL_ENV"),
+        crate::threema_run::launch::RUN_TOOL_ENV,
+        "the app's THREEMA_RUN_TOOL_ENV"
+    );
+}
+
+/// Mutant: the tool's own directory in a profile renamed: the app would no longer see a run
+/// profile started by hand as one, and a linked account there would connect (`ThreemaStart::Shut`).
+#[test]
+fn the_run_tools_directory_matches_the_apps() {
+    let app = source("crates/kourier-app/src/prefs.rs");
+    assert_eq!(
+        string_const(&app, "THREEMA_RUN_TOOL_DIR"),
+        crate::threema_run::TOOL_DIR,
+        "the app's THREEMA_RUN_TOOL_DIR"
+    );
+}
+
 /// The parser of the test finds one definition and nothing in a comment.
 #[test]
 fn the_constant_reader_reads_one_definition() {

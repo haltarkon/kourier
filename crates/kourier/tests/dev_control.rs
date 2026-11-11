@@ -211,6 +211,12 @@ fn drives_the_fixture_ui() {
     // The number check a run tool reads before it says "scan now": a fixture run has no tail,
     // and the key is there (a missing key must not read as "off" by accident).
     assert_eq!(state["expected_number_check"], json!(false), "{state}");
+    // BQ11 (A10d D8): a fixture run has no real Signal backend, so its Storage Service counts
+    // are not measured: the key is there and `null`, never a row of zeros. Mutant: a default of 0.
+    assert!(
+        state.get("storage").is_some_and(Value::is_null),
+        "the storage counts are not null in a fixture run: {state}"
+    );
 
     // Nothing can be attached before a conversation is open.
     let notes = dir.join("Route notes.txt");

@@ -91,10 +91,11 @@ commands:
              question is the open one
   answer     the user types y or n to the question a step asks here, in his own terminal, one key; run
              the built binary: target/debug/xtask threema-run answer [--profile <name>]
-  step <name> [--seconds <s>] [--user-said-yes]
+  step <name> [--seconds <s>] [--user-said-yes] [--lead-sends]
              one named step (see `steps`); --user-said-yes: the user said yes in chat to the
              step's risky act (only the lead passes it; a run with a test phone needs it for `unlink`
-             and `removed-on-phone`)
+             and `removed-on-phone`); --lead-sends: `send`, `group-send` and `send-file` make their
+             one send themselves (only the lead passes it, after the user's word in chat)
   steps      list the steps in their order
   state      the profile and the running app, as counts and states
   report     write threema-run/report.md into the profile directory
@@ -163,6 +164,9 @@ struct Args {
     pub no_test_phone: bool,
     /// `step <name> --user-said-yes`: the lead passes it only after the user's word in chat.
     pub user_said_yes: bool,
+    /// `step send|group-send|send-file --lead-sends`: the step makes its one send itself; the lead
+    /// passes it only after the user's word in chat.
+    pub lead_sends: bool,
     /// `id --from-test-phone`: read the TEST ID from the TEST phone's My ID.
     pub from_test_phone: bool,
     /// `answer --relayed y|n`: the lead relays the user's word (needs a run with a test phone).
@@ -310,6 +314,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--test-phone" => a.test_phone = Some(value("an adb serial")?),
             "--no-test-phone" => a.no_test_phone = true,
             "--user-said-yes" => a.user_said_yes = true,
+            "--lead-sends" => a.lead_sends = true,
             "--from-test-phone" => a.from_test_phone = true,
             "--relayed" => {
                 a.relayed = Some(match value("y or n")?.as_str() {

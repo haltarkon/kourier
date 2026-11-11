@@ -248,6 +248,8 @@ struct Actor {
     control: Arc<FakeControl>,
     uuid: AccountUuid,
     start: StartMode,
+    /// The invite links asked for: on or off, and how many there have been.
+    invites: std::cell::RefCell<std::collections::HashMap<ConvKey, (bool, u32)>>,
     flavor: Flavor,
     /// The network this fake plays (`NetworkKind::Fake` for none): a fake that plays Threema
     /// shows the emoji step after the scan of a QR login.
@@ -321,6 +323,7 @@ impl Actor {
             control,
             uuid: ctx.uuid,
             start: ctx.start,
+            invites: Default::default(),
             flavor,
             kind,
             linking: Cell::new(ctx.start == StartMode::Fresh && !linked),
@@ -1619,6 +1622,13 @@ impl Actor {
                 } => {
                     let _ = reply.send(self.set_verified(user, verified, &key));
                 }
+                Command::GroupInvite {
+                    group,
+                    action,
+                    reply,
+                } => {
+                    let _ = reply.send(self.group_invite(group, action));
+                }
                 Command::ListOwnDevices { reply } => {
                     let _ = reply.send(Ok(vec![OwnDevice {
                         id: self.script.device.unwrap_or(1),
@@ -1743,6 +1753,15 @@ impl Actor {
 
     /// `Command::SetRoamingWrites`: the account's caps again, with the flag as asked.
     fn set_roaming_writes(&self, on: bool) -> Result<(), BackendError> {
+        // A network that rejects the person's changes (a rejected Threema transaction, the same
+        // line as the chats' own at `ChangeConversation`) rejects the switch too: the first
+        // check, before anything else says "not scripted" (A10d D5, the lead's call M6).
+        if self.script.reject_changes {
+            return Err(BackendError::new(
+                ErrorKind::InvalidInput,
+                "transaction rejected",
+            ));
+        }
         let Some(mut caps) = self
             .stated_caps()?
             .filter(|caps| caps.roaming_writes().is_some())
@@ -2574,6 +2593,46 @@ impl Actor {
         self.commit_events(&[BackendEvent::Message(message)], |_| Ok(()))?;
         self.note_arrived(&conv, local, n);
         Ok(())
+    }
+
+    /// `Command::GroupInvite`: the fake's link is `https://invite.example/<round>`, the next
+    /// round after a reset. A network with an on/off states it with the group's features.
+    fn group_invite(
+        &self,
+        group: ConvKey,
+        action: kourier_model::GroupInviteAction,
+    ) -> Result<Option<kourier_model::Redacted<String>>, BackendError> {
+        use kourier_model::{GroupInviteAction as Action, GroupInvites};
+        let switch = match self.flavor.group_invites(self.kind) {
+            GroupInvites::None => {
+                return Err(BackendError::unsupported("this fake has no invite links"));
+            }
+            GroupInvites::Reset => false,
+            GroupInvites::Switch => true,
+        };
+        if !switch && matches!(action, Action::TurnOn | Action::TurnOff) {
+            return Err(BackendError::unsupported("this link cannot be turned off"));
+        }
+        let (on, round, turned) = {
+            let mut invites = self.invites.borrow_mut();
+            let entry = invites.entry(group.clone()).or_insert((!switch, 1));
+            let was = entry.0;
+            match action {
+                Action::Read => {}
+                Action::Reset => entry.1 += 1,
+                Action::TurnOn => entry.0 = true,
+                Action::TurnOff => entry.0 = false,
+            }
+            (entry.0, entry.1, was != entry.0)
+        };
+        if turned {
+            let mut patch = ConversationPatch::new(group);
+            let mut features = crate::scripts::signal_features(true);
+            features.invite_link_on = on;
+            patch.features = Some(features);
+            self.commit_events(&[BackendEvent::ConversationUpsert(patch)], |_| Ok(()))?;
+        }
+        Ok(on.then(|| kourier_model::Redacted::new(format!("https://invite.example/{round}"))))
     }
 
     /// `Command::SafetyNumber` ([`crate::Script::safety`]): the held key's number. A script

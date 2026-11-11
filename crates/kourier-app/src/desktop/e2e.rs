@@ -250,6 +250,7 @@ async fn start_with(late_server: bool, script: fn(&UserId, &UserId, &UserId) -> 
         handle.clone(),
         connection,
         &DesktopOptions::default(),
+        false,
         &paths,
         stop.clone(),
     );
@@ -1173,6 +1174,7 @@ async fn preferences_sent_just_before_the_stop_are_saved() {
                 instance: None,
             },
             &DesktopOptions::default(),
+            false,
             &paths,
             stop.clone(),
         );

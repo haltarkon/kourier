@@ -344,22 +344,6 @@ pub struct Child {
 /// IN THE CHILD: the actor over the parent's file (`Resume`, or `Rebuild` as the parent asked) on
 /// the piped parts, its clock at the fake's virtual time of the spawn. It acks nothing (M4).
 pub async fn child() -> Child {
-    start_child(false).await
-}
-
-/// IN THE CHILD: [`child`] with the parts' test door open, so a `Command::Transmit` reaches the send core (TH6a S8; R7).
-pub async fn child_send_open() -> Child {
-    start_child(true).await
-}
-
-/// IN THE CHILD: the parent's file on a connection of the child's own, beside the actor's: for a child that waits until a
-/// row stands as it must.
-pub fn child_file() -> kourier_db::ZoneDb {
-    let dir = PathBuf::from(std::env::var_os(DIR_ENV).expect("the parent's data directory"));
-    kourier_threema::store::open(&db_path(&dir), &key()).expect("open the file")
-}
-
-async fn start_child(send_open: bool) -> Child {
     assert!(
         offline::in_child(),
         "an actor test outside the unshare child"
@@ -386,17 +370,20 @@ async fn start_child(send_open: bool) -> Child {
         ui: Default::default(),
         local_prefs: Default::default(),
     });
-    let network = if send_open {
-        ThreemaNetwork::new(mock::pipe::parts(&pipe).with_send_open())
-    } else {
-        ThreemaNetwork::new(mock::pipe::parts(&pipe))
-    };
+    let network = ThreemaNetwork::new(mock::pipe::parts(&pipe));
     let handle = network.spawn(ctx).expect("the actor starts");
     Child {
         clock,
         ends,
         handle,
     }
+}
+
+/// IN THE CHILD: the parent's file on a connection of the child's own, beside the actor's: for a child that waits until a
+/// row stands as it must.
+pub fn child_file() -> kourier_db::ZoneDb {
+    let dir = PathBuf::from(std::env::var_os(DIR_ENV).expect("the parent's data directory"));
+    kourier_threema::store::open(&db_path(&dir), &key()).expect("open the file")
 }
 
 impl Child {

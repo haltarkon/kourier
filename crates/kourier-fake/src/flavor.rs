@@ -288,6 +288,26 @@ impl Flavor {
     }
 }
 
+impl Flavor {
+    /// What this flavor, playing `kind`, offers for a group's invite link: a fake playing a
+    /// network as that network does, a plain Signal-like fake can also turn the link off.
+    pub(crate) fn group_invites(
+        self,
+        kind: kourier_model::NetworkKind,
+    ) -> kourier_model::GroupInvites {
+        use kourier_model::{GroupInvites, NetworkKind};
+        match (kind, self) {
+            (NetworkKind::WhatsApp, _) | (NetworkKind::Fake, Self::WhatsAppLike) => {
+                GroupInvites::Reset
+            }
+            (NetworkKind::Signal, _) | (NetworkKind::Fake, Self::SignalLike) => {
+                GroupInvites::Switch
+            }
+            _ => GroupInvites::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -136,6 +136,11 @@ impl Paths {
         })
     }
 
+    /// The directory `KOURIER_HOME` named (made absolute), `None` on the XDG layout.
+    pub(crate) fn home_dir(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
     /// The profile these paths belong to.
     pub fn profile(&self) -> &Profile {
         &self.profile

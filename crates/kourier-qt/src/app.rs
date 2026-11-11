@@ -25,6 +25,10 @@ use kourier_viewmodel::conversations::BannerKind;
 use kourier_viewmodel::diff::ListOp;
 use kourier_viewmodel::i18n::trc;
 use kourier_viewmodel::login::{NetworkEntry, network_choices, privacy_note, welcome_footnote};
+use kourier_viewmodel::person::{self, CopyPart, CopyTarget};
+use kourier_viewmodel::roaming::{
+    LocalPick, MuteChoice, local_to_ms, mute_end, until_allowed, until_start,
+};
 use kourier_viewmodel::source::{GroupUpdate, PersonUpdate, SaveAnswer, SaveFailure};
 use kourier_viewmodel::time::{Calendar, FixedOffset};
 use kourier_viewmodel::timeline::{Block, QuoteState};
@@ -259,10 +263,39 @@ pub struct AppRust {
     shown_actions: Vec<ShownActions>,
 }
 
-/// One account of `accountActions`: `(account, which account it is, offers the transfer,
-/// offers "Unlink…")`.
-/// `(account, about, offers history, offers unlink, shown, last shown)`.
-type ShownActions = (i64, String, bool, bool, bool, bool);
+/// One account of `accountActions`, as it was last shown (to tell when a row changes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShownActions {
+    /// The account.
+    account: i64,
+    /// Which account it is (name, number, network, device).
+    about: String,
+    /// Offers "Transfer History from Phone…".
+    offers_history: bool,
+    /// Offers "Unlink…".
+    offers_unlink: bool,
+    /// The account's chats are in the list.
+    shown: bool,
+    /// It is the last shown account.
+    last_shown: bool,
+    /// The network writes the chat settings to the account's other devices, and the account's
+    /// switch for it: `None` = the row shows no switch.
+    roaming: Option<bool>,
+    /// Why the switch cannot be flipped now; empty when it can.
+    roaming_note: String,
+    /// The color the person gave the account; empty when none.
+    own_tint: String,
+}
+
+/// The key `accountActions` names the sync switch's state by: `""` = the row shows no switch
+/// (the network cannot write the settings), `"off"`, `"on"`. QML shows what it is given.
+pub fn roaming_key(roaming: Option<bool>) -> &'static str {
+    match roaming {
+        None => "",
+        Some(false) => "off",
+        Some(true) => "on",
+    }
+}
 
 /// Timing marks that end with the frame that shows their rows (`kourier_app::trace`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -533,8 +566,40 @@ impl Default for AppRust {
     }
 }
 
+/// The colors the person gave accounts, as the preference holds them.
+fn account_tints(
+    prefs: &kourier_app::Prefs,
+) -> std::collections::HashMap<kourier_model::AccountUuid, String> {
+    prefs
+        .account_tints
+        .iter()
+        .filter_map(|(uuid, tint)| Some((uuid.parse().ok()?, tint.clone())))
+        .collect()
+}
+
 fn string_variant(text: &str) -> QVariant {
     QVariant::from(&QString::from(text))
+}
+
+/// The "Until…" dialog's fields as a local date and time, or `None` when they are no date
+/// (month 1 to 12, day 1 to 31, hour 0 to 23, minute 0 to 59, year 1970 to 9999: the calendar
+/// the dialog's pickers give; a year past 9999 would overflow the millisecond count).
+pub fn local_pick(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> Option<LocalPick> {
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+    {
+        return None;
+    }
+    Some(LocalPick {
+        year: i64::from(year),
+        month: u32::try_from(month).ok()?,
+        day: u32::try_from(day).ok()?,
+        hour: u32::try_from(hour).ok()?,
+        minute: u32::try_from(minute).ok()?,
+    })
 }
 
 /// A history transfer as QML reads it; without one, the same keys with an empty `phase`.
@@ -974,6 +1039,10 @@ impl cxx_qt::Initialize for qobject::App {
                 .collect();
             ShownAccounts::load(prefs.blend_accounts, hidden)
         });
+        if let Some(ctx) = &ctx {
+            let tints = account_tints(&ctx.app.desktop().prefs());
+            shared.borrow_mut().source.set_account_tints(tints);
+        }
         if let (Some(ctx), Some(s)) = (&ctx, settings.as_mut()) {
             let desktop = ctx.app.desktop().clone();
             *s.rust_mut() = SettingsRust::from_prefs(&desktop.prefs(), Some(desktop));
@@ -1115,7 +1184,10 @@ impl cxx_qt::Initialize for qobject::App {
                     self.as_mut().open_conversation(id.0);
                 }
             }
-            Some("quotes" | "menu" | "react" | "edit" | "reply" | "delete") => {
+            Some(
+                "quotes" | "menu" | "react" | "edit" | "reply" | "delete" | "muteuntil"
+                | "chatmenu" | "chatmenuoff",
+            ) => {
                 if let Some(id) = fixture.and_then(|f| f.quotes_conversation) {
                     self.as_mut().open_conversation(id.0);
                 }
@@ -1157,7 +1229,7 @@ impl cxx_qt::Initialize for qobject::App {
                     self.as_mut().open_conversation(id.0);
                 }
             }
-            Some("group") => {
+            Some("group" | "groupadmin") => {
                 if let Some(id) = fixture.and_then(|f| f.group_conversation) {
                     self.as_mut().open_conversation(id.0);
                 }
@@ -1181,6 +1253,8 @@ impl cxx_qt::Initialize for qobject::App {
             // Blended chats: the list of the fixture's three accounts, no chat open (the page
             // hides the second account in `MainWindow.qml` `accountsPageReady`).
             Some("accounts" | "accountsdrawer") => {}
+            // The chat list's own menus (A10d): no chat open, the list stands.
+            Some("rowmenu" | "rowmenuoff" | "rowmenumuted" | "mutemenu") => {}
             Some("link" | "qr" | "transferwait" | "transferdownload" | "transferread") => {
                 let network = shared
                     .borrow()
@@ -1316,6 +1390,42 @@ impl qobject::App {
         };
         let hidden: Vec<String> = self.shown.hidden().iter().map(|u| u.to_string()).collect();
         desktop.update_prefs(|p| p.hidden_accounts = hidden);
+    }
+
+    /// Gives `account` a color of its own (`#rrggbb`), or its network's again (empty). The App
+    /// is the one writer of this preference, as of the hidden accounts.
+    pub fn set_account_tint(mut self: Pin<&mut Self>, account: i64, tint: &QString) {
+        let tint = tint.to_string();
+        if !tint.is_empty() && !kourier_app::prefs::is_tint(&tint) {
+            return;
+        }
+        let (Some(shared), Some(desktop)) = (
+            self.shared.clone(),
+            self.app.as_ref().map(|a| a.desktop().clone()),
+        ) else {
+            return;
+        };
+        let Some(uuid) = self
+            .account_rows
+            .iter()
+            .find(|a| a.id.0 == account)
+            .map(|a| a.uuid)
+        else {
+            return;
+        };
+        desktop.update_prefs(|p| {
+            if tint.is_empty() {
+                p.account_tints.remove(&uuid.to_string());
+            } else {
+                p.account_tints.insert(uuid.to_string(), tint.clone());
+            }
+        });
+        let ch = shared
+            .borrow_mut()
+            .source
+            .set_account_tints(account_tints(&desktop.prefs()));
+        shared.borrow_mut().pending.merge(ch);
+        self.as_mut().apply_pending();
     }
 
     /// The setting "Show chats of several accounts together" changed (queued by the Settings
@@ -1558,8 +1668,10 @@ impl qobject::App {
 
     /// Every account with what Settings → "Accounts" offers for it: a map of `account`,
     /// `about` (which account it is), `transfer` and `unlink` (whether "Transfer History from
-    /// Phone…" and "Unlink…" are offered; "Remove Account…" always is) and the three labels
-    /// `transferLabel`, `removeLabel`, `unlinkLabel`.
+    /// Phone…" and "Unlink…" are offered; "Remove Account…" always is), the three labels
+    /// `transferLabel`, `removeLabel`, `unlinkLabel`, and the sync switch: `roaming` (`""` = no
+    /// switch row, `"off"`, `"on"`, see [`roaming_key`]) and `roamingNote` (why it cannot be
+    /// flipped now; empty when it can).
     fn refresh_account_actions(mut self: Pin<&mut Self>) {
         let Some(shared) = self.shared.clone() else {
             return;
@@ -1577,14 +1689,17 @@ impl qobject::App {
                 );
                 let shown = self.shown.is_shown(a.uuid);
                 let last = self.shown.is_last_shown(&panel, a.uuid);
-                (
-                    a.id.0,
+                ShownActions {
+                    account: a.id.0,
                     about,
-                    a.offers_history,
-                    a.offers_unlink,
+                    offers_history: a.offers_history,
+                    offers_unlink: a.offers_unlink,
                     shown,
-                    last,
-                )
+                    last_shown: last,
+                    roaming: a.roaming_writes,
+                    roaming_note: a.roaming_note,
+                    own_tint: a.own_tint.clone(),
+                }
             })
             .collect();
         if self.shown_actions == rows {
@@ -1594,14 +1709,26 @@ impl qobject::App {
         let remove = kourier_viewmodel::account_actions::remove_action_label();
         let unlink = kourier_viewmodel::account_actions::unlink_action_label();
         let mut list = QList::<QVariant>::default();
-        for (account, about, offers_history, offers_unlink, shown, last) in &rows {
+        for row in &rows {
             let mut m = QMap::<QMapPair_QString_QVariant>::default();
-            m.insert(QString::from("account"), QVariant::from(account));
-            m.insert(QString::from("about"), string_variant(about));
-            m.insert(QString::from("transfer"), QVariant::from(offers_history));
-            m.insert(QString::from("unlink"), QVariant::from(offers_unlink));
-            m.insert(QString::from("shown"), QVariant::from(shown));
-            m.insert(QString::from("lastShown"), QVariant::from(last));
+            m.insert(QString::from("account"), QVariant::from(&row.account));
+            m.insert(QString::from("about"), string_variant(&row.about));
+            m.insert(
+                QString::from("transfer"),
+                QVariant::from(&row.offers_history),
+            );
+            m.insert(QString::from("unlink"), QVariant::from(&row.offers_unlink));
+            m.insert(QString::from("shown"), QVariant::from(&row.shown));
+            m.insert(QString::from("ownTint"), string_variant(&row.own_tint));
+            m.insert(QString::from("lastShown"), QVariant::from(&row.last_shown));
+            m.insert(
+                QString::from("roaming"),
+                string_variant(roaming_key(row.roaming)),
+            );
+            m.insert(
+                QString::from("roamingNote"),
+                string_variant(&row.roaming_note),
+            );
             m.insert(QString::from("transferLabel"), string_variant(&transfer));
             m.insert(QString::from("removeLabel"), string_variant(&remove));
             m.insert(QString::from("unlinkLabel"), string_variant(&unlink));
@@ -1864,6 +1991,19 @@ impl qobject::App {
         if let Some(moved) = ch.archive_move {
             self.as_mut().archive_moved(moved);
         }
+        if ch.told {
+            // After `archive_moved`: an archive of the open chat has closed it by now, so the
+            // notice's "Undo" opens the chat again from a closed state.
+            let told = shared.borrow_mut().source.take_told();
+            for t in told {
+                self.as_mut().chat_told(
+                    QString::from(t.kind()),
+                    t.conv().map_or(0, |c| c.0),
+                    t.was_pinned(),
+                    QString::from(t.words().as_str()),
+                );
+            }
+        }
         if ch.timeline || ch.header {
             self.as_mut().refresh_timeline(false);
         } else {
@@ -1957,6 +2097,15 @@ impl qobject::App {
                     self.as_mut().person_ended();
                 }
                 None => {}
+            }
+        }
+        if ch.copy {
+            let answer = shared.borrow_mut().source.take_copy();
+            if let Some(answer) = answer {
+                if let Some(text) = &answer.text {
+                    qobject::set_clipboard_text(&QString::from(text.expose().as_str()));
+                }
+                self.as_mut().copy_told(QString::from(answer.told.as_str()));
             }
         }
         if ch.safety {
@@ -2872,6 +3021,181 @@ impl qobject::App {
         });
     }
 
+    /// Archives (`on`) or unarchives `conversation` (any chat, open or not). The notice comes
+    /// with `chatTold`, once the core's row says so.
+    pub fn set_archived(self: Pin<&mut Self>, conversation: i64, on: bool) {
+        if conversation <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.set_archived(ConversationId(conversation), on);
+            Changes::default()
+        });
+    }
+
+    /// Pins (`on`) or unpins `conversation`.
+    pub fn set_pinned(self: Pin<&mut Self>, conversation: i64, on: bool) {
+        if conversation <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.set_pinned(ConversationId(conversation), on);
+            Changes::default()
+        });
+    }
+
+    /// Marks `conversation` unread (`on`) or removes the mark.
+    pub fn set_marked_unread(self: Pin<&mut Self>, conversation: i64, on: bool) {
+        if conversation <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.set_marked_unread(ConversationId(conversation), on);
+            Changes::default()
+        });
+    }
+
+    /// Takes an archive back: unarchives `conversation` and pins it again when the archive took
+    /// a pin with it. No notice of its own.
+    pub fn undo_archive(self: Pin<&mut Self>, conversation: i64, was_pinned: bool) {
+        if conversation <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.undo_archive(ConversationId(conversation), was_pinned);
+            Changes::default()
+        });
+    }
+
+    /// Ends the mute of `conversation`.
+    pub fn unmute(self: Pin<&mut Self>, conversation: i64) {
+        if conversation <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.set_muted(ConversationId(conversation), None);
+            Changes::default()
+        });
+    }
+
+    /// Mutes `conversation` for `choice` (`"hour"`, `"eight"`, `"day"`, `"week"`, `"always"`),
+    /// counted from the source's clock; any other word does nothing.
+    pub fn mute_for(self: Pin<&mut Self>, conversation: i64, choice: &QString) {
+        if conversation <= 0 {
+            return;
+        }
+        let Some(choice) = MuteChoice::from_key(&choice.to_string()) else {
+            return;
+        };
+        self.with_source(|s| {
+            let end = mute_end(choice, s.time().now_ms);
+            s.set_muted(ConversationId(conversation), Some(end));
+            Changes::default()
+        });
+    }
+
+    /// Mutes `conversation` until the local date and time given. `false` (and nothing sent)
+    /// when the time is no date or ends inside the next minute.
+    pub fn mute_until(
+        self: Pin<&mut Self>,
+        conversation: i64,
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+    ) -> bool {
+        if conversation <= 0 {
+            return false;
+        }
+        let Some(pick) = local_pick(year, month, day, hour, minute) else {
+            return false;
+        };
+        let mut sent = false;
+        self.with_source(|s| {
+            let end = {
+                let time = s.time();
+                let end = local_to_ms(pick, time.calendar);
+                until_allowed(end, time.now_ms).then_some(end)
+            };
+            if let Some(end) = end {
+                sent = s.set_muted(ConversationId(conversation), Some(end));
+            }
+            Changes::default()
+        });
+        sent
+    }
+
+    /// Whether `muteUntil` takes this local date and time now.
+    pub fn mute_until_allowed(
+        &self,
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+    ) -> bool {
+        let (Some(pick), Some(shared)) = (local_pick(year, month, day, hour, minute), &self.shared)
+        else {
+            return false;
+        };
+        let shared = shared.borrow();
+        let time = shared.source.time();
+        until_allowed(local_to_ms(pick, time.calendar), time.now_ms)
+    }
+
+    /// Where the "Until…" dialog starts: tomorrow at 8:00 on the local clock.
+    pub fn mute_until_start(&self) -> QVariant {
+        let Some(shared) = &self.shared else {
+            return QVariant::from(&QMap::<QMapPair_QString_QVariant>::default());
+        };
+        let shared = shared.borrow();
+        let start = until_start(&shared.source.time());
+        let year = i32::try_from(start.year).unwrap_or(i32::MAX);
+        let (month, day, hour, minute) = (
+            i32::try_from(start.month).unwrap_or(0),
+            i32::try_from(start.day).unwrap_or(0),
+            i32::try_from(start.hour).unwrap_or(0),
+            i32::try_from(start.minute).unwrap_or(0),
+        );
+        let mut m = QMap::<QMapPair_QString_QVariant>::default();
+        for (key, value) in [
+            ("year", year),
+            ("month", month),
+            ("day", day),
+            ("hour", hour),
+            ("minute", minute),
+        ] {
+            m.insert(QString::from(key), QVariant::from(&value));
+        }
+        QVariant::from(&m)
+    }
+
+    /// Turns the account's switch for writing its chats' settings to its other devices on or
+    /// off.
+    pub fn set_roaming_writes(self: Pin<&mut Self>, account: i64, on: bool) {
+        if account <= 0 {
+            return;
+        }
+        self.with_source(|s| {
+            s.set_roaming_writes(AccountId(account), on);
+            Changes::default()
+        });
+    }
+
+    /// What the menu of `conversation` offers of Archive, Pin, Mute and Mark as Unread
+    /// ([`models::timeline::offer_variant`]); an empty map for `conversation` 0 or less.
+    pub fn chat_offer(&self, conversation: i64) -> QVariant {
+        let Some(shared) = self.shared.as_ref().filter(|_| conversation > 0) else {
+            return models::timeline::no_offer();
+        };
+        let offer = shared
+            .borrow()
+            .source
+            .chat_offer(ConversationId(conversation));
+        models::timeline::offer_variant(&offer)
+    }
+
     /// Removes one attachment of a message for this account.
     pub fn delete_attachment(self: Pin<&mut Self>, attachment: i64) {
         if attachment <= 0 {
@@ -2983,6 +3307,61 @@ impl qobject::App {
     /// Puts `text` on the clipboard.
     pub fn copy_text(&self, text: &QString) {
         qobject::set_clipboard_text(text);
+    }
+
+    /// Puts text that is on screen on the clipboard and says so.
+    pub fn copy_shown(self: Pin<&mut Self>, text: &QString) {
+        qobject::set_clipboard_text(text);
+        self.copy_told(QString::from(person::copied_text().as_str()));
+    }
+
+    /// Asks for a copy action; the answer comes as [`Changes::copy`].
+    fn request_copy(&self, part: &QString, target: CopyTarget) -> bool {
+        let part = match part.to_string().as_str() {
+            "number" => CopyPart::Address,
+            "link" => CopyPart::Link,
+            _ => return false,
+        };
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.borrow_mut().source.request_copy(part, target))
+    }
+
+    /// "Copy Number or ID" or "Copy Link" of a member's row.
+    pub fn copy_person(self: Pin<&mut Self>, part: &QString, account: i64, user: &QString) -> bool {
+        // The id came from a member row of the page; a string that is no id asks nothing.
+        let Ok(user) = UserId::parse(&user.to_string()) else {
+            return false;
+        };
+        let account = AccountId(account);
+        self.request_copy(part, CopyTarget::Person { account, user })
+    }
+
+    /// "Copy Number or ID" or "Copy Link" of a direct chat's row.
+    pub fn copy_chat(self: Pin<&mut Self>, part: &QString, conversation: i64) -> bool {
+        self.request_copy(part, CopyTarget::Chat(ConversationId(conversation)))
+    }
+
+    /// An action on a group's invite link.
+    pub fn group_invite(self: Pin<&mut Self>, action: &QString, conversation: i64) -> bool {
+        use kourier_model::GroupInviteAction as Action;
+        let action = match action.to_string().as_str() {
+            "read" => Action::Read,
+            "reset" => Action::Reset,
+            "on" => Action::TurnOn,
+            "off" => Action::TurnOff,
+            _ => return false,
+        };
+        self.shared.as_ref().is_some_and(|s| {
+            s.borrow_mut()
+                .source
+                .request_group_invite(ConversationId(conversation), action)
+        })
+    }
+
+    /// "Copy Number or ID" or "Copy Link" of an account's row.
+    pub fn copy_account(self: Pin<&mut Self>, part: &QString, account: i64) -> bool {
+        self.request_copy(part, CopyTarget::Account(AccountId(account)))
     }
 
     /// "Copy Link" of the person's page on screen (P5b): puts the link Rust holds for that page
@@ -4323,12 +4702,16 @@ mod tests {
             status_label: String::new(),
             unread: 0,
             avatar_url: String::new(),
+            tint: String::new(),
+            own_tint: String::new(),
             number: String::new(),
             offers_history: false,
             offers_unlink: false,
             device: String::new(),
             shown: true,
             place: 0,
+            roaming_writes: None,
+            roaming_note: String::new(),
         };
         let rows = [row(1, "", "WhatsApp"), row(2, "Andrii", "Signal")];
         assert_eq!(single_title(&rows, AccountId(1)), "WhatsApp");

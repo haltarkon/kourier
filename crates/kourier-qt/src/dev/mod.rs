@@ -19,7 +19,11 @@
 //! with the rehearsal fake, whose `rehearsal_arrive {"kind": "direct"|"group"}` puts one text into
 //! the first chat of that kind and is refused everywhere else; `frames` is how many frames that
 //! fake has taken (sends, reacts, edits, deletes, revokes, timer sets) and `null` in every other
-//! run). `chats` also marks each shown chat `pinned`, `muted` and `marked_unread`;
+//! run; `storage` is the real Signal backend's Storage Service counts of this process,
+//! `{version, identifiers, unknown, writes}` (the newest manifest it saw, fetched or written by
+//! us: its version, how many identifiers it lists and how many of them had no record here; our
+//! writes answered 200), and `null` until a manifest was read, in fixture mode and without the
+//! real backend). `chats` also marks each shown chat `pinned`, `muted` and `marked_unread`;
 //! `chat_facts {"conversation": id}` is the core's own row of one chat (`archived` too, which the
 //! shown inbox cannot tell), its call lines (`calls`: `state`, `direction`, `group`) and, for a
 //! group, its `members`, `admins` and `pending` counts ([`facts`]). `send` takes an optional
@@ -224,9 +228,13 @@ async fn run(
             })
             .await?
         }
-        Command::Send { text, conversation } => {
+        Command::Send {
+            text,
+            conversation,
+            files,
+        } => {
             let (conv, before) =
-                on_qt(thread, move |app| app.dev_send(&text, conversation)).await??;
+                on_qt(thread, move |app| app.dev_send(&text, conversation, files)).await??;
             // Answer once the message is in the timeline, so a following `wait` on its state
             // looks at this message and not at an older one.
             let started = Instant::now();

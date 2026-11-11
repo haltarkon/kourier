@@ -18,8 +18,8 @@ use crate::facade::{
     AccountRow, ChatMediaItem, ChatMediaPage, ChatMediaQuery, CommonGroup, ConversationDetail,
     ConversationListQuery, ConversationPage, ConversationRow, GroupDetail, GroupMember,
     MAX_MEDIA_PAGE, MediaKind, MessageRevisions, MessageRow, OriginKind, OutboxWait, PersonChat,
-    PersonDetail, Preview, QuoteState, ReactionGroup, ReplyPreview, Revision, TimelineAnchor,
-    TimelinePage, TimelineQuery,
+    PersonDetail, PersonRef, Preview, QuoteState, ReactionGroup, ReplyPreview, Revision,
+    TimelineAnchor, TimelinePage, TimelineQuery,
 };
 use crate::roaming;
 use crate::sql;
@@ -732,6 +732,7 @@ pub(crate) fn group(conn: &Connection, id: ConversationId) -> Result<Option<Grou
         features: sql::from_json_opt::<ConversationFeatures>(features)?.unwrap_or_default(),
         blocked,
         members,
+        invites: kourier_model::GroupInvites::None,
     }))
 }
 
@@ -1868,6 +1869,29 @@ pub(crate) fn conversation_key(
         .optional()?;
     row.map(|(a, k)| Ok((AccountId(a), sql::conv_key(&k)?)))
         .transpose()
+}
+
+/// Who `target` stands for: the peer of a direct chat, the account's first own id. `None` when
+/// there is nobody.
+pub(crate) fn person_of(
+    conn: &Connection,
+    target: PersonRef,
+) -> Result<Option<(AccountId, UserId)>> {
+    match target {
+        PersonRef::Chat(id) => Ok(conversation_key(conn, id)?
+            .and_then(|(account, key)| key.direct_peer().cloned().map(|peer| (account, peer)))),
+        PersonRef::Own(account) => {
+            let own: Option<String> = conn
+                .prepare_cached("SELECT own_ids FROM accounts WHERE id = ?1")?
+                .query_row([account.0], |r| r.get(0))
+                .optional()?;
+            let Some(own) = own else {
+                return Ok(None);
+            };
+            let own: Vec<UserId> = sql::from_json(&own)?;
+            Ok(own.into_iter().next().map(|user| (account, user)))
+        }
+    }
 }
 
 /// The conversation of a message (the compose lane a command about it runs in).

@@ -69,7 +69,7 @@ futures = { workspace = true, features = ["async-await"] }
 tempfile.workspace = true
 # The real-HTTP test's listener gets a tiny receive buffer (`src/real/tests.rs`, W5b decision G15).
 libc.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 waproto.workspace = true
 # The fixture peer (tests/support/peer.rs) runs libsignal's `process_prekey_bundle`, which takes an
 # rng of the version libsignal uses (rand 0.10; the workspace's own `rand` is 0.9). Already in the

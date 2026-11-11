@@ -27,7 +27,7 @@
 //!    With `--release` each is an error and nothing is built.
 //! 4. Builds the release binary into its own target directory (`target/dist-build`, which the
 //!    development builds never touch) with every absolute path mapped away ([`BuildPlan`]),
-//!    without the test network (`--no-default-features --features signal,whatsapp`), and with the
+//!    without the test network (`--no-default-features --features signal,whatsapp,threema`), and with the
 //!    variables that would change the output cleared ([`build_env_removals`]). A binary holds
 //!    the paths of its sources in its panic messages and C and C++ code holds them through
 //!    `__FILE__`. When the build is done the commit and the state of the tree are read again
@@ -96,12 +96,17 @@ const VERIFY_DIR: &str = ".dist-verify";
 /// right whether or not the names archive is published beside the others (critic MEDIUM-2).
 const NAMES_SUMS: &str = "SHA256SUMS.names";
 
-/// The cargo arguments that choose the features of the public binary: the Signal backend and the
+/// The cargo arguments that choose the features of the public binary: the Signal backend, the
+/// Threema backend (on by default in every build: the user's decision of 2026-11-09) and the
 /// WhatsApp backend (compiled in since W2b; a release build does not REGISTER it, so the archive
-/// links no real account: `kourier-app` `whatsapp_registration`), and not the scripted test network
-/// (`--fixture`, `--fixture-link`, the "Test network" on the welcome page;
+/// links no real WhatsApp account: `kourier-app` `whatsapp_registration`), and not the scripted
+/// test network (`--fixture`, `--fixture-link`, the "Test network" on the welcome page;
 /// `crates/kourier/Cargo.toml`).
-const BUILD_FEATURE_ARGS: [&str; 3] = ["--no-default-features", "--features", "signal,whatsapp"];
+const BUILD_FEATURE_ARGS: [&str; 3] = [
+    "--no-default-features",
+    "--features",
+    "signal,whatsapp,threema",
+];
 
 /// What the stamp records for [`BUILD_FEATURE_ARGS`].
 fn build_features() -> String {
@@ -126,14 +131,18 @@ const NETWORKS_LINE_HEAD: &str = "networks";
 /// `Paths::from_env`: `<home>/kourier/config/kourier.toml`; a test compares).
 const NETWORKS_PREFS_PATH: &str = "kourier/config/kourier.toml";
 
-/// The preferences the check writes: the user turned WhatsApp and Threema on (the file is meant to
-/// be edited by hand, so the names are lower case here and must still be found).
-const NETWORKS_PREFS: &str = "networks-on = [\"whatsapp\", \"threema\"]\n";
+/// The preferences the check writes: the user turned WhatsApp on (the file is meant to be edited
+/// by hand, so the name is lower case here and must still be found) and the file says nothing of
+/// Threema, which is on by default.
+const NETWORKS_PREFS: &str = "networks-on = [\"whatsapp\"]\n";
 
 /// The networks a release binary must offer in no list although [`NETWORKS_PREFS`] turns them on
-/// (`kourier-app` `whatsapp_registration`, `threema_registration`). Threema is not in the archive's
-/// features at all today (`signal,whatsapp`): the check is there for the day it joins.
-const GATED_NETWORKS: [&str; 2] = ["WhatsApp", "Threema"];
+/// (`kourier-app` `whatsapp_registration`).
+const GATED_NETWORKS: [&str; 1] = ["WhatsApp"];
+
+/// The networks a release binary must register with nothing in the file (`kourier-app`
+/// `threema_registration`; the user's decision of 2026-11-09).
+const DEFAULT_ON_NETWORKS: [&str; 1] = ["Threema"];
 
 /// Where the check puts its `KOURIER_HOME`, below the directory the archive was unpacked into.
 const NETWORKS_HOME_DIR: &str = ".networks-home";
@@ -2063,7 +2072,7 @@ pub fn parse_networks_line(stdout: &str) -> Result<NetworksLine> {
 /// What is wrong with a [`NetworksLine`] of a RELEASE binary whose profile turned the
 /// [`GATED_NETWORKS`] on: it registers one, or lists one as off (the lane decisions: no archive
 /// links a real account of them), or the line does not show that the switch of each was read (then
-/// the empty lists prove nothing).
+/// the empty lists prove nothing); or it does not register one of the [`DEFAULT_ON_NETWORKS`].
 pub fn networks_line_problems(line: &NetworksLine) -> Vec<String> {
     let mut problems = Vec::new();
     for network in GATED_NETWORKS {
@@ -2087,14 +2096,30 @@ pub fn networks_line_problems(line: &NetworksLine) -> Vec<String> {
             ));
         }
     }
+    for network in DEFAULT_ON_NETWORKS {
+        let names = |kinds: &[String]| kinds.iter().any(|k| k.eq_ignore_ascii_case(network));
+        if !names(&line.registered) {
+            problems.push(format!(
+                "the packed binary does not register {network}, which is on by default (registered={}, off={})",
+                line.registered.join(","),
+                line.off.join(",")
+            ));
+        }
+        if !names(&line.on) {
+            problems.push(format!(
+                "the binary did not read the preferences that turn {network} on (on={}): the check proves nothing",
+                line.on.join(",")
+            ));
+        }
+    }
     problems
 }
 
 /// Runs `binary --print-networks` as a user would (an empty environment, a private home) on a
-/// profile whose `kourier.toml` has `networks-on = ["whatsapp", "threema"]` (a `KOURIER_HOME` below
-/// `work`) and fails when WhatsApp or Threema is registered or listed as off: a RELEASE build
-/// neither registers nor lists them (`kourier-app` `whatsapp_registration`, lane decision L1;
-/// `threema_registration`), which no test of a debug build can show. The flag starts nothing: no window, no database, no keyring, no network.
+/// profile whose `kourier.toml` has `networks-on = ["whatsapp"]` (a `KOURIER_HOME` below `work`) and
+/// fails when WhatsApp is registered or listed as off, or Threema is not registered: a RELEASE build
+/// neither registers nor lists WhatsApp (`kourier-app` `whatsapp_registration`, lane decision L1) and
+/// has Threema on by default (`threema_registration`), which no test of a debug build can show. The flag starts nothing: no window, no database, no keyring, no network.
 pub fn check_release_networks(binary: &Path, work: &Path, limit: Duration) -> Result<()> {
     let home = work.join(NETWORKS_HOME_DIR);
     let prefs = home.join(NETWORKS_PREFS_PATH);
@@ -4321,52 +4346,57 @@ Version References:
     #[test]
     fn a_networks_line_that_names_whatsapp_fails() {
         let parse = |text: &str| parse_networks_line(text).expect(text);
-        let ok = parse("networks registered=Signal off= on=WhatsApp,Threema\n");
+        let ok = parse("networks registered=Signal,Threema off= on=WhatsApp,Threema\n");
         assert_eq!(
             ok,
             NetworksLine {
-                registered: vec!["Signal".to_owned()],
+                registered: vec!["Signal".to_owned(), "Threema".to_owned()],
                 off: vec![],
                 on: vec!["WhatsApp".to_owned(), "Threema".to_owned()],
             }
         );
         assert!(networks_line_problems(&ok).is_empty());
         // Lists of several kinds, the switch spelled as the file has it.
-        let several = parse("networks registered=Fake,Signal off= on=whatsapp,threema\n");
-        assert_eq!(several.registered, ["Fake", "Signal"]);
+        let several = parse("networks registered=Fake,Signal,threema off= on=whatsapp,threema\n");
+        assert_eq!(several.registered, ["Fake", "Signal", "threema"]);
         assert!(networks_line_problems(&several).is_empty());
         // WhatsApp registered, or listed as off, in whatever case: the check fails, naming which.
-        let registered = parse("networks registered=Signal,WhatsApp off= on=WhatsApp,Threema\n");
+        let registered =
+            parse("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema\n");
         let problems = networks_line_problems(&registered);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("REGISTERS WhatsApp"), "{problems:?}");
-        let listed = parse("networks registered=Signal off=whatsapp on=WhatsApp,Threema\n");
+        let listed = parse("networks registered=Signal,Threema off=whatsapp on=WhatsApp,Threema\n");
         let problems = networks_line_problems(&listed);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].contains("lists WhatsApp as off"),
             "{problems:?}"
         );
-        let both = parse("networks registered=WhatsApp off=WhatsApp on=WhatsApp,Threema\n");
+        let both = parse("networks registered=Threema,WhatsApp off=WhatsApp on=WhatsApp,Threema\n");
         assert_eq!(networks_line_problems(&both).len(), 2);
-        // Threema the same way (TH1: not in the archive's features, the check guards the day it is).
-        let threema = parse("networks registered=Signal,Threema off= on=WhatsApp,Threema\n");
-        let problems = networks_line_problems(&threema);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("REGISTERS Threema"), "{problems:?}");
-        let threema = parse("networks registered=Signal off=threema on=WhatsApp,Threema\n");
-        let problems = networks_line_problems(&threema);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("lists Threema as off"), "{problems:?}");
+        // Threema must be registered: on by default in every build.
+        for line in [
+            "networks registered=Signal off= on=WhatsApp,Threema\n",
+            "networks registered=Signal off=threema on=WhatsApp,Threema\n",
+        ] {
+            let threema = parse(line);
+            let problems = networks_line_problems(&threema);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(
+                problems[0].contains("does not register Threema"),
+                "{problems:?}"
+            );
+        }
         // The switch not shown as read: empty lists would prove nothing (one problem per network).
-        let unread = parse("networks registered=Signal off= on=\n");
+        let unread = parse("networks registered=Signal,Threema off= on=\n");
         let problems = networks_line_problems(&unread);
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(
             problems.iter().all(|p| p.contains("did not read")),
             "{problems:?}"
         );
-        let half = parse("networks registered=Signal off= on=WhatsApp\n");
+        let half = parse("networks registered=Signal,Threema off= on=WhatsApp\n");
         let problems = networks_line_problems(&half);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("turn Threema on"), "{problems:?}");
@@ -4399,12 +4429,12 @@ Version References:
                 &format!(
                     "[ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ] && [ $# = 1 ] || {{ echo \"args: $*\" >&2; exit 9; }}\n\
                      [ -z \"$USER$QT_QPA_PLATFORM$XDG_RUNTIME_DIR\" ] || {{ echo env >&2; exit 8; }}\n\
-                     grep -qF 'networks-on = [\"whatsapp\", \"threema\"]' \"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\" || {{ echo prefs >&2; exit 7; }}\n\
+                     grep -qF 'networks-on = [\"whatsapp\"]' \"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\" || {{ echo prefs >&2; exit 7; }}\n\
                      echo '{answer}'"
                 ),
             )
         };
-        let release = program("networks registered=Signal off= on=WhatsApp,Threema");
+        let release = program("networks registered=Signal,Threema off= on=WhatsApp,Threema");
         check_release_networks(&release, &scratch.0, limit).expect("a release binary");
         assert!(
             !scratch.0.join(NETWORKS_HOME_DIR).exists(),
@@ -4412,8 +4442,8 @@ Version References:
         );
         // A binary that registers WhatsApp, or lists it as off (a debug build's answers).
         for answer in [
-            "networks registered=Signal,WhatsApp off= on=WhatsApp,Threema",
-            "networks registered=Signal off=WhatsApp on=WhatsApp,Threema",
+            "networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema",
+            "networks registered=Signal,Threema off=WhatsApp on=WhatsApp,Threema",
         ] {
             let err =
                 check_release_networks(&program(answer), &scratch.0, limit).expect_err(answer);
@@ -4426,7 +4456,7 @@ Version References:
         }
         let failing = script(
             &scratch,
-            "echo 'networks registered=Signal off= on=WhatsApp,Threema'; exit 3",
+            "echo 'networks registered=Signal,Threema off= on=WhatsApp,Threema'; exit 3",
         );
         assert!(check_release_networks(&failing, &scratch.0, limit).is_err());
         assert!(check_release_networks(&scratch.0.join("missing"), &scratch.0, limit).is_err());
@@ -4704,8 +4734,8 @@ Version References:
         false
     }
 
-    /// What a release build says to `--print-networks` on a profile that turns WhatsApp and Threema on.
-    const RELEASE_NETWORKS: &str = "networks registered=Signal off= on=WhatsApp,Threema";
+    /// What a release build says to `--print-networks` on a profile that turns WhatsApp on.
+    const RELEASE_NETWORKS: &str = "networks registered=Signal,Threema off= on=WhatsApp,Threema";
 
     /// The program of a fake release: refuses `--fixture` like a build without the test
     /// network, answers `--print-networks` like a release build, else runs `body`.
@@ -4922,8 +4952,8 @@ Version References:
         // A binary that registers WhatsApp, or lists it as off, on a profile that turned it on (what a
         // debug build does) is refused: the archive could link a real account.
         for answer in [
-            "networks registered=Signal,WhatsApp off= on=WhatsApp,Threema",
-            "networks registered=Signal off=WhatsApp on=WhatsApp,Threema",
+            "networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema",
+            "networks registered=Signal,Threema off=WhatsApp on=WhatsApp,Threema",
         ] {
             let err = check_fake(&scratch, "echo 'Kourier 0.1.0'", "r\n", &["uk"], &|stage| {
                 std::fs::write(
@@ -5339,7 +5369,7 @@ Version References:
         assert!(features.contains("--no-default-features"), "{features}");
         assert_eq!(BUILD_FEATURE_ARGS[1], "--features");
         // The WhatsApp backend is compiled in (W2b) and, being a release build, not registered.
-        assert_eq!(BUILD_FEATURE_ARGS[2], "signal,whatsapp");
+        assert_eq!(BUILD_FEATURE_ARGS[2], "signal,whatsapp,threema");
         let manifest =
             std::fs::read_to_string(root().join("crates/kourier/Cargo.toml")).expect("manifest");
         assert!(manifest.lines().any(|l| l.starts_with("signal = ")));

@@ -388,6 +388,8 @@ mod tests {
             network,
             network_name: String::new(),
             network_icon: String::new(),
+            tint: String::new(),
+            own_tint: String::new(),
             status: AccountStatus::Online,
             status_label: String::new(),
             unread: 0,
@@ -398,6 +400,8 @@ mod tests {
             device: String::new(),
             shown: true,
             place: 0,
+            roaming_writes: None,
+            roaming_note: String::new(),
         }
     }
 

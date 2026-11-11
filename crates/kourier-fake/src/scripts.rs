@@ -214,6 +214,7 @@ pub fn signal_features(group: bool) -> ConversationFeatures {
         cannot_send: None,
         // Listed: the fake states the roaming fact only when N4 plays an unlisted chat.
         roaming_listed: None,
+        invite_link_on: false,
     }
 }
 

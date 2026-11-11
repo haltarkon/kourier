@@ -70,8 +70,9 @@ use whatsapp_rust::{
 };
 
 use super::{
-    AskFailure, Devices, Groups, Hooks, Outgoing, PairCodeFailure, ReadKind, Receive, Released,
-    SendFailure, Session, SessionFactory, Stanzas, UploadFailure, Uploaded, Wiring,
+    AskFailure, Devices, DownloadFailure, Groups, Hooks, Outgoing, PairCodeFailure, PictureAnswer,
+    ReadKind, Receive, Released, SendFailure, Session, SessionFactory, Stanzas, UploadFailure,
+    Uploaded, Wiring,
 };
 use crate::NetParts;
 use crate::appstate::{Activity, ResyncReport};
@@ -1001,6 +1002,70 @@ impl Session for RealSession {
         }
     }
 
+    async fn download(
+        &self,
+        params: whatsapp_rust::download::DownloadParams,
+        sink: crate::download::BlobSink,
+    ) -> Result<crate::download::BlobSink, DownloadFailure> {
+        let Some(client) = self.client() else {
+            return Err(DownloadFailure::NoClient);
+        };
+        match self
+            .on_runtime_or_abort(async move { client.download_to_writer(&params, sink).await })
+            .await
+        {
+            Some(Ok(sink)) => Ok(sink),
+            Some(Err(error)) => Err(download_failure(&error)),
+            None => Err(DownloadFailure::NoClient),
+        }
+    }
+
+    async fn profile_picture(
+        &self,
+        chat: Jid,
+        group: bool,
+        known: Option<String>,
+    ) -> Result<PictureAnswer, AskFailure> {
+        use whatsapp_rust::{
+            ContactError, ProfilePictureLookup, ProfilePictureRequest, ProfilePictureTarget,
+            ProfilePictureType,
+        };
+
+        let Some(client) = self.client() else {
+            return Err(AskFailure::NoClient);
+        };
+        let done = self
+            .on_runtime_or_abort(async move {
+                let target = if group {
+                    ProfilePictureTarget::Group(&chat)
+                } else {
+                    ProfilePictureTarget::Contact(&chat)
+                };
+                let request = ProfilePictureRequest::new(target, ProfilePictureType::Preview)
+                    .existing_id(known.as_deref());
+                let picture = match client.pictures().lookup(request).await {
+                    Ok(ProfilePictureLookup::Found(picture)) => picture,
+                    Ok(ProfilePictureLookup::Unchanged) => return Ok(PictureAnswer::Unchanged),
+                    Ok(ProfilePictureLookup::NotFound | ProfilePictureLookup::NotAuthorized) => {
+                        return Ok(PictureAnswer::None);
+                    }
+                    Ok(_) => return Ok(PictureAnswer::Unchanged),
+                    Err(ContactError::Iq(error)) => return Err(iq_ask_failure(&error)),
+                    Err(_) => return Err(AskFailure::Internal),
+                };
+                let request = wacore::net::HttpRequest::get(picture.url);
+                match client.http_client().execute(request).await {
+                    Ok(response) if response.status_code == 200 => Ok(PictureAnswer::Found {
+                        id: picture.id,
+                        bytes: response.body,
+                    }),
+                    _ => Err(AskFailure::Timeout),
+                }
+            })
+            .await;
+        done.unwrap_or(Err(AskFailure::NoClient))
+    }
+
     async fn mark_read(
         &self,
         chat: Jid,
@@ -1139,6 +1204,20 @@ impl Session for RealSession {
             .await;
         match answer {
             Some(Ok(results)) => Ok(results),
+            Some(Err(error)) => Err(group_ask_failure(&error)),
+            None => Err(AskFailure::NoClient),
+        }
+    }
+
+    async fn group_invite_link(&self, group: Jid, reset: bool) -> Result<String, AskFailure> {
+        let Some(client) = self.client() else {
+            return Err(AskFailure::NoClient);
+        };
+        let answer = self
+            .on_runtime(async move { client.groups().get_invite_link(group, reset).await })
+            .await;
+        match answer {
+            Some(Ok(link)) => Ok(link),
             Some(Err(error)) => Err(group_ask_failure(&error)),
             None => Err(AskFailure::NoClient),
         }
@@ -1307,6 +1386,20 @@ fn anyhow_failure(error: &anyhow::Error) -> SendFailure {
 /// What a failed upload is, by upstream's TYPED error chain: the HTTP status the media server answered
 /// (`ErrorChainExt::http_status`), else nothing finished. The chain is never formatted: it carries the CDN's answer
 /// body and can carry the URL with its `auth`.
+/// What a failed download is, by upstream's typed error alone.
+pub(crate) fn download_failure(
+    error: &whatsapp_rust::download::ClientDownloadError,
+) -> DownloadFailure {
+    use whatsapp_rust::download::ClientDownloadError as E;
+    match error {
+        E::ReferenceRejected(_) => DownloadFailure::Gone,
+        E::WriterIo(_) => DownloadFailure::Sink,
+        E::Preparation(_) => DownloadFailure::Invalid,
+        E::WriterCleanup { failure, .. } => download_failure(failure),
+        _ => DownloadFailure::Unreachable,
+    }
+}
+
 pub(crate) fn upload_failure(error: &anyhow::Error) -> UploadFailure {
     let chain: &(dyn std::error::Error + Send + Sync + 'static) = error.as_ref();
     match chain.http_status() {

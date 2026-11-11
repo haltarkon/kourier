@@ -118,6 +118,7 @@ fn a_real_start_gets_exactly_this_environment() {
         ("KOURIER_DEV_NO_DUMP", "1"),
         ("KOURIER_DEV_QR_URL", "0"),
         ("KOURIER_DESKTOP", "0"),
+        ("KOURIER_THREEMA_RUN", "1"),
         (
             "KOURIER_LOG",
             "info,kourier_threema=info,kourier_core=info,kourier_app=info",
@@ -166,6 +167,7 @@ fn the_rehearsals_environment_adds_the_fake_offscreen_and_silence() {
         ("KOURIER_DEV_NO_DUMP", "1"),
         ("KOURIER_DEV_QR_URL", "0"),
         ("KOURIER_DESKTOP", "0"),
+        ("KOURIER_THREEMA_RUN", "1"),
         (
             "KOURIER_LOG",
             "info,kourier_threema=info,kourier_core=info,kourier_app=info",
@@ -222,7 +224,7 @@ fn what_the_start_says_of_the_app_names_variables_and_no_values_or_paths() {
 /// every inherited one is out; only a rehearsal carries the fake's switch; it is offscreen and
 /// silent in a real run too.
 #[test]
-fn the_probe_carries_the_profile_and_no_other_kourier_variable() {
+fn the_probe_carries_the_profile_the_marker_and_no_other_kourier_variable() {
     for rehearsal in [false, true] {
         let dir = fake_dir(rehearsal);
         let cmd = probe_command(&dir.copy_file(), &dir, rehearsal, &inherited());
@@ -237,9 +239,13 @@ fn the_probe_carries_the_profile_and_no_other_kourier_variable() {
         assert_eq!(
             kourier,
             if rehearsal {
-                vec!["KOURIER_DEV_REHEARSAL", "KOURIER_HOME"]
+                vec![
+                    "KOURIER_DEV_REHEARSAL",
+                    "KOURIER_HOME",
+                    "KOURIER_THREEMA_RUN",
+                ]
             } else {
-                vec!["KOURIER_HOME"]
+                vec!["KOURIER_HOME", "KOURIER_THREEMA_RUN"]
             }
         );
         for gone in [

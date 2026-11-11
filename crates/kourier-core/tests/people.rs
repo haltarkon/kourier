@@ -278,6 +278,61 @@ fn a_person_comes_with_their_contact_their_chat_and_the_aliases_resolve() {
     assert!(!nobody.is_self);
 }
 
+/// The copy actions of a chat row and of an account find their person: the peer of a direct
+/// chat, the account's own id; a group stands for nobody, and neither does what is gone.
+#[test]
+fn a_chat_and_an_account_stand_for_their_person() {
+    use MemberRole::Member as M;
+    use kourier_core::facade::PersonRef;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut h = harness(&dir);
+    h.apply(vec![BackendEvent::ConversationUpsert(
+        ConversationPatch::new(ConvKey::Direct(uid(ALICE))),
+    )])
+    .expect("chat");
+    group(&mut h, "g1", "Fishers", &[(ME, M), (ALICE, M)], false);
+    let chats: Vec<(i64, String)> = h
+        .connection()
+        .prepare("SELECT id, kind FROM conversations")
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("rows")
+        .map(|r| r.expect("row"))
+        .collect();
+    let id_of = |direct: bool| {
+        chats
+            .iter()
+            .find(|(_, k)| (k.as_str() == "Direct") == direct)
+            .map(|(i, _)| kourier_model::ConversationId(*i))
+            .expect("the chat")
+    };
+    let account = h.account();
+    assert_eq!(
+        h.person_of(PersonRef::Chat(id_of(true))).expect("query"),
+        Some((account, uid(ALICE)))
+    );
+    assert_eq!(
+        h.person_of(PersonRef::Chat(id_of(false))).expect("query"),
+        None,
+        "a group has no person"
+    );
+    assert_eq!(
+        h.person_of(PersonRef::Own(account)).expect("query"),
+        Some((account, uid(ME)))
+    );
+    assert_eq!(
+        h.person_of(PersonRef::Own(AccountId(99))).expect("query"),
+        None,
+        "no such account"
+    );
+    assert_eq!(
+        h.person_of(PersonRef::Chat(kourier_model::ConversationId(99)))
+            .expect("query"),
+        None,
+        "no such chat"
+    );
+}
+
 /// The page of a person says whether their 1:1 chat was deleted from the list (the row stays, as
 /// the state of a deleted chat): the timer of a member's page must not bring it back.
 #[test]
@@ -511,7 +566,7 @@ fn signal_like(seen: &std::cell::RefCell<Vec<String>>) -> impl FnOnce(&str) -> O
 
 fn link_of(d: &PersonDetail, links: bool) -> (LinkState, usize) {
     let seen = std::cell::RefCell::new(Vec::new());
-    let state = LinkState::of(d, links, signal_like(&seen));
+    let state = LinkState::of(d, links, None, signal_like(&seen));
     let handed = seen.borrow().len();
     (state, handed)
 }
@@ -521,8 +576,8 @@ const NUMBER: &str = "+15550001111";
 /// Critic F20 / call 1: a number the page may not show makes no link and never reaches the
 /// network: "does not share" only when the network said so (`Some(false)`), the "Kourier does
 /// not know" state when it never said (`None`, a profile not fetched yet) or when no number is
-/// known; a number-only id links its own number; the own page and a network without links hide
-/// the button.
+/// known; a number-only id links its own number; a network without links hides the button; the
+/// own page links the account's own number.
 #[test]
 fn a_hidden_number_gives_no_link() {
     let (s, handed) = link_of(&link_detail(ALICE, Some(false), Some(NUMBER)), true);
@@ -545,12 +600,29 @@ fn a_hidden_number_gives_no_link() {
     assert_eq!(s, LinkState::NoNumber, "shared, but no number known");
     let (s, _) = link_of(&link_detail(ALICE, Some(true), Some("15550001111")), true);
     assert_eq!(s, LinkState::NoNumber, "not a number the network links");
-    let mut own = link_detail(ALICE, Some(true), Some(NUMBER));
+    let mut own = link_detail(ALICE, None, None);
     own.is_self = true;
     assert_eq!(
         link_of(&own, true).0,
         LinkState::Hidden,
-        "no Copy Link on the own page (BQ-4)"
+        "the own page of an account whose number is not known has no link"
+    );
+    own.own_number = Some(NUMBER.to_owned());
+    assert_eq!(
+        link_of(&own, true).0,
+        LinkState::Link(Redacted::new(format!("https://signal.me/#p/{NUMBER}"))),
+        "the own page links the account's own number"
+    );
+    let by_id = LinkState::of(
+        &link_detail(ALICE, Some(false), None),
+        true,
+        Some("https://threema.id/ABCD1234".to_owned()),
+        |_| panic!("a network that links by id takes no number"),
+    );
+    assert_eq!(
+        by_id,
+        LinkState::Link(Redacted::new("https://threema.id/ABCD1234".to_owned())),
+        "a link by id needs no number, shown or not"
     );
     assert_eq!(
         link_of(&link_detail(ALICE, Some(true), Some(NUMBER)), false).0,

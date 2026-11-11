@@ -158,6 +158,15 @@ fn a_second_process_on_a_profile_is_refused_and_changes_nothing() {
     assert!(wait_exit(&mut again).success());
 }
 
+/// A list of `--print-networks` without Threema, which is on by default in every build (the
+/// user's decision of 2026-11-09) and has its own test.
+fn without_threema(kinds: Vec<&str>) -> Vec<&str> {
+    kinds
+        .into_iter()
+        .filter(|kind| *kind != "Threema")
+        .collect()
+}
+
 /// `kourier --print-networks` (hidden; `cargo xtask dist` runs it on the packed RELEASE binary): the
 /// real debug binary says which networks a start of the profile would register and which it would
 /// list as off, from `kourier.toml` of the profile: with WhatsApp switched on it registers it, else
@@ -238,8 +247,9 @@ fn print_networks_says_what_a_start_would_register_and_starts_nothing() {
             "{name}: {line:?}"
         );
         assert!(!list("off").contains(&"Telegram"), "{name}: {line:?}");
+        // Threema is on by default (the user's decision of 2026-11-09) and has its own test.
         assert_eq!(
-            list("on"),
+            without_threema(list("on")),
             switched.into_iter().collect::<Vec<_>>(),
             "{name}"
         );
@@ -343,7 +353,11 @@ fn print_networks_registers_the_telegram_rehearsal_without_an_api_pair_and_start
                 "{name}: {line:?}"
             );
             assert!(!list("off").contains(&"Telegram"), "{name}: {line:?}");
-            assert_eq!(list("on"), ["Telegram"], "{name}: {line:?}");
+            assert_eq!(
+                without_threema(list("on")),
+                ["Telegram"],
+                "{name}: {line:?}"
+            );
         }
         // Nothing was started on the profile: the only thing below it is the file written above.
         let mut files = Vec::new();
@@ -362,24 +376,66 @@ fn print_networks_registers_the_telegram_rehearsal_without_an_api_pair_and_start
     }
 }
 
-/// The Threema twin of `print_networks_says_what_a_start_would_register_and_starts_nothing` (TH1,
-/// lane decision Q2; review F8: the same form): the real debug binary registers Threema while
-/// `networks-on` names it and, while it is off, lists it NOWHERE in a plain profile (TH4 decision E1:
-/// the backend can link, but only a PREPARED run profile, a kept profile with a list of test IDs,
-/// shows Threema as off; a plain debug start keeps it absent). The third case is that prepared
-/// profile, made the way the binary looks for it (`HOME`, no `XDG_DATA_HOME`): there Threema is
-/// listed as off and registered nowhere. Run as the dist check runs it, with a deadline; its stderr
-/// is part of a failure; nothing is made on the profile except the file written here, whatever the
-/// directory.
+/// The Threema twin of `print_networks_says_what_a_start_would_register_and_starts_nothing`, after
+/// the user's decision of 2026-11-09 ("enable Threema by default globally", "Any ID, every build").
+/// A NORMAL start registers Threema with nothing in the file, also in a prepared run profile (the
+/// test build's profile on another computer lives there: its list is not read), and lists it as
+/// off once the user turned it off (`networks-off`). A start by the RUN TOOL
+/// (`KOURIER_THREEMA_RUN`) keeps TH1 / lane decision Q2 and TH4 decision E1: registered only while
+/// `networks-on` names it, and while it is off listed nowhere in a plain profile and as off only in
+/// a prepared run profile (a kept profile with a list of test IDs, made the way the binary looks
+/// for it: `HOME`, no `XDG_DATA_HOME`). Run as the dist check runs it, with a deadline; its stderr
+/// is part of a failure; nothing is made on the profile except the files written here, whatever
+/// the directory. Mutants: the defaults dropped from `start_prefs` -> `default`; `networks-off`
+/// not read -> `turned-off`; the run tool not told apart -> `run-tool-off`; the marker
+/// (`threema-run/` in the profile) not judged -> `marked-profile*`.
 #[test]
 fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
-    for (name, on, prepared) in [
-        ("threema-off", false, false),
-        ("threema-on", true, false),
-        ("threema-prepared", false, true),
-    ] {
+    const OFF: &str = "networks-off = [\"threema\"]\n";
+    const ON: &str = "networks-on = [\"threema\"]\n";
+    // (name, run tool, preferences, prepared, run tool's directory in the profile, registered,
+    // listed as off)
+    let cases = [
+        ("default", false, None, false, false, true, false),
+        ("turned-off", false, Some(OFF), false, false, false, true),
+        ("prepared-normal", false, None, true, false, true, false),
+        ("run-tool-off", true, None, false, false, false, false),
+        ("run-tool-on", true, Some(ON), false, false, true, false),
+        ("run-tool-prepared", true, None, true, false, false, true),
+        // A profile that holds the run tool's `threema-run/` outside the tool: Threema neither
+        // registered nor listed, whatever `networks-on` says (the tool's own start keeps its table).
+        ("marked-profile", false, None, false, true, false, false),
+        (
+            "marked-profile-on",
+            false,
+            Some(ON),
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "marked-profile-off",
+            false,
+            Some(OFF),
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "marked-run-tool-on",
+            true,
+            Some(ON),
+            false,
+            true,
+            true,
+            false,
+        ),
+    ];
+    for (name, run_tool, text, prepared, marked, registered, off) in cases {
         // A kept run profile must be canonical: the scratch directory may sit below a link.
-        let dir = std::fs::canonicalize(scratch(&format!("print-networks-{name}")))
+        let dir = std::fs::canonicalize(scratch(&format!("print-networks-threema-{name}")))
             .expect("canonical scratch dir");
         let keeper = dir.join(".local/share/kourier-threema-run");
         let home = if prepared {
@@ -401,21 +457,26 @@ fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
             std::fs::set_permissions(&ids_file, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod the list");
         }
-        if on {
-            std::fs::create_dir_all(prefs.parent().expect("config dir")).expect("create");
-            std::fs::write(&prefs, "networks-on = [\"threema\"]\n").expect("write prefs");
+        if marked {
+            std::fs::create_dir_all(home.join("threema-run")).expect("the run tool's directory");
         }
-        let mut child = Command::new(env!("CARGO_BIN_EXE_kourier"))
-            .arg("--print-networks")
+        if let Some(text) = text {
+            std::fs::create_dir_all(prefs.parent().expect("config dir")).expect("create");
+            std::fs::write(&prefs, text).expect("write prefs");
+        }
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kourier"));
+        cmd.arg("--print-networks")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &dir)
             .env("KOURIER_HOME", &home)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start kourier");
+            .stderr(Stdio::piped());
+        if run_tool {
+            cmd.env("KOURIER_THREEMA_RUN", "1");
+        }
+        let mut child = cmd.spawn().expect("start kourier");
         let status = wait_exit(&mut child);
         let (mut out, mut err) = (String::new(), String::new());
         child
@@ -445,28 +506,35 @@ fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
         let built = cfg!(feature = "threema");
         assert_eq!(
             list("registered").contains(&"Threema"),
-            built && on,
+            built && registered,
             "{name}: {line:?}"
         );
-        // E1: listed as off only in the prepared run profile (and registered only while on).
         assert_eq!(
             list("off").contains(&"Threema"),
-            built && prepared,
+            built && off,
             "{name}: {line:?}"
         );
+        // The switch as this start reads it: on by default outside the run tool, `networks-on`
+        // alone for the run tool.
+        let on = if run_tool || marked {
+            text == Some(ON)
+        } else {
+            text != Some(OFF)
+        };
         assert_eq!(
             list("on"),
             if on { vec!["Threema"] } else { vec![] },
-            "{name}"
+            "{name}: {line:?}"
         );
         assert_eq!(
             list("registered").contains(&"Signal"),
             cfg!(feature = "signal"),
             "{name}: {line:?}"
         );
-        // Nothing was started on the profile: the only thing below it is the file written above.
-        if on {
-            let mut files = Vec::new();
+        // Nothing was started on the profile: below it only the preferences written here, the list
+        // untouched and still the only file of the keeper root beside the profile.
+        let mut files = Vec::new();
+        if home.exists() {
             let mut walk = vec![home.clone()];
             while let Some(d) = walk.pop() {
                 for e in std::fs::read_dir(&d).expect("read_dir") {
@@ -478,17 +546,21 @@ fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
                     }
                 }
             }
-            assert_eq!(files, std::slice::from_ref(&prefs), "{name}: {files:?}");
+        } else {
+            assert!(!prepared, "{name}: the run profile went");
+        }
+        let expected: Vec<_> = text.iter().map(|_| prefs.clone()).collect();
+        assert_eq!(files, expected, "{name}: {files:?}");
+        if let Some(text) = text {
             assert_eq!(
                 std::fs::read_to_string(&prefs).expect("prefs"),
-                "networks-on = [\"threema\"]\n",
+                text,
                 "{name}: the preferences were not touched"
             );
-        } else if prepared {
-            // The profile is there (made above) and nothing was written below it; the list is
-            // still what was written, and still the only file of the keeper root.
-            let below: Vec<_> = std::fs::read_dir(&home).expect("read_dir").collect();
-            assert!(below.is_empty(), "{name}: the profile was written to");
+        } else if !prepared && !marked {
+            assert!(!home.exists(), "{name}: the profile was made");
+        }
+        if prepared {
             assert_eq!(
                 std::fs::read_to_string(&ids_file).expect("list"),
                 ids_text,
@@ -500,8 +572,6 @@ fn print_networks_registers_threema_only_when_switched_on_and_starts_nothing() {
                 .collect();
             kept.sort();
             assert_eq!(kept, ["p", "threema-allowed-ids"], "{name}: {kept:?}");
-        } else {
-            assert!(!home.exists(), "{name}: the profile was made");
         }
     }
 }

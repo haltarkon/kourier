@@ -214,6 +214,42 @@ pub(crate) enum UploadFailure {
     Incomplete,
 }
 
+/// What a lookup of a profile picture gave (W8). Its `Debug` holds no URL and no bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PictureAnswer {
+    /// The chat has this picture: the server's id of it and the bytes of its small preview.
+    Found { id: String, bytes: Vec<u8> },
+    /// Still the picture of the id that was named.
+    Unchanged,
+    /// No picture, or its owner's privacy hides it from this account.
+    None,
+}
+
+impl std::fmt::Debug for PictureAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found { bytes, .. } => write!(f, "Found({} bytes)", bytes.len()),
+            Self::Unchanged => f.write_str("Unchanged"),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
+/// Why a file did not download (W7), by upstream's typed error (never its text: a cause may hold a signed URL). Log-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadFailure {
+    /// No client runs (not started, stopped, or replaced while the download ran).
+    NoClient,
+    /// The media servers no longer have the file under this reference, after a fresh `media_conn`.
+    Gone,
+    /// No host gave a file that verified, or no route could be had: worth trying again.
+    Unreachable,
+    /// The destination could not be written (a full disk, a file larger than it said).
+    Sink,
+    /// The pointer cannot be made a request.
+    Invalid,
+}
+
 /// Why a read of the groups or of the blocklist got no answer, read from upstream's typed error BY POSITION (L5: a
 /// `GroupError` or `BlockingError` carries the server's text and the whole rejection stanza, so it is never formatted).
 /// Log-safe.
@@ -338,6 +374,23 @@ pub(crate) trait Session: Send + Sync {
         shape: Shape,
     ) -> Result<Uploaded, UploadFailure>;
 
+    /// Fetches, verifies and decrypts the file `params` names into `sink` (W7): upstream's `download_to_writer`, with
+    /// its host failover and its one fresh `media_conn` after a rejection. Dropping the future aborts the download's task.
+    async fn download(
+        &self,
+        params: whatsapp_rust::download::DownloadParams,
+        sink: crate::download::BlobSink,
+    ) -> Result<crate::download::BlobSink, DownloadFailure>;
+
+    /// Looks up the small preview of the picture of `chat` (a person, or a group when `group`), naming the id of the one
+    /// already held (W8): one IQ, and a GET of the picture when it is a new one.
+    async fn profile_picture(
+        &self,
+        chat: wacore_binary::Jid,
+        group: bool,
+        known: Option<String>,
+    ) -> Result<PictureAnswer, AskFailure>;
+
     /// Sends a `read` or `played` receipt for `ids` in `chat` (`sender`: the author in a group).
     async fn mark_read(
         &self,
@@ -390,6 +443,14 @@ pub(crate) trait Session: Send + Sync {
         &self,
         group: wacore_binary::Jid,
     ) -> Result<GroupMetadataResult, AskFailure>;
+
+    /// The invite link of a group, whole (`https://chat.whatsapp.com/<code>`); `reset` replaces
+    /// it by a new one first. The server answers an administrator only. The link is never a log field.
+    async fn group_invite_link(
+        &self,
+        group: wacore_binary::Jid,
+        reset: bool,
+    ) -> Result<String, AskFailure>;
 
     /// The phone's blocklist (W6a2 D22): ONE IQ, the people it names in the namespace it wrote them (a number or a LID).
     async fn blocklist(&self) -> Result<Vec<wacore_binary::Jid>, AskFailure>;

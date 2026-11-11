@@ -476,6 +476,40 @@ impl Rig {
         took
     }
 
+    /// Asks for a file (W7) and waits for its durable answer.
+    pub(crate) async fn download(
+        &self,
+        remote: kourier_model::BackendBlob,
+        dest: kourier_backend_api::BlobTarget,
+    ) -> Result<kourier_model::AttachmentMeta, kourier_model::BackendError> {
+        self.actor
+            .send(Command::DownloadAttachment {
+                attachment: kourier_model::AttachmentId(7),
+                request: kourier_model::DownloadId(70),
+                remote,
+                dest,
+                net_ids: Vec::new().into(),
+            })
+            .await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let answer = self
+                .events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find_map(|event| match event {
+                    BackendEvent::AttachmentDone { result, .. } => Some(result.clone()),
+                    _ => None,
+                });
+            if let Some(answer) = answer {
+                return answer;
+            }
+            assert!(Instant::now() < deadline, "the download was never answered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The end: the actor shuts down, the core's side stops.
     pub(crate) async fn finish(mut self) {
         self.actor.send(Command::Shutdown).await;

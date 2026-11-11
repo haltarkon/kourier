@@ -18,6 +18,32 @@ QQC2.ItemDelegate {
     required property var member
     // The word on an administrator's row.
     property string adminLabel: ""
+    // The account the group is of: the row's menu copies the member's number or link.
+    property real account: 0
+
+    // The menu of the row, made when it is asked for (a big group has many rows).
+    function openMenu(x: real, y: real): void {
+        const menu = menuComponent.createObject(root) as QQC2.Menu;
+        menu?.closed.connect(menu.destroy);
+        menu?.popup(root, x, y);
+    }
+
+    Keys.onMenuPressed: root.openMenu(Kirigami.Units.gridUnit * 2, root.height)
+
+    TapHandler {
+        acceptedButtons: Qt.RightButton
+        onTapped: point => root.openMenu(point.position.x, point.position.y)
+    }
+
+    Component {
+        id: menuComponent
+
+        PersonCopyMenu {
+            account: root.account
+            user: root.member.user
+            name: root.member.name
+        }
+    }
 
     Accessible.name: Style.unmarked(root.member.name)
     Accessible.description: root.member.admin ? root.adminLabel : ""

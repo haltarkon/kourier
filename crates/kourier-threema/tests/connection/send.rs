@@ -26,8 +26,8 @@ use kourier_db::ZoneDb;
 use kourier_db::rusqlite::types::ValueRef;
 use kourier_db::rusqlite::{Connection, params};
 use kourier_model::{
-    BackendError, Body, CannotSend, CmdId, ConnState, ConvKey, ErrorKind, MsgTarget,
-    RecipientState, TargetAuthor, UserId,
+    BackendError, Body, CmdId, ConnState, ConvKey, ErrorKind, MsgTarget, RecipientState,
+    TargetAuthor, UserId,
 };
 use kourier_threema::StoreError;
 use kourier_threema::failpoints as fp;
@@ -3873,7 +3873,7 @@ async fn contract_a_text_goes_at_once_and_is_answered_sent_when_its_row_is_done_
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_301).with_peer(ANN).send_open();
+    let s = scene(7_301).with_peer(ANN);
     let _phone = phone_of(&s);
     let mut h = harness::start(s);
     h.advance_idle(1_234).await;
@@ -3921,7 +3921,7 @@ async fn contract_a_second_transmit_writes_no_frame_and_gets_the_same_answer_chi
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_302).with_peer(ANN).send_open();
+    let s = scene(7_302).with_peer(ANN);
     let mut h = harness::start(s);
     connect(&mut h).await;
     let expected = sent_at(Some(START_MS), &[ANN]);
@@ -3965,8 +3965,7 @@ async fn contract_a_done_row_with_an_invalid_and_a_no_key_receiver_is_partial_ch
     }
     let mut s = scene(7_303)
         .with_members(CRE, GROUP, &[ANN, BOB, DEE])
-        .with_settings(block(&[BOB]))
-        .send_open();
+        .with_settings(block(&[BOB]));
     s.members
         .get_mut(&(CRE.to_owned(), GROUP))
         .expect("the group")
@@ -4018,8 +4017,7 @@ async fn contract_a_notes_group_and_a_blocked_contact_are_sent_to_an_empty_list_
     let s = scene(7_304)
         .with_members(ME, GROUP, &[])
         .with_peer(ANN)
-        .with_settings(block(&[ANN]))
-        .send_open();
+        .with_settings(block(&[ANN]));
     let mut h = harness::start(s);
     connect(&mut h).await;
     let notes = answered(h.transmit(request(&group(ME, GROUP), LOCAL, None)).await).await;
@@ -4049,9 +4047,7 @@ async fn contract_a_lost_socket_with_some_acked_and_some_pending_is_partial_chil
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_305)
-        .with_members(CRE, GROUP, &[ANN, BOB])
-        .send_open();
+    let s = scene(7_305).with_members(CRE, GROUP, &[ANN, BOB]);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(BOB));
     let mut h = harness::start(s);
@@ -4133,7 +4129,7 @@ async fn contract_no_ack_with_none_acked_is_failed_transient_at_the_deadline_chi
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_306).with_peer(ANN).send_open();
+    let s = scene(7_306).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(ANN));
     let mut h = harness::start(s);
@@ -4179,7 +4175,7 @@ async fn contract_an_acked_row_is_answered_transient_and_finishes_by_itself_chil
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_307).with_peer(ANN).send_open();
+    let s = scene(7_307).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(ANN));
     let mut h = harness::start(s);
@@ -4229,9 +4225,7 @@ async fn contract_no_ack_with_some_acked_is_partial_and_on_an_acked_row_transien
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_322)
-        .with_members(CRE, GROUP, &[ANN, BOB])
-        .send_open();
+    let s = scene(7_322).with_members(CRE, GROUP, &[ANN, BOB]);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(BOB));
     let mut h = harness::start(s);
@@ -4279,7 +4273,7 @@ async fn contract_a_lost_socket_with_none_acked_is_failed_transient_for_every_at
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_323).with_peer(ANN).with_peer(BOB).send_open();
+    let s = scene(7_323).with_peer(ANN).with_peer(BOB);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(ANN));
     let mut h = harness::start(s);
@@ -4320,7 +4314,7 @@ async fn contract_a_reflected_zone_the_store_fails_is_failed_transient_child() {
         return;
     }
     store::fail_send_zone(fp::INSIDE_SEND_REFLECTED, FULL);
-    let s = scene(7_324).with_peer(ANN).send_open();
+    let s = scene(7_324).with_peer(ANN);
     let mut h = harness::start(s);
     connect(&mut h).await;
     let conn = h.conn();
@@ -4355,7 +4349,7 @@ async fn contract_a_transmit_goes_at_syncing_before_dry_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_325).with_peer(ANN).send_open();
+    let s = scene(7_325).with_peer(ANN);
     s.world.mediator().knobs(|k| k.hold_dry = true);
     let mut h = harness::start(s);
     h.send(Command::Connect).await;
@@ -4381,7 +4375,7 @@ async fn contract_with_no_socket_a_transmit_is_transient_and_writes_nothing_chil
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_308).with_peer(ANN).send_open();
+    let s = scene(7_308).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(ANN));
     let mut h = harness::start(s);
@@ -4431,10 +4425,7 @@ async fn contract_what_is_refused_writes_nothing_and_says_why_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_309)
-        .with_peer(ANN)
-        .with_members(CRE, GROUP, &[ANN])
-        .send_open();
+    let s = scene(7_309).with_peer(ANN).with_members(CRE, GROUP, &[ANN]);
     let mut h = harness::start(s);
     bend_group(&h.db(), CRE, GROUP, |g| {
         g.user_state = Some(d2d_sync::group::UserState::Left as i32);
@@ -4573,7 +4564,7 @@ async fn contract_the_same_local_in_another_chat_is_internal_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_310).with_peer(ANN).with_peer(BOB).send_open();
+    let s = scene(7_310).with_peer(ANN).with_peer(BOB);
     let h = harness::start(s);
     store::prepare_outgoing(&h.db(), &text_to(contact(ANN), TEXT), NOW, &[]).expect("the row");
     let outcome = answered(h.transmit(request(&contact(BOB), LOCAL, None)).await).await;
@@ -4593,7 +4584,7 @@ async fn contract_a_full_queue_waits_a_minute_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_311).with_peer(ANN).send_open();
+    let s = scene(7_311).with_peer(ANN);
     let mut h = harness::start(s);
     h.db()
         .zone(|tx| {
@@ -4640,7 +4631,7 @@ async fn contract_a_full_queue_makes_room_from_old_rows_and_never_takes_the_atta
         return;
     }
     const HOUR: i64 = 3_600_000;
-    let s = scene(7_313).with_peer(ANN).send_open();
+    let s = scene(7_313).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.withhold_reflect_acks = true);
     let mut h = harness::start(s);
@@ -4710,7 +4701,7 @@ async fn contract_a_done_zone_the_store_fails_is_never_answered_sent_child() {
         return;
     }
     store::fail_send_zone(fp::INSIDE_SEND_DONE, FULL);
-    let s = scene(7_312).with_peer(ANN).send_open();
+    let s = scene(7_312).with_peer(ANN);
     let m = s.world.mediator().clone();
     let mut h = harness::start(s);
     connect(&mut h).await;
@@ -4749,7 +4740,7 @@ async fn contract_a_done_zone_that_fails_by_content_cools_and_is_answered_child(
         return;
     }
     store::fail_send_zone(fp::INSIDE_SEND_DONE, CONSTRAINT_CHECK);
-    let s = scene(7_313).with_peer(ANN).send_open();
+    let s = scene(7_313).with_peer(ANN);
     let m = s.world.mediator().clone();
     let mut h = harness::start(s);
     connect(&mut h).await;
@@ -4790,7 +4781,7 @@ async fn contract_a_prepare_that_fails_says_whose_failure_it_was_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_314).with_peer(ANN).send_open();
+    let s = scene(7_314).with_peer(ANN);
     let mut h = harness::start(s);
     connect(&mut h).await;
     for (code, kind) in [(CONSTRAINT_CHECK, ErrorKind::Internal), (FULL, TRANSIENT)] {
@@ -4821,7 +4812,7 @@ async fn contract_a_transmit_of_a_cooling_row_writes_nothing_and_is_told_the_tim
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_315).with_peer(ANN).send_open();
+    let s = scene(7_315).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.close_on_box_to(ANN, REFUSED));
     let mut h = harness::start(s);
@@ -4877,9 +4868,7 @@ async fn contract_only_goes_to_those_it_names_and_answers_for_them_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_316)
-        .with_members(CRE, GROUP, &[ANN, BOB])
-        .send_open();
+    let s = scene(7_316).with_members(CRE, GROUP, &[ANN, BOB]);
     let m = s.world.mediator().clone();
     let mut h = harness::start(s);
     let to = group(CRE, GROUP);
@@ -4960,9 +4949,7 @@ async fn contract_only_with_no_ledger_row_prepares_for_those_alone_and_reaches_d
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_317)
-        .with_members(CRE, GROUP, &[ANN, BOB])
-        .send_open();
+    let s = scene(7_317).with_members(CRE, GROUP, &[ANN, BOB]);
     let mut phone = phone_of(&s);
     let mut h = harness::start(s);
     connect(&mut h).await;
@@ -5009,7 +4996,7 @@ async fn contract_a_second_transmit_while_one_waits_answers_the_older_transient_
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_318).with_peer(ANN).send_open();
+    let s = scene(7_318).with_peer(ANN);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.csp.withhold_message_ack_of(ANN));
     let mut h = harness::start(s);
@@ -5044,7 +5031,7 @@ async fn contract_a_queue_that_stopped_answers_what_waits_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_319).with_peer(ANN).send_open();
+    let s = scene(7_319).with_peer(ANN);
     let mut h = harness::start(s);
     {
         let db = h.db();
@@ -5073,48 +5060,18 @@ async fn contract_a_queue_that_stopped_answers_what_waits_child() {
     h.finish().await;
 }
 
-/// THE PLAIN PARTS on a live socket: a `Transmit` is `Failed(unsupported)`, nothing is written and no frame goes, however good the
-/// message (`network::the_actor_runs_offline` holds the same with no socket).
+/// A chat is stated as one that can be sent in: the core offers the composer and its files.
 #[test]
-fn contract_plain_parts_refuse_a_transmit_on_a_live_socket() {
-    support::offline::run_child(
-        module_path!(),
-        "contract_plain_parts_refuse_a_transmit_on_a_live_socket_child",
-    );
+fn contract_every_chat_can_be_sent_in() {
+    support::offline::run_child(module_path!(), "contract_every_chat_can_be_sent_in_child");
 }
 
 #[tokio::test]
-async fn contract_plain_parts_refuse_a_transmit_on_a_live_socket_child() {
+async fn contract_every_chat_can_be_sent_in_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_320).with_peer(ANN);
-    let mut h = harness::start(s);
-    connect(&mut h).await;
-    let outcome = answered(h.transmit(request(&contact(ANN), LOCAL, None)).await).await;
-    says(&outcome, &failed(ErrorKind::Unsupported), "plain parts");
-    h.sync().await;
-    assert_eq!(tasks(&h).len(), 0, "a row under plain parts");
-    assert_eq!(frames(&h), (0, 0, 0), "a frame under plain parts");
-    h.finish().await;
-}
-
-/// The door opens `Transmit` and nothing else: a chat stated behind it still cannot be sent in, so the core refuses a new send there
-/// as in a real build.
-#[test]
-fn contract_every_chat_says_not_yet_built_behind_the_door() {
-    support::offline::run_child(
-        module_path!(),
-        "contract_every_chat_says_not_yet_built_behind_the_door_child",
-    );
-}
-
-#[tokio::test]
-async fn contract_every_chat_says_not_yet_built_behind_the_door_child() {
-    if !support::offline::in_child() {
-        return;
-    }
-    let s = scene(7_321).send_open();
+    let s = scene(7_321);
     let mut phone = phone_of(&s);
     let mut h = harness::start(s);
     connect(&mut h).await;
@@ -5133,7 +5090,7 @@ async fn contract_every_chat_says_not_yet_built_behind_the_door_child() {
         })
         .collect();
     assert_eq!(features.len(), 1, "the contact's one chat");
-    assert_eq!(features[0].cannot_send, Some(CannotSend::NotYetBuilt));
+    assert_eq!(features[0].cannot_send, None);
     envelope.ack.expect("a durable envelope").complete(Ok(()));
     h.finish().await;
 }
@@ -5192,7 +5149,7 @@ async fn clear_takes_the_chats_unsent_rows_and_keeps_the_rest_child() {
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(7_330).with_peer(ANN).with_peer(BOB).send_open();
+    let s = scene(7_330).with_peer(ANN).with_peer(BOB);
     let m = s.world.mediator().clone();
     m.knobs(|k| k.withhold_reflect_acks = true);
     let mut h = harness::start(s);
@@ -5303,8 +5260,7 @@ async fn clear_with_no_time_takes_nothing_and_a_groups_rows_go_by_its_key_child(
     }
     let s = scene(7_331)
         .with_members(CRE, GROUP, &[ANN])
-        .with_members(CRE, GROUP + 1, &[ANN])
-        .send_open();
+        .with_members(CRE, GROUP + 1, &[ANN]);
     let mut h = harness::start(s);
     {
         let db = h.db();

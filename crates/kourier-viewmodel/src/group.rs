@@ -7,12 +7,14 @@ use kourier_core::facade::GroupDetail;
 use kourier_model::{
     AccountId, BlobRef, CannotSend, ConversationFeatures, ConversationId, MemberRole, UserId,
 };
+use kourier_model::{GroupInviteAction, GroupInvites, Redacted};
 
 use crate::conversations::{
     TimerOption, TimerSpan, full_member_count, members_line, timer_menu, timer_secs, timer_span,
 };
 use crate::i18n::{trc, trfc, trnc};
 use crate::names::{fallback_name, single_line};
+use crate::person::CopyUpdate;
 use crate::preview;
 
 /// How many members the page lists before "Show All" (Signal Desktop's 5).
@@ -97,6 +99,11 @@ pub struct GroupView {
     pub invited: String,
     /// "1 request to join"; empty when nobody asked.
     pub requests: String,
+    /// What the page may do with the invite link: "reset" (copy it, replace it), "switch" (also
+    /// turn it off and on), empty for nothing.
+    pub invites: String,
+    /// The invite link can be turned off and is on.
+    pub invite_on: bool,
     /// The word on an administrator's row ("Admin").
     pub admin_label: String,
     /// Every member and admin: the user first, then the admins, then the others, each by name.
@@ -367,12 +374,76 @@ pub fn group_view(detail: &GroupDetail, avatar: &dyn Fn(Option<&BlobRef>) -> Str
         } else {
             String::new()
         },
+        invites: match detail.invites {
+            GroupInvites::None => "",
+            GroupInvites::Reset => "reset",
+            GroupInvites::Switch => "switch",
+        }
+        .to_owned(),
+        invite_on: detail.features.invite_link_on,
         admin_label: trc("@info:status a group member who is an admin", "Admin").into_owned(),
         member_count: members.len(),
         members,
         members_preview,
         members_more,
         rules,
+    }
+}
+
+/// The answer to an action on a group's invite link: the link goes on the clipboard when the
+/// action was to copy it or to make a new one, the toast holds no link. `failed`: the network
+/// could not be asked or said no.
+pub fn invite_update(
+    action: GroupInviteAction,
+    failed: bool,
+    link: Option<Redacted<String>>,
+) -> CopyUpdate {
+    use GroupInviteAction::{Read, Reset, TurnOff, TurnOn};
+    if failed {
+        let told = match action {
+            Read => trc(
+                "@info:status toast, a group's invite link could not be read",
+                "The invite link could not be read. Try again when the account is connected.",
+            ),
+            Reset | TurnOn | TurnOff => trc(
+                "@info:status toast, a group's invite link could not be changed",
+                "The invite link could not be changed. Try again when the account is connected.",
+            ),
+        };
+        return CopyUpdate {
+            text: None,
+            told: told.into_owned(),
+        };
+    }
+    let told = match (action, link.is_some()) {
+        (Read, true) => trc(
+            "@info:status toast after Copy Invite Link",
+            "Invite link copied",
+        ),
+        (Read, false) => trc(
+            "@info:status toast, the group's invite link is off",
+            "The invite link is off",
+        ),
+        (Reset, true) => trc(
+            "@info:status toast after Reset Invite Link",
+            "New invite link copied",
+        ),
+        (Reset, false) => trc(
+            "@info:status toast after Reset Invite Link while it is off",
+            "The invite link was reset",
+        ),
+        (TurnOn, _) => trc(
+            "@info:status toast after Turn On Invite Link",
+            "The invite link is on",
+        ),
+        (TurnOff, _) => trc(
+            "@info:status toast after Turn Off Invite Link",
+            "The invite link is off",
+        ),
+    };
+    CopyUpdate {
+        text: link.filter(|_| matches!(action, Read | Reset)),
+        told: told.into_owned(),
     }
 }
 

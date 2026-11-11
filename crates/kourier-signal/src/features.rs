@@ -585,6 +585,7 @@ pub(crate) fn direct_features(
         // Signal states which chats the phone lists for its roaming settings with the roaming
         // writes (A10b); until then it says nothing, which reads as listed.
         roaming_listed: None,
+        invite_link_on: false,
     }
 }
 
@@ -618,6 +619,7 @@ pub(crate) fn group_features(
         announcements_only: s.announcements_only,
         terminated: s.terminated,
     });
+    features.invite_link_on = snapshot.is_some_and(|s| s.access.invite_link_on());
     let admin = snapshot
         .and_then(|s| s.member(account.aci))
         .is_some_and(|m| m.admin);

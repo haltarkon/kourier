@@ -21,7 +21,7 @@ use crate::threema_run::rehearse::{
     run_on_a_terminal, verdict_of,
 };
 use crate::threema_run::steps::StepTiming;
-use crate::threema_run::supervise::rehearsal_cue_ok;
+use crate::threema_run::supervise::{REHEARSAL_SEND_TEXT, rehearsal_cue_ok};
 
 // ---- The fake's constants ------------------------------------------------------------------------------
 
@@ -334,7 +334,13 @@ fn the_first_prompt_of_id_ends_in_the_words_the_walk_waits_for() {
 
 #[test]
 fn every_cue_is_one_the_supervisor_forwards_in_a_rehearsal_and_no_other_is() {
-    for cue in [Cue::Click, Cue::Arrive("direct"), Cue::Arrive("group")] {
+    for cue in [
+        Cue::Click,
+        Cue::Arrive("direct"),
+        Cue::Arrive("group"),
+        Cue::Send("direct"),
+        Cue::Send("group"),
+    ] {
         let r = cue_request(cue);
         assert_eq!(r["op"], "ctl");
         assert!(
@@ -350,6 +356,20 @@ fn every_cue_is_one_the_supervisor_forwards_in_a_rehearsal_and_no_other_is() {
         ("rehearsal_arrive", json!({"kind": "direct", "x": 1})),
         ("rehearsal_act", json!({"kind": "direct", "act": "pin"})),
         ("send", json!({"text": "x"})),
+        ("send", json!({"text": "x", "conversation": 7})),
+        ("send", json!({"text": REHEARSAL_SEND_TEXT})),
+        (
+            "send",
+            json!({"text": REHEARSAL_SEND_TEXT, "conversation": 0}),
+        ),
+        (
+            "send",
+            json!({"text": REHEARSAL_SEND_TEXT, "conversation": "7"}),
+        ),
+        (
+            "send",
+            json!({"text": REHEARSAL_SEND_TEXT, "conversation": 7, "attachments": []}),
+        ),
         ("page", json!({"name": "list"})),
         ("quit", json!({})),
     ];

@@ -14,7 +14,7 @@ use kourier_backend_api::{
 };
 use kourier_model::{
     AccountHold, AccountId, AccountUuid, BackendError, BanReason, ConnState, DeviceLogout,
-    ErrorKind, HoldReason, LoginStep, LoginStepKind, LogoutCause, NetworkNote, Redacted,
+    ErrorKind, HoldReason, LoginStep, LoginStepKind, LogoutCause, NetworkNote, Patch, Redacted,
     Restriction, UserAction, UserId,
 };
 use tokio_util::sync::CancellationToken;
@@ -2671,7 +2671,7 @@ async fn look_is_armed(h: &H) {
 }
 
 #[tokio::test]
-async fn a_download_request_is_answered_retryable_until_downloads_exist() {
+async fn a_download_request_without_a_client_is_answered_as_one_to_try_again() {
     let dir = tempfile::tempdir().expect("temp dir");
     pair_device(dir.path()).await;
     let mut h = H::start_in(dir, StartMode::Resume);
@@ -2679,7 +2679,7 @@ async fn a_download_request_is_answered_retryable_until_downloads_exist() {
     let download = |attachment: i64, request: i64| Command::DownloadAttachment {
         attachment: kourier_model::AttachmentId(attachment),
         request: kourier_model::DownloadId(request),
-        remote: kourier_model::BackendBlob::new(1, b"{}".to_vec()),
+        remote: whole_pointer(),
         dest: kourier_backend_api::BlobTarget {
             path: blobs.join("file"),
             key: kourier_model::BlobKey::new([0x42; 32]),
@@ -2688,7 +2688,7 @@ async fn a_download_request_is_answered_retryable_until_downloads_exist() {
     };
     h.send(download(7, 70)).await;
     // One DURABLE `AttachmentDone` under the request's id; the error leaves the attachment retryable (the
-    // core turns a transient error into `Failed { retryable: true }`, "try again" after W7).
+    // core turns a transient error into `Failed { retryable: true }`).
     let mut envelope = h.envelope().await;
     let ack = envelope.ack.take().expect("a durable envelope");
     let [
@@ -2718,6 +2718,341 @@ async fn a_download_request_is_answered_retryable_until_downloads_exist() {
     let (exit, dir) = h.exit_keeping_the_files().await;
     assert_eq!(exit, Exit::Shutdown);
     assert_eq!(core_rows(dir.path()), 0, "both answers were acked");
+}
+
+/// The `remote` of a file a download can ask for.
+fn whole_pointer() -> kourier_model::BackendBlob {
+    let pointer = crate::media::MediaPointer {
+        media_type: "image".into(),
+        direct_path: "/v/t62.7118-24/synthetic-path-30491827".into(),
+        media_key: "11".repeat(32),
+        file_sha256: Some("22".repeat(32)),
+        file_enc_sha256: Some("33".repeat(32)),
+        file_length: 5,
+        ..crate::media::MediaPointer::default()
+    };
+    kourier_model::BackendBlob::new(
+        crate::media::POINTER_V,
+        serde_json::to_vec(&pointer).expect("json"),
+    )
+}
+
+/// Asks for the file of [`whole_pointer`] at `path`.
+async fn ask_for_a_file(h: &H, path: &std::path::Path) {
+    h.send(Command::DownloadAttachment {
+        attachment: kourier_model::AttachmentId(7),
+        request: kourier_model::DownloadId(70),
+        remote: whole_pointer(),
+        dest: kourier_backend_api::BlobTarget {
+            path: path.to_owned(),
+            key: kourier_model::BlobKey::new([0x42; 32]),
+        },
+        net_ids: Vec::new().into(),
+    })
+    .await;
+}
+
+/// The next `AttachmentDone`, acked.
+async fn download_answer(h: &mut H) -> Result<kourier_model::AttachmentMeta, BackendError> {
+    loop {
+        let mut envelope = h.envelope().await;
+        let found = envelope.events.iter().find_map(|event| match event {
+            BackendEvent::AttachmentDone { result, .. } => Some(result.clone()),
+            _ => None,
+        });
+        if let Some(ack) = envelope.ack.take() {
+            ack.complete(Ok(()));
+        }
+        if let Some(found) = found {
+            return found;
+        }
+    }
+}
+
+/// W7: the file arrives sealed at the core's target, under the core's key, and the answer says how long it is.
+#[tokio::test]
+async fn a_downloaded_file_is_sealed_at_its_target() {
+    let (mut h, client) = resumed_with_a_client().await;
+    client.session.script_download(Ok(b"hello".to_vec()));
+    let path = h.dir.path().join("blobs/core/ab/file");
+    ask_for_a_file(&h, &path).await;
+    let meta = download_answer(&mut h).await.expect("downloaded");
+    assert_eq!(meta.size, 5);
+    let key = kourier_blob::FileKey::from_bytes([0x42; 32]);
+    assert_eq!(
+        &*kourier_blob::read_all(&path, &key).expect("a sealed file"),
+        b"hello"
+    );
+    assert_eq!(
+        client
+            .session
+            .calls()
+            .iter()
+            .filter(|call| **call == crate::session::fake::Call::Download)
+            .count(),
+        1
+    );
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W7: a file the servers no longer have is `Expired`, not something to try again, and leaves nothing at the target.
+#[tokio::test]
+async fn a_file_the_servers_no_longer_have_is_expired() {
+    let (mut h, client) = resumed_with_a_client().await;
+    client
+        .session
+        .script_download(Err(crate::session::DownloadFailure::Gone));
+    let path = h.dir.path().join("blobs/core/ab/file");
+    ask_for_a_file(&h, &path).await;
+    let error = download_answer(&mut h).await.expect_err("gone");
+    assert!(matches!(error.kind, kourier_model::ErrorKind::Expired));
+    assert!(!path.exists());
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W7: a host that could not be reached is worth another click.
+#[tokio::test]
+async fn a_file_no_host_gave_can_be_tried_again() {
+    let (mut h, client) = resumed_with_a_client().await;
+    client
+        .session
+        .script_download(Err(crate::session::DownloadFailure::Unreachable));
+    let path = h.dir.path().join("blobs/core/ab/file");
+    ask_for_a_file(&h, &path).await;
+    let error = download_answer(&mut h).await.expect_err("unreachable");
+    assert!(error.is_retryable(), "{error:?}");
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+const JPEG: [u8; 4] = [0xFF, 0xD8, 0xFF, 0xE0];
+const PERSON: &str = "direct:lid:77700172839405";
+const OTHER_PERSON: &str = "direct:lid:77700172839406";
+
+/// [`resumed_with_a_client`] for an account with the chats `convs`, online, `spent` lookups already made today.
+async fn online_with_chats(convs: &[&str], spent: usize) -> (H, Made) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    pair_device(dir.path()).await;
+    let owner = StoreOwner::open(
+        &dir.path().join("backend.db"),
+        &kourier_db::DbKey::from(KEY),
+        "wa-test-chats",
+    )
+    .expect("open");
+    let convs: Vec<String> = convs.iter().map(|conv| (*conv).to_owned()).collect();
+    owner
+        .store()
+        .write("test chats", move |tx| {
+            for conv in &convs {
+                // As this build states them, or the start sweep would state them again and the catch-up wait for the acks.
+                tx.execute(
+                    "INSERT INTO features_stated(conv, version, started) VALUES (?1, ?2, 0)",
+                    kourier_db::rusqlite::params![conv, crate::features::VERSION],
+                )
+                .map_err(crate::error::sql("test chats"))?;
+            }
+            for n in 0..spent {
+                tx.execute(
+                    "INSERT INTO avatars(conv, checked_at) VALUES (?1, ?2)",
+                    kourier_db::rusqlite::params![format!("group:g:{n}"), NOW as i64],
+                )
+                .map_err(crate::error::sql("test chats"))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("chats");
+    owner.close();
+    let h = H::start_in(dir, StartMode::Resume);
+    h.send(Command::Connect).await;
+    let client = h.client(0).await;
+    h.go_online(&client).await;
+    (h, client)
+}
+
+/// The ids named by the lookups made so far, in order.
+fn pictures_named(client: &Made) -> Vec<Option<String>> {
+    client
+        .session
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Picture(known) => Some(known),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Moves the clock on, a gap at a time, until `n` lookups were made.
+async fn pictures_asked(h: &H, client: &Made, n: usize) -> Vec<Option<String>> {
+    for _ in 0..300 {
+        let named = pictures_named(client);
+        if named.len() >= n {
+            return named;
+        }
+        h.clock.advance(Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{n} lookups never came: {:?}", pictures_named(client));
+}
+
+/// Time passes on the clock, and the tasks get to look at it.
+async fn time_passes(h: &H, by: Duration) {
+    h.clock.advance(by);
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        h.clock.advance(Duration::from_millis(1));
+    }
+}
+
+/// The next statement of a picture, every envelope on the way acked.
+async fn picture_stated(h: &mut H) -> Patch<kourier_model::BlobRef> {
+    loop {
+        let mut envelope = h.envelope().await;
+        if let Some(ack) = envelope.ack.take() {
+            ack.complete(Ok(()));
+        }
+        for event in envelope.events {
+            let avatar = match event {
+                BackendEvent::ContactUpsert(patch) => patch.avatar,
+                BackendEvent::ConversationUpsert(patch) => patch.avatar,
+                _ => Patch::Unchanged,
+            };
+            if !matches!(avatar, Patch::Unchanged) {
+                return avatar;
+            }
+        }
+    }
+}
+
+fn found(id: &str) -> Result<crate::session::PictureAnswer, crate::session::AskFailure> {
+    Ok(crate::session::PictureAnswer::Found {
+        id: id.to_owned(),
+        bytes: JPEG.to_vec(),
+    })
+}
+
+/// W8: a picture is sealed and stated once; the chat is asked about again only when it is due, naming what it holds.
+#[tokio::test]
+async fn a_picture_is_sealed_and_stated_once() {
+    let (mut h, client) = online_with_chats(&[PERSON], 0).await;
+    client.session.script_picture(found("p1"));
+    assert_eq!(pictures_asked(&h, &client, 1).await, vec![None]);
+    let Patch::Set(blob) = picture_stated(&mut h).await else {
+        panic!("a picture was expected");
+    };
+    assert!(h.dir.path().join("blobs").join(&blob.path).is_file());
+
+    time_passes(&h, Duration::from_secs(24 * 3600)).await;
+    assert_eq!(pictures_named(&client).len(), 1, "not yet due");
+
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::Unchanged));
+    time_passes(&h, Duration::from_secs(7 * 24 * 3600)).await;
+    assert_eq!(
+        pictures_asked(&h, &client, 2).await,
+        vec![None, Some("p1".to_owned())]
+    );
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W8: a picture taken away is stated as gone and its file removed.
+#[tokio::test]
+async fn a_picture_taken_away_is_cleared() {
+    let (mut h, client) = online_with_chats(&[PERSON], 0).await;
+    client.session.script_picture(found("p1"));
+    pictures_asked(&h, &client, 1).await;
+    let Patch::Set(blob) = picture_stated(&mut h).await else {
+        panic!("a picture was expected");
+    };
+    let file = h.dir.path().join("blobs").join(&blob.path);
+
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::None));
+    time_passes(&h, Duration::from_secs(8 * 24 * 3600)).await;
+    pictures_asked(&h, &client, 2).await;
+    assert!(matches!(picture_stated(&mut h).await, Patch::Clear));
+    assert!(!file.exists());
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W8: lookups keep their distance, whatever the number of chats.
+#[tokio::test]
+async fn picture_lookups_keep_their_distance() {
+    let (h, client) = online_with_chats(&[PERSON, OTHER_PERSON], 0).await;
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::None));
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::None));
+    time_passes(&h, Duration::from_millis(crate::avatars::GAP_MS - 100)).await;
+    assert!(pictures_named(&client).is_empty(), "too soon");
+    pictures_asked(&h, &client, 1).await;
+    assert_eq!(pictures_named(&client).len(), 1);
+    time_passes(&h, Duration::from_millis(crate::avatars::GAP_MS - 100)).await;
+    assert_eq!(pictures_named(&client).len(), 1, "too soon after the first");
+    pictures_asked(&h, &client, 2).await;
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W8: a 429 closes the walk for as long as the server said.
+#[tokio::test]
+async fn a_refused_lookup_waits_for_the_delay_named() {
+    let (h, client) = online_with_chats(&[PERSON], 0).await;
+    client
+        .session
+        .script_picture(Err(crate::session::AskFailure::Refused {
+            code: 429,
+            backoff: Some(Duration::from_secs(3600)),
+        }));
+    pictures_asked(&h, &client, 1).await;
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::None));
+    time_passes(&h, Duration::from_secs(1800)).await;
+    assert_eq!(pictures_named(&client).len(), 1, "still closed");
+    time_passes(&h, Duration::from_secs(1900)).await;
+    pictures_asked(&h, &client, 2).await;
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W8: a day's lookups are counted from the rows, so a restart does not begin the count again.
+#[tokio::test]
+async fn the_days_lookups_survive_a_restart() {
+    let spent = usize::try_from(crate::avatars::PER_DAY).expect("a count");
+    let (h, client) = online_with_chats(&[PERSON], spent).await;
+    client
+        .session
+        .script_picture(Ok(crate::session::PictureAnswer::None));
+    time_passes(&h, Duration::from_secs(600)).await;
+    assert!(pictures_named(&client).is_empty(), "the day is spent");
+    time_passes(&h, Duration::from_secs(24 * 3600)).await;
+    pictures_asked(&h, &client, 1).await;
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
+}
+
+/// W8: a lookup the connection could not carry ends the walk until the next connection.
+#[tokio::test]
+async fn a_lookup_without_a_connection_ends_the_walk() {
+    let (h, client) = online_with_chats(&[PERSON], 0).await;
+    client
+        .session
+        .script_picture(Err(crate::session::AskFailure::NotConnected));
+    pictures_asked(&h, &client, 1).await;
+    time_passes(&h, Duration::from_secs(3600)).await;
+    assert_eq!(pictures_named(&client).len(), 1);
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
 }
 
 /// W5b (G2): an abort of a message no attempt runs for is answered `TooLate`, at once (the reply is never dropped).
@@ -5774,6 +6109,62 @@ const ADMIN_LID: &str = "99000071555";
 
 fn group_jid(digits: &str) -> wacore_binary::Jid {
     format!("{digits}@g.us").parse().expect("a jid")
+}
+
+/// What a group's invite link asks of the client, and its answer.
+async fn invite(
+    h: &H,
+    action: kourier_model::GroupInviteAction,
+) -> Result<Option<kourier_model::Redacted<String>>, kourier_model::BackendError> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    h.send(Command::GroupInvite {
+        group: group_key(GROUP_A),
+        action,
+        reply,
+    })
+    .await;
+    answer.await.expect("answered")
+}
+
+/// A group's invite link: Copy reads it, Reset asks for a new one, the link cannot be turned off
+/// and an unanswered question is a failure.
+#[tokio::test]
+async fn a_group_invite_link_is_read_and_reset() {
+    use kourier_model::GroupInviteAction as Action;
+    let (h, client) = online_with_chats(&[PERSON], 0).await;
+    let session = &client.session;
+    session.script_invite_link(Ok("https://chat.whatsapp.com/first".to_owned()));
+    session.script_invite_link(Ok("https://chat.whatsapp.com/second".to_owned()));
+
+    let read = invite(&h, Action::Read)
+        .await
+        .expect("read")
+        .expect("a link");
+    assert_eq!(read.expose(), "https://chat.whatsapp.com/first");
+    let reset = invite(&h, Action::Reset)
+        .await
+        .expect("reset")
+        .expect("a link");
+    assert_eq!(reset.expose(), "https://chat.whatsapp.com/second");
+    assert!(invite(&h, Action::TurnOn).await.is_err());
+    assert!(invite(&h, Action::TurnOff).await.is_err());
+    assert_eq!(
+        session
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::GroupInvite { reset } => Some(reset),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![false, true],
+        "turning on or off asks the server nothing"
+    );
+
+    // (Nothing more is scripted: the fake says it is not connected.)
+    assert!(invite(&h, Action::Read).await.is_err());
+    h.send(Command::Shutdown).await;
+    assert_eq!(h.exit().await, Exit::Shutdown);
 }
 
 fn group_key(digits: &str) -> kourier_model::ConvKey {

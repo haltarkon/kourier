@@ -64,6 +64,8 @@ while IFS= read -r line; do
       if [ ! -e "$D/hold" ]; then exit 0; fi ;;
     state) printf '{"type":"response","id":%s,"ok":true,"result":%s}\n' "$id" "$(cat "$D/state.json")" ;;
     chats) printf '{"type":"response","id":%s,"ok":true,"result":%s}\n' "$id" "$(cat "$D/chats.json")" ;;
+    send|attach) printf '%s\n' "$line" >> "$D/asked"
+      printf '{"type":"response","id":%s,"ok":true,"result":{}}\n' "$id" ;;
     *) printf '{"type":"response","id":%s,"ok":true,"result":{}}\n' "$id" ;;
   esac
 done
@@ -1412,6 +1414,467 @@ fn mirror_sees_one_own_message_sent_and_then_read() {
     finish(&stage, run);
 }
 
+/// A count line of the socket that stands now, with the frames of a send.
+fn count_with_a_send(reflects: u64, boxes: u64) -> String {
+    COUNT_ZERO
+        .replace(
+            "out_reflect_transmit=0",
+            &format!("out_reflect_transmit={reflects}"),
+        )
+        .replace("out_box_transmit=0", &format!("out_box_transmit={boxes}"))
+}
+
+fn info_at(socket: &std::path::Path) -> Value {
+    call_at(socket, &json!({"op": "info"}), Duration::from_secs(5)).expect("the info")
+}
+
+#[test]
+fn send_opens_its_window_before_the_user_is_told_and_closes_it_at_the_end() {
+    let stage = Stage::new("th8-send");
+    stage.linked();
+    stage.cues.chats(&[
+        chat(7, "direct", 0, 1000, "none"),
+        chat(8, "group", 0, 500, "none"),
+    ]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let socket = stage.rig.socket();
+    assert_eq!(info_at(&socket)["send_window"], json!(false));
+    let answers = [
+        ("pp-got-send", true),
+        ("tp-mirrors-send", true),
+        ("phone-warning", false),
+    ];
+    let at = socket.clone();
+    let end = drive(&stage, "send", &[], short(), &answers, move |cues, hear| {
+        hear.until("WINDOW:");
+        assert_eq!(info_at(&at)["send_window"], json!(true));
+        cues.line(&count_with_a_send(1, 1));
+        cues.chats(&[
+            chat(7, "direct", 0, 2000, "sent"),
+            chat(8, "group", 0, 500, "none"),
+        ]);
+    });
+    assert_eq!(end.status, 0, "{}", end.reason);
+    let notes = end.notes.join("\n");
+    assert!(notes.contains("reflects 1, boxes 1"), "{notes}");
+    let info = info_at(&socket);
+    assert_eq!(info["send_window"], json!(false), "{info}");
+    assert_eq!(info["halted"], Value::Null, "{info}");
+    // The step's frames stay allowed, one more is a send nobody asked for.
+    stage.cues.line(&count_with_a_send(1, 1));
+    stage.cues.line(&count_with_a_send(1, 2));
+    finish_halted(run, "transmit", &stage);
+}
+
+#[test]
+fn group_send_watches_the_group_chat_only() {
+    let stage = Stage::new("th8-group-send");
+    stage.linked();
+    stage.cues.chats(&[
+        chat(7, "direct", 0, 1000, "none"),
+        chat(8, "group", 0, 500, "none"),
+    ]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let answers = [
+        ("pp-got-group-send", true),
+        ("tp-mirrors-group-send", true),
+        ("phone-warning", false),
+    ];
+    let end = drive(
+        &stage,
+        "group-send",
+        &[],
+        short(),
+        &answers,
+        |cues, hear| {
+            hear.until("WINDOW:");
+            // Something new in the 1:1 chat is not the send.
+            cues.chats(&[
+                chat(7, "direct", 0, 3000, "sent"),
+                chat(8, "group", 0, 500, "none"),
+            ]);
+            std::thread::sleep(Duration::from_millis(200));
+            cues.line(&count_with_a_send(1, 2));
+            cues.chats(&[
+                chat(7, "direct", 0, 3000, "sent"),
+                chat(8, "group", 0, 900, "sent"),
+            ]);
+        },
+    );
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert!(end.notes.join("\n").contains("boxes 2"));
+    finish(&stage, run);
+}
+
+#[test]
+fn a_send_the_personal_phone_did_not_show_once_halts_the_run() {
+    let stage = Stage::new("th8-send-lost");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let answers = [("pp-got-send", false)];
+    let end = drive(&stage, "send", &[], short(), &answers, |cues, hear| {
+        hear.until("WINDOW:");
+        cues.line(&count_with_a_send(1, 1));
+        cues.chats(&[chat(7, "direct", 0, 2000, "sent")]);
+    });
+    assert_ne!(end.status, 0);
+    assert!(end.reason.contains("exactly once"), "{}", end.reason);
+    finish_halted(run, "lost", &stage);
+}
+
+#[test]
+fn a_send_that_shows_failed_is_a_finding() {
+    let stage = Stage::new("th8-send-failed");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let socket = stage.rig.socket();
+    let end = drive(&stage, "send", &[], short(), &[], |cues, hear| {
+        hear.until("WINDOW:");
+        cues.chats(&[chat(7, "direct", 0, 2000, "failed")]);
+    });
+    assert_ne!(end.status, 0);
+    assert!(end.reason.contains("failed"), "{}", end.reason);
+    assert_eq!(info_at(&socket)["send_window"], json!(false));
+    finish(&stage, run);
+}
+
+#[test]
+fn a_call_that_stops_short_keeps_the_window_and_never_asks_for_a_second_send() {
+    let stage = Stage::new("th8-send-resume");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let socket = stage.rig.socket();
+    // The send does not show in this call.
+    let end = drive(&stage, "send", &["--seconds", "1"], short(), &[], |_, _| {});
+    assert_ne!(end.status, 0);
+    assert_eq!(info_at(&socket)["send_window"], json!(true));
+    assert!(said(&end, "WINDOW:"), "{:?}", end.said);
+    // The next call goes on from the first one's chat state and does not tell the user to send.
+    let answers = [
+        ("pp-got-send", true),
+        ("tp-mirrors-send", true),
+        ("phone-warning", false),
+    ];
+    stage.cues.line(&count_with_a_send(1, 1));
+    stage.cues.chats(&[chat(7, "direct", 0, 2000, "sent")]);
+    let end = drive(&stage, "send", &[], short(), &answers, |_, _| {});
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert!(!said(&end, "WINDOW:"), "{:?}", end.said);
+    assert_eq!(info_at(&socket)["send_window"], json!(false));
+    finish(&stage, run);
+}
+
+/// The `send` and `attach` commands the app got, in order, whole.
+fn asked(stage: &Stage) -> Vec<Value> {
+    std::fs::read_to_string(stage.cues.0.join("asked"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a command"))
+        .collect()
+}
+
+/// The app shows this chat open, with one looked-at file in its composer.
+fn open_in_the_app(stage: &Stage, id: i64) {
+    stage.cues.put(
+        "state.json",
+        &json!({"open": id, "rows": [], "composer": {
+            "planned": true, "preparing": 0, "files": 1, "sendable": 1, "refused": 0
+        }}),
+    );
+}
+
+#[test]
+fn a_lead_send_opens_the_chat_and_sends_the_steps_marker_once() {
+    let stage = Stage::new("th8-lead-send");
+    stage.linked();
+    stage.cues.chats(&[
+        chat(7, "direct", 0, 1000, "none"),
+        chat(8, "group", 0, 500, "none"),
+    ]);
+    open_in_the_app(&stage, 8);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let answers = [
+        ("pp-got-group-send", true),
+        ("tp-mirrors-group-send", true),
+        ("phone-warning", false),
+    ];
+    let end = drive(
+        &stage,
+        "group-send",
+        &["--lead-sends"],
+        short(),
+        &answers,
+        |cues, hear| {
+            hear.until("the tool's send to show");
+            cues.line(&count_with_a_send(1, 1));
+            cues.chats(&[
+                chat(7, "direct", 0, 1000, "none"),
+                chat(8, "group", 0, 900, "sent"),
+            ]);
+        },
+    );
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert!(!said(&end, "WINDOW:"), "{:?}", end.said);
+    let commands = asked(&stage);
+    assert_eq!(commands.len(), 1, "{commands:?}");
+    assert_eq!(commands[0]["cmd"], json!("send"));
+    let args = &commands[0]["args"];
+    assert_eq!(args["conversation"], json!(8));
+    assert_eq!(args["files"], json!(0));
+    assert!(
+        args["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("kourier-rt1-group-send-")),
+        "{args}"
+    );
+    let seen = stage.seen();
+    let place = |c: &str| seen.iter().position(|s| s == c).unwrap_or(usize::MAX);
+    assert!(place("open_id") < place("send"), "{seen:?}");
+    finish(&stage, run);
+}
+
+#[test]
+fn a_lead_send_file_attaches_the_tools_own_picture_and_names_it() {
+    let stage = Stage::new("th8-lead-file");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    open_in_the_app(&stage, 7);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let answers = [
+        ("pp-got-file", true),
+        ("tp-mirrors-file", true),
+        ("phone-warning", false),
+    ];
+    let end = drive(
+        &stage,
+        "send-file",
+        &["--lead-sends"],
+        short(),
+        &answers,
+        |cues, hear| {
+            hear.until("the tool's send to show");
+            cues.line(&count_with_a_send(1, 1));
+            cues.chats(&[chat(7, "direct", 0, 2000, "sent")]);
+        },
+    );
+    assert_eq!(end.status, 0, "{}", end.reason);
+    let commands = asked(&stage);
+    assert_eq!(commands.len(), 2, "{commands:?}");
+    assert_eq!(commands[0]["cmd"], json!("attach"));
+    let path = commands[0]["args"]["path"].as_str().expect("a path");
+    assert!(
+        std::fs::read(path)
+            .expect("the picture")
+            .starts_with(b"\x89PNG"),
+        "{path}"
+    );
+    assert_eq!(commands[1]["cmd"], json!("send"));
+    assert_eq!(commands[1]["args"]["files"], json!(1));
+    finish(&stage, run);
+}
+
+#[test]
+fn a_lead_send_sends_nothing_when_its_kind_has_two_chats() {
+    let stage = Stage::new("th8-lead-two");
+    stage.linked();
+    stage.cues.chats(&[
+        chat(7, "direct", 0, 1000, "none"),
+        chat(9, "direct", 0, 2000, "none"),
+    ]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let end = drive(&stage, "send", &["--lead-sends"], short(), &[], |_, _| {});
+    assert_ne!(end.status, 0);
+    assert!(end.reason.contains("more than one"), "{}", end.reason);
+    assert!(asked(&stage).is_empty());
+    finish(&stage, run);
+}
+
+#[test]
+fn a_lead_send_whose_call_stops_short_is_not_made_again() {
+    let stage = Stage::new("th8-lead-resume");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    open_in_the_app(&stage, 7);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let end = drive(
+        &stage,
+        "send",
+        &["--lead-sends", "--seconds", "1"],
+        short(),
+        &[],
+        |_, _| {},
+    );
+    assert_ne!(end.status, 0);
+    assert_eq!(asked(&stage).len(), 1);
+    let answers = [
+        ("pp-got-send", true),
+        ("tp-mirrors-send", true),
+        ("phone-warning", false),
+    ];
+    stage.cues.line(&count_with_a_send(1, 1));
+    stage.cues.chats(&[chat(7, "direct", 0, 2000, "sent")]);
+    let end = drive(
+        &stage,
+        "send",
+        &["--lead-sends"],
+        short(),
+        &answers,
+        |_, _| {},
+    );
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert_eq!(asked(&stage).len(), 1, "one send over both calls");
+    finish(&stage, run);
+}
+
+#[test]
+fn a_send_step_called_again_after_the_personal_yes_does_not_wait_for_the_preview() {
+    let stage = Stage::new("th8-lead-preview");
+    stage.linked();
+    stage.cues.chats(&[chat(8, "group", 0, 500, "none")]);
+    open_in_the_app(&stage, 8);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let socket = stage.rig.socket();
+    let timing = StepTiming {
+        answer_wait: Duration::from_millis(400),
+        ..short()
+    };
+    let end = drive(
+        &stage,
+        "group-send",
+        &["--lead-sends"],
+        timing,
+        &[("pp-got-group-send", true)],
+        |cues, hear| {
+            hear.until("the tool's send to show");
+            cues.line(&count_with_a_send(1, 1));
+            cues.chats(&[chat(8, "group", 0, 900, "sent")]);
+        },
+    );
+    assert_ne!(end.status, 0, "the TEST phone's question stays open");
+    assert_eq!(info_at(&socket)["send_window"], json!(true));
+    // A member writes into the group: the preview is no longer the step's own message.
+    stage.cues.chats(&[chat(8, "group", 0, 1200, "none")]);
+    let answers = [("tp-mirrors-group-send", true), ("phone-warning", false)];
+    let end = drive(
+        &stage,
+        "group-send",
+        &["--lead-sends"],
+        short(),
+        &answers,
+        |_, _| {},
+    );
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert_eq!(asked(&stage).len(), 1, "one send over both calls");
+    assert_eq!(info_at(&socket)["send_window"], json!(false));
+    finish(&stage, run);
+}
+
+#[test]
+fn a_steps_own_send_needs_its_window_and_its_marker_and_goes_once() {
+    let stage = Stage::new("th8-step-send");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    open_in_the_app(&stage, 7);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let socket = stage.rig.socket();
+    let op = |what: &str, text: &str, conversation: i64, picture: bool| json!({"op": "step_send", "what": what, "text": text, "conversation": conversation, "picture": picture});
+    let refused = |request: &Value, code: &str| {
+        let e = call_at(&socket, request, Duration::from_secs(30)).expect_err("refused");
+        assert!(format!("{e:#}").contains(code), "{e:#}");
+    };
+    let marker = "kourier-rt1-send-abcdef";
+    refused(&op("send", marker, 7, false), "no-window");
+    call_at(
+        &socket,
+        &json!({"op": "send_window", "what": "send"}),
+        Duration::from_secs(5),
+    )
+    .expect("the window");
+    for bad in [
+        op("kinds", "kourier-rt1-kinds-abcdef", 7, false),
+        op("send", "hello", 7, false),
+        op("send", "kourier-rt1-group-send-abcdef", 7, false),
+        op("send", "kourier-rt1-send-", 7, false),
+        op("send", "kourier-rt1-send-ABCDEF", 7, false),
+        op("send", marker, 0, false),
+        op("send", marker, 7, true),
+    ] {
+        refused(&bad, "badRequest");
+    }
+    assert!(asked(&stage).is_empty());
+    call_at(
+        &socket,
+        &op("send", marker, 7, false),
+        Duration::from_secs(30),
+    )
+    .expect("sent");
+    refused(&op("send", marker, 7, false), "sent-before");
+    assert_eq!(asked(&stage).len(), 1);
+    call_at(
+        &socket,
+        &json!({"op": "send_window_over", "what": "send"}),
+        Duration::from_secs(5),
+    )
+    .expect("closed");
+    finish(&stage, run);
+}
+
+#[test]
+fn files_waits_for_three_messages_and_asks_what_opened() {
+    let stage = Stage::new("th8-files");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 1, 1000, "none")]);
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let answers = [("files-open", true), ("avatar-shows", false)];
+    let end = drive(&stage, "files", &[], short(), &answers, |cues, hear| {
+        hear.until("PHONE:");
+        cues.chats(&[chat(7, "direct", 3, 1500, "none")]);
+        std::thread::sleep(Duration::from_millis(200));
+        cues.chats(&[chat(7, "direct", 4, 2000, "none")]);
+    });
+    assert_eq!(end.status, 0, "{}", end.reason);
+    assert!(said(&end, "WINDOW:"), "{:?}", end.said);
+    assert!(end.notes.join("\n").contains("no profile picture"));
+    // The step opened no chat and writes nothing.
+    assert!(stage.seen().iter().all(|c| c == "chats" || c == "state"));
+    finish(&stage, run);
+}
+
+#[test]
+fn files_refuses_a_chat_that_is_open() {
+    let stage = Stage::new("th8-files-open");
+    stage.linked();
+    stage.cues.chats(&[chat(7, "direct", 0, 1000, "none")]);
+    stage
+        .cues
+        .put("state.json", &json!({"open": 7, "rows": []}));
+    let mut run = stage.start(false);
+    online(&stage, &mut run);
+    let end = drive(&stage, "files", &[], short(), &[], |_, _| {});
+    assert_ne!(end.status, 0);
+    assert!(
+        end.reason.contains("open in the Kourier window"),
+        "{}",
+        end.reason
+    );
+    finish(&stage, run);
+}
+
 #[test]
 fn mirror_counts_the_rows_of_a_chat_he_opened_and_a_read_that_never_comes_is_a_finding() {
     let stage = Stage::new("t6-mirror-open");
@@ -1656,6 +2119,10 @@ fn the_steps_are_listed_in_order_and_an_unknown_name_is_never_echoed() {
             "reconnect",
             "passive",
             "kinds",
+            "files",
+            "send",
+            "group-send",
+            "send-file",
             "phone-sleep",
             "flight-mode",
             "removed-on-phone",

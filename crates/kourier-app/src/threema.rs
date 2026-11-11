@@ -2,16 +2,22 @@
 //! allow-list of test IDs a prepared run profile names, and the network over its parts with the host
 //! name the application reads.
 //!
-//! Like WhatsApp's (`app.rs` `whatsapp_registration`), a RELEASE build never offers Threema. Unlike
-//! WhatsApp, a debug build does not list it as "compiled in but off" unless it can link: the backend
-//! can ([`kourier_threema::LINKING_BUILT`], TH4) AND the profile is a kept RUN PROFILE with a
-//! non-empty list of test IDs ([`allowed_ids`], decision E1): an action that does nothing is not
-//! shown, and Kourier links Threema only in a prepared test profile. A plain debug start therefore
-//! keeps Threema absent; a hand-edited `networks-on` still registers it, and the backend then
-//! refuses `StartLogin` at once (B1's gate, no code shown).
+//! THE USER'S DECISION of 2026-11-09 ("enable Threema by default globally", "Any ID, every build"):
+//! a normal start of ANY build has Threema on until the user turns it off in Settings
+//! (`Prefs::with_default_networks`) and takes ANY Threema ID ([`kourier_threema::AllowList::any`]).
+//! No list of IDs, no typing step, nothing to prepare; the risk notice at Add Account still asks
+//! first.
+//!
+//! THE RUN TOOL keeps its own rules: `cargo xtask threema-run` sets
+//! [`crate::prefs::THREEMA_RUN_TOOL_ENV`] for the app it starts, and everything below this line is
+//! that start's. There a RELEASE build never offers Threema, and a debug build does not list it as
+//! "compiled in but off" unless it can link: the backend can ([`kourier_threema::LINKING_BUILT`],
+//! TH4) AND the profile is a kept RUN PROFILE with a non-empty list of test IDs ([`allowed_ids`],
+//! decision E1). A hand-edited `networks-on` still registers it, and the backend then refuses
+//! `StartLogin` at once (B1's gate, no code shown).
 //!
 //! THE LIST (decision C10, the form of `telegram.rs`' API file): [`allowed_ids`] reads the list ONLY
-//! in a debug build inside a kept run profile ([`run_profile`]: `KOURIER_HOME` set, canonical, a
+//! for the run tool, in a debug build inside a kept run profile ([`run_profile`]: `KOURIER_HOME` set, canonical, a
 //! direct child of `<XDG_DATA_HOME or HOME/.local/share>/kourier-threema-run/`), from the FIXED file
 //! `<keeper root>/threema-allowed-ids` (0600, owned by this user, its directory 0700 and owned by
 //! this user; one line `sha256:<64 lower-case hex digits>` per ID, the digest of
@@ -20,13 +26,13 @@
 //! (the whole list goes, not that line). A file that is there but not used is told ONCE as a warning
 //! whose words are fixed: never the path, a line, a digest or an ID. The digest keeps an ID out of
 //! plain sight; it is not a secret. THE FILE IS THE ONLY GATE before the first socket to Threema in a
-//! debug build: the backend refuses `StartLogin` before it makes a client while its list is empty
+//! run tool's start: the backend refuses `StartLogin` before it makes a client while its list is empty
 //! (B1), and with a list the click on Link dials Threema's production rendezvous relay at once, before
 //! the QR code is shown and before any scan. The ID check at `EssentialData` is the next line (which
-//! account is stored, not whether Threema is contacted), and a release build never reads the file or
-//! lists Threema. Whoever writes the file lets a debug start of that profile contact Threema: only the
-//! run tool (TR, not built yet) writes it, after the user's go in that session; agents and tests write
-//! it only inside a temporary data directory.
+//! account is stored, not whether Threema is contacted), and a release build never reads the file.
+//! Only the run tool writes it, after the user's go in that session; agents and tests write it only
+//! inside a temporary data directory. Outside the run tool the file is not read at all, so one left
+//! behind on another computer restricts nothing.
 //!
 //! Nothing here opens a connection or starts a process.
 
@@ -39,6 +45,7 @@ use kourier_threema::AllowList;
 
 use crate::app::{Build, host_name};
 use crate::paths::HOME_ENV;
+pub(crate) use crate::prefs::ThreemaStart;
 
 /// The directory of the kept run profiles of the Threema tests below the data directory.
 pub(crate) const RUN_DIR: &str = "kourier-threema-run";
@@ -60,24 +67,32 @@ pub(crate) enum ThreemaRegistration {
     Absent,
 }
 
-/// THE RULE for the Threema backend (lane decision Q2): a RELEASE build never registers and never
-/// lists it, whatever the preferences say (no archive links a real Threema account until the lane's
-/// real runs have landed and the user says so; `cargo xtask dist` also builds without the
-/// `threema` feature and its check of the packed binary refuses Threema in either list). A debug
-/// build registers it while `networks-on` names it (`on`); while it is off it is listed only when
+/// THE RULE for the Threema backend. A start that is `Shut` (a scripted start, or a profile that holds
+/// the run tool's directory, outside the run tool) offers nothing: absent. Outside the run tool every build registers it while it is on
+/// and lists it while the user has it off (the user's decision of 2026-11-09). A start by the run
+/// tool (`run_tool`) keeps lane decision Q2: a RELEASE build neither registers nor lists it, a debug
+/// build registers it while `networks-on` names it (`on`), and while it is off lists it only when
 /// this start can link (`linking`: [`linking`] of the run profile's list), else it is absent.
-pub(crate) fn threema_registration(build: Build, on: bool, linking: bool) -> ThreemaRegistration {
-    match (build, on, linking) {
-        (Build::Release, _, _) => ThreemaRegistration::Absent,
-        (Build::Debug, true, _) => ThreemaRegistration::Registered,
-        (Build::Debug, false, true) => ThreemaRegistration::Listed,
-        (Build::Debug, false, false) => ThreemaRegistration::Absent,
+pub(crate) fn threema_registration(
+    build: Build,
+    start: ThreemaStart,
+    on: bool,
+    linking: bool,
+) -> ThreemaRegistration {
+    match (start, build, on, linking) {
+        (ThreemaStart::Shut, _, _, _) => ThreemaRegistration::Absent,
+        (ThreemaStart::Person, _, true, _) => ThreemaRegistration::Registered,
+        (ThreemaStart::Person, _, false, _) => ThreemaRegistration::Listed,
+        (ThreemaStart::RunTool, Build::Release, _, _) => ThreemaRegistration::Absent,
+        (ThreemaStart::RunTool, Build::Debug, true, _) => ThreemaRegistration::Registered,
+        (ThreemaStart::RunTool, Build::Debug, false, true) => ThreemaRegistration::Listed,
+        (ThreemaStart::RunTool, Build::Debug, false, false) => ThreemaRegistration::Absent,
     }
 }
 
 /// Whether this start can link a Threema account: the backend can ([`kourier_threema::LINKING_BUILT`])
-/// AND the run profile named at least one test ID (decision E1). Without a prepared profile the
-/// list is empty, so a plain debug start does not list Threema.
+/// AND the list takes at least one ID (decision E1). In a start by the run tool without a prepared
+/// profile the list is empty, so that start does not list Threema.
 pub(crate) fn linking(allowed: &AllowList) -> bool {
     kourier_threema::LINKING_BUILT && !allowed.is_empty()
 }
@@ -241,10 +256,14 @@ fn digest_of(hex: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
-/// The IDs a link may bring: only when `debug` and only inside a run profile ([`run_profile`]),
-/// from its keeper root's fixed file. EMPTY in every other case; a file that is there but unusable
-/// is told once as a warning (its fixed words) and not used.
+/// The IDs a link may bring. A normal start: ANY ID, and no file is looked at. A start by the run
+/// tool: only when `debug` and only inside a run profile ([`run_profile`]), from its keeper root's
+/// fixed file; EMPTY in every other case, and a file that is there but unusable is told once as a
+/// warning (its fixed words) and not used.
 pub(crate) fn allowed_ids(debug: bool, env: &dyn Fn(&str) -> Option<OsString>) -> AllowList {
+    if !crate::prefs::threema_run_tool(env) {
+        return AllowList::any();
+    }
     if !debug {
         return AllowList::default();
     }
@@ -310,11 +329,48 @@ mod tests {
     use super::capture::events_of;
     use super::*;
 
-    /// All eight cases, each with its expectation written out (never computed by the rule): a release
-    /// build offers nothing; a debug build registers while on; while off it is listed only by a build
-    /// that can link, and absent before.
+    /// Outside the run tool every build registers Threema while it is on and lists it while the
+    /// user has it off, whatever the list. Mutant: the `run_tool` arm dropped -> the release rows.
     #[test]
-    fn a_release_build_never_offers_threema_and_a_debug_build_lists_it_only_once_it_can_link() {
+    fn outside_the_run_tool_every_build_offers_threema() {
+        use ThreemaRegistration::{Listed, Registered};
+        for build in [Build::Debug, Build::Release] {
+            for linking in [false, true] {
+                assert_eq!(
+                    threema_registration(build, ThreemaStart::Person, true, linking),
+                    Registered
+                );
+                assert_eq!(
+                    threema_registration(build, ThreemaStart::Person, false, linking),
+                    Listed
+                );
+            }
+        }
+    }
+
+    /// A shut start offers nothing: every build, on or off, linking or not. Mutant: the `Shut` arm
+    /// dropped (or put after the `Person` arms) -> Registered or Listed.
+    #[test]
+    fn a_shut_start_never_offers_threema() {
+        for build in [Build::Debug, Build::Release] {
+            for on in [false, true] {
+                for linking in [false, true] {
+                    assert_eq!(
+                        threema_registration(build, ThreemaStart::Shut, on, linking),
+                        ThreemaRegistration::Absent,
+                        "{build:?}, on={on}, linking={linking}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// All eight cases of a start by the run tool, each with its expectation written out (never
+    /// computed by the rule): a release build offers nothing; a debug build registers while on; while
+    /// off it is listed only by a build that can link, and absent before.
+    #[test]
+    fn for_the_run_tool_a_release_build_never_offers_threema_and_a_debug_build_lists_it_only_once_it_can_link()
+     {
         use ThreemaRegistration::{Absent, Listed, Registered};
         let cases = [
             (Build::Release, false, false, Absent),
@@ -328,7 +384,7 @@ mod tests {
         ];
         for (build, on, linking, expected) in cases {
             assert_eq!(
-                threema_registration(build, on, linking),
+                threema_registration(build, ThreemaStart::RunTool, on, linking),
                 expected,
                 "{build:?}, on={on}, linking={linking}"
             );
@@ -404,8 +460,14 @@ mod tests {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())
     }
 
+    /// What the run tool sets for the app it starts.
+    fn run_tool() -> (&'static str, OsString) {
+        (crate::prefs::THREEMA_RUN_TOOL_ENV, "1".into())
+    }
+
     fn in_profile(s: &Scratch) -> impl Fn(&str) -> Option<OsString> {
         env_of(vec![
+            run_tool(),
             ("XDG_DATA_HOME", s.data.clone().into_os_string()),
             (HOME_ENV, s.profile.clone().into_os_string()),
         ])
@@ -484,7 +546,35 @@ mod tests {
         );
     }
 
-    /// C10 and E1: the list is read only in a debug build inside the run profile, from a private
+    /// The user's decision of 2026-11-09: without the run tool any ID may link in every build and
+    /// no file is looked at, not even a bad one left in a run profile (the test build's profile on
+    /// another computer lives there). Mutant: the first check of `allowed_ids` removed -> the list
+    /// is empty and the bad file warns.
+    #[test]
+    fn without_the_run_tool_any_id_may_link_and_no_file_is_read() {
+        let s = scratch();
+        write_list(&s, b"nonsense\n", 0o644);
+        let env = env_of(vec![
+            ("XDG_DATA_HOME", s.data.clone().into_os_string()),
+            (HOME_ENV, s.profile.clone().into_os_string()),
+        ]);
+        for debug in [true, false] {
+            let (list, events) = allowed_in(debug, &env);
+            assert!(!list.is_empty() && list.contains("TESTID01") && list.contains("TESTID02"));
+            assert!(linking(&list));
+            assert!(events.is_empty(), "the file was looked at: {events:?}");
+        }
+        let (list, _) = allowed_in(false, &env_of(Vec::new()));
+        assert!(list.contains("TESTID01"), "no environment at all");
+        // An empty value is no run tool.
+        let (list, _) = allowed_in(
+            true,
+            &env_of(vec![(crate::prefs::THREEMA_RUN_TOOL_ENV, "".into())]),
+        );
+        assert!(list.contains("TESTID01"));
+    }
+
+    /// C10 and E1: the run tool's list is read only in a debug build inside the run profile, from a private
     /// regular file of this user in a private directory; a missing file is an empty list and says
     /// nothing. Mutants: the `debug` check removed -> the release case gets the list; the run
     /// profile check removed -> the outside case gets it; the mode check removed -> the 0644 case.
@@ -509,6 +599,7 @@ mod tests {
         assert!(release.is_empty(), "a release build read the list");
         assert!(events.is_empty(), "a release build looked at the file");
         let outside = env_of(vec![
+            run_tool(),
             ("XDG_DATA_HOME", s.data.clone().into_os_string()),
             (HOME_ENV, s.root.clone().into_os_string()),
         ]);
@@ -518,7 +609,7 @@ mod tests {
             events.is_empty(),
             "outside a run profile nothing is looked at"
         );
-        let (unset, _) = allowed_in(true, &env_of(Vec::new()));
+        let (unset, _) = allowed_in(true, &env_of(vec![run_tool()]));
         assert!(unset.is_empty(), "no environment, no list");
 
         for mode in [0o644, 0o640, 0o604, 0o700, 0o400, 0o660] {
@@ -578,6 +669,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let env = env_of(vec![
+                run_tool(),
                 ("XDG_DATA_HOME", data.into_os_string()),
                 (HOME_ENV, profile.into_os_string()),
             ]);

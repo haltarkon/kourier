@@ -940,6 +940,18 @@ impl<T: SignalTransport> Actor<T> {
             Command::Resolve { reply, .. } => {
                 let _ = reply.send(Err(BackendError::unsupported("resolve arrives later")));
             }
+            Command::GroupInvite {
+                group,
+                action,
+                reply,
+            } => {
+                spawn_local(crate::groups::invite::run(
+                    self.shared.clone(),
+                    group,
+                    action,
+                    reply,
+                ));
+            }
             Command::ListOwnDevices { reply } => {
                 let _ = reply.send(Err(BackendError::unsupported("device list arrives later")));
             }

@@ -42,7 +42,9 @@
 //! the run), `events {since}`, `lines {since}` (the kept contract lines, redacted), `ctl {cmd, args,
 //! timeout_ms}` (only `state`, `chats`, `open_id`, `close`; every other command, `add_account`,
 //! `send`, `act`, `attach` among them, is refused in every run; ONE exception, a rehearsal's place
-//! only: the two cues of its fake phone, [`rehearsal_cue_ok`]) and `stop`. T4's: `allow` (the digest
+//! only: the cues of its fake phone, [`rehearsal_cue_ok`]) and `stop`. `send_window` and
+//! `send_window_over` (a send step's bounds for the judge; only the `step` of that name asks).
+//! `step_send` (a send step's own send, on the user's word through `--lead-sends`: [`step_send`]). T4's: `allow` (the digest
 //! from `threema-run id`) and `answer` (his y or n), both only from a process in the foreground of a
 //! terminal; `ask` and `answer_of` (a step's question, [`super::prompt::QUESTIONS`]). T5 adds the
 //! halts, T6 and T7 the steps' questions.
@@ -85,6 +87,7 @@ use super::prompt::{
     needs_a_terminal, peer_is_on_a_terminal, peer_pid, question_kind, record_link_answer,
     remove_the_list, wipe, write_the_list,
 };
+use super::tphone::is_marker_for;
 use super::{Args, var};
 use crate::target_dir;
 
@@ -348,16 +351,42 @@ const CTL_FORWARDED: [&str; 4] = ["state", "chats", "open_id", "close"];
 /// What a halted or ending run still forwards: reading, never acting.
 const CTL_WHEN_HALTED: [&str; 2] = ["state", "chats"];
 
-/// The two cues the rehearsal's walk (`rehearse.rs`) gives its fake phone, forwarded in a rehearsal's
+/// The one text a rehearsal's walk may send through its cue (in the real place a send is the user's
+/// own act in the window or a `--lead-sends` step's own, [`step_send`]; `ctl` never forwards one).
+pub(super) const REHEARSAL_SEND_TEXT: &str = "rehearsal send";
+
+/// The send steps: the words a step gives the supervisor when it opens or closes its window.
+pub(super) const SEND_WINDOWS: [&str; 3] = ["send", "group-send", "send-file"];
+
+/// The bounds of a step's own send ([`step_send`]): the chat opening or a file reaching the composer,
+/// the core looking at the file, the app's answer (it waits up to 15 s for the row to show).
+const STEP_SEND_CHAT_WITHIN: Duration = Duration::from_secs(20);
+const STEP_SEND_FILE_WITHIN: Duration = Duration::from_secs(60);
+const STEP_SEND_ANSWER_WITHIN: Duration = Duration::from_secs(40);
+const STEP_SEND_POLL: Duration = Duration::from_millis(100);
+/// The client's bound on the whole of [`step_send`], above the sum of its stages.
+pub(super) const STEP_SEND_WITHIN: Duration = Duration::from_secs(180);
+
+/// The tool's picture, in the tool's own directory of the profile: its name and side.
+const STEP_PICTURE: &str = "step-send-picture.png";
+const STEP_PICTURE_SIDE: u32 = 128;
+
+/// The cues the rehearsal's walk (`rehearse.rs`) gives its fake phone, forwarded in a rehearsal's
 /// place ONLY (a real profile never has one: its start needs the user's go and the real network):
-/// `add_account` for Threema (the click of "Add Account" that no person makes in a rehearsal) and
-/// `rehearsal_arrive` for a direct or a group chat (the PERSONAL phone's text). Nothing else rides on
-/// them: no other key in the arguments (wa_run.rs:3437 `rehearsal_arrive`, the same rule).
+/// `add_account` for Threema (the click of "Add Account" that no person makes in a rehearsal),
+/// `rehearsal_arrive` for a direct or a group chat (the PERSONAL phone's text) and `send` of the one
+/// rehearsal text (the user's own send in the window). Nothing else rides on them: no other key in
+/// the arguments (wa_run.rs:3437 `rehearsal_arrive`, the same rule).
 pub(super) fn rehearsal_cue_ok(cmd: &str, args: &Value) -> bool {
     let one_key = args.as_object().is_some_and(|o| o.len() == 1);
     match cmd {
         "add_account" => one_key && args["network"] == json!(NETWORK_NAME),
         "rehearsal_arrive" => one_key && matches!(args["kind"].as_str(), Some("direct" | "group")),
+        "send" => {
+            args.as_object().is_some_and(|o| o.len() == 2)
+                && args["text"] == json!(REHEARSAL_SEND_TEXT)
+                && args["conversation"].as_i64().is_some_and(|id| id > 0)
+        }
         _ => false,
     }
 }
@@ -878,6 +907,7 @@ fn info_of(s: &Shared) -> Value {
         // T7: a removal was asked (`unlink`, `removed-on-phone`): 4113, `logged_out` and the drop
         // frame are the removal's own then (R-L2).
         "removal": s.judge.removal_asked,
+        "send_window": s.judge.send.is_open(),
     })
 }
 
@@ -1004,6 +1034,38 @@ fn handle(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
             }
             json!({"ok": true})
         }
+        // A send step's window: frames of origin `transmit` within the judge's bounds are the user's
+        // own send while it stands (the step opens it BEFORE it tells them to send). A halted run
+        // takes none.
+        Some("send_window") => {
+            let what = request["what"].as_str().unwrap_or_default();
+            if !SEND_WINDOWS.contains(&what) {
+                return refuse("badRequest", "that is not a send step");
+            }
+            let mut s = locked(shared);
+            if s.halted().is_some() {
+                return refuse("halted", "the run is halted: it opens no send window");
+            }
+            s.judge.send.open();
+            s.push_event(json!({"type": "event", "event": "send_window", "data": {"what": what}}));
+            json!({"ok": true})
+        }
+        // The step is over: what it wrote stays allowed, nothing further is.
+        Some("send_window_over") => {
+            let what = request["what"].as_str().unwrap_or_default();
+            if !SEND_WINDOWS.contains(&what) {
+                return refuse("badRequest", "that is not a send step");
+            }
+            let mut s = locked(shared);
+            if s.judge.send.is_open() {
+                s.judge.send.close();
+                s.push_event(
+                    json!({"type": "event", "event": "send_window_over", "data": {"what": what}}),
+                );
+            }
+            json!({"ok": true})
+        }
+        Some("step_send") => step_send(shared, request),
         // T6: the one page change a step may ask for: leave a login that waits at its code or its
         // emoji (his "no" to "is it the TEST phone": nobody may scan). Not a halt.
         Some("close_login") => close_login(shared),
@@ -1324,12 +1386,17 @@ fn ctl(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
             // The command's name is not echoed: it came from a client, and a name could be anything.
             return refuse(
                 "refused",
-                "that command is not forwarded to the app in this run (add_account, send, act and attach never are, but the two cues of a rehearsal's fake phone; a halted or ending run forwards reading only)",
+                "that command is not forwarded to the app in this run (add_account, send, act and attach never are, but the cues of a rehearsal's fake phone; a halted or ending run forwards reading only)",
             );
         }
     }
+    forward(shared, cmd, &args, timeout)
+}
+
+/// One command to the app, recorded by name only (its arguments can carry an id), the answer redacted.
+fn forward(shared: &Arc<Mutex<Shared>>, cmd: &str, args: &Value, timeout: Duration) -> Value {
     let started = Instant::now();
-    let response = match app_call(shared, cmd, &args, timeout) {
+    let response = match app_call(shared, cmd, args, timeout) {
         Ok(v) => v,
         Err(refusal) => return refusal,
     };
@@ -1347,6 +1414,176 @@ fn ctl(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
         let message = response["error"]["message"].as_str().unwrap_or("failed");
         refuse(&word_of(&response["error"]["code"]), &redact(message))
     }
+}
+
+/// [`forward`] as a `Result`: the result, or the ready refusal.
+fn forwarded(
+    shared: &Arc<Mutex<Shared>>,
+    cmd: &str,
+    args: &Value,
+    timeout: Duration,
+) -> std::result::Result<Value, Value> {
+    let answer = forward(shared, cmd, args, timeout);
+    if answer["ok"] == json!(true) {
+        Ok(answer["result"].clone())
+    } else {
+        Err(answer)
+    }
+}
+
+/// Polls the app's `state` until `holds`; `Err` is a ready refusal (`why`), also when the run halts.
+fn state_becomes(
+    shared: &Arc<Mutex<Shared>>,
+    bound: Duration,
+    why: &str,
+    holds: impl Fn(&Value) -> bool,
+) -> std::result::Result<(), Value> {
+    let limit = Instant::now() + bound;
+    loop {
+        {
+            let s = locked(shared);
+            if s.halted().is_some() || s.ending {
+                return Err(refuse(
+                    "halted",
+                    "the run is halted or ending: nothing was sent",
+                ));
+            }
+        }
+        let state = forward(shared, "state", &json!({}), Duration::from_secs(10));
+        if state["ok"] == json!(true) && holds(&state["result"]) {
+            return Ok(());
+        }
+        if Instant::now() >= limit {
+            return Err(refuse("timeout", why));
+        }
+        std::thread::sleep(STEP_SEND_POLL);
+    }
+}
+
+/// The tool's own picture for `send-file`, made here: no client names a file, so nothing of the
+/// user's can ride along.
+fn write_step_picture(path: &Path) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        STEP_PICTURE_SIDE,
+        STEP_PICTURE_SIDE,
+    );
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    let shade = |v: u32| u8::try_from(v * 2).unwrap_or(u8::MAX);
+    let data: Vec<u8> = (0..STEP_PICTURE_SIDE)
+        .flat_map(|y| (0..STEP_PICTURE_SIDE).flat_map(move |x| [shade(x), shade(y), 160]))
+        .collect();
+    writer.write_image_data(&data)?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// What comes before a step's own send: the chat open, and for `picture` the file in its composer,
+/// looked at by the core. `Ok` is the number of files the send must name; nothing was sent on `Err`.
+fn step_send_ready(
+    shared: &Arc<Mutex<Shared>>,
+    conversation: i64,
+    picture: Option<&Path>,
+) -> std::result::Result<i32, Value> {
+    forwarded(
+        shared,
+        "open_id",
+        &json!({"conversation": conversation}),
+        STEP_SEND_CHAT_WITHIN,
+    )?;
+    state_becomes(
+        shared,
+        STEP_SEND_CHAT_WITHIN,
+        "the chat did not open: nothing was sent",
+        |state| state["open"] == json!(conversation),
+    )?;
+    let Some(path) = picture else {
+        return Ok(0);
+    };
+    write_step_picture(path).map_err(|_| {
+        refuse(
+            "failed",
+            "the tool's picture was not written: nothing was sent",
+        )
+    })?;
+    forwarded(
+        shared,
+        "attach",
+        &json!({"path": path.display().to_string()}),
+        STEP_SEND_CHAT_WITHIN,
+    )?;
+    state_becomes(
+        shared,
+        STEP_SEND_FILE_WITHIN,
+        "the picture did not get ready to send: nothing was sent",
+        |state| {
+            let c = &state["composer"];
+            c["planned"] == json!(true)
+                && c["preparing"] == json!(0)
+                && c["files"] == json!(1)
+                && c["sendable"] == json!(1)
+                && c["refused"] == json!(0)
+        },
+    )?;
+    Ok(1)
+}
+
+/// A send step's own send (`step <name> --lead-sends`, the user's word in chat; [`serve`] takes it
+/// only from that step's process). One thing goes out: the step's marker, into the chat it names,
+/// with the tool's own picture on `send-file`; only while the step's window is open and the run
+/// stands, and once per step and start, whatever the step remembers. The app checks on its Qt thread
+/// that the open chat is the named one and that the composer holds nothing else.
+fn step_send(shared: &Arc<Mutex<Shared>>, request: &Value) -> Value {
+    let what = request["what"].as_str().unwrap_or_default();
+    let text = request["text"].as_str().unwrap_or_default();
+    let conversation = request["conversation"].as_i64().unwrap_or(0);
+    let picture = request["picture"] == json!(true);
+    if !SEND_WINDOWS.contains(&what) {
+        return refuse("badRequest", "that is not a send step");
+    }
+    if !is_marker_for(what, text) || conversation <= 0 || picture != (what == "send-file") {
+        return refuse(
+            "badRequest",
+            "a step's own send is its marker into a named chat, with a picture on `send-file` only: nothing was sent",
+        );
+    }
+    let picture_at = {
+        let mut s = locked(shared);
+        if s.halted().is_some() || s.ending {
+            return refuse("halted", "the run is halted or ending: nothing was sent");
+        }
+        if !s.judge.send.is_open() {
+            return refuse(
+                "no-window",
+                "the step's send window is not open: nothing was sent",
+            );
+        }
+        if !s.judge.send.claim(what) {
+            return refuse(
+                "sent-before",
+                "this start already made this step's send: it is never made twice",
+            );
+        }
+        s.push_event(json!({"type": "event", "event": "step_send", "data": {"what": what}}));
+        picture.then(|| s.dir.tool().join(STEP_PICTURE))
+    };
+    let files = match step_send_ready(shared, conversation, picture_at.as_deref()) {
+        Ok(files) => files,
+        Err(refusal) => {
+            locked(shared).judge.send.give_back(what);
+            return refusal;
+        }
+    };
+    // Claimed for good from here: a send whose answer is lost is not made again.
+    forward(
+        shared,
+        "send",
+        &json!({"text": text, "conversation": conversation, "files": files}),
+        STEP_SEND_ANSWER_WITHIN,
+    )
 }
 
 /// Sends one command to the app and waits for its response (wa_run.rs:4637 `app_call`). `Err` is a
@@ -1407,6 +1644,24 @@ fn serve(shared: &Arc<Mutex<Shared>>, stream: UnixStream) {
         // terminal, whoever else can write to the socket (wa_run's T2 F5).
         if needs_a_terminal(request["op"].as_str()) && !peer_is_on_a_terminal(&stream) {
             refuse("no-terminal", NOT_FROM_A_TERMINAL)
+        } else if matches!(
+            request["op"].as_str(),
+            Some("send_window" | "send_window_over")
+        ) && !peer_is_the_step(&stream, request["what"].as_str().unwrap_or_default())
+        {
+            // The window lifts the no-send rule: only the `step` of that name says so.
+            refuse(
+                "no-step",
+                "a send window is asked by the step of that name only (`threema-run step send`, `group-send` or `send-file`): nothing was changed",
+            )
+        } else if request["op"].as_str() == Some("step_send")
+            && !peer_is_the_sending_step(&stream, request["what"].as_str().unwrap_or_default())
+        {
+            // The tool's own send: only the `step` of that name, and only with the user's word.
+            refuse(
+                "no-step",
+                "a step's own send is asked by the step of that name with --lead-sends only: nothing was sent",
+            )
         } else if matches!(request["op"].as_str(), Some("removal" | "removal_over"))
             && !peer_is_the_step(&stream, request["what"].as_str().unwrap_or_default())
         {
@@ -1439,6 +1694,19 @@ pub(super) fn is_the_step_cmdline(cmdline: &[u8], what: &str) -> bool {
 /// is gone before it is looked at is not. In a unit test the test process itself counts: the step
 /// client runs in it (the refusal is tested with a child process of another command line).
 fn peer_is_the_step(stream: &UnixStream, what: &str) -> bool {
+    peer_cmdline_is(stream, |cmdline| is_the_step_cmdline(cmdline, what))
+}
+
+/// Whether `cmdline` is the step `what` of this tool with `--lead-sends` (the user's word in chat).
+pub(super) fn is_the_sending_step_cmdline(cmdline: &[u8], what: &str) -> bool {
+    is_the_step_cmdline(cmdline, what) && cmdline.split(|b| *b == 0).any(|a| a == b"--lead-sends")
+}
+
+fn peer_is_the_sending_step(stream: &UnixStream, what: &str) -> bool {
+    peer_cmdline_is(stream, |cmdline| is_the_sending_step_cmdline(cmdline, what))
+}
+
+fn peer_cmdline_is(stream: &UnixStream, is: impl Fn(&[u8]) -> bool) -> bool {
     let Some(pid) = peer_pid(stream) else {
         return false;
     };
@@ -1446,8 +1714,7 @@ fn peer_is_the_step(stream: &UnixStream, what: &str) -> bool {
     if pid == std::process::id() {
         return true;
     }
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .is_ok_and(|cmdline| is_the_step_cmdline(&cmdline, what))
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| is(&cmdline))
 }
 
 fn serve_forever(listener: &UnixListener, shared: &Arc<Mutex<Shared>>) {

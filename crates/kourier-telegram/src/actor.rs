@@ -555,6 +555,10 @@ fn sort(command: Command) -> Kind {
             let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             Kind::Other
         }
+        Command::GroupInvite { reply, .. } => {
+            let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
+            Kind::Other
+        }
         Command::ListOwnDevices { reply } => {
             let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             Kind::Other

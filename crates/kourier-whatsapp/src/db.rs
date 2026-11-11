@@ -22,6 +22,7 @@ pub(crate) const MIGRATIONS: Migrations = Migrations::new(
         migration!(6, "0006_media"),
         migration!(7, "0007_chat_state"),
         migration!(8, "0008_people"),
+        migration!(9, "0009_avatars"),
     ],
 );
 

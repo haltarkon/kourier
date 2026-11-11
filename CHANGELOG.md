@@ -12,6 +12,11 @@ into notes a user can read.
 
 Pre-release work on version 0.1.0. See README.md for what works today.
 
+- Archive, Pin, Mute and Mark as Unread for a chat, from the chat list's row menu and the chat page's menu, as in Signal
+  Desktop: Mute offers 1 Hour, 8 Hours, 1 Day, 1 Week, Until… (a dialog with a date and a time) and Always. Ctrl+Shift+A
+  archives the open chat and Ctrl+Shift+U brings it back; "Chat archived" has an Undo for 8 seconds. The changes reach your phone
+  only while the account's switch "Sync chat changes with my phone" (Settings > Accounts) is on; every account starts with it off,
+  and the entries are greyed with the reason until you turn it on. Pin is greyed at the account's limit.
 - Chats of several accounts in one list: the side panel chooses which accounts' chats the list
   shows. A click on an account shows only it, Shift+click or Ctrl+click (also Ctrl+Space, a check box
   and the entry's menu) adds or removes one, and every account shown is mixed into one list, newest

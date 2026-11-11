@@ -20,6 +20,7 @@ pub(crate) const MIGRATIONS: Migrations = Migrations::new(
         migration!(3, "0003_receive"),
         migration!(4, "0004_send"),
         migration!(5, "0005_leader"),
+        migration!(6, "0006_pictures"),
     ],
 );
 

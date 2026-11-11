@@ -33,6 +33,9 @@ Delegates.RoundedItemDelegate {
     // The account's place among its network's accounts, on the avatar's badge (0: none).
     required property int badgeNumber
     required property bool isSelf
+    required property bool isGroup
+    // The color of the chat's account.
+    required property string tint
 
     readonly property bool hasUnread: root.unread > 0 || root.markedUnread
     readonly property bool isDraft: root.previewSource === "draft"
@@ -45,7 +48,10 @@ Delegates.RoundedItemDelegate {
     // What the row's text stands on: the page, or the row's own tint while it is the open
     // chat (RoundedItemDelegate tints the background with the accent by 0.3). The quiet and
     // accent text colors are made readable on that.
-    readonly property color surface: root.highlighted ? Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.3) : Kirigami.Theme.backgroundColor
+    readonly property color surface: root.highlighted ? Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor, 0.3) : (root.tinted ? Kirigami.ColorUtils.tintWithAlpha(Kirigami.Theme.backgroundColor, root.tint, root.wash) : Kirigami.Theme.backgroundColor)
+    // The faint wash of the account's color (Settings → General). The open chat keeps its own tint.
+    readonly property bool tinted: App.settings.tintRows && root.tint !== "" && !root.highlighted && !Style.highContrast
+    readonly property real wash: Style.tintStrength(root.tint, Kirigami.Theme.backgroundColor, 0.08, 0.45)
     readonly property color quiet: Style.secondary(Kirigami.Theme.textColor, root.surface)
     readonly property color accent: Style.readable(Kirigami.Theme.highlightColor, root.surface)
 
@@ -105,15 +111,22 @@ Delegates.RoundedItemDelegate {
 
     // The row the keyboard is on (the list is one tab stop and holds the focus itself); and
     // in a high-contrast scheme the open chat, whose tint alone does not set the row off
-    // from the page: a solid frame in the text color. One item for both, the focus first.
+    // from the page: a solid frame in the text color. The wash of the account's color is the same
+    // item, under the row's content: one item per row for all three.
     Rectangle {
         readonly property bool focused: root.ListView.isCurrentItem && root.ListView.view.activeFocus
+        readonly property bool framed: focused || (Style.highContrast && root.highlighted)
 
+        z: -1
         anchors.fill: parent
-        visible: focused || (Style.highContrast && root.highlighted)
+        anchors.leftMargin: framed ? 0 : root.leftInset
+        anchors.rightMargin: framed ? 0 : root.rightInset
+        anchors.topMargin: framed ? 0 : root.topInset
+        anchors.bottomMargin: framed ? 0 : root.bottomInset
+        visible: framed || root.tinted
         radius: Kirigami.Units.cornerRadius
-        color: "transparent"
-        border.width: 2
+        color: root.tinted ? Qt.alpha(root.tint, root.wash) : "transparent"
+        border.width: framed ? 2 : 0
         border.color: focused ? Kirigami.Theme.focusColor : Kirigami.Theme.textColor
     }
 

@@ -36,8 +36,12 @@
 //!     arrival's words, in every file of the places but the stamped program, and in everything the
 //!     commands and the terminals printed: none; no digest-shaped run in the tool's files.
 //!
+//! The media and send steps run too: `files` on three arrivals, `send`, `group-send` and `send-file`
+//! on a send cue of the walk, the one text [`super::supervise::REHEARSAL_SEND_TEXT`].
+//!
 //! NOT SHOWN, and said so in the end line (C8): `flight-mode`, `phone-sleep` and `kinds` (the fake
-//! prints none of the contract lines: no leader, no D1, no counts), `mirror` (the fake has no act that
+//! prints none of the contract lines: no leader, no D1, no counts, so no frame count of a send and no
+//! real file either), `mirror` (the fake has no act that
 //! writes an own message of the phone), the real removals (`removed-on-phone`, `unlink` itself: the
 //! dev control has no remove command), the wrong-ID refusal (the fake has no ID refusal: the backend's
 //! tests prove B1's gate), the real join and warning text, the window, and a search of the
@@ -63,7 +67,7 @@ use super::launch::{
 use super::preflight::{NETWORK_NAME, TEST_ENV, check_slice};
 use super::profile::{ProfileDir, State, ensure, private_dir, write_private};
 use super::prompt::{PROMPT_AGAIN, PROMPT_FIRST, digest_of_id, list_text};
-use super::supervise::{LIST_TAKEN, call_at};
+use super::supervise::{LIST_TAKEN, REHEARSAL_SEND_TEXT, call_at};
 use super::{ALLOW_FILE, Args, KEEPER_DIR, REHEARSAL_DIR, TOOL_DIR, holds_a_digest};
 use crate::{lock, target_dir};
 
@@ -465,13 +469,19 @@ pub(super) enum Cue {
     Click,
     /// The PERSONAL phone's text into the first chat of this kind (`direct` or `group`).
     Arrive(&'static str),
+    /// The user's own send in the window, into the newest chat of this kind: the one rehearsal text.
+    Send(&'static str),
 }
 
 impl Cue {
-    fn request(self) -> Value {
+    fn request(self, conversation: i64) -> Value {
         let (cmd, args) = match self {
             Self::Click => ("add_account", json!({"network": NETWORK_NAME})),
             Self::Arrive(kind) => ("rehearsal_arrive", json!({"kind": kind})),
+            Self::Send(_) => (
+                "send",
+                json!({"text": REHEARSAL_SEND_TEXT, "conversation": conversation}),
+            ),
         };
         json!({"op": "ctl", "cmd": cmd, "args": args, "timeout_ms": 30_000})
     }
@@ -817,9 +827,53 @@ fn give(socket: &Path, cue: Cue) -> Result<()> {
     if cue == Cue::Click {
         the_window_is_up(socket)?;
     }
-    call_at(socket, &cue.request(), Duration::from_secs(40))
+    let conversation = match cue {
+        Cue::Send(kind) => {
+            let id = newest_conversation(socket, kind)?;
+            open_the_chat(socket, id)?;
+            id
+        }
+        _ => 0,
+    };
+    call_at(socket, &cue.request(conversation), Duration::from_secs(40))
         .map(|_| ())
         .map_err(|e| anyhow!("the cue {cue:?} was not taken: {e:#}"))
+}
+
+/// What the user does before they send: the chat is open (the dev control's send names it).
+fn open_the_chat(socket: &Path, id: i64) -> Result<()> {
+    let ctl = |cmd: &str, args: Value| {
+        call_at(
+            socket,
+            &json!({"op": "ctl", "cmd": cmd, "args": args, "timeout_ms": 30_000}),
+            Duration::from_secs(40),
+        )
+    };
+    ctl("open_id", json!({"conversation": id}))?;
+    wait_for(Duration::from_secs(20), || {
+        ctl("state", json!({}))
+            .ok()
+            .filter(|a| a["result"]["open"] == json!(id))
+    })
+    .map(|_| ())
+    .ok_or_else(|| anyhow!("the chat of the send cue did not open"))
+}
+
+/// The chat of this kind a rehearsal's send goes to: the newest, the one the step watches.
+fn newest_conversation(socket: &Path, kind: &str) -> Result<i64> {
+    let answer = call_at(
+        socket,
+        &json!({"op": "ctl", "cmd": "chats", "args": {}, "timeout_ms": 30_000}),
+        Duration::from_secs(40),
+    )?;
+    answer["result"]["chats"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["kind"] == json!(kind) && c["self"] != json!(true))
+        .max_by_key(|c| c["last_activity"].as_i64().unwrap_or(0))
+        .and_then(|c| c["conversation"].as_i64())
+        .ok_or_else(|| anyhow!("no {kind} chat for the send cue"))
 }
 
 /// The supervisor's `info`, or the error.
@@ -1250,6 +1304,53 @@ fn rehearsal(tool: &mut Tool, base: &Path, secs: u64, no_build: bool) -> Result<
             "`passive` does not say its frame counts were not measured (the fake prints no count line)"
         );
     }
+    // The media and the sends (TH8), after `passive`: its follower words allow no frame of a send. A
+    // send is the user's own act in the window (the walk gives the cue for it) or, with --lead-sends,
+    // the step's own: the walk then gives no cue at all.
+    let files = Plan {
+        answers: vec![("files-open", true), ("avatar-shows", false)],
+        after_line: vec![("PHONE:", Cue::Arrive("direct")); 3],
+        ..Plan::default()
+    };
+    must_pass(&tool.walk_step(&place, "files", &[], &files)?, "files")?;
+    for (step, kind, personal, mirror, lead) in [
+        ("send", "direct", "pp-got-send", "tp-mirrors-send", false),
+        (
+            "group-send",
+            "group",
+            "pp-got-group-send",
+            "tp-mirrors-group-send",
+            true,
+        ),
+        (
+            "send-file",
+            "direct",
+            "pp-got-file",
+            "tp-mirrors-file",
+            true,
+        ),
+    ] {
+        let plan = Plan {
+            answers: vec![(personal, true), (mirror, true), ("phone-warning", false)],
+            after_line: if lead {
+                Vec::new()
+            } else {
+                vec![("WINDOW:", Cue::Send(kind))]
+            },
+            ..Plan::default()
+        };
+        let flags: &[&str] = if lead { &["--lead-sends"] } else { &[] };
+        let sent = tool.walk_step(&place, step, flags, &plan)?;
+        must_pass(&sent, step)?;
+        if lead != has_note(&sent.printed, "the tool made this step's send itself") {
+            bail!("`{step}` does not say who made its send (--lead-sends: {lead})");
+        }
+        if !has_note(&sent.printed, "frame counts: not measured") {
+            bail!(
+                "`{step}` does not say its frame counts were not measured (the fake prints no count line)"
+            );
+        }
+    }
     // The ends are only on his word: a no to `end-go` changes nothing.
     let no = Plan {
         answers: vec![("end-go", false)],
@@ -1545,7 +1646,7 @@ fn end_the_run(tool: &mut Tool, place: &Path) {
 }
 
 /// What a walk does not show, said in its last line (C8).
-pub(super) const NOT_SHOWN: &str = "not measured (rehearsal): flight-mode, phone-sleep, kinds (the fake prints no leader line, no D1 and no count line); not shown: mirror (the fake has no act that writes an own message of the phone), removed-on-phone and unlink's removal (the dev control has no remove command), the wrong-ID refusal (the fake has no ID refusal; the backend's tests prove B1's gate), the real join and warning text, the window, and a search of the app's raw stderr (the supervisor redacts before it writes); with a test phone the walk shows link, sync, receive, group-receive, passive and the unlink flag on the scripted phone, and the acts and checks of mirror, phone-sleep, flight-mode (the firewall cut), kinds and the ends are proved only by the unit tests on that phone, never on a device";
+pub(super) const NOT_SHOWN: &str = "not measured (rehearsal): the frame counts of the send steps and real files, flight-mode, phone-sleep, kinds (the fake prints no leader line, no D1 and no count line); not shown: mirror (the fake has no act that writes an own message of the phone), removed-on-phone and unlink's removal (the dev control has no remove command), the wrong-ID refusal (the fake has no ID refusal; the backend's tests prove B1's gate), the real join and warning text, the window, and a search of the app's raw stderr (the supervisor redacts before it writes); with a test phone the walk shows link, sync, receive, group-receive, passive and the unlink flag on the scripted phone, and the acts and checks of mirror, phone-sleep, flight-mode (the firewall cut), kinds and the ends are proved only by the unit tests on that phone, never on a device";
 
 /// `cargo xtask threema-run rehearse`: the whole tool against the fake playing Threema, in a throwaway
 /// place below `target/thr/`, every command in its own `unshare -rn`. It takes the test lock (a
@@ -1635,5 +1736,5 @@ pub(super) fn line_with_for_tests<'a>(printed: &'a str, prefix: &str) -> Option<
 
 #[cfg(test)]
 pub(super) fn cue_request_for_tests(cue: Cue) -> Value {
-    cue.request()
+    cue.request(7)
 }

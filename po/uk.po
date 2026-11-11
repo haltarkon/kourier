@@ -56,6 +56,102 @@ msgstr "Показувати лише цей акаунт"
 
 #: crates/kourier-qt/qml/AccountsDrawer.qml
 #, kde-format
+msgctxt "@title:menu the color of an account's chats"
+msgid "Color"
+msgstr "Колір"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color: the one of its network"
+msgid "Network Color"
+msgstr "Колір мережі"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Blue"
+msgstr "Синій"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Green"
+msgstr "Зелений"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Teal"
+msgstr "Бірюзовий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Violet"
+msgstr "Фіолетовий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Pink"
+msgstr "Рожевий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Red"
+msgstr "Червоний"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Orange"
+msgstr "Помаранчевий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Yellow"
+msgstr "Жовтий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Gray"
+msgstr "Сірий"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@item:inmenu account color"
+msgid "Dark"
+msgstr "Темний"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Name"
+msgstr "Скопіювати ім'я"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Number or ID"
+msgstr "Скопіювати номер або ID"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#: crates/kourier-qt/qml/components/PersonCopyMenu.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Copy Link"
+msgstr "Скопіювати посилання"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
 msgctxt "@option:check, %1 an account's name"
 msgid "Show %1 in the list"
 msgstr "Показувати «%1» у списку"
@@ -158,11 +254,13 @@ msgid "Open"
 msgstr "Відкрити"
 
 #: crates/kourier-qt/qml/MainWindow.qml
+#: crates/kourier-qt/qml/components/GroupPage.qml
 #: crates/kourier-qt/qml/components/TimerPart.qml
 #: crates/kourier-qt/qml/dialogs/AttachmentDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/ChatDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
 #: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
@@ -270,6 +368,12 @@ msgctxt "@action:button restart the application"
 msgid "Restart"
 msgstr "Перезапустити"
 
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Undo"
+msgstr "Скасувати"
+
 #: crates/kourier-qt/qml/MediaActions.qml
 #, kde-format
 msgctxt "@info"
@@ -352,12 +456,20 @@ msgctxt "@info accessible"
 msgid "Pinned"
 msgstr "Закріплено"
 
+#: crates/kourier-qt/qml/components/CopyableText.qml
+#, kde-format
+msgctxt "@action:button accessible, the small button after a number or an ID"
+msgid "Copy"
+msgstr "Скопіювати"
+
+#: crates/kourier-qt/qml/components/CopyableText.qml
 #: crates/kourier-qt/qml/components/DescriptionText.qml
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Copy"
 msgstr "Скопіювати"
 
+#: crates/kourier-qt/qml/components/CopyableText.qml
 #: crates/kourier-qt/qml/components/DescriptionText.qml
 #, kde-format
 msgctxt "@action:inmenu"
@@ -371,6 +483,7 @@ msgid "Open Link…"
 msgstr "Відкрити посилання…"
 
 #: crates/kourier-qt/qml/components/DescriptionText.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Copy Link Address"
@@ -400,6 +513,43 @@ msgstr "Закрити"
 
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #, kde-format
+msgctxt "@title:dialog"
+msgid "Reset the Invite Link?"
+msgstr "Скинути посилання-запрошення?"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Turn Off the Invite Link?"
+msgstr "Вимкнути посилання-запрошення?"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Nobody can join with the link while it is off. Turning it on again brings the same link back."
+msgstr "Поки посилання вимкнене, ніхто не зможе приєднатися за ним. Якщо ввімкнути його знову, посилання буде те саме."
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "The current link stops working. Nobody can join with it any more."
+msgstr "Поточне посилання перестане працювати. Ніхто більше не зможе приєднатися за ним."
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Reset Link"
+msgstr "Скинути посилання"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn Off"
+msgstr "Вимкнути"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
 msgctxt "@info:accessible the group's description"
 msgid "Group description"
 msgstr "Опис групи"
@@ -422,6 +572,36 @@ msgstr "Більше"
 msgctxt "@title:group the members part of a group's page"
 msgid "Members"
 msgstr "Учасники"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@title:group the invite link part of a group's page"
+msgid "Invite Link"
+msgstr "Посилання-запрошення"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Copy Invite Link"
+msgstr "Скопіювати посилання-запрошення"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Reset Invite Link…"
+msgstr "Скинути посилання-запрошення…"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn Off Invite Link…"
+msgstr "Вимкнути посилання-запрошення…"
+
+#: crates/kourier-qt/qml/components/GroupPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Turn On Invite Link"
+msgstr "Увімкнути посилання-запрошення"
 
 #: crates/kourier-qt/qml/components/MediaPage.qml
 #: crates/kourier-qt/qml/components/MembersPage.qml
@@ -561,6 +741,7 @@ msgid "Copy Link"
 msgstr "Скопіювати посилання"
 
 #: crates/kourier-qt/qml/components/PersonPage.qml
+#: crates/kourier-viewmodel/src/person.rs
 #, kde-format
 msgctxt "@info:status toast after Copy Link"
 msgid "Link copied"
@@ -1153,6 +1334,42 @@ msgctxt "@info:tooltip"
 msgid "Save As… (Ctrl+S)"
 msgstr "Зберегти як… (Ctrl+S)"
 
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Mute Until"
+msgstr "Вимкнути сповіщення до"
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Mute"
+msgstr "Вимкнути сповіщення"
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label"
+msgid "Mute notifications from this chat until:"
+msgstr "Вимкнути сповіщення цього чату до:"
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label accessible, followed by the date"
+msgid "Date: %1"
+msgstr "Дата: %1"
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@label accessible, followed by the time"
+msgid "Time: %1"
+msgstr "Час: %1"
+
+#: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "Choose a time at least a minute from now."
+msgstr "Виберіть час щонайменше на хвилину пізніше, ніж зараз."
+
 #: crates/kourier-qt/qml/dialogs/RevisionsDialog.qml
 #, kde-format
 msgctxt "@title:dialog"
@@ -1380,6 +1597,104 @@ msgstr "Таймер тимчасових повідомлень: %1"
 msgctxt "@action:button"
 msgid "Disappearing Messages"
 msgstr "Тимчасові повідомлення"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Mark as Unread"
+msgstr "Позначити як непрочитаний"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Pin"
+msgstr "Закріпити"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unpin"
+msgstr "Відкріпити"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@title:menu"
+msgid "Mute"
+msgstr "Вимкнути сповіщення"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Hour"
+msgstr "1 годину"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "8 Hours"
+msgstr "8 годин"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Day"
+msgstr "1 день"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "1 Week"
+msgstr "1 тиждень"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Until…"
+msgstr "До…"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Always"
+msgstr "Назавжди"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Mute"
+msgstr "Вимкнути сповіщення"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unmute"
+msgstr "Увімкнути сповіщення"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Archive"
+msgstr "Архівувати"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unarchive"
+msgstr "Розархівувати"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #, kde-format
@@ -1674,12 +1989,6 @@ msgstr "Вимкнути %1?"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
-msgctxt "@action:button"
-msgid "Turn Off"
-msgstr "Вимкнути"
-
-#: crates/kourier-qt/qml/settings/SettingsPage.qml
-#, kde-format
 msgctxt "@title:group"
 msgid "General"
 msgstr "Загальні"
@@ -1791,6 +2100,30 @@ msgstr "Круглі аватари"
 msgctxt "@info"
 msgid "Off: squares with your theme's corners."
 msgstr "Вимкнено: квадратні, із заокругленням кутів, як у вашій темі."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Tint chats with their account's color"
+msgstr "Підфарбовувати чати кольором їхнього акаунта"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Right-click an account in the side panel to choose its color."
+msgstr "Клацніть акаунт на бічній панелі правою кнопкою, щоб вибрати його колір."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Drawings behind messages"
+msgstr "Малюнки під повідомленнями"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "A faint pattern in the color of the chat's account."
+msgstr "Ледь помітний візерунок у кольорі акаунта чату."
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -1977,6 +2310,18 @@ msgstr "Перезапустити зараз"
 msgctxt "@title:group"
 msgid "Accounts"
 msgstr "Акаунти"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Sync chat changes with my phone"
+msgstr "Синхронізувати зміни чатів із телефоном"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Archive, pin, mute and unread marks made here also change on your phone and your other devices."
+msgstr "Якщо тут заархівувати чат, закріпити його, вимкнути його сповіщення чи позначити як непрочитаний, це зміниться й на телефоні та інших пристроях."
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -2219,6 +2564,18 @@ msgstr "Редагувати"
 msgctxt "@action:inmenu"
 msgid "Copy Text"
 msgstr "Скопіювати текст"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu accessible, %1 the address"
+msgid "Copy Link Address %1"
+msgstr "Скопіювати адресу посилання %1"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu, %1 the address"
+msgid "Copy %1"
+msgstr "Скопіювати %1"
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
@@ -3200,6 +3557,7 @@ msgid "The account could not be created."
 msgstr "Не вдалося створити акаунт."
 
 #: crates/kourier-viewmodel/src/core_source.rs
+#: crates/kourier-viewmodel/src/roaming.rs
 #, kde-format
 msgctxt "@info:status"
 msgid "The setting could not be saved."
@@ -3210,6 +3568,12 @@ msgstr "Не вдалося зберегти налаштування."
 msgctxt "@info:status a contact card was not sent"
 msgid "The contact card could not be sent."
 msgstr "Не вдалося надіслати картку контакту."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "The change could not be made."
+msgstr "Не вдалося внести зміну."
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
@@ -3982,6 +4346,54 @@ msgstr[2] "%1 запитів на приєднання"
 msgctxt "@info:status a group member who is an admin"
 msgid "Admin"
 msgstr "Адміністратор"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, a group's invite link could not be read"
+msgid "The invite link could not be read. Try again when the account is connected."
+msgstr "Не вдалося прочитати посилання-запрошення. Спробуйте знову, коли акаунт підключиться."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, a group's invite link could not be changed"
+msgid "The invite link could not be changed. Try again when the account is connected."
+msgstr "Не вдалося змінити посилання-запрошення. Спробуйте знову, коли акаунт підключиться."
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Copy Invite Link"
+msgid "Invite link copied"
+msgstr "Посилання-запрошення скопійовано"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast, the group's invite link is off"
+msgid "The invite link is off"
+msgstr "Посилання-запрошення вимкнено"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Reset Invite Link"
+msgid "New invite link copied"
+msgstr "Нове посилання-запрошення скопійовано"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Reset Invite Link while it is off"
+msgid "The invite link was reset"
+msgstr "Посилання-запрошення скинуто"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Turn On Invite Link"
+msgid "The invite link is on"
+msgstr "Посилання-запрошення ввімкнено"
+
+#: crates/kourier-viewmodel/src/group.rs
+#, kde-format
+msgctxt "@info:status toast after Turn Off Invite Link"
+msgid "The invite link is off"
+msgstr "Посилання-запрошення вимкнено"
 
 #: crates/kourier-viewmodel/src/login.rs
 #, kde-format
@@ -5576,6 +5988,24 @@ msgctxt "@info under the disabled Share Contact button, %1 the person's name"
 msgid "%1 has no name to share."
 msgstr "У користувача %1 немає імені профілю, яким можна поділитися."
 
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast after a copy action"
+msgid "Copied"
+msgstr "Скопійовано"
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast, the person has no number or ID Kourier may show"
+msgid "No number or ID to copy"
+msgstr "Немає номера або ID для копіювання"
+
+#: crates/kourier-viewmodel/src/person.rs
+#, kde-format
+msgctxt "@info:status toast, the person has no link Kourier may make"
+msgid "No link to copy"
+msgstr "Немає посилання для копіювання"
+
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
 msgctxt "@info:preview, %1 how many photos"
@@ -6170,6 +6600,57 @@ msgstr "Груповий виклик · прийнято на іншому пр
 msgctxt "@info:status chat notice, a call the user made from their phone"
 msgid "Outgoing group call"
 msgstr "Вихідний груповий виклик"
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status under the greyed entries of a chat's menu, the account's switch is off"
+msgid "To change this on your phone too, turn on “Sync chat changes with my phone” for this account in Settings."
+msgstr "Щоб це змінилося й на телефоні, увімкніть для цього акаунта «Синхронізувати зміни чатів із телефоном» у налаштуваннях."
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status why a chat's entries and the sync switch are greyed, the account is not linked"
+msgid "Available while this account is linked."
+msgstr "Доступно, поки цей акаунт зв'язано."
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "You can pin up to %1 chat."
+msgid_plural "You can pin up to %1 chats."
+msgstr[0] "Можна закріпити щонайбільше %1 чат."
+msgstr[1] "Можна закріпити щонайбільше %1 чати."
+msgstr[2] "Можна закріпити щонайбільше %1 чатів."
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status a chat is muted with no end"
+msgid "Muted always"
+msgstr "Сповіщення завжди вимкнено"
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status a chat is muted until a time, %1 the time (tomorrow at 09:00)"
+msgid "Muted until %1"
+msgstr "Сповіщення вимкнено до %1"
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat archived"
+msgstr "Чат заархівовано"
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat returned to inbox"
+msgstr "Чат повернуто з архіву"
+
+#: crates/kourier-viewmodel/src/roaming.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Chat marked unread"
+msgstr "Чат позначено як непрочитаний"
 
 #: crates/kourier-viewmodel/src/safety.rs
 #, kde-format

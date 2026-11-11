@@ -23,9 +23,8 @@ whatsapp = ["dep:kourier-whatsapp"]
 # decisions D2: absent from Add Account until a login works; `app.rs` `telegram_registration`). Not
 # in `cargo xtask dist`'s features: no archive holds Telegram code. Architecture §7.5.
 telegram = ["dep:kourier-telegram"]
-# The Threema backend (libthreema). Compiled into every default build so the wiring is built and
-# tested, but REGISTERED only in a debug build while `networks-on` names it (`app.rs`
-# `threema_registration`); a release build never offers it, and `cargo xtask dist` builds without it.
+# The Threema backend (libthreema). In every default build and in `cargo xtask dist`; on by default
+# until the user turns it off (`threema.rs` `threema_registration`).
 threema = ["dep:kourier-threema"]
 # The scripted test network: `--fixture`, `--fixture-link` and the "Test network" on the
 # welcome page.

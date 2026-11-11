@@ -393,6 +393,13 @@ impl DeviceGroupKey {
         Self::from(device_group_key)
     }
 
+    /// The public half of the Device Group Path Key: the blob mirror's device group id and the prefix of its hosts
+    /// (Kourier patch P12).
+    #[must_use]
+    pub fn path_public_key(&self) -> [u8; DeviceGroupPathKey::LENGTH] {
+        *self.path_key().public_key().0.as_bytes()
+    }
+
     /// Derive the Device Group Path Key (DGPK).
     #[must_use]
     pub(crate) fn path_key(&self) -> DeviceGroupPathKey {

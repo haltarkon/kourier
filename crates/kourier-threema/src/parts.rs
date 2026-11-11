@@ -54,8 +54,12 @@ pub struct ServerParams {
     pub rendezvous_url: String,
     /// The directory server's base URL.
     pub directory_url: String,
-    /// The blob mirror's base URL.
+    /// The blob mirror's download URL, with libthreema's placeholders for the device group and the blob.
     pub blob_url: String,
+    /// The blob mirror's URL that marks a blob as downloaded, with the same placeholders.
+    pub blob_done_url: String,
+    /// The blob mirror's upload URL, with the placeholders for the device group.
+    pub blob_upload_url: String,
     /// The chat server's public keys, the primary one first (X25519, 32 bytes each).
     pub chat_server_keys: Vec<[u8; 32]>,
 }
@@ -247,9 +251,6 @@ pub struct ThreemaParts {
     host_name: String,
     /// The Threema IDs a link may bring (M6; EMPTY by default: every link is refused at once, B1).
     allowed: AllowList,
-    /// Whether `Command::Transmit` reaches the send core ([`ThreemaParts::with_send_open`]; off by default, off in a real
-    /// build).
-    send_open: bool,
 }
 
 impl ThreemaParts {
@@ -272,7 +273,6 @@ impl ThreemaParts {
             server,
             host_name: String::new(),
             allowed: AllowList::default(),
-            send_open: false,
         }
     }
 
@@ -297,22 +297,6 @@ impl ThreemaParts {
     #[must_use]
     pub fn allowed(&self) -> &AllowList {
         &self.allowed
-    }
-
-    /// THE SEND CORE'S TEST DOOR (TH6a, decision C3): `Command::Transmit` reaches the send core instead of being refused.
-    /// Only this crate's integration tests call it: the application's parts do not, so in a real build a `Transmit` stays
-    /// `Failed(unsupported)` and nothing reaches the wire through it. Rule 13 keeps the name out of every other crate and
-    /// rule 15 out of the rest of `src/`. A later step that lifts `CannotSend::NotYetBuilt` deletes it.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_send_open(mut self) -> Self {
-        self.send_open = true;
-        self
-    }
-
-    /// Whether `Command::Transmit` reaches the send core.
-    pub(crate) fn send_open(&self) -> bool {
-        self.send_open
     }
 
     /// Parts that refuse every call, for a test of the APPLICATION that must start the network and
@@ -417,14 +401,6 @@ mod tests {
         assert_eq!(https, Err(NetError::Refused("https")));
         assert_eq!(made.load(Ordering::SeqCst), 0, "a refusal made a client");
         assert_eq!(parts.server(), &ServerParams::default());
-    }
-
-    /// The door stays shut by default. (That the parts of a real build never open it is rule 15's: `src/dial/` cannot name it.)
-    #[test]
-    fn the_send_door_is_off_but_for_a_test_that_asks() {
-        let parts = ThreemaParts::refusing(Arc::default());
-        assert!(!parts.send_open(), "parts open the door by themselves");
-        assert!(parts.with_send_open().send_open(), "the door did not open");
     }
 
     #[test]

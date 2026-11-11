@@ -153,6 +153,12 @@ fn own_pn(own: &[UserId]) -> Option<Jid> {
         .and_then(|id| format!("{}@s.whatsapp.net", id.value()).parse().ok())
 }
 
+/// WhatsApp's link to a person by an E.164 number (`https://wa.me/<digits>`, no plus sign);
+/// `None` for anything else.
+fn contact_link(number: &str) -> Option<String> {
+    kourier_backend_api::is_e164(number).then(|| format!("https://wa.me/{}", &number[1..]))
+}
+
 impl Network for WhatsAppNetwork {
     fn kind(&self) -> NetworkKind {
         NetworkKind::WhatsApp
@@ -160,6 +166,18 @@ impl Network for WhatsAppNetwork {
 
     fn descriptor(&self) -> &NetworkDescriptor {
         &self.descriptor
+    }
+
+    fn contact_links(&self) -> bool {
+        true
+    }
+
+    fn group_invites(&self) -> kourier_model::GroupInvites {
+        kourier_model::GroupInvites::Reset
+    }
+
+    fn contact_link(&self, _user: &UserId, number: &str) -> Option<String> {
+        contact_link(number)
     }
 
     /// whatsapp-rust's own derivation (`RequestUtils::message_id_at`): `3EB0` and 18 upper-case hex
@@ -180,5 +198,25 @@ impl Network for WhatsAppNetwork {
         let name = format!("whatsapp-{}", ctx.uuid.short());
         let parts = self.parts.clone();
         spawn_account_thread(name, move || actor::run(ctx, parts))
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::contact_link;
+
+    #[test]
+    fn a_person_link_is_the_number_without_its_plus_sign() {
+        assert_eq!(
+            contact_link("+15551234567").as_deref(),
+            Some("https://wa.me/15551234567")
+        );
+    }
+
+    #[test]
+    fn only_an_e164_number_makes_a_link() {
+        for not in ["15551234567", "+0551234567", "+1555", "", "+1555abc4567"] {
+            assert_eq!(contact_link(not), None, "{not}");
+        }
     }
 }

@@ -415,7 +415,7 @@ fn a_store_that_ran_before_w5a_opens_with_no_started_fact_and_its_chats_are_not_
             |r| r.get(0),
         )
         .expect("version");
-    assert_eq!(version, 8, "migrated to this build's schema (W6a2: 8)");
+    assert_eq!(version, 9, "migrated to this build's schema (W8: 9)");
     let started_rows: i64 = conn
         .query_row("SELECT count(*) FROM chat_started", [], |r| r.get(0))
         .expect("count");

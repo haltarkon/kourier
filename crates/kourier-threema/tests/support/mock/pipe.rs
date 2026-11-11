@@ -282,6 +282,8 @@ fn decode_setup(body: &[u8]) -> Setup {
             mediator_url,
             rendezvous_url,
             directory_url,
+            blob_done_url: format!("{blob_url}done"),
+            blob_upload_url: format!("{blob_url}upload"),
             blob_url,
             chat_server_keys,
         },

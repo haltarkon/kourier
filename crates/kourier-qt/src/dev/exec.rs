@@ -325,6 +325,7 @@ impl qobject::App {
         self: Pin<&mut Self>,
         text: &str,
         conversation: Option<i64>,
+        files: i32,
     ) -> Result<(i64, Option<RowKey>), DevError> {
         let conv = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
         if conv == 0 && conversation.is_none() {
@@ -335,15 +336,16 @@ impl qobject::App {
         let Some(mut composer) = pinned(self.composer) else {
             return Err(DevError::Gone);
         };
-        // A driver that named a chat sends from a plain composer only (F3): a reply he picked, an edit in
-        // progress or files in the strip would go out with, or instead of, the tool's text.
+        // A driver that named a chat sends from a composer holding only what it names (F3): a reply he
+        // picked, an edit in progress or other files in the strip would go out with, or instead of, the
+        // tool's text.
         if conversation.is_some() {
-            guard::the_composer_is_plain(
+            guard::the_composer_holds(
                 *composer.edit_id(),
                 *composer.reply_to_id(),
-                composer
-                    .attachment_count()
-                    .saturating_add(*composer.preparing()),
+                *composer.attachment_count(),
+                *composer.preparing(),
+                files,
             )?;
         }
         if composer.as_mut().send(conv, &QString::from(text)) {
@@ -634,6 +636,17 @@ impl qobject::App {
             // timer sets; T2 C3): the run tool's proof that a read-only step sent nothing.
             // `null` outside a rehearsal: "not measured" is never a 0.
             "frames": self.dev_app().and_then(AppHandle::rehearsal_frames),
+            // BQ11 (A10d D8): the real Signal backend's Storage Service counts of this process
+            // (the newest manifest it saw: version, identifiers, those with no record here; our
+            // writes answered 200), what the lead reads at the real check. `null` until a
+            // manifest was read, in fixture mode and without the real backend: "not measured"
+            // is never a 0.
+            "storage": self.dev_app().and_then(AppHandle::storage_counts).map(|c| json!({
+                "version": c.version,
+                "identifiers": c.identifiers,
+                "unknown": c.unknown,
+                "writes": c.writes,
+            })),
         })
     }
 

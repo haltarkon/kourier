@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::lines::{at, count_line};
 use super::supervise::{Rig, quick};
 use crate::threema_run::judge::{
-    COUNT_LINES_WITHIN, Judge, Said, Seen, count_lines_missing, judge,
+    COUNT_LINES_WITHIN, Judge, SEND_BOXES, SEND_REFLECTS, Said, Seen, count_lines_missing, judge,
 };
 use crate::threema_run::launch::QUESTION_KIND;
 use crate::threema_run::lines::parse;
@@ -1052,4 +1052,84 @@ fn a_removal_given_back_excuses_nothing() {
         W::new().count("end", &[("out_drop", 1)]),
         some("follower-wrote")
     );
+}
+
+/// The no-send rule's only opening: a send step's window, on a leader or a follower socket, bounded,
+/// and for as long as the step stands.
+#[test]
+fn a_transmit_frame_passes_only_inside_a_send_window_and_within_its_bounds() {
+    let frames = |r: u64, b: u64| {
+        vec![
+            ("out_reflect_transmit", r),
+            ("out_box_transmit", b),
+            ("out_unblock", 0),
+        ]
+    };
+    let some = |w: &str| Some(w.to_owned());
+    let open = || {
+        let mut w = W::new();
+        w.j.send.open();
+        w
+    };
+    // No window: the old rule.
+    assert_eq!(W::new().count("running", &frames(1, 0)), some("transmit"));
+    assert_eq!(W::new().count("running", &frames(0, 1)), some("transmit"));
+    // Inside it, up to the bounds and not one frame more of either.
+    let mut w = open();
+    assert_eq!(w.count("running", &frames(1, 1)), None);
+    assert_eq!(w.count("running", &frames(SEND_REFLECTS, SEND_BOXES)), None);
+    assert_eq!(
+        open().count("running", &frames(SEND_REFLECTS + 1, 1)),
+        some("transmit")
+    );
+    assert_eq!(
+        open().count("running", &frames(1, SEND_BOXES + 1)),
+        some("transmit")
+    );
+    // Closed: what the step wrote stays allowed (the counts are cumulative), nothing further is.
+    let mut w = open();
+    assert_eq!(w.count("running", &frames(1, 2)), None);
+    w.j.send.close();
+    assert_eq!(w.count("running", &frames(1, 2)), None);
+    assert_eq!(w.count("running", &frames(1, 3)), some("transmit"));
+    // A second call of a paused step keeps the first call's bounds.
+    let mut w = open();
+    assert_eq!(w.count("running", &frames(1, 1)), None);
+    w.j.send.open();
+    assert_eq!(
+        w.count("running", &frames(SEND_REFLECTS + 1, 1)),
+        some("transmit")
+    );
+    // The next step adds its own bounds to what the socket has written.
+    let mut w = open();
+    assert_eq!(w.count("running", &frames(1, 1)), None);
+    w.j.send.close();
+    w.j.send.open();
+    assert_eq!(
+        w.count("running", &frames(1 + SEND_REFLECTS, 1 + SEND_BOXES)),
+        None
+    );
+    assert_eq!(
+        w.count("running", &frames(2 + SEND_REFLECTS, 1)),
+        some("transmit")
+    );
+    // A socket's end starts the counters at zero: inside the window the bounds start over, after it
+    // nothing is allowed.
+    let mut w = open();
+    assert_eq!(w.count("end", &frames(1, 2)), None);
+    assert_eq!(w.count("running", &frames(SEND_REFLECTS, SEND_BOXES)), None);
+    w.j.send.close();
+    assert_eq!(w.count("end", &frames(SEND_REFLECTS, SEND_BOXES)), None);
+    assert_eq!(w.count("running", &frames(0, 1)), some("transmit"));
+}
+
+#[test]
+fn a_steps_own_send_is_claimed_once_and_given_back_only_when_nothing_went() {
+    let mut window = crate::threema_run::judge::SendWindow::default();
+    assert!(window.claim("send"));
+    assert!(!window.claim("send"));
+    assert!(window.claim("group-send"));
+    window.give_back("send");
+    assert!(window.claim("send"));
+    assert!(!window.claim("group-send"));
 }

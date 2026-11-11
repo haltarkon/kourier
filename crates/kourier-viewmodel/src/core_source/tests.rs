@@ -273,6 +273,8 @@ impl Store {
                     .collect(),
                 next: None,
             }),
+            Query::PersonOf(_) => QueryData::Person(None),
+            Query::GroupInvite { .. } => QueryData::GroupInvite(None),
             Query::Person { .. } => QueryData::Person(None),
             Query::Group(_) => QueryData::Group(None),
             Query::ChatMedia(q) => QueryData::ChatMedia(self.media_page(q)),
@@ -491,6 +493,8 @@ fn first_load_and_coalesced_invalidations() {
     }
     assert_eq!(src.accounts().len(), 1);
     assert_eq!(src.conversations(&ConversationFilter::default()).len(), 2);
+    // The list's rows are read ahead once, for the composers of chats not opened yet.
+    settle(&mut src, &sent, &store);
 
     // Ten invalidations while the list query is in flight → one follow-up query.
     src.on_event(&UiEvent::ConversationsChanged {
@@ -528,6 +532,12 @@ fn a_read_asked_of_the_core_and_not_applied_is_in_flight() {
     for (t, q) in first {
         src.on_event(&result(t, store.answer(&q)));
     }
+    assert_eq!(
+        src.queries_in_flight(),
+        1,
+        "the read ahead for the composers counts as well"
+    );
+    settle(&mut src, &sent, &store);
     assert_eq!(src.queries_in_flight(), 0, "everything applied");
 
     // An invalidation: the list is going to change until its answer is applied.
@@ -2362,6 +2372,39 @@ fn the_header_lists_what_can_be_attached() {
     assert!(header.attach.accepts(AttachmentKind::Image));
     assert!(!header.attach.accepts(AttachmentKind::File));
     assert_eq!(header.attach.names(), "image");
+}
+
+/// The first frame of a chat already has its title and composer: what can be attached and whether
+/// anything can be sent do not change a moment later, when the core's answer arrives.
+#[test]
+fn a_chat_opens_with_the_composer_it_is_going_to_have() {
+    use kourier_model::{AttachmentKind, CannotSend, FileLimits};
+    let (mut src, sent) = source();
+    let mut store = media_store();
+    store.features.files = BTreeMap::from([(
+        AttachmentKind::Image,
+        FileLimits {
+            max_size: 1000,
+            caption: true,
+        },
+    )]);
+    store.features.cannot_send = Some(CannotSend::NotMember);
+    assert_eq!(src.chat(ConversationId(1)), None, "nothing open yet");
+    src.reload();
+    settle(&mut src, &sent, &store);
+    // Never opened: the list and the read-ahead are all there is, and they are enough.
+    src.open_conversation(Some(ConversationId(1)));
+    let first = src
+        .chat(ConversationId(1))
+        .expect("the first frame's header");
+    assert!(first.attach.accepts(AttachmentKind::Image));
+    assert!(!first.cannot_send.is_empty());
+    assert!(!first.title.is_empty());
+    settle(&mut src, &sent, &store);
+    let answered = src.chat(ConversationId(1)).expect("the answered header");
+    assert_eq!(first.attach.names(), answered.attach.names());
+    assert_eq!(first.cannot_send, answered.cannot_send);
+    assert_eq!(first.title, answered.title);
 }
 
 /// Group timelines show an author's picture: the avatar of the author's direct chat.

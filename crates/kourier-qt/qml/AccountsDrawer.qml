@@ -187,9 +187,26 @@ Kirigami.GlobalDrawer {
         QQC2.Menu {
             id: accountMenu
 
+            // One color of the account's chats ("": its network's).
+            component ColorItem: QQC2.MenuItem {
+                property string value
+
+                icon.source: value === "" ? "" : "image://kourierart/swatch/" + value.slice(1)
+                icon.color: "transparent"
+                checkable: true
+                checked: (accountMenu.actions.ownTint ?? "") === value
+                onTriggered: {
+                    App.setAccountTint(accountMenu.account, value);
+                    checked = Qt.binding(() => (accountMenu.actions.ownTint ?? "") === value);
+                }
+            }
+
             // The account the menu was opened for, and what it offers
             // (`App.accountActions`).
             property real account: 0
+            property string accountName: ""
+            // Its own number or ID on its network ("": not known).
+            property string accountNumber: ""
             property var actions: ({})
             // Set at popup (M6): whether the account is shown, and whether the choice items show.
             property bool listed: false
@@ -222,6 +239,82 @@ Kirigami.GlobalDrawer {
             QQC2.MenuSeparator {
                 visible: accountMenu.choosing
                 height: visible ? implicitHeight : 0
+            }
+
+            QQC2.Menu {
+                objectName: "drawer-account-color"
+                popupType: QQC2.Popup.Item
+                title: L10n.i18nc("@title:menu the color of an account's chats", "Color")
+
+                ColorItem {
+                    text: L10n.i18nc("@item:inmenu account color: the one of its network", "Network Color")
+                }
+                QQC2.MenuSeparator {}
+                ColorItem {
+                    value: "#3a76f0"
+                    text: L10n.i18nc("@item:inmenu account color", "Blue")
+                }
+                ColorItem {
+                    value: "#1da851"
+                    text: L10n.i18nc("@item:inmenu account color", "Green")
+                }
+                ColorItem {
+                    value: "#14a3a3"
+                    text: L10n.i18nc("@item:inmenu account color", "Teal")
+                }
+                ColorItem {
+                    value: "#8b5cf6"
+                    text: L10n.i18nc("@item:inmenu account color", "Violet")
+                }
+                ColorItem {
+                    value: "#e0529c"
+                    text: L10n.i18nc("@item:inmenu account color", "Pink")
+                }
+                ColorItem {
+                    value: "#dc4c3e"
+                    text: L10n.i18nc("@item:inmenu account color", "Red")
+                }
+                ColorItem {
+                    value: "#ef8a17"
+                    text: L10n.i18nc("@item:inmenu account color", "Orange")
+                }
+                ColorItem {
+                    value: "#d9b310"
+                    text: L10n.i18nc("@item:inmenu account color", "Yellow")
+                }
+                ColorItem {
+                    value: "#7f8c8d"
+                    text: L10n.i18nc("@item:inmenu account color", "Gray")
+                }
+                ColorItem {
+                    value: "#0b1215"
+                    text: L10n.i18nc("@item:inmenu account color", "Dark")
+                }
+            }
+
+            QQC2.MenuItem {
+                objectName: "drawer-copy-name"
+                visible: accountMenu.accountName !== ""
+                enabled: visible
+                height: visible ? implicitHeight : 0
+                icon.name: "edit-copy"
+                text: L10n.i18nc("@action:inmenu", "Copy Name")
+                onTriggered: App.copyShown(accountMenu.accountName)
+            }
+            QQC2.MenuItem {
+                objectName: "drawer-copy-number"
+                visible: accountMenu.accountNumber !== ""
+                enabled: visible
+                height: visible ? implicitHeight : 0
+                icon.name: "edit-copy"
+                text: L10n.i18nc("@action:inmenu", "Copy Number or ID")
+                onTriggered: App.copyShown(accountMenu.accountNumber)
+            }
+            QQC2.MenuItem {
+                objectName: "drawer-copy-link"
+                icon.name: "edit-copy"
+                text: L10n.i18nc("@action:inmenu", "Copy Link")
+                onTriggered: App.copyAccount("link", accountMenu.account)
             }
 
             // (A hidden item is disabled too: the menu's keyboard navigation does not skip an
@@ -280,6 +373,8 @@ Kirigami.GlobalDrawer {
             return;
         }
         menu.account = account;
+        menu.accountName = entry.name ?? "";
+        menu.accountNumber = entry.number ?? "";
         menu.actions = actions;
         menu.listed = actions.shown === true;
         menu.choosing = drawer.choosing;
@@ -314,19 +409,24 @@ Kirigami.GlobalDrawer {
     bottomPadding: 0
 
     header: Kirigami.AbstractApplicationHeader {
-        visible: !drawer.rail
         contentItem: RowLayout {
             spacing: Kirigami.Units.smallSpacing
             anchors.fill: parent
-            anchors.leftMargin: Kirigami.Units.largeSpacing
+            // In the rail the logo stands alone in the middle of the band.
+            anchors.leftMargin: drawer.rail ? Math.round((drawer.collapsedSize - Kirigami.Units.iconSizes.medium) / 2) : Kirigami.Units.largeSpacing
             Kirigami.Icon {
                 source: Style.appIcon
                 implicitWidth: Kirigami.Units.iconSizes.medium
                 implicitHeight: Kirigami.Units.iconSizes.medium
             }
             Kirigami.Heading {
+                visible: !drawer.rail
                 level: 3
                 text: "Kourier"
+                Layout.fillWidth: true
+            }
+            Item {
+                visible: drawer.rail
                 Layout.fillWidth: true
             }
         }

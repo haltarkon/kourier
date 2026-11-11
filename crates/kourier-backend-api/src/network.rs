@@ -71,6 +71,19 @@ pub trait Network: Send + Sync + 'static {
         None
     }
 
+    /// The link to `user` made of their id alone, on a network whose ids are the public address
+    /// people hand each other (Threema: `https://threema.id/<ID>`). It takes precedence over the
+    /// number rule, which has nothing to protect there. Default: none.
+    fn contact_id_link(&self, user: &UserId) -> Option<String> {
+        let _ = user;
+        None
+    }
+
+    /// What the network offers for the invite link of a group (default: nothing).
+    fn group_invites(&self) -> kourier_model::GroupInvites {
+        kourier_model::GroupInvites::None
+    }
+
     /// Starts the account actor (Signal: own OS thread + current-thread runtime + `LocalSet`,
     /// see [`crate::spawn_account_thread`]).
     fn spawn(&self, ctx: AccountContext) -> Result<AccountHandle, BackendError>;

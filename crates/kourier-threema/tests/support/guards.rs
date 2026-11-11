@@ -60,6 +60,8 @@ pub fn servers() -> ServerParams {
         rendezvous_url: "wss://rendezvous.invalid/".to_owned(),
         directory_url: "https://directory.invalid/".to_owned(),
         blob_url: "https://blob.invalid/".to_owned(),
+        blob_done_url: "https://blob.invalid/done".to_owned(),
+        blob_upload_url: "https://blob.invalid/upload".to_owned(),
         chat_server_keys: vec![[0x5a; 32]],
     }
 }

@@ -24,7 +24,8 @@ use crate::threema_run::profile::{
 };
 use crate::threema_run::prompt::{list_text, remove_the_list, write_the_list};
 use crate::threema_run::supervise::{
-    StopTiming, Timing, is_the_step_cmdline, proc_file_readable, readable_files, state_in, stop_in,
+    StopTiming, Timing, is_the_sending_step_cmdline, is_the_step_cmdline, proc_file_readable,
+    readable_files, state_in, stop_in,
 };
 
 // ---- The stand-in app ----------------------------------------------------------------------------------
@@ -612,4 +613,32 @@ fn the_cleanups_words_hold_no_path_and_no_value() {
         probe_lock(&dir.keeper_lock_file(), Duration::ZERO).expect("a probe"),
         Lock::Free
     );
+}
+
+#[test]
+fn a_steps_own_send_comes_only_from_that_step_with_the_flag() {
+    let send = cmdline(&["/x/xtask", "threema-run", "step", "send", "--lead-sends"]);
+    assert!(is_the_sending_step_cmdline(&send, "send"));
+    assert!(!is_the_sending_step_cmdline(&send, "group-send"));
+    assert!(!is_the_sending_step_cmdline(
+        &cmdline(&["/x/xtask", "threema-run", "step", "send"]),
+        "send"
+    ));
+    assert!(!is_the_sending_step_cmdline(
+        &cmdline(&["/x/xtask", "threema-run", "state", "send", "--lead-sends"]),
+        "send"
+    ));
+    let rig = Rig::new("f-step-send");
+    let mut run = rig.run("normal", false, quick());
+    run.ready();
+    let line = raw_op(
+        &rig,
+        &json!({"op": "step_send", "what": "send", "text": "kourier-rt1-send-abcdef", "conversation": 7, "picture": false}),
+        "raw-op",
+        None,
+    );
+    assert!(line.contains("no-step"), "{line}");
+    run.stop();
+    run.join().expect("ended");
+    assert!(!rig.seen_commands().iter().any(|c| c == "send"));
 }

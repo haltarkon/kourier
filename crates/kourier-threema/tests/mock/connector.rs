@@ -448,7 +448,7 @@ async fn other_hosts_and_https_are_refused_and_counted() {
         .https()
         .execute(HttpsRequest {
             method: HttpsMethod::Get,
-            url: "https://blob.invalid/upload".to_owned(),
+            url: "https://elsewhere.invalid/upload".to_owned(),
             headers: Vec::new(),
             body: Vec::new(),
             max_body: None,

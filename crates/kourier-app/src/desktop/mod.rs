@@ -490,11 +490,16 @@ pub(crate) fn spawn(
     core: CoreHandle,
     connection: Connection,
     opts: &DesktopOptions,
+    default_networks: bool,
     paths: &Paths,
     stop: CancellationToken,
 ) -> (DesktopHandle, tokio::task::JoinHandle<()>) {
     let prefs_path = paths.config_file();
     let mut prefs = Prefs::load_or_default(&prefs_path);
+    if default_networks {
+        // As this start's registry was made (`app.rs` `start_prefs`): Settings shows the truth.
+        prefs = prefs.with_default_networks();
+    }
     let (autostart_path, entry) = autostart_target(paths);
     // The entry's existence is the truth (the user may remove it in System Settings).
     prefs.autostart = autostart::is_enabled(&autostart_path);

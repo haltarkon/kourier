@@ -44,7 +44,7 @@ fn opening_twice_gives_one_schema() {
     }
     let conn = raw(dir.path());
     let outbox = i64::from(kourier_db::outbox::MIGRATIONS.latest());
-    for (component, version) in [("whatsapp", 8), ("core_outbox", outbox)] {
+    for (component, version) in [("whatsapp", 9), ("core_outbox", outbox)] {
         let found: i64 = conn
             .query_row(
                 "SELECT version FROM schema_version WHERE component = ?1",
@@ -131,7 +131,7 @@ fn a_new_file_is_at_schema_8_with_the_history_send_upload_app_state_and_people_t
             |r| r.get(0),
         )
         .expect("version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap_or_else(|e| panic!("table {table}: {e}"))
@@ -236,7 +236,7 @@ fn a_newer_schema_is_refused_and_not_touched() {
             component,
             found,
             supported,
-        } => assert_eq!((component.as_str(), found, supported), ("whatsapp", 999, 8)),
+        } => assert_eq!((component.as_str(), found, supported), ("whatsapp", 999, 9)),
         other => panic!("{other}"),
     }
     assert_eq!(files_hash(&dir), before);

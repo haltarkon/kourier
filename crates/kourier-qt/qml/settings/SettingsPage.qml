@@ -99,6 +99,23 @@ FormCard.FormCardPage {
     // The question "Turn Off WhatsApp?" while it is open (tests read it).
     property Kirigami.PromptDialog turnOffDialog: null
 
+    // The account whose "Sync chat changes with my phone" row has the keyboard (0 = none). A caps
+    // echo remakes EVERY account card (the comment at the accounts' Repeater), so the row that is
+    // clicked or toggled by key says who it was before it asks, and the new row of that account
+    // takes the keyboard when it is made, then clears this. A refusal clears it too: nothing
+    // changes, so no card is remade for it to be taken by (A10d D5, critic L4).
+    property real roamingFocus: 0
+
+    Connections {
+        target: App
+        // The switch was refused ("The setting could not be saved." is MainWindow's toast).
+        function onChatTold(kind: string, conversation: var, wasPinned: bool, text: string): void {
+            if (kind === "switch-refused") {
+                page.roamingFocus = 0;
+            }
+        }
+    }
+
     // Turning a network off with an account of it asks first: the account stays linked and
     // readable, nothing is sent or received until the network is on again.
     function askTurnOff(kind: string, name: string, text: string): void {
@@ -214,6 +231,22 @@ FormCard.FormCardPage {
             description: L10n.i18nc("@info", "Off: squares with your theme's corners.")
             checked: App.settings.roundAvatars
             onToggled: App.settings.roundAvatars = checked
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
+            objectName: "tint-rows"
+            text: L10n.i18nc("@option:check", "Tint chats with their account's color")
+            description: L10n.i18nc("@info", "Right-click an account in the side panel to choose its color.")
+            checked: App.settings.tintRows
+            onToggled: App.settings.tintRows = checked
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
+            objectName: "chat-wallpaper"
+            text: L10n.i18nc("@option:check", "Drawings behind messages")
+            description: L10n.i18nc("@info", "A faint pattern in the color of the chat's account.")
+            checked: App.settings.chatWallpaper
+            onToggled: App.settings.chatWallpaper = checked
         }
     }
 
@@ -431,6 +464,93 @@ FormCard.FormCardPage {
                 text: Style.plain(accountCard.modelData.about)
                 textItem.textFormat: Text.PlainText
                 icon.name: "im-user"
+            }
+            // "Sync chat changes with my phone" (A10d D5): whether Archive, Pin, Mute and Mark as
+            // Unread made here are also written to the phone and the other devices. The row is
+            // there only for an account whose network writes them (`roaming` is "" otherwise:
+            // a hidden row has no height and takes no key). The mark follows the echo, not the
+            // click; it flips at once, no question (the lead's call M8). While the account cannot
+            // flip it, `roamingNote` says why and the row is off.
+            FormCard.FormDelegateSeparator {
+                visible: accountCard.modelData.roaming !== ""
+            }
+            FormCard.FormSwitchDelegate {
+                id: roamingRow
+                visible: accountCard.modelData.roaming !== ""
+                objectName: "roaming-" + accountCard.account
+                text: L10n.i18nc("@option:check", "Sync chat changes with my phone")
+                description: accountCard.modelData.roamingNote !== "" ? accountCard.modelData.roamingNote : L10n.i18nc("@info", "Archive, pin, mute and unread marks made here also change on your phone and your other devices.")
+                enabled: accountCard.modelData.roamingNote === ""
+                // The clicked value is held (`pendingOn`) until the core's echo, the switch's
+                // refusal or 5 s, so the handle does not spring back to the old state while the
+                // answer is on its way, which looked like a refusal (L5).
+                property var pendingOn: null
+                readonly property bool coreOn: accountCard.modelData.roaming === "on"
+                onCoreOnChanged: roamingRow.pendingOn = null
+                checked: roamingRow.pendingOn !== null ? roamingRow.pendingOn : roamingRow.coreOn
+                Timer {
+                    id: pendingTimer
+
+                    interval: 5000
+                    onTriggered: roamingRow.pendingOn = null
+                }
+                Connections {
+                    target: App
+                    function onChatTold(kind: string, conversation: var, wasPinned: bool, text: string): void {
+                        if (kind === "switch-refused") {
+                            roamingRow.pendingOn = null;
+                        }
+                    }
+                }
+                // With several accounts the rows have the same name: the delegate's own
+                // description (what the switch does) would be all a screen reader hears, so the
+                // account's line goes in front of it (L1: FormSwitchDelegate binds
+                // `Accessible.description` to its description alone).
+                Accessible.description: accountCard.modelData.about + ". " + roamingRow.description
+                // The keyboard goes to the row of the NEW card after the echo (see `roamingFocus`).
+                Component.onCompleted: {
+                    if (page.roamingFocus === accountCard.account && accountCard.modelData.roaming !== "") {
+                        Qt.callLater(roamingRow.takeKeyboard);
+                    }
+                }
+                function takeKeyboard(): void {
+                    // (The echo can remake the card again before this runs; then the next row
+                    // of the account takes it, and `roamingFocus` is still set.)
+                    if (roamingRow === null || page.roamingFocus !== accountCard.account) {
+                        return;
+                    }
+                    // FormCardPage scrolls a newly focused item into view by the place it has NOW
+                    // (its `onActiveFocusItemChanged`, run inside the call), and the cards that were
+                    // just made are not laid out yet: the row stands at the top and the view would
+                    // jump there (seen in `settings_ui` `roaming`, one flip in two). The person
+                    // left the view where it is, and the row was in it: it stays.
+                    const kept = page.flickable.contentY;
+                    roamingRow.forceActiveFocus(Qt.TabFocusReason);
+                    page.flickable.contentY = kept;
+                    page.roamingFocus = 0;
+                }
+                // A held Space toggles once, not again with every repeat (qml.md: "A held key
+                // and a button"; L5). The repeats of EVERY key are taken here, Tab and Backtab
+                // excepted; the first press and the real release reach the switch. The parameter
+                // is untyped so a test can hand over a stand-in event.
+                function holdKey(event: var): void {
+                    if (event.isAutoRepeat && event.key !== Qt.Key_Tab && event.key !== Qt.Key_Backtab) {
+                        event.accepted = true;
+                    }
+                }
+                Keys.onPressed: event => roamingRow.holdKey(event)
+                Keys.onReleased: event => roamingRow.holdKey(event)
+                // Applied at once; the handle stays at the clicked value until the core's echo (the
+                // mark then follows what the core holds) or the refusal ("The setting could not
+                // be saved."), which puts the old state back.
+                onToggled: {
+                    page.roamingFocus = accountCard.account;
+                    const want = roamingRow.checked;
+                    roamingRow.pendingOn = want;
+                    pendingTimer.restart();
+                    roamingRow.checked = Qt.binding(() => roamingRow.pendingOn !== null ? roamingRow.pendingOn : roamingRow.coreOn);
+                    App.setRoamingWrites(accountCard.account, want);
+                }
             }
             FormCard.FormDelegateSeparator {
                 visible: accountCard.modelData.transfer

@@ -958,7 +958,7 @@ MainWindow {
             const out = win.mode === "already-out";
             const leave = out ? "Go to Chats" : "OK";
             if (App.login.retry) return win.fail("an account that is here offers Try Again");
-            if (App.login.leave !== leave) return win.fail("the way back: '" + App.login.leave + "'");
+            if (App.login.leave !== leave) return win.fail("the way back: '" + App.login.leave + "' (kind '" + App.login.kind + "', error '" + App.login.error + "')");
             if (App.login.error.indexOf("already in Kourier") < 0) return win.fail("the text: " + App.login.error);
             if (out !== (App.login.error.indexOf("“Link Again”") >= 0)) return win.fail("the text and Link Again: " + App.login.error);
             if (win.linkPage === null || !win.linking()) return win.fail("the failure is not on the link page");

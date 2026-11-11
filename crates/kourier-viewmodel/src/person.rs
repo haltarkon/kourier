@@ -94,8 +94,8 @@ pub struct PersonView {
     pub safety_shown: bool,
     /// The quiet line under it ("Verified", "Safety number changed"); empty otherwise.
     pub safety_state: String,
-    /// "Copy Link" is shown (P5b): the network has links to people and this is not the own
-    /// page (BQ-4).
+    /// "Copy Link" is shown (P5b): the network has links to people, and for the own page there
+    /// is one (the own number or ID; BQ-4 kept it off the own page before copy-and-links).
     pub link_shown: bool,
     /// Why the button is disabled ("%1's phone number is not shown."), a quiet line under
     /// it and its accessible description; empty when there is a link.
@@ -170,7 +170,7 @@ pub fn person_view(
 
     // A person known only by their number is named by it: a second line with the same text
     // would only repeat the name.
-    let number = Some(shown_number(detail))
+    let number = Some(shown_number(detail, network))
         .filter(|n| *n != name)
         .unwrap_or_default();
 
@@ -388,8 +388,12 @@ pub fn no_name_text(name: &str) -> String {
 /// The number the page may show, or an empty string. Signal's rule is applied below the
 /// seam (the contact's `number_shown`); here: a number is shown only when the backend said so
 /// (`Some(true)`; "never said" is NOT shown), a person known by their number alone shows it
-/// (nothing else names them), and the user's own page shows the account's number.
-fn shown_number(detail: &PersonDetail) -> String {
+/// (nothing else names them), and the user's own page shows the account's number. A Threema ID is
+/// the public address people hand each other, so the page shows it, on every page of that network.
+fn shown_number(detail: &PersonDetail, network: NetworkKind) -> String {
+    if network == NetworkKind::Threema {
+        return single_line(detail.user.value());
+    }
     if detail.is_self {
         return detail
             .own_number
@@ -412,4 +416,88 @@ fn shown_number(detail: &PersonDetail) -> String {
         .find(|i| i.kind == IdentifierKind::Phone)
         .map(|i| single_line(&i.value))
         .unwrap_or_default()
+}
+/// What a copy action takes from a person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyPart {
+    /// The number or ID their page shows.
+    Address,
+    /// The link to them, when their page has one.
+    Link,
+}
+
+/// Who a copy action is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyTarget {
+    /// A person of an account (a member's row).
+    Person {
+        /// The account.
+        account: AccountId,
+        /// The person.
+        user: UserId,
+    },
+    /// The other side of a direct chat (a chat's row).
+    Chat(ConversationId),
+    /// The account itself (an account's row).
+    Account(AccountId),
+}
+
+/// What a copy action in flight asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyAsked {
+    /// A part of a person's page.
+    Person(CopyPart),
+    /// An action on a group's invite link.
+    Invite(kourier_model::GroupInviteAction),
+}
+
+/// The answer to a copy action: what goes on the clipboard and what the toast says. The text
+/// holds a number or a link: it never reaches a log and it does not pass through QML.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyUpdate {
+    /// For the clipboard; `None` when the person has nothing of that kind to copy.
+    pub text: Option<Redacted<String>>,
+    /// The toast. It holds no number and no link.
+    pub told: String,
+}
+
+/// The toast after anything copied that is not a link.
+pub fn copied_text() -> String {
+    trc("@info:status toast after a copy action", "Copied").into_owned()
+}
+
+/// The answer to a copy action about `detail` (`None`: nobody there), by the rules of the
+/// person's page: the number or ID the page shows, the link the page has.
+pub fn copy_update(
+    detail: Option<&PersonDetail>,
+    part: CopyPart,
+    network: NetworkKind,
+) -> CopyUpdate {
+    let text = detail.and_then(|d| match part {
+        CopyPart::Address => Some(shown_number(d, network)).filter(|n| !n.is_empty()),
+        CopyPart::Link => match &d.link {
+            LinkState::Link(link) => Some(link.expose().clone()),
+            _ => None,
+        },
+    });
+    let told = match (part, text.is_some()) {
+        (CopyPart::Address, true) => copied_text(),
+        (CopyPart::Link, true) => {
+            trc("@info:status toast after Copy Link", "Link copied").into_owned()
+        }
+        (CopyPart::Address, false) => trc(
+            "@info:status toast, the person has no number or ID Kourier may show",
+            "No number or ID to copy",
+        )
+        .into_owned(),
+        (CopyPart::Link, false) => trc(
+            "@info:status toast, the person has no link Kourier may make",
+            "No link to copy",
+        )
+        .into_owned(),
+    };
+    CopyUpdate {
+        text: text.map(Redacted::new),
+        told,
+    }
 }

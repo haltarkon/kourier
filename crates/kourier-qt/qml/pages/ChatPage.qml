@@ -412,6 +412,158 @@ Kirigami.Page {
             tooltip: App.timeline.timerHeld
             onTriggered: page.openTimerMenu()
         },
+        // What the chat offers of the settings the phone shares (A10d), from the core's offer for
+        // the open chat: Mark as Unread, Pin, Mute (with its times), Archive. All in the overflow
+        // menu. An entry the chat does not offer is not shown; one the sync switch greys says why
+        // in its tooltip and in the line below the entries.
+        Kirigami.Action {
+            icon.name: "mail-mark-unread"
+            text: L10n.i18nc("@action:inmenu", "Mark as Unread")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true && page.offer.hasUnread !== true
+            enabled: page.offer.on === true
+            tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
+            onTriggered: App.setMarkedUnread(App.timeline.conversationId, true)
+        },
+        Kirigami.Action {
+            id: pinAction
+
+            readonly property bool pinned: page.offer.pinned === true
+            icon.name: pinAction.pinned ? "window-unpin" : "pin"
+            text: pinAction.pinned ? L10n.i18nc("@action:inmenu", "Unpin") : L10n.i18nc("@action:inmenu", "Pin")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true
+            enabled: page.offer.on === true && (pinAction.pinned || page.offer.pinAtLimit !== true)
+            tooltip: pinAction.enabled ? "" : Style.plain(page.offer.on === true ? page.offer.pinWhy : page.offer.why)
+            onTriggered: App.setPinned(App.timeline.conversationId, !pinAction.pinned)
+        },
+        // Mute with its times (Signal Desktop's order) while the chat can be muted and the sync is
+        // on; the greyed flat entry below stands for the off state (a sub-menu's entries do not
+        // inherit a parent's `enabled`).
+        Kirigami.Action {
+            icon.name: "player-volume-muted"
+            text: L10n.i18nc("@title:menu", "Mute")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.on === true && page.offer.muteOffered === true && page.offer.muted !== true
+            enabled: visible
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "1 Hour")
+                onTriggered: App.muteFor(App.timeline.conversationId, "hour")
+            }
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "8 Hours")
+                onTriggered: App.muteFor(App.timeline.conversationId, "eight")
+            }
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "1 Day")
+                onTriggered: App.muteFor(App.timeline.conversationId, "day")
+            }
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "1 Week")
+                onTriggered: App.muteFor(App.timeline.conversationId, "week")
+            }
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "Until…")
+                onTriggered: page.untilAsked(App.timeline.conversationId, null)
+            }
+            Kirigami.Action {
+                text: L10n.i18nc("@action:inmenu", "Always")
+                onTriggered: App.muteFor(App.timeline.conversationId, "always")
+            }
+        },
+        Kirigami.Action {
+            icon.name: "player-volume-muted"
+            text: L10n.i18nc("@action:inmenu", "Mute")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true && page.offer.on !== true && page.offer.muteOffered === true && page.offer.muted !== true
+            enabled: false
+            tooltip: Style.plain(page.offer.why)
+        },
+        // When a mute ends (his answer to question 1): a quiet line above Unmute.
+        Kirigami.Action {
+            text: page.offer.mutedLabel ? page.offer.mutedLabel : ""
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.muted === true && page.offer.mutedLabel !== undefined && page.offer.mutedLabel !== ""
+            enabled: visible
+            // An item of 18 grid units with the wrapping label inside (as the row menu's): an
+            // unwrapped label would make the menu as wide as the whole sentence (M3).
+            displayComponent: Item {
+                implicitWidth: Kirigami.Units.gridUnit * 18
+                implicitHeight: mutedText.implicitHeight + Kirigami.Units.smallSpacing * 2
+                Accessible.role: Accessible.StaticText
+                Accessible.name: mutedText.text
+
+                QQC2.Label {
+                    id: mutedText
+
+                    anchors.fill: parent
+                    anchors.leftMargin: Kirigami.Units.largeSpacing
+                    anchors.rightMargin: Kirigami.Units.largeSpacing
+                    verticalAlignment: Text.AlignVCenter
+                    text: page.offer.mutedLabel ? page.offer.mutedLabel : ""
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                }
+            }
+        },
+        Kirigami.Action {
+            icon.name: "player-volume"
+            text: L10n.i18nc("@action:inmenu", "Unmute")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true && page.offer.muteOffered === true && page.offer.muted === true
+            enabled: page.offer.on === true
+            tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
+            onTriggered: App.unmute(App.timeline.conversationId)
+        },
+        Kirigami.Action {
+            id: archiveAction
+
+            readonly property bool archived: page.offer.archived === true
+            icon.name: archiveAction.archived ? "archive-remove" : "archive-insert"
+            text: archiveAction.archived ? L10n.i18nc("@action:inmenu", "Unarchive") : L10n.i18nc("@action:inmenu", "Archive")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true
+            enabled: page.offer.on === true
+            tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
+            onTriggered: archiveAction.archived ? page.unarchiveAsked(App.timeline.conversationId) : page.archiveAsked(App.timeline.conversationId)
+        },
+        // Why the entries above are grey, or why Pin is: right under Archive, as in the row menu
+        // (a wrapping label: the sentence is long). Known limit: Kirigami's overflow gives the page
+        // no hook when the menu opens, so a screen reader is not told it (the row menu announces it).
+        Kirigami.Action {
+            text: page.offerLine
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offerLine !== ""
+            enabled: visible
+            // An item of 18 grid units with the wrapping label inside (as the row menu's): an
+            // unwrapped label would make the menu as wide as the whole sentence (M3).
+            displayComponent: Item {
+                implicitWidth: Kirigami.Units.gridUnit * 18
+                implicitHeight: offerText.implicitHeight + Kirigami.Units.smallSpacing * 2
+                Accessible.role: Accessible.StaticText
+                Accessible.name: offerText.text
+
+                QQC2.Label {
+                    id: offerText
+
+                    anchors.fill: parent
+                    anchors.leftMargin: Kirigami.Units.largeSpacing
+                    anchors.rightMargin: Kirigami.Units.largeSpacing
+                    verticalAlignment: Text.AlignVCenter
+                    text: page.offerLine
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                }
+            }
+        },
+        Kirigami.Action {
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && page.offer.shown === true
+            enabled: visible
+            separator: true
+        },
         // What is done to the chat as a whole lives in the page's menu; both ask first.
         // While the chat's message history still arrives both wait, and the menu says why
         // (`App.timeline.stillFilling`; link feedback L3).
@@ -495,6 +647,21 @@ Kirigami.Page {
 
     background: Rectangle {
         color: Kirigami.Theme.backgroundColor
+
+        // The drawings behind the messages, in the color of the chat's account (Settings →
+        // General). One tile per color, made the first time it is asked for: not at the start.
+        Image {
+            readonly property string tint: App.timeline.tint
+
+            anchors.fill: parent
+            visible: page.open && App.settings.chatWallpaper && !Style.highContrast && tint !== ""
+            source: visible ? "image://kourierart/doodle/" + tint.slice(1) : ""
+            sourceSize: Qt.size(Style.doodleSide, Style.doodleSide)
+            fillMode: Image.Tile
+            horizontalAlignment: Image.AlignLeft
+            verticalAlignment: Image.AlignTop
+            opacity: visible ? Style.tintStrength(tint, Kirigami.Theme.backgroundColor, 0.12, 0.6) : 0
+        }
     }
 
     // `--page=history`: keep the view at the oldest message while older pages load.
@@ -547,6 +714,18 @@ Kirigami.Page {
 
     // A chat the panel offers (a group in common, Message) is to be opened.
     signal conversationRequested(real id)
+    // The menu asks: Archive, Unarchive or Mute "Until…" for the open chat `conv` (the window does
+    // the work: `MainWindow`).
+    signal archiveAsked(real conv)
+    signal unarchiveAsked(real conv)
+    signal untilAsked(real conv, var back)
+
+    // What the open chat offers (the core's offer, a map; empty while no chat is open) and the
+    // line under the menu's entries: why they are grey, else why Pin is.
+    // (Read only while a chat is open: until the model has had a header the property is an invalid
+    // variant, which QML must never read.)
+    readonly property var offer: page.open ? App.timeline.chatOffer : ({})
+    readonly property string offerLine: page.offer.why ? page.offer.why : (page.offer.pinAtLimit === true && page.offer.pinned !== true && page.offer.pinWhy ? page.offer.pinWhy : "")
 
     // Files dragged in (Dolphin, the desktop) are attached to the message being written.
     DropArea {

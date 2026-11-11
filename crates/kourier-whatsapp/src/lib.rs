@@ -53,11 +53,13 @@
 
 mod actor;
 mod appstate;
+mod avatars;
 mod blocklist;
 mod book;
 mod calls;
 mod catchup;
 mod db;
+mod download;
 mod error;
 mod events;
 mod facts;

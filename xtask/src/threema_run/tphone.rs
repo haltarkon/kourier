@@ -50,6 +50,12 @@ pub(super) fn marker_for(slot: &str, nonce: &str) -> String {
     format!("kourier-rt1-{slot}-{nonce}")
 }
 
+/// Whether `text` has the shape of a marker of the step `slot`: nothing else can be a step's own send.
+pub(super) fn is_marker_for(slot: &str, text: &str) -> bool {
+    text.strip_prefix(&marker_for(slot, ""))
+        .is_some_and(|nonce| !nonce.is_empty() && nonce.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Words the next calls of [`random_letters`] on this thread return (a test that must know them).

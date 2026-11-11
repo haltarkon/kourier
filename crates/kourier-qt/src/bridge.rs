@@ -199,6 +199,10 @@ pub mod qobject {
             reader: fn(&str, i32, i32) -> Vec<u8>,
         );
 
+        /// Registers `image://kourierart`: the app's own drawings, in a color of the request.
+        #[cxx_name = "installArtProvider"]
+        fn install_art_provider(engine: Pin<&mut QQmlApplicationEngine>);
+
         /// Requests of the provider that are queued or being decoded.
         #[cxx_name = "pendingImageRequests"]
         fn pending_image_requests() -> i32;
@@ -621,6 +625,94 @@ pub mod qobject {
         #[qinvokable]
         fn mark_read(self: Pin<&mut App>, conversation: i64);
 
+        /// Archives (`on`) or unarchives the conversation `conversation` (any chat, open or not;
+        /// the chat's menu and the keys). The notice ("Chat archived") comes as `chatTold`, once
+        /// the core's row says so. Nothing for `conversation` 0 or less.
+        #[qinvokable]
+        fn set_archived(self: Pin<&mut App>, conversation: i64, on: bool);
+
+        /// Pins (`on`) or unpins `conversation`.
+        #[qinvokable]
+        fn set_pinned(self: Pin<&mut App>, conversation: i64, on: bool);
+
+        /// Marks `conversation` unread (`on`) or removes the mark. On the open chat the mark
+        /// stays until a real reading.
+        #[qinvokable]
+        fn set_marked_unread(self: Pin<&mut App>, conversation: i64, on: bool);
+
+        /// Takes an archive back (the notice's "Undo"): unarchives `conversation` and, when the
+        /// archive took a pin with it (`wasPinned`), pins it again. Leaves no notice.
+        #[qinvokable]
+        fn undo_archive(self: Pin<&mut App>, conversation: i64, was_pinned: bool);
+
+        /// Ends the mute of `conversation`.
+        #[qinvokable]
+        fn unmute(self: Pin<&mut App>, conversation: i64);
+
+        /// Mutes `conversation` for `choice`: `"hour"`, `"eight"`, `"day"`, `"week"` or
+        /// `"always"` (the time is computed in Rust from the source's clock). Any other word does
+        /// nothing.
+        #[qinvokable]
+        fn mute_for(self: Pin<&mut App>, conversation: i64, choice: &QString);
+
+        /// Mutes `conversation` until the local date and time given ("Until…"). `false` when
+        /// the time is not allowed (it ends inside the next minute, or it is no date); nothing is
+        /// sent then.
+        #[qinvokable]
+        fn mute_until(
+            self: Pin<&mut App>,
+            conversation: i64,
+            year: i32,
+            month: i32,
+            day: i32,
+            hour: i32,
+            minute: i32,
+        ) -> bool;
+
+        /// Whether `muteUntil` would take this local date and time now (the dialog's Mute button
+        /// follows it).
+        #[qinvokable]
+        fn mute_until_allowed(
+            self: &App,
+            year: i32,
+            month: i32,
+            day: i32,
+            hour: i32,
+            minute: i32,
+        ) -> bool;
+
+        /// Where the "Until…" dialog starts, tomorrow at 8:00 on the local clock: a map of `year`,
+        /// `month`, `day`, `hour` and `minute`.
+        #[qinvokable]
+        fn mute_until_start(self: &App) -> QVariant;
+
+        /// Turns the account's switch for writing its chats' archive, pin, mute and unread marks
+        /// to its other devices on or off (Settings → Accounts). A refusal is told as
+        /// `chatTold("switch-refused", …)`.
+        #[qinvokable]
+        fn set_roaming_writes(self: Pin<&mut App>, account: i64, on: bool);
+
+        /// What the menu of `conversation` offers of Archive, Pin, Mute and Mark as Unread: a
+        /// map of `shown`, `on`, `archived`, `pinned`, `pinAtLimit`, `pinWhy`, `markedUnread`,
+        /// `hasUnread`, `muteOffered`, `muted`, `mutedLabel` and `why` (the chat's own account's
+        /// statement, in the list or not). An empty map for `conversation` 0 or less.
+        #[qinvokable]
+        fn chat_offer(self: &App, conversation: i64) -> QVariant;
+
+        /// A change of a chat or of the sync switch left a short notice, told once: `kind` is
+        /// `"archived"`, `"unarchived"`, `"marked-unread"`, `"refused"` (a change of the chat was refused) or
+        /// `"switch-refused"`, `conversation` the chat (0 for the switch's), `wasPinned` whether an archive took a pin with it (Undo
+        /// pins the chat again), `text` the words. Emitted after the list has followed the change
+        /// and an open chat that archived has closed.
+        #[qsignal]
+        fn chat_told(
+            self: Pin<&mut App>,
+            kind: QString,
+            conversation: i64,
+            was_pinned: bool,
+            text: QString,
+        );
+
         /// Removes one attachment of a message of the open conversation for this account.
         /// The caller asked first.
         #[qinvokable]
@@ -687,6 +779,31 @@ pub mod qobject {
         /// Puts `text` on the clipboard ("Copy Text").
         #[qinvokable]
         fn copy_text(self: &App, text: &QString);
+
+        /// Puts text that is on screen on the clipboard and says so (`copyTold`): a name, a
+        /// number or an ID of a page.
+        #[qinvokable]
+        fn copy_shown(self: Pin<&mut App>, text: &QString);
+
+        /// "Copy Number or ID" (`part` "number") or "Copy Link" (`part` "link") of a member's
+        /// row. Rust finds it and copies it (the link never passes through QML); `copyTold` says
+        /// what came of it. `false`: nothing was asked.
+        #[qinvokable]
+        fn copy_person(self: Pin<&mut App>, part: &QString, account: i64, user: &QString) -> bool;
+
+        /// The same for the other side of a direct chat (a chat's row).
+        #[qinvokable]
+        fn copy_chat(self: Pin<&mut App>, part: &QString, conversation: i64) -> bool;
+
+        /// The same for an account itself (an account's row).
+        #[qinvokable]
+        fn copy_account(self: Pin<&mut App>, part: &QString, account: i64) -> bool;
+
+        /// An action on the invite link of a group's page (`action` "read", "reset", "on" or
+        /// "off"): Rust asks the network and copies the link (it never passes through QML);
+        /// `copyTold` says what came of it. `false`: nothing was asked.
+        #[qinvokable]
+        fn group_invite(self: Pin<&mut App>, action: &QString, conversation: i64) -> bool;
 
         /// "Copy Link" of the person's page on screen (P5b): Rust copies the link it holds for
         /// that page (the URL never passes through QML). `false` when there is none.
@@ -763,6 +880,10 @@ pub mod qobject {
         /// chat has no person (a group, no chat open).
         #[qinvokable]
         fn show_person_of_chat(self: Pin<&mut App>) -> bool;
+
+        /// A copy action is done: the toast's text, which holds no number and no link.
+        #[qsignal]
+        fn copy_told(self: Pin<&mut App>, text: QString);
 
         /// The page asked for with `showPersonOfChat` is in `person`. Comes again when the
         /// contact, their chat or their groups change while the page is shown.
@@ -903,6 +1024,10 @@ pub mod qobject {
         /// when the account is gone or does not offer the action.
         #[qinvokable]
         fn ask_account_action(self: Pin<&mut App>, account: i64, action: &QString);
+
+        /// Gives an account a color of its own (`#rrggbb`); empty: its network's again.
+        #[qinvokable]
+        fn set_account_tint(self: Pin<&mut App>, account: i64, tint: &QString);
 
         /// Put this question to the user: the map of `replaceAsked` and its `action`. The
         /// answer is `confirmAccountAction` or `cancelAccountAction`.
@@ -1548,6 +1673,7 @@ pub mod qobject {
         #[qproperty(bool, is_self)]
         #[qproperty(bool, muted)]
         #[qproperty(QString, avatar_url)]
+        #[qproperty(QString, tint)]
         #[qproperty(QString, cannot_send)]
         #[qproperty(QString, attach_kinds)]
         #[qproperty(QString, timer_label)]
@@ -1559,6 +1685,7 @@ pub mod qobject {
         #[qproperty(bool, deletes_sync)]
         #[qproperty(QString, still_filling)]
         #[qproperty(QString, timer_held)]
+        #[qproperty(QVariant, chat_offer)]
         #[qproperty(bool, has_older)]
         #[qproperty(bool, has_newer)]
         #[qproperty(bool, loading)]
@@ -1883,6 +2010,8 @@ pub mod qobject {
         #[qproperty(bool, compact, READ, WRITE = set_compact_pref, NOTIFY = changed)]
         #[qproperty(bool, blend_accounts, READ, WRITE = set_blend_accounts_pref, NOTIFY = changed)]
         #[qproperty(bool, round_avatars, READ, WRITE = set_round_avatars_pref, NOTIFY = changed)]
+        #[qproperty(bool, tint_rows, READ, WRITE = set_tint_rows_pref, NOTIFY = changed)]
+        #[qproperty(bool, chat_wallpaper, READ, WRITE = set_chat_wallpaper_pref, NOTIFY = changed)]
         #[qproperty(f64, avatar_corner, READ, WRITE = set_avatar_corner_pref, NOTIFY = changed)]
         #[qproperty(i32, notification_content, READ, WRITE = set_notification_content_pref, NOTIFY = changed)]
         #[qproperty(i32, location_files, READ, WRITE = set_location_files_pref, NOTIFY = changed)]
@@ -1939,6 +2068,12 @@ pub mod qobject {
 
         /// Avatars are circles; off, squares with the theme's corners.
         fn set_round_avatars_pref(self: Pin<&mut SettingsController>, value: bool);
+
+        /// Chat rows carry a faint wash of their account's color.
+        fn set_tint_rows_pref(self: Pin<&mut SettingsController>, value: bool);
+
+        /// The pattern of small drawings behind a chat's messages.
+        fn set_chat_wallpaper_pref(self: Pin<&mut SettingsController>, value: bool);
 
         /// The corner of a square avatar in the theme, as a share of the side of a list
         /// avatar. QML sets it from the theme; notification avatars (drawn in Rust, which

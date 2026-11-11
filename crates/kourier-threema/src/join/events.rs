@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 
 use kourier_backend_api::BackendEvent;
 use kourier_model::{
-    AccountSettingsPatch, AttachmentKind, CannotSend, ContactPatch, ConvKey, ConversationFeatures,
+    AccountSettingsPatch, AttachmentKind, ContactPatch, ConvKey, ConversationFeatures,
     ConversationPatch, FileLimits, Member, MemberList, MemberRole, Patch, Support, UserId, Window,
 };
 use libthreema::protobuf::d2d_sync;
@@ -217,14 +217,14 @@ pub(crate) fn contact_event(
 /// - the RECEIVE windows OPEN (`Window { None, None }`): the spec applies an edit's and a delete's time
 ///   constraint "on the sender side only. The receiver will always accept" (`csp-e2e.proto`), and the core
 ///   drops an edit or delete outside a stated window;
-/// - the SEND side OFF until TH7: no edit, no delete for everyone, no reply, no reactions offered, and
-///   `cannot_send: Some(CannotSend::NotYetBuilt)` (the composer's quiet line, his QD); a delete for me stays
+/// - the SEND side (TH8) is a text or one file: no edit, no delete for everyone, no reply, no reactions offered; a delete
+///   for me stays
 ///   local (`delete_for_me: false`: nothing reaches the network); no admin delete (Threema has none);
 /// - `reactions_per_user: None`: Threema keeps a SET of reactions per user;
-/// - `files` (TH5b B1, decision R3 F2): EVERY attachment kind with `FileLimits { max_size: 0, caption: true }`,
+/// - `files` (TH5b B1, decision R3 F2): EVERY attachment kind with a limit and `caption: true`,
 ///   only so the core takes a received edit of a file's CAPTION (it checks that the chat's `files` say every
-///   kind of the message takes a caption). The send side stays off through `cannot_send: NotYetBuilt`; TH7
-///   sets the real limits (`max_size: 0` is "no limit" to the core's import, not a promise).
+///   kind of the message takes a caption). TH8: a text is held under Desktop's limit (`MAX_TEXT_BYTES`: PREPARE's box has
+///   random padding, so the last bytes under its own limit are a matter of chance), a file under what Threema carries.
 ///
 /// Everything else is the contract's most restrictive default (no timers, no group actions).
 pub(crate) fn features() -> ConversationFeatures {
@@ -242,22 +242,25 @@ pub(crate) fn features() -> ConversationFeatures {
         reactions_per_user: None,
         delete_for_me: false,
         admin_delete: false,
+        max_text_bytes: Some(MAX_TEXT_BYTES),
         files: ATTACHMENT_KINDS
             .into_iter()
             .map(|kind| {
                 (
                     kind,
                     FileLimits {
-                        max_size: 0,
+                        max_size: crate::blob::MAX_FILE as u64,
                         caption: true,
                     },
                 )
             })
             .collect(),
-        cannot_send: Some(CannotSend::NotYetBuilt),
         ..ConversationFeatures::default()
     }
 }
+
+/// The longest text a composer takes (Desktop's `MAX_TEXT_MESSAGE_BYTES`).
+const MAX_TEXT_BYTES: u32 = 6_000;
 
 /// Every [`AttachmentKind`] (the six of the model; the unit test holds the list against an exhaustive match,
 /// so a kind the model adds is a failing test here).
@@ -394,7 +397,7 @@ pub(crate) fn direct_patch(
 }
 
 /// The 1:1 chat's patch of a stored contact WHATEVER its acquaintance level: the key and [`chat_state`]
-/// (features, `NotYetBuilt`, protected, archive / pin, mute). [`direct_patch`] for a direct contact; for a
+/// (features, protected, archive / pin, mute). [`direct_patch`] for a direct contact; for a
 /// HIDDEN one only `reflect::map` asks (TH5 A8, E5: its message makes the core create the chat, which then
 /// carries the features first in the same row).
 pub(crate) fn one_to_one_patch(contact: &d2d_sync::Contact) -> Result<ConversationPatch, BadId> {
@@ -653,7 +656,7 @@ mod tests {
     }
 
     /// H2 written out with EVERY field named (no `..`): the receive windows open, the send side off,
-    /// `NotYetBuilt`, a set of reactions per user, every attachment kind with `max_size: 0` and a caption
+    /// a chat that can be sent in, a set of reactions per user, every attachment kind with its limit and a caption
     /// (TH5b R3 F2), the rest the contract's most restrictive values.
     fn h2_features() -> ConversationFeatures {
         let open = Window {
@@ -661,7 +664,7 @@ mod tests {
             max_count: None,
         };
         ConversationFeatures {
-            max_text_bytes: None,
+            max_text_bytes: Some(MAX_TEXT_BYTES),
             formatting: std::collections::BTreeMap::new(),
             files: [
                 AttachmentKind::Image,
@@ -676,7 +679,7 @@ mod tests {
                 (
                     kind,
                     FileLimits {
-                        max_size: 0,
+                        max_size: crate::blob::MAX_FILE as u64,
                         caption: true,
                     },
                 )
@@ -701,8 +704,9 @@ mod tests {
             history: kourier_model::HistorySource::None,
             group_actions: kourier_model::GroupActions::default(),
             group_info: None,
-            cannot_send: Some(CannotSend::NotYetBuilt),
+            cannot_send: None,
             roaming_listed: None,
+            invite_link_on: false,
         }
     }
 
@@ -1040,13 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn threema_features_are_h2s_receive_open_send_off_and_not_yet_built() {
+    fn threema_features_are_h2s_receive_open_and_th8s_text_and_files_to_send() {
         assert_eq!(
             features(),
             h2_features(),
             "Threema's features differ from H2's"
         );
-        assert_eq!(features().cannot_send, Some(CannotSend::NotYetBuilt));
+        assert_eq!(features().cannot_send, None);
         let f = features();
         for window in [f.edit_receive, f.delete_receive] {
             assert!(
@@ -1105,11 +1109,11 @@ mod tests {
         );
     }
 
-    /// TH5b B1 (R3, F2): the chat's `files` name EVERY attachment kind, each with a caption and `max_size: 0`,
+    /// TH5b B1 (R3, F2): the chat's `files` name EVERY attachment kind, each with a caption and the mirror's limit,
     /// so the core takes a received edit of a file's caption; nothing else about files is stated (no album
-    /// packing: the send side is off).
+    /// packing: one file per message).
     #[test]
-    fn the_files_state_every_attachment_kind_with_a_caption_and_no_size_limit() {
+    fn the_files_state_every_attachment_kind_with_a_caption_and_the_mirrors_limit() {
         // An exhaustive match: a kind the model adds does not compile here until it is decided.
         let _every_kind = |kind: AttachmentKind| match kind {
             AttachmentKind::Image
@@ -1132,7 +1136,7 @@ mod tests {
             assert_eq!(
                 files.get(&kind),
                 Some(&FileLimits {
-                    max_size: 0,
+                    max_size: crate::blob::MAX_FILE as u64,
                     caption: true
                 }),
                 "a kind lacks its limits: {kind:?}"

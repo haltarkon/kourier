@@ -100,6 +100,10 @@ pub enum Launch {
     /// The user's profile with the compiled-in networks.
     #[default]
     Normal,
+    /// The user's profile like [`Launch::Normal`], driven by `--dev-control` (a scripted start: the
+    /// demo, the smoke and run tools, an agent's own run). Threema is absent in such a start unless
+    /// the run tool made it (`prefs::ThreemaStart`).
+    Scripted,
     /// A throwaway profile in a temporary `KOURIER_HOME` with only the fake network (§10.2).
     Fixture(FixtureOptions),
     /// The reference profile of the quality targets (§1.3) in a directory of its own, with
@@ -163,6 +167,10 @@ pub struct FixtureOptions {
     /// group's timer, the only change a command can make to the page; a fixture page leaves
     /// it off, its picture shows the read-only value).
     pub group_timers: bool,
+    /// With the showcase chats: the account is an administrator of the group of `--page=group`,
+    /// so the page offers the invite link (`--page=groupadmin` and the tests of the link; the
+    /// page of a plain member has no such part).
+    pub group_admin: bool,
     /// With the showcase chats: seven messages are added to the group of `--page=group`, two members
     /// write them (a run of two by one of them among them) and four mention each other and the
     /// account, one under a spoiler, one inside a link, one beside a forged mention link (the tests of the senders and mentions that open a
@@ -259,6 +267,12 @@ pub struct FixtureOptions {
     /// knob of the window tests (`settings_ui`, `networks_ui`); no page sets it, so no picture
     /// has a missing Telegram. `None`: the build lacks nothing, as before.
     pub telegram_missing: Option<TelegramMissing>,
+    /// The fixture's network rejects every change the person makes (`Script::reject_changes`,
+    /// like a rejected Threema transaction): an archive, a pin, a mute, a mark and the Settings
+    /// switch "Sync chat changes with my phone" all come back refused. A knob of the window tests
+    /// (`settings_ui` `roaming-refused`, `roaming_ui`'s refusals); no page sets it, so no picture
+    /// has a refused change. `false`: the network accepts, as before.
+    pub reject_changes: bool,
 }
 
 /// What a page of WhatsApp's own states puts into the fixture account
@@ -450,6 +464,7 @@ impl Default for FixtureOptions {
             person_groups: 0,
             group_members: 0,
             group_timers: false,
+            group_admin: false,
             group_mentions: false,
             safety_changed: false,
             safety_peer: false,
@@ -469,6 +484,7 @@ impl Default for FixtureOptions {
             window_sends: false,
             telegram_off: false,
             telegram_missing: None,
+            reject_changes: false,
         }
     }
 }
@@ -766,6 +782,21 @@ struct AppInfo {
     telegram_missing: Option<TelegramMissing>,
 }
 
+/// What the real Signal backend of this process saw of the Storage Service
+/// ([`AppHandle::storage_counts`], BQ11): numbers only, no name, identifier, key or byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageCounts {
+    /// The version of the newest manifest this process saw (fetched, or written by us).
+    pub version: u64,
+    /// How many identifiers that manifest lists.
+    pub identifiers: u64,
+    /// How many of them had no record in the backend's database when it was seen (0 right after
+    /// a write of ours; all of them at a fresh profile's first read).
+    pub unknown: u64,
+    /// How many of our Storage Service writes were answered 200 in this process.
+    pub writes: u64,
+}
+
 /// Whether the backend configuration carries a number tail a first link is checked against
 /// (what [`AppHandle::expected_number_check`] reports; never the tail itself).
 fn number_check_on(backend: &BackendConfig) -> bool {
@@ -959,6 +990,34 @@ impl AppHandle {
         {
             // A build without the backend never registers it.
             debug_assert!(!self.info.whatsapp_real);
+            None
+        }
+    }
+
+    /// The Signal backend's Storage Service counts of this process (BQ11, A10d D8;
+    /// `kourier_signal::storage_counts`), for the development state: the version and identifier
+    /// count of the newest manifest this process saw, how many of its identifiers had no record
+    /// here, and how many of our writes were answered 200. `None` in a build without the real
+    /// Signal backend, in fixture mode (the fake plays Signal there) and until the real backend
+    /// read a manifest in this run: "not measured" is never a row of zeros (the rule of
+    /// [`Self::wam_counts`]). Numbers only; process-wide, so it means what it says on a profile
+    /// with one Signal account (the real check's test profile).
+    pub fn storage_counts(&self) -> Option<StorageCounts> {
+        #[cfg(feature = "signal")]
+        {
+            if self.info.fixture_mode {
+                return None;
+            }
+            kourier_signal::storage_counts().map(|c| StorageCounts {
+                version: c.version,
+                identifiers: c.identifiers,
+                unknown: c.unknown,
+                writes: c.writes,
+            })
+        }
+        #[cfg(not(feature = "signal"))]
+        {
+            // A build without the backend never reads a manifest.
             None
         }
     }
@@ -1694,6 +1753,7 @@ fn compiled_in_experimental(
     seams: Seams,
     prefs: &Prefs,
     rehearsal: Rehearsal,
+    #[cfg(feature = "threema")] threema_start: crate::prefs::ThreemaStart,
     #[cfg(feature = "threema")] threema_allowed: kourier_threema::AllowList,
 ) -> Experimental {
     let mut networks: Vec<Arc<dyn kourier_backend_api::Network>> = Vec::new();
@@ -1760,13 +1820,14 @@ fn compiled_in_experimental(
         }
         TelegramRegistration::Absent => {}
     }
-    // Threema (TH4 J6, decision E1): listed or registered only when this start can link: the
-    // backend can AND the run profile named test IDs (`crate::threema::allowed_ids`); a plain
-    // debug start keeps it absent. The list goes to the network's parts: with none, `StartLogin`
-    // is refused at once (B1's gate).
+    // Threema: every build registers it while it is on and lists it while the user has it off, and
+    // any ID may link (`crate::threema`). A start by the run tool keeps TH4 J6 and decision E1:
+    // listed or registered only when that start can link. The list goes to the network's parts:
+    // with none, `StartLogin` is refused at once (B1's gate).
     #[cfg(feature = "threema")]
     if crate::threema::threema_registration(
         seams.build,
+        threema_start,
         prefs.network_on(NetworkKind::Threema),
         crate::threema::linking(&threema_allowed),
     ) != crate::threema::ThreemaRegistration::Absent
@@ -1873,6 +1934,9 @@ struct Setup {
     whatsapp_real: bool,
     /// This build cannot log in to Telegram ([`AppHandle::telegram_missing`]).
     telegram_missing: Option<TelegramMissing>,
+    /// The desktop task reads the preferences as this start did: with the networks that are on
+    /// by default ([`Prefs::with_default_networks`]). A normal start outside the run tool.
+    default_networks: bool,
     #[cfg(feature = "fake")]
     home: Option<tempfile::TempDir>,
     /// Fixture profile pictures, written once the fixture account exists.
@@ -1943,7 +2007,7 @@ impl App {
             .map_err(AppError::Runtime)?;
         // §8.2 step 1: a second launch of a profile hands over to the first and exits.
         let instance = match &opts.launch {
-            Launch::Normal => Some(desktop::instance_name(&Paths::resolve(
+            Launch::Normal | Launch::Scripted => Some(desktop::instance_name(&Paths::resolve(
                 opts.profile.clone(),
             )?)),
             Launch::Fixture(_) => None,
@@ -1962,7 +2026,7 @@ impl App {
         // held until the app is gone. Fixture and measuring runs have directories of their
         // own per run.
         let profile_lock = match &opts.launch {
-            Launch::Normal => {
+            Launch::Normal | Launch::Scripted => {
                 let paths = Paths::resolve(opts.profile.clone())?;
                 Some(
                     crate::paths::ProfileLock::acquire(&paths).map_err(|e| match e {
@@ -1977,7 +2041,8 @@ impl App {
         };
         #[allow(unused_mut)]
         let mut setup = match &opts.launch {
-            Launch::Normal => runtime.block_on(normal_setup(&opts.profile))?,
+            Launch::Normal => runtime.block_on(normal_setup(&opts.profile, false))?,
+            Launch::Scripted => runtime.block_on(normal_setup(&opts.profile, true))?,
             Launch::Fixture(f) => fixture_setup(f)?,
             #[cfg(feature = "perf")]
             Launch::Perf(p) => perf_setup(p)?,
@@ -2072,6 +2137,7 @@ impl App {
             handle.clone(),
             connection,
             &opts.desktop,
+            setup.default_networks,
             &setup.paths,
             shutdown.child_token(),
         );
@@ -2214,11 +2280,11 @@ impl Drop for App {
 }
 
 /// The user's profile: paths, logging, the Secret Service master key, compiled-in networks.
-async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
+async fn normal_setup(profile: &Profile, scripted: bool) -> Result<Setup, AppError> {
     let paths = Paths::resolve(profile.clone())?;
     paths.create_dirs().map_err(AppError::Dirs)?;
     crate::logging::init(Some(&paths.log_dir()));
-    normal_setup_in(paths, |k| std::env::var_os(k)).await
+    normal_setup_in(paths, |k| std::env::var_os(k), scripted).await
 }
 
 /// What [`normal_setup`] does once the paths are known and logging runs, reading the
@@ -2229,6 +2295,7 @@ async fn normal_setup(profile: &Profile) -> Result<Setup, AppError> {
 async fn normal_setup_in(
     paths: Paths,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    scripted: bool,
 ) -> Result<Setup, AppError> {
     // A rehearsal switch this build cannot honour fails the start BEFORE `Seams::real()` makes the
     // Telegram decision: that decision takes the run tool's confirmation and logs the dialer line,
@@ -2236,14 +2303,26 @@ async fn normal_setup_in(
     // order). `start_networks` judges it again for the callers that do not come through here.
     #[cfg(debug_assertions)]
     crate::dev::rehearsal_refused(&env).map_err(|e| AppError::Config(ConfigError::Rehearsal(e)))?;
-    normal_setup_with(paths, env, Seams::real()).await
+    normal_setup_scripted_with(paths, env, Seams::real(), scripted).await
 }
 
-/// [`normal_setup_in`] with the parts a test replaces ([`Seams`]).
+/// [`normal_setup_in`] of an unscripted start with the parts a test replaces ([`Seams`]).
+#[cfg(test)]
 async fn normal_setup_with(
     paths: Paths,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     seams: Seams,
+) -> Result<Setup, AppError> {
+    normal_setup_scripted_with(paths, env, seams, false).await
+}
+
+/// [`normal_setup_in`] with the parts a test replaces ([`Seams`]); `scripted` is a start driven by
+/// `--dev-control` ([`Launch::Scripted`]).
+async fn normal_setup_scripted_with(
+    paths: Paths,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    seams: Seams,
+    scripted: bool,
 ) -> Result<Setup, AppError> {
     let backend =
         config::backend_config(|k| env(k).and_then(|v| v.into_string().ok()), &paths.state)?;
@@ -2265,7 +2344,9 @@ async fn normal_setup_with(
     // effect at the next one). An account of one that is off is paused: the core keeps its
     // chats and starts nothing for it.
     let prefs_path = paths.config_file();
-    let prefs = Prefs::load_or_default(&prefs_path);
+    let threema_start = crate::prefs::threema_start_of(&env, scripted, &paths);
+    let prefs = start_prefs(&prefs_path, threema_start);
+    let default_networks = threema_start == crate::prefs::ThreemaStart::Person;
     let StartNetworks {
         registry,
         networks_off,
@@ -2278,7 +2359,7 @@ async fn normal_setup_with(
     } = {
         #[cfg(feature = "telegram")]
         let seams = seams.with_telegram_files_root(&paths);
-        start_networks(&env, &prefs, seams)?
+        start_networks(&env, &prefs, seams, threema_start)?
     };
     let pending_link = take_pending_link(&prefs_path, &registry);
     Ok(Setup {
@@ -2292,6 +2373,7 @@ async fn normal_setup_with(
         fake,
         #[cfg(feature = "fake")]
         rehearsal,
+        default_networks,
         whatsapp_real,
         telegram_missing,
         #[cfg(feature = "fake")]
@@ -2355,10 +2437,24 @@ struct StartNetworks {
     not(any(feature = "signal", feature = "fake")),
     allow(unused_variables, unused_mut)
 )]
+/// The preferences a normal start works from: the file's, with the networks that are on by default
+/// (only for a person's start: the run tool's switch is `networks-on` alone, `crate::prefs::THREEMA_RUN_TOOL_ENV`,
+/// and a shut start offers no Threema at all).
+fn start_prefs(path: &std::path::Path, start: crate::prefs::ThreemaStart) -> Prefs {
+    let prefs = Prefs::load_or_default(path);
+    if start == crate::prefs::ThreemaStart::Person {
+        prefs.with_default_networks()
+    } else {
+        prefs
+    }
+}
+
 fn start_networks(
     env: &impl Fn(&str) -> Option<std::ffi::OsString>,
     prefs: &Prefs,
     seams: Seams,
+    #[cfg_attr(not(feature = "threema"), allow(unused_variables))]
+    threema_start: crate::prefs::ThreemaStart,
 ) -> Result<StartNetworks, AppError> {
     // The rehearsal switch is read first, so a wrong value fails the start before anything is made.
     // Debug builds only (`dev` exists only there): a release build with the test network, which is
@@ -2411,14 +2507,16 @@ fn start_networks(
         let servers = crate::telegram::servers(seams.build == Build::Debug, env)?;
         seams.with_telegram_servers(servers)
     };
-    // Threema's list of test IDs is read before the seams are used (debug + run profile only:
-    // `crate::threema::allowed_ids`; empty, and nothing read, anywhere else).
+    // Which IDs a Threema link may bring is settled before the seams are used
+    // (`crate::threema::allowed_ids`: any, except in a start by the run tool).
     #[cfg(feature = "threema")]
     let threema_allowed = crate::threema::allowed_ids(seams.build == Build::Debug, env);
     let experimental = compiled_in_experimental(
         seams,
         prefs,
         rehearsal,
+        #[cfg(feature = "threema")]
+        threema_start,
         #[cfg(feature = "threema")]
         threema_allowed,
     );
@@ -2451,8 +2549,9 @@ const NETWORKS_LINE_HEAD: &str = "networks";
 /// uses ([`start_networks`]); it opens no window, no database and no keyring and contacts nothing.
 /// `cargo xtask dist` runs it on the packed (release) binary with `networks-on = ["whatsapp",
 /// "threema"]`, which is the only proof that a release build takes the release arm of
-/// [`whatsapp_registration`] (Threema is not in the archive's features; its unit tests are the
-/// repeatable proof of its release arm).
+/// [`whatsapp_registration`] (the archive builds Threema in since `4d03eb2`, and a person's start
+/// of a release build offers it; the run tool's start keeps the release arm that the unit tests
+/// of `threema_registration` prove).
 pub fn networks_line(profile: Profile) -> Result<String, AppError> {
     let paths = Paths::resolve(profile)?;
     networks_line_in(&paths, |k| std::env::var_os(k), Seams::probe())
@@ -2465,10 +2564,12 @@ fn networks_line_in(
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     seams: Seams,
 ) -> Result<String, AppError> {
-    let prefs = Prefs::load_or_default(&paths.config_file());
+    // `--print-networks` has no dev control: only the profile's marker can shut Threema out here.
+    let threema_start = crate::prefs::threema_start_of(&env, false, paths);
+    let prefs = start_prefs(&paths.config_file(), threema_start);
     #[cfg(feature = "telegram")]
     let seams = seams.with_telegram_files_root(paths);
-    let networks = start_networks(&env, &prefs, seams)?;
+    let networks = start_networks(&env, &prefs, seams, threema_start)?;
     let kinds = |kinds: Vec<NetworkKind>| {
         kinds
             .iter()
@@ -2628,6 +2729,7 @@ fn fixture_setup(f: &FixtureOptions) -> Result<Setup, AppError> {
         rehearsal: None,
         whatsapp_real: false,
         telegram_missing: f.telegram_missing,
+        default_networks: false,
         home: Some(home),
         avatars: demo.avatars,
         clock,
@@ -2674,6 +2776,7 @@ fn perf_setup(p: &crate::perf::PerfOptions) -> Result<Setup, AppError> {
         rehearsal: None,
         whatsapp_real: false,
         telegram_missing: None,
+        default_networks: false,
         home: None,
         avatars: Default::default(),
         clock: crate::perf::clock(p),
@@ -2837,6 +2940,8 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
         ..FixtureSpec::default()
     };
     let mut script = fixture(&spec).map_err(|e| AppError::Fixture(e.to_string()))?;
+    // A network that rejects the person's changes (a test knob; no page sets it).
+    script.reject_changes = f.reject_changes;
     let now_ms =
         crate::fixture_media::newest_message(&script).map(|t| t + FIXTURE_NOW_AFTER_NEWEST_MS);
     let mut avatars = crate::fixture_media::FixtureAvatars::default();
@@ -2925,6 +3030,11 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
             && let Some(g) = &group
         {
             script = crate::fixture_media::with_group_timers(script, &g.key);
+        }
+        if f.group_admin
+            && let Some(g) = &group
+        {
+            script = crate::fixture_media::with_group_admin(script, &g.key);
         }
         if f.group_mentions
             && let Some(g) = &group
@@ -3591,7 +3701,9 @@ mod transfer_switch_tests {
             };
             let paths = Paths::from_env(Profile::default(), env).expect("paths");
             paths.create_dirs().expect("dirs");
-            let setup = normal_setup_in(paths, env).await.expect("a normal setup");
+            let setup = normal_setup_in(paths, env, false)
+                .await
+                .expect("a normal setup");
             let signal = setup
                 .registry
                 .get(NetworkKind::Signal)
@@ -3625,7 +3737,9 @@ mod transfer_switch_tests {
             };
             let paths = Paths::from_env(Profile::default(), env).expect("paths");
             paths.create_dirs().expect("dirs");
-            let setup = normal_setup_in(paths, env).await.expect("a normal setup");
+            let setup = normal_setup_in(paths, env, false)
+                .await
+                .expect("a normal setup");
             assert_eq!(number_check_on(&setup.backend), expected, "{tail:?}");
         }
     }
@@ -4083,9 +4197,19 @@ mod threema_registration_tests {
         _tmp: tempfile::TempDir,
         data: PathBuf,
         home: PathBuf,
+        run_tool: bool,
     }
 
     impl Scratch {
+        /// A normal start of a profile, without the run tool.
+        fn normal() -> Self {
+            Self {
+                run_tool: false,
+                ..Self::new(false)
+            }
+        }
+
+        /// A start by the run tool.
         fn new(prepared: bool) -> Self {
             use std::os::unix::fs::PermissionsExt as _;
 
@@ -4113,11 +4237,13 @@ mod threema_registration_tests {
                 _tmp: tmp,
                 data,
                 home,
+                run_tool: true,
             }
         }
 
         fn env(&self, key: &str) -> Option<OsString> {
             match key {
+                crate::prefs::THREEMA_RUN_TOOL_ENV if self.run_tool => Some("1".into()),
                 HOME_ENV => Some(self.home.clone().into()),
                 "XDG_DATA_HOME" => Some(self.data.clone().into()),
                 _ => None,
@@ -4179,6 +4305,38 @@ mod threema_registration_tests {
                 file,
                 "{case}: the preferences were changed"
             );
+        }
+    }
+
+    /// The user's decision of 2026-11-09: a normal start of EVERY build has Threema on with nothing
+    /// in the file, keeps it off once the user turned it off (listed then, so Settings can turn it
+    /// on again), and the probe changes no file and makes no client. Mutants: `start_prefs` without
+    /// the defaults -> the first half; the release arm back in `threema_registration` -> Release.
+    #[test]
+    fn a_normal_start_of_every_build_has_threema_on_until_it_is_turned_off() {
+        use super::networks_line_in;
+        use crate::paths::{Paths, Profile};
+
+        for build in [Build::Debug, Build::Release] {
+            let scratch = Scratch::normal();
+            let env = |k: &str| scratch.env(k);
+            let paths = Paths::from_env(Profile::default(), env).expect("paths");
+            paths.create_dirs().expect("dirs");
+            let made = Arc::new(AtomicUsize::new(0));
+            let line = networks_line_in(&paths, env, seams(build, &made)).expect("the line");
+            let case = format!("{build:?}: {line:?}");
+            assert!(listed(&line, "registered").contains(&"Threema"), "{case}");
+            assert!(!listed(&line, "off").contains(&"Threema"), "{case}");
+            assert_eq!(listed(&line, "on"), vec!["Threema"], "{case}");
+            assert!(!paths.config_file().exists(), "{case}: the probe wrote");
+
+            prefs(false).save(&paths.config_file()).expect("save prefs");
+            let line = networks_line_in(&paths, env, seams(build, &made)).expect("the line");
+            let case = format!("{build:?}, off: {line:?}");
+            assert!(!listed(&line, "registered").contains(&"Threema"), "{case}");
+            assert!(listed(&line, "off").contains(&"Threema"), "{case}");
+            assert!(listed(&line, "on").is_empty(), "{case}");
+            assert_eq!(made.load(Ordering::SeqCst), 0, "{case}: a client was made");
         }
     }
 
@@ -4296,6 +4454,167 @@ mod threema_registration_tests {
             );
             #[cfg(feature = "signal")]
             assert!(setup.registry.get(NetworkKind::Signal).is_some(), "{case}");
+        }
+    }
+
+    /// THE SAFETY GATE (`prefs::ThreemaStart`): a scripted start (`--dev-control`) outside the run tool, and
+    /// a start whose profile holds the run tool's `threema-run/` (as a directory, a symbolic link or a
+    /// file; in `KOURIER_HOME` or in the data directory) outside the run tool, offer no Threema at all:
+    /// neither registered nor listed, whatever `networks-on` says. The same profile unscripted and
+    /// unmarked registers it (on) or lists it (off); the run tool's start keeps its old table, also in
+    /// a profile with the marker (its own). Mutants: `scripted || marker` -> `scripted` (the marker
+    /// cases fail) or `marker` (the scripted cases fail); `Shut` arm of `threema_registration`
+    /// dropped; `normal_setup_in` passing `false` for `scripted`.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_scripted_start_or_a_run_tools_profile_outside_the_tool_offers_no_threema() {
+        use super::normal_setup_scripted_with;
+        use crate::dev::DEV_KEYRING_ENV;
+        use crate::paths::{Paths, Profile};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Marker {
+            None,
+            Dir,
+            Link,
+            File,
+            InData,
+        }
+        // (scripted, run tool, marker, on) -> (registered, listed), written out.
+        let cases = [
+            (false, false, Marker::None, true, (true, false)),
+            (false, false, Marker::None, false, (false, true)),
+            (true, false, Marker::None, true, (false, false)),
+            (true, false, Marker::None, false, (false, false)),
+            (false, false, Marker::Dir, true, (false, false)),
+            (false, false, Marker::Dir, false, (false, false)),
+            (false, false, Marker::Link, true, (false, false)),
+            (false, false, Marker::File, true, (false, false)),
+            (false, false, Marker::InData, true, (false, false)),
+            (true, false, Marker::Dir, true, (false, false)),
+            // The run tool's start: the old table (a debug build registers while on, lists nothing
+            // while off with no list), scripted or not, in its own profile or not.
+            (false, true, Marker::None, true, (true, false)),
+            (false, true, Marker::Dir, true, (true, false)),
+            (true, true, Marker::Dir, true, (true, false)),
+            (true, true, Marker::None, false, (false, false)),
+        ];
+        for (scripted, run_tool, marker, on, (want_registered, want_listed)) in cases {
+            let mut scratch = Scratch::normal();
+            scratch.run_tool = run_tool;
+            let tool_dir = crate::prefs::THREEMA_RUN_TOOL_DIR;
+            match marker {
+                Marker::None => {}
+                Marker::Dir => std::fs::create_dir(scratch.home.join(tool_dir)).expect("dir"),
+                Marker::Link => {
+                    std::os::unix::fs::symlink("/nonexistent-target", scratch.home.join(tool_dir))
+                        .expect("link")
+                }
+                Marker::File => std::fs::write(scratch.home.join(tool_dir), b"x").expect("file"),
+                Marker::InData => {
+                    let env = |k: &str| scratch.env(k);
+                    let paths = Paths::from_env(Profile::default(), env).expect("paths");
+                    std::fs::create_dir_all(paths.data.join(tool_dir)).expect("data dir");
+                }
+            }
+            let env = |k: &str| -> Option<OsString> {
+                match k {
+                    DEV_KEYRING_ENV => Some("passphrase".into()),
+                    _ => scratch.env(k),
+                }
+            };
+            let paths = Paths::from_env(Profile::default(), env).expect("paths");
+            paths.create_dirs().expect("dirs");
+            prefs(on).save(&paths.config_file()).expect("save prefs");
+            let made = Arc::new(AtomicUsize::new(0));
+            let setup =
+                normal_setup_scripted_with(paths, env, seams(Build::Debug, &made), scripted)
+                    .await
+                    .expect("a start");
+            let case = format!("scripted={scripted}, run_tool={run_tool}, {marker:?}, on={on}");
+            assert_eq!(
+                setup.registry.get(NetworkKind::Threema).is_some(),
+                want_registered,
+                "{case}: registered"
+            );
+            assert_eq!(
+                setup
+                    .networks_off
+                    .iter()
+                    .any(|n| n.kind == NetworkKind::Threema),
+                want_listed,
+                "{case}: listed"
+            );
+            assert_eq!(made.load(Ordering::SeqCst), 0, "{case}: a client was made");
+        }
+    }
+
+    /// `start_prefs` applies the on-by-default networks to a person's start only: a shut start and the
+    /// run tool's read the file alone. Mutant: the defaults for everyone (`if true`).
+    #[test]
+    fn only_a_persons_start_gets_the_networks_that_are_on_by_default() {
+        use crate::prefs::ThreemaStart::{Person, RunTool, Shut};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("kourier.toml");
+        for (start, on) in [(Person, true), (RunTool, false), (Shut, false)] {
+            assert_eq!(
+                super::start_prefs(&path, start).network_on(NetworkKind::Threema),
+                on,
+                "{start:?}"
+            );
+        }
+    }
+
+    /// The two joints of the safety gate above `normal_setup_scripted_with`: `normal_setup_in` hands
+    /// its `scripted` on (the real seams, a profile with nothing in it: Threema is on by default
+    /// for a person, absent for a scripted start), and `App::start` makes `Launch::Scripted` a
+    /// scripted setup and `Launch::Normal` an unscripted one (a source pin, the form of the
+    /// confirmation test below). Mutants: `normal_setup_in` passing `false`; the `Scripted` arm of
+    /// `App::start` passing `false`.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn the_scripted_launch_reaches_the_gate_through_both_joints() {
+        use super::normal_setup_in;
+        use crate::dev::DEV_KEYRING_ENV;
+        use crate::paths::{Paths, Profile};
+
+        for (scripted, expected) in [(false, true), (true, false)] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let env = |k: &str| -> Option<OsString> {
+                match k {
+                    HOME_ENV => Some(tmp.path().into()),
+                    DEV_KEYRING_ENV => Some("passphrase".into()),
+                    _ => None,
+                }
+            };
+            let paths = Paths::from_env(Profile::default(), env).expect("paths");
+            paths.create_dirs().expect("dirs");
+            let setup = normal_setup_in(paths, env, scripted)
+                .await
+                .expect("a start");
+            assert_eq!(
+                setup.registry.get(NetworkKind::Threema).is_some(),
+                expected,
+                "scripted={scripted}"
+            );
+        }
+        let text = include_str!("app.rs");
+        let cut = text
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("the first test module");
+        let code = &text[..cut];
+        for (arm, flag) in [("Launch::Normal", "false"), ("Launch::Scripted", "true")] {
+            let line = code
+                .lines()
+                .find(|l| {
+                    l.trim_start()
+                        .starts_with(&format!("{arm} => runtime.block_on("))
+                })
+                .unwrap_or_else(|| panic!("no `{arm}` setup arm in App::start"));
+            assert!(
+                line.contains(&format!("normal_setup(&opts.profile, {flag})")),
+                "{line}"
+            );
         }
     }
 
@@ -4874,9 +5193,14 @@ mod whatsapp_registration_tests {
             let listed_here = build == Build::Debug && !on;
             assert_eq!(registered.contains(&"WhatsApp"), registered_here, "{case}");
             assert_eq!(off.contains(&"WhatsApp"), listed_here, "{case}");
-            // The switch as the file has it, in a release build too.
+            // The switch as the file has it, in a release build too. Threema is on by default and
+            // has its own test.
             assert_eq!(
-                switched,
+                switched
+                    .iter()
+                    .copied()
+                    .filter(|kind| *kind != "Threema")
+                    .collect::<Vec<_>>(),
                 if on { vec!["WhatsApp"] } else { vec![] },
                 "{case}"
             );
@@ -5881,7 +6205,7 @@ mod telegram_registration_tests {
         let real = calls_of(&["Seams::", "real()"].concat());
         assert_eq!(real.len(), 1, "{real:#?}");
         assert!(
-            real[0].contains("normal_setup_with(paths, env, "),
+            real[0].contains("normal_setup_scripted_with(paths, env, "),
             "{real:#?}"
         );
         let probe = calls_of(&["Seams::", "probe()"].concat());
@@ -6691,7 +7015,12 @@ mod fakeless_rehearsal_tests {
     fn a_rehearsal_switch_in_a_build_without_the_network_fails_the_start() {
         for value in ["telegram", "whatsapp", "real", "1"] {
             let env = move |k: &str| (k == REHEARSAL_ENV).then(|| OsString::from(value));
-            let Err(error) = start_networks(&env, &Prefs::default(), Seams::real()) else {
+            let Err(error) = start_networks(
+                &env,
+                &Prefs::default(),
+                Seams::real(),
+                crate::prefs::ThreemaStart::Person,
+            ) else {
                 panic!("{value}: the start went on without a rehearsal network");
             };
             assert!(
@@ -6709,7 +7038,15 @@ mod fakeless_rehearsal_tests {
             );
         }
         let none = |_: &str| -> Option<OsString> { None };
-        assert!(start_networks(&none, &Prefs::default(), Seams::real()).is_ok());
+        assert!(
+            start_networks(
+                &none,
+                &Prefs::default(),
+                Seams::real(),
+                crate::prefs::ThreemaStart::Person
+            )
+            .is_ok()
+        );
     }
 
     /// Re-check N-6, the normal start: it refuses the switch itself, before the Telegram seams are
@@ -6736,7 +7073,7 @@ mod fakeless_rehearsal_tests {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            let Err(error) = rt.block_on(super::normal_setup_in(paths, env)) else {
+            let Err(error) = rt.block_on(super::normal_setup_in(paths, env, false)) else {
                 panic!("{value}: the normal start went on without a rehearsal network");
             };
             assert!(

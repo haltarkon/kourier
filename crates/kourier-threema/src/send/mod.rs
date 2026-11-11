@@ -1,6 +1,5 @@
 //! THE SEND CORE (TH6a): the Bundled Messages Send Steps (`csp.struct.yml`) as a persistent queue of sealed rows,
-//! resumed by window. It has no user yet: every chat still says `CannotSend::NotYetBuilt`, and nothing in a real build
-//! reaches it.
+//! resumed by window.
 //!
 //! THE ORDER, zone by zone: PREPARE (the task, its receivers, every sealed box, the sealed reflect, every nonce) ->
 //! the reflect's frame -> its ack -> REFLECTED -> the boxes -> their acks -> ACKS (once per pass; the last one writes
@@ -50,6 +49,7 @@ use crate::error::Result;
 pub(crate) mod attempt;
 pub(crate) mod body;
 pub(crate) mod encode;
+pub(crate) mod files;
 pub(crate) mod machine;
 pub(crate) mod prepare;
 pub(crate) mod props;

@@ -56,6 +56,8 @@ QQC2.Menu {
 
     // The pages the row offers (the core states which: the sender's, the mentioned people's).
     readonly property var pages: root.row !== null && root.row.pages !== undefined ? root.row.pages : []
+    // The addresses "Copy Link Address" offers (none where the message offers no copy).
+    readonly property var links: root.offers.copy === true && root.row !== null && root.row.links !== undefined ? root.row.links : []
     // How much of an entry's text fits: a longer name is elided here (it is whole in the entry's
     // accessible name), the menu does not grow with it.
     readonly property real pageTextWidth: Kirigami.Units.gridUnit * 20
@@ -67,6 +69,16 @@ QQC2.Menu {
     function pagesAt(): int {
         for (let i = 0; i < root.count; ++i) {
             if (root.itemAt(i) === pagesSeparator) {
+                return i + 1;
+            }
+        }
+        return root.count;
+    }
+
+    // Where the entries of the links go: right after "Copy Text".
+    function linksAt(): int {
+        for (let i = 0; i < root.count; ++i) {
+            if (root.itemAt(i) === copyEntry) {
                 return i + 1;
             }
         }
@@ -180,10 +192,39 @@ QQC2.Menu {
         onTriggered: App.composer.startEdit(App.timeline.conversationId, root.row.messageId)
     }
     Entry {
+        id: copyEntry
+
         visible: root.offers.copy === true
         icon.name: "edit-copy"
         text: L10n.i18nc("@action:inmenu", "Copy Text")
         onTriggered: App.copyText(root.row.copyText)
+    }
+    // One entry for each link of the text. No network has a link to one message: these are the
+    // links the message holds.
+    Instantiator {
+        model: root.links
+        delegate: Entry {
+            id: linkEntry
+
+            required property string modelData
+
+            objectName: "menuCopyLink"
+            icon.name: "edit-copy"
+            // (With several links the entry says which; "&" as for the pages' entries.)
+            text: root.links.length === 1 ? L10n.i18nc("@action:inmenu", "Copy Link Address") : linkText.elidedText.replace(/&/g, "&&")
+            Accessible.name: L10n.i18nc("@action:inmenu accessible, %1 the address", "Copy Link Address %1", linkEntry.modelData)
+            onTriggered: App.copyShown(linkEntry.modelData)
+
+            TextMetrics {
+                id: linkText
+                font: linkEntry.font
+                elide: Text.ElideMiddle
+                elideWidth: root.pageTextWidth
+                text: L10n.i18nc("@action:inmenu, %1 the address", "Copy %1", linkEntry.modelData)
+            }
+        }
+        onObjectAdded: (index, object) => root.insertItem(root.linksAt() + index, object)
+        onObjectRemoved: (index, object) => root.removeItem(object)
     }
     Entry {
         visible: root.hasReactions

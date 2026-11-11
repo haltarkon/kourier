@@ -393,6 +393,16 @@ async fn merge_manifest<T: SignalTransport>(
             .zone(|tx| intents::resolve_not_landed(tx, account, &record, now, &shared.wake))?;
     }
     if local.version.is_some_and(|local| version <= local) {
+        // BQ11's counts (debug-only line, `counts`): a manifest that is not newer than the merged
+        // version, and its identifiers that have no record here (a read, no zone; a failed read
+        // only leaves the counts as they were, the path goes on as before).
+        if let Ok(stored) = shared.db.read(stored_keys) {
+            counts::seen(
+                version,
+                record.identifiers.len(),
+                unknown_identifiers(&record, &stored),
+            );
+        }
         let now = shared.now();
         shared.db.zone(|tx| mark_synced(tx, now))?;
         return Ok(record);
@@ -415,6 +425,9 @@ async fn merge_manifest<T: SignalTransport>(
         .filter(|(key, _)| !stored.contains(key))
         .collect();
     let keys: Vec<Vec<u8>> = missing.iter().map(|(key, _)| key.clone()).collect();
+    // BQ11's counts (debug-only line, `counts`, H3): this manifest and the merge's own number of
+    // its identifiers not stored yet (a fresh profile's first read: all of them).
+    counts::seen(version, record.identifiers.len(), keys.len());
     let mut items = read_items(shared, credentials, &keys).await?;
     let record_ikm = Some(record.record_ikm.as_slice()).filter(|ikm| !ikm.is_empty());
     let mut decrypted = Vec::with_capacity(missing.len());
@@ -502,6 +515,18 @@ async fn merge_manifest<T: SignalTransport>(
         shared.jobs_wake.notify_one();
     }
     Ok(record)
+}
+
+/// How many distinct identifiers of `record` have no record in `stored` (BQ11's `unknown`; the
+/// merge path counts the same set as its `missing`).
+fn unknown_identifiers(record: &proto::ManifestRecord, stored: &BTreeSet<Vec<u8>>) -> usize {
+    record
+        .identifiers
+        .iter()
+        .filter(|identifier| !identifier.raw.is_empty() && !stored.contains(&identifier.raw))
+        .map(|identifier| identifier.raw.as_slice())
+        .collect::<BTreeSet<&[u8]>>()
+        .len()
 }
 
 fn stored_keys(conn: &Connection) -> Result<BTreeSet<Vec<u8>>> {
@@ -1658,6 +1683,7 @@ pub(crate) fn reset(conn: &Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
+pub(crate) mod counts;
 pub(crate) mod intents;
 pub(crate) mod wire;
 pub(crate) mod write;

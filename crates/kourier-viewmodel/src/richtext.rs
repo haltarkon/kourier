@@ -56,6 +56,9 @@ pub struct RichText {
     /// The whole displayed text, when [`Self::more`] (copy, quote, edit); empty otherwise, then
     /// [`Self::plain`] is the whole text.
     pub whole: String,
+    /// The addresses of the links that are shown, each once, in reading order ("Copy Link
+    /// Address"). A link a spoiler covers, even in part, is not listed: copying must not show it.
+    pub links: Vec<String>,
     /// The people the mentions of the text name, in the order of their ranges: the `<i>` of a
     /// `kourier:mention/<i>` link ([`MENTION_HREF`]) indexes this. Every valid mention range has
     /// an entry; only one that stands outside a link has the link.
@@ -1009,6 +1012,8 @@ pub(crate) fn render_with(text: &Text, names: &dyn Names, urls: Vec<(usize, usiz
         open_bidi: Vec::new(),
     };
     let mut open: Vec<Tag<'_>> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+    let mut spoiled: Vec<String> = Vec::new();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if a >= b {
@@ -1043,6 +1048,17 @@ pub(crate) fn render_with(text: &Text, names: &dyn Names, urls: Vec<(usize, usiz
                 .iter()
                 .find(|(s, e, _)| *s <= a && b <= *e)
                 .and_then(|(s, e, url)| allowed_href(url).map(|h| (e - s, h)));
+        }
+
+        if let Some((_, href)) = link {
+            let list = if style.spoiler {
+                &mut spoiled
+            } else {
+                &mut links
+            };
+            if !list.iter().any(|l| l == href) {
+                list.push(href.to_owned());
+            }
         }
 
         // A mention outside any link is a link of its own (P3); inside one it stays that link.
@@ -1119,6 +1135,7 @@ pub(crate) fn render_with(text: &Text, names: &dyn Names, urls: Vec<(usize, usiz
         tag.close(&mut em.html);
     }
 
+    links.retain(|l| !spoiled.contains(l));
     let jumbo = text.ranges.is_empty() && is_jumbo_emoji(body);
     RichText {
         html: em.html,
@@ -1128,6 +1145,7 @@ pub(crate) fn render_with(text: &Text, names: &dyn Names, urls: Vec<(usize, usiz
         more: false,
         more_words: 0,
         whole: String::new(),
+        links,
         mentions,
         mention_spoilers,
     }
@@ -1276,6 +1294,33 @@ mod tests {
         assert_whitelisted(&h);
         let h = html("x y", &[(0, 3, RangeKind::Mono)]);
         assert_eq!(h, "<code>x y</code>");
+    }
+
+    /// "Copy Link Address": each link once, in reading order; what a spoiler covers stays hidden.
+    #[test]
+    fn the_links_of_a_text_are_listed_once_and_a_spoiler_keeps_its_own() {
+        let r = render(
+            &text("a.de then https://b.example/x and a.de", &[]),
+            &TestNames,
+        );
+        assert_eq!(r.links, ["https://a.de", "https://b.example/x"]);
+        let r = render(
+            &text(
+                "click",
+                &[(0, 5, RangeKind::Link("https://c.example/".into()))],
+            ),
+            &TestNames,
+        );
+        assert_eq!(r.links, ["https://c.example/"]);
+        let body = "see https://secret.example";
+        let r = render(&text(body, &[(4, 22, RangeKind::Spoiler)]), &TestNames);
+        assert!(r.links.is_empty(), "a link under a spoiler is not offered");
+        assert!(
+            render(&text("plain words", &[]), &TestNames)
+                .links
+                .is_empty(),
+            "no links, no entries"
+        );
     }
 
     #[test]

@@ -39,6 +39,18 @@ pub fn network_icon(kind: NetworkKind) -> &'static str {
     }
 }
 
+/// The color of a network's chats: the wash of their rows and the drawings behind their
+/// messages, until the person gives an account a color of its own.
+pub fn network_tint(kind: NetworkKind) -> &'static str {
+    match kind {
+        NetworkKind::Signal => "#3a76f0",
+        NetworkKind::WhatsApp => "#1da851",
+        NetworkKind::Threema => "#0b1215",
+        NetworkKind::Fake => "#7f8c8d",
+        NetworkKind::Telegram => "#2b8fd6",
+    }
+}
+
 /// The state dot of an account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AccountStatus {
@@ -112,6 +124,10 @@ pub struct AccountRow {
     pub network_name: String,
     /// Badge icon key.
     pub network_icon: String,
+    /// The account's color (`#rrggbb`): its own, else its network's.
+    pub tint: String,
+    /// The color the person gave the account; empty: its network's.
+    pub own_tint: String,
     /// State dot.
     pub status: AccountStatus,
     /// State label ("Online").
@@ -139,6 +155,14 @@ pub struct AccountRow {
     /// Its place among the visible accounts of its network in panel order (1, 2, …), `0`
     /// when it is the only one of its network (same filler).
     pub place: u32,
+    /// Whether the account's network writes the settings it keeps for the account's other
+    /// devices (archive, pin, mute, marked unread) and this account's switch for it: `None` =
+    /// the network cannot (the switch row is not shown), `Some(false)` = off, `Some(true)` = on.
+    /// The core's [`kourier_core::facade::AccountRow::roaming_writes`], unchanged.
+    pub roaming_writes: Option<bool>,
+    /// Why the switch cannot be flipped now ("Available while this account is linked."); empty
+    /// when it can, or when the row is not shown.
+    pub roaming_note: String,
 }
 
 crate::safe_debug!(AccountRow {
@@ -165,6 +189,8 @@ pub fn account_row(account: &Account, conn: &ConnState, unread: u32) -> AccountR
         network: account.network,
         network_icon: network_icon(account.network).to_owned(),
         network_name,
+        tint: network_tint(account.network).to_owned(),
+        own_tint: String::new(),
         status,
         status_label: status.label(),
         unread,
@@ -175,6 +201,8 @@ pub fn account_row(account: &Account, conn: &ConnState, unread: u32) -> AccountR
         device: String::new(),
         shown: true,
         place: 0,
+        roaming_writes: None,
+        roaming_note: String::new(),
     }
 }
 
@@ -256,6 +284,8 @@ pub struct ConversationRow {
     pub account_badge: String,
     /// Badge icon key of the account's network; empty when only one account exists.
     pub badge_icon: String,
+    /// The account's color (`#rrggbb`). Set by [`AccountTable::decorate`].
+    pub tint: String,
     /// The number on the badge: the account's place among the accounts of its network in the
     /// panel (1, 2, …), `0` (no number) when it is the only one of its network. Set by
     /// [`AccountTable::decorate`], with the account name and the icon.
@@ -491,6 +521,7 @@ pub fn conversation_row(
         // [`AccountTable::decorate`], once per call)
         account_badge: String::new(),
         badge_icon: String::new(),
+        tint: String::new(),
         badge_number: 0,
         account_order: 0,
         protected: c.protected,
@@ -702,6 +733,8 @@ pub struct TableAccount {
     /// The name its chats carry (the chip): the profile name, else the network's name; empty
     /// for none (the pure fixture's accounts that carry no label).
     pub name: String,
+    /// Its color (`#rrggbb`).
+    pub tint: String,
 }
 
 struct TableEntry {
@@ -713,6 +746,7 @@ struct TableEntry {
     shown: bool,
     /// The chip text, the number added where another account of the network has the name.
     chip: String,
+    tint: String,
 }
 
 /// What the rows of one list call need to know about the accounts: built ONCE per call from the
@@ -774,6 +808,7 @@ impl AccountTable {
                         Hidden::Ids(ids) => !ids.contains(&a.id),
                     },
                     chip,
+                    tint: a.tint.clone(),
                 }
             })
             .collect();
@@ -797,8 +832,10 @@ impl AccountTable {
             row.account_badge = String::new();
             row.badge_number = 0;
             row.account_order = u32::MAX;
+            row.tint = network_tint(row.network).to_owned();
             return;
         };
+        row.tint.clone_from(&e.tint);
         row.account_order = e.order;
         row.badge_number = e.place;
         row.account_badge = if (e.shown && self.shown_count > 1) || (!e.shown && self.searching) {
@@ -845,6 +882,8 @@ pub struct ChatHeader {
     pub typing: bool,
     /// Avatar URL, empty for initials.
     pub avatar_url: String,
+    /// The color of the chat's account (`#rrggbb`): the drawings behind its messages.
+    pub tint: String,
     /// Group-like conversation.
     pub is_group: bool,
     /// Note to self.
@@ -883,6 +922,10 @@ pub struct ChatHeader {
     /// Why the disappearing-message timer cannot be changed now (the account's network holds
     /// back what is sent, [`AccountHold`]); empty when it can.
     pub timer_held: String,
+    /// What the chat's menu offers of Archive, Pin, Mute and Mark as Unread
+    /// ([`crate::roaming::offer_in_account`]); nothing for a chat the source does not know
+    /// the account's statement for (the fixture).
+    pub offer: crate::roaming::ChatOffer,
 }
 
 /// The custom timers a conversation takes: every `min + k × step` seconds up to `max`.
@@ -1714,6 +1757,7 @@ pub fn chat_header(
         subtitle,
         typing: !typing_text.is_empty(),
         avatar_url: String::new(),
+        tint: network_tint(network).to_owned(),
         is_group,
         is_self: c.is_self,
         peer: c.key.direct_peer().cloned(),
@@ -1736,6 +1780,7 @@ pub fn chat_header(
         deletes_sync: c.features.delete_for_me,
         still_filling: String::new(),
         timer_held: String::new(),
+        offer: crate::roaming::ChatOffer::default(),
     }
 }
 
@@ -1819,6 +1864,7 @@ mod tests {
                 id: AccountId(n),
                 network: NetworkKind::Signal,
                 name: format!("A{n}"),
+                tint: String::new(),
             })
         };
         let table = AccountTable::new(accounts(), &Hidden::Unknown, false);

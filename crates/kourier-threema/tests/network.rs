@@ -476,9 +476,10 @@ async fn every_reply_is_answered_and_a_shutdown_ends_cleanly() {
         })
         .await;
     match answered(answer, "Transmit").await {
-        TransmitOutcome::Failed(e) if is_unsupported(&e) => {}
+        // TH8: sending is on; with no socket nothing is written and the core may try again.
+        TransmitOutcome::Failed(e) if matches!(e.kind, ErrorKind::Transient { .. }) => {}
         TransmitOutcome::Failed(_) => {
-            panic!("Transmit: failed with another error than unsupported")
+            panic!("Transmit: failed with another error than transient")
         }
         _ => panic!("Transmit: the outcome is not Failed"),
     }
@@ -495,8 +496,8 @@ async fn every_reply_is_answered_and_a_shutdown_ends_cleanly() {
         "nothing uploads, so nothing can be stopped"
     );
 
-    // A download is answered too: the core waits for its `AttachmentDone`, here the contract's
-    // failure form, durable (an ack comes with it).
+    // A download is answered too: the core waits for its `AttachmentDone`, here a transient failure (no account is
+    // linked in this actor), durable (an ack comes with it).
     actor
         .send(Command::DownloadAttachment {
             attachment: AttachmentId(7),
@@ -524,8 +525,8 @@ async fn every_reply_is_answered_and_a_shutdown_ends_cleanly() {
                 "the answer names another download"
             );
             assert!(
-                matches!(result, Err(e) if is_unsupported(e)),
-                "the download was not refused as unsupported"
+                matches!(result, Err(e) if matches!(e.kind, ErrorKind::Transient { .. })),
+                "the download of an account not linked was not transient"
             );
         }
         _ => panic!("the download was not answered with one AttachmentDone"),

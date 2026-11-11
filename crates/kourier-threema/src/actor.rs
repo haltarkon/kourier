@@ -92,11 +92,8 @@
 //! `sent_at` that went. A real fix needs the core: the pending clears handed to the actor before its
 //! re-map, or a durable "cleared at" the backend reads; a follow-up for the main lead).
 //!
-//! THE SEND CORE'S DOOR (TH6a, decision C3): `Command::Transmit` stays `Failed(unsupported)` unless the parts say
-//! `send_open` (`ThreemaParts::with_send_open`, doc-hidden, which only this crate's tests call: rules 13 and 15), so nothing
-//! in a real build reaches the wire through it and every chat keeps `CannotSend::NotYetBuilt`. Behind the door
-//! `send::attempt` carries it out. `AbortTransmit` is `TooLate` either way: nothing uploads, and PREPARE is the point of no
-//! return. THE CLEAR'S share of the queue: the chat's unsent rows at or below `before_ms` go in the clear's one zone, an
+//! SENDING (TH6a, TH8): `send::attempt` carries out a `Command::Transmit`; a file goes up first (`send::files`), beside
+//! the event loop. `AbortTransmit` stops an upload and is `TooLate` after it: PREPARE is the point of no return. THE CLEAR'S share of the queue: the chat's unsent rows at or below `before_ms` go in the clear's one zone, an
 //! attached row stays (decision R5).
 //!
 //! THE COMMAND MATCH LISTS EVERY `Command` VARIANT, with no wildcard arm, and NAMES EVERY FIELD of
@@ -109,21 +106,23 @@
 //! stops, then the store is closed, then the `Exit` is reported.
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use kourier_backend_api::{
-    AbortAnswer, AccountContext, BackendConfig, BackendEnv, BackendEvent, Clock, Command, Envelope,
-    Exit, Relink, StartMode, TakenIdentity, TransmitOutcome,
+    AbortAnswer, AccountContext, BackendConfig, BackendEnv, BackendEvent, BlobTarget, Clock,
+    Command, Envelope, Exit, OutgoingRequest, Relink, StartMode, TakenIdentity, TransmitOutcome,
 };
 use kourier_db::{DbKey, ZoneDb};
 use kourier_model::{
-    AccountUuid, AttachmentId, BackendError, CmdId, ConnState, ConvKey, DeviceLogout, DownloadId,
-    ErrorKind, LoginStep, LoginStepKind, LogoutReport, Redacted,
+    AccountUuid, AttachmentId, BackendBlob, BackendError, CmdId, ConnState, ConvKey, DeviceLogout,
+    DownloadId, ErrorKind, LoginStep, LoginStepKind, LogoutReport, MessageId, Redacted,
 };
-use tokio::sync::{Notify, mpsc, oneshot, watch};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::conn::{self, End, JoinHook, Nudge, Panicked, SlotReport, Task};
@@ -133,13 +132,15 @@ use crate::join::rules::Rules;
 use crate::join::{self, Join, JoinEvent, Received, Registration};
 use crate::send::attempt;
 use crate::send::shared::Shared;
-use crate::{ThreemaParts, Transports, db, outbox, store};
+use crate::{ThreemaParts, Transports, blob, db, outbox, store};
 
 /// What the core is told when it starts (`Resume`, `Rebuild`) a file whose join never reached its zone 2
 /// (S4).
 const UNFINISHED_LINK: &str = "the link was never finished";
 /// What a request TH1 does not carry out is told.
 const NOT_DONE: &str = "Threema does not do this yet";
+const NOT_ONLINE: &str = "the account is not online";
+const UPLOAD_STOPPED: &str = "the upload was stopped";
 /// What the core is told when the start's re-map stopped on the store's failure (TH5b S-M1): the start
 /// fails, the core restarts the actor with its back-off.
 const REMAP_STOPPED: &str = "the deferred rows could not be mapped again";
@@ -237,6 +238,66 @@ struct Actor {
     send: Rc<Shared>,
     /// TH6 L4b: what the actor keeps of the leader across its sockets (the inbound cooling, critic T-M4).
     leader: Rc<crate::leader::Shared>,
+    /// `accounts/<uuid>/blobs`.
+    blob_dir: PathBuf,
+    /// The files being fetched (TH8), at most `blob::SLOTS` of them on the wire.
+    downloads: JoinSet<()>,
+    download_slots: Rc<Semaphore>,
+    /// The walk over the profile pictures (TH8): one per actor.
+    pictures: JoinSet<()>,
+    /// Told after a contact or group sync was stored: the walk over the pictures looks again.
+    pictures_changed: Rc<Notify>,
+    /// The files going up (TH8), at most `blob::SLOTS` of them on the wire.
+    uploads: JoinSet<()>,
+    /// The uploads by `local`, to stop one.
+    uploading: HashMap<MessageId, (CancellationToken, AbortHandle)>,
+    upload_slots: Rc<Semaphore>,
+}
+
+/// One file on its way up.
+struct Upload {
+    mirror: blob::Mirror,
+    blob_dir: PathBuf,
+    db: Rc<ZoneDb>,
+    send: Rc<Shared>,
+    clock: Arc<dyn Clock>,
+    slots: Rc<Semaphore>,
+    stop: CancellationToken,
+    req: OutgoingRequest,
+    reply: oneshot::Sender<TransmitOutcome>,
+}
+
+/// The upload, then the message. No frame goes before the upload is whole, so a stop or a failure sends nothing to anyone.
+async fn upload_and_send(upload: Upload) {
+    let Upload {
+        mirror,
+        blob_dir,
+        db,
+        send,
+        clock,
+        slots,
+        stop,
+        req,
+        reply,
+    } = upload;
+    let made = tokio::select! {
+        biased;
+        () = stop.cancelled() => Err(BackendError::transient(UPLOAD_STOPPED)),
+        made = async {
+            let _slot = slots
+                .acquire()
+                .await
+                .map_err(|_| BackendError::transient(UPLOAD_STOPPED))?;
+            crate::send::files::message_of(&mirror, &blob_dir, &req).await
+        } => made,
+    };
+    match made {
+        Ok(body) => attempt::transmit_made(&db, &send, clock.now_ms(), req, body, reply),
+        Err(error) => {
+            tracing::warn!(kind = ?error.kind, "a file did not go up");
+            let _ = reply.send(TransmitOutcome::Failed(error));
+        }
+    }
 }
 
 impl Actor {
@@ -253,6 +314,7 @@ impl Actor {
             config,
             conn: conn_state,
             uuid: account,
+            blob_dir,
             ..
         } = ctx;
         if start != StartMode::Fresh && !backend_db.exists() {
@@ -290,6 +352,10 @@ impl Actor {
         let linked_label = identity.as_ref().map(|i| i.device_label.clone());
         if start == StartMode::Rebuild && identity.is_some() {
             state_ready_again(&db, &*clock, &wake)?;
+            // The core lost what it was told: the pictures are stated again, from the servers.
+            crate::pictures::forget_all(&db, &blob_dir).map_err(|_: StoreError| {
+                BackendError::internal("the pictures could not be reset")
+            })?;
         }
         // A started identity passed the marker check above (S4): its file is join-ready.
         let (ready, _) = watch::channel(identity.is_some());
@@ -306,6 +372,12 @@ impl Actor {
             let now = i64::try_from(clock.now_ms()).unwrap_or(i64::MAX);
             crate::reflect::remap::at_start(&db, &identity.threema_id, now, &wake, &cancel)
                 .map_err(|_: StoreError| BackendError::internal(REMAP_STOPPED))?;
+        }
+        if identity.is_some() && start != StartMode::Fresh {
+            let now = i64::try_from(clock.now_ms()).unwrap_or(i64::MAX);
+            store::state_features_again(&db, now, &wake).map_err(|_: StoreError| {
+                BackendError::internal("the chats' features could not be stated")
+            })?;
         }
         let (acked_tx, acked) = watch::channel(0);
         let forwarder_stop = CancellationToken::new();
@@ -344,6 +416,14 @@ impl Actor {
             expire_due: Rc::new(Cell::new(true)),
             send: Rc::new(Shared::default()),
             leader: Rc::new(crate::leader::Shared::default()),
+            blob_dir,
+            downloads: JoinSet::new(),
+            download_slots: Rc::new(Semaphore::new(crate::blob::SLOTS)),
+            pictures: JoinSet::new(),
+            pictures_changed: Rc::new(Notify::new()),
+            uploads: JoinSet::new(),
+            uploading: HashMap::new(),
+            upload_slots: Rc::new(Semaphore::new(crate::blob::SLOTS)),
         })
     }
 
@@ -442,22 +522,27 @@ impl Actor {
                     }
                 }
             }
-            // TH6a: only under the parts' test door does a `Transmit` reach the send core (`send_open`, module doc).
-            Command::Transmit {
-                local: _,
-                req,
-                reply,
-            } => {
-                if self.parts.send_open() {
-                    attempt::transmit(&self.db, &self.send, self.clock.now_ms(), *req, reply);
+            // A file goes up first (`send::files`), beside the event loop; everything else is carried out here.
+            Command::Transmit { local, req, reply } => {
+                if attempt::wants_upload(&self.db, &req) {
+                    self.start_upload(local, *req, reply);
                 } else {
-                    let _ =
-                        reply.send(TransmitOutcome::Failed(BackendError::unsupported(NOT_DONE)));
+                    attempt::transmit(&self.db, &self.send, self.clock.now_ms(), *req, reply);
                 }
             }
-            // Nothing uploads, so nothing can be stopped.
-            Command::AbortTransmit { local: _, reply } => {
-                let _ = reply.send(AbortAnswer::TooLate);
+            // Only an upload can still be stopped: PREPARE is the point of no return.
+            Command::AbortTransmit { local, reply } => {
+                let running = self
+                    .uploading
+                    .remove(&local)
+                    .filter(|(_, task)| !task.is_finished());
+                let answer = if let Some((stop, _)) = running {
+                    stop.cancel();
+                    AbortAnswer::Stopping
+                } else {
+                    AbortAnswer::TooLate
+                };
+                let _ = reply.send(answer);
             }
             Command::ChangeConversation {
                 conv: _,
@@ -482,6 +567,14 @@ impl Actor {
                 let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             }
             Command::Resolve { id: _, reply } => {
+                let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
+            }
+            // Threema has no invite links to a group.
+            Command::GroupInvite {
+                group: _,
+                action: _,
+                reply,
+            } => {
                 let _ = reply.send(Err(BackendError::unsupported(NOT_DONE)));
             }
             Command::ListOwnDevices { reply } => {
@@ -557,15 +650,15 @@ impl Actor {
                 conv: _,
                 target: _,
             } => {}
-            // The core waits for the answer to every download it asks for: it is told the request
-            // cannot be carried out (the contract's failure form), durably.
+            // The core waits for the answer to every download it asks for: exactly one
+            // `AttachmentDone`, durably (`blob::run`).
             Command::DownloadAttachment {
                 attachment,
                 request,
-                remote: _,
-                dest: _,
+                remote,
+                dest,
                 net_ids: _,
-            } => self.answer_download(attachment, request),
+            } => self.start_download(attachment, request, remote, dest),
             // No message of a Threema account exists before the receive path (TH5): no history to
             // fetch or transfer, no contact to act on.
             Command::SetTyping { conv: _, on: _ }
@@ -629,12 +722,50 @@ impl Actor {
             join,
             ready: self.ready.subscribe(),
             wake: self.wake.clone(),
+            pictures: self.pictures_changed.clone(),
             acked: self.acked.clone(),
             expire_due: self.expire_due.clone(),
             events: self.events.clone(),
             send: self.send.clone(),
             leader: self.leader.clone(),
         }));
+        self.start_pictures();
+    }
+
+    /// The blob mirror of the linked identity; `None` before there is one.
+    fn mirror(&mut self) -> Option<blob::Mirror> {
+        let identity = self.identity.clone()?;
+        let https = self
+            .transports
+            .get_or_insert_with(|| self.parts.make())
+            .https
+            .clone();
+        Some(blob::Mirror::new(
+            https,
+            self.clock.clone(),
+            self.parts.server(),
+            &identity,
+        ))
+    }
+
+    /// The walk over the profile pictures, once per actor.
+    fn start_pictures(&mut self) {
+        if !self.pictures.is_empty() {
+            return;
+        }
+        let Some(mirror) = self.mirror() else {
+            return;
+        };
+        let walk = crate::pictures::run(crate::pictures::Parts {
+            mirror,
+            db: self.db.clone(),
+            conn: self.conn_state.subscribe(),
+            clock: self.clock.clone(),
+            blob_dir: self.blob_dir.clone(),
+            wake: self.wake.clone(),
+            changed: self.pictures_changed.clone(),
+        });
+        self.pictures.spawn_local(walk);
     }
 
     fn nudge(&self, nudge: Nudge) {
@@ -643,23 +774,73 @@ impl Actor {
         }
     }
 
-    /// `DownloadAttachment`: the core waits for an `AttachmentDone` for every request, and nothing
-    /// downloads before the receive path (TH5), so the answer is the contract's failure form, an
-    /// unsupported error, written to `core_outbox` in one zone (the core sends an unanswered request
-    /// again at its next start, so a kill before the commit loses nothing).
-    fn answer_download(&mut self, attachment: AttachmentId, request: DownloadId) {
-        let answer = BackendEvent::AttachmentDone {
-            attachment,
-            request: Some(request),
-            result: Err(BackendError::unsupported(NOT_DONE)),
-        };
-        let now = i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX);
-        let appended = self
-            .db
-            .zone(|tx| outbox::append_events(tx, std::slice::from_ref(&answer), now, &self.wake));
-        if appended.is_err() {
-            tracing::warn!("a download request could not be answered");
+    /// The file of a `Transmit` goes up beside the event loop, then the message goes the way of any other. A second
+    /// `Transmit` of a `local` still uploading replaces the older, which answers `Failed`.
+    fn start_upload(
+        &mut self,
+        local: MessageId,
+        req: OutgoingRequest,
+        reply: oneshot::Sender<TransmitOutcome>,
+    ) {
+        while self.uploads.try_join_next().is_some() {}
+        self.uploading.retain(|_, (_, task)| !task.is_finished());
+        if !self.send.live() {
+            let _ = reply.send(TransmitOutcome::Failed(BackendError::transient(NOT_ONLINE)));
+            return;
         }
+        let Some(mirror) = self.mirror() else {
+            let _ = reply.send(TransmitOutcome::Failed(BackendError::transient(NOT_ONLINE)));
+            return;
+        };
+        if let Some((older, _)) = self.uploading.remove(&local) {
+            older.cancel();
+        }
+        let stop = CancellationToken::new();
+        let task = self.uploads.spawn_local(upload_and_send(Upload {
+            mirror,
+            blob_dir: self.blob_dir.clone(),
+            db: self.db.clone(),
+            send: self.send.clone(),
+            clock: self.clock.clone(),
+            slots: self.upload_slots.clone(),
+            stop: stop.clone(),
+            req,
+            reply,
+        }));
+        self.uploading.insert(local, (stop, task));
+    }
+
+    /// `DownloadAttachment`: fetched beside the event loop, and answered once. Without an identity there is no mirror
+    /// to ask, and the answer is the contract's failure form, durably.
+    fn start_download(
+        &mut self,
+        attachment: AttachmentId,
+        request: DownloadId,
+        remote: BackendBlob,
+        dest: BlobTarget,
+    ) {
+        while self.downloads.try_join_next().is_some() {}
+        let Some(mirror) = self.mirror() else {
+            blob::answer(
+                &self.db,
+                &*self.clock,
+                &self.wake,
+                attachment,
+                request,
+                Err(BackendError::transient("the account is not linked")),
+            );
+            return;
+        };
+        let fetcher = blob::Fetcher {
+            mirror,
+            db: self.db.clone(),
+            events: self.events.clone(),
+            wake: self.wake.clone(),
+            clock: self.clock.clone(),
+            slots: self.download_slots.clone(),
+        };
+        self.downloads
+            .spawn_local(blob::run(fetcher, attachment, request, remote, dest));
     }
 
     /// `ChangeConversationDurable`: confirmed with `CommandPersisted` in one zone and dropped (no
@@ -1046,6 +1227,10 @@ impl Actor {
         if let Some(task) = self.task.take() {
             let _ = task.stop().await;
         }
+        // They hold handles of the store. A download cut here is unanswered: the core asks again at its next start.
+        self.downloads.shutdown().await;
+        self.uploads.shutdown().await;
+        self.pictures.shutdown().await;
         if let Ok(target) = outbox::max_seq(&self.db)
             && target > 0
         {

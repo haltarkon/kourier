@@ -30,7 +30,8 @@
 //!    plan, row, time and left intents are one moment. Failpoint
 //!    [`FAILPOINT_BEFORE_STORAGE_WRITE_PUT`].
 //! 7. The PUT of the sealed [`proto::WriteOperation`] (`PUT /v1/storage/`, 30 s).
-//! 8. 200: failpoint [`FAILPOINT_AFTER_STORAGE_WRITE_PUT`], then the zone of the 200:
+//! 8. 200: failpoint [`FAILPOINT_AFTER_STORAGE_WRITE_PUT`], BQ11's counts (`storage::counts`:
+//!    the written version and count, one more write; memory only), then the zone of the 200:
 //!    [`intents::land_written`] (the written records, the version and the landing in one
 //!    transaction) and [`after_landing`] (the fetch-latest sync; a landing renews its hour, D4);
 //!    failpoint [`FAILPOINT_AFTER_STORAGE_WRITE_COMMIT`].
@@ -418,6 +419,12 @@ async fn attempt<T: SignalTransport>(
     };
     if response.status.is_success() {
         kourier_db::failpoint::hit(FAILPOINT_AFTER_STORAGE_WRITE_PUT);
+        // BQ11's counts (debug-only line, `storage::counts`, M1): the written manifest is the
+        // newest this process saw, and one more PUT was answered 200 (no zone, no await).
+        crate::storage::counts::written(
+            write.plan.manifest.version,
+            write.plan.manifest.identifiers.len(),
+        );
         let now = shared.now();
         let done = shared
             .db

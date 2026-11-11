@@ -570,11 +570,17 @@ pub fn record_link(db: &ZoneDb, identity: &Identity, now_ms: i64, wake: &Rc<Noti
 
 /// Writes the zone-2 marker (S4): the one `join_ready` row, `at` = `now_ms`; an existing row stays (the
 /// first time is kept). Zone 2 and [`record_link`] write it in their own zone; a test that seeds a
-/// linked file with [`save_identity`] alone writes it in the same zone, as the join would have.
+/// linked file with [`save_identity`] alone writes it in the same zone, as the join would have. A file joined by this
+/// build has told the core nothing older, so [`state_features_again`] has nothing to say to it.
 pub fn mark_join_ready(tx: &Tx<'_>, now_ms: i64) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO join_ready (id, at) VALUES (1, ?1)",
         params![now_ms],
+    )
+    .map_err(sql("mark the join ready failed"))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO features_stated (id, version) VALUES (1, ?1)",
+        params![FEATURES_VERSION],
     )
     .map_err(sql("mark the join ready failed"))?;
     Ok(())
@@ -797,6 +803,46 @@ pub fn ready_join(db: &ZoneDb, now_ms: i64, wake: &Rc<Notify>) -> Result<Ready> 
             }),
             _ => Err(StoreError::Failed("state the joined account failed")),
         }
+    })
+}
+
+/// What this build's chats can do differs from what the older builds told the core; raised with [`events::features`].
+const FEATURES_VERSION: i64 = 1;
+
+/// One zone at the first start of a build whose [`events::features`] changed: every chat the file shows says again what it
+/// can do. A hidden contact's chat is left out, as at a join: its next message carries the features.
+pub fn state_features_again(db: &ZoneDb, now_ms: i64, wake: &Rc<Notify>) -> Result<()> {
+    const OP: &str = "state the chats' features failed";
+    db.zone(|tx: &mut Tx<'_>| {
+        let stated: Option<i64> = tx
+            .query_row("SELECT version FROM features_stated", [], |row| row.get(0))
+            .optional()
+            .map_err(sql(OP))?;
+        if stated.is_some_and(|version| version >= FEATURES_VERSION) {
+            return Ok(());
+        }
+        let snapshot = load_snapshot(tx)?;
+        let mut patches = Vec::new();
+        for contact in &snapshot.contacts {
+            if let Ok(Some(patch)) = events::direct_patch(contact) {
+                patches.push(BackendEvent::ConversationUpsert(patch));
+            }
+        }
+        for group in &snapshot.groups {
+            if let Ok(Some(patch)) = events::group_patch(group, &snapshot.own_id) {
+                patches.push(BackendEvent::ConversationUpsert(patch));
+            }
+        }
+        for row in patches.chunks(64) {
+            outbox::append_events(tx, row, now_ms, wake)?;
+        }
+        tx.execute(
+            "INSERT INTO features_stated(id, version) VALUES (1, ?1) \
+             ON CONFLICT (id) DO UPDATE SET version = excluded.version",
+            params![FEATURES_VERSION],
+        )
+        .map_err(sql(OP))?;
+        Ok(())
     })
 }
 

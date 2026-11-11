@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use kourier_model::{
     AccountId, AccountSettingsPatch, AttachmentId, BackendBlob, BackendError, BlobKey, Body, CmdId,
-    ContactChange, ConvKey, ConversationChange, DownloadId, Identifier, IdentityFingerprint,
-    LocalMsgId, MsgTarget, NetMsgId, OwnDevice, ProfilePatch, ReceiptKind, RecipientState,
-    Redacted, ReplyTo, SafetyAnswer, UserId,
+    ContactChange, ConvKey, ConversationChange, DownloadId, GroupInviteAction, Identifier,
+    IdentityFingerprint, LocalMsgId, MsgTarget, NetMsgId, OwnDevice, ProfilePatch, ReceiptKind,
+    RecipientState, Redacted, ReplyTo, SafetyAnswer, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -413,6 +413,16 @@ pub enum Command {
         /// The user.
         reply: Reply<UserId>,
     },
+    /// The invite link of a group: read or changed, by an administrator of the group. The link
+    /// lets anyone join: it is never a log field.
+    GroupInvite {
+        /// The group.
+        group: ConvKey,
+        /// What to do with its link.
+        action: GroupInviteAction,
+        /// The link as it stands afterwards, `None` when it is off.
+        reply: Reply<Option<Redacted<String>>>,
+    },
     /// List our devices.
     ListOwnDevices {
         /// The devices.
@@ -484,6 +494,7 @@ impl Command {
             Self::SetVerified { .. } => "SetVerified",
             Self::FetchHistory { .. } => "FetchHistory",
             Self::Resolve { .. } => "Resolve",
+            Self::GroupInvite { .. } => "GroupInvite",
             Self::ListOwnDevices { .. } => "ListOwnDevices",
             Self::RefreshContact { .. } => "RefreshContact",
             Self::SubmitChallenge { .. } => "SubmitChallenge",

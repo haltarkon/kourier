@@ -22,7 +22,9 @@ use crate::core_source::{Changes, Paging};
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules};
 use crate::fixture::Fixture;
 use crate::login::{LoginView, NetworkChoice, NetworkEntry, network_choices};
+use crate::person::{CopyPart, CopyTarget, CopyUpdate};
 use crate::richtext::RichText;
+use crate::roaming::{ChatOffer, ChatTold};
 use crate::time::{Calendar, TimeContext};
 use crate::timeline::{self, MessageRow, QuoteBlock, RowKind, WaitLine};
 use crate::transfer::{AbandonQuestion, ReplaceQuestion};
@@ -512,6 +514,26 @@ pub trait UiSource {
     /// The page asked for with [`UiSource::request_person`] is no longer shown.
     fn close_person(&mut self) {}
 
+    /// A copy action about a person (the menu of a chat, an account or a member): the answer
+    /// comes through [`UiSource::take_copy`] ([`Changes::copy`]). Only the newest action is
+    /// answered: what the user clicked last is what lands on the clipboard. `false`: not asked.
+    fn request_copy(&mut self, _part: CopyPart, _target: CopyTarget) -> bool {
+        false
+    }
+    /// Asks the network about a group's invite link; the answer comes as a copy
+    /// ([`UiSource::take_copy`]). `false`: nothing was asked.
+    fn request_group_invite(
+        &mut self,
+        _conversation: ConversationId,
+        _action: kourier_model::GroupInviteAction,
+    ) -> bool {
+        false
+    }
+    /// The answer to [`UiSource::request_copy`], once.
+    fn take_copy(&mut self) -> Option<CopyUpdate> {
+        None
+    }
+
     /// Asks for the safety number of `user` (P5a, the details panel's "safety" level): the
     /// answer comes through [`UiSource::take_safety`] ([`Changes::safety`]), and again whenever
     /// the account's contacts or the accounts change while the level is shown (one query in
@@ -689,6 +711,45 @@ pub trait UiSource {
     /// core.
     fn mark_read(&mut self, _conv: ConversationId) -> bool {
         false
+    }
+    /// What the menu of `conv` offers of Archive, Pin, Mute and Mark as Unread
+    /// ([`ChatOffer`]): the chat's own account's statement, read from the core's row, in the
+    /// list or not. Nothing shown for a chat the source does not know.
+    fn chat_offer(&self, _conv: ConversationId) -> ChatOffer {
+        ChatOffer::default()
+    }
+    /// Archives (`true`) or unarchives `conv`. The notice ("Chat archived") comes later, once
+    /// the core's row says so ([`UiSource::take_told`]).
+    fn set_archived(&mut self, _conv: ConversationId, _archived: bool) -> bool {
+        false
+    }
+    /// Pins or unpins `conv`.
+    fn set_pinned(&mut self, _conv: ConversationId, _pinned: bool) -> bool {
+        false
+    }
+    /// Mutes `conv` until `until` (ms since the epoch; `i64::MAX` = always), or unmutes it
+    /// (`None`).
+    fn set_muted(&mut self, _conv: ConversationId, _until: Option<i64>) -> bool {
+        false
+    }
+    /// Marks `conv` unread (`true`) or removes the mark. Marking the open chat unread keeps
+    /// the mark until the chat is read for real.
+    fn set_marked_unread(&mut self, _conv: ConversationId, _marked: bool) -> bool {
+        false
+    }
+    /// Takes an archive back (Undo): unarchives `conv` and pins it again when the archive took
+    /// a pin with it. Leaves no notice of its own.
+    fn undo_archive(&mut self, _conv: ConversationId, _was_pinned: bool) -> bool {
+        false
+    }
+    /// Turns the account's switch for writing the chat settings to its other devices on or off.
+    fn set_roaming_writes(&mut self, _account: AccountId, _on: bool) -> bool {
+        false
+    }
+    /// The short notices these changes left since the last call, in order
+    /// ([`Changes::told`]).
+    fn take_told(&mut self) -> Vec<ChatTold> {
+        Vec::new()
     }
     /// Removes one attachment of a message for this account (the message stays).
     fn delete_attachment(&mut self, _attachment: AttachmentId) -> bool {
@@ -956,6 +1017,14 @@ pub trait UiSource {
         None
     }
     /// Window focus and whether the chat page is on screen (notifications, read markers).
+    /// The colors the person gave accounts (uuid to `#rrggbb`); the others have their network's.
+    fn set_account_tints(
+        &mut self,
+        _tints: std::collections::HashMap<kourier_model::AccountUuid, String>,
+    ) -> Changes {
+        Changes::default()
+    }
+
     fn set_presence(&mut self, _focused: bool, _chat_visible: bool) -> Changes {
         Changes::default()
     }

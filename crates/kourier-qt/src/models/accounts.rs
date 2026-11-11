@@ -8,7 +8,7 @@ use kourier_viewmodel::diff::RoleSet;
 use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
-const ROLES: [&str; 13] = [
+const ROLES: [&str; 14] = [
     "accountId",
     "name",
     "network",
@@ -22,6 +22,7 @@ const ROLES: [&str; 13] = [
     "device",
     "shown",
     "place",
+    "tint",
 ];
 
 /// Rust side of `AccountListModel`.
@@ -48,6 +49,8 @@ pub struct AccountQt {
     shown: bool,
     /// The place among its network's accounts in the panel (1, 2, …; 0 when it is alone).
     place: i32,
+    /// The account's color (`#rrggbb`).
+    tint: QString,
 }
 
 impl AccountQt {
@@ -66,6 +69,7 @@ impl AccountQt {
             device: QString::from(v.device.as_str()),
             shown: v.shown,
             place: i32::try_from(v.place).unwrap_or(i32::MAX),
+            tint: QString::from(v.tint.as_str()),
         }
     }
 
@@ -83,6 +87,7 @@ impl AccountQt {
             .with_if(10, a.device != b.device)
             .with_if(11, a.shown != b.shown)
             .with_if(12, a.place != b.place)
+            .with_if(13, a.tint != b.tint)
     }
 
     fn key(v: &AccountRow) -> AccountId {
@@ -110,7 +115,8 @@ impl qobject::AccountListModel {
             9 => QVariant::from(&row.number),
             10 => QVariant::from(&row.device),
             11 => QVariant::from(&row.shown),
-            _ => QVariant::from(&row.place),
+            12 => QVariant::from(&row.place),
+            _ => QVariant::from(&row.tint),
         }
     }
 

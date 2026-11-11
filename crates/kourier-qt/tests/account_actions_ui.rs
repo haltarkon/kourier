@@ -26,8 +26,8 @@
 //!   `Qt.callLater`) opens with its size here too: the failure seen in the L4 build is not
 //!   reproduced by it, offscreen.
 //! - `hidden`: the account's history is being imported, so "Transfer History from Phone…" is
-//!   hidden from its menu. The keyboard (Menu key, Down, Return) lands on the first item that
-//!   is shown, never on the hidden one: no "Remove and Link Again?" is asked.
+//!   hidden from its menu. The keyboard (Menu key, Down past "Color", Down, Return) lands on the
+//!   first action that is shown, never on the hidden one: no "Remove and Link Again?" is asked.
 //!
 //! - `trayed` (L5): as `unreachable`, but the window is hidden (in the tray) right after the
 //!   confirmation: the notice is told while hidden and shown only when the window is back.
@@ -314,8 +314,14 @@ MainWindow {
             if (menu === null || !menu.opened) return win.later("the menu opens on the Menu key");
             win.quiet += 1;
             if (win.quiet < 8) return;
-            // Down goes to the first item that is shown; Return acts on it.
-            win.ev.keyClick(Qt.Key_Down, Qt.NoModifier, -1);
+            // Down goes to the first item that is shown, the "Color" submenu, then over the copy
+            // actions that are shown; the next Down skips the hidden transfer to the first action
+            // that is shown; Return acts on it.
+            const copies = ["drawer-copy-name", "drawer-copy-number", "drawer-copy-link"].filter(name => {
+                const item = win.find(menu.contentItem, i => i.objectName === name);
+                return item !== null && item.visible;
+            }).length;
+            for (let i = 0; i < copies + 2; i++) win.ev.keyClick(Qt.Key_Down, Qt.NoModifier, -1);
             win.ev.keyClick(Qt.Key_Return, Qt.NoModifier, -1);
             win.next("asked");
             return;

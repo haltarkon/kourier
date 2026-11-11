@@ -1040,3 +1040,175 @@ fn share_targets_come_from_the_list_and_send_contact_names_chat_account_and_pers
     assert!(ch.notice);
     assert_eq!(src.notice(), "The contact card could not be sent.");
 }
+
+/// A copy action is a question of its own: it never waits for the page's, the answer is handed
+/// over once, and when the user clicks twice the last click is what lands on the clipboard.
+#[test]
+fn a_copy_action_is_answered_once_and_only_the_newest_counts() {
+    use crate::person::{CopyPart, CopyTarget};
+    use kourier_core::facade::{LinkState, PersonRef};
+    use kourier_model::Redacted;
+
+    const NUMBER: &str = "+15550001111";
+    const LINK: &str = "https://signal.me/#p/+15550001111";
+    let who = user(7);
+    let (mut src, sent) = opened_person(&Store::new(&[(1, 3)]));
+
+    assert!(src.request_copy(CopyPart::Link, CopyTarget::Chat(ConversationId(5))));
+    let older = take_queries(&sent).pop().expect("a query");
+    assert_eq!(older.1, Query::PersonOf(PersonRef::Chat(ConversationId(5))));
+    assert!(src.request_copy(CopyPart::Address, CopyTarget::Account(AccountId(1))));
+    let newest = take_queries(&sent).pop().expect("a query");
+    assert_eq!(newest.1, Query::PersonOf(PersonRef::Own(AccountId(1))));
+
+    let mut d = detail(&who);
+    d.is_self = true;
+    d.own_number = Some(NUMBER.to_owned());
+    d.link = LinkState::Link(Redacted::new(LINK.to_owned()));
+    let ch = src.on_event(&result(
+        older.0,
+        QueryData::Person(Some(Box::new(d.clone()))),
+    ));
+    assert!(!ch.copy, "an older click's answer is dropped");
+    assert!(src.take_copy().is_none());
+
+    let ch = src.on_event(&result(
+        newest.0,
+        QueryData::Person(Some(Box::new(d.clone()))),
+    ));
+    assert!(ch.copy);
+    let got = src.take_copy().expect("the answer");
+    assert_eq!(got.text.as_ref().map(|t| t.expose().as_str()), Some(NUMBER));
+    assert!(!got.told.contains(NUMBER), "the toast holds no number");
+    assert!(src.take_copy().is_none(), "taken once");
+
+    assert!(src.request_copy(
+        CopyPart::Link,
+        CopyTarget::Person {
+            account: AccountId(1),
+            user: who.clone()
+        }
+    ));
+    let asked = take_queries(&sent).pop().expect("a query");
+    assert!(matches!(asked.1, Query::Person { .. }));
+    src.on_event(&result(asked.0, QueryData::Person(Some(Box::new(d)))));
+    let got = src.take_copy().expect("the answer");
+    assert_eq!(got.text.as_ref().map(|t| t.expose().as_str()), Some(LINK));
+    assert_eq!(got.told, "Link copied");
+
+    // A group's row, an account that is gone: nothing is copied and the toast says so.
+    assert!(src.request_copy(CopyPart::Link, CopyTarget::Chat(ConversationId(6))));
+    let asked = take_queries(&sent).pop().expect("a query");
+    src.on_event(&result(asked.0, QueryData::Person(None)));
+    let got = src.take_copy().expect("the answer");
+    assert_eq!(got.text, None);
+    assert_eq!(got.told, "No link to copy");
+}
+
+/// An action on a group's invite link: Copy and Reset put the link on the clipboard, turning it
+/// on or off puts nothing there, the toast never holds the link and a failure says so.
+#[test]
+fn an_invite_action_copies_only_what_it_should() {
+    use kourier_core::facade::CoreError;
+    use kourier_core::facade::UiEvent;
+    use kourier_model::{GroupInviteAction as Action, Redacted};
+
+    const LINK: &str = "https://signal.group/#abc";
+    const GROUP: ConversationId = ConversationId(9);
+    let (mut src, sent) = opened_person(&Store::new(&[(1, 3)]));
+    let link = || QueryData::GroupInvite(Some(Redacted::new(LINK.to_owned())));
+    let asked = |src: &mut CoreSource, action| {
+        assert!(src.request_group_invite(GROUP, action));
+        let (token, query) = take_queries(&sent).pop().expect("a query");
+        assert_eq!(
+            query,
+            Query::GroupInvite {
+                conversation: GROUP,
+                action
+            }
+        );
+        token
+    };
+
+    for (action, told) in [
+        (Action::Read, "Invite link copied"),
+        (Action::Reset, "New invite link copied"),
+    ] {
+        let token = asked(&mut src, action);
+        assert!(src.on_event(&result(token, link())).copy);
+        let got = src.take_copy().expect("the answer");
+        assert_eq!(got.text.as_ref().map(|t| t.expose().as_str()), Some(LINK));
+        assert_eq!(got.told, told);
+        assert!(
+            !got.told.contains("signal.group"),
+            "the toast holds no link"
+        );
+    }
+
+    for (action, told) in [
+        (Action::TurnOn, "The invite link is on"),
+        (Action::TurnOff, "The invite link is off"),
+    ] {
+        let token = asked(&mut src, action);
+        src.on_event(&result(token, link()));
+        let got = src.take_copy().expect("the answer");
+        assert_eq!(got.text, None, "nothing goes on the clipboard");
+        assert_eq!(got.told, told);
+    }
+
+    // A link that is off: nothing to copy, and the toast says why.
+    let token = asked(&mut src, Action::Read);
+    src.on_event(&result(token, QueryData::GroupInvite(None)));
+    let got = src.take_copy().expect("the answer");
+    assert_eq!(got.text, None);
+    assert_eq!(got.told, "The invite link is off");
+
+    // The network could not be asked.
+    let token = asked(&mut src, Action::Reset);
+    src.on_event(&UiEvent::QueryResult {
+        token,
+        result: Err(std::sync::Arc::new(CoreError::Stopped)),
+    });
+    let got = src.take_copy().expect("the answer");
+    assert_eq!(got.text, None);
+    assert!(got.told.contains("could not be changed"), "{}", got.told);
+
+    // An answer to an older click is dropped when a newer action is in flight.
+    let older = asked(&mut src, Action::Read);
+    let newest = asked(&mut src, Action::Read);
+    assert!(!src.on_event(&result(older, link())).copy);
+    assert!(src.take_copy().is_none());
+    assert!(src.on_event(&result(newest, link())).copy);
+}
+
+/// What a copy action takes is what the page shows: a hidden number is not copied, a Threema ID
+/// is the public address, and a link is taken only when the page has one.
+#[test]
+fn a_copy_action_takes_only_what_the_page_may_show() {
+    use crate::person::{CopyPart, copy_update};
+    use kourier_core::facade::LinkState;
+
+    let who = user(7);
+    let mut hidden = detail(&who);
+    {
+        let c = hidden.contact.as_mut().expect("contact");
+        c.identifiers = vec![phone("+15550001111")];
+        c.number_shown = Some(false);
+    }
+    hidden.link = LinkState::NotShared;
+    let got = copy_update(Some(&hidden), CopyPart::Address, NetworkKind::Signal);
+    assert_eq!(got.text, None, "a number that is not shared is not copied");
+    assert_eq!(got.told, "No number or ID to copy");
+    let got = copy_update(Some(&hidden), CopyPart::Link, NetworkKind::Signal);
+    assert_eq!(got.text, None, "a page without a link copies none");
+
+    let id = UserId::parse("threema:ABCD1234").expect("id");
+    let got = copy_update(Some(&detail(&id)), CopyPart::Address, NetworkKind::Threema);
+    assert_eq!(
+        got.text.as_ref().map(|t| t.expose().as_str()),
+        Some("ABCD1234"),
+        "a Threema ID is the address people hand each other"
+    );
+    let got = copy_update(None, CopyPart::Address, NetworkKind::Threema);
+    assert_eq!(got.text, None, "nobody there");
+}

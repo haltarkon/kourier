@@ -2,8 +2,9 @@
 //!
 //! Behavior is ported from Signal Desktop, which is the spec; every module names the Desktop file
 //! it follows. The crate's public items are [`SignalNetwork`] (the `Network` implementation the
-//! composition root registers) and environment configuration ([`SignalEnvironment`],
-//! [`LocalTestEnv`]); protobuf and libsignal types never appear in a public item (§2.3).
+//! composition root registers), environment configuration ([`SignalEnvironment`],
+//! [`LocalTestEnv`]) and the Storage Service counts the debug-only dev-control line shows
+//! ([`storage_counts`], BQ11: numbers only); protobuf and libsignal types never appear in a public item (§2.3).
 //!
 //! Modules (§6.2):
 //! - `actor`: the per-account thread (current-thread runtime + `LocalSet`) and command loop.
@@ -104,6 +105,7 @@ use kourier_model::{
 };
 
 pub use net::{LocalTestEnv, SignalEnvironment};
+pub use storage::counts::{StorageCounts, storage_counts};
 
 /// Archives of Signal's history transfer for other crates' tests (feature `testing`). Only
 /// plain data crosses this boundary: no protobuf or libsignal type (§2.3).
@@ -978,6 +980,10 @@ impl Network for SignalNetwork {
     /// nobody else (P5b, refresh §3.2).
     fn contact_links(&self) -> bool {
         true
+    }
+
+    fn group_invites(&self) -> kourier_model::GroupInvites {
+        kourier_model::GroupInvites::Switch
     }
 
     fn contact_link(&self, _user: &UserId, number: &str) -> Option<String> {

@@ -48,6 +48,14 @@ Keyboard use, without a mouse:
   button has no name of its own, so a screen reader finds the count as a text beside it ("Open the
   side panel · N unread messages in hidden accounts").
 
+Chats' Archive, Pin, Mute and Mark as Unread are in the row menu of the chat list (right click, the Menu key or
+Shift+F10) and in the overflow menu of the chat page. Mute opens a sub-menu (1 Hour, 8 Hours, 1 Day, 1 Week, Until…,
+Always); "Until…" opens the "Mute Until" dialog with a Date and a Time button. Ctrl+Shift+A archives the open chat and
+Ctrl+Shift+U takes it back into the chats (Signal Desktop's keys); while the "Chat archived" notice stands, Ctrl+Shift+U
+also undoes the archive. An entry that cannot be used is greyed and says why in its description, and a menu with no usable
+entry announces that reason. The notices ("Chat archived", "Chat returned to inbox", "Chat marked unread") are announced
+politely.
+
 The interface follows the system's color scheme and font through Qt and Kirigami, and has a narrow
 layout for small windows.
 
@@ -63,6 +71,8 @@ layout for small windows.
   a switch that turns the several-accounts choice off.
 - **No shortcuts yet** for switching chats, searching, or marking a chat read, and they cannot be
   configured.
+- **Ctrl+Shift+U and input methods.** IBus takes Ctrl+Shift+U for Unicode entry on many setups, so with it running the
+  key never reaches Kourier; use the menu.
 - **Contrast.** A review of the theme on 2026-10-06 found text that is below the WCAG AA ratio of
   4.5:1 in a few places (for example the accent color behind your own messages and some secondary
   text). Fixing this is planned before a first release; until then, assume it is not met everywhere.

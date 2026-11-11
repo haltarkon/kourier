@@ -819,7 +819,7 @@ fn a_text_from_a_hidden_contact_states_its_chat_first() {
 
 /// E5 (the lead's call after A7b): Desktop's `:93` has the conversation from the contact's creation; here a
 /// contact the phone HID has no stated chat, so the message's row states the whole 1:1 patch (Threema's
-/// features with `NotYetBuilt`, no composer) FIRST and then the `Message`.
+/// features) FIRST and then the `Message`.
 #[tokio::test]
 async fn a_text_from_a_hidden_contact_states_its_chat_first_child() {
     if !support::offline::in_child() {

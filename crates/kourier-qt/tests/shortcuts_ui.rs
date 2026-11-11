@@ -14,7 +14,8 @@
 //!   archive (the list's last row, while there are archived chats), the timeline and the
 //!   composer;
 //! - a row of the conversation list has a menu (the Menu key and Shift+F10 on the current row,
-//!   a right click) with "Mark as Read" only for a chat with unread messages; the entry,
+//!   a right click) with "Mark as Read" only for a chat with unread messages (and, on an account
+//!   whose network writes the settings, Mark as Unread, Pin, Mute and Archive, A10d); the entry,
 //!   chosen by the keyboard, clears that chat's unread count without opening the chat and
 //!   leaves the other chats alone;
 //! - every button and every text field that is on screen has an accessible name (its text, or
@@ -340,19 +341,31 @@ MainWindow {
             return;
         }
         case "menu-none": {
-            // A chat with nothing unread has nothing to offer: no menu opens, by any way.
+            // A chat with nothing unread still offers its copy actions and, on the fixture's
+            // account (its sync is on), Archive, Pin, Mute and Mark as Unread (A10d), without
+            // "Mark as Read".
             const page = win.pageStack.get(0);
             const list = page.conversations;
             list.forceActiveFocus();
             list.currentIndex = win.menuRead;
-            win.key(Qt.Key_Menu, Qt.NoModifier);
-            if (page.rowMenu.visible) return win.fail("the Menu key opened a menu for a chat with nothing unread");
-            win.key(Qt.Key_F10, Qt.ShiftModifier);
-            if (page.rowMenu.visible) return win.fail("Shift+F10 opened a menu for a chat with nothing unread");
             const row = list.itemAtIndex(win.menuRead);
             if (!win.ev.mouseClick(row, row.width / 2, row.height / 2, Qt.RightButton, Qt.NoModifier, -1)) return win.fail("the window took no mouse event");
-            if (page.rowMenu.visible) return win.fail("a right click opened a menu for a chat with nothing unread");
+            win.next("menu-none-open");
+            return;
+        }
+        case "menu-none-open": {
+            const page = win.pageStack.get(0);
+            if (!page.rowMenu.opened) return win.later("a right click opens the menu of a chat with nothing unread");
+            if (page.markReadEntry.visible) return win.fail("Mark as Read on a chat with nothing unread");
             if (App.timeline.conversationId !== win.openBefore) return win.fail("a right click opened the chat");
+            if (!page.archiveMenuEntry.visible || !page.archiveMenuEntry.enabled) return win.fail("Archive is not offered by the fixture's account");
+            win.key(Qt.Key_Escape, Qt.NoModifier);
+            win.next("menu-none-closed");
+            return;
+        }
+        case "menu-none-closed": {
+            const page = win.pageStack.get(0);
+            if (page.rowMenu.visible) return win.later("Escape closes the menu");
             win.next("menu-key");
             return;
         }
@@ -378,7 +391,11 @@ MainWindow {
         case "menu-key-closed": {
             const page = win.pageStack.get(0);
             if (page.rowMenu.visible) return win.later("Escape closes the menu");
-            if (!page.conversations.activeFocus) return win.fail("the keyboard did not return to the list, it is in " + win.activeFocusItem);
+            if (!page.conversations.activeFocus) {
+                let chain = "";
+                for (let i = win.activeFocusItem; i; i = i.parent) chain += " > " + i;
+                return win.fail("the keyboard did not return to the list, it is in " + chain + "; menu " + page.rowMenu.visible + " sub " + page.muteSub.visible);
+            }
             // A right click on a row of a chat with news.
             const row = page.conversations.itemAtIndex(win.menuUnread);
             if (!win.ev.mouseClick(row, row.width / 2, row.height / 2, Qt.RightButton, Qt.NoModifier, -1)) return win.fail("the window took no mouse event");
@@ -432,10 +449,23 @@ MainWindow {
                 const other = find(id);
                 if (other && other.unread === 0) return win.fail("another chat was marked read too");
             }
-            // The chat has nothing unread now: its menu stays shut.
+            // The chat has nothing unread now: its menu keeps the copy actions, without "Mark as Read".
             list.currentIndex = win.menuUnread;
             win.key(Qt.Key_Menu, Qt.NoModifier);
-            if (page.rowMenu.visible) return win.fail("a chat just read still has a menu");
+            win.next("menu-marked-open");
+            return;
+        }
+        case "menu-marked-open": {
+            const page = win.pageStack.get(0);
+            if (!page.rowMenu.opened) return win.later("the Menu key opens the menu of a chat just read");
+            if (page.markReadEntry.visible) return win.fail("a chat just read still offers Mark as Read");
+            win.key(Qt.Key_Escape, Qt.NoModifier);
+            win.next("menu-marked-closed");
+            return;
+        }
+        case "menu-marked-closed": {
+            const page = win.pageStack.get(0);
+            if (page.rowMenu.visible) return win.later("Escape closes the menu");
             win.next("names");
             return;
         }

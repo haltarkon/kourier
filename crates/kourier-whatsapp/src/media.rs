@@ -196,7 +196,7 @@ impl MediaPointer {
 }
 
 /// Lower-case (or upper-case) hex back to bytes; `None` for anything else.
-fn unhex(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
     }

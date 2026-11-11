@@ -2268,6 +2268,8 @@ pub struct SettingsRust {
     /// shown accounts follows it; the hidden accounts themselves are the App's to save.
     pub(crate) blend_accounts: bool,
     pub(crate) round_avatars: bool,
+    pub(crate) tint_rows: bool,
+    pub(crate) chat_wallpaper: bool,
     /// The theme's avatar corner as a share of a list avatar's side, as QML last said (not
     /// saved: the theme is the front-end's).
     pub(crate) avatar_corner: f64,
@@ -2307,6 +2309,8 @@ impl SettingsRust {
             compact: prefs.compact,
             blend_accounts: prefs.blend_accounts,
             round_avatars: prefs.round_avatars,
+            tint_rows: prefs.tint_rows,
+            chat_wallpaper: prefs.chat_wallpaper,
             avatar_corner: 0.0,
             notification_content: prefs.notification_content.index(),
             location_files: prefs.location_files.index(),
@@ -2332,6 +2336,8 @@ impl SettingsRust {
             compact: self.compact,
             blend_accounts: self.blend_accounts,
             round_avatars: self.round_avatars,
+            tint_rows: self.tint_rows,
+            chat_wallpaper: self.chat_wallpaper,
             notification_content: NotificationContent::from_index(self.notification_content),
             location_files: LocationFiles::from_index(self.location_files),
             ..self
@@ -2436,6 +2442,16 @@ impl qobject::SettingsController {
     /// `roundAvatars`. Notification avatars read it from the preferences at each use.
     pub fn set_round_avatars_pref(self: Pin<&mut Self>, value: bool) {
         self.update(|s| std::mem::replace(&mut s.round_avatars, value) != value);
+    }
+
+    /// `tintRows`.
+    pub fn set_tint_rows_pref(self: Pin<&mut Self>, value: bool) {
+        self.update(|s| std::mem::replace(&mut s.tint_rows, value) != value);
+    }
+
+    /// `chatWallpaper`.
+    pub fn set_chat_wallpaper_pref(self: Pin<&mut Self>, value: bool) {
+        self.update(|s| std::mem::replace(&mut s.chat_wallpaper, value) != value);
     }
 
     /// `avatarCorner`: kept for QML and handed to the notification avatars. Not a preference,

@@ -439,10 +439,16 @@ fn allowed_internal() -> BTreeMap<&'static str, &'static [&'static str]> {
             ][..],
         ),
         ("kourier-tdlib", &[][..]),
-        // The Threema backend (architecture §7.4): the same edges as WhatsApp's.
+        // The Threema backend (architecture §7.4): the same edges as WhatsApp's, from TH8 (files and
+        // profile pictures) the encrypted files too. It re-encodes no picture, so no kourier-media.
         (
             "kourier-threema",
-            &["kourier-model", "kourier-backend-api", "kourier-db"][..],
+            &[
+                "kourier-model",
+                "kourier-backend-api",
+                "kourier-db",
+                "kourier-blob",
+            ][..],
         ),
         ("kourier-desktop", &[][..]),
         (
@@ -755,7 +761,7 @@ fn target_dir() -> PathBuf {
 /// network's linking walk) for the first three, `--fixture` (the fake account's demo data in
 /// `core.db`) for the rest. Every `--page` value is here (`PAGES` in `crates/kourier-qt/src/lib.rs`;
 /// a test compares the two).
-const SHOT_PAGES: [&str; 82] = [
+const SHOT_PAGES: [&str; 90] = [
     "welcome",
     "link",
     "qr",
@@ -827,6 +833,7 @@ const SHOT_PAGES: [&str; 82] = [
     "archive",
     "person",
     "group",
+    "groupadmin",
     "chatmedia",
     "safety",
     "safetychanged",
@@ -838,6 +845,13 @@ const SHOT_PAGES: [&str; 82] = [
     "locationnever",
     "accounts",
     "accountsdrawer",
+    "rowmenu",
+    "rowmenuoff",
+    "rowmenumuted",
+    "mutemenu",
+    "muteuntil",
+    "chatmenu",
+    "chatmenuoff",
 ];
 
 /// Pages that look the same in both color schemes: the image viewer covers the window with a
@@ -1242,14 +1256,16 @@ mod tests {
         }
     }
 
-    /// The Threema backend's edges (architecture §2.2, §7.4): the contract crates and the database,
-    /// libthreema and tokio; nothing else of Kourier, and nobody else gets libthreema.
+    /// The Threema backend's edges (architecture §2.2, §7.4): the contract crates, the database, the
+    /// encrypted files (TH8), libthreema and tokio; nothing else of Kourier, and nobody else gets libthreema.
     #[test]
     fn threema_may_use_the_contract_the_database_and_libthreema() {
         let m = meta(&[
             ("kourier-threema", "kourier-model", "normal"),
             ("kourier-threema", "kourier-backend-api", "normal"),
             ("kourier-threema", "kourier-db", "normal"),
+            // TH8 (files and profile pictures).
+            ("kourier-threema", "kourier-blob", "normal"),
             ("kourier-threema", "libthreema", "normal"),
             ("kourier-threema", "tokio", "normal"),
             ("kourier-app", "kourier-threema", "normal"),
@@ -1268,6 +1284,7 @@ mod tests {
             "kourier-telegram",
             "kourier-tdlib",
             "kourier-fake",
+            "kourier-media",
         ] {
             let m = meta(&[("kourier-threema", to, "normal")]);
             let errors = check_metadata(&m).unwrap();

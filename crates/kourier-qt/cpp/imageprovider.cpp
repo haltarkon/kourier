@@ -458,6 +458,56 @@ QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
     return image;
 }
 
+namespace {
+
+class ArtProvider : public QQuickImageProvider {
+public:
+    ArtProvider()
+        : QQuickImageProvider(QQuickImageProvider::Image)
+    {
+    }
+
+    QImage requestImage(const QString& id, QSize* size, const QSize& requested) override
+    {
+        const QStringList parts = id.split(QLatin1Char('/'));
+        const QColor color = parts.size() == 2 ? QColor(QLatin1Char('#') + parts[1]) : QColor();
+        if (!color.isValid()) {
+            return {};
+        }
+        QImage image;
+        if (parts[0] == QLatin1String("doodle")) {
+            QImageReader reader(QStringLiteral(":/qt/qml/app/kourier/icons/doodle.svg"), "svg");
+            reader.setScaledSize(requested.isValid() ? requested : QSize(480, 480));
+            image = reader.read().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            if (!image.isNull()) {
+                QPainter painter(&image);
+                painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+                painter.fillRect(image.rect(), color);
+            }
+        } else if (parts[0] == QLatin1String("swatch")) {
+            image = QImage(requested.isValid() ? requested : QSize(16, 16),
+                QImage::Format_ARGB32_Premultiplied);
+            image.fill(Qt::transparent);
+            QPainter painter(&image);
+            painter.setRenderHint(QPainter::Antialiasing);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(color);
+            painter.drawEllipse(image.rect().adjusted(1, 1, -1, -1));
+        }
+        if (size != nullptr) {
+            *size = image.size();
+        }
+        return image;
+    }
+};
+
+} // namespace
+
+void installArtProvider(QQmlApplicationEngine& engine)
+{
+    engine.addImageProvider(QStringLiteral("kourierart"), new ArtProvider);
+}
+
 void installImageProvider(QQmlApplicationEngine& engine, MediaReader reader)
 {
     engine.addImageProvider(QStringLiteral("kourier"), new Provider(reader));

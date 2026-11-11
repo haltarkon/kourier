@@ -57,13 +57,15 @@ differently is listed at the end. Read the whole page once before the first run.
   refills them and renews the signed keys about every two days.
 - The device states its capabilities. They are Signal Desktop's values.
 - Kourier asks the phone for its contacts, settings and block list and reads the account's
-  Storage Service records and groups. It reads only.
+  Storage Service records and groups. It reads only, as long as the account's switch "Sync chat changes with my phone"
+  stays off (it starts off, and no step turns it on).
 - From then on the device receives the account's messages and sends delivery receipts. Opening
   a chat in Kourier marks it read, which sends read receipts and a read sync.
 - The server notes the device's last connection at every connect.
 - Contacts' apps learn of the new device at their next send. There is no safety-number change.
-- Kourier has no request that writes the profile, the avatar, the username, the PIN, a group or
-  the Storage Service.
+- Kourier has no request that writes the profile, the avatar, the username, the PIN or a group.
+  It writes the Storage Service only for a chat's Archive, Pin, Mute or Mark as Unread, and only while
+  the account's switch "Sync chat changes with my phone" is on. Every account starts with it off.
 
 ## What the run does to the personal account
 
@@ -384,7 +386,11 @@ left running and the command says so; `stop --force` then ends it with SIGTERM.
 Closing the window also quits the app. Do not use "Remove account" or "Link again" in the
 window during the default run: Remove deletes the device on the server and shreds the keys.
 
-`cargo xtask smoke state` shows the profile and the running app at any time.
+`cargo xtask smoke state` shows the profile and the running app at any time. A debug-only line
+`storage:  version N, identifiers M, unknown ids U, writes K` gives the Storage Service counts of the app's
+process (the newest manifest it saw, the identifiers with no stored record, our writes answered 200), or
+`storage:  not read yet`. On any read after the first write, `unknown ids` above half of `identifiers`
+is a sign that the phone's state was replaced; the first read of a fresh profile has U = M.
 
 ## How the login is kept
 

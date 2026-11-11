@@ -100,6 +100,39 @@ pub(super) const QUESTIONS: &[(&str, &str)] = &[
         "pp-read-it",
         "Did the PERSONAL phone open the 1:1 chat and show the text from the TEST phone, with read receipts on there?",
     ),
+    // The media and send steps (TH8). Each is a y or n about a phone or the window.
+    (
+        "files-open",
+        "In Kourier, did the picture show and open, did the file open, and did the voice message play?",
+    ),
+    (
+        "avatar-shows",
+        "Does Kourier show the PERSONAL phone's profile picture on that chat? (Answer no too if that phone has none or does not share it)",
+    ),
+    (
+        "pp-got-send",
+        "Did the PERSONAL phone show that text exactly once, from the test ID, in the 1:1 chat?",
+    ),
+    (
+        "tp-mirrors-send",
+        "Does the TEST phone show that text once, as its own message, in the 1:1 chat?",
+    ),
+    (
+        "pp-got-group-send",
+        "Did the PERSONAL phone show that text exactly once, from the test ID, in the group?",
+    ),
+    (
+        "tp-mirrors-group-send",
+        "Does the TEST phone show that text once, as its own message, in the group?",
+    ),
+    (
+        "pp-got-file",
+        "Did the PERSONAL phone show that picture with its caption exactly once, and does it open?",
+    ),
+    (
+        "tp-mirrors-file",
+        "Does the TEST phone show that picture once, as its own message, in the 1:1 chat?",
+    ),
     // T7: `kinds`, `phone-sleep`, `flight-mode` and the two ends. Each is a y or n about a phone.
     (
         "kinds-sent",

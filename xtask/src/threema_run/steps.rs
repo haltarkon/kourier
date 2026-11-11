@@ -320,6 +320,41 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Opens a send step's window: until [`Self::send_window_over`] the judge lets the frames of the
+    /// user's own send through, within its bounds. Set BEFORE they are told to send. Idempotent.
+    pub(super) fn send_window(&self, what: &str) -> Result<()> {
+        self.call(
+            &json!({"op": "send_window", "what": what}),
+            Duration::from_secs(10),
+        )
+        .map(|_| ())
+    }
+
+    /// A send step's own send (`--lead-sends`): the supervisor opens the chat, attaches the tool's
+    /// picture when `picture`, and sends `text`.
+    pub(super) fn step_send(
+        &self,
+        what: &str,
+        conversation: i64,
+        text: &str,
+        picture: bool,
+    ) -> Result<()> {
+        self.call(
+            &json!({"op": "step_send", "what": what, "conversation": conversation, "text": text, "picture": picture}),
+            crate::threema_run::supervise::STEP_SEND_WITHIN,
+        )
+        .map(|_| ())
+    }
+
+    /// Closes a send step's window: what it wrote stays allowed, nothing further is.
+    pub(super) fn send_window_over(&self, what: &str) -> Result<()> {
+        self.call(
+            &json!({"op": "send_window_over", "what": what}),
+            Duration::from_secs(10),
+        )
+        .map(|_| ())
+    }
+
     /// Asks the supervisor to leave the link page for the list: `Ok(true)` only when the app took it,
     /// `Ok(false)` when no login waits at its code or emoji (nothing to close) or the app refused.
     pub(super) fn close_login(&self) -> Result<bool> {
@@ -756,6 +791,14 @@ impl StepRun<'_> {
         self.carry.get(key).and_then(Value::as_u64)
     }
 
+    /// The answer to `name` an earlier call of this step got ([`StepRun::asked_once`]).
+    fn carried_answer(&self, name: &str) -> Option<bool> {
+        self.carry
+            .get("answers")
+            .and_then(|a| a.get(name))
+            .and_then(Value::as_bool)
+    }
+
     fn carried_bool(&self, key: &str) -> bool {
         self.carry.get(key).and_then(Value::as_bool) == Some(true)
     }
@@ -775,12 +818,7 @@ impl StepRun<'_> {
     ///
     /// `reuse_no`: a "no" he gave between two calls stands too (else a no is asked again).
     fn asked_once(&mut self, name: &str, reuse_no: bool) -> Result<bool> {
-        if let Some(answer) = self
-            .carry
-            .get("answers")
-            .and_then(|a| a.get(name))
-            .and_then(Value::as_bool)
-        {
+        if let Some(answer) = self.carried_answer(name) {
             return Ok(answer);
         }
         let asked = match self.ask_him(name, reuse_no) {
@@ -1970,6 +2008,7 @@ fn step_passive(run: &mut StepRun<'_>) -> Result<()> {
 
 mod auto;
 mod part2;
+mod sends;
 
 // ---- The step table and the runner ------------------------------------------------------------------------
 
@@ -1981,7 +2020,8 @@ pub(super) struct StepDef {
     run: StepFn,
 }
 
-/// The steps, in the order of the run (part one's seven, then part two's five: [`part2`]).
+/// The steps, in the order of the run (part one's seven, then the media and sends [`sends`] and part
+/// two's: [`part2`]).
 pub(super) const STEPS: &[StepDef] = &[
     StepDef {
         name: "link",
@@ -2024,6 +2064,28 @@ pub(super) const STEPS: &[StepDef] = &[
         name: "kinds",
         what: "optional, his word: the PERSONAL phone sends a quote, a mention in the group, bold text, an edit, a reaction and a delete while the TEST phone leads; Kourier only receives and counts",
         run: part2::step_kinds,
+    },
+    // The media and the sends (TH8): after `passive`, whose follower words allow no frame of a send.
+    // The window is the user's to act in; the no-send rule is lifted only inside these three.
+    StepDef {
+        name: "files",
+        what: "a picture, a file and a voice message from the PERSONAL phone arrive in the 1:1 chat, open and play in the window; the profile picture shows if there is one",
+        run: sends::step_files,
+    },
+    StepDef {
+        name: "send",
+        what: "one text you send in the Kourier window reaches the PERSONAL phone exactly once and shows on the TEST phone as its own",
+        run: sends::step_send,
+    },
+    StepDef {
+        name: "group-send",
+        what: "one text you send in the Kourier window into the group reaches the PERSONAL phone exactly once and shows on the TEST phone as its own",
+        run: sends::step_group_send,
+    },
+    StepDef {
+        name: "send-file",
+        what: "one small picture with a caption you send from the Kourier window reaches the PERSONAL phone exactly once, opens there, and shows on the TEST phone as its own",
+        run: sends::step_send_file,
     },
     StepDef {
         name: "phone-sleep",

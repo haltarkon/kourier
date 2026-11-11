@@ -454,6 +454,7 @@ pub fn receive_inbound(
         bounds: at.bounds,
         own,
         wake: at.wake,
+        pictures: None,
         catch_up: at.catch_up,
     };
     let (received, counts) = inbound_zone(db, RECEIVE_POINTS, |tx| {

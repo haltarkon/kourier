@@ -462,7 +462,7 @@ fn the_phone(reflected: &[d2d::Envelope], expected: &Expect<'_>) -> u64 {
 /// Desktop's `runNicknameTest` for a text: the user's nickname is NICK and `receiver` is a stored contact. The frames are
 /// the reflect, the box and the update; the peer opens the one text. Returns the run and what the peer opened.
 async fn nickname_text(seed: u64, receiver: &str, nickname: Option<&str>) -> (W, Opened) {
-    let mut s = scene(seed).with_peer(receiver).send_open();
+    let mut s = scene(seed).with_peer(receiver);
     if let Some(nickname) = nickname {
         s = s.with_nickname(nickname);
     }
@@ -683,9 +683,7 @@ struct Run<'a> {
 /// exactly `run.receivers` each acked, the update last; what the peers open is the member container the fake builds; no
 /// other member of the group is sent anything; the phone opens the message with the boxes' nonces and the update.
 async fn group_text(run: &Run<'_>) -> W {
-    let mut s = scene(run.seed)
-        .with_members(run.creator, GROUP, run.members)
-        .send_open();
+    let mut s = scene(run.seed).with_members(run.creator, GROUP, run.members);
     if !run.blocked.is_empty() {
         s = s.with_settings(blocking(run.blocked));
     }
@@ -1014,10 +1012,7 @@ async fn a_text_to_a_blocked_contact_is_reflected_and_updated_with_no_box_child(
     if !support::offline::in_child() {
         return;
     }
-    let s = scene(9_301)
-        .with_peer(ONE)
-        .with_settings(blocking(&[ONE]))
-        .send_open();
+    let s = scene(9_301).with_peer(ONE).with_settings(blocking(&[ONE]));
     let mut w = W::new(s).await;
     let to = contact(ONE);
     w.transmit(&to).await;

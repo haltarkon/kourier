@@ -1229,6 +1229,15 @@ pub enum Progress {
     },
 }
 
+/// Who [`Query::PersonOf`] asks about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonRef {
+    /// The other side of a direct chat (of Note to Self: the account).
+    Chat(ConversationId),
+    /// The account itself.
+    Own(AccountId),
+}
+
 /// What to read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
@@ -1267,6 +1276,10 @@ pub enum Query {
         /// The person (an own id gives the user's own page).
         user: UserId,
     },
+    /// The same answer as [`Query::Person`], for the person a chat or an account stands for
+    /// (the copy actions of a chat row and of an account): `None` when it has nobody (a group,
+    /// a channel, a list, an account that is gone or has no id yet).
+    PersonOf(PersonRef),
     /// One group for its page (people pages P2): the description, the rules, the timer and
     /// every member row with the name the core has for it. Answers for a conversation of kind
     /// `Group` only: `None` for a 1:1 chat, a channel, a list or a conversation that is gone.
@@ -1282,6 +1295,13 @@ pub enum Query {
         account: AccountId,
         /// The person.
         user: UserId,
+    },
+    /// The invite link of a group (copy-and-links), read or changed by the account's backend.
+    GroupInvite {
+        /// The group.
+        conversation: ConversationId,
+        /// What to do with its link.
+        action: model::GroupInviteAction,
     },
     /// The option [`UiCommand::SetExpiryPolicy`] chose
     /// ([`ExpiryPolicy::HideUntilConfirmed`] until the user chooses another).
@@ -1327,6 +1347,9 @@ pub enum QueryData {
         /// the backend's answer arrives; [`UiEvent::SafetyWaitChanged`] says when it changes.
         waits: bool,
     },
+    /// [`Query::GroupInvite`]: the link as it stands afterwards, `None` when it is off. It lets
+    /// anyone join: never a log field.
+    GroupInvite(Option<model::Redacted<String>>),
     /// [`Query::ExpiryPolicy`].
     ExpiryPolicy(ExpiryPolicy),
     /// [`Query::QuietNotices`]: `true` when quiet notices are shown in the list.
@@ -1841,7 +1864,7 @@ impl ShareState {
 /// Some(true)`, or the id is the number), `Debug` hides it, and it never reaches a log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum LinkState {
-    /// The network has no links to people, or this is the user's own page (read-only, BQ-4):
+    /// The network has no links to people, or the user's own page has no number a link takes:
     /// no button.
     #[default]
     Hidden,
@@ -1857,18 +1880,32 @@ pub enum LinkState {
 }
 
 impl LinkState {
-    /// The state of `detail`'s page on a network with or without links. `link` makes the link
-    /// of a number that may be shown (the network's [`contact_link`]); it is called with no
-    /// other number.
+    /// The state of `detail`'s page on a network with or without links. `id_link` is the link
+    /// the network makes of the id alone, if it has that kind ([`contact_id_link`]). `link` makes
+    /// the link of a number that may be shown (the network's [`contact_link`]); it is called with
+    /// no other number. The user's own page links the account's own number: "links (to account /
+    /// chat / messages etc)", the user's word of 2026-11-09, which replaces BQ-4's no button there.
     ///
+    /// [`contact_id_link`]: kourier_backend_api::Network::contact_id_link
     /// [`contact_link`]: kourier_backend_api::Network::contact_link
     pub fn of(
         detail: &PersonDetail,
         links: bool,
+        id_link: Option<String>,
         link: impl FnOnce(&str) -> Option<String>,
     ) -> Self {
-        if !links || detail.is_self {
+        if !links {
             return Self::Hidden;
+        }
+        if let Some(l) = id_link {
+            return Self::Link(Redacted::new(l));
+        }
+        if detail.is_self {
+            return detail
+                .own_number
+                .as_deref()
+                .and_then(link)
+                .map_or(Self::Hidden, |l| Self::Link(Redacted::new(l)));
         }
         // Known by the number alone: it names them anyway (the page shows it).
         if !detail.user.is_phone_number()
@@ -1924,10 +1961,13 @@ pub struct GroupDetail {
     /// Every member row, in no particular order: full members, admins, people invited and
     /// people who asked to join. Our own row is among them while we are in the list.
     pub members: Vec<GroupMember>,
+    /// What the page may do with the group's invite link: the network's offer when we are an
+    /// administrator of a group that still stands, else nothing.
+    pub invites: model::GroupInvites,
 }
 
 kourier_model::redacting_debug!(GroupDetail {
-    account, id, avatar, timer, features, blocked, members
+    account, id, avatar, timer, features, blocked, members, invites
 } redact { title, description });
 
 /// Which attachments a gallery page lists ([`Query::ChatMedia`]). Voice notes and stickers are

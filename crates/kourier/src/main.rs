@@ -30,8 +30,8 @@ offline|loggedout|challenge|clock|originals|timercustom|clearchat|mediamenu|dele
 folder|folderfiles|folderzip|expiry|readmore|about|calls|unavailable|transferwait|\
 transferdownload|transferread|transferupdate|transferbanner|transferfailed|transferask|\
 networks|warisk|waqr|waphone|wacode|thqr|themoji|tgwarn|tgqr|tgcode|tgpassword|wahistory|waban|\
-walock|waoff|wafailed|walost|uploading|uploadfile|archive|person|group|chatmedia|safety|safetychanged|share|timerpending|save|location|\
-locationmany|locationnever|accounts|accountsdrawer>] \
+walock|waoff|wafailed|walost|uploading|uploadfile|archive|person|group|groupadmin|chatmedia|safety|safetychanged|share|timerpending|save|location|\
+locationmany|locationnever|accounts|accountsdrawer|rowmenu|rowmenuoff|rowmenumuted|mutemenu|muteuntil|chatmenu|chatmenuoff>] \
 [--fixture-transfer=<walk|declined|wait|download|read|link-again|update-app|corrupt|too-large|\
 download-failed|internal>] [--fixture-send=<slow|keys|members|retry|uploading>] \
 [--fixture-network=<fake|whatsapp|threema|telegram>] [--screenshot=<png>] \
@@ -411,6 +411,12 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
     // The warning page of a network that is off starts from the welcome page, with no account;
     // so do the link pages of WhatsApp, Threema and Telegram.
     let held_links = matches!(page, Some("warisk" | "tgwarn")) || page_holds_link(page);
+    // A start with the development control channel (debug builds only: the flag and its field
+    // exist only there, so a release build never makes a scripted start).
+    #[cfg(debug_assertions)]
+    let scripted = args.ui.dev_control;
+    #[cfg(not(debug_assertions))]
+    let scripted = false;
     let launch = if args.fixture || args.fixture_link {
         Launch::Fixture(FixtureOptions {
             link: args.fixture_link || page_links || held_links,
@@ -442,12 +448,18 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
             accounts: page_accounts(page),
             // The person's safety number in state Changed (the level of `--page=safetychanged`).
             safety_changed: page == Some("safetychanged"),
+            // The account administers the group of the group page (`--page=groupadmin`).
+            group_admin: page == Some("groupadmin"),
             // The window sends this page's photo itself (`MainWindow.pageSetup`): the core's
             // clock starts early in the minute of "now", so the time under it never follows the
             // length of the start.
             window_sends: page_window_sends(page),
             ..FixtureOptions::default()
         })
+    } else if scripted {
+        // A scripted start: the user's profile like a normal one, but Threema is absent unless the
+        // run tool made the start (`kourier_app::Launch::Scripted`).
+        Launch::Scripted
     } else {
         Launch::Normal
     };
@@ -1059,6 +1071,19 @@ mod tests {
                 .launch,
             Launch::Normal
         );
+        // A scripted start (`--dev-control`) without a fixture is the user's profile, scripted.
+        assert_eq!(
+            start_options(&p(&["--dev-control"]).expect("dev control"))
+                .expect("options")
+                .launch,
+            Launch::Scripted
+        );
+        assert!(matches!(
+            start_options(&p(&["--dev-control", "--fixture"]).expect("fixture"))
+                .expect("options")
+                .launch,
+            Launch::Fixture(_)
+        ));
         // The account-state pages put the fixture account into their state.
         for (page, state) in [
             ("offline", FixtureState::Offline),

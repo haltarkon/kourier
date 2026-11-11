@@ -93,8 +93,7 @@
 //!     `clear_deferred` (R1: the user's clear, which deletes plaintext rows and states `CommandPersisted`); TH6a S1: `prepare_send`,
 //!     `prepare_send_zone`, `mark_send_reflected`, `mark_send_acks`, `mark_send_done`, `count_failed_run`, `give_up_send_job`, `sweep_sends`, `next_send`,
 //!     `send_task`, `send_ledger`, `send_tasks`, `send_receivers`: they write or read the send queue's sealed rows outside the send core; and
-//!     `fail_send_zone` (a send zone of the test's choice fails with a SQLite code of its choice); TH6a S6: `with_send_open` (the
-//!     send core's door, rule 15); TH6 L1: `receive_inbound`, `mark_inbound_reflected`, `sweep_inbound`, `inbound_row`,
+//!     `fail_send_zone` (a send zone of the test's choice fails with a SQLite code of its choice); TH6 L1: `receive_inbound`, `mark_inbound_reflected`, `sweep_inbound`, `inbound_row`,
 //!     `inbound_rows`, `fail_inbound_zone`: they write or read the leader's `csp_inbound` rows outside the socket's leader
 //!     stage, or make one of its zones fail) are named ONLY under this crate's `src/` and `tests/` (and its build script): no file of
 //!     any other crate or of xtask names one of them ([`DOORS`], whole names, comments included: the
@@ -122,11 +121,7 @@
 //!     stays refused there, and `hash_with` too (the leader hashes through `src/reflect/`'s keys); the opens
 //!     stay refused everywhere else (`src/send/`, `src/conn/`, `src/leader.rs`). The transactions (TH9) widen
 //!     the list on purpose, with their own prefix, when they need a box.
-//! 15. THE SEND CORE'S DOOR STAYS SHUT (TH6a S6, decision C3, [`send_door_violations`]): only `src/parts.rs` and
-//!     `src/actor.rs` of `src/` name the flag ([`SEND_DOOR`]: `with_send_open`, `send_open`; whole names, comments and
-//!     test blocks included), so no other code of the crate opens `Command::Transmit` or asks whether it is open, and
-//!     the dial module's parts of a real build cannot. Rule 13 keeps the method out of every other crate. In a real build a `Transmit` stays
-//!     `Failed(unsupported)`.
+//! 15. (the send core's test door: gone with `CannotSend::NotYetBuilt`, TH8).
 //!
 //! 16. ONLY THE DIRECTORY TALKS HTTPS (TH6 L4b, [`https_violations`]): in the production code of `src/` (comment
 //!     lines and `#[cfg(test)]` blocks left out) only [`HTTPS_HOMES`] name the parts' HTTPS client ([`https_names`]:
@@ -177,7 +172,12 @@ fn unblock_violations(path: &str, text: &str) -> Vec<String> {
 
 /// The files of `src/` that may name the parts' HTTPS client (rule 16): the directory's call, the trait, its
 /// re-export; the dial module (the real client) is [`DIAL_PREFIX`].
-const HTTPS_HOMES: &[&str] = &["src/leader/directory.rs", "src/parts.rs", "src/lib.rs"];
+const HTTPS_HOMES: &[&str] = &[
+    "src/leader/directory.rs",
+    "src/parts.rs",
+    "src/lib.rs",
+    "src/blob.rs",
+];
 
 /// The names of the parts' HTTPS client (rule 16): the trait, a call through the parts' field, a call with a request,
 /// and the request type (P-L8: building a request is the act; a call through a local binding names no field).
@@ -258,7 +258,7 @@ fn connect_violations(path: &str, text: &str) -> Vec<String> {
 
 /// The doc-hidden `pub` doors of this crate that exist for its integration tests (rule 13, S5). Whole
 /// names; each is unique to this crate in the workspace (a test checks that the others do not use it).
-const DOORS: [&str; 52] = [
+const DOORS: [&str; 51] = [
     "checked_for_tests",
     "import_join",
     "ready_join",
@@ -302,7 +302,6 @@ const DOORS: [&str; 52] = [
     "prepare_outgoing",
     "seal_sent_update",
     "enqueue_job",
-    "with_send_open",
     "receive_inbound",
     "mark_inbound_reflected",
     "sweep_inbound",
@@ -312,23 +311,6 @@ const DOORS: [&str; 52] = [
     "open_inbound",
     "write_body",
 ];
-
-/// The flag of the send core's door and what asks it (rule 15).
-const SEND_DOOR: [&str; 2] = ["with_send_open", "send_open"];
-/// The files of `src/` that may name them (rule 15): the parts that hold the flag, the actor's `Transmit` arm.
-const SEND_DOOR_HOMES: [&str; 2] = ["src/parts.rs", "src/actor.rs"];
-
-/// Rule 15: a file of `src/` but [`SEND_DOOR_HOMES`] that names the flag, in code, a comment or a test block.
-fn send_door_violations(path: &str, text: &str) -> Vec<String> {
-    if !path.starts_with("src/") || SEND_DOOR_HOMES.contains(&path) {
-        return Vec::new();
-    }
-    SEND_DOOR
-        .iter()
-        .filter(|name| names(text, name))
-        .map(|name| format!("{path} names {name}; only {SEND_DOOR_HOMES:?} of src/ may (rule 15)"))
-        .collect()
-}
 
 /// The doc-hidden module whose path no other crate names (rule 13).
 fn store_path() -> String {
@@ -762,7 +744,6 @@ fn violations(path: &str, text: &str) -> Vec<String> {
     found.extend(connect_violations(path, text));
     found.extend(door_violations(path, text));
     found.extend(crypto_violations(path, text));
-    found.extend(send_door_violations(path, text));
     found.extend(https_violations(path, text));
     found.extend(entry_violations(path, text));
     found.extend(wildcard_arms(path, text));
@@ -2715,11 +2696,6 @@ fn rule_thirteen_keeps_the_test_doors_in_the_crate() {
             "../kourier-app/src/s.rs",
             "let n = clear_deferred(&db, &conv, cmd, 1, &wake);".to_owned(),
         ),
-        // TH6a S6: the send core's door.
-        (
-            "../kourier-app/src/r.rs",
-            "let parts = parts.with_send_open();".to_owned(),
-        ),
     ] {
         let v = violations(path, &text);
         assert!(v.iter().any(|m| m.contains("rule 13")), "{path}: {v:?}");
@@ -2809,80 +2785,6 @@ fn rule_thirteen_keeps_the_test_doors_in_the_crate() {
 /// the real `src/send/encode.rs` is read like the real `src/reflect/mod.rs`, so the allowed place is real.
 /// Rule 15 refuses the flag in the rest of `src/`, also in a comment, and the real homes name it, so the scan sees the names
 /// where they live: the door opens only where the actor asks, and the parts of a real build do not name it.
-#[test]
-fn rule_fifteen_keeps_the_send_door_in_the_parts_and_the_actor() {
-    let rule = |path: &str, text: &str| -> Vec<String> {
-        violations(path, text)
-            .into_iter()
-            .filter(|m| m.contains("rule 15"))
-            .collect()
-    };
-    for path in [
-        "src/dial/mod.rs",
-        "src/conn/mod.rs",
-        "src/send/attempt.rs",
-        "src/send/mod.rs",
-        "src/lib.rs",
-        "src/network.rs",
-        "src/store.rs",
-        "src/parts/x.rs",
-        "src/actor/x.rs",
-    ] {
-        for (text, name) in [
-            (
-                "let parts = make_parts().with_send_open();",
-                "with_send_open",
-            ),
-            ("if self.parts.send_open() {}", "send_open"),
-            ("// the door is with_send_open", "with_send_open"),
-            (
-                "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() { parts.send_open(); }\n}",
-                "send_open",
-            ),
-        ] {
-            let v = rule(path, text);
-            assert!(
-                v.len() == 1 && v[0].contains(name) && v[0].contains(path),
-                "{path} {name}: {v:?}"
-            );
-        }
-    }
-    for (path, text) in [
-        ("src/parts.rs", "self.send_open = true;"),
-        ("src/actor.rs", "if self.parts.send_open() {}"),
-        ("tests/connection/harness.rs", "parts.with_send_open()"),
-        (
-            "src/send/attempt.rs",
-            "let send_opener = 1; let send_open_x = 2;",
-        ),
-        ("../kourier-app/src/x.rs", "let send_open = 1;"),
-    ] {
-        let v = rule(path, text);
-        assert!(v.is_empty(), "{path}: {v:?}");
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for home in SEND_DOOR_HOMES {
-        let text = std::fs::read_to_string(root.join(home)).expect("read");
-        assert!(
-            names(&text, "send_open"),
-            "{home} no longer names the flag: the scan sees nothing there"
-        );
-        assert!(
-            !rule("src/conn/mod.rs", &text).is_empty(),
-            "{home}'s text, moved out, is not refused"
-        );
-    }
-    let dial = std::fs::read_to_string(root.join("src/dial/mod.rs")).expect("read");
-    assert!(
-        names(&dial, &["live", "_parts"].concat()),
-        "the parts of a real build moved: this test reads the wrong file"
-    );
-    assert!(
-        rule("src/dial/mod.rs", &dial).is_empty(),
-        "the parts of a real build name the door"
-    );
-}
-
 #[test]
 fn rule_fourteen_keeps_the_p5_crypto_in_the_reflect_directory() {
     let rule = |path: &str, text: &str| -> Vec<String> {

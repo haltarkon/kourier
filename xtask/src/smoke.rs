@@ -2019,6 +2019,7 @@ fn state(a: &Args) -> Result<i32> {
         "ui:       accounts {}, {} conversations, open #{}, banner {}, challenge {}, login {}",
         ui["accounts"], ui["conversations"], ui["open"], ui["banner"], ui["challenge"], ui["login"]
     );
+    println!("{}", storage_line(&ui["storage"]));
     let chats = parse_chats(&client.ctl("chats", json!({}), Duration::from_secs(30))?);
     let of = |kind: &str| chats.iter().filter(|c| c.kind == kind).count();
     println!(
@@ -2820,6 +2821,22 @@ fn timer_to_send_with(
         (None, None) => bail!(
             "this chat's disappearing-messages timer was not compared with the PERSONAL phone yet: nothing was sent. Run `step send --timer <off|seconds>` first, or pass --timer here. Every 1:1 message restates the chat's timer, and a wrong value would change the setting on the personal account"
         ),
+    }
+}
+
+/// BQ11's line (A10d D8): the dev state's `storage`, the Signal backend's Storage Service counts
+/// of the app's process (the newest manifest it saw: version, identifiers and those with no
+/// record in backend.db; our writes answered 200). The real check's stop rule reads it: on any
+/// read after the first write, `unknown ids` above half of `identifiers` is a force-push sign (a
+/// fresh profile's first read has all of them unknown: the baseline). `null`, or anything that
+/// is not four numbers, is "not read yet": never a row of zeros.
+fn storage_line(storage: &Value) -> String {
+    let n = |key: &str| storage[key].as_u64();
+    match (n("version"), n("identifiers"), n("unknown"), n("writes")) {
+        (Some(version), Some(identifiers), Some(unknown), Some(writes)) => format!(
+            "storage:  version {version}, identifiers {identifiers}, unknown ids {unknown}, writes {writes}"
+        ),
+        _ => "storage:  not read yet".to_owned(),
     }
 }
 
@@ -4939,6 +4956,37 @@ mod tests {
             "{online}"
         );
         assert!(online.contains("may still be arriving"), "{online}");
+    }
+
+    /// BQ11's line (A10d D8): four numbers as the lead reads them, and "not read yet" for a
+    /// `null` (and for anything that is not four numbers), never a row of zeros.
+    #[test]
+    fn the_storage_line_names_the_four_counts_or_says_not_read_yet() {
+        assert_eq!(
+            storage_line(&json!({"version": 7, "identifiers": 41, "unknown": 2, "writes": 3})),
+            "storage:  version 7, identifiers 41, unknown ids 2, writes 3"
+        );
+        assert_eq!(
+            storage_line(&json!({"version": 1, "identifiers": 0, "unknown": 0, "writes": 0})),
+            "storage:  version 1, identifiers 0, unknown ids 0, writes 0"
+        );
+        for not_read in [
+            Value::Null,
+            json!({}),
+            json!({"version": 7, "identifiers": 41, "unknown": 2}),
+            json!({"version": "7", "identifiers": 41, "unknown": 2, "writes": 3}),
+        ] {
+            assert_eq!(
+                storage_line(&not_read),
+                "storage:  not read yet",
+                "{not_read}"
+            );
+        }
+        // A missing key of the state (an app older than D8) reads as not read yet too.
+        assert_eq!(
+            storage_line(&json!({"open": 0})["storage"]),
+            "storage:  not read yet"
+        );
     }
 
     /// A scratch directory below the target directory, removed when dropped.

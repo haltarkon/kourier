@@ -886,7 +886,7 @@ async fn attempt_child() {
         .parse()
         .expect("a time");
     let by_itself = std::env::var(ITSELF_ENV).is_ok_and(|v| v == "1");
-    let mut c = piped::child_send_open().await;
+    let mut c = piped::child().await;
     c.send(Command::Connect).await;
     c.wait_state("past the login", |s| {
         matches!(s, ConnState::Syncing { .. } | ConnState::Online { .. })
