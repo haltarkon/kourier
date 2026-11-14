@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 
 use kourier_backend_api::BackendEvent;
 use kourier_model::{
-    AccountSettingsPatch, AttachmentKind, ContactPatch, ConvKey, ConversationFeatures,
+    AccountSettingsPatch, AttachmentKind, ChatExport, ContactPatch, ConvKey, ConversationFeatures,
     ConversationPatch, FileLimits, Member, MemberList, MemberRole, Patch, Support, UserId, Window,
 };
 use libthreema::protobuf::d2d_sync;
@@ -255,6 +255,8 @@ pub(crate) fn features() -> ConversationFeatures {
                 )
             })
             .collect(),
+        // Threema has no restriction on saving a chat.
+        export: ChatExport::Allowed,
         ..ConversationFeatures::default()
     }
 }
@@ -707,6 +709,7 @@ mod tests {
             cannot_send: None,
             roaming_listed: None,
             invite_link_on: false,
+            export: kourier_model::ChatExport::Allowed,
         }
     }
 

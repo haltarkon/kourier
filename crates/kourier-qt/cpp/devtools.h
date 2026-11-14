@@ -5,6 +5,7 @@
 
 #include <QtCore/QObject>
 #include <QtCore/QString>
+#include <QtCore/QVariant>
 #include <QtGui/QColor>
 
 #include "rust/cxx.h"
@@ -50,6 +51,21 @@ void parkCursor();
 // A mention (the link `kourier:mention/<i>`) is not a link to look at: it keeps the look of the
 // text (`ink`, bold from its markup), without the underline an anchor gets.
 void colorLinks(QObject* textDocument, const QColor& color, const QColor& ink);
+
+// Marks a TextEdit's document (R3): each entry of `marks` (a list of {start, len, color}, the
+// color `#aarrggbb`) gets that background, in document positions of the text shown; what an earlier
+// call marked is cleared first. `colorLinks` leaves a background alone.
+void applyMarks(QObject* textDocument, const QVariant& marks);
+
+// The html of a NAME with marked parts (R3): `shown` is the name as the label draws it (cut by
+// `TextMetrics` with an ellipsis when it did not fit), `whole` the name `marks` (`{start, len, color}`,
+// UTF-16 units, the color `#aarrggbb`) were made for; each mark is laid over `surface` as an opaque
+// `background-color` span, clipped to what `shown` has of the name (the ellipsis is not marked).
+QString markedNameHtml(const QString& shown, const QString& whole, const QVariant& marks, const QColor& surface);
+
+// Tests: `html` marked with `marks`, then its links recolored, one line per marked fragment
+// ("position length #aarrggbb foreground").
+QString richTextMarked(const QString& html, const QVariant& marks, const QColor& color, const QColor& ink);
 
 // How the links of `html` look after `colorLinks`, one line per link ("href fg underline bold"):
 // what the tests of the mention's look read.

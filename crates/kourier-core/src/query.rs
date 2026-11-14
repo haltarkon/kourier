@@ -108,6 +108,7 @@ pub(crate) fn accounts(
                     hold: holds.get(&AccountId(id)).copied(),
                     roaming_writes: roaming.writes,
                     pin_limit: roaming.pin_limit,
+                    own_ids,
                 })
             },
         )
@@ -166,7 +167,7 @@ macro_rules! shown_profile_name {
 
 /// Display name of a user: nickname, address-book name, then profile name (marked for WhatsApp's
 /// people, see [`shown_profile_name`]).
-fn display_name(conn: &Connection, account: i64, user: &str) -> Result<Option<String>> {
+pub(crate) fn display_name(conn: &Connection, account: i64, user: &str) -> Result<Option<String>> {
     Ok(conn
         .prepare_cached(concat!(
             "SELECT coalesce(ct.nickname, ct.system_name, ",
@@ -190,7 +191,8 @@ const CONV_SELECT: &str = concat!(
       c.marked_unread, c.muted_until, c.local_muted_until, c.archived, c.pinned_order, c.blocked,
       c.request_pending, coalesce(c.features_hash, 0), c.draft IS NOT NULL, c.hidden,
       json_extract(c.features, '$.cannot_send') IS NULL,
-      coalesce(json_extract(c.features, '$.roaming_listed'), 1) <> 0, c.protected
+      coalesce(json_extract(c.features, '$.roaming_listed'), 1) <> 0, c.protected,
+      CASE WHEN c.draft IS NULL THEN 0 ELSE coalesce(c.draft_at, 0) END
     FROM conversations c
     JOIN accounts a ON a.id = c.account_id
     LEFT JOIN contacts ct ON c.kind = 'Direct' AND ct.account_id = c.account_id
@@ -223,6 +225,8 @@ struct ConvRaw {
     roaming_listed: bool,
     /// The user protects the chat on another device (core.db `protected`).
     protected: bool,
+    /// When the chat was left with its draft (0: no draft, or an unstamped one).
+    draft_at: i64,
 }
 
 fn conv_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<ConvRaw> {
@@ -250,6 +254,7 @@ fn conv_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<ConvRaw> {
         can_send: r.get(20)?,
         roaming_listed: r.get(21)?,
         protected: r.get(22)?,
+        draft_at: r.get(23)?,
     })
 }
 
@@ -298,6 +303,7 @@ fn conv_row(
         can_send: raw.can_send,
         roaming,
         protected: raw.protected,
+        draft_at: raw.draft_at,
     })
 }
 
@@ -1343,6 +1349,93 @@ pub(crate) fn timeline(
     })
 }
 
+/// The rows of the caught-up messages `ids` that are still there and visible (not deleted for
+/// me, not hidden by the expiry sweeper), grouped by conversation in the order of `ids`, for
+/// the catch-up summary's filter matching (R4): one read, one page context per conversation.
+pub(crate) fn caught_up_messages(
+    conn: &Connection,
+    ids: &[(ConversationId, MessageId)],
+    now: i64,
+) -> Result<Vec<(ConversationId, MessageRow)>> {
+    let none = HashSet::new();
+    // A protected chat's rows show nowhere outside the open chat (core.md): the exclusion is in
+    // the SQL, the desktop policy's own check is the second line.
+    let sql = format!(
+        "{MSG_SELECT} WHERE {TIMELINE_VISIBLE} AND id = ?2
+           AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = ?1 AND c.protected = 0)"
+    );
+    let mut ctxs: BTreeMap<ConversationId, PageCtx> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (conv, id) in ids {
+        let raw = conn
+            .prepare_cached(&sql)?
+            .query_row((conv.0, id.0), msg_raw)
+            .optional()?;
+        let Some(raw) = raw else {
+            continue;
+        };
+        if !ctxs.contains_key(conv) {
+            ctxs.insert(*conv, PageCtx::load(conn, *conv, now, true, &none)?);
+        }
+        let Some(ctx) = ctxs.get_mut(conv) else {
+            continue;
+        };
+        out.push((*conv, message_row(conn, raw, ctx)?));
+    }
+    Ok(out)
+}
+
+/// How many ids one statement of [`messages_by_ids`] binds.
+const IDS_PER_STATEMENT: usize = 500;
+
+/// The messages `ids` of `conv` as [`timeline`] shows them, oldest first and each once: only
+/// rows the timeline would show ([`TIMELINE_VISIBLE`]); an unknown id, an id of another
+/// conversation and a hidden row are absent. The ids are bound in chunks of
+/// [`IDS_PER_STATEMENT`].
+pub(crate) fn messages_by_ids(
+    conn: &Connection,
+    conv: ConversationId,
+    ids: &[MessageId],
+    now: i64,
+    registered: bool,
+    uploading: &HashSet<MessageId>,
+    paused: Option<UserId>,
+) -> Result<TimelinePage> {
+    let mut ids: Vec<i64> = ids.iter().map(|m| m.0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut ctx = PageCtx::load(conn, conv, now, registered, uploading)?;
+    ctx.paused = paused.filter(|_| registered);
+    let mut raws: Vec<MsgRaw> = Vec::new();
+    for chunk in ids.chunks(IDS_PER_STATEMENT) {
+        let marks = (0..chunk.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "{MSG_SELECT} WHERE {TIMELINE_VISIBLE} AND id IN ({marks}) ORDER BY sort_key, id"
+        );
+        let params = std::iter::once(conv.0).chain(chunk.iter().copied());
+        let found = conn
+            .prepare(&sql)?
+            .query_map(kourier_db::rusqlite::params_from_iter(params), msg_raw)?
+            .collect::<kourier_db::rusqlite::Result<Vec<_>>>()?;
+        raws.extend(found);
+    }
+    raws.sort_by_key(|r| (r.sort_key, r.id));
+    let rows = raws
+        .into_iter()
+        .map(|raw| message_row(conn, raw, &mut ctx))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TimelinePage {
+        conv,
+        rows,
+        has_older: false,
+        has_newer: false,
+        now,
+    })
+}
+
 /// The outbox columns of an own message's send row (§4.5), for [`MessageRow::outbox`].
 #[derive(Clone)]
 struct QueuedRaw {
@@ -1381,6 +1474,25 @@ struct AttRaw {
     height: Option<i64>,
     duration_ms: Option<i64>,
     blurhash: Option<String>,
+    model: Option<kourier_model::ModelFacts>,
+}
+
+/// The model mark of an attachment row: present only when the derive step wrote all of it.
+fn model_facts(
+    size: [Option<f64>; 3],
+    tris: Option<i64>,
+    tint: Option<i64>,
+) -> Option<kourier_model::ModelFacts> {
+    let [Some(x), Some(y), Some(z)] = size else {
+        return None;
+    };
+    Some(kourier_model::ModelFacts {
+        x_mm: x as f32,
+        y_mm: y as f32,
+        z_mm: z as f32,
+        tris: sql::u32_of(tris?),
+        tint: tint? != 0,
+    })
 }
 
 fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<MessageRow> {
@@ -1390,7 +1502,8 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
     // media handle table has the files (§8.6).
     let atts: Vec<AttRaw> = conn
         .prepare_cached(
-            "SELECT id, idx, state, mime, size, width, height, duration_ms, blurhash
+            "SELECT id, idx, state, mime, size, width, height, duration_ms, blurhash,
+                    model_x_mm, model_y_mm, model_z_mm, model_tris, model_tint
              FROM attachments WHERE message_id = ?1",
         )?
         .query_map([raw.id], |r| {
@@ -1404,6 +1517,7 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
                 height: r.get(6)?,
                 duration_ms: r.get(7)?,
                 blurhash: r.get(8)?,
+                model: model_facts([r.get(9)?, r.get(10)?, r.get(11)?], r.get(12)?, r.get(13)?),
             })
         })?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
@@ -1436,6 +1550,7 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
             if let Some(d) = row.duration_ms {
                 a.duration_ms = Some(sql::u32_of(d));
             }
+            a.model = row.model;
             if row.blurhash.is_some() {
                 a.blurhash.clone_from(&row.blurhash);
             }
@@ -1709,6 +1824,101 @@ pub(crate) const QUOTE_ORIGINAL: &str =
    AND (?3 IS NULL OR m.net_author = ?3) AND m.expiry_hidden = 0
  LIMIT 4";
 
+/// The author column a quote names its original by: `''` for our own, the canonical id, or
+/// `None` for an unknown author.
+fn quote_author(
+    conn: &Connection,
+    account: i64,
+    r: &ReplyTo,
+    own_ids: &[UserId],
+) -> Result<Option<String>> {
+    Ok(match &r.target.author {
+        TargetAuthor::Own => Some(String::new()),
+        TargetAuthor::User(u) => {
+            let c = resolve_alias(conn, account, u)?;
+            // A peer quoting us names one of our ids.
+            Some(if own_ids.iter().any(|own| own.as_str() == c) {
+                String::new()
+            } else {
+                c
+            })
+        }
+        TargetAuthor::Unknown => None,
+    })
+}
+
+/// SQL: like [`QUOTE_ORIGINAL`], but also the rows hidden by `expiry_hidden`, and the facts the
+/// export's rule asks for: `(deleted, view_once, expiry_hidden, has a timer)`. The export's own
+/// lookup of a quote's original ([`quote_original_facts`]).
+pub(crate) const QUOTE_ORIGINAL_ANY: &str =
+    "SELECT m.deleted, m.view_once, m.expiry_hidden, m.expiry_kind IS NOT NULL FROM messages m
+ WHERE m.account_id = ?1 AND m.conversation_id = ?4 AND m.net_local = ?2
+   AND (?3 IS NULL OR m.net_author = ?3)
+ UNION ALL
+ SELECT m.deleted, m.view_once, m.expiry_hidden, m.expiry_kind IS NOT NULL
+   FROM message_revisions v JOIN messages m ON m.id = v.message_id
+ WHERE v.account_id = ?1 AND m.conversation_id = ?4 AND v.net_local = ?2
+   AND (?3 IS NULL OR v.net_author = ?3)
+ UNION ALL
+ SELECT m.deleted, m.view_once, m.expiry_hidden, m.expiry_kind IS NOT NULL
+   FROM message_aliases a CROSS JOIN messages m ON m.id = a.message_id
+ WHERE a.account_id = ?1 AND a.net_local = ?2 AND m.conversation_id = ?4
+   AND (?3 IS NULL OR m.net_author = ?3)
+ LIMIT 4";
+
+/// What the export's rule needs of the original of the quote of message `message`: `Ok(None)`
+/// when the message quotes nothing; else every row of the conversation that the quote's key
+/// names (hidden ones too), as `(deleted, view_once, expiry_hidden, has a timer)`, and the
+/// conversation's key for the memory of expired messages. An empty list is an original the core
+/// does not have.
+pub(crate) struct QuoteFacts {
+    /// The account.
+    pub account: i64,
+    /// The quote's author column (`None` = unknown).
+    pub author: Option<String>,
+    /// The quote's local id.
+    pub local: String,
+    /// The conversation's encoded key.
+    pub conv_key: String,
+    /// The rows the key names.
+    pub rows: Vec<(Option<String>, bool, bool, bool)>,
+}
+
+/// See [`QuoteFacts`].
+pub(crate) fn quote_original_facts(
+    conn: &Connection,
+    conv: ConversationId,
+    message: MessageId,
+) -> Result<Option<QuoteFacts>> {
+    let raw: Option<(i64, Option<String>)> = conn
+        .prepare_cached("SELECT account_id, reply_to FROM messages WHERE id = ?1")?
+        .query_row([message.0], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((account, Some(json))) = raw else {
+        return Ok(None);
+    };
+    let reply: ReplyTo = sql::from_json(&json)?;
+    let ctx = PageCtx::load(conn, conv, 0, false, &HashSet::new())?;
+    let author = quote_author(conn, account, &reply, &ctx.own_ids)?;
+    let conv_key: String = conn
+        .prepare_cached("SELECT conv_key FROM conversations WHERE id = ?1")?
+        .query_row([conv.0], |r| r.get(0))?;
+    let rows = conn
+        .prepare_cached(QUOTE_ORIGINAL_ANY)?
+        .query_map(
+            (account, reply.target.local.as_ref(), &author, conv.0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?
+        .collect::<kourier_db::rusqlite::Result<_>>()?;
+    Ok(Some(QuoteFacts {
+        account,
+        author,
+        local: reply.target.local.as_ref().to_owned(),
+        conv_key,
+        rows,
+    }))
+}
+
 /// Resolves the quote of a row for display: the original (when it is a message of this
 /// conversation, by its current or a revision key), who wrote it, and what the quote block
 /// shows, from the sender's snapshot first and the original second.
@@ -1718,19 +1928,7 @@ fn reply_preview(
     r: ReplyTo,
     ctx: &mut PageCtx,
 ) -> Result<ReplyPreview> {
-    let canonical: Option<String> = match &r.target.author {
-        TargetAuthor::Own => Some(String::new()),
-        TargetAuthor::User(u) => {
-            let c = resolve_alias(conn, account, u)?;
-            // A peer quoting us names one of our ids.
-            Some(if ctx.own_ids.iter().any(|own| own.as_str() == c) {
-                String::new()
-            } else {
-                c
-            })
-        }
-        TargetAuthor::Unknown => None,
-    };
+    let canonical = quote_author(conn, account, &r, &ctx.own_ids)?;
     // (id, deleted, body, author). An original that is hidden because its time has come
     // on an unconfirmed clock is not found, like one the sweeper erased: the quote keeps
     // only what its sender's snapshot says. A quote WITHOUT an author names its original by the

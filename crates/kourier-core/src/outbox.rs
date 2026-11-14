@@ -651,8 +651,10 @@ pub(crate) fn enqueue_files(
             hide_again(&tx, conv)?;
         }
         if whole && clear_draft {
-            tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
-                .execute([conv.0])?;
+            tx.prepare_cached(
+                "UPDATE conversations SET draft = NULL, draft_at = NULL WHERE id = ?1",
+            )?
+            .execute([conv.0])?;
         }
         let (account, changes) = target.finish()?;
         Ok((account, changes, messages, rest))
@@ -752,8 +754,10 @@ pub(crate) fn enqueue_files_more(
             }
         }
         if send.clear_draft {
-            tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
-                .execute([conv.0])?;
+            tx.prepare_cached(
+                "UPDATE conversations SET draft = NULL, draft_at = NULL WHERE id = ?1",
+            )?
+            .execute([conv.0])?;
         }
     }
     let (account, changes) = target.finish()?;
@@ -1257,7 +1261,7 @@ fn enqueue(
         &[],
     )?;
     if clear_draft {
-        tx.prepare_cached("UPDATE conversations SET draft = NULL WHERE id = ?1")?
+        tx.prepare_cached("UPDATE conversations SET draft = NULL, draft_at = NULL WHERE id = ?1")?
             .execute([conv.0])?;
     }
     let (account, changes) = target.finish()?;
@@ -3298,23 +3302,38 @@ pub(crate) fn requeue(
     Ok(changes)
 }
 
-/// Stores (or clears) the composer draft of a conversation (core-local).
+/// Stores (or clears) the composer draft of a conversation (core-local). A draft that differs
+/// from the stored one is stamped with `at` (the arrival time in the unit of
+/// `conversations.last_activity`, [`draft_stamp`]): the chat is left with it, and a front-end
+/// may move the chat up by it. The same draft again keeps its stamp; clearing it clears the
+/// stamp.
 pub(crate) fn save_draft(
     conn: &Connection,
     conv: ConversationId,
     draft: Option<&Text>,
+    at: i64,
 ) -> Result<()> {
     let json = draft
         .filter(|t| !t.body.is_empty())
         .map(sql::to_json)
         .transpose()?;
     let n = conn
-        .prepare_cached("UPDATE conversations SET draft = ?2 WHERE id = ?1")?
-        .execute((conv.0, json))?;
+        .prepare_cached(
+            "UPDATE conversations SET draft_at = CASE WHEN ?2 IS NULL THEN NULL
+               WHEN draft IS ?2 THEN draft_at ELSE ?3 END,
+             draft = ?2 WHERE id = ?1",
+        )?
+        .execute((conv.0, json, at))?;
     if n == 0 {
         return Err(CoreError::UnknownConversation(conv));
     }
     Ok(())
+}
+
+/// The stamp of a draft saved at `now_ms`: the unit of `conversations.last_activity`
+/// (milliseconds * 1024, as `ingest` makes a row's sort key).
+pub(crate) fn draft_stamp(now_ms: i64) -> i64 {
+    now_ms.saturating_mul(1024)
 }
 
 #[cfg(test)]
@@ -3701,7 +3720,7 @@ mod tests {
         let account = h.account();
         let conn = h.connection_mut();
         let conv = ConversationId(id_of(conn, "SELECT id FROM conversations"));
-        save_draft(conn, conv, Some(&Text::plain("the caption"))).unwrap();
+        save_draft(conn, conv, Some(&Text::plain("the caption")), 0).unwrap();
         let net = kourier_fake::FakeNetwork::new(
             kourier_fake::Flavor::SignalLike,
             kourier_fake::Script::new("staged", vec![UserId::parse(ME).unwrap()]),
@@ -5607,7 +5626,13 @@ mod tests {
             kourier_fake::Script::new("gate", vec![UserId::parse(ME).unwrap()]),
         );
         let conv = ConversationId(id_of(h.connection(), "SELECT id FROM conversations"));
-        save_draft(h.connection(), conv, Some(&Text::plain("my unsent draft"))).unwrap();
+        save_draft(
+            h.connection(),
+            conv,
+            Some(&Text::plain("my unsent draft")),
+            0,
+        )
+        .unwrap();
         (h, net, conv)
     }
 
@@ -5620,6 +5645,75 @@ mod tests {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap()
+    }
+
+    /// The stamp a chat gets when it is left with a draft (Signal Desktop's `draftTimestamp`): a
+    /// new or changed draft is stamped with the time it was saved, the same draft again keeps its
+    /// first stamp, a cleared draft loses it, and the row reports 0 without a draft. The stamp is
+    /// in the unit of `last_activity`. Mutants: the CASE's `draft IS ?2` arm dropped (a repeat
+    /// restamps); the `?2 IS NULL` arm dropped (a cleared draft keeps a stamp); the row's
+    /// `draft IS NULL` guard dropped.
+    #[test]
+    fn a_draft_left_in_a_chat_is_stamped_once_and_loses_the_stamp_with_the_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _net, conv) = a_chat_with_a_draft(&dir);
+        let row = |h: &crate::testing::IngestHarness| {
+            h.conversations(&crate::facade::ConversationListQuery::default())
+                .unwrap()
+                .rows
+                .into_iter()
+                .find(|r| r.id == conv)
+                .unwrap()
+        };
+        // The first save (at 0 in the helper) carries the stamp 0: no stamp.
+        assert!(row(&h).has_draft);
+        assert_eq!(row(&h).draft_at, 0);
+        let stamp = |ms: i64| draft_stamp(ms);
+        save_draft(
+            h.connection(),
+            conv,
+            Some(&Text::plain("a new text")),
+            stamp(5_000),
+        )
+        .unwrap();
+        assert_eq!(row(&h).draft_at, stamp(5_000), "a changed draft is stamped");
+        save_draft(
+            h.connection(),
+            conv,
+            Some(&Text::plain("a new text")),
+            stamp(9_000),
+        )
+        .unwrap();
+        assert_eq!(
+            row(&h).draft_at,
+            stamp(5_000),
+            "the same draft keeps its stamp"
+        );
+        save_draft(
+            h.connection(),
+            conv,
+            Some(&Text::plain("a third text")),
+            stamp(9_000),
+        )
+        .unwrap();
+        assert_eq!(
+            row(&h).draft_at,
+            stamp(9_000),
+            "another text is stamped again"
+        );
+        save_draft(h.connection(), conv, None, stamp(12_000)).unwrap();
+        let cleared = row(&h);
+        assert!(!cleared.has_draft);
+        assert_eq!(cleared.draft_at, 0, "no draft, no stamp");
+        let stored: Option<i64> = h
+            .connection()
+            .query_row(
+                "SELECT draft_at FROM conversations WHERE id = ?1",
+                [conv.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "the column is cleared too");
     }
 
     fn draft_stays(conn: &Connection, conv: ConversationId) -> bool {

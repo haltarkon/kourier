@@ -45,6 +45,12 @@ pub struct CoreConfig {
     pub core_db: PathBuf,
     /// Its key (HKDF of the master key, §5.2).
     pub core_key: kourier_db::DbKey,
+    /// `search.db`, message search's own file (G1): the default is beside `core_db`
+    /// ([`crate::search_db_beside`]).
+    pub search_db: PathBuf,
+    /// Its key: never `core_key` (the app gives it its own HKDF, §5.2; [`Core::start`] refuses
+    /// the same key for both).
+    pub search_key: kourier_db::DbKey,
     /// The compiled-in networks.
     pub networks: NetworkRegistry,
     /// Per-account keys and directories.
@@ -69,16 +75,21 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// A configuration with the default policy and timeouts.
+    /// A configuration with the default policy and timeouts. `search_key` is the key of
+    /// `search.db`: its own, never `core_key` ([`Core::start`] refuses a file under both; the
+    /// argument is required so that no caller can leave it out and share the key by default).
     pub fn new(
         core_db: PathBuf,
         core_key: kourier_db::DbKey,
+        search_key: kourier_db::DbKey,
         networks: NetworkRegistry,
         vault: Arc<dyn AccountVault>,
         clock: Arc<dyn Clock>,
         net_rt: tokio::runtime::Handle,
     ) -> Self {
         Self {
+            search_db: crate::search::file::beside(&core_db),
+            search_key,
             core_db,
             core_key,
             networks,
@@ -135,6 +146,8 @@ pub(crate) struct Shared {
     /// when the actor stops), read by the timeline query. In memory on purpose: a restart
     /// starts the attempt over and the next one reports again.
     pub uploading: Mutex<HashMap<MessageId, (AccountId, ConversationId)>>,
+    /// The running exports' cancel flags ([`UiCommand::ExportArchive`]).
+    pub exports: crate::export::Running,
     /// The conversations whose queue waits for the user to confirm a person's changed safety
     /// number (the dispatcher's identity pauses, P5a BQ-3): the conversation → its account, the
     /// paused head's outbox row and the person. Copied from the dispatcher by the account's
@@ -215,6 +228,36 @@ pub(crate) struct Shared {
     /// The control channel of every account's supervisor, for writers outside the core task
     /// (the sweeper) that took rows out of an account's outbox.
     pub controls: Mutex<HashMap<AccountId, mpsc::UnboundedSender<Control>>>,
+    /// The saved RegExp filters, their compiled set and the revision (`crate::filters`):
+    /// ONE `Arc<FilterSet>`, rebuilt on a blocking thread after every change and swapped in
+    /// by the command that made it ([`FilterState`]). Memory mirrors core.db `filters`.
+    pub filters: Mutex<FilterState>,
+    /// [`FILTERS_PENDING`] until a real set is in [`Self::filters`] (the start's compile or a
+    /// command's rebuild, whichever comes first), then [`FILTERS_READY`]; [`FILTERS_STOPPED`]
+    /// when the core goes down. [`Query::Filters`] waits on it, never answers the placeholder.
+    pub filters_ready: watch::Sender<u8>,
+    /// "A valid filter has Notify and Also in muted chats": the muted chats' live messages
+    /// are candidates for a notification only while this is set (R4 reads it; ingest never
+    /// matches a pattern). Kept by the filter store, true or false after every change and at
+    /// the start. Named for its one consumer: a later consumer of the filters gets a feed of
+    /// its own.
+    pub notify_muted_watch: std::sync::atomic::AtomicBool,
+    /// "A valid filter has Notify": the catch-up records the ids of the caught-up messages
+    /// only while this is set, so the summary can name the filters they match (R4). Kept with
+    /// [`Self::notify_muted_watch`].
+    pub notify_watch: std::sync::atomic::AtomicBool,
+}
+
+pub(crate) const FILTERS_PENDING: u8 = 0;
+pub(crate) const FILTERS_READY: u8 = 1;
+pub(crate) const FILTERS_STOPPED: u8 = 2;
+
+/// The filters as the core holds them ([`Shared::filters`]).
+#[derive(Clone)]
+pub(crate) struct FilterState {
+    pub list: Vec<crate::filters::Filter>,
+    pub set: Arc<crate::filters::FilterSet>,
+    pub revision: u64,
 }
 
 /// Thumbnail jobs that decode at the same time.
@@ -349,11 +392,21 @@ impl Shared {
             .is_some_and(|h| h.until_ms.is_none_or(|until| now < until))
     }
 
+    /// Whether a valid filter has Notify and "Also in muted chats" ([`Self::notify_muted_watch`]).
+    pub(crate) fn watches_muted(&self) -> bool {
+        self.notify_muted_watch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Announces what a committed change wants announced (§8.7), unless the user is looking
     /// at that conversation: the window has the focus and shows it.
     pub(crate) fn notify(&self, account: AccountId, candidates: &[NotifyCandidate]) {
         let presence = self.presence.borrow().clone();
         for n in candidates {
+            // A muted chat's message is a candidate only while a filter watches muted chats.
+            if n.muted && !self.watches_muted() {
+                continue;
+            }
             let focused_here = presence.focused
                 && presence
                     .visible
@@ -365,6 +418,7 @@ impl Shared {
                     conv: n.conv,
                     message: n.message,
                     mentions_me: n.mentions_me,
+                    muted: n.muted,
                 }));
             }
         }
@@ -511,6 +565,8 @@ pub struct Core {
     calls: Option<JoinHandle<()>>,
     /// The deadline task of the waits for the other device's answer ([`restore`]).
     restores: Option<JoinHandle<()>>,
+    /// The task that writes the search index (`search::index::run`).
+    search: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
 }
 
@@ -526,6 +582,15 @@ struct Slot {
 }
 
 impl Core {
+    /// Whether a valid filter has Notify and "Also in muted chats" ([`Shared::notify_muted_watch`]):
+    /// for the tests of the filter store; the notify path reads the flag inside the core.
+    #[doc(hidden)]
+    pub fn filters_notify_muted_watch(&self) -> bool {
+        self.shared
+            .notify_muted_watch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Opens and migrates `core.db`, reconciles the accounts with the vault and starts one
     /// supervisor per account. Call inside a tokio runtime.
     ///
@@ -535,14 +600,22 @@ impl Core {
     /// them when `core.db` was deleted — is recreated as an `Active` account started with
     /// `StartMode::Rebuild` when its secret still opens it, and removed when it does not.
     pub async fn start(cfg: CoreConfig) -> Result<Self> {
+        // The index file never shares core.db's key: a key found in one of them must not open
+        // the other.
+        if cfg.search_key.as_bytes() == cfg.core_key.as_bytes() {
+            return Err(CoreError::InvalidInput(
+                "search.db needs a key of its own, not core.db's",
+            ));
+        }
         crate::ingest::restore::tune_waits(
             cfg.timeouts.restore_answer,
             cfg.timeouts.restore_pending,
         );
         let (path, key) = (cfg.core_db.clone(), cfg.core_key.clone());
+        let (search_path, search_key) = (cfg.search_db.clone(), cfg.search_key.clone());
         let media_dir = cfg.media_cache.clone();
         let (store, fresh, playback) = tokio::task::spawn_blocking(move || {
-            let (store, fresh) = Store::open(&path, &key)?;
+            let (store, fresh) = Store::open_with(&path, &key, &search_path, &search_key)?;
             Ok::<_, CoreError>((store, fresh, Playback::new(media_dir.as_deref())))
         })
         .await
@@ -561,6 +634,12 @@ impl Core {
         let clock_wrong = store.read(local::clock_wrong_accounts).await?;
         // Read before the first sweep of this start, with no UI anywhere near (§9.6).
         let expiry_policy = store.read(expiry::stored_policy).await?;
+        // The saved filters compile on a blocking thread, off the start's path: the watches are
+        // set from the stored rows' switches (a superset for a moment at worst) and an empty
+        // placeholder (revision 0) stands in until the compile publishes (`publish_start_filters`).
+        let saved = store.read(crate::filter_store::list).await?;
+        let watch_muted = crate::filter_store::wants_muted(&saved);
+        let watch_notify = crate::filter_store::wants_notify(&saved);
         let (events, _) = broadcast::channel(UI_EVENT_CAPACITY);
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
@@ -577,6 +656,7 @@ impl Core {
             conn_states: Mutex::new(HashMap::new()),
             holds: Mutex::new(HashMap::new()),
             uploading: Mutex::new(HashMap::new()),
+            exports: crate::export::Running::default(),
             paused: Mutex::new(HashMap::new()),
             presence: watch::channel(Presence::default()).0,
             ui_ready: watch::channel(false).0,
@@ -598,7 +678,29 @@ impl Core {
             expiry_policy: Mutex::new(expiry_policy),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             controls: Mutex::new(HashMap::new()),
+            filters: Mutex::new(FilterState {
+                list: Vec::new(),
+                set: Arc::new(crate::filters::FilterSet::empty()),
+                revision: 0,
+            }),
+            filters_ready: watch::channel(FILTERS_PENDING).0,
+            notify_muted_watch: std::sync::atomic::AtomicBool::new(watch_muted),
+            notify_watch: std::sync::atomic::AtomicBool::new(watch_notify),
         });
+        {
+            let sh = shared.clone();
+            tokio::spawn(async move {
+                let built = tokio::task::spawn_blocking(move || {
+                    crate::filters::start_delay();
+                    let set = crate::filters::FilterSet::build(&saved);
+                    (saved, set)
+                })
+                .await;
+                if let Ok((list, set)) = built {
+                    publish_start_filters(&sh, list, set);
+                }
+            });
+        }
         let plans = reconcile(&shared).await?;
         // Before any supervisor or the sweeper runs: the accounts whose backend starts now
         // and can still object to the clock.
@@ -657,12 +759,14 @@ impl Core {
         let sweeper = tokio::spawn(expiry::run(shared.clone()));
         let calls = tokio::spawn(calls::run(shared.clone()));
         let restores = tokio::spawn(restore::run(shared.clone()));
+        let search = tokio::spawn(crate::search::index::run(shared.clone()));
         Ok(Self {
             handle,
             task: Some(task),
             sweeper: Some(sweeper),
             calls: Some(calls),
             restores: Some(restores),
+            search: Some(search),
             shared,
         })
     }
@@ -682,9 +786,17 @@ impl Core {
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
-        for t in [self.sweeper.take(), self.calls.take(), self.restores.take()]
-            .into_iter()
-            .flatten()
+        // A search step or walk that runs on the blocking pool ends now, not at the process's
+        // shutdown timeout (aborting a task does not stop its blocking job).
+        self.shared.store.interrupt_search();
+        for t in [
+            self.sweeper.take(),
+            self.calls.take(),
+            self.restores.take(),
+            self.search.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             t.abort();
             let _ = t.await;
@@ -699,9 +811,14 @@ impl Drop for Core {
         if self.task.is_some() {
             self.shared.cancel.cancel();
         }
-        for t in [self.sweeper.take(), self.calls.take(), self.restores.take()]
-            .into_iter()
-            .flatten()
+        for t in [
+            self.sweeper.take(),
+            self.calls.take(),
+            self.restores.take(),
+            self.search.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             t.abort();
         }
@@ -983,6 +1100,7 @@ async fn run_core(
                 // hold on the way out, and the sweeper stops.
                 sh.shutting_down
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                sh.filters_ready.send_replace(FILTERS_STOPPED);
                 let mut waits = Vec::new();
                 for (_, slot) in slots.drain() {
                     let (tx, rx) = oneshot::channel();
@@ -1098,6 +1216,87 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             }
             Ok(QueryData::Timeline(page))
         }
+        Query::MessagesByIds { conv, ids } => {
+            let now = sh.now();
+            let sh2 = sh.clone();
+            let uploading: std::collections::HashSet<MessageId> = sh
+                .uploading
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(_, (_, c))| *c == conv)
+                .map(|(m, _)| *m)
+                .collect();
+            let paused = sh
+                .paused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&conv)
+                .map(|(_, _, user)| user.clone());
+            let (page, media) = sh
+                .store
+                .read(move |c| {
+                    let registered = outbox::network_of(c, conv)?
+                        .is_none_or(|(_, kind)| sh2.networks.get(kind).is_some());
+                    let page =
+                        query::messages_by_ids(c, conv, &ids, now, registered, &uploading, paused)?;
+                    let media = query::page_media(c, &page)?;
+                    Ok((page, media))
+                })
+                .await?;
+            for m in media {
+                sh.register_media(m);
+            }
+            Ok(QueryData::MessagesByIds(page))
+        }
+        Query::ExportPlan { conv, ids } => {
+            let now = sh.now();
+            let sh2 = sh.clone();
+            let uploading: std::collections::HashSet<MessageId> = sh
+                .uploading
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(_, (_, c))| *c == conv)
+                .map(|(m, _)| *m)
+                .collect();
+            let paused = sh
+                .paused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&conv)
+                .map(|(_, _, user)| user.clone());
+            let mut plan = sh
+                .store
+                .read(move |c| {
+                    let network = outbox::network_of(c, conv)?;
+                    let registered = network
+                        .as_ref()
+                        .is_none_or(|(_, kind)| sh2.networks.get(*kind).is_some());
+                    let scope = network
+                        .and_then(|(_, kind)| sh2.networks.get(kind))
+                        .map_or(kourier_model::MsgIdScope::default(), |n| {
+                            n.descriptor().msg_id_scope
+                        });
+                    crate::export::plan(c, conv, &ids, now, registered, &uploading, paused, scope)
+                })
+                .await?;
+            // What the first bytes of each file that is here say it is (`SaveFacts::sniffed`).
+            for file in plan
+                .messages
+                .iter_mut()
+                .flat_map(|m| m.files.iter_mut())
+                .filter(|f| f.accepted.is_ok())
+            {
+                let id = file.attachment;
+                if let Some(blob) = sh.media.resolve(id).await?.and_then(|e| e.file) {
+                    file.sniffed = tokio::task::spawn_blocking(move || sniff_blob(&blob))
+                        .await
+                        .map_err(|_| CoreError::Stopped)?;
+                }
+            }
+            Ok(QueryData::ExportPlan(Box::new(plan)))
+        }
         Query::Conversation(id) => sh
             .store
             .read(move |c| query::conversation(c, id))
@@ -1168,22 +1367,9 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             };
             let entry = sh.media.resolve(id).await?;
             if let Some(file) = entry.and_then(|e| e.file) {
-                facts.sniffed = tokio::task::spawn_blocking(move || {
-                    use std::io::Read as _;
-                    let key = kourier_blob::FileKey::from_bytes(*file.key.expose());
-                    let mut reader = kourier_blob::BlobReader::open(&file.path, &key).ok()?;
-                    let mut head = [0u8; 16];
-                    let mut got = 0;
-                    while got < head.len() {
-                        match reader.read(&mut head[got..]) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => got += n,
-                        }
-                    }
-                    kourier_media::sniff_mime(&head[..got]).map(str::to_owned)
-                })
-                .await
-                .map_err(|_| CoreError::Stopped)?;
+                facts.sniffed = tokio::task::spawn_blocking(move || sniff_blob(&file))
+                    .await
+                    .map_err(|_| CoreError::Stopped)?;
             }
             Ok(QueryData::SaveFacts(Some(facts)))
         }
@@ -1263,6 +1449,59 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             .read(crate::notices::shown)
             .await
             .map(QueryData::QuietNotices),
+        // From memory: the set is built once per change (`save_filter` and its kin).
+        Query::Filters => {
+            // Never the placeholder: wait for the start's compile or a command's rebuild.
+            let mut ready = sh.filters_ready.subscribe();
+            loop {
+                match *ready.borrow_and_update() {
+                    FILTERS_READY => break,
+                    FILTERS_STOPPED => return Err(CoreError::Stopped),
+                    _ => {}
+                }
+                tokio::select! {
+                    r = ready.changed() => if r.is_err() { return Err(CoreError::Stopped) },
+                    () = sh.cancel.cancelled() => return Err(CoreError::Stopped),
+                }
+            }
+            Ok(QueryData::Filters(sh.filter_list()))
+        }
+        Query::CaughtUpMessages(mut ids) => {
+            ids.truncate(crate::facade::CATCH_UP_IDS);
+            let now = sh.now();
+            sh.store
+                .read(move |c| query::caught_up_messages(c, &ids, now))
+                .await
+                .map(QueryData::CaughtUpMessages)
+        }
+        Query::SearchQueued => sh
+            .store
+            .read(crate::search::log::queued)
+            .await
+            .map(QueryData::SearchQueued),
+        // On the search's own read connections (`Store::search`): a newer search interrupts
+        // it; one that did not run answers its page again (`unanswered`), never "nothing".
+        Query::Search(q) => {
+            let before = q.before;
+            let page = sh
+                .store
+                .search(move |search, core, deadline| {
+                    crate::search::query::search(
+                        search,
+                        core,
+                        &q,
+                        crate::search::query::CAP,
+                        deadline,
+                    )
+                })
+                .await?;
+            Ok(QueryData::Search(match page {
+                crate::store::Searched::Done(w) => w.page,
+                crate::store::Searched::NotReady | crate::store::Searched::Superseded => {
+                    crate::search::query::unanswered(before)
+                }
+            }))
+        }
     }
 }
 
@@ -1765,6 +2004,23 @@ async fn ui_command(
                 }
             });
         }
+        UiCommand::OpenModel { attachment } => {
+            // Its own task, not the media queue: a parse of a big file must not hold up a
+            // video's open (the parse itself runs on the blocking pool).
+            let sh2 = sh.clone();
+            tokio::spawn(async move {
+                match open_model(&sh2, attachment).await {
+                    Ok(mesh) => sh2.emit(UiEvent::ModelOpened {
+                        attachment,
+                        mesh: Arc::new(mesh),
+                    }),
+                    Err(e) => {
+                        let subject = ActionSubject::Attachment(attachment);
+                        action_failed(&sh2, None, "OpenModel", e, subject);
+                    }
+                }
+            });
+        }
         UiCommand::SaveAttachment {
             attachment,
             target,
@@ -1781,6 +2037,51 @@ async fn ui_command(
                 }
             });
         }
+        UiCommand::ExportArchive {
+            request,
+            conv,
+            target,
+            mode,
+            with_disappearing,
+            messages,
+            files,
+            documents,
+            manifest,
+        } => {
+            let sh2 = sh.clone();
+            // The flag stands from now on, so a cancel that comes while the job still waits in
+            // the queue behind another save is not lost.
+            let Some(cancel) = sh.exports.start(request) else {
+                // A request id that is running is refused at once; the first export keeps its
+                // flag and its end.
+                tracing::warn!("an export with a running request id was refused");
+                sh.emit(UiEvent::ExportEnded {
+                    request,
+                    outcome: crate::facade::ExportOutcome::Failed(crate::facade::ExportFailure::Io),
+                });
+                return;
+            };
+            enqueue(&queues.saves, async move {
+                let outcome = crate::export::run(
+                    &sh2,
+                    request,
+                    conv,
+                    target,
+                    mode,
+                    with_disappearing,
+                    messages,
+                    files,
+                    documents,
+                    manifest,
+                    cancel,
+                )
+                .await;
+                sh2.exports.finish(request);
+                tracing::info!("an export ended");
+                sh2.emit(UiEvent::ExportEnded { request, outcome });
+            });
+        }
+        UiCommand::CancelExport { request } => sh.exports.cancel(request),
         UiCommand::CloseMedia { attachment } => {
             let sh2 = sh.clone();
             enqueue(&queues.media, async move {
@@ -2091,7 +2392,28 @@ async fn ui_command(
                 fail(None, "SetQuietNotices", e);
             }
         }
+        // Awaited like the options above: a query right behind a save reads the new set.
+        UiCommand::SaveFilter { id, spec } => {
+            if let Err(e) = save_filter(sh, id, spec).await {
+                fail(None, "SaveFilter", e);
+            }
+        }
+        UiCommand::DeleteFilter { id } => {
+            if let Err(e) = change_filters(sh, FilterChange::Delete(id)).await {
+                fail(None, "DeleteFilter", e);
+            }
+        }
+        UiCommand::MoveFilter { id, to } => {
+            if let Err(e) = change_filters(sh, FilterChange::Move(id, to)).await {
+                fail(None, "MoveFilter", e);
+            }
+        }
         UiCommand::ReleaseMemory => {
+            // Every account's running actor gives back its backend.db caches too: a control of
+            // its own, apart from the hint slot, so a pending hint is not replaced.
+            for s in slots.values() {
+                let _ = s.control.send(Control::ReleaseMemory);
+            }
             let sh2 = sh.clone();
             tokio::spawn(async move {
                 if let Err(e) = sh2.store.release_memory().await {
@@ -2292,6 +2614,132 @@ async fn set_expiry_policy(sh: &Arc<Shared>, policy: ExpiryPolicy) -> Result<()>
     }
     sh.expiry_wake.notify_one();
     Ok(())
+}
+
+/// What [`change_filters`] does to the list.
+enum FilterChange {
+    Delete(crate::filters::FilterId),
+    Move(crate::filters::FilterId, usize),
+}
+
+/// [`UiCommand::SaveFilter`]: the spec is validated on a blocking thread (the compile checks
+/// the size limit), stored, and the set is rebuilt.
+async fn save_filter(
+    sh: &Arc<Shared>,
+    id: Option<crate::filters::FilterId>,
+    spec: crate::filters::FilterSpec,
+) -> Result<()> {
+    // Nothing of the spec is logged, and the refusal holds no pattern.
+    let spec = tokio::task::spawn_blocking(move || crate::filters::validate(&spec))
+        .await
+        .map_err(|_| CoreError::Stopped)?
+        .map_err(CoreError::Filter)?;
+    let now = sh.now();
+    sh.store
+        .write(Priority::High, GLOBAL_LANE, move |c| {
+            crate::filter_store::save(c, id, &spec, now)
+        })
+        .await?;
+    rebuild_filters(sh).await
+}
+
+/// A delete or a move of a filter, then the rebuilt set.
+async fn change_filters(sh: &Arc<Shared>, change: FilterChange) -> Result<()> {
+    sh.store
+        .write(Priority::High, GLOBAL_LANE, move |c| match change {
+            FilterChange::Delete(id) => crate::filter_store::delete(c, id),
+            FilterChange::Move(id, to) => crate::filter_store::move_to(c, id, to),
+        })
+        .await?;
+    rebuild_filters(sh).await
+}
+
+/// Reads the list back, compiles the set on a blocking thread, swaps both in with the next
+/// revision, sets the muted watch and tells the front-ends. Commands run one at a time in the
+/// core task, so two rebuilds never race.
+async fn rebuild_filters(sh: &Arc<Shared>) -> Result<()> {
+    let saved = sh.store.read(crate::filter_store::list).await?;
+    let (list, set) = tokio::task::spawn_blocking(move || {
+        let set = crate::filters::FilterSet::build(&saved);
+        (saved, set)
+    })
+    .await
+    .map_err(|_| CoreError::Stopped)?;
+    sh.notify_muted_watch.store(
+        crate::filter_store::wants_muted(set.filters()),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    sh.notify_watch.store(
+        crate::filter_store::wants_notify(set.filters()),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let revision = {
+        let mut state = sh.filters.lock().unwrap_or_else(PoisonError::into_inner);
+        state.revision += 1;
+        state.list = list;
+        state.set = Arc::new(set);
+        state.revision
+    };
+    sh.filters_ready.send_if_modified(|v| {
+        let changed = *v == FILTERS_PENDING;
+        if changed {
+            *v = FILTERS_READY;
+        }
+        changed
+    });
+    // (Counts only: no pattern, no name.)
+    tracing::info!(
+        filters = sh.filter_list().filters.len(),
+        revision,
+        "the filters changed"
+    );
+    sh.emit(UiEvent::FiltersChanged { revision });
+    Ok(())
+}
+
+/// The start's compile is done: publishes it unless a command rebuilt the filters meanwhile (its
+/// list is newer), sets both watches exactly and tells the front-ends.
+fn publish_start_filters(
+    sh: &Arc<Shared>,
+    list: Vec<crate::filters::Filter>,
+    set: crate::filters::FilterSet,
+) {
+    let revision = {
+        let mut state = sh.filters.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.revision != 0 {
+            return;
+        }
+        sh.notify_muted_watch.store(
+            crate::filter_store::wants_muted(set.filters()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        sh.notify_watch.store(
+            crate::filter_store::wants_notify(set.filters()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        state.list = list;
+        state.set = Arc::new(set);
+        state.revision = 1;
+        state.revision
+    };
+    sh.filters_ready.send_replace(FILTERS_READY);
+    tracing::info!(
+        filters = sh.filter_list().filters.len(),
+        "the filters are ready"
+    );
+    sh.emit(UiEvent::FiltersChanged { revision });
+}
+
+impl Shared {
+    /// The answer to [`Query::Filters`].
+    pub(crate) fn filter_list(&self) -> crate::facade::FilterList {
+        let state = self.filters.lock().unwrap_or_else(PoisonError::into_inner);
+        crate::facade::FilterList {
+            filters: state.list.clone(),
+            set: state.set.clone(),
+            revision: state.revision,
+        }
+    }
 }
 
 /// [`UiCommand::SetQuietNotices`]: the choice is stored and, in the same transaction, every
@@ -2696,9 +3144,10 @@ async fn save_draft(
         .await
         .map_err(|e| (None, e))?
         .ok_or((None, CoreError::UnknownConversation(conv)))?;
+    let at = outbox::draft_stamp(sh.now());
     sh.store
         .write(Priority::High, lane(account), move |c| {
-            outbox::save_draft(c, conv, draft.as_ref())
+            outbox::save_draft(c, conv, draft.as_ref(), at)
         })
         .await
         .map_err(|e| (Some(account), e))?;
@@ -3425,6 +3874,86 @@ async fn open_media(sh: &Arc<Shared>, attachment: kourier_model::AttachmentId) -
     })
     .await
     .map_err(|_| CoreError::Stopped)?
+}
+
+/// [`UiCommand::OpenModel`]: the attachment's file read and parsed under the mesh bounds.
+async fn open_model(
+    sh: &Arc<Shared>,
+    attachment: kourier_model::AttachmentId,
+) -> Result<crate::facade::ModelMesh> {
+    let entry = sh
+        .media
+        .resolve(attachment)
+        .await?
+        .ok_or(CoreError::refused(Refusal::Gone, "unknown attachment"))?;
+    let file = entry
+        .file
+        .clone()
+        .ok_or(CoreError::InvalidInput("the attachment is not downloaded"))?;
+    // Looked at again in the rows, as `open_media` does: a message the sweeper hid on an
+    // unconfirmed clock, or a long text, is not opened.
+    let facts: Option<(Option<String>, bool)> = sh
+        .store
+        .read_media(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT a.file_name, a.long_text FROM attachments a
+                 JOIN messages m ON m.id = a.message_id
+                 WHERE a.id = ?1 AND m.expiry_hidden = 0",
+            )?
+            .query_row([attachment.0], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+        })
+        .await?;
+    let (name, long_text) = facts.ok_or(CoreError::refused(Refusal::Gone, "unknown attachment"))?;
+    let mime = entry.mime.as_deref().or(file.mime.as_deref());
+    if long_text || !kourier_mesh::looks_like_model(name.as_deref(), mime) {
+        return Err(CoreError::InvalidInput("the attachment is not a 3D model"));
+    }
+    // One of the derive step's permits: at most `DERIVE_PARALLEL` big parses run at once,
+    // whoever asked (a 256 MiB model takes about 600 MB while it is parsed).
+    let permit = sh
+        .derive_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| CoreError::Stopped)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let key = kourier_blob::FileKey::from_bytes(*file.key.expose());
+        crate::attachments::derive::load_mesh(&file.path, &key)
+    })
+    .await
+    .map_err(|_| CoreError::Stopped)?
+    .map(|m| crate::facade::ModelMesh {
+        triangles: m.triangle_count(),
+        positions: m.positions,
+        colors: m.colors,
+        min: m.min,
+        max: m.max,
+    })
+    .map_err(|e| match e {
+        crate::attachments::derive::LoadError::Blob(e) => CoreError::from(e),
+        crate::attachments::derive::LoadError::Mesh(_) => {
+            CoreError::InvalidInput("the file is not a model within the bounds")
+        }
+    })
+}
+
+/// What the first 16 bytes of a stored file say it is (`kourier_media::sniff_mime`); `None` for
+/// a type it does not know or a blob that does not open. Blocking: the first chunk is decrypted.
+fn sniff_blob(file: &crate::media::MediaBlob) -> Option<String> {
+    use std::io::Read as _;
+    let key = kourier_blob::FileKey::from_bytes(*file.key.expose());
+    let mut reader = kourier_blob::BlobReader::open(&file.path, &key).ok()?;
+    let mut head = [0u8; 16];
+    let mut got = 0;
+    while got < head.len() {
+        match reader.read(&mut head[got..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    kourier_media::sniff_mime(&head[..got]).map(str::to_owned)
 }
 
 /// [`UiCommand::SaveAttachment`]: a plaintext copy of the attachment in the user's folder

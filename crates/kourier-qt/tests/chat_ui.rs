@@ -717,6 +717,94 @@ MainWindow {
         return win.inWindow(still, (still.width - still.paintedWidth) / 2, (still.height - still.paintedHeight) / 2, still.paintedWidth, still.paintedHeight);
     }
 
+    // ---- picture zoom (the `zm*` steps) ----
+    property var zm: ({})
+
+    // A point of the viewer's coordinates, in the window's.
+    function zmWin(v: var, x: real, y: real): var {
+        return v.contentItem.mapToItem(null, x, y);
+    }
+
+    // The shown rectangle / the viewport of the viewer `v`, in the window's coordinates.
+    function zmRect(v: var): var {
+        const r = v.shownRect;
+        const p = win.zmWin(v, r.x, r.y);
+        return {
+            "x": p.x,
+            "y": p.y,
+            "w": r.w,
+            "h": r.h
+        };
+    }
+
+    function zmPort(v: var): var {
+        const r = v.viewportRect;
+        const p = win.zmWin(v, r.x, r.y);
+        return {
+            "x": p.x,
+            "y": p.y,
+            "w": r.w,
+            "h": r.h
+        };
+    }
+
+    // A real drag: press, six moves with the button down, release (window coordinates).
+    function zmDrag(x0: real, y0: real, x1: real, y1: real): void {
+        const a = win.contentItem.mapFromItem(null, x0, y0);
+        if (!win.ev.mousePress(win.contentItem, a.x, a.y, Qt.LeftButton, Qt.NoModifier, -1)) {
+            win.fail("the window took no press");
+        }
+        for (let i = 1; i <= 6; ++i) {
+            const b = win.contentItem.mapFromItem(null, x0 + (x1 - x0) * i / 6, y0 + (y1 - y0) * i / 6);
+            win.ev.mouseMove(win.contentItem, b.x, b.y, -1, Qt.LeftButton, Qt.NoModifier);
+        }
+        const c = win.contentItem.mapFromItem(null, x1, y1);
+        if (!win.ev.mouseRelease(win.contentItem, c.x, c.y, Qt.LeftButton, Qt.NoModifier, -1)) {
+            win.fail("the window took no release");
+        }
+    }
+
+    // A wheel tick of `delta` (120 = one notch up) at a window point.
+    function zmWheel(x: real, y: real, delta: real): void {
+        const p = win.contentItem.mapFromItem(null, x, y);
+        if (!win.ev.mouseWheel(win.contentItem, p.x, p.y, Qt.NoButton, Qt.NoModifier, 0, delta, -1)) {
+            win.fail("the window took no wheel event");
+        }
+    }
+
+    // What the viewer is as a whole: still open, one viewer, the timeline where it was.
+    function zmStill(v: var): string {
+        if (!v || !v.opened || !v.visible) {
+            return "the viewer closed";
+        }
+        if (win.viewersOpened !== win.zm.opened) {
+            return "another viewer opened";
+        }
+        if (Math.abs(win.view.rowList.contentY - win.zm.contentY) > 0.5) {
+            return "the timeline under the viewer moved: " + win.view.rowList.contentY + " of " + win.zm.contentY;
+        }
+        return "";
+    }
+
+    // Where one axis of a shown rectangle ends after a pan by `delta` (`edge` -1: pushed to the
+    // viewport's start, 1: to its end, 0: just by `delta`): centred when the picture is smaller.
+    function zmAxis(pos: real, size: real, start: real, room: real, delta: real, edge: int): real {
+        if (size <= room + 1) {
+            return start + (room - size) / 2;
+        }
+        const moved = edge < 0 ? start : (edge > 0 ? start + room - size : pos + delta);
+        return Math.max(start + room - size, Math.min(start, moved));
+    }
+
+    function zmItem(v: var, name: string): var {
+        return win.find(v.contentItem, c => c.objectName === name);
+    }
+
+    function zmClick(item: var): void {
+        const p = item.mapToItem(null, item.width / 2, item.height / 2);
+        win.clickWindow(p.x, p.y);
+    }
+
     // A real click (press and release through the window, as the platform delivers them) at
     // a point of the window.
     function clickWindow(x: real, y: real): void {
@@ -1620,6 +1708,292 @@ MainWindow {
             }
             case "twiceClosed":
                 if (win.imageViewer !== null && win.imageViewer.visible) return win.later("Escape closes the viewer");
+                win.next("zmOpen");
+                return;
+
+            // ---- picture zoom: wheel, drag, double click, keys, toolbar (real events) ----
+            case "zmOpen": {
+                const v = win.openAlbumViewer(App.viewerItems(win.photo), 0, win.photo);
+                win.zm = {
+                    "viewer": v,
+                    "contentY": win.view.rowList.contentY,
+                    "opened": win.viewersOpened
+                };
+                win.next("zmFit");
+                return;
+            }
+            case "zmFit": {
+                const v = win.zm.viewer;
+                if (!v.opened || !v.shown || v.shownRect.w <= 0 || win.waits < 4) return win.later("the viewer shows the photo");
+                if (!v.fitted || v.zoomPercent >= 100 || v.zoomPercent <= 0) return win.fail("opens at Fit, below 100 %: " + v.fitted + " " + v.zoomPercent + "% of " + v.naturalWidth);
+                if (v.naturalWidth <= v.shownRect.w) return win.fail("the photo's natural size is not known or not larger than the box: " + v.naturalWidth);
+                if (v.sharpRequests !== 0) return win.fail("the sharp decode is asked at Fit");
+                const r = win.zmRect(v);
+                win.zm.fit = r;
+                // A drag across the picture at Fit moves nothing and closes nothing.
+                win.zmDrag(r.x + r.w * 0.7, r.y + r.h * 0.7, r.x + r.w * 0.2, r.y + r.h * 0.3);
+                win.next("zmFitDragged");
+                return;
+            }
+            case "zmFitDragged": {
+                const v = win.zm.viewer;
+                if (win.waits < 8) return win.later("the drag settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a drag at Fit: " + bad);
+                const r = win.zmRect(v);
+                if (!v.fitted || Math.abs(r.x - win.zm.fit.x) > 0.5 || Math.abs(r.y - win.zm.fit.y) > 0.5 || Math.abs(r.w - win.zm.fit.w) > 0.5) return win.fail("a drag at Fit moved the picture: " + JSON.stringify(win.zm.fit) + " -> " + JSON.stringify(r));
+                // A drag that starts on the picture and ends beside it (in the margin) is a drag, never a tap
+                // beside the picture: the viewer stays.
+                win.zmDrag(r.x + r.w * 0.5, r.y + r.h * 0.5, 8, r.y + r.h * 0.5);
+                win.next("zmFitDragOut");
+                return;
+            }
+            case "zmFitDragOut": {
+                const v = win.zm.viewer;
+                if (win.waits < 8) return win.later("the drag settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a drag from the picture to the margin closed or moved something: " + bad);
+                const r = win.zmRect(v);
+                // One notch up, at a point of the picture that is not its centre.
+                const at = Qt.point(r.x + r.w * 0.65, r.y + r.h * 0.65);
+                win.zm.at = at;
+                win.zm.scale = v.zoomScale;
+                win.zmWheel(at.x, at.y, 120);
+                win.next("zmWheeled");
+                return;
+            }
+            case "zmWheeled": {
+                const v = win.zm.viewer;
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("one notch of the wheel: " + bad);
+                if (v.fitted || Math.abs(v.zoomScale - win.zm.scale * 1.25) > 0.01) return win.fail("one notch zooms by 1.25: " + win.zm.scale + " -> " + v.zoomScale + " fitted " + v.fitted);
+                const r = win.zmRect(v);
+                const f = win.zm.fit;
+                // (An axis on which the picture is still smaller than the viewport stays centred: only the other keeps the point.)
+                const port0 = win.zmPort(v);
+                const fx = (win.zm.at.x - f.x) / f.w;
+                const fy = (win.zm.at.y - f.y) / f.h;
+                if (r.w > port0.w + 1 && Math.abs(r.x + fx * r.w - win.zm.at.x) > 1.5) return win.fail("the picture point under the pointer moved in x: " + JSON.stringify(f) + " -> " + JSON.stringify(r));
+                if (r.h > port0.h + 1 && Math.abs(r.y + fy * r.h - win.zm.at.y) > 1.5) return win.fail("the picture point under the pointer moved in y: " + JSON.stringify(f) + " -> " + JSON.stringify(r));
+                if (r.w <= port0.w + 1 && Math.abs((r.x + r.w / 2) - (port0.x + port0.w / 2)) > 1.5) return win.fail("a picture smaller than the viewport is centred: " + JSON.stringify(r));
+                if (v.sharpRequests !== 1) return win.fail("the first zoom asks the sharp decode once: " + v.sharpRequests);
+                // Two more notches, at the centre of the viewport: the sharp decode is not asked again.
+                const port = win.zmPort(v);
+                win.zmWheel(port.x + port.w / 2, port.y + port.h / 2, 120);
+                win.zmWheel(port.x + port.w / 2, port.y + port.h / 2, 120);
+                win.next("zmZoomed");
+                return;
+            }
+            case "zmZoomed": {
+                const v = win.zm.viewer;
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("more notches: " + bad);
+                const r = win.zmRect(v);
+                const port = win.zmPort(v);
+                if (r.w <= port.w + 1 && r.h <= port.h + 1) return win.fail("zoomed past the viewport on no axis: " + JSON.stringify(r) + " in " + JSON.stringify(port));
+                if (v.sharpRequests !== 1) return win.fail("a wheel notch asked the sharp decode again: " + v.sharpRequests);
+                win.zm.r0 = r;
+                win.zm.port = port;
+                // A drag pans by the translation (until an edge stops it).
+                win.zmDrag(port.x + port.w / 2, port.y + port.h / 2, port.x + port.w / 2 - 40, port.y + port.h / 2 - 30);
+                win.next("zmPanned");
+                return;
+            }
+            case "zmPanned": {
+                const v = win.zm.viewer;
+                if (win.waits < 3) return win.later("the drag settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a drag of a zoomed picture: " + bad);
+                const r = win.zmRect(v);
+                const r0 = win.zm.r0;
+                const port = win.zm.port;
+                const ex = win.zmAxis(r0.x, r0.w, port.x, port.w, -40, 0);
+                const ey = win.zmAxis(r0.y, r0.h, port.y, port.h, -30, 0);
+                if (Math.abs(r.x - ex) > 1.5 || Math.abs(r.y - ey) > 1.5 || (Math.abs(r.x - r0.x) < 5 && Math.abs(r.y - r0.y) < 5)) return win.fail("a drag pans by its translation: " + JSON.stringify(r0) + " -> " + JSON.stringify(r) + " expected " + ex + "," + ey);
+                // A long drag to the left and up: the right and bottom edges stop at the viewport's.
+                win.zmDrag(500, 440, 20, 40);
+                win.next("zmEdgeA");
+                return;
+            }
+            case "zmEdgeA": {
+                const v = win.zm.viewer;
+                if (win.waits < 3) return win.later("the drag settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a long drag to the top left: " + bad);
+                const r = win.zmRect(v);
+                const port = win.zm.port;
+                if (Math.abs(r.x - win.zmAxis(r.x, r.w, port.x, port.w, 0, 1)) > 1 || Math.abs(r.y - win.zmAxis(r.y, r.h, port.y, port.h, 0, 1)) > 1) return win.fail("the right and bottom edges stop at the viewport's: " + JSON.stringify(r) + " in " + JSON.stringify(port));
+                win.zmDrag(20, 40, 500, 440);
+                win.next("zmEdgeB");
+                return;
+            }
+            case "zmEdgeB": {
+                const v = win.zm.viewer;
+                if (win.waits < 3) return win.later("the drag settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a long drag to the bottom right: " + bad);
+                const r = win.zmRect(v);
+                const port = win.zm.port;
+                if (Math.abs(r.x - win.zmAxis(r.x, r.w, port.x, port.w, 0, -1)) > 1 || Math.abs(r.y - win.zmAxis(r.y, r.h, port.y, port.h, 0, -1)) > 1) return win.fail("the left and top edges stop at the viewport's: " + JSON.stringify(r) + " in " + JSON.stringify(port));
+                // A click ON a picture that covers the whole viewport does not close.
+                win.clickWindow(port.x + port.w / 2, port.y + port.h / 2);
+                win.next("zmOnStays");
+                return;
+            }
+            case "zmOnStays": {
+                const v = win.zm.viewer;
+                if (win.waits < 8) return win.later("the click settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a click on a picture that covers the viewport: " + bad);
+                // A click beside it (the margin of the viewer) closes.
+                win.clickWindow(6, 230);
+                win.next("zmBesideCloses");
+                return;
+            }
+            case "zmBesideCloses":
+                if (win.imageViewer !== null && win.imageViewer.visible) return win.later("a click beside the picture closes the viewer");
+                if (win.viewersOpened !== win.zm.opened) return win.fail("a viewer opened after the click beside the picture");
+                win.next("zmReopen");
+                return;
+
+            // The double click: Fit <-> 100 % at the point.
+            case "zmReopen": {
+                const v = win.openAlbumViewer(App.viewerItems(win.photo), 0, win.photo);
+                win.zm.viewer = v;
+                win.zm.opened = win.viewersOpened;
+                win.next("zmDbl1");
+                return;
+            }
+            case "zmDbl1": {
+                const v = win.zm.viewer;
+                if (!v.opened || !v.shown || v.shownRect.w <= 0 || win.waits < 4) return win.later("the viewer shows the photo again");
+                if (!v.fitted) return win.fail("a picture opens at Fit, not at the level of the one before: " + v.zoomPercent);
+                const r = win.zmRect(v);
+                win.zm.fit = r;
+                win.zm.fx = 0.3;
+                win.zm.fy = 0.4;
+                win.zm.at = Qt.point(r.x + r.w * 0.3, r.y + r.h * 0.4);
+                const p = win.contentItem.mapFromItem(null, win.zm.at.x, win.zm.at.y);
+                if (!win.ev.mouseDoubleClickSequence(win.contentItem, p.x, p.y, Qt.LeftButton, Qt.NoModifier, -1)) return win.fail("the window took no double click");
+                win.next("zmDbl2");
+                return;
+            }
+            case "zmDbl2": {
+                const v = win.zm.viewer;
+                if (win.waits < 8) return win.later("the double click settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("a double click on the picture: " + bad);
+                if (v.fitted || v.zoomPercent !== 100) return win.fail("a double click at Fit shows 100 %: " + v.zoomPercent + " fitted " + v.fitted);
+                const r = win.zmRect(v);
+                const port = win.zmPort(v);
+                // (An axis on which the picture is smaller than the viewport is centred instead.)
+                if (r.w > port.w + 1 && Math.abs(r.x + 0.3 * r.w - win.zm.at.x) > 1.5) return win.fail("the clicked point stays under the pointer in x: " + JSON.stringify(r));
+                if (r.h > port.h + 1 && Math.abs(r.y + 0.4 * r.h - win.zm.at.y) > 1.5) return win.fail("the clicked point stays under the pointer in y: " + JSON.stringify(r));
+                if (r.w <= port.w + 1 && Math.abs(r.x + r.w / 2 - (port.x + port.w / 2)) > 1.5) return win.fail("a picture narrower than the viewport is centred: " + JSON.stringify(r));
+                if (Math.abs(r.w - v.naturalWidth) > 0.5) return win.fail("100 % is one picture pixel per device pixel: " + r.w + " of " + v.naturalWidth);
+                const p = win.contentItem.mapFromItem(null, win.zm.at.x, win.zm.at.y);
+                win.ev.mouseDoubleClickSequence(win.contentItem, p.x, p.y, Qt.LeftButton, Qt.NoModifier, -1);
+                win.next("zmDbl3");
+                return;
+            }
+            case "zmDbl3": {
+                const v = win.zm.viewer;
+                if (win.waits < 8) return win.later("the double click settles");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("the second double click: " + bad);
+                if (!v.fitted || v.zoomPercent >= 100) return win.fail("a double click at 100 % is Fit again: " + v.zoomPercent);
+                win.next("zmKeys");
+                return;
+            }
+
+            // The keys (all state is plain bindings: read at once).
+            case "zmKeys": {
+                const v = win.zm.viewer;
+                const ladder = [10, 15, 25, 33, 50, 67, 100, 150, 200, 300, 400, 600, 800];
+                const fit = v.fitPercent;
+                const first = ladder.find(l => l > fit + 1);
+                const second = ladder.find(l => l > first + 1);
+                const before = v.sharpRequests;
+                win.key(Qt.Key_Equal, Qt.ControlModifier);
+                if (v.fitted || v.zoomPercent !== first) return win.fail("Ctrl+= from Fit " + Math.round(fit) + " % goes to " + first + " %: " + v.zoomPercent);
+                if (v.sharpRequests !== before + 1) return win.fail("the first zoom asks the sharp decode once: " + (v.sharpRequests - before));
+                win.key(Qt.Key_Equal, Qt.ControlModifier);
+                if (v.zoomPercent !== second) return win.fail("Ctrl+= goes on to " + second + " %: " + v.zoomPercent);
+                win.key(Qt.Key_Minus, Qt.ControlModifier);
+                if (v.zoomPercent !== first) return win.fail("Ctrl+- goes back to " + first + " %: " + v.zoomPercent);
+                win.key(Qt.Key_1, Qt.ControlModifier);
+                if (v.zoomPercent !== 100 || v.fitted) return win.fail("Ctrl+1 shows real pixels: " + v.zoomPercent);
+                // Shift+Right pans by a tenth of the viewport; Shift+Left back.
+                const a = win.zmRect(v);
+                const port = win.zmPort(v);
+                win.key(Qt.Key_Right, Qt.ShiftModifier);
+                const b = win.zmRect(v);
+                if (Math.abs((a.x - b.x) - port.w / 10) > 1.5 || Math.abs(a.y - b.y) > 0.5) return win.fail("Shift+Right pans by a tenth of the viewport: " + JSON.stringify(a) + " -> " + JSON.stringify(b));
+                win.key(Qt.Key_Left, Qt.ShiftModifier);
+                if (Math.abs(win.zmRect(v).x - a.x) > 1.5) return win.fail("Shift+Left pans back");
+                if (v.sharpRequests !== before + 1) return win.fail("zooming while zoomed asked the sharp decode again: " + (v.sharpRequests - before));
+                win.key(Qt.Key_0, Qt.ControlModifier);
+                if (!v.fitted) return win.fail("Ctrl+0 is Fit");
+                const sharp = win.zmItem(v, "sharp");
+                if (sharp.source.toString() !== "") return win.fail("the sharp decode is released at Fit: " + sharp.source);
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("the keys: " + bad);
+                // The toolbar: + goes to the next level, - back to Fit.
+                win.zm.first = first;
+                win.zmClick(win.zmItem(v, "viewerZoomIn"));
+                win.next("zmToolIn");
+                return;
+            }
+            case "zmToolIn": {
+                const v = win.zm.viewer;
+                if (win.waits < 4) return win.later("the click settles");
+                if (v.fitted || v.zoomPercent !== win.zm.first) return win.fail("the plus button goes to " + win.zm.first + " %: " + v.zoomPercent);
+                const level = win.zmItem(v, "viewerZoomLevel");
+                if (level.text.indexOf(String(win.zm.first)) < 0) return win.fail("the level button says the level: " + level.text);
+                win.zmClick(win.zmItem(v, "viewerZoomOut"));
+                win.next("zmToolOut");
+                return;
+            }
+            case "zmToolOut": {
+                const v = win.zm.viewer;
+                if (win.waits < 4) return win.later("the click settles");
+                if (!v.fitted) return win.fail("the minus button goes back to Fit: " + v.zoomPercent);
+                if (win.zmItem(v, "viewerZoomLevel").text !== "Fit") return win.fail("the level button says Fit: " + win.zmItem(v, "viewerZoomLevel").text);
+                win.zmClick(win.zmItem(v, "viewerZoomLevel"));
+                win.next("zmMenuOpened");
+                return;
+            }
+            case "zmMenuOpened": {
+                const v = win.zm.viewer;
+                const menu = v.zoomMenu;
+                if (!menu.opened || win.waits < 4) return win.later("the level menu opens");
+                let at = null;
+                for (let i = 0; i < menu.count; ++i) {
+                    if (menu.itemAt(i).objectName === "viewerZoom200") at = menu.itemAt(i);
+                }
+                if (at === null) return win.fail("the level menu has 200 %");
+                if (win.zmItem(v, "viewerZoomLevel") === null) return win.fail("no level button");
+                win.zmClick(at);
+                win.next("zmMenuPicked");
+                return;
+            }
+            case "zmMenuPicked": {
+                const v = win.zm.viewer;
+                if (v.zoomMenu.opened || win.waits < 12) return win.later("the menu closes");
+                const level = win.zmItem(v, "viewerZoomLevel");
+                if (v.zoomPercent !== 200 || level.text.indexOf("200") < 0) return win.fail("the menu's 200 % shows 200 %: " + v.zoomPercent + " " + level.text);
+                // The keyboard is back on the stage after the menu closed.
+                win.key(Qt.Key_0, Qt.ControlModifier);
+                if (!v.fitted) return win.fail("the keyboard is not back on the viewer after the menu closed");
+                const bad = win.zmStill(v);
+                if (bad !== "") return win.fail("the toolbar: " + bad);
+                win.key(Qt.Key_Escape, Qt.NoModifier);
+                win.next("zmClosed");
+                return;
+            }
+            case "zmClosed":
+                if (win.imageViewer !== null && win.imageViewer.visible) return win.later("Escape closes the viewer");
+                if (win.viewersOpened !== win.zm.opened) return win.fail("a viewer opened during the zoom steps");
                 win.popupIndex = 0;
                 win.next("popup");
                 return;

@@ -221,6 +221,7 @@ async fn catch_up(world: &World, account: AccountId, settle: Duration) -> (App, 
                 account: a,
                 messages,
                 conversations,
+                ..
             })) if a == account => {
                 if seen.summaries.is_empty() {
                     seen.summarized = started.elapsed();

@@ -7,8 +7,8 @@ import app.kourier
 
 // An avatar with an optional network badge (bottom end corner; a pill with the account's
 // number when there are several accounts of the network) and an optional connection state
-// dot (top start corner). Its shape is a circle, or, with Settings → "Round avatars" off, a square
-// whose corners have the theme's radius (`cornerRadius`). Pictures come already cut to that
+// dot (top start corner). Its corners follow Settings → "Avatar corners" (`cornerRadius`: a circle
+// at 100, a square at 0). Pictures come already cut to that
 // shape from the image provider (`image://kourier/avatar/…` takes the radius in the request,
 // so every renderer shows them alike and no layer is needed to clip an `Image`); until one
 // has loaded, or when it fails, the initials show, drawn here in the same shape. The badge and
@@ -40,9 +40,11 @@ Item {
 
     // The side of the square the avatar fills.
     readonly property real side: Math.min(root.width, root.height)
-    // The corner radius of the shape: half the side (a circle), or the theme's own corner
-    // radius when avatars are not round (never more than a circle).
-    readonly property real cornerRadius: App.settings.roundAvatars ? root.side / 2 : Math.min(Kirigami.Units.cornerRadius, root.side / 2)
+    // The corner radius of the shape: Settings > "Avatar corners" (0 to 100) as a share of half
+    // the side, so 100 is a circle and 0 a square.
+    // `cornerOverride` (0 to 100; -1: none) is the preview's own value in Settings.
+    property real cornerOverride: -1
+    readonly property real cornerRadius: root.side * Math.max(0, Math.min(100, root.cornerOverride >= 0 ? root.cornerOverride : App.settings.avatarCorners)) / 200
     // The same in pixels of the size the provider is asked for: `sourceSize` below is the item's
     // size in logical pixels, which Qt multiplies by `Screen.devicePixelRatio` itself.
     readonly property int pictureRadius: Math.ceil(root.cornerRadius * Screen.devicePixelRatio)
@@ -53,15 +55,6 @@ Item {
     // initials, in the color of the name (of the id's tail for a placeholder title).
     readonly property bool glyph: root.anonymous || Components.NameUtils.isStringUnsuitableForInitials(root.bareName)
     readonly property color placeholderColor: Components.NameUtils.colorsFromString(root.anonymous ? root.bareName.slice(-4) : root.bareName)
-
-    // The theme's corner as a share of the side of a list avatar: the notification pictures,
-    // which are drawn below the UI, take their corners from it.
-    Binding {
-        target: App.settings
-        property: "avatarCorner"
-        value: Kirigami.Units.cornerRadius / Style.listAvatarSize
-        restoreMode: Binding.RestoreNone
-    }
 
     // Initials or the glyph on a tinted shape, as Kirigami Add-ons' Avatar draws them (its
     // outline is a circle that cannot be changed, so the shape is drawn here).

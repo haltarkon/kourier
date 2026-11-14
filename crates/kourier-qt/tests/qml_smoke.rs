@@ -600,6 +600,7 @@ Item {
             "own": false,
             "author": author,
             "authorId": "",
+            "authorMarks": [],
             "pages": [],
             "avatarUrl": "",
             "showAuthor": showAuthor,
@@ -617,7 +618,8 @@ Item {
                 }),
             "expiry": "",
             "wait": "",
-            "waitTimer": ""
+            "waitTimer": "",
+            "selected": false
         });
     }
 

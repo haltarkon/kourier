@@ -107,6 +107,8 @@ async fn child(home: PathBuf) {
     let mut cfg = CoreConfig::new(
         home.join("data").join("core.db"),
         kourier_db::DbKey::from(CORE_KEY),
+        // search.db has a key of its own (a test one).
+        kourier_db::DbKey::from([0x5e; 32]),
         networks,
         vault,
         Arc::new(SystemClock),

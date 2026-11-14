@@ -1,10 +1,13 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import org.kde.kirigami as Kirigami
+import app.kourier
 
-// The composer's emoji picker: categories and a grid; a pick is inserted at the cursor.
+// The composer's emoji picker: search, Favorites and groups; a pick is inserted at the cursor.
 QQC2.Popup {
     id: root
+
+    readonly property alias grid: grid
 
     signal picked(string emoji)
 
@@ -17,6 +20,7 @@ QQC2.Popup {
     contentItem: EmojiGrid {
         id: grid
         onPicked: emoji => {
+            App.emojiLists.used(emoji);
             root.picked(emoji);
             root.close();
         }

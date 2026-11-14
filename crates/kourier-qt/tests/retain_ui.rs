@@ -101,6 +101,15 @@ MainWindow {
     property bool followLost: false
     property real followBefore: 0
     property real followBase: 0
+    // The row that grows by more than a page (step "page").
+    property var pageRow: null
+    property int pageRun: 0
+    property real pageGrow: 0
+    property real pageBefore: 0
+    // The model row the view held on to when the cycle began: the SAME row must be held after the
+    // growth and after the shrink (a view that holds on to another row has lost what was being read,
+    // although that row stands where it should).
+    property int pageHeld: -1
 
     // The pictures that nobody has drawn yet (their ids), for the viewer and the guards.
     readonly property var spare: [SPARE]
@@ -370,6 +379,76 @@ MainWindow {
             // (the pump was slowed down) and the reads of the models held the screenshot.
             if (win.holes.length > 0) return win.fail("a screenshot would have been taken with the old picture on screen (frames " + JSON.stringify(win.holes) + "; holds seen " + JSON.stringify(win.seenHolds) + ")");
             if (!win.seenHolds["events"] || !win.seenHolds["queries"]) return win.fail("the slowed-down pump never showed as events and queries: " + JSON.stringify(win.seenHolds));
+            return win.next("page");
+        }
+        case "page": {
+            // A row below the reader's grows by more than a page inside ONE layout: the held
+            // row's `y` changes by more than the viewport while the list's loop over its rows
+            // runs, and the correction (`realign`) has to move the view by as much. Done in
+            // the loop itself, that refill released every visible row while the loop went on
+            // (a use-after-free in Qt's `layoutVisibleItems`; `tlfix`, timeline.md).
+            const list = win.view.rowList;
+            if (win.view.followNewest || list.held === null) return win.later("the view holding on to a row");
+            // Cycles: the newest row and the row under the held one, by 2.5 to 12 pages.
+            const run = win.pageRun;
+            let d = list.itemAt(list.width / 2, list.contentY + list.height - 2);
+            if (d === null) d = win.blk;
+            if (run % 2 === 1) {
+                const under = list.itemAt(list.width / 2, list.held.y + list.held.height + 2);
+                if (under !== null && under !== list.held) d = under;
+            }
+            while (d !== null && d.parent !== list.contentItem) d = d.parent;
+            if (d === null) return win.fail("the row to grow was not found");
+            win.pageRow = d;
+            win.pageBefore = d.height;
+            win.heldAt0 = win.heldAtNow();
+            win.pageHeld = list.held.index;
+            win.worst = 0;
+            win.heldFrames = 0;
+            win.holding = true;
+            win.pageGrow = [2.5, 3, 6, 6, 12, 12][run] * list.height;
+            d.height = d.height + win.pageGrow;
+            return win.next("page-grown");
+        }
+        case "page-grown": {
+            const list = win.view.rowList;
+            const d = win.pageRow;
+            if (win.heldFrames < 1 || win.waits < 20) return win.later("frames after the growth");
+            // (The list may release a row that went far out of the view: then there is nothing to read.)
+            if (d !== null && d.height < win.pageBefore + 2 * list.height) return win.fail("precondition: the row did not grow by more than a page (" + win.pageBefore + " -> " + d.height + ")");
+            const at = win.heldAtNow();
+            if (isNaN(at) || Math.abs(at - win.heldAt0) > 1) return win.fail("the row at the top of the viewport moved from " + win.heldAt0 + " to " + at + " when a row below it grew by " + win.pageGrow);
+            if (list.held.index !== win.pageHeld) return win.fail("the view holds on to row " + list.held.index + ", not to row " + win.pageHeld + " that was being read, after a row below it grew by " + win.pageGrow);
+            if (win.worst > 1) return win.fail("a frame showed the held row " + win.worst + " px from where it was while a row below it grew by more than a page (" + win.heldFrames + " frames)");
+            console.log("held row: a row grew by " + win.pageGrow + " px (more than a page), worst distance " + win.worst + " px over " + win.heldFrames + " frames");
+            win.heldFrames = 0;
+            if (d !== null) d.height = Qt.binding(() => d.implicitHeight);
+            return win.next("page-back");
+        }
+        case "page-back": {
+            const d = win.pageRow;
+            if (win.heldFrames < 1 || win.waits < 20) return win.later("frames after the shrink");
+            if (d !== null && Math.abs(d.height - win.pageBefore) > 1) return win.fail("the row did not get its own height back (" + d.height + " from " + win.pageBefore + ")");
+            // The row that was being read is the row held on to, whatever the list did with its delegates
+            // (a shrink of more than the content has above the view makes it let every row go).
+            const held = win.view.rowList.held;
+            if (held === null) return win.later("the view holding on to a row after the shrink");
+            if (held.index !== win.pageHeld) return win.fail("after the row shrank back the view holds on to row " + held.index + ", not to row " + win.pageHeld + " that was being read (cycle " + win.pageRun + ")");
+            // (A row the list released while it was that tall has no shrink to judge frame by frame: its
+            // delegate was made anew at its own height. The row being read still ends where it stood.)
+            if (d === null) {
+                const end = win.heldAtNow();
+                if (isNaN(end) || Math.abs(end - win.heldAt0) > 1) return win.fail("the held row ended at " + end + ", not at " + win.heldAt0 + ", after a row below it was made anew at its own height (cycle " + win.pageRun + ")");
+                win.pageRun += 1;
+                if (win.pageRun < 6) return win.next("page");
+                win.holding = false;
+                return win.next("follow");
+            }
+            const at = win.heldAtNow();
+            if (isNaN(at) || Math.abs(at - win.heldAt0) > 1 || win.worst > 1) return win.fail("the held row moved when the row shrank back (at " + at + " from " + win.heldAt0 + ", worst " + win.worst + ")");
+            win.pageRun += 1;
+            if (win.pageRun < 6) return win.next("page");
+            win.holding = false;
             return win.next("follow");
         }
         case "follow": {
@@ -379,7 +458,10 @@ MainWindow {
         }
         case "follow-set": {
             const list = win.view.rowList;
-            const b = win.blk;
+            // (The row of the picture was far out of the view during the step "page" and was made anew.)
+            const b = win.block(win.pic);
+            if (b === null) return win.later("the picture's block at the newest end");
+            win.blk = b;
             if (!win.view.followNewest || !list.atNewest()) return win.later("the view following the newest message (follows " + win.view.followNewest + ", " + list.below() + " px from the newest end)");
             // The picture is the newest row: its bottom edge is the viewport's (minus the margin).
             const bottom = b.mapToItem(list, 0, b.height).y;

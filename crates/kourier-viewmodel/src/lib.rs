@@ -33,7 +33,11 @@ pub mod conversations;
 pub mod core_source;
 pub mod diff;
 pub mod edit;
+pub mod emoji;
+pub mod export;
 pub mod files;
+pub mod filter_marks;
+pub mod filters;
 pub mod fixture;
 pub mod group;
 pub mod i18n;
@@ -45,11 +49,14 @@ pub mod notify;
 pub mod pagetext;
 pub mod person;
 pub mod preview;
+pub mod printer_boxes;
 pub mod readmore;
 pub mod richtext;
 pub mod roaming;
 pub mod safety;
 pub mod save_name;
+pub mod search;
+pub mod selection;
 pub mod share;
 pub mod shown_accounts;
 pub mod source;
@@ -73,6 +80,8 @@ pub use files::{
     LocationPref, LocationQuestion, LocationSend, LocationSnapshot, PlanAnswer, PlanRequest,
     StripRules, StripSummary,
 };
+/// The parsed model a `ModelOpened` carries (a front-end names it without the core crate).
+pub use kourier_core::facade::ModelMesh;
 pub use login::{LoginView, LoginViewKind, NetworkChoice, NetworkEntry, NetworkMissing, RiskView};
 pub use names::{NameMap, Names};
 pub use readmore::ReadMore;
@@ -81,11 +90,12 @@ pub use roaming::{
     AccountFacts, ChatOffer, ChatTold, LocalPick, MuteChoice, local_to_ms, mute_end,
     offer_in_account, offer_of, until_allowed, until_start,
 };
+pub use search::{SearchRow, SearchView, SnippetLine};
 pub use shown_accounts::ShownAccounts;
 pub use source::{
-    EmptySource, FinishedSend, FixtureSource, MediaAnswer, RefusedSend, ReplaceNews, ReturnedFile,
-    RevisionList, RevisionRow, SendOutcome, SourceError, UiSource,
+    EmptySource, FinishedSend, FixtureSource, MediaAnswer, ModelAnswer, RefusedSend, ReplaceNews,
+    ReturnedFile, RevisionList, RevisionRow, SendOutcome, SourceError, UiSource,
 };
 pub use time::{Calendar, FixedOffset, TimeContext};
-pub use timeline::{Block, MessageRow, Receipt, RowKey, RowKind};
+pub use timeline::{Block, MessageRow, ModelInfo, Receipt, RowKey, RowKind};
 pub use transfer::{AbandonQuestion, ReplaceQuestion, TransferPhase, TransferView};

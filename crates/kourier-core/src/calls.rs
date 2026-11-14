@@ -254,6 +254,7 @@ async fn release(sh: &Arc<Shared>) {
             account,
             messages: u32::try_from(convs.len()).unwrap_or(u32::MAX),
             conversations: u32::try_from(distinct.len()).unwrap_or(u32::MAX),
+            ids: Vec::new(),
         });
     }
 }
@@ -319,7 +320,10 @@ async fn sweep_once(sh: &Arc<Shared>) -> bool {
                     held = ch.held_calls.len(),
                     "call lines past their deadline are missed"
                 );
-                let held = std::mem::take(&mut ch.held_calls);
+                let mut held = std::mem::take(&mut ch.held_calls);
+                // A muted chat's line counts only while a filter watches muted chats.
+                let watch_muted = sh.watches_muted();
+                held.retain(|c| !c.muted || watch_muted);
                 crate::runtime::emit_changes(sh, &ch);
                 sh.notify(account, &ch.notify);
                 sh.hold_calls(account, held);

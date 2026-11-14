@@ -4,7 +4,9 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
 # The vendored libthreema is its own workspace (third_party/libthreema/VENDORED.md): its lock, its
 # lints and its own test suite stay as upstream's; Kourier builds it only as a path dependency.
-exclude = ["third_party/libthreema"]
+# The vendored qt-build-utils (third_party/qt-build-utils/VENDORED.md) is a build-script helper
+# patched in below; it is no member either (upstream's lints and tests).
+exclude = ["third_party/libthreema", "third_party/qt-build-utils"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,12 +16,16 @@ license = "AGPL-3.0-only"
 publish = false
 
 [workspace.dependencies]
+# RegExp filters (kourier-core only; both are in the lock file through other crates)
+regex = "1.13"
+regex-syntax = "0.8"
 # Internal crates
 kourier-model = { path = "crates/kourier-model" }
 kourier-backend-api = { path = "crates/kourier-backend-api" }
 kourier-db = { path = "crates/kourier-db" }
 kourier-blob = { path = "crates/kourier-blob" }
 kourier-media = { path = "crates/kourier-media" }
+kourier-mesh = { path = "crates/kourier-mesh" }
 kourier-core = { path = "crates/kourier-core" }
 kourier-fake = { path = "crates/kourier-fake" }
 kourier-signal = { path = "crates/kourier-signal" }
@@ -133,6 +139,8 @@ hkdf = "0.13"
 hmac = "0.13"
 # Raw AES blocks for streaming AES-256-CBC attachment decryption (kourier-signal, §6.11).
 aes = "0.9"
+# Byte search of the search attack test's raw look (kourier-core tests/support/pages.rs).
+memchr = "2"
 http = "1"
 rand = "0.9"
 sha2 = "0.11"
@@ -144,7 +152,7 @@ libc = "0.2"
 tempfile = "3"
 # A folder sent as one archive (kourier-app `folders`): the ZIP container, with deflate from the
 # pure-Rust zlib-rs that flate2 already brings (no C library, no other codec, no encryption).
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # gzip for the test archive writer (kourier-signal `archive::writer`, feature `testing`); the
 # zlib-rs backend `zip` already uses, so no crate is added.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
@@ -160,6 +168,8 @@ png = "0.18"
 # for a full run.)
 quircs = "0.10"
 blurhash = "0.2"
+# The XML reader of the 3MF parser (kourier-mesh): no DOCTYPE or entity expansion, streaming. MIT.
+quick-xml = { version = "0.42", default-features = false }
 
 [patch.crates-io]
 # Mirrors libsignal's own Cargo.toml: a single BoringSSL (`links = "boringssl"`).
@@ -168,6 +178,11 @@ boring-sys = { git = "https://github.com/signalapp/boring", tag = "signal-v5.2.0
 # SQLCipher with a RustCrypto crypto provider (no OpenSSL next to BoringSSL) + atexit fix;
 # the rev gurk-rs ships.
 libsqlite3-sys = { git = "https://github.com/boxdot/rusqlite", rev = "a2f393913d9994645c94810498bef07b2183b3dc" }
+# cxx-qt's build helper 0.10.0 with one Kourier patch (Q1): qmlcachegen emits bytecode only, no
+# ahead-of-time C++, so the binary references no private Qt symbol (`Qt_6_PRIVATE_API` on
+# Debian/neon, `Qt_6.<minor>_PRIVATE_API` on Fedora) and loads on either distribution's Qt 6.
+# third_party/qt-build-utils/VENDORED.md.
+qt-build-utils = { path = "third_party/qt-build-utils" }
 
 # Dependencies (every package that is not a workspace member) are optimised in dev and test
 # builds (T2, 2026-10-14): libsignal, SQLCipher, BoringSSL and the image codecs at opt-level 0
@@ -190,6 +205,9 @@ debug = "line-tables-only"
 [profile.dev.package.kourier-media]
 opt-level = 2
 [profile.dev.package.kourier-blob]
+opt-level = 2
+# The parsers and the rasterizer loop over millions of triangles (kourier-mesh tests).
+[profile.dev.package.kourier-mesh]
 opt-level = 2
 # Named packages win over "*": the database's crypto stays at 3 (architecture §5.3).
 [profile.dev.package.sqlcipher-crypto-provider]

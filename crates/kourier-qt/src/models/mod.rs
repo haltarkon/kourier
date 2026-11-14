@@ -4,11 +4,15 @@
 pub mod accounts;
 pub mod attachments;
 pub mod conversations;
+pub mod emoji;
+pub mod filters;
 pub mod media;
 pub mod members;
+pub mod search;
 pub mod share;
 pub mod timeline;
 
+use std::cell::OnceCell;
 use std::pin::Pin;
 
 use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QVector};
@@ -17,12 +21,20 @@ use kourier_viewmodel::diff::{self, ListOp, RoleSet};
 /// First custom role id (`Qt::UserRole + 1`).
 pub const FIRST_ROLE: i32 = 257;
 
-/// Rows of one model: viewmodel rows (diff input) and their prebuilt Qt form.
+/// Builds the Qt form of a viewmodel row (implemented by `list_model_glue!`).
+pub trait BuildQt<V> {
+    /// The Qt form of `view`.
+    fn build_qt(view: &V) -> Self;
+}
+
+/// Rows of one model: viewmodel rows (diff input) and their Qt form, built on first use.
 pub struct Store<V, Q> {
     /// Viewmodel rows, in model order.
     pub view: Vec<V>,
-    /// Qt rows, parallel to `view`.
-    pub qt: Vec<Q>,
+    /// Qt rows, parallel to `view`: a row's `QString`s and `QVariant`s are built the first time
+    /// QML asks for the row (`data()`), not when the row arrives: a list holds many more rows
+    /// than its delegates show (structs.md #1). A changed row is emptied again.
+    pub qt: Vec<OnceCell<Q>>,
     /// Generation of the applied rows; older results are dropped (§8.5).
     pub generation: u64,
     /// How often [`set_rows`] had to fall back to a reset because the ops did not reproduce
@@ -38,6 +50,28 @@ impl<V, Q> Default for Store<V, Q> {
             generation: 0,
             resyncs: 0,
         }
+    }
+}
+
+impl<V, Q: BuildQt<V>> Store<V, Q> {
+    /// The Qt form of row `at`, built from its viewmodel row on the first call.
+    pub fn qt_row(&self, at: usize) -> Option<&Q> {
+        let view = self.view.get(at)?;
+        let cell = self.qt.get(at)?;
+        Some(cell.get_or_init(|| Q::build_qt(view)))
+    }
+
+    /// Every row's Qt form, built where it is not yet (for the few lookups that read a Qt value
+    /// of a short list).
+    pub fn qt_rows(&self) -> impl Iterator<Item = &Q> {
+        (0..self.qt.len()).filter_map(|i| self.qt_row(i))
+    }
+}
+
+impl<V, Q> Store<V, Q> {
+    /// How many rows have their Qt form built (tests).
+    pub fn built(&self) -> usize {
+        self.qt.iter().filter(|c| c.get().is_some()).count()
     }
 }
 
@@ -70,8 +104,8 @@ fn as_i32(n: usize) -> i32 {
 pub trait ListModel {
     /// Viewmodel row type.
     type View: Clone + PartialEq;
-    /// Prebuilt Qt row type.
-    type Qt;
+    /// Qt row type, built on first use.
+    type Qt: BuildQt<Self::View>;
     /// Diff identity of a row (unique within the model).
     type Key: Eq + std::hash::Hash + Clone;
 
@@ -79,8 +113,6 @@ pub trait ListModel {
     fn store(&self) -> &Store<Self::View, Self::Qt>;
     /// The row store, mutably.
     fn store_mut(self: Pin<&mut Self>) -> &mut Store<Self::View, Self::Qt>;
-    /// Builds the Qt form of a row.
-    fn build(view: &Self::View) -> Self::Qt;
     /// Which roles differ between two versions of a row.
     fn changed_roles(old: &Self::View, new: &Self::View) -> RoleSet;
     /// Diff identity of a row.
@@ -190,7 +222,7 @@ pub fn patch_row<M: ListModel>(mut model: Pin<&mut M>, at: usize, new: M::View) 
     }
     let roles = M::changed_roles(old, &new);
     let store = model.as_mut().store_mut();
-    store.qt[at] = M::build(&new);
+    store.qt[at] = OnceCell::new();
     store.view[at] = new;
     let mut ids = QVector::<i32>::default();
     for i in roles.iter() {
@@ -209,7 +241,7 @@ pub fn apply<M: ListModel>(mut model: Pin<&mut M>, ops: &[ListOp], new: &[M::Vie
                 unsafe { model.as_mut().begin_reset() };
                 let store = model.as_mut().store_mut();
                 store.view = new.to_vec();
-                store.qt = new.iter().map(M::build).collect();
+                store.qt = new.iter().map(|_| OnceCell::new()).collect();
                 unsafe { model.as_mut().end_reset() };
             }
             ListOp::Insert { at, n } => {
@@ -221,7 +253,7 @@ pub fn apply<M: ListModel>(mut model: Pin<&mut M>, ops: &[ListOp], new: &[M::Vie
                 let store = model.as_mut().store_mut();
                 for (off, v) in new[at..at + n].iter().enumerate() {
                     store.view.insert(at + off, v.clone());
-                    store.qt.insert(at + off, M::build(v));
+                    store.qt.insert(at + off, OnceCell::new());
                 }
                 unsafe { model.as_mut().end_insert() };
             }
@@ -259,7 +291,7 @@ pub fn apply<M: ListModel>(mut model: Pin<&mut M>, ops: &[ListOp], new: &[M::Vie
                 }
                 let store = model.as_mut().store_mut();
                 store.view[at] = new[at].clone();
-                store.qt[at] = M::build(&new[at]);
+                store.qt[at] = OnceCell::new();
                 let mut ids = QVector::<i32>::default();
                 for i in roles.iter() {
                     ids.append(role_id(i as usize));
@@ -273,6 +305,12 @@ pub fn apply<M: ListModel>(mut model: Pin<&mut M>, ops: &[ListOp], new: &[M::Vie
 /// Implements [`ListModel`] for a bridge type whose Rust struct has a `store` field.
 macro_rules! list_model_glue {
     ($qobject:ty, $view:ty, $qt:ty, $key:ty) => {
+        impl $crate::models::BuildQt<$view> for $qt {
+            fn build_qt(view: &$view) -> Self {
+                <$qt>::from_view(view)
+            }
+        }
+
         impl $crate::models::ListModel for $qobject {
             type View = $view;
             type Qt = $qt;
@@ -286,10 +324,6 @@ macro_rules! list_model_glue {
                 self: ::std::pin::Pin<&mut Self>,
             ) -> &mut $crate::models::Store<$view, $qt> {
                 &mut ::cxx_qt::CxxQtType::rust_mut(self).get_mut().store
-            }
-
-            fn build(view: &$view) -> $qt {
-                <$qt>::from_view(view)
             }
 
             fn changed_roles(old: &$view, new: &$view) -> kourier_viewmodel::diff::RoleSet {
@@ -357,8 +391,8 @@ macro_rules! list_model_glue {
 pub(crate) use list_model_glue;
 
 /// Row access shared by the `data()` overrides.
-pub fn row_at<'a, V, Q>(store: &'a Store<V, Q>, index: &QModelIndex) -> Option<&'a Q> {
+pub fn row_at<'a, V, Q: BuildQt<V>>(store: &'a Store<V, Q>, index: &QModelIndex) -> Option<&'a Q> {
     usize::try_from(index.row())
         .ok()
-        .and_then(|r| store.qt.get(r))
+        .and_then(|r| store.qt_row(r))
 }

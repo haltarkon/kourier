@@ -38,6 +38,11 @@ pub enum Pointer {
         /// Content seed.
         seed: u64,
     },
+    /// A file with exactly these bytes (the 3D model fixtures).
+    Data {
+        /// The content.
+        bytes: Vec<u8>,
+    },
     /// A text file with exactly this content (the whole text of a long message).
     Text {
         /// The content.
@@ -75,6 +80,7 @@ impl Pointer {
                     .map_err(|e| BackendError::internal(format!("fake image: {e}"))),
             ),
             Self::Bytes { len, seed } => Some(Ok(bytes(*len, *seed))),
+            Self::Data { bytes } => Some(Ok(bytes.clone())),
             Self::Text { text } => Some(Ok(text.clone().into_bytes())),
             Self::Expired => None,
         }
@@ -138,6 +144,175 @@ pub fn synthetic_file(name: &str, mime: &str, len: u64, seed: u64) -> Attachment
         remote: Some(Pointer::Bytes { len, seed }.to_blob()),
         ..Attachment::default()
     }
+}
+
+/// A file attachment with exactly `bytes` as its download.
+fn data_file(name: &str, mime: &str, bytes: Vec<u8>) -> Attachment {
+    Attachment {
+        kind: AttachmentKind::File,
+        mime: mime.into(),
+        size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        file_name: Some(name.into()),
+        remote: Some(Pointer::Data { bytes }.to_blob()),
+        ..Attachment::default()
+    }
+}
+
+/// The 12 triangles of the box `lo` … `hi` (counter-clockwise seen from outside).
+fn box_triangles(lo: [f32; 3], hi: [f32; 3]) -> Vec<[f32; 9]> {
+    let p = |i: usize| -> [f32; 3] {
+        [
+            if i & 1 == 0 { lo[0] } else { hi[0] },
+            if i & 2 == 0 { lo[1] } else { hi[1] },
+            if i & 4 == 0 { lo[2] } else { hi[2] },
+        ]
+    };
+    let quads = [
+        [0, 1, 3, 2],
+        [4, 6, 7, 5],
+        [0, 4, 5, 1],
+        [2, 3, 7, 6],
+        [0, 2, 6, 4],
+        [1, 5, 7, 3],
+    ];
+    let mut out = Vec::new();
+    for q in quads {
+        for tri in [[q[0], q[1], q[2]], [q[0], q[2], q[3]]] {
+            let mut t = [0f32; 9];
+            for (k, &i) in tri.iter().enumerate() {
+                t[3 * k..3 * k + 3].copy_from_slice(&p(i));
+            }
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// A small binary STL (a 60 x 31 x 48 mm angle bracket with a block on its plate: three
+/// overlapping boxes, which is all a still needs), built here, never a committed file.
+pub fn synthetic_stl(name: &str) -> Attachment {
+    let mut tris = box_triangles([0.0, 0.0, 0.0], [60.0, 31.0, 6.0]);
+    tris.extend(box_triangles([0.0, 0.0, 0.0], [60.0, 6.0, 48.0]));
+    tris.extend(box_triangles([22.0, 12.0, 6.0], [38.0, 26.0, 20.0]));
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&u32::try_from(tris.len()).unwrap_or(0).to_le_bytes());
+    for t in &tris {
+        bytes.extend_from_slice(&[0u8; 12]);
+        for c in t {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    data_file(name, "model/stl", bytes)
+}
+
+/// A lumpy sphere of about `2 * segments * (segments / 2 - 1)` triangles as a binary STL (for the
+/// viewer's real-GL proof on the PC: 320 gives ~100 k triangles), built here, never a committed file.
+pub fn synthetic_sphere_stl(name: &str, segments: usize) -> Attachment {
+    let rings = (segments / 2).max(3);
+    let vertex = |i: usize, j: usize| -> [f32; 3] {
+        let theta = std::f64::consts::PI * j as f64 / rings as f64;
+        let phi = 2.0 * std::f64::consts::PI * (i % segments) as f64 / segments as f64;
+        let r = 40.0 * (1.0 + 0.08 * (5.0 * phi).sin() * (3.0 * theta).cos());
+        [
+            (r * theta.sin() * phi.cos()) as f32,
+            (r * theta.sin() * phi.sin()) as f32,
+            (r * theta.cos()) as f32,
+        ]
+    };
+    let mut tris: Vec<[f32; 9]> = Vec::new();
+    let mut push = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let mut t = [0f32; 9];
+        t[0..3].copy_from_slice(&a);
+        t[3..6].copy_from_slice(&b);
+        t[6..9].copy_from_slice(&c);
+        tris.push(t);
+    };
+    for j in 0..rings {
+        for i in 0..segments {
+            let (a, b, c, d) = (
+                vertex(i, j),
+                vertex(i + 1, j),
+                vertex(i + 1, j + 1),
+                vertex(i, j + 1),
+            );
+            if j > 0 {
+                push(a, d, b);
+            }
+            if j + 1 < rings {
+                push(b, d, c);
+            }
+        }
+    }
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&u32::try_from(tris.len()).unwrap_or(0).to_le_bytes());
+    for t in &tris {
+        bytes.extend_from_slice(&[0u8; 12]);
+        for c in t {
+            bytes.extend_from_slice(&c.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+    data_file(name, "model/stl", bytes)
+}
+
+/// A small 3MF with its own colours (standard `basematerials`, one colour per face pair of a
+/// 40 mm cube and a 20 mm block on top), built here as a ZIP, never a committed file.
+pub fn synthetic_3mf(name: &str) -> Attachment {
+    use std::io::Write;
+    let colours = [
+        "#D9442B", "#2B7BD9", "#3DAA55", "#E8B923", "#8E44AD", "#16A5A5",
+    ];
+    let bases: String = colours
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(r#"<base name="c{i}" displaycolor="{c}"/>"#))
+        .collect();
+    let mut vertices = String::new();
+    let mut triangles = String::new();
+    let mut corner = 0usize;
+    for (lo, hi) in [
+        ([0.0f32, 0.0, 0.0], [40.0f32, 40.0, 40.0]),
+        ([10.0, 10.0, 40.0], [30.0, 30.0, 60.0]),
+    ] {
+        let tris = box_triangles(lo, hi);
+        for (n, t) in tris.iter().enumerate() {
+            for k in 0..3 {
+                vertices.push_str(&format!(
+                    r#"<vertex x="{}" y="{}" z="{}"/>"#,
+                    t[3 * k],
+                    t[3 * k + 1],
+                    t[3 * k + 2]
+                ));
+            }
+            triangles.push_str(&format!(
+                r#"<triangle v1="{}" v2="{}" v3="{}" pid="1" p1="{}"/>"#,
+                corner,
+                corner + 1,
+                corner + 2,
+                (n / 2) % colours.len()
+            ));
+            corner += 3;
+        }
+    }
+    let model = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><basematerials id="1">{bases}</basematerials><object id="2" type="model"><mesh><vertices>{vertices}</vertices><triangles>{triangles}</triangles></mesh></object></resources><build><item objectid="2"/></build></model>"#
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>"#;
+    let types = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>"#;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (part, body) in [
+        ("[Content_Types].xml", types),
+        ("_rels/.rels", rels),
+        ("3D/3dmodel.model", model.as_str()),
+    ] {
+        zip.start_file(part, options).expect("zip part");
+        zip.write_all(body.as_bytes()).expect("zip body");
+    }
+    let bytes = zip.finish().expect("zip end").into_inner();
+    data_file(name, "model/3mf", bytes)
 }
 
 /// The whole text of a message whose body arrives trimmed: an attachment marked

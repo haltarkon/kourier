@@ -286,7 +286,9 @@ fn the_index_of_the_positions_takes_nothing_from_the_hot_statements() {
                 "revisions_by_key",
                 "message_aliases_by_local",
             ],
-            "the original of a quote" => &["revisions_by_key", "message_aliases_by_local"],
+            "the original of a quote" | "the original of a quote, hidden too" => {
+                &["revisions_by_key", "message_aliases_by_local"]
+            }
             "recount" => &["messages_unread", "messages_timeline"],
             "the read watermark" => &["messages_unread"],
             "the read position" => &["messages_unread_seq"],
@@ -1632,6 +1634,19 @@ async fn read_positions_cut_a_chat_where_own_and_incoming_rows_interleave() {
     let (env, _, uuid, conv) = linked(s).await;
     let db = env.core_db();
     let timed = (T0 - 60_000).to_string();
+    // `linked` returns once her chat exists, which the setup's own row of hers makes; her three
+    // rows of the next delivery can still be on their way (seen once under load: "her row:
+    // QueryReturnedNoRows").
+    until(&env, "her three rows arrived", |c| {
+        c.query_row(
+            "SELECT count(*) FROM messages WHERE net_local IN ('a1', 'a2', 'a3') AND net_author <> ''",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count")
+            == 3
+    })
+    .await;
     assert_eq!(
         ["a1", "a2", "a3", timed.as_str()].map(|l| her_read_state(&db, l)),
         ["Unread"; 4],

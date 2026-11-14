@@ -12,7 +12,7 @@ use kourier_fake::attachments::{synthetic_file, synthetic_image, synthetic_image
 use kourier_fake::{Script, Step};
 use kourier_model::{
     Attachment, AttachmentKind, BlobKey, BlobRef, Body, ContactPatch, ConvKey, ConversationPatch,
-    MsgTarget, Patch, Placeholder, Text, UserId,
+    MsgTarget, Patch, Placeholder, RangeKind, Text, TextRange, UserId,
 };
 
 /// One more message in the showcase chat with the timer: received, read (so its time runs
@@ -116,6 +116,49 @@ fn deliver_before_final_state(mut script: Script, events: Vec<BackendEvent>) -> 
     script = script.deliver(events);
     script.steps.extend(last);
     script
+}
+
+/// The page `model3d`: two 3D models land at the end of the albums chat, an STL without colours of
+/// its own (its still is a shade picture the app tints with the accent colour) and a 3MF with its
+/// own colours (its still keeps them). PAGE-SCOPED (`FixtureOptions::models`): in any other run
+/// the chat stays as it is, so no other picture moves. The files are built in `kourier-fake`.
+pub(crate) fn with_models(script: Script) -> Script {
+    let (Some(peer), Some(newest)) = (albums_peer(), newest_message(&script)) else {
+        return script;
+    };
+    let key = ConvKey::Direct(peer.clone());
+    let mut extra = Vec::new();
+    let mut add = |n: i64, attachment: kourier_model::Attachment, caption: Option<&str>| {
+        let at = newest - (4 - n) * 60_000;
+        let mut m = kourier_fake::scripts::remote(&key, &peer, &at.to_string(), at, "");
+        m.body = Body::Media {
+            attachments: vec![attachment],
+            caption: caption.map(Text::plain),
+        };
+        m.read = true;
+        extra.push(BackendEvent::Message(m));
+    };
+    add(
+        0,
+        kourier_fake::attachments::synthetic_stl("bracket.stl"),
+        Some("Angle bracket for the camera mount"),
+    );
+    add(
+        1,
+        kourier_fake::attachments::synthetic_3mf("gadget.3mf"),
+        None,
+    );
+    // A debug knob for the real-GL proof on the PC (`KOURIER_DEV_MODEL3D=big`): a sphere of about
+    // 100 k triangles joins them (the viewer pages open it for the solid and wire pictures).
+    #[cfg(debug_assertions)]
+    if std::env::var_os("KOURIER_DEV_MODEL3D").is_some_and(|v| v == "big") {
+        add(
+            2,
+            kourier_fake::attachments::synthetic_sphere_stl("sphere.stl", 320),
+            None,
+        );
+    }
+    deliver_before_final_state(script, extra)
 }
 
 /// The newest message of the script (ms): fixture mode's "now" is a little after it.
@@ -625,6 +668,220 @@ pub(crate) fn with_safety_peer(
             .in_conv(ConvKey::Direct(peer.clone())),
         );
     (script, Some(peer))
+}
+
+/// A protected chat (`FixtureOptions::protected_chat`, G1i): the lowest plain chat no other page
+/// takes (no chat added) is protected on another device, as a statement of the network after the
+/// generated stream.
+pub(crate) fn with_protected_chat(script: Script, taken: &[Option<&UserId>]) -> Script {
+    let Some((peer, _)) = lowest_plain_chat(&script, taken) else {
+        return script;
+    };
+    let mut patch = ConversationPatch::new(ConvKey::Direct(peer));
+    patch.protected = Some(true);
+    script.deliver(vec![BackendEvent::ConversationUpsert(patch)])
+}
+
+/// The rows of the search pages (`FixtureOptions::search_rows`, G1j): three rows holding
+/// [`SEARCH_WORD`], each read and older than its chat's newest message, so no chat's preview,
+/// place or count changes. Two in English are days old, in the lowest plain chat no other page
+/// takes (no chat added). The one in Hebrew (a right-to-left snippet, the `rtl` look of the matrix)
+/// goes into the chat with the newest message of all, a minute before that message: hits are
+/// walked by hour, newest first (`search::query`), and only there is it among the first screen's
+/// hits rather than below the busy group's (R3, V5). The words are synthetic; the rest of the hits
+/// are the generated chats' own sentences.
+pub(crate) fn with_search_rows(script: Script, taken: &[Option<&UserId>]) -> Script {
+    let Some((peer, last)) = lowest_plain_chat(&script, taken) else {
+        return script;
+    };
+    let key = ConvKey::Direct(peer.clone());
+    let row = |conv: &ConvKey, author: &UserId, n: u8, at: i64, text: &str| {
+        let mut m = kourier_fake::scripts::remote(conv, author, &format!("search-{n}"), at, "");
+        m.body = Body::Text(Text::plain(text));
+        m.read = true;
+        m
+    };
+    let english = vec![
+        row(
+            &key,
+            &peer,
+            0,
+            last - 3 * 86_400_000,
+            "The garden gate needs a new hinge before the swap.",
+        ),
+        row(
+            &key,
+            &peer,
+            2,
+            last - 5 * 86_400_000,
+            "Bring seeds for the garden beds on Saturday.",
+        ),
+    ];
+    let hebrew = "הגינה שלנו garden פורחת מאוד השבוע";
+    let (rtl_conv, rtl_author, rtl_at) =
+        newest_chat_with_a_person(&script, taken).unwrap_or((key.clone(), peer, last));
+    let rtl = row(&rtl_conv, &rtl_author, 1, rtl_at - 60_000, hebrew);
+    let mut batches = vec![BackendEvent::HistoryBatch {
+        conv: key.clone(),
+        messages: english,
+        has_more: false,
+        progress: None,
+    }];
+    if rtl_conv == key {
+        if let BackendEvent::HistoryBatch { messages, .. } = &mut batches[0] {
+            messages.push(rtl);
+        }
+    } else {
+        batches.push(BackendEvent::HistoryBatch {
+            conv: rtl_conv,
+            messages: vec![rtl],
+            has_more: false,
+            progress: None,
+        });
+    }
+    deliver_before_final_state(script, batches)
+}
+
+/// The rows of the page `highlight` (`FixtureOptions::highlight`, R3): three rows from the chat's
+/// newest person, a few minutes before its newest message (no preview, place or count moves): a
+/// text with two words the "Invoices" filter marks, a text whose "receipt" is a spoiler (no mark in
+/// it) and whose "invoice" touches another spoiler (none there either) beside one that is marked,
+/// and a text with a word of the "Garden talk" filter. The words are synthetic.
+pub(crate) fn with_highlight_rows(script: Script) -> Script {
+    let Some((conv, author, at)) = newest_group_with_a_person(&script) else {
+        return script;
+    };
+    let row = |n: u8, at: i64, body: &str, spoilers: &[(u32, u32)]| {
+        let mut m =
+            kourier_fake::scripts::remote(&conv, &author, &format!("highlight-{n}"), at, "");
+        m.body = Body::Text(Text {
+            body: body.to_owned(),
+            ranges: spoilers
+                .iter()
+                .map(|&(start, len)| TextRange {
+                    start,
+                    len,
+                    kind: RangeKind::Spoiler,
+                })
+                .collect(),
+        });
+        m.read = true;
+        m
+    };
+    // "Invoice 14 is attached, the receipt follows tomorrow."
+    let one = row(
+        0,
+        at - 4 * 60_000,
+        "Invoice 14 is attached, the receipt follows tomorrow.",
+        &[],
+    );
+    // "This invoice is marked, the receipt and invoice(code) are hidden." (bytes: "receipt"
+    // 28..35, "invoice" 40..47 and the spoiler "(code)" 47..53 right behind it)
+    let two = row(
+        1,
+        at - 3 * 60_000,
+        "This invoice is marked, the receipt and invoice(code) are hidden.",
+        &[(28, 7), (47, 6)],
+    );
+    let three = row(
+        2,
+        at - 2 * 60_000,
+        "Bring tomatoes and soup to the garden on Saturday.",
+        &[],
+    );
+    deliver_before_final_state(
+        script,
+        vec![BackendEvent::HistoryBatch {
+            conv,
+            messages: vec![one, two, three],
+            has_more: false,
+            progress: None,
+        }],
+    )
+}
+
+/// The chat (1:1 or group) whose newest message is the newest of the script, the author of its
+/// newest message from another person, and the time of the chat's newest message. A 1:1 chat
+/// another page takes is passed over.
+fn newest_chat_with_a_person(
+    script: &Script,
+    taken: &[Option<&UserId>],
+) -> Option<(ConvKey, UserId, i64)> {
+    newest_chat_where(script, taken, false)
+}
+
+/// [`newest_chat_with_a_person`] among the groups only (the chat the window's `demo` is: the
+/// first group of the list).
+fn newest_group_with_a_person(script: &Script) -> Option<(ConvKey, UserId, i64)> {
+    let events: Vec<BackendEvent> = script.deliveries().into_iter().flatten().collect();
+    // The list shows the pinned groups first (by their place), then the others by their newest
+    // message; an archived group is not in the list's body.
+    let mut pinned: std::collections::HashMap<ConvKey, u32> = std::collections::HashMap::new();
+    let mut archived: std::collections::HashSet<ConvKey> = std::collections::HashSet::new();
+    for e in &events {
+        if let BackendEvent::ConversationUpsert(p) = e {
+            if let Patch::Set(n) = &p.pinned_order {
+                pinned.insert(p.key.clone(), *n);
+            }
+            if p.archived == Some(true) {
+                archived.insert(p.key.clone());
+            }
+        }
+    }
+    let mut chats: std::collections::HashMap<ConvKey, (i64, Option<UserId>)> =
+        std::collections::HashMap::new();
+    for e in &events {
+        let BackendEvent::Message(m) = e else {
+            continue;
+        };
+        if matches!(m.conv, ConvKey::Direct(_)) || archived.contains(&m.conv) {
+            continue;
+        }
+        let chat = chats.entry(m.conv.clone()).or_insert((m.sent_at, None));
+        chat.0 = chat.0.max(m.sent_at);
+        if let kourier_model::Origin::Remote { author, .. } = &m.origin {
+            chat.1 = Some(author.clone());
+        }
+    }
+    chats
+        .into_iter()
+        .filter_map(|(conv, (newest, author))| author.map(|a| (conv, a, newest)))
+        .min_by_key(|(conv, _, newest)| {
+            (
+                pinned.get(conv).copied().unwrap_or(u32::MAX),
+                std::cmp::Reverse(*newest),
+                format!("{conv:?}"),
+            )
+        })
+}
+
+fn newest_chat_where(
+    script: &Script,
+    taken: &[Option<&UserId>],
+    groups_only: bool,
+) -> Option<(ConvKey, UserId, i64)> {
+    let mut chats: std::collections::HashMap<ConvKey, (i64, Option<(i64, UserId)>)> =
+        std::collections::HashMap::new();
+    for e in script.deliveries().into_iter().flatten() {
+        let BackendEvent::Message(m) = e else {
+            continue;
+        };
+        let chat = chats.entry(m.conv.clone()).or_insert((m.sent_at, None));
+        chat.0 = chat.0.max(m.sent_at);
+        if let kourier_model::Origin::Remote { author, .. } = &m.origin
+            && chat.1.as_ref().is_none_or(|(at, _)| m.sent_at > *at)
+        {
+            chat.1 = Some((m.sent_at, author.clone()));
+        }
+    }
+    chats
+        .into_iter()
+        .filter(|(conv, _)| match conv {
+            ConvKey::Direct(peer) => !groups_only && !taken.contains(&Some(peer)),
+            _ => true,
+        })
+        .filter_map(|(conv, (newest, person))| person.map(|(_, author)| (conv, author, newest)))
+        .max_by_key(|(conv, _, newest)| (*newest, format!("{conv:?}")))
 }
 
 /// The third person of the safety steps (`FixtureOptions::safety_peer`, P5a U6): the next lowest

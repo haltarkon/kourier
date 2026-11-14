@@ -14,6 +14,7 @@ kourier-backend-api.workspace = true
 kourier-db.workspace = true
 kourier-blob.workspace = true
 kourier-media.workspace = true
+kourier-mesh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,15 +23,39 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+# Message search (G1a, `search::normalize`): NFKC/NFD/NFC with compiled data, and the Unicode
+# word and grapheme boundaries. Both are in the lock file already (icu_normalizer through
+# `idna_adapter`, unicode-segmentation through kourier-viewmodel): no new package. The default
+# features of icu_normalizer would add utf8_iter/utf16_iter users (three small packages); the
+# `&str` methods used here need only the compiled data.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
+unicode-segmentation = "1"
+# RegExp filters (`filters`): the matcher and the syntax check; direct dependencies of this crate
+# only (the viewmodel reaches them through `facade::filters`).
+regex.workspace = true
+regex-syntax.workspace = true
+# The filters' own regexes are built with `meta::Config` (R6b); the same crate `regex` sits on.
+regex-automata = "0.4"
 
 [dev-dependencies]
+# The look below SQLite of the search attack test (`tests/support/pages.rs`).
+aes.workspace = true
 # Progress screenshot of the media pipeline (tests/attachments.rs, `KOURIER_MEDIA_SHOT`).
 image.workspace = true
+libc.workspace = true
 kourier-fake.workspace = true
+kourier-db = { workspace = true, features = ["trace"] }
+# The byte search of the raw look (`tests/support/pages.rs`).
+memchr.workspace = true
 proptest.workspace = true
+# The export archive read back and hashed (tests/export.rs).
+sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 tracing-subscriber.workspace = true
+# The 3MF fixtures of the derive tests are built in the test; the export archive is read back
+# (tests/export.rs).
+zip.workspace = true
 
 [[test]]
 name = "it"

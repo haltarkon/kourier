@@ -10,6 +10,8 @@ Item {
     id: root
 
     required property string text
+    // The row's number in the model: the timeline finds the row it holds on to by it.
+    required property int index
 
     width: ListView.view ? ListView.view.width : implicitWidth
     implicitHeight: row.implicitHeight + Kirigami.Units.largeSpacing * 2

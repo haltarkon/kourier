@@ -126,6 +126,9 @@ Item {
         if (root.sticker) {
             return "";
         }
+        if (root.block.isModel === true) {
+            return "model";
+        }
         return root.block.kind === "video" ? "open" : "view";
     }
 
@@ -152,6 +155,9 @@ Item {
             if (root.downloadable) {
                 App.downloadAttachment(root.attachment);
             }
+        } else if (root.block.isModel === true) {
+            // The 3D viewer, not the picture viewer.
+            MediaActions.viewModel(root.attachment, root.block.modelName ?? "", root.block.save === true, root.block.modelTint === true);
         } else if (root.block.kind === "video") {
             // Another application plays it; an unusual type asks first (the copy keeps the
             // sender's file-name extension).
@@ -208,7 +214,7 @@ Item {
     implicitHeight: root.standIn && standInLoader.item ? Math.ceil((standInLoader.item as Item).implicitHeight) : (root.sticker ? Math.round(Math.min(root.implicitWidth, root.available) * root.ratio) : root.singleBoxH)
 
     Accessible.role: Accessible.Graphic
-    Accessible.name: root.block.kind === "video" ? L10n.i18nc("@info accessible", "Video") : L10n.i18nc("@info accessible", "Picture")
+    Accessible.name: root.block.isModel === true ? L10n.i18nc("@info accessible", "3D model") : (root.block.kind === "video" ? L10n.i18nc("@info accessible", "Video") : L10n.i18nc("@info accessible", "Picture"))
     // Why it is not shown, whole, though a tile may cut the note on the screen.
     Accessible.description: root.gone ? root.note : ""
 
@@ -320,7 +326,8 @@ Item {
         height: root.picH
         // Also the poster of an animation until (or unless) it plays.
         visible: root.pictureHeld && !root.playing
-        source: root.block.url
+        // A model's shade picture is tinted by the provider: the colour is in the URL.
+        source: root.block.modelTint === true ? root.block.url + "&tint=" + Style.modelTint : root.block.url
         asynchronous: true
         retainWhileLoading: true
         smooth: true
@@ -365,6 +372,7 @@ Item {
     // tile to the album's overlay over it, which takes the X by position and opens the viewer
     // anywhere else (the ring is not in the middle when the number stands beside it).
     TapHandler {
+        acceptedModifiers: Qt.NoModifier
         enabled: root.attachment > 0
         onTapped: eventPoint => {
             const p = eventPoint.position;

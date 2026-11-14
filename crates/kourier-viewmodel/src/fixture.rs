@@ -1237,6 +1237,7 @@ mod tests {
             hidden: Default::default(),
             query: "Olena".into(),
             archived: false,
+            ..Default::default()
         };
         dumps.push(format!("{filter:?}"));
         for secret in [

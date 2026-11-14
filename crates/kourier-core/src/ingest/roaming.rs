@@ -668,6 +668,9 @@ impl Apply<'_> {
         self.conn
             .prepare_cached("DELETE FROM conversations WHERE id = ?1")?
             .execute([id.0])?;
+        // The words of the chat leave search.db once the search task has applied the log up to
+        // here (G1d): asked after the delete and its cascade.
+        crate::search::log::ask_now(self.conn)?;
         self.ch.conversations.remove(&id);
         self.ch.messages.remove(&id);
         self.ch.removed.insert(id);

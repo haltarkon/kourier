@@ -225,8 +225,10 @@ case "$STANDIN_CASE" in
     ;;
 esac
 while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
-  cmd=$(printf '%s' "$line" | sed 's/.*"cmd":"\([a-z_]*\)".*/\1/')
+  # Shell builtins only, no fork before the command is recorded: a forked `sed` under load took longer
+  # than the kill grace, and the app was killed before it had written down the `quit` it was sent.
+  id=${line#*\"id\":}; id=${id%%[!0-9]*}
+  cmd=${line#*\"cmd\":\"}; cmd=${cmd%%\"*}
   printf '%s\n' "$cmd" >> "$STANDIN_SEEN"
   case "$cmd" in
     quit) [ -n "$BG" ] && kill "$BG" 2>/dev/null

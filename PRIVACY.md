@@ -44,6 +44,7 @@ are mode 0700, files 0600.
 | Where | What | Protection |
 |---|---|---|
 | `~/.local/share/kourier/core.db` | conversations, messages, contacts, settings, attachment keys | SQLCipher 4 database, key derived from the master key |
+| `~/.local/share/kourier/search.db` | the words of your messages (the search index) | SQLCipher 4 database, a key of its own derived from the master key |
 | `~/.local/share/kourier/accounts/<id>/backend.db` | Signal identity and session keys, group secrets, profile keys | SQLCipher 4 database, its own random key per account |
 | `~/.local/share/kourier/accounts/<id>/key.wrap` | that account's database key | encrypted (AES-256-GCM) under a key made from the master key and a per-account secret in the Secret Service |
 | `~/.local/share/kourier/accounts/<id>/blobs/` | received and sent files, thumbnails, avatars | encrypted file by file (AES-256-GCM, a random key per file, kept in `core.db`) |
@@ -69,6 +70,8 @@ read a log before you share it.
 **Notifications.** A notification goes to your desktop's notification service. By default it shows
 the sender and the message text, which can appear on a lock screen or on a screen you share. The
 setting "notification content" can reduce it to the sender, or to "New message".
+
+**Search.** The search index is a file of its own beside the messages' database (`search.db`), encrypted with a key of its own made from the same master key. It holds the words of your messages, and deleting it loses nothing (Kourier builds it again). The words of a deleted or expired message are kept in it for at most a day of Kourier running, counted after the first indexing; after you clear a chat, delete a chat or remove an account they leave it within minutes.
 
 **Disappearing messages.** A message whose timer ran out is erased from the database and its files
 are removed. When the clock has not yet been confirmed against a server, a setting decides whether

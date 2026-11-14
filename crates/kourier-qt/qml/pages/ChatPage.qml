@@ -340,13 +340,26 @@ Kirigami.Page {
                 spacing: 0
                 Layout.fillWidth: true
                 QQC2.Label {
-                    text: App.timeline.title
+                    id: headerTitle
+                    // A marked title is a `RichText` label cut by `headerFit` (`Style.markedName`).
+                    readonly property var titleMarks: App.timeline.titleMarks ?? []
+                    readonly property bool marked: headerTitle.titleMarks.length > 0
+                    text: headerTitle.marked ? Style.markedName(headerFit.elidedText, App.timeline.title, headerTitle.titleMarks, Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor) : App.timeline.title
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold
                     })
                     elide: Text.ElideRight
-                    textFormat: Text.PlainText
+                    textFormat: headerTitle.marked ? Text.RichText : Text.PlainText
+                    Accessible.name: App.timeline.title
                     Layout.fillWidth: true
+
+                    TextMetrics {
+                        id: headerFit
+                        font: headerTitle.font
+                        text: headerTitle.marked ? App.timeline.title : ""
+                        elide: Qt.ElideRight
+                        elideWidth: headerTitle.width
+                    }
                 }
                 RowLayout {
                     spacing: Kirigami.Units.smallSpacing
@@ -411,6 +424,18 @@ Kirigami.Page {
             enabled: visible && App.timeline.timerHeld === ""
             tooltip: App.timeline.timerHeld
             onTriggered: page.openTimerMenu()
+        },
+        // Search in this chat only (G1i): the list's search field takes the keyboard with a chip
+        // naming the chat. Not shown (not merely greyed) for a protected chat: it offers no search.
+        Kirigami.Action {
+            icon.name: "edit-find"
+            text: L10n.i18nc("@action:inmenu", "Search in Chat")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && App.timeline.chatSearchable
+            enabled: visible
+            // (The window's key is Ctrl+Shift+F; an action's own shortcut would be ambiguous with it.)
+            tooltip: L10n.i18nc("@info:tooltip, %1 a keyboard shortcut", "Search in Chat (%1)", "Ctrl+Shift+F")
+            onTriggered: page.searchAsked()
         },
         // What the chat offers of the settings the phone shares (A10d), from the core's offer for
         // the open chat: Mark as Unread, Pin, Mute (with its times), Archive. All in the overflow
@@ -719,6 +744,8 @@ Kirigami.Page {
     signal archiveAsked(real conv)
     signal unarchiveAsked(real conv)
     signal untilAsked(real conv, var back)
+    // The menu's "Search in Chat": the window brings the list's search field forward.
+    signal searchAsked
 
     // What the open chat offers (the core's offer, a map; empty while no chat is open) and the
     // line under the menu's entries: why they are grey, else why Pin is.

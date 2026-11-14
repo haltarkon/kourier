@@ -390,6 +390,7 @@ mod tests {
             network_icon: String::new(),
             tint: String::new(),
             own_tint: String::new(),
+            own_tag: String::new(),
             status: AccountStatus::Online,
             status_label: String::new(),
             unread: 0,

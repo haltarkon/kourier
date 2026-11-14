@@ -30,6 +30,8 @@ pub(super) struct AttRow {
     pub(super) file_id: Option<i64>,
     pub(super) sticker: bool,
     pub(super) long_text: bool,
+    /// The sender's file name (`attachments.file_name`; not log-safe).
+    pub(super) file_name: Option<String>,
     /// Its place in the message's attachments (`attachments.idx`).
     pub(super) idx: usize,
     /// Its pointer came from the other device's answer (`attachments.restored`).
@@ -59,7 +61,8 @@ impl Source {
 }
 
 const ATT_SELECT: &str = "SELECT a.id, a.message_id, m.conversation_id, a.kind, a.size, a.mime,
-    a.state, a.remote, a.file_id, m.body_kind, a.long_text, a.idx, a.restored
+    a.state, a.remote, a.file_id, m.body_kind, a.long_text, a.idx, a.restored,
+    a.file_name
     FROM attachments a JOIN messages m ON m.id = a.message_id";
 
 fn att_row(r: &kourier_db::rusqlite::Row<'_>) -> kourier_db::rusqlite::Result<RawAtt> {
@@ -77,6 +80,7 @@ fn att_row(r: &kourier_db::rusqlite::Row<'_>) -> kourier_db::rusqlite::Result<Ra
         long_text: r.get(10)?,
         idx: r.get(11)?,
         restored: r.get(12)?,
+        file_name: r.get(13)?,
     })
 }
 
@@ -94,6 +98,7 @@ struct RawAtt {
     long_text: bool,
     idx: i64,
     restored: bool,
+    file_name: Option<String>,
 }
 
 impl RawAtt {
@@ -112,6 +117,7 @@ impl RawAtt {
             long_text: self.long_text,
             idx: usize::try_from(self.idx).unwrap_or(usize::MAX),
             restored: self.restored,
+            file_name: self.file_name,
         })
     }
 }
@@ -509,6 +515,7 @@ impl Apply<'_> {
                     kind: row.kind,
                     sticker: row.sticker,
                     long_text: row.long_text,
+                    file_name: row.file_name,
                 });
                 self.ch.media.insert(attachment);
                 self.ch.message(row.conv, row.message);
@@ -816,11 +823,12 @@ pub(crate) fn pending_derives(conn: &Connection, account: AccountId) -> Result<V
         String,
         String,
         bool,
+        Option<String>,
     );
     let rows: Vec<Raw> = conn
         .prepare_cached(
             "SELECT a.id, a.message_id, m.conversation_id, f.id, f.path, f.key, a.mime, a.kind,
-                    m.body_kind, a.long_text
+                    m.body_kind, a.long_text, a.file_name
              FROM attachments a JOIN messages m ON m.id = a.message_id
              JOIN files f ON f.id = a.file_id
              WHERE a.derived_at IS NULL AND m.account_id = ?1 ORDER BY a.id",
@@ -837,12 +845,13 @@ pub(crate) fn pending_derives(conn: &Connection, account: AccountId) -> Result<V
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
+                r.get(10)?,
             ))
         })?
         .collect::<kourier_db::rusqlite::Result<_>>()?;
     rows.into_iter()
         .map(
-            |(att, msg, conv, fid, path, key, mime, kind, body_kind, long_text)| {
+            |(att, msg, conv, fid, path, key, mime, kind, body_kind, long_text, file_name)| {
                 Ok(DeriveJob {
                     attachment: AttachmentId(att),
                     message: MessageId(msg),
@@ -854,6 +863,7 @@ pub(crate) fn pending_derives(conn: &Connection, account: AccountId) -> Result<V
                     kind: sql::from_enum_name(&kind)?,
                     sticker: body_kind == "Sticker",
                     long_text,
+                    file_name,
                 })
             },
         )

@@ -14,6 +14,14 @@ ignore = [
     # Kourier cannot change. Look at it again on every libsignal upgrade
     # (docs/architecture.md section 6.15); first listed 2026-10-08.
     { id = "RUSTSEC-2025-0141", reason = "unmaintained, no vulnerability; only through libsignal's zkgroup" },
+    # zvariant, zbus_names and zvariant_derive (zbus 5 family) are "unmaintained" only because
+    # they are no longer standalone crates: they were merged into zbus 6 (z-galaxy/zbus#2043).
+    # No vulnerability. They come through zbus 5.19, used by kourier-desktop and, on zbus 5, by
+    # oo7 0.6, ashpd 0.13 and ksni. Do not upgrade zbus alone; look at it again when oo7, ashpd
+    # and ksni have released on zbus 6; first listed 2026-11-14.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained because merged into zbus 6, no vulnerability; zbus 5 via kourier-desktop, oo7, ashpd, ksni" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained because merged into zbus 6, no vulnerability; zbus 5 via kourier-desktop, oo7, ashpd, ksni" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained because merged into zbus 6, no vulnerability; zbus 5 via kourier-desktop, oo7, ashpd, ksni" },
 ]
 
 [licenses]

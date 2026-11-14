@@ -276,7 +276,24 @@ impl UserId {
     /// and [`UserId::value`] is `value`.
     pub fn from_parts(scheme: &str, value: &str) -> Result<Self, IdError> {
         validate_scheme(scheme)?;
-        Self::parse(&format!("{scheme}:{value}"))
+        // The checks of `parse`, in its order, on the parts; then the id is built in a stack
+        // buffer and copied into its `Arc` once (a `format!` and a re-parse allocated twice).
+        let len = scheme.len() + 1 + value.len();
+        if len > MAX_ID_LEN {
+            return Err(IdError::TooLong);
+        }
+        if value.is_empty() {
+            return Err(IdError::Empty);
+        }
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(IdError::BadChar);
+        }
+        let mut buf = [0u8; MAX_ID_LEN];
+        buf[..scheme.len()].copy_from_slice(scheme.as_bytes());
+        buf[scheme.len()] = b':';
+        buf[scheme.len() + 1..len].copy_from_slice(value.as_bytes());
+        let id = std::str::from_utf8(&buf[..len]).map_err(|_| IdError::BadChar)?;
+        Ok(Self(Arc::from(id)))
     }
 
     /// The full id string. Not log-safe.
@@ -705,6 +722,119 @@ impl fmt::Debug for Identifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts the allocations of the calling thread, to pin that an id is built with one.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub(super) struct Counting;
+
+        fn note() {
+            let _ = CALLS.try_with(|c| c.set(c.get() + 1));
+        }
+
+        // SAFETY: every call is forwarded to the system allocator unchanged; the thread-local is
+        // a `Cell<usize>` with a const initialiser, which never allocates.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                note();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// How many allocations this thread makes while `f` runs.
+        pub(super) fn during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            let before = CALLS.with(Cell::get);
+            let out = f();
+            (out, CALLS.with(Cell::get) - before)
+        }
+    }
+
+    /// `from_parts` is the same id as `parse` of the joined text (value, `Eq`, `Hash`, `Ord`,
+    /// serde, and the same error for every bad input) for every form the tests use, and it
+    /// allocates once (the `Arc`). Mutant: back to `parse(&format!(..))` (two allocations).
+    #[test]
+    fn from_parts_equals_the_parsed_id_with_one_allocation() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let long = "x".repeat(MAX_ID_LEN - 4);
+        let too_long = "x".repeat(MAX_ID_LEN - 3);
+        let cases: Vec<(&str, &str)> = vec![
+            ("aci", "9d0652a3-dcc3-4d11-975f-74d61598733f"),
+            ("pni", "9d0652a3-dcc3-4d11-975f-74d61598733f"),
+            ("e164", "+491234"),
+            ("lid", "99900100777"),
+            ("lid", "1:2@lid"),
+            ("pn", "15550100123"),
+            ("threema", "ECHOECHO"),
+            ("tg", "42"),
+            ("th-id", "X"),
+            ("aci", "ünï"),
+            ("aci", &long),
+            ("aci", &too_long),
+            ("aci", ""),
+            ("aci", "a b"),
+            ("aci", "a\nb"),
+            ("a:b", "c"),
+            ("", "c"),
+            ("ACI", "x"),
+        ];
+        let hash = |u: &UserId| {
+            let mut h = DefaultHasher::new();
+            u.hash(&mut h);
+            h.finish()
+        };
+        for (scheme, value) in cases {
+            let built = UserId::from_parts(scheme, value);
+            if validate_scheme(scheme).is_err() {
+                // The scheme is checked first, as it always was ("a:b" + "c" is not "a" + "b:c").
+                assert_eq!(built, Err(IdError::BadScheme), "{scheme}:{value}");
+                continue;
+            }
+            let parsed = UserId::parse(&format!("{scheme}:{value}"));
+            match (&built, &parsed) {
+                (Ok(b), Ok(p)) => {
+                    assert_eq!(b, p, "{scheme}:{value}");
+                    assert_eq!(b.cmp(p), std::cmp::Ordering::Equal);
+                    assert_eq!(hash(b), hash(p));
+                    assert_eq!(
+                        serde_json::to_string(b).expect("json"),
+                        serde_json::to_string(p).expect("json")
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<UserId>(&serde_json::to_string(b).expect("json"))
+                            .expect("back"),
+                        *p
+                    );
+                    assert_eq!((b.scheme(), b.value()), (scheme, value));
+                }
+                _ => assert_eq!(built, parsed, "{scheme}:{value}"),
+            }
+        }
+        let (id, calls) =
+            counting::during(|| UserId::from_parts("aci", "9d0652a3-dcc3-4d11-975f-74d61598733f"));
+        assert!(id.is_ok());
+        assert_eq!(calls, 1, "one allocation: the Arc");
+    }
 
     fn uid(s: &str) -> UserId {
         UserId::parse(s).expect("valid user id")

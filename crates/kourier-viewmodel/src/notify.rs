@@ -4,11 +4,13 @@
 //! `kourier-qt` hands these to the desktop integration (`kourier_app::desktop::Presenter`).
 //! Log safety (§9.1): the results are names and message texts; never log them.
 
-use kourier_core::facade::{AccountRow, ConversationDetail, ConversationRow, MessageRow};
+use kourier_core::facade::{
+    AccountRow, ConversationDetail, ConversationRow, MessageRow, OwnedFilterTexts,
+};
 use kourier_model::{ConvKind, UserId};
 
 use crate::conversations::network_name;
-use crate::i18n::{trc, trfc, trnc};
+use crate::i18n::{trc, trfc, trnc, trnfc};
 use crate::names::{NameMap, fallback_name, first_name, single_line};
 use crate::preview::{body_summary, deleted_text};
 
@@ -93,6 +95,62 @@ pub fn message_line(detail: &ConversationDetail, msg: &MessageRow) -> String {
         ),
         _ => text,
     }
+}
+
+/// The texts of `msg` in `detail`'s chat for the filters on the notification path: the SAME
+/// function as the timeline's marks ([`crate::filter_marks::filter_texts`]) does the sender
+/// (no "~") and the text (mentions as `@Name`, the whole text). A deleted or view-once message
+/// offers no text; a message without a text or caption none. Never logged.
+pub fn filter_texts(detail: &ConversationDetail, msg: &MessageRow) -> OwnedFilterTexts {
+    use kourier_model::Body;
+    let mut names = NameMap::new();
+    let sender = author_name(msg);
+    if let (Some(author), Some(name)) = (&msg.author, &sender) {
+        names.insert(author.clone(), name.clone());
+    }
+    let hidden = msg.deleted.is_some() || msg.view_once;
+    let source = match &msg.body {
+        Body::Text(t) => Some(t),
+        Body::Media {
+            attachments,
+            caption,
+        } => caption
+            .as_ref()
+            .or_else(|| attachments.first().and_then(|a| a.caption.as_ref()))
+            .filter(|c| !c.body.trim().is_empty()),
+        _ => None,
+    };
+    let rich = source
+        .filter(|_| !hidden)
+        .map(|t| crate::richtext::render(t, &names));
+    let title = conversation_title(&detail.row);
+    let texts = crate::filter_marks::filter_texts(rich.as_ref(), sender.as_deref(), Some(&title));
+    OwnedFilterTexts {
+        text: texts.text.map(str::to_owned),
+        sender: texts.sender.map(str::to_owned),
+        chat: title,
+    }
+}
+
+/// The title of a filter's notification: the chat's name and the filter's name.
+pub fn filter_title(title: &str, filter: &str) -> String {
+    trfc(
+        "@title:notification, %1 the name of a chat, %2 the name of the RegExp filter that matched",
+        "%1 · %2",
+        &[title, filter],
+    )
+}
+
+/// One line of the catch-up summary: how many caught-up messages matched a filter
+/// ("2 match Invoices").
+pub fn filter_matches(count: u32, filter: &str) -> String {
+    trnfc(
+        "@info:notification summary, %1 how many caught-up messages matched, %2 the name of a RegExp filter",
+        "%1 matches %2",
+        "%1 match %2",
+        u64::from(count),
+        &[&count.to_string(), filter],
+    )
 }
 
 /// "3 new messages".
@@ -218,6 +276,7 @@ mod tests {
             request_pending: false,
             features_hash: 0,
             has_draft: false,
+            draft_at: 0,
             hidden: false,
             can_send: true,
             roaming: kourier_core::facade::Roaming::Hidden,
@@ -441,6 +500,7 @@ mod tests {
             hold: None,
             roaming_writes: None,
             pin_limit: None,
+            own_ids: Vec::new(),
         };
         assert_eq!(account_label(&a), "Work");
         a.display_name = None;

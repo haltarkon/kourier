@@ -103,15 +103,14 @@ impl qobject::ShareTargetListModel {
     pub fn conversation_at(&self, row: i32) -> i64 {
         usize::try_from(row)
             .ok()
-            .and_then(|r| self.store.qt.get(r))
+            .and_then(|r| self.store.qt_row(r))
             .map_or(0, |r| r.conversation)
     }
 
     /// The title of listed chat `conversation` (empty when it is not listed).
     pub fn title_of(&self, conversation: i64) -> QString {
         self.store
-            .qt
-            .iter()
+            .qt_rows()
             .find(|r| r.conversation == conversation)
             .map(|r| r.title.clone())
             .unwrap_or_default()

@@ -27,6 +27,8 @@ Item {
     required property string author
     // The author's user id ("" for a notice): a click on the name or the picture opens that person.
     required property string authorId
+    // The RegExp filters' marker backgrounds in the author's name: `[{start, len, colour}]` (R3).
+    required property var authorMarks
     // The pages the row's menu offers: `[{user, label}]` (the sender's, the mentioned people's).
     required property var pages
     required property string avatarUrl
@@ -48,6 +50,8 @@ Item {
     // a narrow window, the timer never does.
     required property string wait
     required property string waitTimer
+    // The row is selected in the selection mode (the model's `selected` role, Rust's state).
+    required property bool selected
 
     readonly property bool group: App.timeline.isGroup
     // The row is laid out right to left (the window's layout direction, as anchors and
@@ -66,7 +70,10 @@ Item {
     readonly property real maxBubble: Math.floor(Math.min(Style.bubbleMaxWidth, (root.width - root.sideMargin * 2 - root.avatarColumn) * 0.85))
     readonly property real hpad: Math.round(Kirigami.Units.largeSpacing + Kirigami.Units.smallSpacing / 2)
     readonly property real vpad: Math.round(Kirigami.Units.smallSpacing * 1.5)
-    readonly property color bubbleColor: root.own ? Style.ownBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor) : Style.peerBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor)
+    readonly property color baseBubble: root.own ? Style.ownBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor) : Style.peerBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor)
+    // A selected row is the bubble leaning towards the theme's highlight (what is drawn on it is
+    // read against this colour, `surface`), with a frame in the highlight colour.
+    readonly property color bubbleColor: root.selected ? Kirigami.ColorUtils.linearInterpolation(root.baseBubble, Kirigami.Theme.highlightColor, 0.3) : root.baseBubble
     // What the content stands on: the bubble, or the page for big emoji and stickers.
     readonly property color surface: root.jumbo ? Kirigami.Theme.backgroundColor : root.bubbleColor
     readonly property color inkColor: Kirigami.Theme.textColor
@@ -201,6 +208,8 @@ Item {
             }
         }
         switch (root.mediaAction()) {
+        case "model":
+            return L10n.i18nc("@action:inmenu", "View 3D Model");
         case "view":
             return pictures > 1 ? L10n.i18nc("@action:inmenu", "View Pictures") : L10n.i18nc("@action:inmenu", "View Picture");
         case "open":
@@ -332,8 +341,30 @@ Item {
         return out.filter(a => a > 0);
     }
 
+    // The attachment of a row whose ONE attachment is a 3D model (0 for any other row) and its name:
+    // what the menu's "Open in Slicer" starts a slicer with. Whether the menu offers it is the
+    // core's word, the same as for "Save As…" (`actions.saveAttachments`, `saveIds`).
+    function modelBlock(): var {
+        if (root.deleted || root.blocks.length === 0) {
+            return null;
+        }
+        let found = null;
+        for (const b of root.blocks) {
+            if (b.type === "image" && b.isModel === true) {
+                if (found !== null) {
+                    return null;
+                }
+                found = b;
+            } else if (b.type === "image" || b.type === "album" || b.type === "file") {
+                return null;
+            }
+        }
+        return found;
+    }
+
     // What the shared popups need to know about this row.
     function rowInfo(): var {
+        const model = root.modelBlock();
         return {
             "messageId": root.messageId,
             "own": root.own,
@@ -350,7 +381,11 @@ Item {
             "mediaLabel": root.mediaLabel(),
             "quoted": root.quoteBlock() !== null,
             "attachments": root.deleted ? [] : root.attachmentList(),
-            "saveIds": root.saveList()
+            "saveIds": root.saveList(),
+            "modelAttachment": model !== null ? model.attachment : 0,
+            "modelName": model !== null ? (model.modelName ?? "") : "",
+            "selectable": true,
+            "selected": root.selected
         };
     }
 
@@ -360,10 +395,9 @@ Item {
     }
 
     // The context menu without a pointer (the Menu key): beside the bubble.
+    // (Every message row has a menu: "Select" is an entry of it that no core rule decides.)
     function openMenu(): void {
-        if (root.actions.any) {
-            TimelineActions.menu(bubble, root.rowInfo(), -1, 0);
-        }
+        TimelineActions.menu(bubble, root.rowInfo(), -1, 0);
     }
 
     function reply(): void {
@@ -426,7 +460,9 @@ Item {
     implicitHeight: column.y + column.height + (root.groupEnd ? Kirigami.Units.largeSpacing : Kirigami.Units.smallSpacing / 2)
 
     Accessible.role: Accessible.ListItem
-    Accessible.name: root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", Style.unmarked(root.author), root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", Style.unmarked(root.author), root.timeLabel, root.copyText)
+    Accessible.name: (root.selected ? L10n.i18nc("@info accessible, said before a selected message", "Selected.") + " " : "") + (root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", Style.unmarked(root.author), root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", Style.unmarked(root.author), root.timeLabel, root.copyText))
+    Accessible.selectable: App.timeline.selecting
+    Accessible.selected: root.selected
     Accessible.description: (root.edited ? L10n.i18nc("@info accessible", "Edited.") + " " : "") + (root.failed ? L10n.i18nc("@info accessible", "Not sent.") + " " : "") + root.waitHint + root.expiry + (root.current && root.keyHint !== "" ? " " + root.keyHint : "")
     // Why the message has not left, without the seconds (a description that changes every
     // second would be read again for the focused row); a countdown has no reason, so it says
@@ -495,6 +531,8 @@ Item {
     // (a handler each for the name and the picture would double the cost).
     TapHandler {
         acceptedButtons: Qt.LeftButton
+        // (A Ctrl+click starts the selection mode: `TimelineView`'s one handler takes it.)
+        acceptedModifiers: Qt.NoModifier
         enabled: root.authorId !== "" && (root.showAuthor || root.showAvatar)
         onTapped: point => {
             if (root.hitsSender(point.position)) {
@@ -559,8 +597,8 @@ Item {
             // frame contrast: faint in Breeze, solid in the high-contrast schemes, where the
             // tint alone does not set the bubble off from the page. Big emoji and stickers
             // have no bubble to frame.
-            border.width: root.current ? 2 : (root.jumbo ? 0 : 1)
-            border.color: root.current ? Kirigami.Theme.focusColor : Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
+            border.width: root.current || root.selected ? 2 : (root.jumbo ? 0 : 1)
+            border.color: root.current ? Kirigami.Theme.focusColor : root.selected ? Kirigami.Theme.highlightColor : Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
             // The software renderer (headless screenshots) ignores per-corner radii and
             // draws `radius` on every corner.
             radius: bubble.big
@@ -574,13 +612,11 @@ Item {
             // button selects text).
             TapHandler {
                 acceptedButtons: Qt.RightButton
-                enabled: root.actions.any
                 onTapped: point => TimelineActions.menu(bubble, root.rowInfo(), Math.round(point.position.x), Math.round(point.position.y))
             }
             TapHandler {
                 id: longPress
                 acceptedDevices: PointerDevice.TouchScreen | PointerDevice.Stylus
-                enabled: root.actions.any
                 onLongPressed: TimelineActions.menu(bubble, root.rowInfo(), Math.round(longPress.point.position.x), Math.round(longPress.point.position.y))
             }
 
@@ -595,16 +631,33 @@ Item {
                 QQC2.Label {
                     id: authorLabel
                     objectName: "senderName"
+                    // A name with marks is a `RichText` label (Qt's `Text` cannot elide rich text, so
+                    // the name is cut by `nameFit` and the html made of the cut name; the measure
+                    // probe: `names_probe_ui`). A name without marks keeps the plain label.
+                    readonly property bool marked: root.showAuthor && root.authorMarks.length > 0
                     visible: root.showAuthor
                     width: parent.width
-                    text: root.author
+                    text: authorLabel.marked ? Style.markedName(nameFit.elidedText, root.author, root.authorMarks, root.surface, root.authorColor) : root.author
                     elide: Text.ElideRight
-                    textFormat: Text.PlainText
+                    textFormat: authorLabel.marked ? Text.RichText : Text.PlainText
+                    Accessible.name: root.author
                     color: root.authorColor
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold
                     })
                     onImplicitWidthChanged: root.measure()
+
+                    // The width the name may take: the cut that the marked label draws (made only for a
+                    // marked name).
+                    TextMetrics {
+                        id: nameFit
+                        font: authorLabel.font
+                        text: authorLabel.marked ? root.author : ""
+                        elide: Qt.ElideRight
+                        // (The most the bubble can give the name, not the label's own width: that one
+                        // follows the name's implicit width, and the cut text would loop on itself.)
+                        elideWidth: root.textWidth
+                    }
                 }
 
                 // One delegate per block, KEPT while the blocks' content changes (a new picture
@@ -886,6 +939,9 @@ Item {
                     function toggle(): void {
                         if (root.actions.react) {
                             App.react(root.messageId, chip.modelData.emoji, chip.modelData.mine);
+                            if (!chip.modelData.mine) {
+                                App.emojiLists.used(chip.modelData.emoji);
+                            }
                         } else {
                             root.openReactions();
                         }
@@ -940,7 +996,13 @@ Item {
         // (React, Reply and the menu, and Save beside them when the row has something to save.)
         readonly property bool compact: toolbar.room < toolbar.buttonSize * (root.actions.saveAttachments ? 4 : 3) + Kirigami.Units.smallSpacing * (root.actions.saveAttachments ? 3 : 2)
 
-        visible: root.actions.any && (hover.hovered || root.current || root.active)
+        // The first pinned emoji as one-click reactions before "Add Reaction": dropped first when
+        // the window leaves no room (the buttons above are kept as before).
+        readonly property int pinCount: root.actions.react === true ? App.emojiLists.hoverPins.length : 0
+        readonly property bool showPins: toolbar.pinCount > 0 && !toolbar.compact && toolbar.room >= toolbar.buttonSize * ((root.actions.saveAttachments ? 4 : 3) + toolbar.pinCount) + Kirigami.Units.smallSpacing * (root.actions.saveAttachments ? 3 : 2)
+
+        // (Never empty, and not while selecting: a click there selects.)
+        visible: root.actions.any && !App.timeline.selecting && (hover.hovered || root.current || root.active)
         y: Math.round(column.y + bubble.y + (bubble.height - height) / 2)
         x: Math.round(root.atRight ? column.x + column.width - bubble.width - width - Kirigami.Units.smallSpacing : column.x + bubble.width + Kirigami.Units.smallSpacing)
         spacing: 0
@@ -949,6 +1011,51 @@ Item {
         // (The buttons never take the keyboard focus: a click on one leaves it where the user
         // is typing, and the timeline is one tab stop. With the keyboard the same actions are
         // in the menu of the current row: Menu, Shift+F10 or Enter.)
+        // The pinned emoji (made only while the toolbar shows and for a row that can be reacted to:
+        // the row is made many times). Never in the tab order: the menu has the keyboard path.
+        Loader {
+            id: pinsLoader
+            objectName: "hoverPins"
+            active: toolbar.showPins && toolbar.visible
+            visible: active
+            sourceComponent: Row {
+                spacing: 0
+                layoutDirection: toolbar.layoutDirection
+                Repeater {
+                    model: App.emojiLists.hoverPins
+                    delegate: QQC2.ToolButton {
+                        id: pin
+
+                        required property string modelData
+
+                        readonly property bool mine: {
+                            for (const chip of root.reactions) {
+                                if (chip.mine && chip.emoji === pin.modelData) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+
+                        objectName: "hoverPin"
+                        focusPolicy: Qt.NoFocus
+                        implicitWidth: toolbar.buttonSize
+                        text: pin.modelData
+                        font.family: "emoji"
+                        font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2
+                        checkable: false
+                        checked: pin.mine
+                        Accessible.name: pin.mine ? L10n.i18nc("@action:button accessible", "Remove reaction %1", pin.modelData) : L10n.i18nc("@action:button accessible", "React with %1", pin.modelData)
+                        onClicked: {
+                            App.react(root.messageId, pin.modelData, pin.mine);
+                            if (!pin.mine) {
+                                App.emojiLists.used(pin.modelData);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         QQC2.ToolButton {
             id: reactButton
             visible: root.actions.react && !toolbar.compact

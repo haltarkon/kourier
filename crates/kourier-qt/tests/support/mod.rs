@@ -18,8 +18,19 @@ pub fn answer_list(name: &str) {
 /// The same for a binary that is several tests for nextest (SE6: `scroll_ui` and its slow twin
 /// `scroll_ui_climbed`): the listing names each, and nextest then runs the binary once per name
 /// with `--exact <name>`, which `main` reads from [`named`].
+///
+/// Every such binary calls it first in `main`, so it also turns the QML engine's incremental
+/// JavaScript collector off here, as the application does (`kourier_qt::JS_GC_NOT_INCREMENTAL`:
+/// Qt 6.11's crashed `qml_smoke` 4 times in 167 runs), unless the variable is set; the children a
+/// test starts inherit it. Only this one of the application's defaults: `media_ui` proves what
+/// `kourier_qt::prepare_environment` does to the other two, in children that start without them.
 #[allow(dead_code)]
 pub fn answer_list_of(names: &[&str]) {
+    let (gc, not_incremental) = kourier_qt::JS_GC_NOT_INCREMENTAL;
+    if std::env::var_os(gc).is_none() {
+        // SAFETY: the first thing `main` does (see above); no thread has started yet.
+        unsafe { std::env::set_var(gc, not_incremental) };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.iter().any(|a| a == "--list") {
         return;

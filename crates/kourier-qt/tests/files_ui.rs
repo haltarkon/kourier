@@ -61,6 +61,14 @@ Window {
     property real longestGap: 0
     property real lastCpu: -1
     property real longestWork: 0
+    // How far the worst stretch of Qt-thread work went over what its rows may cost
+    // (`workBudget`): <= 0 while every stretch stayed within it. `lastRows` is the timeline's
+    // row count at the last tick; `rowsInWorst` the rows that came in the worst stretch.
+    property real worstOver: -1e9
+    property real worstWork: 0
+    property int rowsInWorst: 0
+    property int lastRows: 0
+    property int lastArrived: 0
     property real addTook: 0
     property real album: 0
     property real edited: 0
@@ -106,6 +114,18 @@ Window {
         return null;
     }
 
+    // What the Qt thread may spend in one go (between two ticks) when `arrived` timeline rows
+    // came in during it or the tick before (the views build their items a tick later): 80 ms
+    // of its own (non-row stretches of 30 to 50 ms are normal) and 4 ms for each row (a row costs about 2 to 3 ms of
+    // CPU in a debug build). The rows that come in one go depend on how the system schedules
+    // the core's thread against this one: on a busy machine a whole send arrives in one batch
+    // (229 ms for 105 rows, 2026-11-11) and a flat 150 ms bound fails with no fault in the
+    // code. A stall of its own (a busy loop on the Qt thread per batch) is not made of rows
+    // and shows over the budget.
+    function workBudget(arrived: int): real {
+        return 80 + 4 * arrived;
+    }
+
     function click(item: Item): void {
         if (!test.ev.mouseClick(item, item.width / 2, item.height / 2, Qt.LeftButton, Qt.NoModifier, -1)) {
             fail("the window took no mouse event");
@@ -124,9 +144,19 @@ Window {
             test.lastTick = now;
             const cpu = App.threadCpuMs();
             if (test.lastCpu >= 0) {
-                test.longestWork = Math.max(test.longestWork, cpu - test.lastCpu);
+                const work = cpu - test.lastCpu;
+                test.longestWork = Math.max(test.longestWork, work);
+                const arrived = Math.max(0, rows.count - test.lastRows) + test.lastArrived;
+                test.lastArrived = Math.max(0, rows.count - test.lastRows);
+                const over = work - test.workBudget(arrived);
+                if (over > test.worstOver) {
+                    test.worstOver = over;
+                    test.worstWork = work;
+                    test.rowsInWorst = arrived;
+                }
             }
             test.lastCpu = cpu;
+            test.lastRows = rows.count;
         }
     }
 
@@ -350,6 +380,11 @@ Window {
                 if (App.composer.messageCount !== MESSAGES) return fail("messages with a caption: " + App.composer.messageCount);
                 test.longestGap = 0;
                 test.longestWork = 0;
+                test.worstOver = -1e9;
+                test.worstWork = 0;
+                test.rowsInWorst = 0;
+                test.lastRows = rows.count;
+                test.lastArrived = 0;
                 test.sentAt = Date.now();
                 composerItem.send();
                 if (App.composer.attachmentCount !== 2 || App.composer.sendableCount !== 0) return fail("after the send the two refused files stay: " + App.composer.attachmentCount);
@@ -368,9 +403,12 @@ Window {
                 // The Qt thread never worked for long in one go while the core copied (and
                 // while 105 messages arrived in the timeline). Phase H allowed a wall-clock
                 // stall of 1000 ms and still failed once in a full run: the gaps it measured
-                // (33 to 466 ms) were mostly the system running other builds. In CPU time
-                // the longest stretch is the timeline taking the new rows, a few tens of ms.
-                if (test.longestWork > 150) return fail("the Qt thread worked for " + test.longestWork.toFixed(1) + " ms in one go during the send");
+                // (33 to 466 ms) were mostly the system running other builds. In CPU time the
+                // longest stretch is the timeline taking the rows that came in, so it is judged
+                // per row (`workBudget`): a flat bound failed three times under load (181, 152
+                // and 229 ms) because the batch of rows between two ticks grew, not the cost of
+                // a row (notes/kourier-g1 files-ui-flake).
+                if (test.worstOver > 0) return fail("the Qt thread worked for " + test.worstWork.toFixed(1) + " ms in one go during the send, for " + test.rowsInWorst + " new rows (" + test.workBudget(test.rowsInWorst).toFixed(0) + " ms allowed)");
                 console.warn("files_ui: add " + test.addTook.toFixed(1) + " ms of the Qt thread, longest work in one go " + test.longestWork.toFixed(1) + " ms (longest gap between ticks " + test.longestGap + " ms), " + (Date.now() - test.sentAt) + " ms until the messages showed");
                 App.composer.clearAttachments();
                 App.composer.clearNotice();
@@ -489,6 +527,31 @@ Window {
                 // The picture it stepped to is shown, not only numbered.
                 const v = test.viewer;
                 if (!v.shown) return later("the picture after stepping");
+                // Picture zoom: a wheel notch zooms this one; an album step (the key, then the button)
+                // shows the next picture at Fit, with no zoomed decode held.
+                const port = v.viewportRect;
+                const sharp = test.find(v.contentItem, c => c.objectName === "sharp");
+                if (!sharp) return fail("the viewer's zoomed decode item");
+                if (!test.ev.mouseWheel(v.contentItem, port.x + port.w / 2, port.y + port.h / 2, Qt.NoButton, Qt.NoModifier, 0, 120, -1)) return fail("the window took no wheel event");
+                if (v.fitted) return fail("a wheel notch zooms the picture");
+                const at = v.index;
+                test.key(Qt.Key_Right);
+                if (v.index !== at + 1) return fail("Right after zooming: " + v.index);
+                if (!v.fitted) return fail("the next picture of the album is not shown at Fit");
+                if (sharp.source.toString() !== "") return fail("the zoomed decode is held across an album step: " + sharp.source);
+                test.next("zoomStepped");
+                return;
+            }
+            case "zoomStepped": {
+                const v = test.viewer;
+                if (!v.shown) return later("the next picture");
+                const port = v.viewportRect;
+                const sharp = test.find(v.contentItem, c => c.objectName === "sharp");
+                test.ev.mouseWheel(v.contentItem, port.x + port.w / 2, port.y + port.h / 2, Qt.NoButton, Qt.NoModifier, 0, 120, -1);
+                if (v.fitted) return fail("a wheel notch zooms the second picture");
+                const at = v.index;
+                test.click(test.find(v.contentItem, c => c.objectName === "viewerNext"));
+                if (v.index !== at + 1 || !v.fitted || sharp.source.toString() !== "") return fail("the side button shows the next picture at Fit: " + v.index + " " + v.fitted);
                 test.key(Qt.Key_Escape);
                 test.next("viewerClosed");
                 return;

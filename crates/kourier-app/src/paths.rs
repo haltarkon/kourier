@@ -161,6 +161,13 @@ impl Paths {
         self.data.join("core.db")
     }
 
+    /// `search.db`: message search's own file beside `core.db` (G1), with its `-wal` and `-shm`.
+    /// Never needed: a profile without it builds it again, so it is no sign of data
+    /// ([`Paths::has_data`] asks `core.db`).
+    pub fn search_db(&self) -> PathBuf {
+        self.data.join("search.db")
+    }
+
     /// `accounts/`.
     pub fn accounts_dir(&self) -> PathBuf {
         self.data.join("accounts")

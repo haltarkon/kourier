@@ -227,6 +227,8 @@ async fn start_with(late_server: bool, script: fn(&UserId, &UserId, &UserId) -> 
     let cfg = CoreConfig::new(
         data.join("core.db"),
         kourier_db::DbKey::from([0xc0; 32]),
+        // search.db has a key of its own (a test one).
+        kourier_db::DbKey::from([0x5e; 32]),
         registry,
         Arc::new(DirVault::new(data.clone())),
         Arc::new(clock.clone()),
@@ -480,6 +482,7 @@ async fn notifications_end_to_end() {
         Some(DesktopEvent::Activate {
             token: Some("xdg-token-1".into()),
             conversation: Some(bob_conv),
+            message: None,
         })
     );
     env.advance().await; // 4: the message is deleted for everyone
@@ -1000,6 +1003,8 @@ async fn resume_and_network_hints_reach_the_backend() {
     let cfg = CoreConfig::new(
         data.join("core.db"),
         kourier_db::DbKey::from([0xc0; 32]),
+        // search.db has a key of its own (a test one).
+        kourier_db::DbKey::from([0x5e; 32]),
         registry,
         Arc::new(DirVault::new(data.clone())),
         Arc::new(SystemClock),
@@ -1151,6 +1156,8 @@ async fn preferences_sent_just_before_the_stop_are_saved() {
     let core = Core::start(CoreConfig::new(
         data.join("core.db"),
         kourier_db::DbKey::from([0xc0; 32]),
+        // search.db has a key of its own (a test one).
+        kourier_db::DbKey::from([0x5e; 32]),
         registry,
         Arc::new(DirVault::new(data.clone())),
         Arc::new(FakeClock::new(u64::try_from(T0).unwrap_or(0))),
@@ -1212,3 +1219,5 @@ async fn preferences_sent_just_before_the_stop_are_saved() {
     }
     core.shutdown().await;
 }
+
+mod filters;

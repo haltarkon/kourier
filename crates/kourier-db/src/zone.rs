@@ -114,6 +114,17 @@ impl ZoneDb {
         crate::try_checkpoint_truncate(&conn)
     }
 
+    /// [`crate::release_memory`] on this connection, between zones: the page cache and the
+    /// prepared statements go back to the allocator. Does nothing inside a zone.
+    pub fn release_memory(&self) {
+        if self.in_zone.get() {
+            return;
+        }
+        if let Ok(conn) = self.conn.try_borrow() {
+            crate::release_memory(&conn);
+        }
+    }
+
     /// Gives the connection back (for shutdown and tests).
     pub fn into_inner(self) -> Connection {
         self.conn.into_inner()
@@ -176,6 +187,35 @@ mod tests {
     fn count(db: &ZoneDb, sql: &str) -> i64 {
         db.read(|c| -> Result<i64> { Ok(c.query_row(sql, [], |r| r.get(0))?) })
             .unwrap()
+    }
+
+    #[test]
+    fn a_zone_db_gives_its_page_cache_back_between_zones_and_not_inside_one() {
+        let (_dir, db) = db();
+        db.zone(|tx| -> Result<()> {
+            for _ in 0..200 {
+                tx.execute("INSERT INTO state VALUES (hex(randomblob(2000)), 1)", [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let used = |db: &ZoneDb| {
+            db.read(|c| -> Result<i64> { Ok(crate::cache_used(c)) })
+                .unwrap()
+        };
+        assert_eq!(count(&db, "SELECT count(*) FROM state"), 200);
+        let full = used(&db);
+        assert!(full > 100_000, "{full}");
+        db.zone(|tx| -> Result<()> {
+            // Inside a zone it does nothing, and does not trip over the borrow.
+            let _ = tx;
+            Ok(())
+        })
+        .unwrap();
+        db.release_memory();
+        let after = used(&db);
+        assert!(after < full / 4, "{full} -> {after}");
+        assert_eq!(count(&db, "SELECT count(*) FROM state"), 200);
     }
 
     #[test]

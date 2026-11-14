@@ -47,7 +47,15 @@ singleton Style 1.0 Style.qml
 singleton L10n 1.0 L10n.qml
 Avatar 1.0 Avatar.qml
 UnreadPill 1.0 UnreadPill.qml
+AccountTagDialog 1.0 AccountTagDialog.qml
 AccountsDrawer 1.0 AccountsDrawer.qml
+";
+
+/// The tag dialog is not what this test is about: a stand-in with the one function the drawer calls.
+const TAG_DIALOG: &str = "import QtQuick
+Item {
+    function openFor(account: real, current: string): void {}
+}
 ";
 
 const APP: &str = r#"pragma Singleton
@@ -290,6 +298,7 @@ fn write_module(dir: &Path) {
         ("L10n.qml", L10N),
         ("Avatar.qml", AVATAR),
         ("UnreadPill.qml", PILL),
+        ("AccountTagDialog.qml", TAG_DIALOG),
         ("AccountsDrawer.qml", drawer.as_str()),
     ] {
         std::fs::write(module.join(name), text).expect("a module file");

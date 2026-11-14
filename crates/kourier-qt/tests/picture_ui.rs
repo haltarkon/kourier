@@ -118,6 +118,7 @@ const SCRIPT: &str = r##"
 import QtQuick
 import QtQuick.Window
 import QtQml
+import QtTest
 import org.kde.kirigami as Kirigami
 import app.kourier
 
@@ -136,6 +137,8 @@ Window {
     property string step: "start"
     property int index: 0
     property var shownBlock: null
+    property var zoomViewer: null
+    property var events: null
     property int settle: 0
     readonly property var wanted: [IDS]
     readonly property var names: [NAMES]
@@ -410,6 +413,11 @@ Window {
         }
     }
 
+    Component {
+        id: viewerComponent
+        ImageViewer {}
+    }
+
     Timer {
         interval: 50
         repeat: true
@@ -530,7 +538,7 @@ Window {
                 if (test.settle < 4) {
                     return;
                 }
-                const kind = App.settings.roundAvatars ? "round" : "corner";
+                const kind = App.settings.avatarCorners >= 100 ? "round" : "corner";
                 const file = GRABDIR + "/avatar-" + kind + "-" + Math.round(item.cornerRadius * 100) + "-" + item.side + ".png";
                 test.step = "avatar grabbing";
                 item.grabToImage(function (result) {
@@ -543,13 +551,77 @@ Window {
             }
             case "avatar grabbed":
                 avatarView.active = false;
-                if (App.settings.roundAvatars) {
-                    App.settings.roundAvatars = false;
+                if (App.settings.avatarCorners >= 100) {
+                    App.settings.avatarCorners = 30;
                     test.step = "avatar";
                 } else {
-                    test.step = "done";
+                    test.step = "zoom";
                 }
                 break;
+            // Picture zoom: the viewer shows real pixels at Ctrl+1 at every display scale.
+            case "zoom": {
+                const b = test.blockFor(test.wanted[2]);
+                if (!b) {
+                    return;
+                }
+                const item = { "attachment": b.attachment, "url": b.fullUrl, "animated": false, "media": true, "kind": "image", "state": "local", "progress": 0, "placeholder": "", "ask": false, "save": false, "width": b.width, "height": b.height };
+                test.zoomViewer = viewerComponent.createObject(stage.contentItem, { "items": [item], "index": 0 });
+                test.zoomViewer.open();
+                test.events = Qt.createQmlObject("import QtQuick\nimport QtTest\nTestEvent {}", test, "picture_ui_events.qml");
+                test.settle = 0;
+                test.step = "zoom shown";
+                break;
+            }
+            case "zoom shown": {
+                const v = test.zoomViewer;
+                if (!v || !v.opened || !v.shown) {
+                    return;
+                }
+                test.settle += 1;
+                if (test.settle < 4) {
+                    return;
+                }
+                if (!v.fitted || v.naturalWidth !== test.dims[2][0]) {
+                    return fail("the viewer opens fitted, with the natural size " + test.dims[2][0] + ": " + v.fitted + " " + v.naturalWidth);
+                }
+                if (!test.events.keyClick(Qt.Key_1, Qt.ControlModifier, -1)) {
+                    return fail("the window took no key event");
+                }
+                if (v.fitted || v.zoomPercent !== 100) {
+                    return fail("Ctrl+1 shows 100 %: " + v.zoomPercent);
+                }
+                test.settle = 0;
+                test.step = "zoom sharp";
+                break;
+            }
+            case "zoom sharp": {
+                const v = test.zoomViewer;
+                const sharp = test.child(v.contentItem, "sharp");
+                if (!sharp || sharp.status !== Image.Ready) {
+                    return;
+                }
+                test.settle += 1;
+                if (test.settle < 4) {
+                    return;
+                }
+                const dpr = v.contentItem.Screen.devicePixelRatio;
+                const r = v.shownRect;
+                const p = v.contentItem.mapToItem(null, r.x, r.y);
+                const note = "scale " + dpr + ": shown " + r.w + " logical wide, natural " + v.naturalWidth + ", top-left " + p.x + "," + p.y;
+                if (Math.abs(r.w * dpr - v.naturalWidth) > 0.5) {
+                    return fail("real pixels: shown width x dpr is not the natural width: " + note);
+                }
+                if (Math.abs(p.x * dpr - Math.round(p.x * dpr)) > 0.01 || Math.abs(p.y * dpr - Math.round(p.y * dpr)) > 0.01) {
+                    return fail("real pixels: the top-left is not on a device pixel: " + note);
+                }
+                if (Math.abs(sharp.paintedWidth * v.shownW / v.fitW * dpr - v.naturalWidth) > 1) {
+                    return fail("the sharp picture is not drawn 1:1: " + note);
+                }
+                console.warn("ZOOM " + note + " ok");
+                test.zoomViewer.close();
+                test.step = "done";
+                break;
+            }
             case "done":
                 Qt.exit(0);
                 break;
@@ -579,6 +651,21 @@ fn requests_of(log: &[String], attachment: AttachmentId, album: bool) -> Vec<(i3
             let (id, size) = line.split_once(' ')?;
             let (w, h) = size.split_once('x')?;
             if !id.starts_with(&prefix) || id.contains(ALBUM_MARK) != album {
+                return None;
+            }
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The sizes of the requests for `attachment`'s `att/` picture (the viewer's), in order.
+fn full_requests_of(log: &[String], attachment: AttachmentId) -> Vec<(i32, i32)> {
+    let prefix = format!("att/{}?", attachment.0);
+    log.iter()
+        .filter_map(|line| {
+            let (id, size) = line.split_once(' ')?;
+            let (w, h) = size.split_once('x')?;
+            if !id.starts_with(&prefix) {
                 return None;
             }
             Some((w.parse().ok()?, h.parse().ok()?))
@@ -866,6 +953,22 @@ fn run_case(scale: &str, judged: bool) {
                 "scale {scale} {}: the provider was asked for {}x{} but the item is {w}x{h} device pixels (sourceSize is logical: Qt multiplies it by the device pixel ratio)",
                 s.name, asked.0, asked.1
             ));
+        }
+        // Picture zoom: Ctrl+1 on the viewer asked for the picture at its NATURAL size (the long
+        // side), at every scale, the user's 125 % included.
+        if s.name == "landscape" {
+            let full = full_requests_of(&requests, s.attachment);
+            println!(
+                "scale {scale} {:>10}: the viewer asked for {full:?}",
+                s.name
+            );
+            let natural = i32::try_from(s.dims.0.max(s.dims.1)).expect("size");
+            if !full.iter().any(|r| (r.0.max(r.1) - natural).abs() <= 1) {
+                hard.push(format!(
+                    "scale {scale} {}: no request of the sharp decode at the natural {natural} px: {full:?}",
+                    s.name
+                ));
+            }
         }
         let largest = largest_request(&requests, s.attachment);
         if largest.0 > w + 1 || largest.1 > h + 1 {

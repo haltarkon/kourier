@@ -616,11 +616,13 @@ impl Apply<'_> {
             if unread && !cs.blocked {
                 if m.catch_up {
                     self.ch.catch_up.push(conv);
-                } else if self.may_notify(&cs, m.mentions_me) {
+                    self.ch.catch_up_ids.push((conv, id));
+                } else if let Some(muted) = self.may_notify(&cs, m.mentions_me) {
                     self.ch.notify.push(NotifyCandidate {
                         conv,
                         message: id,
                         mentions_me: m.mentions_me,
+                        muted,
                     });
                 }
             }
@@ -629,19 +631,24 @@ impl Apply<'_> {
     }
 
     /// Mute rules (§8.7): muted 1:1 chats never notify, muted groups only for mentions.
-    pub(super) fn may_notify(&self, cs: &ConvState, mentions_me: bool) -> bool {
+    /// `Some(false)`: notifies as usual. `Some(true)`: muted, and a candidate only because a
+    /// filter may want it in muted chats: the supervisor drops it while `notify_muted_watch`
+    /// is off, and the desktop unless such a filter matches. `None`: nothing.
+    pub(super) fn may_notify(&self, cs: &ConvState, mentions_me: bool) -> Option<bool> {
         if !self.acc.local_notifications {
-            return false;
+            return None;
         }
         let now = self.now;
         let muted = cs.muted_until.is_some_and(|t| t > now)
             || cs.local_muted_until.is_some_and(|t| t > now)
             || self.acc.local_muted_until.is_some_and(|t| t > now);
         if !muted {
-            return true;
+            return Some(false);
         }
         let group = cs.kind != sql::enum_name(&ConvKind::Direct).unwrap_or_default();
-        group && mentions_me
+        // (Ingest stays flag-free: the supervisor drops a muted candidate while no filter
+        // watches the muted chats, `Shared::notify_muted_watch`.)
+        Some(group && mentions_me).map(|normal| !normal)
     }
 
     /// A message whose key exists already: placeholder replacement, echo merge or duplicate.
@@ -729,11 +736,14 @@ impl Apply<'_> {
             let notify = !history && !m.silent && !m.catch_up && !ex.is_own() && !hidden;
             if notify && ex.read_state.as_deref() == Some("Unread") {
                 let cs = self.conv_state(ex.conv)?;
-                if !cs.blocked && self.may_notify(&cs, m.mentions_me) {
+                if !cs.blocked
+                    && let Some(muted) = self.may_notify(&cs, m.mentions_me)
+                {
                     self.ch.notify.push(NotifyCandidate {
                         conv: ex.conv,
                         message: ex.id,
                         mentions_me: m.mentions_me,
+                        muted,
                     });
                 }
             }

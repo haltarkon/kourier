@@ -702,6 +702,68 @@ fn assert_decoder_scales_at_decode() {
         (864, 864),
         "an avatar is its square, not snapped to the request"
     );
+    assert_decode_cap(jpeg);
+}
+
+/// THE CAP of a decode (picture zoom): whatever is asked, the long side is at most 8192 px and
+/// the pixel count at most 32,000,000; a phone photo is not touched. One picture at a time (each
+/// is tens of megabytes while it is made).
+fn assert_decode_cap(jpeg: u8) {
+    let decode = kourier_qt::bridge::qobject::decode_probe;
+    let near = |a: i32, b: i32| (a - b).abs() <= 1;
+    // A panorama asked at its natural size (one side set: the zoomed picture's sharp request).
+    let got = decode(
+        kourier_qt::bridge::qobject::oriented_image(10000, 1000, 1),
+        jpeg,
+        10000,
+        0,
+        false,
+    );
+    assert!(
+        got.len() == 6 && near(got[0], 8192) && near(got[1], 819),
+        "a panorama asked whole is capped at 8192 x 819: {got:?}"
+    );
+    // 35 MP with the long side under 8192: the pixel cap, with the proportions.
+    let got = decode(
+        kourier_qt::bridge::qobject::oriented_image(7000, 5000, 1),
+        jpeg,
+        7000,
+        0,
+        false,
+    );
+    let (w, h) = (i64::from(got[0]), i64::from(got[1]));
+    assert!(w * h <= 32_000_000, "at most 32 MP: {w} x {h}");
+    assert!(w > 6600, "the cap keeps what it may: {w} x {h}");
+    assert!(
+        (w * 5000 - h * 7000).abs() <= 7000 + 5000,
+        "the proportions hold: {w} x {h}"
+    );
+    // A phone photo is decoded whole.
+    let got = decode(
+        kourier_qt::bridge::qobject::oriented_image(4000, 3000, 1),
+        jpeg,
+        4000,
+        0,
+        false,
+    );
+    assert_eq!(
+        (got[0], got[1]),
+        (4000, 3000),
+        "a phone photo is not capped"
+    );
+    // Today's Fit request of a panorama (the cover case: 1600 x 900 into a 20000 x 1000 file
+    // asks for 18000 x 900) is clamped too.
+    let got = decode(
+        kourier_qt::bridge::qobject::oriented_image(20000, 1000, 1),
+        jpeg,
+        1600,
+        900,
+        false,
+    );
+    assert!(
+        got.len() == 6 && near(got[0], 8192) && got[1] >= 400 && got[1] <= 420,
+        "the Fit request of a panorama is capped: {got:?}"
+    );
 }
 
 /// The provider's decoder (§9.4): Qt decodes a payload with the one decoder its codec byte

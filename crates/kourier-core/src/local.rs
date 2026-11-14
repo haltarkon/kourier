@@ -220,11 +220,17 @@ pub(crate) fn logged_out(
 /// Deletes an account row (cascading to every core row of the account) and truncates the WAL so
 /// deleted rows leave it too (§4.3 step 7, §5.2).
 pub(crate) fn delete_account(conn: &Connection, id: AccountId) -> Result<()> {
-    conn.prepare_cached("DELETE FROM accounts WHERE id = ?1")?
+    let tx = conn.unchecked_transaction()?;
+    tx.prepare_cached("DELETE FROM accounts WHERE id = ?1")?
         .execute([id.0])?;
     // Account-scoped bookkeeping without a foreign key (the outbox id allocator).
-    conn.prepare_cached("DELETE FROM settings WHERE scope = ?1")?
+    tx.prepare_cached("DELETE FROM settings WHERE scope = ?1")?
         .execute([crate::outbox::alloc_scope(id)])?;
+    // The account's words leave search.db once the search task has applied the log up to here
+    // (G1d): asked AFTER the cascade in the same transaction, so the position covers every log
+    // row the cascade appended, and a kill leaves both or neither.
+    crate::search::log::ask_now(&tx)?;
+    tx.commit()?;
     kourier_db::checkpoint_truncate(conn)?;
     Ok(())
 }

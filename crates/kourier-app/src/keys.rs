@@ -5,6 +5,8 @@
 //!   profile}`, or, in passphrase mode, Argon2id(passphrase, salt) with salt and parameters in
 //!   `kourier.toml` ([`PassphraseConfig`]). There is no plaintext fallback.
 //! - `core.db` key = HKDF-SHA256(master, info = `"kourier core.db v1"`).
+//! - `search.db` key (message search's own file, G1) = HKDF-SHA256(master, info = `"kourier
+//!   search.db v1"`): another key than core.db's, so neither file opens with the other's.
 //! - Per account: a random `backend.db` key lives only in `accounts/<uuid>/key.wrap`, as
 //!   AES-256-GCM(KEK, random nonce, db_key) with the file header as associated data, where
 //!   KEK = HKDF-SHA256(ikm = master, salt = account secret, info = `"kourier account kek v1" ‖
@@ -51,6 +53,7 @@ const MODE_PASSPHRASE: u8 = 2;
 const NONCE_LEN: usize = 12;
 const WRAPPED_LEN: usize = 32 + 16;
 const CORE_DB_INFO: &[u8] = b"kourier core.db v1";
+const SEARCH_DB_INFO: &[u8] = b"kourier search.db v1";
 const ACCOUNT_KEK_INFO: &[u8] = b"kourier account kek v1";
 const PASSPHRASE_CHECK_INFO: &[u8] = b"kourier passphrase check v1";
 
@@ -365,6 +368,11 @@ impl<S> Keyring<S> {
     /// The `core.db` key.
     pub fn core_db_key(&self) -> Key32 {
         self.master.derive(None, &[CORE_DB_INFO])
+    }
+
+    /// The `search.db` key (G1: the search index's own file).
+    pub fn search_db_key(&self) -> Key32 {
+        self.master.derive(None, &[SEARCH_DB_INFO])
     }
 
     /// Passphrase mode for a new profile: a fresh salt; the returned config goes into
@@ -850,6 +858,28 @@ mod tests {
         assert!(items.contains_key(&expected), "§5.2 attributes");
         let master = items.get(&expected).unwrap();
         assert_ne!(&master[..], &k1.core_db_key()[..], "core key is derived");
+    }
+
+    /// The search index file has a key of its own (G1, privacy P4): for both keyrings the
+    /// `search.db` key differs from the `core.db` key, is the same on every open of the
+    /// profile, and differs from another profile's.
+    #[tokio::test]
+    async fn search_db_key_is_not_the_core_db_key_in_either_keyring() {
+        let store = MemoryStore::default();
+        let first = Keyring::with_secret_service(&store, "default", true)
+            .await
+            .unwrap();
+        let again = Keyring::with_secret_service(&store, "default", false)
+            .await
+            .unwrap();
+        let other = Keyring::with_secret_service(&store, "other", true)
+            .await
+            .unwrap();
+        assert_ne!(*first.search_db_key(), *first.core_db_key());
+        assert_eq!(*first.search_db_key(), *again.search_db_key());
+        assert_ne!(*first.search_db_key(), *other.search_db_key());
+        let (pass, _) = Keyring::<NoSecretStore>::create_passphrase(b"test", FAST).unwrap();
+        assert_ne!(*pass.search_db_key(), *pass.core_db_key());
     }
 
     #[tokio::test]

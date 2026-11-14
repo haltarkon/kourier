@@ -25,13 +25,13 @@ const USAGE: &str = "usage: kourier [--version] [--profile=<name>] [--background
 const USAGE: &str =
     "usage: kourier [--version] [--profile=<name>] [--background] [--fixture | --fixture-link] \
 [--page=<welcome|link|qr|list|chat|history|settings|drawer|media|viewer|compose|files|album|\
-albumviewer|revisions|compact|quotes|menu|react|reactions|edit|reply|delete|timer|placeholders|\
+albumviewer|viewerzoom|revisions|compact|quotes|menu|react|reactions|edit|reply|delete|timer|placeholders|\
 offline|loggedout|challenge|clock|originals|timercustom|clearchat|mediamenu|deleteattachment|\
 folder|folderfiles|folderzip|expiry|readmore|about|calls|unavailable|transferwait|\
 transferdownload|transferread|transferupdate|transferbanner|transferfailed|transferask|\
-networks|warisk|waqr|waphone|wacode|thqr|themoji|tgwarn|tgqr|tgcode|tgpassword|wahistory|waban|\
+networks|appearance|filters|filteredit|highlight|regexsearch|warisk|waqr|waphone|wacode|thqr|themoji|tgwarn|tgqr|tgcode|tgpassword|wahistory|waban|\
 walock|waoff|wafailed|walost|uploading|uploadfile|archive|person|group|groupadmin|chatmedia|safety|safetychanged|share|timerpending|save|location|\
-locationmany|locationnever|accounts|accountsdrawer|rowmenu|rowmenuoff|rowmenumuted|mutemenu|muteuntil|chatmenu|chatmenuoff>] \
+locationmany|locationnever|accounts|accountsdrawer|rowmenu|rowmenuoff|rowmenumuted|mutemenu|muteuntil|chatmenu|chatmenuoff|searchresults|searchchat|searchindexing|emojipicker|emojisearch|hoverpins|model3d|model3dviewer|select|exportdialog|exportdone>] \
 [--fixture-transfer=<walk|declined|wait|download|read|link-again|update-app|corrupt|too-large|\
 download-failed|internal>] [--fixture-send=<slow|keys|members|retry|uploading>] \
 [--fixture-network=<fake|whatsapp|threema|telegram>] [--screenshot=<png>] \
@@ -97,7 +97,7 @@ struct Args {
 /// `--perf-size=<contacts>,<groups>,<messages per conversation>,<media percent>` sets its
 /// size, `--perf-seed` exits once the profile is seeded, `--perf-scenario=<name>` runs a
 /// scripted session in the UI and `--perf-live-ms=<n>` delivers one message `n` ms after the
-/// backend is online.
+/// backend is online, `--perf-filters=<n>` stores `n` synthetic filters in the profile first (when it has none).
 #[cfg(feature = "perf")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PerfArgs {
@@ -105,6 +105,7 @@ struct PerfArgs {
     size: Option<kourier_app::perf::PerfSpec>,
     seed: bool,
     live_ms: Option<u64>,
+    filters: usize,
 }
 
 #[cfg(feature = "perf")]
@@ -136,6 +137,12 @@ impl PerfArgs {
             self.seed = true;
         } else if let Some(name) = arg.strip_prefix("--perf-scenario=") {
             ui.perf_scenario = Some(name.to_owned());
+        } else if let Some(n) = arg.strip_prefix("--perf-filters=") {
+            self.filters = n
+                .parse()
+                .ok()
+                .filter(|n| *n <= 1000)
+                .ok_or_else(|| format!("bad filter count {n:?}"))?;
         } else if let Some(ms) = arg.strip_prefix("--perf-live-ms=") {
             self.live_ms = Some(ms.parse().map_err(|_| format!("bad delay {ms:?}"))?);
         } else {
@@ -150,6 +157,7 @@ impl PerfArgs {
             home,
             spec: self.size.unwrap_or_default(),
             live_after: self.live_ms.map(std::time::Duration::from_millis),
+            filters: self.filters,
         }))
     }
 }
@@ -442,6 +450,11 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
             // The warning of Telegram, off: the page lists it off beside WhatsApp (page-scoped,
             // LC-KT1b-5: no other page has an off Telegram in its welcome list).
             telegram_off: page == Some("tgwarn"),
+            // Two 3D models at the end of the albums chat (page-scoped: they move that chat).
+            // A debug build also adds them to a plain `--fixture` when `KOURIER_DEV_MODEL3D` is set
+            // (to anything; `big` adds the 100 k sphere too), to look at the live viewer by hand.
+            models: matches!(page, Some("model3d" | "model3dviewer"))
+                || (cfg!(debug_assertions) && std::env::var_os("KOURIER_DEV_MODEL3D").is_some()),
             // Threema's emoji page stands one step further on than its QR page.
             hold_emoji: page == Some("themoji"),
             whatsapp: page_whatsapp(page),
@@ -450,6 +463,17 @@ fn start_options(args: &Args) -> Result<StartOptions, String> {
             safety_changed: page == Some("safetychanged"),
             // The account administers the group of the group page (`--page=groupadmin`).
             group_admin: page == Some("groupadmin"),
+            // Three saved filters for the filter pages (R2).
+            filters: matches!(page, Some("filters" | "filteredit")),
+            // Four highlighting filters and three rows to look at them on (R3).
+            highlight: page == Some("highlight"),
+            // The old rows of the search pages (G1j): the word the pages look for, one row in Hebrew.
+            search_rows: matches!(
+                page,
+                Some("searchresults" | "searchchat" | "searchindexing" | "regexsearch")
+            ),
+            // `searchindexing` holds the index at its first backfill batch (G1j).
+            search_filling: page == Some("searchindexing"),
             // The window sends this page's photo itself (`MainWindow.pageSetup`): the core's
             // clock starts early in the minute of "now", so the time under it never follows the
             // length of the start.
@@ -500,6 +524,10 @@ fn main() -> ExitCode {
         println!("{}", version_line());
         return ExitCode::SUCCESS;
     }
+    // First of all, before any thread exists (an arena that exists is not given back): glibc
+    // gets at most two malloc arenas, unless the person set a cap of their own (RAM3, RAM2's
+    // numbers: `kourier_app::process::MALLOC_ARENAS`). Writes no environment variable.
+    kourier_app::process::cap_malloc_arenas();
     // Before anything starts a thread (`App::start` makes the runtime): Qt's FFmpeg backend
     // would probe every hardware video device at the first voice note (`QT_ENV_DEFAULTS`).
     // SAFETY: nothing has started a thread yet.
@@ -635,8 +663,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("main does not contain {needle}"))
         };
         let prepare = at("kourier_qt::prepare_environment()");
+        // The arena cap comes right after the `--version` early return and before everything
+        // else (nothing has a thread yet), `prepare_environment` and every later item included.
+        let cap = at("kourier_app::process::cap_malloc_arenas()");
+        assert!(cap > at("wants_version("), "after the --version check");
+        assert!(cap < prepare, "the cap comes before prepare_environment");
         for later in [
             "kourier_app::trace::init()",
+            "kourier_app::process::deny_dumps()",
             "kourier_app::process::install_panic_hook(",
             "App::start(",
             "kourier_qt::run(",
@@ -645,6 +679,7 @@ mod tests {
                 prepare < at(later),
                 "prepare_environment comes after {later}"
             );
+            assert!(cap < at(later), "the arena cap comes after {later}");
         }
         // Only the `--version` early return, which starts nothing, comes first.
         assert!(prepare > at("wants_version("), "after the --version check");
@@ -1494,10 +1529,18 @@ mod tests {
                 home: PathBuf::from("/x/profile"),
                 spec,
                 live_after: Some(std::time::Duration::from_millis(1777)),
+                filters: 0,
             })
         );
         let a = p(&["--perf-profile=/x", "--perf-seed"]).expect("parse");
         assert!(a.perf.seed);
+        let a = p(&["--perf-profile=/x", "--perf-filters=50"]).expect("parse");
+        assert!(matches!(
+            start_options(&a).expect("options").launch,
+            Launch::Perf(PerfOptions { filters: 50, .. })
+        ));
+        assert!(p(&["--perf-profile=/x", "--perf-filters=many"]).is_err());
+        let a = p(&["--perf-profile=/x", "--perf-seed"]).expect("parse");
         assert!(matches!(
             start_options(&a).expect("options").launch,
             Launch::Perf(PerfOptions { spec, live_after: None, .. }) if spec == PerfSpec::default()

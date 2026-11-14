@@ -127,6 +127,12 @@ msgid "Dark"
 msgstr "Темний"
 
 #: crates/kourier-qt/qml/AccountsDrawer.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Chat List Tag…"
+msgstr "Мітка в списку чатів…"
+
+#: crates/kourier-qt/qml/AccountsDrawer.qml
 #: crates/kourier-qt/qml/components/PersonCopyMenu.qml
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -186,59 +192,17 @@ msgctxt "@action:button"
 msgid "Settings"
 msgstr "Налаштування"
 
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Smileys"
-msgstr "Смайлики"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "People"
-msgstr "Люди"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Symbols"
-msgstr "Символи"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Animals and Nature"
-msgstr "Тварини і природа"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Food and Drink"
-msgstr "Їжа і напої"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Activities"
-msgstr "Заняття"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Travel and Places"
-msgstr "Подорожі і місцевості"
-
-#: crates/kourier-qt/qml/Emoji.qml
-#, kde-format
-msgctxt "@title:tab emoji category"
-msgid "Objects"
-msgstr "Предмети"
-
 #: crates/kourier-qt/qml/MainWindow.qml
 #, kde-format
 msgctxt "@title:dialog"
 msgid "Open This File?"
 msgstr "Відкрити цей файл?"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info, %1 a file name, %2 the name of a slicer program"
+msgid "“%1” opens in %2. Files can be harmful: open only what you expect from this sender."
+msgstr "«%1» відкриється в %2. Файли можуть бути шкідливими: відкривайте лише те, що очікуєте від цього відправника."
 
 #: crates/kourier-qt/qml/MainWindow.qml
 #, kde-format
@@ -256,9 +220,13 @@ msgstr "Відкрити"
 #: crates/kourier-qt/qml/MainWindow.qml
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #: crates/kourier-qt/qml/components/TimerPart.qml
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
 #: crates/kourier-qt/qml/dialogs/AttachmentDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/ChatDeleteDialog.qml
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
 #: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
 #: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
@@ -271,6 +239,12 @@ msgstr "Відкрити"
 msgctxt "@action:button"
 msgid "Cancel"
 msgstr "Скасувати"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "Finish or cancel the export first."
+msgstr "Спершу завершіть або скасуйте експорт."
 
 #: crates/kourier-qt/qml/MainWindow.qml
 #, kde-format
@@ -352,6 +326,12 @@ msgstr "%1: %2."
 
 #: crates/kourier-qt/qml/MainWindow.qml
 #, kde-format
+msgctxt "@info:status"
+msgid "Close the other save dialog first."
+msgstr "Спершу закрийте інше вікно збереження."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
 msgctxt "@action:button"
 msgid "Show in Folder"
 msgstr "Показати в теці"
@@ -373,6 +353,16 @@ msgstr "Перезапустити"
 msgctxt "@action:button"
 msgid "Undo"
 msgstr "Скасувати"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages were exported"
+msgid "Exported %1 message"
+msgid_plural "Exported %1 messages"
+msgstr[0] "Експортовано %1 повідомлення"
+msgstr[1] "Експортовано %1 повідомлення"
+msgstr[2] "Експортовано %1 повідомлень"
 
 #: crates/kourier-qt/qml/MediaActions.qml
 #, kde-format
@@ -417,6 +407,7 @@ msgid "Pick a chat from the list to start reading."
 msgstr "Виберіть чат зі списку, щоб почати читати."
 
 #: crates/kourier-qt/qml/components/ConversationDelegate.qml
+#: crates/kourier-qt/qml/components/SearchResultDelegate.qml
 #, kde-format
 msgctxt "@info accessible, %1 the account of the chat"
 msgid "Account %1"
@@ -455,6 +446,13 @@ msgstr "Сповіщення вимкнено"
 msgctxt "@info accessible"
 msgid "Pinned"
 msgstr "Закріплено"
+
+#: crates/kourier-qt/qml/components/ConversationDelegate.qml
+#: crates/kourier-qt/qml/components/SearchResultDelegate.qml
+#, kde-format
+msgctxt "@item:intext, %1 who wrote the message that the row shows"
+msgid "%1:"
+msgstr "%1:"
 
 #: crates/kourier-qt/qml/components/CopyableText.qml
 #, kde-format
@@ -506,10 +504,35 @@ msgstr "Усі медіа та файли"
 #: crates/kourier-qt/qml/dialogs/ChallengeDialog.qml
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #: crates/kourier-qt/qml/dialogs/LogoutNoticeDialog.qml
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Close"
 msgstr "Закрити"
+
+#: crates/kourier-qt/qml/components/ExportStrip.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Export progress"
+msgstr "Хід експорту"
+
+#: crates/kourier-qt/qml/components/ExportStrip.qml
+#, javascript-format, kde-format
+msgctxt "@info:status, %1 how many percent of the export is written"
+msgid "Exporting… %1%"
+msgstr "Експорт… %1%"
+
+#: crates/kourier-qt/qml/components/ExportStrip.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "Preparing the export…"
+msgstr "Підготовка експорту…"
+
+#: crates/kourier-qt/qml/components/ExportStrip.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Cancel Export"
+msgstr "Скасувати експорт"
 
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #, kde-format
@@ -1017,6 +1040,8 @@ msgid "Emoji"
 msgstr "Емоджі"
 
 #: crates/kourier-qt/qml/composer/Composer.qml
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Save"
@@ -1039,6 +1064,207 @@ msgstr "Зберегти (Enter)"
 msgctxt "@info:tooltip"
 msgid "Send (Enter)"
 msgstr "Надіслати (Enter)"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Smileys and Emotion"
+msgstr "Смайлики та емоції"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "People and Body"
+msgstr "Люди та частини тіла"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Animals and Nature"
+msgstr "Тварини і природа"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Food and Drink"
+msgstr "Їжа і напої"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Travel and Places"
+msgstr "Подорожі і місцевості"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Activities"
+msgstr "Заняття"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Objects"
+msgstr "Предмети"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Symbols"
+msgstr "Символи"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Flags"
+msgstr "Прапори"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Search emoji…"
+msgstr "Пошук емодзі…"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@label:textbox accessible"
+msgid "Search emoji"
+msgstr "Пошук емодзі"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:tab emoji category"
+msgid "Favorites"
+msgstr "Обране"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:group emoji"
+msgid "Recently Used"
+msgstr "Нещодавно використані"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@title:group emoji"
+msgid "Favorites"
+msgstr "Обране"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Emoji you use and star with a right click show up here."
+msgstr "Тут з’являться емодзі, які ви використовуєте або додаєте до обраного правим клацанням."
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@info:status accessible"
+msgid "Search results"
+msgstr "Результати пошуку"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "No emoji found"
+msgstr "Емодзі не знайдено"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Pin to Reactions"
+msgstr "Закріпити для реакцій"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Unpin from Reactions"
+msgstr "Відкріпити від реакцій"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Six emoji are pinned already: unpin one first."
+msgstr "Уже закріплено шість емодзі: спершу відкріпіть одне."
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Add to Favorites"
+msgstr "Додати до обраного"
+
+#: crates/kourier-qt/qml/composer/EmojiGrid.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Remove from Favorites"
+msgstr "Вилучити з обраного"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Selected messages"
+msgstr "Вибрані повідомлення"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info:status, %1 how many messages are selected"
+msgid "%1 selected"
+msgid_plural "%1 selected"
+msgstr[0] "Вибрано %1 повідомлення"
+msgstr[1] "Вибрано %1 повідомлення"
+msgstr[2] "Вибрано %1 повідомлень"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Copy as Text"
+msgstr "Копіювати як текст"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Select at least one message to copy."
+msgstr "Виберіть хоча б одне повідомлення, щоб скопіювати."
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Export Selected…"
+msgstr "Експортувати вибране…"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "An export is running."
+msgstr "Експорт виконується."
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Select at least one message to export."
+msgstr "Виберіть хоча б одне повідомлення, щоб експортувати."
+
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Chat List Tag"
+msgstr "Мітка в списку чатів"
+
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "A short tag, up to 8 characters, shown on this account's chats in the list instead of its name. It stays on this computer. Leave it empty to show the name again."
+msgstr "Коротка мітка до 8 символів, яку чати цього акаунта показують у списку замість його назви. Вона зберігається лише на цьому комп’ютері. Залиште поле порожнім, щоб знову показувати назву."
+
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Tag"
+msgstr "Мітка"
+
+#: crates/kourier-qt/qml/dialogs/AccountTagDialog.qml
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Chat list tag"
+msgstr "Мітка в списку чатів"
 
 #: crates/kourier-qt/qml/dialogs/AttachmentDeleteDialog.qml
 #, kde-format
@@ -1172,6 +1398,12 @@ msgctxt "@action:button"
 msgid "Delete Chat"
 msgstr "Видалити чат"
 
+#: crates/kourier-qt/qml/dialogs/ColorPickDialog.qml
+#, kde-format
+msgctxt "@title:window"
+msgid "Custom Color"
+msgstr "Свій колір"
+
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
 #, kde-format
 msgctxt "@title:dialog"
@@ -1203,6 +1435,7 @@ msgid "The notice is removed from this conversation on your devices. Nothing cha
 msgstr "Службове повідомлення буде видалено з цього чату на ваших пристроях. Для інших учасників нічого не зміниться."
 
 #: crates/kourier-qt/qml/dialogs/DeleteDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Delete"
@@ -1213,6 +1446,212 @@ msgstr "Видалити"
 msgctxt "@action:button"
 msgid "Delete for Me"
 msgstr "Видалити для мене"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Export Selected Messages"
+msgstr "Експорт вибраних повідомлень"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Export…"
+msgstr "Експортувати…"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info, %1 how many messages are exported"
+msgid "%1 message will be exported."
+msgid_plural "%1 messages will be exported."
+msgstr[0] "Буде експортовано %1 повідомлення."
+msgstr[1] "Буде експортовано %1 повідомлення."
+msgstr[2] "Буде експортовано %1 повідомлень."
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info, %1 the size of all the files together"
+msgid "All the files together: %1"
+msgstr "Усі файли разом: %1"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@label, followed by ticks for kinds of files"
+msgid "Files to include:"
+msgstr "Файли для додавання:"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@option:check, %1 how many pictures, %2 their size"
+msgid "Pictures (%1, %2)"
+msgstr "Зображення (%1, %2)"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@option:check, %1 how many videos, %2 their size"
+msgid "Videos (%1, %2)"
+msgstr "Відео (%1, %2)"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@option:check, %1 how many files, %2 their size"
+msgid "Other files (%1, %2)"
+msgstr "Інші файли (%1, %2)"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@option:check, %1 how many disappearing messages"
+msgid "Include %1 disappearing message"
+msgid_plural "Include %1 disappearing messages"
+msgstr[0] "Додати %1 тимчасове повідомлення"
+msgstr[1] "Додати %1 тимчасові повідомлення"
+msgstr[2] "Додати %1 тимчасових повідомлень"
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "The copy does not disappear: it stays in the archive after the timer has deleted the message here."
+msgstr "Копія не зникає: вона залишається в архіві після того, як таймер видалить повідомлення тут."
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info, %1 how many view-once messages"
+msgid "%1 view-once message is never exported."
+msgid_plural "%1 view-once messages are never exported."
+msgstr[0] "%1 одноразове повідомлення ніколи не експортується."
+msgstr[1] "%1 одноразові повідомлення ніколи не експортуються."
+msgstr[2] "%1 одноразових повідомлень ніколи не експортуються."
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info, %1 how many messages"
+msgid "%1 message is gone and is left out."
+msgid_plural "%1 messages are gone and are left out."
+msgstr[0] "%1 повідомлення більше недоступне й пропущене."
+msgstr[1] "%1 повідомлення більше недоступні й пропущені."
+msgstr[2] "%1 повідомлень більше недоступні й пропущені."
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info, %1 how many files"
+msgid "%1 file is not on this computer: it is listed without its file."
+msgid_plural "%1 files are not on this computer: they are listed without their files."
+msgstr[0] "%1 файлу немає на цьому комп’ютері: він указаний без самого файлу."
+msgstr[1] "%1 файлів немає на цьому комп’ютері: вони вказані без самих файлів."
+msgstr[2] "%1 файлів немає на цьому комп’ютері: вони вказані без самих файлів."
+
+#: crates/kourier-qt/qml/dialogs/ExportDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "The archive is not encrypted. Other programs on this computer can read it, and so can the provider of any agent you give it to."
+msgstr "Архів не зашифровано. Його можуть прочитати інші програми на цьому комп’ютері та постачальник будь-якого агента, якому ви його передасте."
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Add Filter"
+msgstr "Додати фільтр"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Edit Filter"
+msgstr "Редагувати фільтр"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "The filter could not be saved."
+msgstr "Не вдалося зберегти фільтр."
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Regular expression"
+msgstr "Регулярний вираз"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@label"
+msgid "Name"
+msgstr "Назва"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@label:textbox"
+msgid "Filter name"
+msgstr "Назва фільтра"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@label"
+msgid "Message text"
+msgstr "Текст повідомлення"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@label"
+msgid "Sender's name"
+msgstr "Ім’я відправника"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@label"
+msgid "Chat's name"
+msgstr "Назва чату"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "A message matches when every filled field matches."
+msgstr "Повідомлення підходить, коли збігаються всі заповнені поля."
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Match Case"
+msgstr "З урахуванням регістру"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Notify"
+msgstr "Сповіщати"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Also in muted chats"
+msgstr "Також у чатах із вимкненими сповіщеннями"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Highlight"
+msgstr "Виділяти"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@info:whatsthis accessible, %1 a number from 1 to 8"
+msgid "Color %1"
+msgstr "Колір %1"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Custom…"
+msgstr "Свій колір…"
+
+#: crates/kourier-qt/qml/dialogs/FilterDialog.qml
+#, kde-format
+msgctxt "@info:whatsthis accessible"
+msgid "Custom color"
+msgstr "Свій колір"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #, kde-format
@@ -1311,6 +1750,49 @@ msgstr "%1 з %2"
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #, kde-format
 msgctxt "@action:button"
+msgid "Zoom Out"
+msgstr "Зменшити"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Zoom Out (Ctrl+-)"
+msgstr "Зменшити (Ctrl+-)"
+
+#. TRANSLATORS: a zoom level as a percentage, e.g. "100%"; %1 is the number.
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, javascript-format, kde-format
+msgctxt "@item:inmenu zoom level, %1 is a number"
+msgid "%1%"
+msgstr "%1%"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@item:inmenu zoom level"
+msgid "Fit"
+msgstr "Вмістити"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Zoom level"
+msgstr "Масштаб"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Zoom In"
+msgstr "Збільшити"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Zoom In (Ctrl+=)"
+msgstr "Збільшити (Ctrl+=)"
+
+#: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#, kde-format
+msgctxt "@action:button"
 msgid "Open in Another Application"
 msgstr "Відкрити в іншому застосунку"
 
@@ -1321,6 +1803,7 @@ msgid "Picture"
 msgstr "Зображення"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #: crates/kourier-qt/qml/timeline/blocks/FileBlock.qml
 #, kde-format
@@ -1329,10 +1812,250 @@ msgid "Save As…"
 msgstr "Зберегти як…"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
 #, kde-format
 msgctxt "@info:tooltip"
 msgid "Save As… (Ctrl+S)"
 msgstr "Зберегти як… (Ctrl+S)"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button, %1 the name of a slicer program"
+msgid "Open in %1"
+msgstr "Відкрити в %1"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Open in Slicer"
+msgstr "Відкрити в слайсері"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "View"
+msgstr "Вигляд"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Standard views"
+msgstr "Стандартні види"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Front"
+msgstr "Спереду"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Back"
+msgstr "Ззаду"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Left"
+msgstr "Зліва"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Right"
+msgstr "Справа"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Top"
+msgstr "Згори"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model"
+msgid "Bottom"
+msgstr "Знизу"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:inmenu standard view of a 3D model: the angle of the picture in the chat"
+msgid "Isometric"
+msgstr "Ізометрія"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Wireframe"
+msgstr "Каркас"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Draw the edges of the triangles over the model"
+msgstr "Показувати ребра трикутників поверх моделі"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Printer Box"
+msgstr "Об'єм принтера"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Show a translucent box of a printer's build volume around the model"
+msgstr "Показати навколо моделі напівпрозорий об'єм друку принтера"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@item:inmenu no printer box"
+msgid "Off"
+msgstr "Вимкнено"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Model Color"
+msgstr "Колір моделі"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "The color of models that have none of their own"
+msgstr "Колір моделей, які не мають власного кольору"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Free Rotation"
+msgstr "Вільне обертання"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Rotate freely instead of around the vertical axis"
+msgstr "Обертати вільно, а не навколо вертикальної осі"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Choose a slicer program to open this model in"
+msgstr "Виберіть слайсер, у якому відкрити цю модель"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Open this model in the slicer program"
+msgstr "Відкрити цю модель у слайсері"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Choose a Slicer"
+msgstr "Вибрати слайсер"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu, %1 the name of a slicer program"
+msgid "%1 (not installed)"
+msgstr "%1 (не встановлено)"
+
+#: crates/kourier-qt/qml/dialogs/Model3dHeader.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Other Application…"
+msgstr "Інший застосунок…"
+
+#: crates/kourier-qt/qml/dialogs/Model3dViewer.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "The model could not be opened"
+msgstr "Не вдалося відкрити модель"
+
+#: crates/kourier-qt/qml/dialogs/Model3dViewer.qml
+#, kde-format
+msgctxt "@info size of a 3D model in millimetres: width, depth, height"
+msgid "%1 × %2 × %3 mm"
+msgstr "%1 × %2 × %3 мм"
+
+#: crates/kourier-qt/qml/dialogs/Model3dViewer.qml
+#, kde-format
+msgctxt "@info:tooltip, %1 the number of triangles"
+msgid "%1 triangle"
+msgid_plural "%1 triangles"
+msgstr[0] "%1 трикутник"
+msgstr[1] "%1 трикутники"
+msgstr[2] "%1 трикутників"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color: the desktop's accent color"
+msgid "Use Accent Color"
+msgstr "Колір акценту"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Blue"
+msgstr "Синій"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Green"
+msgstr "Зелений"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Teal"
+msgstr "Бірюзовий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Violet"
+msgstr "Фіолетовий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Pink"
+msgstr "Рожевий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Red"
+msgstr "Червоний"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Orange"
+msgstr "Помаранчевий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Yellow"
+msgstr "Жовтий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Light Gray"
+msgstr "Світло-сірий"
+
+#: crates/kourier-qt/qml/dialogs/ModelColourMenu.qml
+#, kde-format
+msgctxt "@item:inmenu 3D model color"
+msgid "Gray"
+msgstr "Сірий"
 
 #: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
 #, kde-format
@@ -1599,6 +2322,18 @@ msgid "Disappearing Messages"
 msgstr "Тимчасові повідомлення"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Search in Chat"
+msgstr "Пошук у чаті"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@info:tooltip, %1 a keyboard shortcut"
+msgid "Search in Chat (%1)"
+msgstr "Пошук у чаті (%1)"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
 msgctxt "@action:inmenu"
@@ -1727,6 +2462,27 @@ msgid "Drop files to attach them"
 msgstr "Перетягніть файли сюди, щоб прикріпити їх"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, javascript-format, kde-format
+msgctxt "@item:intext, %1 a percentage number"
+msgid "%1%"
+msgstr "%1%"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:status, %1 how many percent of the old messages are indexed"
+msgid "Older messages are still being prepared for search (%1)"
+msgstr "Старіші повідомлення ще готуються до пошуку (%1)"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible, %1 how many"
+msgid "%1 message found"
+msgid_plural "%1 messages found"
+msgstr[0] "Знайдено %1 повідомлення"
+msgstr[1] "Знайдено %1 повідомлення"
+msgstr[2] "Знайдено %1 повідомлень"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
 msgctxt "@info"
 msgid "These chats are archived. They come back to your chats when a new message arrives."
@@ -1734,9 +2490,27 @@ msgstr "Ці чати заархівовано. Вони повернуться 
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
+msgctxt "@info:status, the search is limited to this chat, %1 the chat's name"
+msgid "In: %1"
+msgstr "У чаті: %1"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Search All Chats"
+msgstr "Шукати в усіх чатах"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
 msgctxt "@info:placeholder"
 msgid "Search"
 msgstr "Пошук"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Search by regular expression"
+msgstr "Пошук за регулярним виразом"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1759,8 +2533,56 @@ msgstr "Пошук чатів (%1)"
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
 msgctxt "@info accessible"
+msgid "Regular Expression"
+msgstr "Регулярний вираз"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Search messages by a regular expression"
+msgstr "Пошук повідомлень за регулярним виразом"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Regular Expression"
+msgstr "Регулярний вираз"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Match Case"
+msgstr "З урахуванням регістру"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Match Case"
+msgstr "З урахуванням регістру"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Match Case (turn on Regular Expression first)"
+msgstr "З урахуванням регістру (спершу ввімкніть регулярний вираз)"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Save as Filter"
+msgstr "Зберегти як фільтр"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible"
 msgid "Conversations"
 msgstr "Чати"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Search Further"
+msgstr "Шукати далі"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1770,9 +2592,15 @@ msgstr "Архівних чатів немає"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
+msgctxt "@info:placeholder"
+msgid "Kourier looked through many messages and found none yet."
+msgstr "Kourier переглянув багато повідомлень і поки нічого не знайшов."
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
 msgctxt "@info:placeholder, %1 what was searched for"
-msgid "No chats match “%1”"
-msgstr "За запитом «%1» чатів не знайдено"
+msgid "No results for “%1”"
+msgstr "За запитом «%1» нічого не знайдено"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1848,6 +2676,24 @@ msgstr[2] "Архівні чати, %1 чатів"
 msgctxt "@action:button, %1 how many archived chats there are"
 msgid "Archived Chats (%1)"
 msgstr "Архівні чати (%1)"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@title:group the chats that match a search"
+msgid "Chats"
+msgstr "Чати"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info accessible, the hits of a search in the messages"
+msgid "Messages"
+msgstr "Повідомлення"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@title:group the hits of a search in the messages"
+msgid "Messages"
+msgstr "Повідомлення"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -1989,6 +2835,12 @@ msgstr "Вимкнути %1?"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
+msgctxt "@info:placeholder a sample filter name"
+msgid "Invoices"
+msgstr "Рахунки"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
 msgctxt "@title:group"
 msgid "General"
 msgstr "Загальні"
@@ -2080,6 +2932,30 @@ msgstr "Клацніть акаунт на бічній панелі, утрим
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@option:check"
+msgid "Move chats with a draft to the top"
+msgstr "Піднімати чати з чернеткою вгору"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "A chat you leave with an unsent message moves up in the list until you send or clear it, or a newer message arrives."
+msgstr "Чат, який ви залишили з ненадісланим повідомленням, піднімається вгору списку, доки ви не надішлете чи не видалите чернетку або не надійде новіше повідомлення."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
+msgid "Show account tags in the chat list"
+msgstr "Показувати мітки акаунтів у списку чатів"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "Right-click an account in the side panel to give it a short tag. Off: no chat names its account."
+msgstr "Клацніть акаунт на бічній панелі правою кнопкою, щоб дати йому коротку мітку. Вимкнено: жоден чат не називає свій акаунт."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check"
 msgid "Show minor notices in the conversation list"
 msgstr "Показувати другорядні сповіщення у списку чатів"
 
@@ -2091,15 +2967,57 @@ msgstr "Зміни коду безпеки, оновлені сеанси, зм�
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
-msgctxt "@option:check"
-msgid "Round avatars"
-msgstr "Круглі аватари"
+msgctxt "@title:group"
+msgid "Appearance"
+msgstr "Вигляд"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info:whatsthis accessible"
+msgid "Preview of message and avatar corners"
+msgstr "Попередній перегляд кутів повідомлень і аватара"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info:placeholder a sample name for the corner preview"
+msgid "Olena Kovalenko"
+msgstr "Олена Коваленко"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info:placeholder a sample incoming message"
+msgid "Are we still on for Saturday?"
+msgstr "Ми ще зустрічаємося в суботу?"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info:placeholder a sample outgoing message"
+msgid "Yes, see you at ten."
+msgstr "Так, побачимося о десятій."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@label:slider"
+msgid "Message corners"
+msgstr "Кути повідомлень"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@info"
-msgid "Off: squares with your theme's corners."
-msgstr "Вимкнено: квадратні, із заокругленням кутів, як у вашій темі."
+msgid "From square to very round."
+msgstr "Від квадратних до дуже округлих."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@label:slider"
+msgid "Avatar corners"
+msgstr "Кути аватарів"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "From square to a circle."
+msgstr "Від квадрата до кола."
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -2124,6 +3042,36 @@ msgstr "Малюнки під повідомленнями"
 msgctxt "@info"
 msgid "A faint pattern in the color of the chat's account."
 msgstr "Ледь помітний візерунок у кольорі акаунта чату."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:group"
+msgid "3D Models"
+msgstr "3D-моделі"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "The accent color of your desktop, for models that have no colors of their own."
+msgstr "Колір акценту вашої стільниці, для моделей, які не мають власних кольорів."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "The color you chose, for models that have no colors of their own."
+msgstr "Вибраний вами колір, для моделей, які не мають власних кольорів."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@label:button"
+msgid "Model color"
+msgstr "Колір моделі"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Use Accent Color"
+msgstr "Використовувати колір акценту"
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -2184,6 +3132,91 @@ msgstr "Після повернення в мережу"
 msgctxt "@info"
 msgid "Messages that arrived while Kourier was offline are summed up in one notification."
 msgstr "Повідомлення, які надійшли, поки Kourier був поза мережею, зводяться в одне сповіщення."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:group"
+msgid "Filters"
+msgstr "Фільтри"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "No filters yet"
+msgstr "Фільтрів ще немає"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "A filter looks for a pattern in what a message says, in who sent it or in the chat's name. It can notify you and mark what it finds."
+msgstr "Фільтр шукає шаблон у тексті повідомлення, в імені відправника або в назві чату. Він може сповіщати вас і позначати знайдене."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info:whatsthis accessible"
+msgid "Highlight color"
+msgstr "Колір виділення"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@option:check accessible, %1 a filter's name"
+msgid "Notify for %1"
+msgstr "Сповіщати для %1"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button accessible"
+msgid "Filter Actions"
+msgstr "Дії фільтра"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button accessible, %1 a filter's name"
+msgid "Actions for %1"
+msgstr "Дії для %1"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Edit…"
+msgstr "Редагувати…"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Move Up"
+msgstr "Посунути вгору"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Move Down"
+msgstr "Посунути вниз"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Delete…"
+msgstr "Видалити…"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Add Filter…"
+msgstr "Додати фільтр…"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Delete Filter?"
+msgstr "Видалити фільтр?"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info, %1 a filter's name"
+msgid "The filter “%1” stops notifying and highlighting. This cannot be undone."
+msgstr "Фільтр «%1» перестане сповіщати й виділяти. Це не можна скасувати."
 
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
@@ -2344,6 +3377,12 @@ msgstr "Версія %1"
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
 msgctxt "@action:inmenu"
+msgid "View 3D Model"
+msgstr "Переглянути 3D-модель"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#, kde-format
+msgctxt "@action:inmenu"
 msgid "View Picture"
 msgstr "Переглянути зображення"
 
@@ -2412,6 +3451,13 @@ msgstr "%1, %2: %3"
 msgctxt "@info accessible, %1 author, %2 time"
 msgid "%1, %2: deleted message"
 msgstr "%1, %2: видалене повідомлення"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#: crates/kourier-qt/qml/timeline/SystemRow.qml
+#, kde-format
+msgctxt "@info accessible, said before a selected message"
+msgid "Selected."
+msgstr "Вибране."
 
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
@@ -2486,6 +3532,22 @@ msgid "%1 reacted with %2"
 msgstr "Реакція %2: %1"
 
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#: crates/kourier-qt/qml/timeline/ReactionPicker.qml
+#, kde-format
+msgctxt "@action:button accessible"
+msgid "React with %1"
+msgstr "Поставити реакцію %1"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#: crates/kourier-qt/qml/timeline/ReactionPicker.qml
+#, kde-format
+msgctxt "@action:button accessible"
+msgid "Remove reaction %1"
+msgstr "Прибрати реакцію %1"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
 msgctxt "@action:button"
 msgid "Add Reaction"
@@ -2510,20 +3572,6 @@ msgid "More Actions"
 msgstr "Інші дії"
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
-#: crates/kourier-qt/qml/timeline/ReactionPicker.qml
-#, kde-format
-msgctxt "@action:button accessible"
-msgid "React with %1"
-msgstr "Поставити реакцію %1"
-
-#: crates/kourier-qt/qml/timeline/MessageMenu.qml
-#: crates/kourier-qt/qml/timeline/ReactionPicker.qml
-#, kde-format
-msgctxt "@action:button accessible"
-msgid "Remove reaction %1"
-msgstr "Прибрати реакцію %1"
-
-#: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
 msgctxt "@action:inmenu"
 msgid "Save All…"
@@ -2534,6 +3582,12 @@ msgstr "Зберегти все…"
 msgctxt "@action:inmenu"
 msgid "Save As…"
 msgstr "Зберегти як…"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@title:menu"
+msgid "Open in Slicer"
+msgstr "Відкрити в слайсері"
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
@@ -2592,6 +3646,18 @@ msgstr "Історія редагування"
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
 msgctxt "@action:inmenu"
+msgid "Deselect"
+msgstr "Скасувати вибір"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Select"
+msgstr "Вибрати"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
 msgid "Send Again"
 msgstr "Надіслати знову"
 
@@ -2612,12 +3678,6 @@ msgstr "Видалити"
 msgctxt "@action:inmenu"
 msgid "Delete Attachment…"
 msgstr "Видалити вкладення…"
-
-#: crates/kourier-qt/qml/timeline/MessageMenu.qml
-#, kde-format
-msgctxt "@action:inmenu"
-msgid "Delete…"
-msgstr "Видалити…"
 
 #: crates/kourier-qt/qml/timeline/ReactionPicker.qml
 #, kde-format
@@ -2748,6 +3808,12 @@ msgctxt "@info"
 msgid "Download failed"
 msgstr "Не вдалося завантажити"
 
+#: crates/kourier-qt/qml/timeline/blocks/ImageBlock.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "3D model"
+msgstr "3D-модель"
+
 #: crates/kourier-qt/qml/timeline/blocks/QuoteBlock.qml
 #, kde-format
 msgctxt "@info accessible, %1 author, %2 text"
@@ -2802,14 +3868,20 @@ msgstr[2] "%1 акаунтів"
 #: crates/kourier-qt/src/app.rs
 #, kde-format
 msgctxt "@info:status"
-msgid "Linking again could not be started."
-msgstr "Не вдалося почати повторне зв'язування."
+msgid "The slicer could not be started."
+msgstr "Не вдалося запустити слайсер."
 
 #: crates/kourier-qt/src/app.rs
 #, kde-format
 msgctxt "@info:status"
 msgid "The file could not be opened."
 msgstr "Не вдалося відкрити файл."
+
+#: crates/kourier-qt/src/app.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Linking again could not be started."
+msgstr "Не вдалося почати повторне зв'язування."
 
 #: crates/kourier-qt/src/controllers.rs
 #, kde-format
@@ -3071,6 +4143,7 @@ msgstr[2] "%1 учасників пишуть…"
 
 #: crates/kourier-viewmodel/src/conversations.rs
 #: crates/kourier-viewmodel/src/core_source.rs
+#: crates/kourier-viewmodel/src/search.rs
 #, kde-format
 msgctxt "@item:intext author of the last message in the chat list, yourself"
 msgid "You"
@@ -3378,6 +4451,12 @@ msgstr "Повідомлення собі"
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
+msgctxt "@info:status a message found by a search was opened"
+msgid "The message is no longer available."
+msgstr "Повідомлення вже недоступне."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
 msgctxt "@info:status"
 msgid "The original message is no longer available."
 msgstr "Початкове повідомлення вже недоступне."
@@ -3565,6 +4644,12 @@ msgstr "Не вдалося зберегти налаштування."
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #, kde-format
+msgctxt "@info:status"
+msgid "The filter could not be changed."
+msgstr "Не вдалося змінити фільтр."
+
+#: crates/kourier-viewmodel/src/core_source.rs
+#, kde-format
 msgctxt "@info:status a contact card was not sent"
 msgid "The contact card could not be sent."
 msgstr "Не вдалося надіслати картку контакту."
@@ -3635,6 +4720,7 @@ msgstr "Невідомий користувач"
 
 #: crates/kourier-viewmodel/src/core_source.rs
 #: crates/kourier-viewmodel/src/preview.rs
+#: crates/kourier-viewmodel/src/selection.rs
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
 msgctxt "@info:preview kind of message"
@@ -3678,6 +4764,211 @@ msgstr "Повідомлення недоступне"
 msgctxt "@item:intext the author of a quoted message, yourself"
 msgid "You"
 msgstr "Ви"
+
+#: crates/kourier-viewmodel/src/core_source/exporting.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "An export is running."
+msgstr "Експорт виконується."
+
+#: crates/kourier-viewmodel/src/core_source/exporting.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Could not read the selected messages."
+msgstr "Не вдалося прочитати вибрані повідомлення."
+
+#: crates/kourier-viewmodel/src/core_source/exporting.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "None of the selected messages can be exported."
+msgstr "Жодне з вибраних повідомлень не можна експортувати."
+
+#: crates/kourier-viewmodel/src/core_source/exporting.rs
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Export cancelled. Nothing was saved."
+msgstr "Експорт скасовано. Нічого не збережено."
+
+#: crates/kourier-viewmodel/src/core_source/exporting.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "The export could not be started."
+msgstr "Не вдалося почати експорт."
+
+#: crates/kourier-viewmodel/src/emoji/mod.rs
+#, kde-format
+msgctxt "@info:meta language code of the interface, used to name emoji"
+msgid "en"
+msgstr "uk"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:tooltip why Export Selected is off"
+msgid "This chat's network does not allow saving its messages."
+msgstr "Мережа цього чату не дозволяє зберігати його повідомлення."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:tooltip why Export Selected is off"
+msgid "Kourier cannot tell yet whether this chat may be saved."
+msgstr "Kourier поки не може визначити, чи можна зберігати цей чат."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:tooltip why Export Selected is off"
+msgid "This chat is protected, so it cannot be exported."
+msgstr "Цей чат захищений, тому його не можна експортувати."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:tooltip why Export Selected is off"
+msgid "This chat cannot be exported."
+msgstr "Цей чат не можна експортувати."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status, %1 how many files"
+msgid "%1 file could not be read and is not in the archive."
+msgid_plural "%1 files could not be read and are not in the archive."
+msgstr[0] "Не вдалося прочитати %1 файл, тому його немає в архіві."
+msgstr[1] "Не вдалося прочитати %1 файли, тому їх немає в архіві."
+msgstr[2] "Не вдалося прочитати %1 файлів, тому їх немає в архіві."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status, %1 the names of the files"
+msgid "Not saved: %1"
+msgstr "Не збережено: %1"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Messages changed while exporting. Try again."
+msgstr "Повідомлення змінилися під час експорту. Спробуйте ще раз."
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status why an export failed"
+msgid "a file with that name is already there"
+msgstr "файл із такою назвою вже є"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status why an export failed"
+msgid "the folder is gone"
+msgstr "теки більше немає"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status why an export failed"
+msgid "the folder is not writable"
+msgstr "у цю теку не можна записувати"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status why an export failed"
+msgid "there is no space left on the disk"
+msgstr "на диску немає місця"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status why an export failed"
+msgid "the file could not be written"
+msgstr "файл не вдалося записати"
+
+#: crates/kourier-viewmodel/src/export/flow.rs
+#, kde-format
+msgctxt "@info:status, %1 why"
+msgid "Could not export the messages: %1."
+msgstr "Не вдалося експортувати повідомлення: %1."
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:status a file in the exported chat that the page does not link"
+msgid "Open it from the folder, not from this page"
+msgstr "Відкрийте його з теки, а не з цієї сторінки"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:status a file missing from the exported chat"
+msgid "Not on this computer"
+msgstr "Немає на цьому комп’ютері"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:status a file left out of the exported chat"
+msgid "Left out of this export"
+msgstr "Не додано до експорту"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:intext heading of the exported chat page"
+msgid "%1 message"
+msgid_plural "%1 messages"
+msgstr[0] "%1 повідомлення"
+msgstr[1] "%1 повідомлення"
+msgstr[2] "%1 повідомлень"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:intext heading of the exported chat page, %1 a date and time"
+msgid "Exported %1"
+msgstr "Експортовано %1"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:intext footer of the exported chat page"
+msgid "Exported with Kourier"
+msgstr "Експортовано за допомогою Kourier"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:status on an exported message"
+msgid "edited"
+msgstr "змінено"
+
+#: crates/kourier-viewmodel/src/export/html.rs
+#, kde-format
+msgctxt "@info:status earlier versions of an exported message"
+msgid "Earlier versions"
+msgstr "Попередні версії"
+
+#: crates/kourier-viewmodel/src/export/mod.rs
+#, kde-format
+msgctxt "@title:window the title of an exported group chat"
+msgid "Group"
+msgstr "Група"
+
+#: crates/kourier-viewmodel/src/export/mod.rs
+#, kde-format
+msgctxt "@title:window the title of an exported channel"
+msgid "Channel"
+msgstr "Канал"
+
+#: crates/kourier-viewmodel/src/export/mod.rs
+#, kde-format
+msgctxt "@title:window the title of an exported broadcast list"
+msgid "Broadcast list"
+msgstr "Список розсилки"
+
+#: crates/kourier-viewmodel/src/export/mod.rs
+#, kde-format
+msgctxt "@title:window the title of an exported direct chat"
+msgid "Chat"
+msgstr "Чат"
+
+#: crates/kourier-viewmodel/src/export/people.rs
+#, kde-format
+msgctxt "@item:intext the account owner's name in an exported chat"
+msgid "You"
+msgstr "Ви"
+
+#: crates/kourier-viewmodel/src/export/people.rs
+#, kde-format
+msgctxt "@item:intext a person the export has no name for"
+msgid "Someone"
+msgstr "Хтось"
 
 #: crates/kourier-viewmodel/src/files.rs
 #, kde-format
@@ -4274,6 +5565,90 @@ msgstr "Інші файли буде надіслано без нього."
 msgctxt "@info what Don't Send still sends: the other files, without the files asked about"
 msgid "The other files are sent without them."
 msgstr "Інші файли буде надіслано без них."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "A group is not closed, at character %1."
+msgstr "Групу не закрито, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "A character class is not closed, at character %1."
+msgstr "Клас символів не закрито, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This escape sequence is not known, at character %1."
+msgstr "Невідома керувальна послідовність, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "There is nothing to repeat here, at character %1."
+msgstr "Тут нема чого повторювати, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Look-around is not supported, at character %1."
+msgstr "Перевірка навколишнього тексту не підтримується, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Back-references are not supported, at character %1."
+msgstr "Зворотні посилання не підтримуються, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This pattern is too large or too complex."
+msgstr "Цей шаблон завеликий або надто складний."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This pattern is not valid, at character %1."
+msgstr "Шаблон недійсний, на символі %1."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Give the filter a name."
+msgstr "Дайте фільтру назву."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This name is too long."
+msgstr "Ця назва задовга."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Fill in at least one pattern."
+msgstr "Заповніть хоча б один шаблон."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This color cannot be used."
+msgstr "Цей колір не можна використати."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This pattern is too long."
+msgstr "Цей шаблон задовгий."
+
+#: crates/kourier-viewmodel/src/filters.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "This filter does not exist any more."
+msgstr "Цього фільтра більше не існує."
 
 #: crates/kourier-viewmodel/src/group.rs
 #, kde-format
@@ -5874,6 +7249,21 @@ msgstr "%1: %2"
 
 #: crates/kourier-viewmodel/src/notify.rs
 #, kde-format
+msgctxt "@title:notification, %1 the name of a chat, %2 the name of the RegExp filter that matched"
+msgid "%1 · %2"
+msgstr "%1 · %2"
+
+#: crates/kourier-viewmodel/src/notify.rs
+#, kde-format
+msgctxt "@info:notification summary, %1 how many caught-up messages matched, %2 the name of a RegExp filter"
+msgid "%1 matches %2"
+msgid_plural "%1 match %2"
+msgstr[0] "%1 збігається з %2"
+msgstr[1] "%1 збігаються з %2"
+msgstr[2] "%1 збігаються з %2"
+
+#: crates/kourier-viewmodel/src/notify.rs
+#, kde-format
 msgctxt "@info:notification, %1 how many messages"
 msgid "%1 new message"
 msgid_plural "%1 new messages"
@@ -6221,6 +7611,18 @@ msgstr "Початкове повідомлення не знайдено"
 msgctxt "@info:preview in a quote"
 msgid "Deleted message"
 msgstr "Видалене повідомлення"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:preview in a quote of an export"
+msgid "A disappearing message"
+msgstr "Тимчасове повідомлення"
+
+#: crates/kourier-viewmodel/src/preview.rs
+#, kde-format
+msgctxt "@info:preview in a quote of an export"
+msgid "A message that is not exported"
+msgstr "Повідомлення, яке не експортовано"
 
 #: crates/kourier-viewmodel/src/preview.rs
 #, kde-format
@@ -6601,6 +8003,12 @@ msgctxt "@info:status chat notice, a call the user made from their phone"
 msgid "Outgoing group call"
 msgstr "Вихідний груповий виклик"
 
+#: crates/kourier-viewmodel/src/printer_boxes.rs
+#, kde-format
+msgctxt "@item:inmenu 3D printer build volume: width, depth, height in millimetres, then the printers that have it"
+msgid "%1 × %2 × %3 mm — %4"
+msgstr "%1 × %2 × %3 мм — %4"
+
 #: crates/kourier-viewmodel/src/roaming.rs
 #, kde-format
 msgctxt "@info:status under the greyed entries of a chat's menu, the account's switch is off"
@@ -6753,6 +8161,12 @@ msgstr "Код безпеки змінився"
 msgctxt "@item:intext file name offered when the sender gave none"
 msgid "Attachment"
 msgstr "Вкладення"
+
+#: crates/kourier-viewmodel/src/selection.rs
+#, kde-format
+msgctxt "@info:status toast, the selected messages could not be copied"
+msgid "Could not copy the messages"
+msgstr "Не вдалося скопіювати повідомлення"
 
 #: crates/kourier-viewmodel/src/time.rs
 #, kde-format
@@ -7020,6 +8434,12 @@ msgstr "Учора"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
+msgctxt "@info:preview size of a 3D model in millimetres: width, depth, height"
+msgid "%1 × %2 × %3 mm"
+msgstr "%1 × %2 × %3 мм"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
 msgctxt "@action:inmenu, %1 the name of a person whose safety number changed"
 msgid "Show %1's Safety Number"
 msgstr "Показати код безпеки з %1"
@@ -7200,6 +8620,12 @@ msgstr "Не надіслано: код безпеки з %1 змінився"
 msgctxt "@item:intext the author of a message, yourself"
 msgid "You"
 msgstr "Ви"
+
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@info:preview attachment type"
+msgid "3D model"
+msgstr "3D-модель"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
@@ -7602,6 +9028,89 @@ msgstr "Повідомлення і вкладення зберігаються 
 #: packaging/app.kourier.Kourier.metainfo.xml
 msgid "The Kourier developers"
 msgstr "Розробники Kourier"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Blue"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Blue"
+#~ msgstr "Синій"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Green"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Green"
+#~ msgstr "Зелений"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Teal"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Teal"
+#~ msgstr "Бірюзовий"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Violet"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Violet"
+#~ msgstr "Фіолетовий"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Pink"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Pink"
+#~ msgstr "Рожевий"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Red"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Red"
+#~ msgstr "Червоний"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Orange"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Orange"
+#~ msgstr "Помаранчевий"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Yellow"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Yellow"
+#~ msgstr "Жовтий"
+
+#, fuzzy, kde-format
+#~| msgctxt "@item:inmenu account color"
+#~| msgid "Gray"
+#~ msgctxt "@item:inmenu 3D model colour"
+#~ msgid "Gray"
+#~ msgstr "Сірий"
+
+#, kde-format
+#~ msgctxt "@title:tab emoji category"
+#~ msgid "Smileys"
+#~ msgstr "Смайлики"
+
+#, kde-format
+#~ msgctxt "@title:tab emoji category"
+#~ msgid "People"
+#~ msgstr "Люди"
+
+#, kde-format
+#~ msgctxt "@option:check"
+#~ msgid "Round avatars"
+#~ msgstr "Круглі аватари"
+
+#, kde-format
+#~ msgctxt "@info"
+#~ msgid "Off: squares with your theme's corners."
+#~ msgstr "Вимкнено: квадратні, із заокругленням кутів, як у вашій темі."
 
 #, kde-format
 #~ msgctxt "@info:status why linking failed, %1 the name of a messenger"

@@ -107,6 +107,11 @@ rust::Vec<uint8_t> sampleImage(int32_t width, int32_t height, int32_t hue, rust:
 // or a side is not 1 … 8192.
 rust::Vec<uint8_t> detailImage(int32_t width, int32_t height, rust::Str format);
 
+// What a request for `id` (`thumb/<id>?tint=RRGGBB`) does to a decoded PNG: `[width, height, the
+// first, the middle and the last pixel as premultiplied ARGB]` after the provider's own tint
+// step, or empty when the PNG does not decode (tests of the model tint).
+rust::Vec<uint32_t> tintProbe(rust::Str id, rust::Vec<uint8_t> png);
+
 // How close the picture the app drew is to the file it comes from (tests of picture quality).
 // `grab` is a PNG of the item as the app showed it, in physical pixels; `file` is decoded by the
 // decoder of `codec` (the payload's codec byte). Two references are made of the file, each cut

@@ -489,6 +489,88 @@ pub(crate) fn save_attachments(
         .collect()
 }
 
+/// Whether a chat may be exported at all (Export Selected; architecture §5.8.3): its network
+/// states [`kourier_model::ChatExport::Allowed`] and it is not protected (`protected`: refused
+/// with [`Refusal::ExportProtected`] first). Features not known yet and a chat that states
+/// nothing are refused (fail closed: a backend that has not said that saving is fine is not
+/// asked to prove it is not), a chat the network forbids saving too, each with its own
+/// [`Refusal`] so the UI says why. THE one rule for the plan ([`crate::facade::ExportPlan::chat`],
+/// [`crate::facade::ConversationDetail::export`]) and the command
+/// ([`crate::facade::UiCommand::ExportArchive`], which asks again on the chat's current features).
+pub(crate) fn may_export_chat(
+    features: Option<&kourier_model::ConversationFeatures>,
+    protected: bool,
+) -> Result<()> {
+    use kourier_model::ChatExport;
+    // A protected chat is refused whatever its network says (his decision, 2026-11-13).
+    if protected {
+        return Err(CoreError::refused(
+            Refusal::ExportProtected,
+            "the chat is protected on another device",
+        ));
+    }
+    match features.map(|f| f.export) {
+        Some(ChatExport::Allowed) => Ok(()),
+        Some(ChatExport::Restricted) => Err(CoreError::refused(
+            Refusal::ExportRestricted,
+            "the network does not allow saving this chat",
+        )),
+        Some(ChatExport::Unstated) | None => Err(CoreError::refused(
+            Refusal::ExportUnstated,
+            "the network has not said that this chat may be saved",
+        )),
+    }
+}
+
+/// What an export does with one message ([`export_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExportVerdict {
+    /// The message goes into the export (a message deleted for everyone as its "deleted" line:
+    /// the core never had a body for it).
+    Included,
+    /// A disappearing message (it has an expiry timer): exported only when the dialog's tick is
+    /// set (his rule: off by default; the copy does not disappear, and the dialog warns).
+    NeedsTick,
+    /// Never exported.
+    LeftOut(LeftOut),
+}
+
+/// Why a message is not exported ([`ExportVerdict::LeftOut`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LeftOut {
+    /// A view-once message is never saved, in any form (his "Show once, then remove").
+    ViewOnce,
+    /// The message is gone for the user: hidden by the disappearing sweeper on a clock nobody
+    /// confirmed (an erased or deleted-for-me row is not read at all).
+    Gone,
+}
+
+/// What an export does with a message: THE one rule for the plan and the command (which asks
+/// again on the message's current row, so a message that went between the two fails the whole
+/// export). Gone first (like [`may_save_message`]), then a message deleted for everyone
+/// (`deleted`: a "deleted" line without a body, whatever else the tombstone was: even one of a
+/// disappearing message is exported without the tick and carries nothing but "deleted" and its
+/// time), then view-once, then a timer (`expiry_kind IS NOT NULL`, the one predicate of the plan and
+/// the command).
+pub(crate) fn export_verdict(
+    deleted: Option<&str>,
+    view_once: bool,
+    expiry_hidden: bool,
+    disappearing: bool,
+) -> ExportVerdict {
+    if expiry_hidden {
+        ExportVerdict::LeftOut(LeftOut::Gone)
+    } else if deleted.is_some() {
+        ExportVerdict::Included
+    } else if view_once {
+        ExportVerdict::LeftOut(LeftOut::ViewOnce)
+    } else if disappearing {
+        ExportVerdict::NeedsTick
+    } else {
+        ExportVerdict::Included
+    }
+}
+
 /// Whether "Send Again" ([`UiCommand::RetryMessage`](crate::facade::UiCommand::RetryMessage))
 /// is accepted for an own message whose send ended in `floor` (the message's stored send floor,
 /// [`crate::outbox::floor`]). THE one rule for the flag ([`MessageActions::retry`]) and the
@@ -1759,5 +1841,48 @@ mod tests {
             vec![uid(ALICE)],
             "a person last: the person"
         );
+    }
+
+    /// `export_verdict` over all 16 inputs: gone first, then a tombstone (a "deleted" line), then
+    /// view-once, then a timer, else included. A reordering changes a row of this table.
+    #[test]
+    fn the_export_verdict_over_every_input() {
+        use super::LeftOut::{Gone, ViewOnce};
+        use ExportVerdict::{Included, LeftOut as Out, NeedsTick};
+        let mut seen = 0;
+        for bits in 0u8..16 {
+            let (deleted, view_once, hidden, timer) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let want = if hidden {
+                Out(Gone)
+            } else if deleted {
+                Included
+            } else if view_once {
+                Out(ViewOnce)
+            } else if timer {
+                NeedsTick
+            } else {
+                Included
+            };
+            let got = export_verdict(deleted.then_some("ForEveryone"), view_once, hidden, timer);
+            assert_eq!(
+                got, want,
+                "deleted {deleted}, view-once {view_once}, hidden {hidden}, timer {timer}"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 16);
+        // The values spelled out, so a wrong reference above cannot hide a wrong rule.
+        assert_eq!(
+            export_verdict(Some("ForEveryone"), false, true, false),
+            Out(Gone)
+        );
+        assert_eq!(
+            export_verdict(Some("ForEveryone"), true, false, true),
+            Included
+        );
+        assert_eq!(export_verdict(None, true, false, true), Out(ViewOnce));
+        assert_eq!(export_verdict(None, false, false, true), NeedsTick);
+        assert_eq!(export_verdict(None, false, false, false), Included);
     }
 }

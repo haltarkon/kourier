@@ -3355,6 +3355,16 @@ pub fn bundled_libraries(
                 )?,
             ],
         },
+        BundledLibrary {
+            name: "Unicode emoji data".to_owned(),
+            licence: "Unicode-3.0".to_owned(),
+            note: "The emoji pickers' table (the emoji with their names and search words in English and Ukrainian) is made of the Unicode emoji data files (emoji-test.txt, Emoji 18.0) and the CLDR annotations (version 49, Unicode, Inc.), copied into this program as read-only data (third_party/unicode-emoji in the source). Their licence, the Unicode License v3, requires this notice with every copy.".to_owned(),
+            texts: vec![licence_file(
+                "Unicode, Inc. data files (Unicode License v3)",
+                &root(),
+                "third_party/unicode-emoji/LICENSE",
+            )?],
+        },
     ])
 }
 
@@ -5559,7 +5569,8 @@ Version References:
                 "SQLCipher",
                 "SQLite",
                 "BoringSSL",
-                "The Rust standard library"
+                "The Rust standard library",
+                "Unicode emoji data"
             ]
         );
         let html = render_bundled_section(&libs);

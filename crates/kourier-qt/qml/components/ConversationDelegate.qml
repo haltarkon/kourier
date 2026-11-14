@@ -36,6 +36,8 @@ Delegates.RoundedItemDelegate {
     required property bool isGroup
     // The color of the chat's account.
     required property string tint
+    // The RegExp filters' marker backgrounds in the title: `[{start, len, colour}]` (R3).
+    required property var titleMarks
 
     readonly property bool hasUnread: root.unread > 0 || root.markedUnread
     readonly property bool isDraft: root.previewSource === "draft"
@@ -113,21 +115,12 @@ Delegates.RoundedItemDelegate {
     // in a high-contrast scheme the open chat, whose tint alone does not set the row off
     // from the page: a solid frame in the text color. The wash of the account's color is the same
     // item, under the row's content: one item per row for all three.
-    Rectangle {
-        readonly property bool focused: root.ListView.isCurrentItem && root.ListView.view.activeFocus
-        readonly property bool framed: focused || (Style.highContrast && root.highlighted)
-
-        z: -1
-        anchors.fill: parent
-        anchors.leftMargin: framed ? 0 : root.leftInset
-        anchors.rightMargin: framed ? 0 : root.rightInset
-        anchors.topMargin: framed ? 0 : root.topInset
-        anchors.bottomMargin: framed ? 0 : root.bottomInset
-        visible: framed || root.tinted
-        radius: Kirigami.Units.cornerRadius
-        color: root.tinted ? Qt.alpha(root.tint, root.wash) : "transparent"
-        border.width: framed ? 2 : 0
-        border.color: focused ? Kirigami.Theme.focusColor : Kirigami.Theme.textColor
+    RowFrame {
+        tint: root.tint
+        tinted: root.tinted
+        wash: root.wash
+        focused: root.ListView.isCurrentItem && root.ListView.view.activeFocus
+        framed: focused || (Style.highContrast && root.highlighted)
     }
 
     contentItem: RowLayout {
@@ -165,13 +158,26 @@ Delegates.RoundedItemDelegate {
 
                         QQC2.Label {
                             id: titleLabel
+                            // A marked title is a `RichText` label cut by `titleFit` (`Style.markedName`).
+                            readonly property bool marked: root.titleMarks.length > 0
                             width: Math.min(implicitWidth, titleRow.width - marks.implicitWidth - (marks.visible ? titleRow.spacing : 0))
-                            text: root.title
+                            text: titleLabel.marked ? Style.markedName(titleFit.elidedText, root.title, root.titleMarks, root.surface, Kirigami.Theme.textColor) : root.title
                             elide: Text.ElideRight
                             font: Style.styled(Kirigami.Theme.defaultFont, {
                                 "weight": root.hasUnread ? Font.DemiBold : Font.Normal
                             })
-                            textFormat: Text.PlainText
+                            textFormat: titleLabel.marked ? Text.RichText : Text.PlainText
+                            Accessible.name: Style.unmarked(root.title)
+
+                            TextMetrics {
+                                id: titleFit
+                                font: titleLabel.font
+                                text: titleLabel.marked ? root.title : ""
+                                elide: Qt.ElideRight
+                                // (What the row gives the title, not the label's own width: that one
+                                // follows the label's implicit width.)
+                                elideWidth: titleRow.width - marks.implicitWidth - (marks.visible ? titleRow.spacing : 0)
+                            }
                         }
                         Row {
                             id: marks
@@ -247,7 +253,7 @@ Delegates.RoundedItemDelegate {
                 }
                 QQC2.Label {
                     visible: root.typing === "" && (root.previewSource === "peer" || root.isDraft)
-                    text: root.previewAuthor + ":"
+                    text: L10n.i18nc("@item:intext, %1 who wrote the message that the row shows", "%1:", root.previewAuthor)
                     color: root.isDraft ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
                     textFormat: Text.PlainText
                 }

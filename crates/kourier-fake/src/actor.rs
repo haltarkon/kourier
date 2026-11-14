@@ -1325,6 +1325,8 @@ impl Actor {
                 }
                 Command::NetworkChanged
                 | Command::Resumed
+                // Counted by name like every command; the fake keeps no cache.
+                | Command::ReleaseMemory
                 | Command::SetTyping { .. }
                 | Command::RefreshContact { .. }
                 | Command::FetchHistory { .. } => {}
@@ -1685,6 +1687,24 @@ impl Actor {
             .stated_caps()?
             .and_then(|caps| caps.roaming_writes())
             .unwrap_or(false))
+    }
+
+    /// The export rule the script states for a chat ([`Script::chat_export`]) put into the
+    /// features of the chat's upserts of a delivery.
+    fn with_export_states<'a>(&self, events: Cow<'a, [BackendEvent]>) -> Cow<'a, [BackendEvent]> {
+        if self.script.chat_export.is_empty() {
+            return events;
+        }
+        let mut out = events.into_owned();
+        for e in &mut out {
+            if let BackendEvent::ConversationUpsert(p) = e
+                && let Some(features) = p.features.as_mut()
+                && let Some((_, state)) = self.script.chat_export.iter().find(|(k, _)| *k == p.key)
+            {
+                features.export = *state;
+            }
+        }
+        Cow::Owned(out)
     }
 
     /// What the fake states of the roaming settings ([`Script::roaming_writes`]) added to the
@@ -2887,6 +2907,7 @@ impl Actor {
                 // script's `AccountCaps` and the first delivery carry what the fake states of
                 // the roaming settings.)
                 let events = self.with_roaming_statement(&d.events)?;
+                let events = self.with_export_states(events);
                 let row = encode_outbox_row(&events).map_err(internal)?;
                 let next = i64::try_from(cursor + 1).unwrap_or(i64::MAX);
                 let step_no = i64::try_from(cursor).unwrap_or(i64::MAX);

@@ -53,13 +53,108 @@ Kirigami.ScrollablePage {
     // The way into the archive shows as the list's last row: there are archived chats, the
     // archive is not shown already and nothing is searched (a search looks in both). Not shown
     // means no footer at all, so the list keeps no empty band at its end.
-    readonly property bool entryShown: !App.archiveShown && App.archivedCount > 0 && search.text.trim() === ""
+    readonly property bool entryShown: !App.archiveShown && App.archivedCount > 0 && search.text.trim() === "" && page.searchChat === 0
     // The Back arrow of the archive view's title (null while that title is not shown).
     property Item archiveBack: null
     // Kirigami's own title delegate, taken at completion (see `titleDelegate` below).
     property Component kirigamiTitle: null
     // The list's last row, the way into the archive (null while it is not shown; tests read it).
     property Item archiveEntry: null
+    // The hits of the message search, under the chats: a header "Messages" and a row per hit,
+    // newest first, in the list's footer while a search has any (none without a query, so a
+    // picture of the list without one cannot move).
+    readonly property bool hitsShown: App.searchResults.active && App.searchResults.count > 0 && !App.archiveShown
+    // The hits' rows (null while they are not shown; tests read it).
+    property Repeater hitRows: null
+    // Search in ONE chat (G1i): the chat the chip names, 0 for none. While it is set the chats
+    // part of the list is empty (`list.model` is null: the chats' model, `conversationAt(0)` and
+    // the list without a query stay as they are) and only the hits show. It ends when another
+    // chat opens, the chat turns protected, the X or Backspace in the empty field takes the chip
+    // off (then every chat is searched), or Escape.
+    property real searchChat: 0
+    readonly property bool chipShown: page.searchChat !== 0
+    // What the chip names, kept as it was when the one-chat search began: the chat may close or
+    // go while the chip stands (R3 F8, C9).
+    property string chipTitle: ""
+    property string chipAvatar: ""
+    property bool chipSelf: false
+    // The chat the chip names left the list (its account went, it was removed): the search goes
+    // back to every chat with the same text.
+    readonly property bool searchChatGone: page.searchChat !== 0 && App.searchResults.chat === page.searchChat && App.searchResults.chatGone
+    // (Later: the chip's own state is part of the binding above.)
+    onSearchChatGoneChanged: Qt.callLater(page.dropGoneChip)
+    function dropGoneChip(): void {
+        if (page.searchChatGone) {
+            page.removeChip();
+        }
+    }
+    // What a screen reader was told of the last answer (tests read it), and for which text.
+    property string searchAnnounced: ""
+    property string announcedText: ""
+    // The text (trimmed) the last message search was asked for: "No results" is only for a text
+    // the core answered (never for the one typed a moment ago).
+    property string askedText: ""
+    // RegExp search (R5): the field's `.*` toggle, and `Aa` (Match Case, only with `.*`). They
+    // live for the window's life and are not saved. The pattern is checked as you type
+    // (`regexError`, the viewmodel's words); a bad one asks nothing.
+    property bool regexOn: false
+    property bool matchCase: false
+    readonly property string syntaxError: page.regexOn ? App.filters.checkPattern(search.text) : ""
+    // What shows under the field: the syntax problem, else the core's refusal of a pattern the
+    // check could not judge (too large to compile).
+    readonly property string regexError: page.syntaxError !== "" ? page.syntaxError : (page.regexOn ? App.searchResults.refusal : "")
+    // "Save as Filter" is offered for a pattern that is typed and valid.
+    readonly property bool canSaveFilter: page.regexOn && search.text.trim() !== "" && page.regexError === ""
+    readonly property alias regexButton: regexButton
+    readonly property alias matchCaseButton: matchCaseButton
+    readonly property alias saveFilterButton: saveFilterButton
+    readonly property alias saveFilterDialog: saveFilterDialog
+    // Asks the core for the typed text in the mode the toggles say (a pattern keeps its spaces;
+    // words are trimmed); a bad pattern ends the search instead.
+    function runSearch(): void {
+        const text = search.text.trim();
+        if (text === "") {
+            return;
+        }
+        if (page.syntaxError !== "") {
+            App.closeSearch();
+            return;
+        }
+        page.askedText = text;
+        App.searchMessages(page.regexOn ? search.text : text, page.searchChat);
+    }
+    // The toggles changed: the core asks in the new mode (a search that runs starts again) and the
+    // chat titles follow the pattern.
+    function modeChanged(): void {
+        App.setSearchMode(page.regexOn, page.matchCase);
+        searchDelay.stop();
+        page.runSearch();
+    }
+    // The pattern becomes a filter: the filter dialog opens with it in Message text.
+    function saveAsFilter(): void {
+        if (!page.canSaveFilter) {
+            return;
+        }
+        saveFilterDialog.openWith({
+            "name": App.filters.nameFromPattern(search.text),
+            "text": search.text,
+            "matchCase": page.matchCase
+        });
+    }
+    // The quiet line while the search index is still being built (G1i, call 3): under the
+    // "Messages" header of the hits, or the explanation of "No results".
+    readonly property string indexLine: L10n.i18nc("@info:status, %1 how many percent of the old messages are indexed", "Older messages are still being prepared for search (%1)", L10n.i18nc("@item:intext, %1 a percentage number", "%1%", App.searchResults.indexPercent))
+    // The chip and the placeholder (tests read them).
+    readonly property alias searchChip: chipItem
+    readonly property alias placeholder: emptyList
+    // Nothing is found for the text asked: the message search answered it (not capped: a search
+    // that stopped early may have missed hits), no chat matches and no hit shows.
+    // The search looked through all it may (capped) and found nothing yet: it says so and offers
+    // another round (R3 F6).
+    readonly property bool cappedEmpty: !App.archiveShown && search.text.trim() !== "" && page.askedText === search.text.trim() && App.searchResults.active && App.searchResults.answered && App.searchResults.capped && App.searchResults.chat === page.searchChat && App.searchResults.count === 0 && list.count === 0
+    // "Chats" above the chats that match, only while "Messages" shows (R3 F8, V10).
+    readonly property bool chatsHeaderShown: page.hitsShown && !page.chipShown && list.count > 0
+    readonly property bool noResults: !App.archiveShown && search.text.trim() !== "" && page.askedText === search.text.trim() && App.searchResults.active && App.searchResults.answered && !App.searchResults.capped && App.searchResults.chat === page.searchChat && App.searchResults.count === 0 && list.count === 0
 
     // What the menu told a screen reader when it opened with nothing to choose, and how (tests
     // read both; "" and -1 while it did not).
@@ -67,6 +162,9 @@ Kirigami.ScrollablePage {
     property int menuAnnouncedPoliteness: -1
 
     signal openConversation(real id)
+    // A hit of the message search was chosen: its chat opens at `message`, and the list stays
+    // as it is (the search, its hits, the view).
+    signal openSearchHit(real id, real message)
     // The menu or the keys of the window ask: Archive, Unarchive, Mute "Until…" for chat `conv`.
     // The window does the work (the Undo notice and the dialog are its own: `MainWindow`).
     signal archiveAsked(real conv)
@@ -78,6 +176,64 @@ Kirigami.ScrollablePage {
     // The banner's button (link again, solve the challenge, restart): the window decides
     // whether a link in progress must be asked about first.
     signal bannerActivated
+
+    // Search in the open chat only (G1i): the chip names the chat and the keyboard goes to the field.
+    // What is typed already searches that chat alone. A chat that is not open or is protected does
+    // nothing (it offers no search).
+    function searchInChat(): void {
+        if (App.timeline.conversationId === 0 || !App.timeline.chatSearchable) {
+            return;
+        }
+        if (page.searchChat !== App.timeline.conversationId) {
+            page.chipTitle = App.timeline.title;
+            page.chipAvatar = App.timeline.avatarUrl;
+            page.chipSelf = App.timeline.isSelf;
+            page.searchChat = App.timeline.conversationId;
+            // The chats part goes empty: the list is shown as without a query.
+            App.setSearch("");
+            if (search.text.trim() !== "") {
+                searchDelay.stop();
+                page.runSearch();
+            } else {
+                App.closeSearch();
+            }
+        }
+        page.focusSearch();
+    }
+
+    // The chip's X and Backspace in an empty field: the chip goes and the same text searches every
+    // chat (the chats that match, and the hits of all).
+    function removeChip(): void {
+        if (page.searchChat === 0) {
+            return;
+        }
+        page.searchChat = 0;
+        const text = search.text.trim();
+        App.setSearch(search.text);
+        if (text !== "") {
+            searchDelay.stop();
+            page.askedText = text;
+            page.runSearch();
+        } else {
+            App.closeSearch();
+        }
+        search.forceActiveFocus();
+    }
+
+    // Escape: the field is emptied, the chip goes and the search closes (the list as without a
+    // query). True when there was something to end.
+    function endSearch(): bool {
+        if (search.text === "" && page.searchChat === 0) {
+            return false;
+        }
+        searchDelay.stop();
+        page.searchChat = 0;
+        search.text = "";
+        App.setSearch("");
+        App.closeSearch();
+        page.askedText = "";
+        return true;
+    }
 
     // The keyboard goes to the search field, with what is typed there selected. The archive
     // view has no search field: the chats come back first (Ctrl+K in the archive searches
@@ -106,6 +262,178 @@ Kirigami.ScrollablePage {
         list.currentIndex = -1;
         App.showArchive(false);
         list.forceActiveFocus();
+    }
+
+    // Down from the search field: the first chat that matches, else the first hit (false: there
+    // is neither, the key goes on as before).
+    function enterList(): bool {
+        if (list.count > 0) {
+            list.currentIndex = 0;
+            list.forceActiveFocus(Qt.TabFocusReason);
+            return true;
+        }
+        return page.hitsShown && page.focusHit(0);
+    }
+
+    // The hit at `index` takes the keyboard (inside the list, which stays its one tab stop) and
+    // comes into view. No chat row is current meanwhile, so no chat shows the focus frame.
+    function focusHit(index: int): bool {
+        const rows = page.hitRows;
+        if (rows === null || index < 0 || index >= rows.count) {
+            return false;
+        }
+        const row = rows.itemAt(index) as SearchResultDelegate;
+        if (row === null) {
+            return false;
+        }
+        list.currentIndex = -1;
+        if (!list.activeFocus) {
+            list.forceActiveFocus(Qt.TabFocusReason);
+        }
+        row.forceActiveFocus(Qt.TabFocusReason);
+        const at = row.mapToItem(list.contentItem, 0, 0);
+        if (at.y < list.contentY) {
+            list.contentY = at.y;
+        } else if (at.y + row.height > list.contentY + list.height) {
+            list.contentY = at.y + row.height - list.height;
+        }
+        return true;
+    }
+
+    // Up from the first hit: back to the last chat (the field when no chat matches).
+    function leaveHits(row: Item): void {
+        row.focus = false;
+        if (list.count > 0) {
+            list.currentIndex = list.count - 1;
+            list.forceActiveFocus(Qt.BacktabFocusReason);
+            list.positionViewAtIndex(list.currentIndex, ListView.Contain);
+        } else {
+            search.forceActiveFocus(Qt.BacktabFocusReason);
+        }
+    }
+
+    // The hit that has the keyboard (its place among the hits), -1 when none.
+    function focusedHit(): int {
+        const rows = page.hitRows;
+        for (let i = 0; rows !== null && i < rows.count; i++) {
+            const row = rows.itemAt(i);
+            if (row !== null && row.activeFocus) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // The current row over the chats AND the hits (the hits come after the chats): the keyboard's
+    // place for Page Up, Page Down, Home and End (R3 F7). -1: none.
+    function currentRow(): int {
+        const hit = page.focusedHit();
+        return hit >= 0 ? list.count + hit : list.currentIndex;
+    }
+
+    // Goes to row `row` of that one sequence (clamped): a chat becomes current, a hit takes the keyboard.
+    function goRow(row: int): void {
+        const hits = page.hitsShown && page.hitRows !== null ? page.hitRows.count : 0;
+        const last = list.count + hits - 1;
+        if (last < 0) {
+            return;
+        }
+        const target = Math.max(0, Math.min(last, row));
+        if (target < list.count) {
+            const held = page.focusedHit();
+            if (held >= 0) {
+                (page.hitRows.itemAt(held) as Item).focus = false;
+            }
+            list.currentIndex = target;
+            list.forceActiveFocus(Qt.TabFocusReason);
+            list.positionViewAtIndex(target, ListView.Contain);
+        } else {
+            page.focusHit(target - list.count);
+        }
+    }
+
+    // How many rows a screen holds (at least one row's move).
+    function screenRows(): int {
+        return Math.max(1, Math.floor(list.height / (Kirigami.Units.gridUnit * 3.6)) - 1);
+    }
+
+    // Page Up, Page Down, Home and End on the list and on a hit; true when the key was one of them.
+    function pageKey(event: var): bool {
+        if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)) {
+            return false;
+        }
+        const at = page.currentRow();
+        switch (event.key) {
+        case Qt.Key_PageDown:
+            page.goRow(at < 0 ? page.screenRows() - 1 : at + page.screenRows());
+            return true;
+        case Qt.Key_PageUp:
+            page.goRow(at < 0 ? 0 : at - page.screenRows());
+            return true;
+        case Qt.Key_Home:
+            page.goRow(0);
+            return true;
+        case Qt.Key_End:
+            page.goRow(list.count + (page.hitsShown && page.hitRows !== null ? page.hitRows.count : 0) - 1);
+            return true;
+        }
+        return false;
+    }
+
+    // The hit that held the keyboard went (deleted, expired): the next hit takes it, else the
+    // previous one, else the field (R3 F8, C14). `at`: where it stood.
+    property int refocusAt: -1
+    function refocusHit(): void {
+        const at = page.refocusAt;
+        page.refocusAt = -1;
+        if (at < 0 || page.focusedHit() >= 0 || list.currentIndex >= 0) {
+            return;
+        }
+        const count = page.hitRows !== null ? page.hitRows.count : 0;
+        if (count > 0) {
+            page.focusHit(Math.min(at, count - 1));
+        } else {
+            search.forceActiveFocus();
+        }
+    }
+    Connections {
+        target: App.searchResults
+        function onRowsAboutToBeRemoved(parent: var, first: int, last: int): void {
+            const held = page.focusedHit();
+            if (held >= first && held <= last) {
+                page.refocusAt = first;
+            }
+        }
+        function onRowsRemoved(): void {
+            if (page.refocusAt >= 0) {
+                Qt.callLater(page.refocusHit);
+            }
+        }
+        // One announcement for each answered text: how many messages it found.
+        function onAnsweredChanged(): void {
+            page.announceAnswer();
+        }
+    }
+    function announceAnswer(): void {
+        const hits = App.searchResults;
+        if (!hits.answered || hits.count === 0 || page.announcedText === page.askedText) {
+            return;
+        }
+        page.announcedText = page.askedText;
+        const text = L10n.i18ncp("@info accessible, %1 how many", "%1 message found", "%1 messages found", hits.count);
+        page.searchAnnounced = text;
+        page.Accessible.announce(text, Accessible.Polite);
+    }
+
+    // The next page of hits once the end of the list is near (one request at a time).
+    function moreHitsSoon(): void {
+        const hits = App.searchResults;
+        if (!page.hitsShown || !hits.more || hits.loading) {
+            return;
+        }
+        if (list.contentY + list.height >= list.originY + list.contentHeight - Kirigami.Units.gridUnit * 10) {
+            App.moreSearch();
+        }
     }
 
     // The menu of the chat `row` shows, at (`x`, `y`) of the row; with a negative `x` (the
@@ -184,8 +512,25 @@ Kirigami.ScrollablePage {
         }
         function onArchiveShownChanged(): void {
             if (App.archiveShown) {
+                page.searchChat = 0;
                 search.text = "";
             }
+        }
+    }
+    // The one-chat search follows its chat: another chat opening (a chat row, the quick switch,
+    // the step keys, a notification) ends it, and so does the chat turning protected. A hit of
+    // the chat opens the same chat: the chip and the hits stay. (Properties of the page, not a
+    // `Connections` on the timeline: qmllint types its target as a plain QObject.)
+    readonly property real openChatId: App.timeline.conversationId
+    readonly property bool openChatProtected: App.timeline.chatProtected
+    onOpenChatIdChanged: {
+        if (page.searchChat !== 0 && page.openChatId !== 0 && page.openChatId !== page.searchChat) {
+            page.endSearch();
+        }
+    }
+    onOpenChatProtectedChanged: {
+        if (page.searchChat !== 0 && page.openChatProtected && page.openChatId === page.searchChat) {
+            page.endSearch();
         }
     }
     leftPadding: 0
@@ -220,36 +565,216 @@ Kirigami.ScrollablePage {
                 Layout.margins: Kirigami.Units.smallSpacing
             }
 
-            Kirigami.SearchField {
-                id: search
-
+            // The search field, with the one-chat search's chip BEFORE it (G1i).
+            RowLayout {
+                // (Not in the archive view: the row would keep a gap there, which the field alone never left.)
                 visible: !App.archiveShown
-                placeholderText: L10n.i18nc("@info:placeholder", "Search")
-                // Find (like Ctrl+K) is the window's key, so that it also works in a narrow
-                // window where the chat covers the list; the field's own Find key would
-                // make the two ambiguous, and neither would act.
-                focusSequences: []
-                // Only Enter accepts: Kirigami's field accepts by itself a moment after every
-                // change by default, and accepting is the quick switch below, so the first
-                // letter typed opened a chat and took the keyboard away (his report,
-                // 2026-10-16). The list filters on `onTextChanged`.
-                autoAccept: false
-                Accessible.name: L10n.i18nc("@info accessible", "Search conversations")
-                QQC2.ToolTip.visible: search.hovered && search.text === ""
-                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-                QQC2.ToolTip.text: page.searchKeys !== "" ? L10n.i18nc("@info:tooltip, %1 a keyboard shortcut", "Search conversations (%1)", page.searchKeys) : L10n.i18nc("@info:tooltip", "Search conversations")
-                onTextChanged: App.setSearch(text)
-                // The quick switch: type a name, Enter opens the first chat that matches, and
-                // the keyboard goes on to the message. The window empties the field once the
-                // chat opens (`MainWindow.switchTo`): kept when the switch is not made (it
-                // asks "Stop Linking?" first and the answer is "Continue Linking").
-                onAccepted: {
-                    const id = App.conversationAt(0);
-                    if (id !== 0) {
-                        page.switchedByKeyboard(id);
+                Layout.fillWidth: true
+                spacing: Kirigami.Units.smallSpacing
+
+                    // The chip: the chat's picture, "In: <name>" and an X that goes back to every chat. A
+                    // part of the search field's line: the field's height, a button's corner and the
+                    // frame every other frame takes (R3 F3); the picture grows with the font.
+                    Item {
+                        id: chipItem
+
+                        objectName: "search-chip"
+                        visible: page.chipShown
+                        Layout.alignment: Qt.AlignVCenter
+                        Layout.preferredWidth: chipRow.implicitWidth + Kirigami.Units.smallSpacing * 2
+                        // (Not tied to the field's width: the field takes what the chip leaves.)
+                        Layout.maximumWidth: page.width * 0.5
+                        Layout.preferredHeight: search.implicitHeight
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: L10n.i18nc("@info:status, the search is limited to this chat, %1 the chat's name", "In: %1", Style.unmarked(page.chipTitle))
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: Kirigami.Units.cornerRadius
+                            color: Kirigami.Theme.backgroundColor
+                            border.width: 1
+                            border.color: Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
+                        }
+                        RowLayout {
+                            id: chipRow
+
+                            anchors.fill: parent
+                            anchors.leftMargin: Kirigami.Units.smallSpacing
+                            anchors.rightMargin: Kirigami.Units.smallSpacing
+                            spacing: Kirigami.Units.smallSpacing
+
+                            Avatar {
+                                name: page.chipTitle
+                                source: page.chipAvatar
+                                selfChat: page.chipSelf
+                                implicitWidth: chipLabel.implicitHeight
+                                implicitHeight: chipLabel.implicitHeight
+                                Layout.preferredWidth: chipLabel.implicitHeight
+                                Layout.preferredHeight: chipLabel.implicitHeight
+                                Layout.alignment: Qt.AlignVCenter
+                            }
+                            QQC2.Label {
+                                id: chipLabel
+
+                                objectName: "search-chip-label"
+                                text: L10n.i18nc("@info:status, the search is limited to this chat, %1 the chat's name", "In: %1", Style.plain(page.chipTitle))
+                                textFormat: Text.PlainText
+                                color: Style.readable(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 0
+                                Layout.alignment: Qt.AlignVCenter
+                            }
+                            QQC2.ToolButton {
+                                id: chipX
+
+                                objectName: "search-chip-x"
+                                icon.name: "dialog-close"
+                                display: QQC2.AbstractButton.IconOnly
+                                // A Tab stop (Space or Enter takes the chip off); Backspace in the empty
+                                // field and Escape do the same.
+                                focusPolicy: Qt.TabFocus
+                                padding: 0
+                                implicitWidth: Kirigami.Units.iconSizes.small + Kirigami.Units.smallSpacing
+                                implicitHeight: implicitWidth
+                                Layout.alignment: Qt.AlignVCenter
+                                text: L10n.i18nc("@action:button", "Search All Chats")
+                                Accessible.name: chipX.text
+                                QQC2.ToolTip.visible: chipX.hovered
+                                QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                                QQC2.ToolTip.text: chipX.text
+                                onClicked: page.removeChip()
+                            }
+                        }
+                    }
+
+                Kirigami.SearchField {
+                    id: search
+
+                    visible: !App.archiveShown
+                    placeholderText: page.regexOn ? L10n.i18nc("@info:placeholder", "Search by regular expression") : L10n.i18nc("@info:placeholder", "Search")
+                    // Find (like Ctrl+K) is the window's key, so that it also works in a narrow
+                    // window where the chat covers the list; the field's own Find key would
+                    // make the two ambiguous, and neither would act.
+                    focusSequences: []
+                    // Only Enter accepts: Kirigami's field accepts by itself a moment after every
+                    // change by default, and accepting is the quick switch below, so the first
+                    // letter typed opened a chat and took the keyboard away (his report,
+                    // 2026-10-16). The list filters on `onTextChanged`.
+                    autoAccept: false
+                    Accessible.name: L10n.i18nc("@info accessible", "Search conversations")
+                    QQC2.ToolTip.visible: search.hovered && search.text === ""
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    QQC2.ToolTip.text: page.searchKeys !== "" ? L10n.i18nc("@info:tooltip, %1 a keyboard shortcut", "Search conversations (%1)", page.searchKeys) : L10n.i18nc("@info:tooltip", "Search conversations")
+                    // The chats are filtered at once; the messages are searched 200 ms after the
+                    // last key (an empty field ends the search at once).
+                    onTextChanged: {
+                        // (While the chip stands the chats are not filtered: their part is empty.)
+                        App.setSearch(page.chipShown ? "" : text);
+                        if (text.trim() === "") {
+                            searchDelay.stop();
+                            App.closeSearch();
+                        } else {
+                            searchDelay.restart();
+                        }
+                    }
+                    // Down goes from a query into the list: its first chat, or the first hit when no
+                    // chat matches (Enter is the quick switch and does nothing then).
+                    Keys.onDownPressed: event => {
+                        event.accepted = search.text.trim() !== "" && page.enterList();
+                    }
+                    // Escape empties the field, takes the chip off and closes the search (the list as
+                    // without a query); with nothing to end it passes on as before. Backspace in an
+                    // empty field takes the chip off.
+                    Keys.onEscapePressed: event => {
+                        event.accepted = page.endSearch();
+                    }
+                    Keys.onPressed: event => {
+                        if (event.key === Qt.Key_Backspace && search.text === "" && page.chipShown && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+                            page.removeChip();
+                            event.accepted = true;
+                        }
+                    }
+                    // The quick switch: type a name, Enter opens the first chat that matches, and
+                    // the keyboard goes on to the message. The window empties the field once the
+                    // chat opens (`MainWindow.switchTo`): kept when the switch is not made (it
+                    // asks "Stop Linking?" first and the answer is "Continue Linking").
+                    onAccepted: {
+                        // (No quick switch in a one-chat search: no chat shows.)
+                        const id = page.chipShown ? 0 : App.conversationAt(0);
+                        if (id !== 0) {
+                            page.switchedByKeyboard(id);
+                        }
+                    }
+                    Layout.fillWidth: true
+
+                    Timer {
+                        id: searchDelay
+
+                        interval: 200
+                        onTriggered: page.runSearch()
                     }
                 }
+                // `.*`: the text is a regular expression. `Aa`: case matters (only with `.*`).
+                QQC2.ToolButton {
+                    id: regexButton
+
+                    objectName: "search-regex"
+                    checkable: true
+                    checked: page.regexOn
+                    text: ".*"
+                    font: Kirigami.Theme.fixedWidthFont
+                    Accessible.name: L10n.i18nc("@info accessible", "Regular Expression")
+                    Accessible.description: L10n.i18nc("@info accessible", "Search messages by a regular expression")
+                    QQC2.ToolTip.visible: regexButton.hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    QQC2.ToolTip.text: L10n.i18nc("@info:tooltip", "Regular Expression")
+                    onToggled: {
+                        page.regexOn = regexButton.checked;
+                        page.modeChanged();
+                    }
+                }
+                QQC2.ToolButton {
+                    id: matchCaseButton
+
+                    objectName: "search-match-case"
+                    checkable: true
+                    checked: page.matchCase
+                    enabled: page.regexOn
+                    text: "Aa"
+                    Accessible.name: L10n.i18nc("@info accessible", "Match Case")
+                    QQC2.ToolTip.visible: matchCaseButton.hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    QQC2.ToolTip.text: page.regexOn ? L10n.i18nc("@info:tooltip", "Match Case") : L10n.i18nc("@info:tooltip", "Match Case (turn on Regular Expression first)")
+                    onToggled: {
+                        page.matchCase = matchCaseButton.checked;
+                        page.modeChanged();
+                    }
+                }
+            }
+            // The pattern's problem and where, under the field; "Save as Filter" for a valid one.
+            QQC2.Label {
+                objectName: "search-regex-error"
+                visible: !App.archiveShown && page.regexError !== ""
+                text: page.regexError
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: Style.readable(Kirigami.Theme.negativeTextColor, Kirigami.Theme.backgroundColor)
+                Accessible.role: Accessible.StaticText
+                Accessible.name: page.regexError
                 Layout.fillWidth: true
+                Layout.leftMargin: Kirigami.Units.smallSpacing
+            }
+            QQC2.Button {
+                id: saveFilterButton
+
+                objectName: "search-save-filter"
+                visible: !App.archiveShown && page.canSaveFilter
+                text: L10n.i18nc("@action:button", "Save as Filter")
+                icon.name: "view-filter"
+                Accessible.name: L10n.i18nc("@action:button", "Save as Filter")
+                Layout.alignment: Qt.AlignRight
+                onClicked: page.saveAsFilter()
             }
             AccountBanner {
                 id: banner
@@ -273,12 +798,21 @@ Kirigami.ScrollablePage {
         }
     }
 
+    // Save as Filter (R5): the filter dialog, opened with the search pattern in Message text.
+    FilterDialog {
+        id: saveFilterDialog
+
+        objectName: "saveFilterDialog"
+        parent: QQC2.Overlay.overlay
+    }
+
     ListView {
         id: list
 
-        // The list is one tab stop (not a stop per chat): Up, Down, Page Up, Page Down, Home
-        // and End move the current row, Enter or Space opens it. No row is current until
-        // the keyboard moves into the list.
+        // The list is one tab stop (not a stop per chat): Up and Down move the current row (the
+        // list's own keys), Page Up, Page Down, Home and End move it over the chats AND the hits
+        // (`pageKey`: a ListView handles the arrows only), Enter or Space opens it. No row is
+        // current until the keyboard moves into the list.
         function openCurrent(): void {
             // Only the list's own keyboard: the Return that the search field passes on after
             // the quick switch opened its chat is not the list's, and must not open the
@@ -296,7 +830,8 @@ Kirigami.ScrollablePage {
             page.openMenu(list.currentItem as ConversationDelegate, -1, -1);
         }
 
-        model: page.rowsShown ? App.conversations : null
+        // (No chats while a one-chat search stands: only its hits show.)
+        model: page.rowsShown && !page.chipShown ? App.conversations : null
         currentIndex: -1
         activeFocusOnTab: true
         keyNavigationEnabled: true
@@ -307,6 +842,11 @@ Kirigami.ScrollablePage {
         Keys.onEnterPressed: list.openCurrent()
         Keys.onSpacePressed: list.openCurrent()
         Keys.onMenuPressed: list.currentMenu()
+        // Down past the last chat (or with no chat at all) goes on into the hits of the
+        // message search; the hits take Up and Down themselves and Up from the first comes back.
+        Keys.onDownPressed: event => {
+            event.accepted = page.hitsShown && (list.count === 0 || list.currentIndex === list.count - 1) && page.focusHit(0);
+        }
         // Esc and Alt+Left leave the archive view while the list has the keyboard.
         Keys.onEscapePressed: event => {
             event.accepted = App.archiveShown;
@@ -322,7 +862,9 @@ Kirigami.ScrollablePage {
             }
         }
         Keys.onPressed: event => {
-            if (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
+            if (page.pageKey(event)) {
+                event.accepted = true;
+            } else if (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
                 list.currentMenu();
                 event.accepted = true;
             } else if (event.key === Qt.Key_Left && (event.modifiers & Qt.AltModifier) && App.archiveShown) {
@@ -337,8 +879,16 @@ Kirigami.ScrollablePage {
         topMargin: Kirigami.Units.smallSpacing
         bottomMargin: Kirigami.Units.smallSpacing
 
-        // The way into the archive: the last row, its own stop of the keyboard (below).
-        footer: page.entryShown ? archiveEntryComponent : null
+        // More hits of the message search as the end of the list comes near.
+        // (Later, outside the change that caused it: a page asked inside a layout pass changed
+        // `loading` under the bindings that were being worked out.)
+        onContentYChanged: Qt.callLater(page.moreHitsSoon)
+        onContentHeightChanged: Qt.callLater(page.moreHitsSoon)
+
+        // The way into the archive: the last row, its own stop of the keyboard (below). While a
+        // search has hits, the footer holds them instead (the entry never shows with a query).
+        header: page.chatsHeaderShown ? chatsHeaderComponent : null
+        footer: page.hitsShown ? hitsComponent : (page.entryShown ? archiveEntryComponent : null)
 
         delegate: ConversationDelegate {
             id: row
@@ -367,15 +917,29 @@ Kirigami.ScrollablePage {
             anchors.centerIn: parent
             width: parent.width - Kirigami.Units.gridUnit * 2
             // Not while the list's only row is the way into the archive: every chat is archived,
-            // which is no reason to say there is no conversation.
-            visible: page.rowsShown && list.count === 0 && !page.entryShown
+            // which is no reason to say there is no conversation. Nor while the search found
+            // messages: the hits are the list then.
+            visible: page.rowsShown && list.count === 0 && !page.entryShown && !page.hitsShown && emptyList.text !== ""
             icon.name: App.archiveShown ? "archive-insert" : "dialog-messages"
+            // After a capped search with no hit: another round of the search.
+            helpfulAction: Kirigami.Action {
+                visible: page.cappedEmpty
+                enabled: visible
+                text: L10n.i18nc("@action:button", "Search Further")
+                icon.name: "edit-find"
+                onTriggered: App.moreSearch()
+            }
             text: {
                 if (App.archiveShown) {
                     return L10n.i18nc("@info:placeholder", "No archived chats");
                 }
-                if (emptyList.query !== "") {
-                    return L10n.i18nc("@info:placeholder, %1 what was searched for", "No chats match “%1”", Style.plain(emptyList.query));
+                if (emptyList.query !== "" || page.chipShown) {
+                    // The messages are searched too: nothing is said until that search answered
+                    // this text (no "No chats match" that turns into hits a moment later).
+                    if (page.cappedEmpty) {
+                        return L10n.i18nc("@info:placeholder", "Kourier looked through many messages and found none yet.");
+                    }
+                    return page.noResults ? L10n.i18nc("@info:placeholder, %1 what was searched for", "No results for “%1”", Style.plain(emptyList.query)) : "";
                 }
                 switch (emptyList.phase) {
                 case "waiting":
@@ -392,8 +956,12 @@ Kirigami.ScrollablePage {
                 }
             }
             explanation: {
-                if (App.archiveShown || emptyList.query !== "") {
+                if (App.archiveShown) {
                     return "";
+                }
+                if (emptyList.query !== "" || page.chipShown) {
+                    // While the index fills, why there may be more later.
+                    return page.noResults && !App.searchResults.indexReady ? page.indexLine : "";
                 }
                 switch (emptyList.phase) {
                 case "waiting":
@@ -466,6 +1034,96 @@ Kirigami.ScrollablePage {
                     Layout.alignment: Qt.AlignVCenter
                 }
             }
+        }
+    }
+
+    // "Chats" above the chats that match while "Messages" shows (R3 F8, V10).
+    Component {
+        id: chatsHeaderComponent
+
+        Kirigami.ListSectionHeader {
+            width: list.width
+            text: L10n.i18nc("@title:group the chats that match a search", "Chats")
+            focusPolicy: Qt.NoFocus
+        }
+    }
+
+    // The footer of the list while a search has hits: "Messages" and the hits, newest first. A
+    // hit opens its chat at the message; the list stays as it is.
+    Component {
+        id: hitsComponent
+
+        Column {
+            id: hitsColumn
+
+            width: list.width
+            objectName: "search-hits"
+            // The section is a list of its own for a screen reader (the footer of the chats' list).
+            Accessible.role: Accessible.List
+            Accessible.name: L10n.i18nc("@info accessible, the hits of a search in the messages", "Messages")
+
+            Kirigami.ListSectionHeader {
+                width: hitsColumn.width
+                text: L10n.i18nc("@title:group the hits of a search in the messages", "Messages")
+                focusPolicy: Qt.NoFocus
+            }
+            // The index still fills: older messages may add hits later (the line moves by itself).
+            QQC2.Label {
+                objectName: "search-index-line"
+                width: hitsColumn.width - Kirigami.Units.largeSpacing * 2
+                x: Kirigami.Units.largeSpacing
+                visible: !App.searchResults.indexReady
+                text: page.indexLine
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                bottomPadding: Kirigami.Units.smallSpacing
+                color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            Repeater {
+                id: hitRepeater
+
+                model: App.searchResults
+                Component.onCompleted: page.hitRows = hitRepeater
+                Component.onDestruction: {
+                    if (page.hitRows === hitRepeater) {
+                        page.hitRows = null;
+                    }
+                }
+
+                delegate: SearchResultDelegate {
+                    id: hit
+
+                    width: hitsColumn.width
+                    oneChat: page.chipShown
+                    onClicked: page.openSearchHit(hit.conversationId, hit.message)
+                    Keys.onPressed: event => {
+                        event.accepted = page.pageKey(event);
+                    }
+                    // The hits are rows of the list for the keyboard: Up and Down move between
+                    // them (Up from the first goes back to the chats), Enter opens one as Space does.
+                    Keys.onDownPressed: page.focusHit(hit.index + 1)
+                    Keys.onUpPressed: {
+                        if (hit.index === 0) {
+                            page.leaveHits(hit);
+                        } else {
+                            page.focusHit(hit.index - 1);
+                        }
+                    }
+                    Keys.onReturnPressed: hit.clicked()
+                    Keys.onEnterPressed: hit.clicked()
+                    // Escape gives the keyboard back to the field (the next Escape clears).
+                    Keys.onEscapePressed: event => {
+                        hit.focus = false;
+                        search.forceActiveFocus(Qt.BacktabFocusReason);
+                        event.accepted = true;
+                    }
+                }
+            }
+            // (A page that came while the end was in view: the next one once it is read.)
+            readonly property bool idle: !App.searchResults.loading
+            onIdleChanged: Qt.callLater(page.moreHitsSoon)
         }
     }
 

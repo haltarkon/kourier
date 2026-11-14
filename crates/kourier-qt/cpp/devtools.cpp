@@ -1,6 +1,8 @@
 #include "kourier-qt/cpp/devtools.h"
 
 #include <QtCore/QList>
+#include <QtCore/QVariant>
+#include <QtCore/QVariantMap>
 #include <QtCore/QStringList>
 #include <QtCore/QPair>
 #include <QtGui/QCursor>
@@ -16,6 +18,7 @@
 #include <QtCore/QByteArray>
 #include <QtCore/QtGlobal>
 
+#include <algorithm>
 #include <optional>
 #include <utility>
 
@@ -242,6 +245,117 @@ void recolorLinks(QTextDocument* doc, const QColor& color, const QColor& ink)
     }
 }
 } // namespace
+
+namespace {
+const char* const MarksProperty = "kourierMarks";
+
+// Gives each mark of `marks` (a list of {start, len, color}) a background in `doc`, in document
+// positions of the text shown. What an earlier call marked is cleared first (the ranges are kept
+// on the document), so a filter change touches the formats only, never the html.
+void markDocument(QTextDocument* doc, const QVariantList& marks)
+{
+    doc->setUndoRedoEnabled(false);
+    const int last = std::max(0, doc->characterCount() - 1);
+    auto paint = [&](int start, int len, const QBrush& brush) {
+        const int from = std::clamp(start, 0, last);
+        const int to = std::clamp(start + len, 0, last);
+        if (to <= from) {
+            return;
+        }
+        QTextCursor cursor(doc);
+        cursor.setPosition(from);
+        cursor.setPosition(to, QTextCursor::KeepAnchor);
+        QTextCharFormat format;
+        format.setBackground(brush);
+        cursor.mergeCharFormat(format);
+    };
+    const QVariantList before = doc->property(MarksProperty).toList();
+    for (const QVariant& old : before) {
+        const QVariantMap m = old.toMap();
+        paint(m.value(QStringLiteral("start")).toInt(), m.value(QStringLiteral("len")).toInt(), QBrush(Qt::NoBrush));
+    }
+    QVariantList kept;
+    for (const QVariant& v : marks) {
+        const QVariantMap m = v.toMap();
+        const QColor color(m.value(QStringLiteral("color")).toString());
+        if (!color.isValid()) {
+            continue;
+        }
+        paint(m.value(QStringLiteral("start")).toInt(), m.value(QStringLiteral("len")).toInt(), QBrush(color));
+        kept.append(m);
+    }
+    doc->setProperty(MarksProperty, kept);
+}
+} // namespace
+
+void applyMarks(QObject* textDocument, const QVariant& marks)
+{
+    auto* quickDoc = qobject_cast<QQuickTextDocument*>(textDocument);
+    QTextDocument* doc = quickDoc != nullptr ? quickDoc->textDocument() : nullptr;
+    if (doc == nullptr) {
+        return;
+    }
+    markDocument(doc, marks.toList());
+}
+
+QString richTextMarked(const QString& html, const QVariant& marks, const QColor& color, const QColor& ink)
+{
+    QTextDocument doc;
+    doc.setHtml(html);
+    markDocument(&doc, marks.toList());
+    recolorLinks(&doc, color, ink);
+    QStringList lines;
+    for (QTextBlock block = doc.begin(); block.isValid(); block = block.next()) {
+        for (auto it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            const QBrush bg = fragment.charFormat().background();
+            if (bg.style() != Qt::NoBrush) {
+                lines.append(QStringLiteral("%1 %2 %3 %4")
+                                 .arg(fragment.position())
+                                 .arg(fragment.length())
+                                 .arg(bg.color().name(QColor::HexArgb), fragment.charFormat().foreground().color().name()));
+            }
+        }
+    }
+    return lines.join(QLatin1Char('\n'));
+}
+
+QString markedNameHtml(const QString& shown, const QString& whole, const QVariant& marks, const QColor& surface)
+{
+    // `shown` is the name as the label draws it (cut by TextMetrics, with an ellipsis when it was cut),
+    // `whole` the name the marks (UTF-16 units) were made for. A mark is clipped to the part of `shown`
+    // that is the name's own; the ellipsis is not marked.
+    const int shownSize = static_cast<int>(shown.size());
+    const int own = shown == whole ? shownSize : std::max(0, shownSize - 1);
+    QString out;
+    int at = 0;
+    QList<QVariantMap> sorted;
+    for (const QVariant& v : marks.toList()) {
+        sorted.append(v.toMap());
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const QVariantMap& a, const QVariantMap& b) {
+        return a.value(QStringLiteral("start")).toInt() < b.value(QStringLiteral("start")).toInt();
+    });
+    for (const QVariantMap& m : std::as_const(sorted)) {
+        const int start = std::max(at, m.value(QStringLiteral("start")).toInt());
+        const int end = std::min(own, m.value(QStringLiteral("start")).toInt() + m.value(QStringLiteral("len")).toInt());
+        QColor color(m.value(QStringLiteral("color")).toString());
+        if (start >= end || !color.isValid()) {
+            continue;
+        }
+        // Over the surface, opaque: rich text takes plain `#rrggbb`.
+        const qreal a = color.alphaF();
+        const QColor flat = QColor::fromRgbF(color.redF() * a + surface.redF() * (1 - a),
+                                             color.greenF() * a + surface.greenF() * (1 - a),
+                                             color.blueF() * a + surface.blueF() * (1 - a));
+        out += shown.mid(at, start - at).toHtmlEscaped();
+        out += QStringLiteral("<span style=\"background-color:%1\">").arg(flat.name())
+            + shown.mid(start, end - start).toHtmlEscaped() + QStringLiteral("</span>");
+        at = end;
+    }
+    out += shown.mid(at).toHtmlEscaped();
+    return out;
+}
 
 void colorLinks(QObject* textDocument, const QColor& color, const QColor& ink)
 {

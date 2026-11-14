@@ -358,6 +358,8 @@ async fn tail_of_a_big_link() {
     let mut cfg = CoreConfig::new(
         data.join("core.db"),
         kourier_db::DbKey::from(CORE_KEY),
+        // search.db has a key of its own (a test one).
+        kourier_db::DbKey::from([0x5e; 32]),
         networks,
         Arc::new(DirVault::new(&data)),
         Arc::new(SystemClock),

@@ -44,16 +44,16 @@ pub use contact::{
 };
 pub use content::{
     AskFailure, Attachment, AttachmentKind, AttachmentMeta, AttachmentState, BlobKey, BlobRef,
-    Body, ContactCard, Deletion, DisappearKind, Expiry, Location, Message, Origin, Placeholder,
-    Poll, QuoteSnapshot, ReplyTo, SystemEvent,
+    Body, ContactCard, Deletion, DisappearKind, Expiry, Location, Message, ModelFacts, Origin,
+    Placeholder, Poll, QuoteSnapshot, ReplyTo, SystemEvent,
 };
 pub use conversation::{ConvKind, Conversation, ConversationChange, ConversationPatch};
 pub use error::{BackendError, ErrorKind, PersistError};
 pub use features::{
-    AccountCaps, CannotSend, CleanedPictures, ConversationFeatures, EditTarget, FileAlbum,
-    FileLimits, FilePacking, FilePlan, FormatKind, GroupActions, GroupInfo, GroupInviteAction,
-    GroupInvites, HistoryReadState, HistorySource, LoginFlow, NetworkDescriptor, OutboxPolicy,
-    PlanFile, RiskNotice, ServerRules, Support, TimerRange, TypingPolicy, Window,
+    AccountCaps, CannotSend, ChatExport, CleanedPictures, ConversationFeatures, EditTarget,
+    FileAlbum, FileLimits, FilePacking, FilePlan, FormatKind, GroupActions, GroupInfo,
+    GroupInviteAction, GroupInvites, HistoryReadState, HistorySource, LoginFlow, NetworkDescriptor,
+    OutboxPolicy, PlanFile, RiskNotice, ServerRules, Support, TimerRange, TypingPolicy, Window,
 };
 pub use ids::{
     AccountId, AccountUuid, AttachmentId, BackendBlob, CmdId, ContactId, ConvKey, ConversationId,

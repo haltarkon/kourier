@@ -7,8 +7,11 @@
 //! `kourier_viewmodel::i18n` after it returned, with one exception KI18n needs: a plural takes
 //! its count to choose the form, and KI18n writes that count into `%1` itself.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use cxx_qt_lib::{QQmlApplicationEngine, QString, QStringList};
 use kourier_viewmodel::i18n::{self, DOMAIN, Translator};
@@ -20,9 +23,82 @@ use crate::kde_ffi::qt;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KdeTranslator;
 
+/// The most answers [`TRANSLATIONS`] keeps: the program's literals are a few thousand at the
+/// most; a full cache is cleared (`trc("", variable)` is the one lookup that is not a literal).
+const CACHE_MAX: usize = 4096;
+
+/// The answers of [`KdeTranslator::translate`] by context, then message: KI18n made three
+/// allocations and a catalog lookup per call, for every UI string on every delegate update
+/// (structs.md #5). A lookup by `&str` allocates nothing but the returned `String`.
+static TRANSLATIONS: Mutex<Cache> = Mutex::new(Cache {
+    by_context: None,
+    entries: 0,
+});
+
+/// Counts the clears: an answer KI18n gave before a clear is not stored after it.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct Cache {
+    by_context: Option<HashMap<String, HashMap<String, String>>>,
+    entries: usize,
+}
+
+/// Forgets every answer: the domain or a locale directory or the languages changed.
+fn clear_cache() {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    let mut cache = TRANSLATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.by_context = None;
+    cache.entries = 0;
+}
+
+/// Tests: how many answers are kept.
+#[doc(hidden)]
+pub fn cache_len() -> usize {
+    TRANSLATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entries
+}
+
+/// Tests: the answer of KI18n itself, bypassing the cache.
+#[doc(hidden)]
+pub fn translate_uncached(context: &str, msgid: &str) -> String {
+    String::from(&qt::translate(DOMAIN, context, msgid))
+}
+
 impl Translator for KdeTranslator {
     fn translate(&self, context: &str, msgid: &str) -> String {
-        String::from(&qt::translate(DOMAIN, context, msgid))
+        let generation = GENERATION.load(Ordering::SeqCst);
+        {
+            let cache = TRANSLATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(hit) = cache
+                .by_context
+                .as_ref()
+                .and_then(|c| c.get(context))
+                .and_then(|m| m.get(msgid))
+            {
+                return hit.clone();
+            }
+        }
+        // KI18n runs outside the lock: a slow first lookup stops no other thread.
+        let answer = translate_uncached(context, msgid);
+        let mut cache = TRANSLATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        if GENERATION.load(Ordering::SeqCst) == generation {
+            if cache.entries >= CACHE_MAX {
+                cache.by_context = None;
+                cache.entries = 0;
+            }
+            let map = cache.by_context.get_or_insert_with(HashMap::new);
+            if map
+                .entry(context.to_owned())
+                .or_default()
+                .insert(msgid.to_owned(), answer.clone())
+                .is_none()
+            {
+                cache.entries += 1;
+            }
+        }
+        answer
     }
 
     fn translate_plural(&self, context: &str, singular: &str, plural: &str, count: u64) -> String {
@@ -41,6 +117,7 @@ impl Translator for KdeTranslator {
 /// load QML themselves may call it too. A translator that is installed already stays.
 pub fn install() {
     qt::set_application_domain(DOMAIN);
+    clear_cache();
     // A run that is not installed finds the catalogs `cargo xtask i18n build` wrote (debug
     // builds only: an installed application reads the system's `share/locale`).
     #[cfg(debug_assertions)]
@@ -64,6 +141,7 @@ pub fn setup_engine(engine: Pin<&mut QQmlApplicationEngine>) {
 #[doc(hidden)]
 pub fn add_catalog_dir(dir: &Path) {
     qt::add_locale_dir(DOMAIN, &QString::from(dir.to_string_lossy().as_ref()));
+    clear_cache();
 }
 
 /// Tests: the languages KI18n translates into, best first.
@@ -74,4 +152,5 @@ pub fn set_languages(languages: &[&str]) {
         list.append(QString::from(*language));
     }
     qt::set_languages(&list);
+    clear_cache();
 }

@@ -103,9 +103,64 @@ fn common_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Frees what `conn` keeps only for speed: its page cache (`sqlite3_db_release_memory`, the
+/// same as `PRAGMA shrink_memory`) and its cached prepared statements. Nothing durable is
+/// touched and the connection answers as before; the next reads fill the cache again. A failure
+/// is logged at debug level (no path, no name).
+pub fn release_memory(conn: &Connection) {
+    conn.flush_prepared_statement_cache();
+    if let Err(e) = conn.release_memory() {
+        tracing::debug!(error = %e, "releasing a connection's memory failed");
+    }
+}
+
+/// `SQLITE_DBSTATUS_CACHE_USED` of `conn` in bytes: what its page caches hold now. For the tests
+/// of [`release_memory`] and of the backends' dispatch to it; nothing in a build reads it.
+#[doc(hidden)]
+pub fn cache_used(conn: &Connection) -> i64 {
+    let (mut current, mut high) = (0_i32, 0_i32);
+    // SAFETY: `handle()` is the open connection `conn` borrows for this call, and the two
+    // out-pointers are live locals; the call only reads counters.
+    let rc = unsafe {
+        libsqlite3_sys::sqlite3_db_status(
+            conn.handle(),
+            libsqlite3_sys::SQLITE_DBSTATUS_CACHE_USED,
+            &raw mut current,
+            &raw mut high,
+            0,
+        )
+    };
+    assert_eq!(rc, libsqlite3_sys::SQLITE_OK, "sqlite3_db_status");
+    i64::from(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_gives_the_page_cache_back_and_the_file_still_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.db"), &DbKey::from([5; 32])).unwrap();
+        conn.execute_batch("CREATE TABLE t(x BLOB);").unwrap();
+        for _ in 0..200 {
+            conn.execute("INSERT INTO t VALUES (zeroblob(4000))", [])
+                .unwrap();
+        }
+        let n: i64 = conn
+            .query_row("SELECT sum(length(x)) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 800_000);
+        let full = cache_used(&conn);
+        assert!(full > 100_000, "the reads filled the cache: {full}");
+        release_memory(&conn);
+        let after = cache_used(&conn);
+        assert!(after < full / 4, "the cache went back: {full} -> {after}");
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 200, "it still answers");
+    }
 
     fn key(b: u8) -> DbKey {
         DbKey::from([b; 32])

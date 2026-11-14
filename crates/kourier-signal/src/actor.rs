@@ -859,6 +859,8 @@ impl<T: SignalTransport> Actor<T> {
             Command::DismissHistoryTransfer => crate::transfer::dismiss_stored(&self.shared),
             Command::NetworkChanged => self.hint(Nudge::NetworkChanged),
             Command::Resumed => self.hint(Nudge::Resumed),
+            // The connection lives on this thread: released between zones, here.
+            Command::ReleaseMemory => self.shared.db.release_memory(),
             Command::Disconnect => self.disconnect().await,
             Command::StartLogin {
                 flow,
@@ -2871,6 +2873,73 @@ mod removal_tests {
                 if let Some(connection) = actor.connection.take() {
                     let _ = connection.task.await;
                 }
+            })
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    /// `Command::ReleaseMemory` (the window was let go): the actor's own `backend.db`
+    /// connection gives its page cache back, on the thread that owns it, and still answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_command_empties_the_page_cache_of_the_actors_database() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let (ctx, _core) =
+                    kourier_backend_api::AccountContext::new(kourier_backend_api::ContextParams {
+                        account: kourier_model::AccountId(1),
+                        uuid: kourier_model::AccountUuid::new_random(),
+                        start: kourier_backend_api::StartMode::Fresh,
+                        backend_db: dir.path().join("backend.db"),
+                        db_key: kourier_backend_api::DbKey::new([5; 32]),
+                        blob_dir: dir.path().join("blobs"),
+                        net_rt: tokio::runtime::Handle::current(),
+                        cancel: CancellationToken::new(),
+                        clock: Arc::new(kourier_backend_api::SystemClock),
+                        config: kourier_backend_api::BackendConfig::default(),
+                        ui: Default::default(),
+                        local_prefs: Default::default(),
+                    });
+                let mut actor = Actor::start(
+                    ctx,
+                    Arc::new(testing::NoTransport::default()),
+                    Vec::new(),
+                    Vec::new(),
+                    Tuning::default(),
+                )
+                .expect("the actor starts");
+                let db = actor.shared.db.clone();
+                db.zone(|tx| {
+                    tx.execute_batch("CREATE TABLE ram3_probe(x BLOB)")?;
+                    for _ in 0..200 {
+                        tx.execute("INSERT INTO ram3_probe VALUES (zeroblob(4000))", [])?;
+                    }
+                    Ok::<_, kourier_db::Error>(())
+                })
+                .unwrap();
+                let read = |db: &ZoneDb| -> i64 {
+                    db.read(|c| {
+                        let n: i64 =
+                            c.query_row("SELECT sum(length(x)) FROM ram3_probe", [], |r| r.get(0))?;
+                        Ok::<_, kourier_db::Error>(n)
+                    })
+                    .unwrap()
+                };
+                assert_eq!(read(&db), 800_000);
+                let full = db
+                    .read(|c| Ok::<_, kourier_db::Error>(kourier_db::cache_used(c)))
+                    .unwrap();
+                assert!(full > 100_000, "the reads filled the cache: {full}");
+                assert!(actor.command(Command::ReleaseMemory).await.is_none());
+                let after = db
+                    .read(|c| Ok::<_, kourier_db::Error>(kourier_db::cache_used(c)))
+                    .unwrap();
+                assert!(after < full / 4, "the cache went back: {full} -> {after}");
+                assert_eq!(read(&db), 800_000, "the store still answers");
             })
             .await;
     }

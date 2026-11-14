@@ -481,6 +481,10 @@ pub fn hot_statements() -> Vec<(&'static str, String)> {
             ingest::MESSAGES_WITH_LOCAL.to_owned(),
         ),
         ("the original of a quote", query::QUOTE_ORIGINAL.to_owned()),
+        (
+            "the original of a quote, hidden too",
+            query::QUOTE_ORIGINAL_ANY.to_owned(),
+        ),
         ("recount", ingest::RECOUNT.to_owned()),
         ("the read watermark", ingest::READ_UP_TO.to_owned()),
         ("the read position", ingest::READ_BY_POSITION.to_owned()),
@@ -502,11 +506,18 @@ pub fn hot_statements() -> Vec<(&'static str, String)> {
 /// What a write of the [`IngestHarness`] wants announced (§8.7), before the focus rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Announced {
-    /// The messages to notify, in order.
+    /// The messages to notify, in order (a muted chat's candidates are in [`Self::muted`]
+    /// instead: the runtime drops them while no filter watches the muted chats).
     pub notify: Vec<kourier_model::MessageId>,
     /// How many rows count towards the catch-up summary instead (missed calls that wait for
     /// it included).
     pub catch_up: usize,
+    /// The candidates of muted chats (`Notification::muted`): announced only when a filter
+    /// with "Also in muted chats" may want them.
+    pub muted: Vec<kourier_model::MessageId>,
+    /// The caught-up messages by id, in order (what the summary carries while a filter has
+    /// Notify).
+    pub catch_up_ids: Vec<(kourier_model::ConversationId, kourier_model::MessageId)>,
     /// The rows that changed.
     pub changed: Vec<kourier_model::MessageId>,
     /// The conversation rows that changed (`UiEvent::ConversationsChanged`).
@@ -516,8 +527,22 @@ pub struct Announced {
 impl Announced {
     fn of(ch: &Changes) -> Self {
         Self {
-            notify: ch.notify.iter().map(|n| n.message).collect(),
-            catch_up: ch.catch_up.len() + ch.held_calls.len(),
+            // (As the runtime sees it with no filter watching the muted chats: a muted chat's
+            // candidate is listed under `muted` and dropped from `notify`, held lines too.)
+            notify: ch
+                .notify
+                .iter()
+                .filter(|n| !n.muted)
+                .map(|n| n.message)
+                .collect(),
+            catch_up: ch.catch_up.len() + ch.held_calls.iter().filter(|c| !c.muted).count(),
+            muted: ch
+                .notify
+                .iter()
+                .filter(|n| n.muted)
+                .map(|n| n.message)
+                .collect(),
+            catch_up_ids: ch.catch_up_ids.clone(),
             changed: ch.messages.values().flatten().copied().collect(),
             conversations: ch.conversations.iter().copied().collect(),
         }
@@ -556,6 +581,11 @@ impl Started {
 /// tests of §4.9 and §10.1).
 pub struct IngestHarness {
     conn: Connection,
+    /// search.db (its writer) and a read-only core.db, as the search task holds them (G1).
+    search: crate::search::index::Files,
+    search_paths: crate::search::file::Paths,
+    /// Why the harness's open built search.db again, if it did.
+    search_judged: Option<crate::search::file::Rebuild>,
     account: AccountId,
     scope: MsgIdScope,
     history_read: kourier_model::HistoryReadState,
@@ -601,8 +631,20 @@ impl IngestHarness {
                 id
             }
         };
+        // search.db is made now, with the core.db the harness starts from (as the search task
+        // makes it at the first `UiReady`): the rows written later go through the log.
+        let search_paths = crate::search::file::Paths {
+            core: path.to_owned(),
+            core_key: key.clone(),
+            search: crate::search::file::beside(path),
+            search_key: key.clone(),
+        };
+        let (search, search_judged) = crate::search::index::Files::open(&search_paths)?;
         Ok(Self {
             conn,
+            search,
+            search_paths,
+            search_judged,
             account,
             scope,
             history_read: kourier_model::HistoryReadState::Known,
@@ -689,6 +731,7 @@ impl IngestHarness {
         for (_, ch) in crate::calls::sweep(&mut self.conn, self.now, &|_| true)? {
             let one = Announced::of(&ch);
             out.notify.extend(one.notify);
+            out.muted.extend(one.muted);
             out.catch_up += one.catch_up;
             out.changed.extend(one.changed);
             out.conversations.extend(one.conversations);
@@ -826,6 +869,32 @@ impl IngestHarness {
     /// A timeline page, as the facade answers it (action flags at the harness clock).
     pub fn timeline(&self, q: &TimelineQuery) -> Result<TimelinePage> {
         query::timeline(&self.conn, q, self.now, true, &Default::default(), None)
+    }
+
+    /// The catch-up summary's read, as the facade answers `Query::CaughtUpMessages`.
+    pub fn caught_up_messages(
+        &self,
+        ids: &[(kourier_model::ConversationId, kourier_model::MessageId)],
+    ) -> Result<Vec<(kourier_model::ConversationId, crate::facade::MessageRow)>> {
+        query::caught_up_messages(&self.conn, ids, self.now)
+    }
+
+    /// The messages `ids` of `conv`, as the facade answers `Query::MessagesByIds` (action flags
+    /// at the harness clock).
+    pub fn messages_by_ids(
+        &self,
+        conv: kourier_model::ConversationId,
+        ids: &[kourier_model::MessageId],
+    ) -> Result<TimelinePage> {
+        query::messages_by_ids(
+            &self.conn,
+            conv,
+            ids,
+            self.now,
+            true,
+            &Default::default(),
+            None,
+        )
     }
 
     /// One conversation, as the facade answers `Query::Conversation` (a hidden one too).
@@ -972,4 +1041,773 @@ impl IngestHarness {
             .map(|(_, ch)| ch.media.len())
             .sum())
     }
+
+    /// Flushes the search log into search.db until nothing is left above `applied`, and prunes
+    /// the log, as the core's search task does (G1b); returns what it did.
+    pub fn search_flush(&mut self) -> Result<search::Flushed> {
+        let done = crate::search::index::flush_all(&mut self.search)?;
+        crate::search::log::prune_all(&self.conn, done.applied)?;
+        Ok(done.into())
+    }
+
+    /// The SECOND TRY of a flush that failed (P2): the whole batch again and, when it fails for
+    /// a reason of one row, id by id with the failing ids skipped; flushes until the log is
+    /// empty, then prunes. The first try is [`Self::search_flush`], which returns the error.
+    pub fn search_flush_retry(&mut self) -> Result<search::Flushed> {
+        let mut sum = crate::search::index::Flushed::default();
+        loop {
+            let one = crate::search::index::flush_retry(
+                &mut self.search,
+                crate::search::index::MAX_BATCH,
+            )?;
+            sum.taken += one.taken;
+            sum.indexed += one.indexed;
+            sum.removed += one.removed;
+            sum.unreadable += one.unreadable;
+            sum.skipped += one.skipped;
+            sum.applied = one.applied;
+            sum.compact_after = one.compact_after;
+            if !one.more {
+                break;
+            }
+        }
+        crate::search::log::prune_all(&self.conn, sum.applied)?;
+        Ok(sum.into())
+    }
+
+    /// ONE flush job of at most `batch` log rows, and its prune (the segment and batch tests);
+    /// between its commit and the prune it passes the task's kill point
+    /// (`FAILPOINT_SEARCH_AFTER_COMMIT`), as the task does.
+    pub fn search_flush_one(&mut self, batch: usize) -> Result<search::Flushed> {
+        let done = crate::search::index::flush(&mut self.search, batch)?;
+        if done.taken > 0 {
+            kourier_db::failpoint::hit(crate::search::index::FAILPOINT_AFTER_COMMIT);
+        }
+        crate::search::log::prune_all(&self.conn, done.applied)?;
+        Ok(done.into())
+    }
+
+    /// ONE flush job whose `between` runs on core.db's writer after the flush read its
+    /// snapshot and before search.db's commit (a change the snapshot does not see), then the
+    /// prune. Without `prune` the log is left as the commit left it.
+    pub fn search_flush_between(
+        &mut self,
+        batch: usize,
+        between: impl FnOnce(&Connection) -> Result<()>,
+        prune: bool,
+    ) -> Result<search::Flushed> {
+        let conn = &self.conn;
+        let mut between = Some(between);
+        let mut failed = None;
+        let done = crate::search::index::flush_with(
+            &mut self.search,
+            batch,
+            crate::search::index::Pass::Whole,
+            &mut || {
+                if let Some(f) = between.take()
+                    && let Err(e) = f(conn)
+                {
+                    failed = Some(e);
+                }
+            },
+        )?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        if prune {
+            crate::search::log::prune_all(&self.conn, done.applied)?;
+        }
+        Ok(done.into())
+    }
+
+    /// THE PRUNE of the log up to `applied` (as the core's Low job runs it); how many rows went.
+    pub fn search_prune(&mut self, applied: i64) -> Result<usize> {
+        crate::search::log::prune_all(&self.conn, applied)
+    }
+
+    /// ONE prune JOB of the log up to `applied` (at most `PRUNE_ROWS` rows, as the core's Low
+    /// job runs it): rows gone and whether more remain at or below `applied` (G1f again).
+    pub fn search_prune_job(&mut self, applied: i64) -> Result<(usize, bool)> {
+        crate::search::log::prune(&self.conn, applied)
+    }
+
+    /// ONE flush job like [`Self::search_flush_one`] but with NO prune: the log stays as the
+    /// commit left it, and the caller prunes in jobs of its own (G1f again).
+    pub fn search_flush_only(&mut self, batch: usize) -> Result<search::Flushed> {
+        Ok(crate::search::index::flush(&mut self.search, batch)?.into())
+    }
+
+    /// ONE backfill batch of at most `batch` rows (G1c).
+    pub fn search_backfill_one(&mut self, batch: usize) -> Result<search::Filled> {
+        crate::search::index::backfill(&mut self.search, batch).map(search::Filled::from)
+    }
+
+    /// Backfill batches of `batch` rows until every row has been read (G1c).
+    pub fn search_backfill_all(&mut self, batch: usize) -> Result<search::Filled> {
+        crate::search::index::backfill_all(&mut self.search, batch).map(search::Filled::from)
+    }
+
+    /// THE REBUILD of search.db (G1c): a new file from core.db as it is now, every row at or
+    /// below `floor`, as a file built again (or the first one of a core.db that has rows).
+    pub fn search_rebuild(&mut self) -> Result<()> {
+        self.search.rebuild(&self.search_paths)
+    }
+
+    /// The search task's open (G1c): search.db closed, opened again and judged against
+    /// core.db; the reason it was built again, if it was.
+    pub fn search_open(&mut self) -> Result<Option<search::Rebuild>> {
+        self.search_open_after(|_| {})
+    }
+
+    /// [`Self::search_open`] with `between` run while no connection to search.db is open (it
+    /// gets the file's path: a test replaces or damages the file there).
+    pub fn search_open_after(
+        &mut self,
+        between: impl FnOnce(&Path),
+    ) -> Result<Option<search::Rebuild>> {
+        let placeholder = crate::search::index::Files {
+            search: Connection::open_in_memory()?,
+            core: Connection::open_in_memory()?,
+        };
+        drop(std::mem::replace(&mut self.search, placeholder));
+        between(&self.search_paths.search);
+        let (files, why) = crate::search::index::Files::open(&self.search_paths)?;
+        self.search = files;
+        Ok(why)
+    }
+
+    /// search.db's writer connection: the raw looks ([`search`]) and the steps of a
+    /// compaction (G1d).
+    pub fn search_db(&self) -> &Connection {
+        &self.search.search
+    }
+
+    /// The same, mutable (a compaction's steps take it).
+    pub fn search_writer(&mut self) -> &mut Connection {
+        &mut self.search.search
+    }
+
+    /// Why [`Self::open`] built search.db again (`None`: it was new, or it belonged).
+    pub fn search_judged(&self) -> Option<search::Rebuild> {
+        self.search_judged
+    }
+
+    /// Where search.db is.
+    pub fn search_path(&self) -> &Path {
+        &self.search_paths.search
+    }
+}
+
+/// A raw look at the search index (G1b, critic H2): what search.db's `messages_fts` holds, read
+/// with FTS5's own `MATCH` and its `%_docsize` table, never through `Query::Search` (whose
+/// query-time rules would hide a row the index still holds). Every word is cut by the index's
+/// own rules first, so a test names a word as a person types it. The functions say which file
+/// they read: `search` is search.db (`IngestHarness::search_db`), `core` is core.db.
+pub mod search {
+    use std::path::{Path, PathBuf};
+
+    use kourier_db::rusqlite::Connection;
+    use kourier_model::{ConversationId, MessageId};
+
+    pub use crate::search::file::Rebuild;
+
+    use crate::error::Result;
+    use crate::search::normalize::normalize;
+    use crate::search::{compact, file, index, log};
+
+    /// What one flush did, counts only.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Flushed {
+        /// Log rows taken.
+        pub taken: usize,
+        /// Rows written into the index.
+        pub indexed: usize,
+        /// Old entries removed (each named by `indexed`).
+        pub removed: usize,
+        /// Rows whose body does not parse.
+        pub unreadable: usize,
+        /// Ids whose write failed and were skipped.
+        pub skipped: usize,
+        /// `applied` after the job.
+        pub applied: i64,
+        /// Whether the log may hold more rows.
+        pub more: bool,
+    }
+
+    impl From<index::Flushed> for Flushed {
+        fn from(f: index::Flushed) -> Self {
+            Self {
+                taken: f.taken,
+                indexed: f.indexed,
+                removed: f.removed,
+                unreadable: f.unreadable,
+                skipped: f.skipped,
+                applied: f.applied,
+                more: f.more,
+            }
+        }
+    }
+
+    /// What one backfill batch did (G1c), counts only.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Filled {
+        /// Rows read.
+        pub looked: usize,
+        /// Rows written into the index.
+        pub indexed: usize,
+        /// Rows whose body does not parse.
+        pub unreadable: usize,
+        /// Rows the index would not take (skipped).
+        pub skipped: usize,
+        /// `floor` after the batch (0: done).
+        pub floor: i64,
+    }
+
+    impl From<index::Filled> for Filled {
+        fn from(f: index::Filled) -> Self {
+            Self {
+                looked: f.looked,
+                indexed: f.indexed,
+                unreadable: f.unreadable,
+                skipped: f.skipped,
+                floor: f.floor,
+            }
+        }
+    }
+
+    /// The search.db beside a core.db ([`crate::search_db_beside`]).
+    pub fn beside(core_db: &Path) -> PathBuf {
+        file::beside(core_db)
+    }
+
+    /// The token of `word` (it must cut to exactly one).
+    fn token(word: &str) -> String {
+        let mut tokens = normalize(word);
+        assert_eq!(tokens.len(), 1, "a test word cuts to one token");
+        tokens.remove(0).text
+    }
+
+    fn ids(search: &Connection, expr: &str) -> Result<Vec<MessageId>> {
+        let mut out: Vec<MessageId> = search
+            .prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1")?
+            .query_map([expr], |r| r.get::<_, i64>(0))?
+            .map(|r| r.map(|rowid| MessageId(rowid & index::ID_MASK)))
+            .collect::<kourier_db::rusqlite::Result<_>>()?;
+        out.sort_unstable_by_key(|m| m.0);
+        Ok(out)
+    }
+
+    /// The messages whose index entry holds the word exactly (`words:"<token>"`).
+    pub fn ids_with(search: &Connection, word: &str) -> Result<Vec<MessageId>> {
+        ids(search, &format!("words:\"{}\"", token(word)))
+    }
+
+    /// The messages whose index entry holds the word under chat `conv`'s token.
+    pub fn ids_with_in(
+        search: &Connection,
+        word: &str,
+        conv: ConversationId,
+    ) -> Result<Vec<MessageId>> {
+        ids(
+            search,
+            &format!("words:\"{}\" AND meta:\"c{}\"", token(word), conv.0),
+        )
+    }
+
+    /// The messages that have an entry in the index (a `%_docsize` row, any hour).
+    pub fn indexed(search: &Connection) -> Result<Vec<MessageId>> {
+        let mut out: Vec<MessageId> = search
+            .prepare("SELECT id FROM messages_fts_docsize")?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .map(|r| r.map(|rowid| MessageId(rowid & index::ID_MASK)))
+            .collect::<kourier_db::rusqlite::Result<_>>()?;
+        out.sort_unstable_by_key(|m| m.0);
+        Ok(out)
+    }
+
+    /// The `indexed` map: (message, rowid) in message order. THE MAP INVARIANT: it names
+    /// exactly the entries `%_docsize` holds, each under its rowid.
+    pub fn indexed_map(search: &Connection) -> Result<Vec<(MessageId, i64)>> {
+        Ok(search
+            .prepare("SELECT message_id, rowid FROM indexed ORDER BY message_id")?
+            .query_map([], |r| Ok((MessageId(r.get(0)?), r.get(1)?)))?
+            .collect::<kourier_db::rusqlite::Result<_>>()?)
+    }
+
+    /// The rowids of `%_docsize`, sorted.
+    pub fn docsize_rowids(search: &Connection) -> Result<Vec<i64>> {
+        Ok(search
+            .prepare("SELECT id FROM messages_fts_docsize ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<kourier_db::rusqlite::Result<_>>()?)
+    }
+
+    /// Asserts THE MAP INVARIANT: `indexed` and `%_docsize` name the same entries.
+    pub fn assert_map_holds(search: &Connection) -> Result<()> {
+        let mut map: Vec<i64> = indexed_map(search)?.into_iter().map(|(_, r)| r).collect();
+        map.sort_unstable();
+        let docsize = docsize_rowids(search)?;
+        assert_eq!(map, docsize, "`indexed` names exactly what the index holds");
+        for (id, rowid) in indexed_map(search)? {
+            assert_eq!(
+                rowid & index::ID_MASK,
+                id.0,
+                "an entry's rowid holds its id"
+            );
+        }
+        Ok(())
+    }
+
+    /// How many rows wait in core.db's log.
+    pub fn queued(core: &Connection) -> Result<usize> {
+        let n: i64 = core.query_row("SELECT count(*) FROM search_queue", [], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// The seqs in core.db's log, in order.
+    pub fn log_seqs(core: &Connection) -> Result<Vec<i64>> {
+        Ok(core
+            .prepare("SELECT seq FROM search_queue ORDER BY seq")?
+            .query_map([], |r| r.get(0))?
+            .collect::<kourier_db::rusqlite::Result<_>>()?)
+    }
+
+    /// The log's position (the last seq it handed out, 0 when none).
+    pub fn position(core: &Connection) -> Result<i64> {
+        log::position(core)
+    }
+
+    /// core.db's epoch.
+    pub fn epoch(core: &Connection) -> Result<String> {
+        log::epoch(core)
+    }
+
+    /// Writes a new epoch into core.db (what a wholesale rewrite of the rows would do).
+    pub fn new_epoch(core: &Connection) -> Result<()> {
+        log::new_epoch(core)
+    }
+
+    /// core.db's compaction ask (`compact_after`, a log position).
+    pub fn compact_after(core: &Connection) -> Result<i64> {
+        log::number(core, "compact_after")
+    }
+
+    /// Asks for a compaction as a clear does ([`log::ask_now`]).
+    pub fn ask_now(core: &Connection) -> Result<()> {
+        log::ask_now(core)
+    }
+
+    /// How many segments the index has (each segment has at least one row in `%_idx`).
+    pub fn segments(search: &Connection) -> Result<usize> {
+        let n: i64 = search.query_row(
+            "SELECT count(DISTINCT segid) FROM messages_fts_idx",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// A number of search.db's `meta` (`applied`, `floor`, `top`, `dead`, `dead_since`,
+    /// `compacted_for`, `checkpoint_due`, `version`, `norm`); 0 when absent.
+    pub fn meta(search: &Connection, key: &str) -> Result<i64> {
+        file::meta(search, key)
+    }
+
+    /// Sets a number of `meta` (a file of another version, a clock ahead).
+    pub fn set_meta(search: &Connection, key: &str, value: i64) -> Result<()> {
+        file::set_meta(search, key, value)
+    }
+
+    /// The version of search.db's schema in this build.
+    pub const SEARCH_FILE_VERSION: i64 = file::SEARCH_FILE_VERSION;
+
+    /// The rowid a message has in the index (`hour << 36 | id`).
+    pub fn rowid_of(sort_key: i64, id: MessageId) -> Option<i64> {
+        index::rowid_of(sort_key, id.0)
+    }
+
+    /// The backfill's progress: `(ready, percent)`.
+    pub fn progress(search: &Connection) -> Result<(bool, u8)> {
+        file::progress(search)
+    }
+
+    /// FTS5's own check of the index (`integrity-check`; a contentless table checks the
+    /// index alone).
+    pub fn integrity_check(search: &Connection) -> Result<()> {
+        search.execute(
+            "INSERT INTO messages_fts(messages_fts, rank) VALUES ('integrity-check', 0)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The version of the token rules of this build.
+    pub const NORMALIZER_VERSION: u32 = crate::search::NORMALIZER_VERSION;
+
+    /// The token of `word` as the index holds it (it must cut to exactly one).
+    pub fn token_of(word: &str) -> String {
+        token(word)
+    }
+
+    /// Whether a compaction is due (G1d).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Due {
+        /// Not now; `at`: when the 24 hour rule falls due (the core's clock, ms).
+        Not { at: Option<i64> },
+        /// Due.
+        Now,
+    }
+
+    /// [`Due`] at `now_ms`, given core.db's `compact_after` (notes `dead_since` the first time
+    /// `dead` is above 0, and moves one ahead of the clock back to it).
+    pub fn due(search: &Connection, compact_after: i64, now_ms: i64) -> Result<Due> {
+        Ok(match compact::due(search, compact_after, now_ms)? {
+            compact::Due::Not { at } => Due::Not { at },
+            compact::Due::Now => Due::Now,
+        })
+    }
+
+    /// The start of a compaction: its snapshot of `dead`.
+    pub fn begin(search: &Connection) -> Result<i64> {
+        compact::begin(search)
+    }
+
+    /// One step of a compaction; whether it did work.
+    pub fn step(search: &mut Connection) -> Result<bool> {
+        compact::step(search)
+    }
+
+    /// The end of a compaction that began with `snapshot`, answering `asked`, at `started_ms`.
+    pub fn finish(
+        search: &mut Connection,
+        snapshot: i64,
+        asked: i64,
+        started_ms: i64,
+    ) -> Result<()> {
+        compact::finish(search, snapshot, asked, started_ms)
+    }
+
+    /// The truncating checkpoint of search.db; `false` while a reader holds it.
+    pub fn checkpoint(search: &Connection) -> Result<bool> {
+        compact::checkpoint(search)
+    }
+
+    /// What a whole compaction did, counts only.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Compacted {
+        /// Steps that did work.
+        pub steps: usize,
+        /// Whether the truncating checkpoint went through.
+        pub checkpointed: bool,
+    }
+
+    /// A whole compaction in one go, answering `asked`.
+    pub fn compact_all(search: &mut Connection, asked: i64, now_ms: i64) -> Result<Compacted> {
+        let c = compact::compact_all(search, asked, now_ms)?;
+        Ok(Compacted {
+            steps: c.steps,
+            checkpointed: c.checkpointed,
+        })
+    }
+
+    /// The most rows of the index one page of `Query::Search` looks up.
+    pub const CAP: usize = crate::search::query::CAP;
+
+    /// One page of `Query::Search` on search.db and core.db connections, as the core runs it but
+    /// with at most `cap` rows looked up and no time cap; and how many rows it looked up.
+    pub fn page(
+        search: &Connection,
+        core: &Connection,
+        q: &crate::facade::SearchQuery,
+        cap: usize,
+    ) -> Result<(crate::facade::SearchPage, usize)> {
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        crate::search::query::search(search, core, q, cap, far).map(|w| (w.page, w.looked))
+    }
+
+    /// One page of `Query::Search` that must end by `deadline` (a pattern scan reads the clock
+    /// every few hundred rows; a deadline already past gives a `capped` page).
+    pub fn page_by(
+        search: &Connection,
+        core: &Connection,
+        q: &crate::facade::SearchQuery,
+        deadline: std::time::Instant,
+    ) -> Result<crate::facade::SearchPage> {
+        crate::search::query::search(search, core, q, crate::search::query::CAP, deadline)
+            .map(|w| w.page)
+    }
+
+    /// The FTS5 expression a typed text gives (`None`: nothing can match).
+    pub fn match_expr(text: &str, chats: Option<&[ConversationId]>) -> Option<String> {
+        crate::search::query::match_expr(&crate::search::normalize::query_terms(text), chats)
+    }
+
+    /// `EXPLAIN QUERY PLAN` of the search's statements, each on its own file: (name, plan
+    /// lines joined by `|`). The word search's two, and the pattern scan's two (R5).
+    pub fn plans(search: &Connection, core: &Connection) -> Result<Vec<(&'static str, String)>> {
+        use crate::search::pattern::{ID_SCAN, TIMELINE_SCAN};
+        use crate::search::query::{HIT, ROWIDS};
+        let plan = |conn: &Connection,
+                    sql: &str,
+                    params: &[&dyn kourier_db::rusqlite::ToSql]|
+         -> Result<String> {
+            let lines: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                .query_map(params, |r| r.get::<_, String>(3))?
+                .collect::<kourier_db::rusqlite::Result<_>>()?;
+            Ok(lines.join("|"))
+        };
+        Ok(vec![
+            (
+                "rowids",
+                plan(search, ROWIDS, &[&"words:(\"plan\")", &i64::MAX])?,
+            ),
+            ("hit", plan(core, HIT, &[&1_i64])?),
+            ("id_scan", plan(core, ID_SCAN, &[&i64::MAX])?),
+            (
+                "timeline_scan",
+                plan(core, TIMELINE_SCAN, &[&1_i64, &i64::MAX, &i64::MAX])?,
+            ),
+        ])
+    }
+
+    /// The REAL store (its writer thread and its read pools) and the REAL search task
+    /// (`search::index::keep`) on a profile's files, driven on a core clock the caller owns
+    /// (G1f again: what the core's writer pays while the search writer compacts). The jobs
+    /// below go through `Store::write` exactly as the runtime's do (High priority, the account's
+    /// lane), so their latency is queue wait plus run time on the one writer thread. Opens the
+    /// files at `core` and `search::beside(core)` under one key; nothing else may hold
+    /// search.db's writer while it lives.
+    pub struct Task {
+        store: std::sync::Arc<crate::store::Store>,
+        rt: tokio::runtime::Runtime,
+        clock: kourier_backend_api::FakeClock,
+        stop: std::sync::Arc<tokio::sync::Notify>,
+        keeper: Option<std::thread::JoinHandle<()>>,
+        account: kourier_model::AccountId,
+        scope: kourier_model::MsgIdScope,
+    }
+
+    impl Task {
+        /// Opens the store and starts the search task (no backfill delay).
+        pub fn start(
+            core: &Path,
+            key: &kourier_db::DbKey,
+            account: kourier_model::AccountId,
+            scope: kourier_model::MsgIdScope,
+            clock_ms: u64,
+        ) -> Result<Self> {
+            let (store, _) = crate::store::Store::open_with(core, key, &file::beside(core), key)?;
+            let store = std::sync::Arc::new(store);
+            let clock = kourier_backend_api::FakeClock::new(clock_ms);
+            let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+            let keeper = {
+                let (store, clock, stop) = (store.clone(), clock.clone(), stop.clone());
+                std::thread::Builder::new()
+                    .name("search-task".into())
+                    .spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("keeper runtime");
+                        rt.block_on(async {
+                            let clock: std::sync::Arc<dyn kourier_backend_api::Clock> =
+                                std::sync::Arc::new(clock);
+                            tokio::select! {
+                                () = index::keep(
+                                    &store,
+                                    std::time::Duration::ZERO,
+                                    clock,
+                                    || false,
+                                ) => {}
+                                () = stop.notified() => {}
+                            }
+                        });
+                    })
+                    .expect("spawn the search task")
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("caller runtime");
+            Ok(Self {
+                store,
+                rt,
+                clock,
+                stop,
+                keeper: Some(keeper),
+                account,
+                scope,
+            })
+        }
+
+        /// Whether the task has judged (or made) search.db.
+        pub fn ready(&self) -> bool {
+            self.store.search_link().is_ready()
+        }
+
+        /// Moves the core clock forward (the 24 hour rule's time).
+        pub fn advance_clock(&self, d: std::time::Duration) {
+            self.clock.advance(d);
+        }
+
+        /// The `applied` search.db last committed.
+        pub fn applied(&self) -> i64 {
+            self.store.search_link().applied()
+        }
+
+        /// One ingest job (a live envelope's events) on the core's writer; its latency.
+        pub fn ingest(
+            &self,
+            events: Vec<kourier_backend_api::BackendEvent>,
+            now: i64,
+        ) -> Result<std::time::Duration> {
+            let (account, scope) = (self.account, self.scope);
+            let t = std::time::Instant::now();
+            self.rt.block_on(self.store.write(
+                kourier_db::Priority::High,
+                crate::store::lane(account),
+                move |c| {
+                    crate::ingest::apply_events(
+                        c,
+                        account,
+                        scope,
+                        kourier_model::HistoryReadState::Known,
+                        kourier_model::ServerRules::default(),
+                        now,
+                        events,
+                    )
+                    .map(|_| ())
+                },
+            ))?;
+            Ok(t.elapsed())
+        }
+
+        /// One send job (a text queued into `conv`, as `UiCommand::SendText` does); its latency.
+        pub fn send(
+            &self,
+            net: std::sync::Arc<dyn kourier_backend_api::Network>,
+            conv: ConversationId,
+            text: &str,
+            now: i64,
+        ) -> Result<std::time::Duration> {
+            let text = kourier_model::Text::plain(text);
+            let t = std::time::Instant::now();
+            self.rt.block_on(self.store.write(
+                kourier_db::Priority::High,
+                crate::store::lane(self.account),
+                move |c| {
+                    crate::outbox::enqueue_text(c, net.as_ref(), conv, text, None, now).map(|_| ())
+                },
+            ))?;
+            Ok(t.elapsed())
+        }
+
+        /// One read-mark job (`UiCommand::MarkRead`); its latency and whether anything was unread.
+        pub fn mark_read(
+            &self,
+            conv: ConversationId,
+            now: i64,
+        ) -> Result<(std::time::Duration, bool)> {
+            let t = std::time::Instant::now();
+            let some = self.rt.block_on(self.store.write(
+                kourier_db::Priority::High,
+                crate::store::lane(self.account),
+                move |c| crate::local::mark_read(c, conv, now, now, false).map(|m| m.is_some()),
+            ))?;
+            Ok((t.elapsed(), some))
+        }
+
+        /// One `Query::Search` page through the store's own search reader with the production
+        /// time cap; `None` while the index is not ready or a newer search superseded it.
+        pub fn query(
+            &self,
+            q: crate::facade::SearchQuery,
+        ) -> Result<Option<(crate::facade::SearchPage, usize, std::time::Duration)>> {
+            let t = std::time::Instant::now();
+            let got = self.rt.block_on(self.store.search(move |s, c, deadline| {
+                crate::search::query::search(s, c, &q, crate::search::query::CAP, deadline)
+            }))?;
+            Ok(match got {
+                crate::store::Searched::Done(w) => Some((w.page, w.looked, t.elapsed())),
+                _ => None,
+            })
+        }
+
+        /// Ends the task and closes the store.
+        pub fn shutdown(mut self) {
+            self.stop.notify_one();
+            if let Some(k) = self.keeper.take() {
+                let _ = k.join();
+            }
+            self.store.close();
+        }
+    }
+}
+
+/// The synthetic filter mix of the perf runs (`cargo xtask perf --filters <n>`, the filter
+/// timing tests): `n` specs of literal words, alternations of 5 to 20 words, `\d{3,}`, an
+/// address-like pattern and Cyrillic words with `\b`; every 5th also has a sender and a chat
+/// pattern, every 7th matches case, half notify, all highlight. The words are made up
+/// (8 letters), nobody's.
+pub fn filter_mix(n: usize) -> Vec<crate::facade::FilterSpec> {
+    use kourier_model::Redacted;
+    const SWATCHES: [u32; 8] = [
+        0xFFD60A, 0xFF9F0A, 0xFF453A, 0xFF6EB4, 0xBF5AF2, 0x0A84FF, 0x1FC8B4, 0x30D158,
+    ];
+    let pat = |p: String| Some(Redacted::new(p));
+    (0..n)
+        .map(|i| {
+            let text = match i % 6 {
+                0 => filter_mix_word(i, false),
+                1 => {
+                    let words = 5 + (i * 7) % 16;
+                    (0..words)
+                        .map(|k| filter_mix_word(i * 31 + k, false))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                }
+                2 => r"\d{3,}".to_owned(),
+                3 => r"\b\w+@\w+\.\w+\b".to_owned(),
+                4 => format!(
+                    r"\b{}\w*",
+                    filter_mix_word(i, true).chars().take(3).collect::<String>()
+                ),
+                _ => filter_mix_word(i, true),
+            };
+            let wide = i % 5 == 4;
+            crate::facade::FilterSpec {
+                name: Redacted::new(format!("perf filter {i}")),
+                text_pattern: pat(text),
+                sender_pattern: wide.then(|| Redacted::new(r"^\w+".to_owned())),
+                chat_pattern: wide.then(|| Redacted::new(r"\w".to_owned())),
+                match_case: i % 7 == 0,
+                notify: i % 2 == 0,
+                notify_muted: false,
+                highlight: true,
+                colour: SWATCHES[i % SWATCHES.len()],
+            }
+        })
+        .collect()
+}
+
+/// The 8-letter made-up word `k` of [`filter_mix`] (Latin, or Cyrillic when `cyrillic`).
+pub fn filter_mix_word(k: usize, cyrillic: bool) -> String {
+    const LC: [char; 14] = [
+        'b', 'd', 'k', 'l', 'm', 'n', 'p', 'r', 's', 't', 'v', 'z', 'g', 'h',
+    ];
+    const LV: [char; 5] = ['a', 'e', 'i', 'o', 'u'];
+    const CC: [char; 14] = [
+        'б', 'д', 'к', 'л', 'м', 'н', 'п', 'р', 'с', 'т', 'в', 'з', 'г', 'х',
+    ];
+    const CV: [char; 5] = ['а', 'е', 'і', 'о', 'у'];
+    let (c, v) = if cyrillic { (&CC, &CV) } else { (&LC, &LV) };
+    let mut n = k.wrapping_mul(2_654_435_761) % 70_usize.pow(4);
+    let mut out = Vec::with_capacity(8);
+    for _ in 0..4 {
+        out.push(c[(n % 70) / 5]);
+        out.push(v[n % 5]);
+        n /= 70;
+    }
+    out.into_iter().collect()
 }

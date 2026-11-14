@@ -11,7 +11,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use kourier_core::facade::{ConversationRow, MessageRow, Notification as CoreNotification};
+use kourier_core::facade::{
+    ConversationRow, FilterId, FilterSet, FilterTexts, MessageRow, Notification as CoreNotification,
+};
 use kourier_desktop::notifications::{CloseReason, ImageData, InlineReply, Notification, Urgency};
 use kourier_model::{AccountId, ConversationId, MessageId};
 
@@ -29,6 +31,9 @@ pub enum Target {
     Conversation(ConversationId),
     /// The catch-up summary of one account.
     Summary(AccountId),
+    /// The notification a RegExp filter's hit in one conversation made (one per chat AND
+    /// filter, beside the chat's usual notification).
+    Filter(ConversationId, FilterId),
 }
 
 /// A click on a notification: raise the window with `token` and open the conversation.
@@ -38,6 +43,9 @@ pub struct Activation {
     pub target: Target,
     /// The XDG activation token the server sent before the click.
     pub token: Option<String>,
+    /// The message a click opens the chat at: a filter's hit, or the newest match of a
+    /// catch-up summary (`conversation, message`); `None` for a chat's usual notification.
+    pub open: Option<(ConversationId, MessageId)>,
 }
 
 impl std::fmt::Debug for Activation {
@@ -45,6 +53,7 @@ impl std::fmt::Debug for Activation {
         f.debug_struct("Activation")
             .field("target", &self.target)
             .field("token", &self.token.is_some())
+            .field("open", &self.open)
             .finish()
     }
 }
@@ -60,6 +69,16 @@ struct Shown {
     mode: NotificationContent,
 }
 
+/// A filter's notification on screen.
+#[derive(Clone, Debug)]
+struct FilterShown {
+    id: u32,
+    account: AccountId,
+    /// The message that matched, and the revision shown.
+    message: MessageId,
+    revision: u16,
+}
+
 /// Most messages remembered per conversation notification (older ones cannot be told apart
 /// from the newest anyway).
 const MAX_TRACKED: usize = 32;
@@ -73,6 +92,10 @@ const MAX_EXPIRED_TEXT: usize = 64;
 pub struct NotificationBook {
     convs: HashMap<ConversationId, Shown>,
     summaries: HashMap<AccountId, u32>,
+    /// The filters' notifications, one per (chat, filter).
+    filters: HashMap<(ConversationId, FilterId), FilterShown>,
+    /// The newest match of each catch-up summary on screen: what its click opens.
+    summary_open: HashMap<AccountId, (ConversationId, MessageId)>,
     targets: HashMap<u32, Target>,
     tokens: HashMap<u32, String>,
     /// Notifications that EXPIRED while they showed a message's text, as (chat, id), oldest
@@ -175,6 +198,86 @@ impl NotificationBook {
         ids
     }
 
+    /// The id the notification of filter `filter` in `conv` replaces (0 = none shown).
+    pub fn filter_replaces(&self, conv: ConversationId, filter: FilterId) -> u32 {
+        self.filters.get(&(conv, filter)).map_or(0, |s| s.id)
+    }
+
+    /// Records that `id` shows filter `filter`'s hit `message` (revision `revision`) in `conv`;
+    /// the next hit of the same filter in the chat replaces it.
+    pub fn shown_filter(
+        &mut self,
+        conv: ConversationId,
+        filter: FilterId,
+        account: AccountId,
+        message: MessageId,
+        revision: u16,
+        id: u32,
+    ) {
+        if let Some(old) = self.filters.insert(
+            (conv, filter),
+            FilterShown {
+                id,
+                account,
+                message,
+                revision,
+            },
+        ) && old.id != id
+        {
+            self.targets.remove(&old.id);
+            self.tokens.remove(&old.id);
+        }
+        self.targets.insert(id, Target::Filter(conv, filter));
+    }
+
+    /// The filter notifications of `conv`: `(filter, message, revision shown)`.
+    pub fn filter_messages(&self, conv: ConversationId) -> Vec<(FilterId, MessageId, u16)> {
+        self.filters
+            .iter()
+            .filter(|((c, _), _)| *c == conv)
+            .map(|((_, f), s)| (*f, s.message, s.revision))
+            .collect()
+    }
+
+    /// Forgets one filter notification; returns the id to close.
+    pub fn close_filter(&mut self, conv: ConversationId, filter: FilterId) -> Option<u32> {
+        let shown = self.filters.remove(&(conv, filter))?;
+        self.targets.remove(&shown.id);
+        self.tokens.remove(&shown.id);
+        Some(shown.id)
+    }
+
+    /// Forgets every filter notification of `conv` (it was read, or is gone); returns the ids
+    /// to close.
+    pub fn close_filters(&mut self, conv: ConversationId) -> Vec<u32> {
+        let filters: Vec<FilterId> = self
+            .filters
+            .keys()
+            .filter(|(c, _)| *c == conv)
+            .map(|(_, f)| *f)
+            .collect();
+        filters
+            .into_iter()
+            .filter_map(|f| self.close_filter(conv, f))
+            .collect()
+    }
+
+    /// Records the message a click on the summary of `account` opens (its newest match).
+    pub fn set_summary_open(
+        &mut self,
+        account: AccountId,
+        open: Option<(ConversationId, MessageId)>,
+    ) {
+        match open {
+            Some(o) => {
+                self.summary_open.insert(account, o);
+            }
+            None => {
+                self.summary_open.remove(&account);
+            }
+        }
+    }
+
     /// The id the summary of `account` replaces (0 = none shown).
     pub fn summary_replaces(&self, account: AccountId) -> u32 {
         self.summaries.get(&account).copied().unwrap_or(0)
@@ -193,12 +296,18 @@ impl NotificationBook {
 
     /// Conversations with a notification on screen.
     pub fn conversations(&self) -> Vec<ConversationId> {
-        self.convs.keys().copied().collect()
+        let mut convs: Vec<ConversationId> = self.convs.keys().copied().collect();
+        for (c, _) in self.filters.keys() {
+            if !convs.contains(c) {
+                convs.push(*c);
+            }
+        }
+        convs
     }
 
     /// Whether `conv` has a notification on screen.
     pub fn is_tracked(&self, conv: ConversationId) -> bool {
-        self.convs.contains_key(&conv)
+        self.convs.contains_key(&conv) || self.filters.keys().any(|(c, _)| *c == conv)
     }
 
     /// The messages announced for `conv`, with the revision shown.
@@ -247,6 +356,18 @@ impl NotificationBook {
             .into_iter()
             .filter_map(|c| self.close_conversation(c))
             .collect();
+        let filters: Vec<(ConversationId, FilterId)> = self
+            .filters
+            .iter()
+            .filter(|(_, s)| s.account == account)
+            .map(|(k, _)| *k)
+            .collect();
+        ids.extend(
+            filters
+                .into_iter()
+                .filter_map(|(c, f)| self.close_filter(c, f)),
+        );
+        self.summary_open.remove(&account);
         if let Some(id) = self.summaries.remove(&account) {
             self.targets.remove(&id);
             self.tokens.remove(&id);
@@ -257,6 +378,7 @@ impl NotificationBook {
 
     /// Forgets every summary (the user looked at the window); returns the ids to close.
     pub fn close_summaries(&mut self) -> Vec<u32> {
+        self.summary_open.clear();
         let ids: Vec<u32> = self.summaries.drain().map(|(_, id)| id).collect();
         for id in &ids {
             self.targets.remove(id);
@@ -291,6 +413,17 @@ impl NotificationBook {
             }
             Some(Target::Summary(a)) if self.summaries.get(&a) == Some(&id) => {
                 self.summaries.remove(&a);
+                self.summary_open.remove(&a);
+            }
+            Some(Target::Filter(c, f)) if self.filters.get(&(c, f)).is_some_and(|s| s.id == id) => {
+                self.filters.remove(&(c, f));
+                // (A filter's notification always showed text.)
+                if reason == CloseReason::Expired {
+                    self.expired_text.push_back((c, id));
+                    if self.expired_text.len() > MAX_EXPIRED_TEXT {
+                        self.expired_text.pop_front();
+                    }
+                }
             }
             _ => {}
         }
@@ -308,17 +441,133 @@ impl NotificationBook {
     pub fn on_action(&mut self, id: u32, key: &str) -> Option<Activation> {
         let target = *self.targets.get(&id)?;
         let token = self.tokens.remove(&id);
-        (key == kourier_desktop::notifications::DEFAULT_ACTION)
-            .then_some(Activation { target, token })
+        let open = match target {
+            Target::Conversation(_) => None,
+            Target::Summary(a) => self.summary_open.get(&a).copied(),
+            Target::Filter(c, f) => self.filters.get(&(c, f)).map(|s| (c, s.message)),
+        };
+        (key == kourier_desktop::notifications::DEFAULT_ACTION).then_some(Activation {
+            target,
+            token,
+            open,
+        })
     }
 
     /// An inline reply was sent from `id`: the conversation to send it to.
     pub fn on_reply(&self, id: u32) -> Option<ConversationId> {
         match self.targets.get(&id)? {
-            Target::Conversation(c) => Some(*c),
+            Target::Conversation(c) | Target::Filter(c, _) => Some(*c),
             Target::Summary(_) => None,
         }
     }
+}
+
+/// What the RegExp filters decide for one candidate of the core ([`decide`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilterDecision {
+    /// Nothing for the filters to add: the message notifies as usual (or, for a candidate that
+    /// is not muted, as before).
+    Normal,
+    /// A muted chat's candidate that no filter wants: no notification at all.
+    Drop,
+    /// The first matching Notify filter (id and name): its own notification, with the name.
+    Hit(FilterId, String),
+}
+
+/// The filters' verdict on a candidate: `texts` are the three texts of its message, `muted` is
+/// the candidate's flag ([`CoreNotification::muted`]: the chat is muted and only the filters'
+/// watch let the message through), `mode` the content mode of the chat ([`content_mode`]: a
+/// protected chat's is never `NameAndMessage`). Pure: `set` is the compiled set of the core,
+/// whose indices point into [`FilterSet::filters`]; only filters with Notify count, and a
+/// muted candidate only those with "Also in muted chats". The filter's name is shown only in
+/// "Name and message" mode and never in a protected chat (`protected`, whose muted candidates
+/// are dropped and whose texts the caller does not even make). Never logs.
+pub fn decide(
+    set: &FilterSet,
+    texts: &FilterTexts<'_>,
+    muted: bool,
+    protected: bool,
+    mode: NotificationContent,
+) -> FilterDecision {
+    if protected {
+        return if muted {
+            FilterDecision::Drop
+        } else {
+            FilterDecision::Normal
+        };
+    }
+    let hit = set
+        .matches(texts)
+        .filter_map(|i| set.filters().get(i))
+        .find(|f| f.spec.notify && (!muted || f.spec.notify_muted));
+    match hit {
+        None if muted => FilterDecision::Drop,
+        Some(f) if mode == NotificationContent::NameAndMessage => {
+            FilterDecision::Hit(f.id, f.spec.name.expose().clone())
+        }
+        _ => FilterDecision::Normal,
+    }
+}
+
+/// What the catch-up's messages matched: per filter (list order) how many messages, and the
+/// newest matching message (the click on the summary opens it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SummaryMatches {
+    /// `(filter name, how many messages)`, in the filters' list order.
+    pub filters: Vec<(String, u32)>,
+    /// The newest match, `(conversation, message)`.
+    pub newest: Option<(ConversationId, MessageId)>,
+}
+
+/// One caught-up message for [`match_catch_up`].
+pub struct CaughtUp<'a> {
+    /// Its conversation.
+    pub conv: ConversationId,
+    /// Its id.
+    pub message: MessageId,
+    /// The chat is muted (and the message does not mention us in a group).
+    pub muted: bool,
+    /// The chat is protected: never matched.
+    pub protected: bool,
+    /// The three texts.
+    pub texts: FilterTexts<'a>,
+}
+
+/// Matches the caught-up messages (oldest first) against the Notify filters of `set`: a muted
+/// chat counts only for filters with "Also in muted chats", a protected chat never; a message
+/// counts once for each filter it matches. Pure. Never logs.
+pub fn match_catch_up<'a>(
+    set: &FilterSet,
+    messages: impl IntoIterator<Item = CaughtUp<'a>>,
+) -> SummaryMatches {
+    let mut counts = vec![0u32; set.len()];
+    let mut newest = None;
+    for m in messages {
+        if m.protected {
+            continue;
+        }
+        let mut any = false;
+        for i in set.matches(&m.texts) {
+            let Some(f) = set.filters().get(i) else {
+                continue;
+            };
+            if f.spec.notify && (!m.muted || f.spec.notify_muted) {
+                counts[i] = counts[i].saturating_add(1);
+                any = true;
+            }
+        }
+        if any {
+            newest = Some((m.conv, m.message));
+        }
+    }
+    let filters = set
+        .filters()
+        .iter()
+        .zip(counts)
+        .filter(|(_, n)| *n > 0)
+        .map(|(f, n)| (f.spec.name.expose().clone(), n))
+        .collect();
+    SummaryMatches { filters, newest }
 }
 
 /// How long the notification of a conversation rests after it was shown: further messages
@@ -599,6 +848,7 @@ pub fn message_notification(c: MessageContent<'_>) -> Notification {
 }
 
 /// The catch-up summary ("12 new messages in 4 chats"); counts only, so every mode shows it.
+/// The caller adds the filters' matching lines to `text` (only in "Name and message" mode).
 pub fn summary_notification(
     text: &str,
     origin: Option<&str>,
@@ -743,6 +993,7 @@ mod tests {
             request_pending: false,
             features_hash: 0,
             has_draft: false,
+            draft_at: 0,
             hidden: false,
             can_send: true,
             roaming: kourier_core::facade::Roaming::Hidden,
@@ -756,6 +1007,7 @@ mod tests {
             conv: ConversationId(conv),
             message: MessageId(message),
             mentions_me,
+            muted: false,
         }
     }
 
@@ -1173,5 +1425,188 @@ mod tests {
         assert_eq!(n.replaces_id, 3);
         assert!(n.inline_reply.is_none());
         assert_eq!(n.origin_name.as_deref(), Some("Work"));
+    }
+
+    // --- RegExp filters (R4) ---
+
+    use kourier_core::facade::{Filter, FilterSpec, FilterTexts};
+    use kourier_model::Redacted;
+
+    fn filter(id: i64, name: &str, text: &str, notify: bool, muted: bool) -> Filter {
+        Filter {
+            id: FilterId(id),
+            spec: FilterSpec {
+                name: Redacted::new(name.to_owned()),
+                text_pattern: Some(Redacted::new(text.to_owned())),
+                notify,
+                notify_muted: muted,
+                colour: 0xFFD400,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn set(filters: &[Filter]) -> FilterSet {
+        FilterSet::build(filters)
+    }
+
+    fn text(t: &str) -> FilterTexts<'_> {
+        FilterTexts {
+            text: Some(t),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_first_notify_filter_that_matches_names_the_notification() {
+        let s = set(&[
+            filter(1, "Silent", "invoice", false, false),
+            filter(2, "Invoices", "invoice", true, false),
+            filter(3, "Later", "invoice", true, false),
+        ]);
+        assert_eq!(
+            decide(&s, &text("An INVOICE"), false, false, TEXT),
+            FilterDecision::Hit(FilterId(2), "Invoices".into()),
+            "a filter without Notify never names, the first with it does"
+        );
+        assert_eq!(
+            decide(&s, &text("nothing"), false, false, TEXT),
+            FilterDecision::Normal
+        );
+    }
+
+    #[test]
+    fn the_name_is_shown_only_in_name_and_message_mode_and_never_in_a_protected_chat() {
+        let s = set(&[filter(1, "Invoices", "invoice", true, true)]);
+        for mode in [NotificationContent::NameOnly, NotificationContent::Hidden] {
+            assert_eq!(
+                decide(&s, &text("invoice"), false, false, mode),
+                FilterDecision::Normal,
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            decide(&s, &text("invoice"), false, true, TEXT),
+            FilterDecision::Normal,
+            "protected: the normal rules only"
+        );
+        assert_eq!(
+            decide(&s, &text("invoice"), true, true, TEXT),
+            FilterDecision::Drop,
+            "protected and muted: no muted hit"
+        );
+    }
+
+    #[test]
+    fn a_muted_candidate_needs_a_matching_also_in_muted_chats_filter() {
+        let s = set(&[
+            filter(1, "Loud", "invoice", true, false),
+            filter(2, "Everywhere", "invoice", true, true),
+        ]);
+        assert_eq!(
+            decide(&s, &text("invoice"), true, false, TEXT),
+            FilterDecision::Hit(FilterId(2), "Everywhere".into()),
+            "the first filter that may speak in a muted chat"
+        );
+        let only_loud = set(&[filter(1, "Loud", "invoice", true, false)]);
+        assert_eq!(
+            decide(&only_loud, &text("invoice"), true, false, TEXT),
+            FilterDecision::Drop
+        );
+        assert_eq!(
+            decide(&s, &text("other"), true, false, TEXT),
+            FilterDecision::Drop,
+            "a muted message that matches nothing is dropped"
+        );
+        // Muted and matching, but the mode shows no name: it notifies as an ordinary one.
+        assert_eq!(
+            decide(
+                &s,
+                &text("invoice"),
+                true,
+                false,
+                NotificationContent::NameOnly
+            ),
+            FilterDecision::Normal
+        );
+    }
+
+    #[test]
+    fn a_catch_up_counts_per_filter_skips_protected_and_opens_the_newest_match() {
+        let s = set(&[
+            filter(1, "Invoices", "invoice", true, false),
+            filter(2, "Urgent", "urgent", true, true),
+            filter(3, "Quiet", "invoice", false, false),
+        ]);
+        let items = [
+            ("an invoice", 1, 10, false, false),
+            ("urgent invoice", 1, 11, false, false),
+            ("urgent", 2, 12, true, false),
+            ("invoice", 3, 13, true, false),
+            ("invoice urgent", 4, 14, false, true),
+        ];
+        let got = match_catch_up(
+            &s,
+            items.iter().map(|(t, c, m, muted, protected)| CaughtUp {
+                conv: ConversationId(*c),
+                message: MessageId(*m),
+                muted: *muted,
+                protected: *protected,
+                texts: text(t),
+            }),
+        );
+        assert_eq!(
+            got.filters,
+            [("Invoices".to_owned(), 2), ("Urgent".to_owned(), 2)],
+            "muted counts only for Also in muted chats, Quiet has no Notify, protected never"
+        );
+        assert_eq!(
+            got.newest,
+            Some((ConversationId(2), MessageId(12))),
+            "the newest message that matched"
+        );
+        let none = match_catch_up(&s, std::iter::empty());
+        assert_eq!(none, SummaryMatches::default());
+    }
+
+    #[test]
+    fn a_filters_notification_has_its_own_entry_and_both_go_with_the_chat() {
+        let mut b = NotificationBook::default();
+        let f = FilterId(7);
+        b.shown_message(C1, A1, MessageId(10), 0, 100, TEXT);
+        assert_eq!(b.filter_replaces(C1, f), 0);
+        b.shown_filter(C1, f, A1, MessageId(11), 0, 101);
+        assert_eq!(b.filter_replaces(C1, f), 101);
+        assert_eq!(b.replaces_for(C1), 100, "the usual one stays beside it");
+        // The next hit of the same filter replaces it; the new server id is followed.
+        b.shown_filter(C1, f, A1, MessageId(12), 0, 102);
+        assert_eq!(b.filter_replaces(C1, f), 102);
+        assert!(
+            b.on_action(101, "default").is_none(),
+            "the old id means nothing"
+        );
+        // A click opens the chat at the hit.
+        let a = b.on_action(102, "default").expect("activation");
+        assert_eq!(a.target, Target::Filter(C1, f));
+        assert_eq!(a.open, Some((C1, MessageId(12))));
+        assert_eq!(b.on_reply(102), Some(C1));
+        // An ordinary message of the chat does not touch the filter's notification.
+        b.shown_message(C1, A1, MessageId(13), 0, 100, TEXT);
+        assert_eq!(b.filter_replaces(C1, f), 102);
+        // Reading the chat withdraws both.
+        assert_eq!(b.close_conversation(C1), Some(100));
+        assert_eq!(b.close_filters(C1), vec![102]);
+        assert!(!b.is_tracked(C1));
+    }
+
+    #[test]
+    fn a_summary_click_opens_its_newest_match() {
+        let mut b = NotificationBook::default();
+        b.shown_summary(A1, 7);
+        b.set_summary_open(A1, Some((C2, MessageId(5))));
+        let a = b.on_action(7, "default").expect("activation");
+        assert_eq!(a.open, Some((C2, MessageId(5))));
+        b.set_summary_open(A1, None);
+        assert_eq!(b.on_action(7, "default").expect("again").open, None);
     }
 }

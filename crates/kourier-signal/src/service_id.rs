@@ -95,18 +95,16 @@ fn last4(uuid: Uuid) -> String {
 
 /// `aci:<uuid>`.
 pub(crate) fn aci_user_id(aci: Aci) -> Result<UserId, ServiceIdError> {
-    Ok(UserId::from_parts(
-        ACI_SCHEME,
-        &Uuid::from(aci).hyphenated().to_string(),
-    )?)
+    let mut buf = Uuid::encode_buffer();
+    let text = Uuid::from(aci).hyphenated().encode_lower(&mut buf);
+    Ok(UserId::from_parts(ACI_SCHEME, text)?)
 }
 
 /// `pni:<uuid>`.
 pub(crate) fn pni_user_id(pni: Pni) -> Result<UserId, ServiceIdError> {
-    Ok(UserId::from_parts(
-        PNI_SCHEME,
-        &Uuid::from(pni).hyphenated().to_string(),
-    )?)
+    let mut buf = Uuid::encode_buffer();
+    let text = Uuid::from(pni).hyphenated().encode_lower(&mut buf);
+    Ok(UserId::from_parts(PNI_SCHEME, text)?)
 }
 
 /// `aci:<uuid>` or `pni:<uuid>`.

@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use super::{cargo, names, qml_problems, root, run, target_dir, theme_home};
 
 const USAGE: &str = "usage: cargo xtask perf [--out <file>] [--quick] [--start] [--report-only] \
-[--idle <seconds>] [--runs <n>] [--scale <factor>] [--no-mock] [--no-build] [--keep-profile]
+[--idle <seconds>] [--runs <n>] [--scale <factor>] [--filters <n>] [--no-mock] [--no-build] [--keep-profile]
 
   --out <file>     write the report there too (default: target/perf/report.md; a --start
                    run: target/perf/report-start.md)
@@ -77,6 +77,11 @@ const USAGE: &str = "usage: cargo xtask perf [--out <file>] [--quick] [--start] 
   --scale <x>      the display scale of every app start (QT_SCALE_FACTOR; default 1, 0.5 to 4):
                    --scale 1.25 is the user's 125 % display, where tall pictures are drawn from
                    the file (P1); the report says which scale it measured
+  --filters <n>    store n synthetic RegExp filters (0 to 1000; default 0) in the copy of the
+                   profile every run starts from, through the core's own save path, before
+                   anything is measured: a mix of words, alternations, \\d{3,}, an address
+                   shape and Cyrillic words, half with Notify, all with Highlight. The reference
+                   profile itself stays as it is; the report names the count
   --no-mock        skip the catch-up test on the Signal mock server
   --no-build       measure the binaries as they are in target/
   --keep-profile   reuse target/perf/profile even when the code that fills it changed
@@ -167,6 +172,8 @@ pub struct Options {
     pub keep_profile: bool,
     /// The display scale of every app start (`QT_SCALE_FACTOR`), as the user wrote it.
     pub scale: String,
+    /// Synthetic filters stored in every run's copy of the profile (`--filters`).
+    pub filters: usize,
 }
 
 impl Options {
@@ -194,6 +201,7 @@ pub fn parse_options(args: &[String]) -> Result<Options> {
         build: true,
         keep_profile: false,
         scale: "1".to_owned(),
+        filters: 0,
     };
     let mut idle = None;
     let mut runs = None;
@@ -212,6 +220,14 @@ pub fn parse_options(args: &[String]) -> Result<Options> {
             "--no-mock" => o.mock = false,
             "--no-build" => o.build = false,
             "--keep-profile" => o.keep_profile = true,
+            "--filters" => {
+                let v = value("--filters")?;
+                o.filters = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n <= 1000)
+                    .with_context(|| format!("bad --filters {v:?} (0 to 1000)"))?;
+            }
             "--scale" => {
                 let v = value("--scale")?;
                 v.parse::<f64>()
@@ -2593,6 +2609,8 @@ struct Runner {
     config_home: PathBuf,
     profile: PathBuf,
     quick: bool,
+    /// Filters stored in every copy ([`Options::filters`]).
+    filters: usize,
 }
 
 impl Runner {
@@ -2620,7 +2638,34 @@ impl Runner {
     fn run_copy(&self, name: &str) -> Result<PathBuf> {
         let dir = perf_dir().join(name);
         copy_dir(&self.profile, &dir)?;
+        if self.filters > 0 {
+            self.store_filters(&dir)?;
+        }
         Ok(dir)
+    }
+
+    /// Stores the run's synthetic filters in `profile` (a copy) by a start of the measuring
+    /// binary that ends before Qt: the core's own save path, not a database write.
+    fn store_filters(&self, profile: &Path) -> Result<()> {
+        let mut cmd = Command::new(&self.bin);
+        private_env(&mut cmd, &self.config_home, &no_bus(), display_scale())?;
+        let out = cmd
+            .arg(format!("--perf-profile={}", profile.display()))
+            .arg("--perf-seed")
+            .arg(format!("--perf-filters={}", self.filters))
+            .env("KOURIER_LOG", "warn")
+            .env("KOURIER_DESKTOP", "0")
+            .stdin(Stdio::null())
+            .output()
+            .context("store the filters")?;
+        if !out.status.success() {
+            bail!(
+                "storing the filters failed ({}):\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
     }
 
     /// One start up to the frame that shows the conversation list, then a clean exit: with
@@ -3307,6 +3352,7 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
         config_home,
         profile,
         quick: opts.quick,
+        filters: opts.filters,
     };
     let context = format!(
         "Measured {} on {}. Release build of this tree, offscreen (`QT_QPA_PLATFORM=offscreen`, \
@@ -3320,7 +3366,8 @@ fn run_perf(opts: &Options, parts: &mut Parts) -> Result<i32> {
         } else {
             ""
         }
-    ) + &scale_note(&opts.scale);
+    ) + &scale_note(&opts.scale)
+        + &filters_note(opts.filters);
     let cold_runs = if opts.quick || opts.start {
         1
     } else {
@@ -3404,6 +3451,15 @@ fn scale_note(scale: &str) -> String {
     }
 }
 
+/// The sentence of the report that names the filter count ("filters: 50"); nothing for 0.
+fn filters_note(filters: usize) -> String {
+    if filters == 0 {
+        String::new()
+    } else {
+        format!(" filters: {filters} (`--filters`, stored in each run's copy of the profile).")
+    }
+}
+
 fn date() -> String {
     Command::new("date")
         .arg("+%Y-%m-%d %H:%M")
@@ -3466,6 +3522,26 @@ mod tests {
         ] {
             assert!(parse_options(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_filter_count_is_an_option() {
+        assert_eq!(parse_options(&args(&[])).unwrap().filters, 0);
+        assert_eq!(
+            parse_options(&args(&["--quick", "--filters", "50"]))
+                .unwrap()
+                .filters,
+            50
+        );
+        for bad in [
+            &["--filters"][..],
+            &["--filters", "x"],
+            &["--filters", "1001"],
+        ] {
+            assert!(parse_options(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(filters_note(0), "");
+        assert!(filters_note(50).contains("filters: 50"));
     }
 
     #[test]

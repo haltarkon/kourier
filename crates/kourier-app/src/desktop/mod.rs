@@ -25,12 +25,14 @@ mod service;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kourier_core::facade::{AccountRow, ConversationDetail, CoreHandle, MessageRow, UiCommand};
+use kourier_core::facade::{
+    AccountRow, ConversationDetail, CoreHandle, MessageRow, OwnedFilterTexts, UiCommand,
+};
 use kourier_desktop::Bus;
 use kourier_desktop::autostart::{self, AutostartEntry};
 use kourier_desktop::hints::{Hint, SystemHints};
 use kourier_desktop::instance::{self, Claim, Instance, InstanceRequest};
-use kourier_model::{Body, ConversationId};
+use kourier_model::{Body, ConversationId, MessageId};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -152,6 +154,9 @@ pub enum DesktopEvent {
         token: Option<String>,
         /// The conversation to open.
         conversation: Option<ConversationId>,
+        /// The message to open it at (a filter's notification, the newest match of a catch-up
+        /// summary): the jump of a search hit, with the flash.
+        message: Option<MessageId>,
     },
     /// A tray click: hide the window when it is shown and active, else show and raise it.
     Toggle {
@@ -177,10 +182,12 @@ impl std::fmt::Debug for DesktopEvent {
             Self::Activate {
                 token,
                 conversation,
+                message,
             } => f
                 .debug_struct("Activate")
                 .field("token", &token.is_some())
                 .field("conversation", conversation)
+                .field("message", message)
                 .finish(),
             Self::Toggle { token } => f
                 .debug_struct("Toggle")
@@ -220,6 +227,36 @@ pub trait Presenter: Send + Sync + 'static {
             Body::Text(t) => t.body.clone(),
             _ => self.texts().new_message,
         }
+    }
+
+    /// The three texts the RegExp filters look at for `message` of `detail`'s chat (owned; the
+    /// Qt presenter forwards to the viewmodel's one function). The default is a plain text
+    /// body, the sender's name and the title.
+    fn filter_texts(&self, detail: &ConversationDetail, message: &MessageRow) -> OwnedFilterTexts {
+        OwnedFilterTexts {
+            text: match &message.body {
+                Body::Text(t) if message.deleted.is_none() && !message.view_once => {
+                    Some(t.body.clone())
+                }
+                _ => None,
+            },
+            sender: message
+                .author_name
+                .as_ref()
+                .map(|n| n.expose().trim_start_matches('~').to_owned()),
+            chat: self.conversation_title(detail),
+        }
+    }
+
+    /// The title of a filter's notification: the chat's title and the filter's name.
+    fn filter_title(&self, title: &str, filter: &str) -> String {
+        format!("{title} · {filter}")
+    }
+
+    /// One line of the catch-up summary: how many caught-up messages matched the filter
+    /// ("2 match Invoices").
+    fn filter_matches(&self, count: u32, filter: &str) -> String {
+        format!("{count} match {filter}")
     }
 
     /// "3 new messages".
@@ -268,7 +305,8 @@ impl Presenter for PlainPresenter {}
 /// Commands to the desktop task.
 enum Command {
     Attach(Arc<dyn Presenter>),
-    Prefs(Prefs),
+    // Boxed: the preferences outgrew the other variants (clippy::large_enum_variant).
+    Prefs(Box<Prefs>),
     Focused(bool),
     Unread(u32),
 }
@@ -337,7 +375,7 @@ impl DesktopHandle {
         }
         *current = prefs.clone();
         drop(current);
-        let _ = self.shared.commands.send(Command::Prefs(prefs));
+        let _ = self.shared.commands.send(Command::Prefs(Box::new(prefs)));
     }
 
     /// Changes the preferences through `change`, which sees the stored ones: the read and the
@@ -356,7 +394,7 @@ impl DesktopHandle {
         }
         *current = next.clone();
         drop(current);
-        let _ = self.shared.commands.send(Command::Prefs(next));
+        let _ = self.shared.commands.send(Command::Prefs(Box::new(next)));
     }
 
     /// The UI is up: use its strings and pixels; the tray starts now (when enabled).
@@ -828,7 +866,7 @@ mod tests {
         };
         assert_eq!(handle.prefs(), expected);
         match rx.try_recv() {
-            Ok(Command::Prefs(sent)) => assert_eq!(sent, expected),
+            Ok(Command::Prefs(sent)) => assert_eq!(*sent, expected),
             _ => panic!("the changed preferences were not sent to the desktop task"),
         }
         // The same change again, and a closure that changes nothing: no command.

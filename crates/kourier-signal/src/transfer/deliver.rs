@@ -962,6 +962,8 @@ fn contact_event(tx: &Tx<'_>, contact: &StagedContact, now: i64) -> Result<Backe
 fn number_only_features() -> ConversationFeatures {
     ConversationFeatures {
         cannot_send: Some(CannotSend::NotAccepted),
+        // Signal has no restriction on saving a chat (its history may be exported).
+        export: kourier_model::ChatExport::Allowed,
         ..ConversationFeatures::default()
     }
 }

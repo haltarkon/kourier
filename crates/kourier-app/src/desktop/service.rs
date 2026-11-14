@@ -14,21 +14,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kourier_core::facade::{
-    AccountRow, ConversationDetail, CoreHandle, MessageRow, Notification as CoreNotification,
-    Query, QueryData, TimelineAnchor, TimelineQuery, UiCommand, UiEvent,
+    AccountRow, ConversationDetail, CoreHandle, FilterId, FilterSet, MessageRow,
+    Notification as CoreNotification, Query, QueryData, TimelineAnchor, TimelineQuery, UiCommand,
+    UiEvent,
 };
 use kourier_desktop::autostart::{self, AutostartEntry};
 use kourier_desktop::instance::InstanceRequest;
 use kourier_desktop::notifications::{self, NotificationClient, NotificationEvent};
 use kourier_desktop::tray::{Tray, TrayConfig, TrayEvent, TrayState};
 use kourier_desktop::{Bus, DesktopError};
-use kourier_model::{AccountId, AccountState, ConversationId, MessageId, Text};
+use kourier_model::{
+    AccountId, AccountState, ConvKind, ConversationId, MessageId, ReadState, Text,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use super::policy::{self, Burst, MessageContent, NotificationBook, Target, Texts};
+use super::policy::{
+    self, Burst, FilterDecision, MessageContent, NotificationBook, SummaryMatches, Target, Texts,
+};
 use super::{Command, Connection, DesktopEvent, PlainPresenter, Presenter};
 use crate::prefs::{NotificationContent, Prefs};
 
@@ -61,7 +66,14 @@ pub(crate) struct Service {
     /// the server existed, so a failure of it connects again instead of giving up.
     appeared_while_connecting: bool,
     /// Catch-up summaries that arrived while connecting.
-    queued_summaries: Vec<(AccountId, u32, u32)>,
+    queued_summaries: Vec<(AccountId, u32, u32, SummaryMatches)>,
+    /// The compiled filters (the core's one `Arc`), refreshed on `FiltersChanged`.
+    filters: Arc<FilterSet>,
+    /// Filters' hits that arrived while the notification server was being connected.
+    waiting_hits: Vec<CoreNotification>,
+    /// Finished background matchings of catch-up summaries.
+    summary_tx: mpsc::UnboundedSender<SummaryJob>,
+    summary_rx: mpsc::UnboundedReceiver<SummaryJob>,
     book: NotificationBook,
     accounts: Vec<AccountRow>,
     tray: Option<Tray>,
@@ -75,6 +87,102 @@ pub(crate) struct Service {
     flush_at: Option<tokio::time::Instant>,
     /// Which conversations' notifications rest, and until when.
     pace: policy::Pace<tokio::time::Instant>,
+}
+
+/// The most filter lines a catch-up summary shows.
+const MAX_SUMMARY_FILTERS: usize = 5;
+
+/// What the filters made of a candidate ([`Service::filter_verdict`]).
+enum Verdict {
+    /// Notifies as before.
+    Normal,
+    /// No notification (a muted chat's candidate no filter wants).
+    Drop,
+    /// A filter's own notification.
+    Hit(Box<FilterHit>),
+}
+
+/// A matching Notify filter and what it matched.
+struct FilterHit {
+    filter: FilterId,
+    name: String,
+    detail: ConversationDetail,
+    msg: MessageRow,
+}
+
+/// A catch-up summary whose background matching finished.
+pub(crate) struct SummaryJob {
+    account: AccountId,
+    messages: u32,
+    conversations: u32,
+    matches: SummaryMatches,
+}
+
+/// Matches the caught-up messages against the Notify filters: ONE batched read of the rows
+/// (`Query::CaughtUpMessages`), one read per chat for its row, then the matching on a blocking
+/// thread. A failed read shows the summary without filter lines. Never logs a text.
+async fn match_caught_up(
+    core: CoreHandle,
+    presenter: Arc<dyn Presenter>,
+    set: Arc<FilterSet>,
+    ids: Vec<(ConversationId, MessageId)>,
+) -> SummaryMatches {
+    let Ok(QueryData::CaughtUpMessages(rows)) = core.query(Query::CaughtUpMessages(ids)).await
+    else {
+        return SummaryMatches::default();
+    };
+    let mut details: std::collections::HashMap<ConversationId, Option<ConversationDetail>> =
+        std::collections::HashMap::new();
+    for (conv, row) in &rows {
+        if row.deleted.is_some() || row.read_state != Some(ReadState::Unread) {
+            continue;
+        }
+        if !details.contains_key(conv) {
+            let detail = match core.query(Query::Conversation(*conv)).await {
+                Ok(QueryData::Conversation(d)) => d.map(|d| *d),
+                _ => None,
+            };
+            details.insert(*conv, detail);
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    tokio::task::spawn_blocking(move || {
+        let mut owned = Vec::new();
+        for (conv, row) in &rows {
+            if row.deleted.is_some() || row.read_state != Some(ReadState::Unread) {
+                continue;
+            }
+            let Some(Some(detail)) = details.get(conv) else {
+                continue;
+            };
+            // Blocked and own never got here; a protected chat is never matched.
+            if detail.row.protected || detail.row.blocked {
+                continue;
+            }
+            let chat_muted = detail.row.muted_until.is_some_and(|t| t > now)
+                || detail.row.local_muted_until.is_some_and(|t| t > now);
+            // A muted group still announces a mention (the core's rule).
+            let group = detail.row.kind != ConvKind::Direct;
+            let muted = chat_muted && !(group && row.mentions_me);
+            owned.push((*conv, row.id, muted, presenter.filter_texts(detail, row)));
+        }
+        policy::match_catch_up(
+            &set,
+            owned
+                .iter()
+                .map(|(conv, message, muted, texts)| policy::CaughtUp {
+                    conv: *conv,
+                    message: *message,
+                    muted: *muted,
+                    protected: false,
+                    texts: texts.as_texts(),
+                }),
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Sleeps until `at`; forever without one.
@@ -125,6 +233,7 @@ impl Service {
         files: Files,
     ) -> Self {
         let (tray_tx, tray_rx) = mpsc::unbounded_channel();
+        let (summary_tx, summary_rx) = mpsc::unbounded_channel();
         Self {
             core,
             events,
@@ -137,6 +246,10 @@ impl Service {
             connecting: None,
             appeared_while_connecting: false,
             queued_summaries: Vec::new(),
+            filters: Arc::new(FilterSet::empty()),
+            waiting_hits: Vec::new(),
+            summary_tx,
+            summary_rx,
             book: NotificationBook::default(),
             accounts: Vec::new(),
             tray: None,
@@ -173,6 +286,7 @@ impl Service {
         // The autostart entry is only written when the user changes the setting: a run of
         // another build (a debug binary) must not repoint the user's entry at itself.
         self.refresh_accounts().await;
+        self.refresh_filters().await;
         loop {
             // New messages wait while the server is being connected.
             let flush_at = self.flush_at.filter(|_| self.connecting.is_none());
@@ -211,6 +325,11 @@ impl Service {
                     Some(r) => self.on_instance(r),
                     None => instance_rx = None,
                 },
+                j = self.summary_rx.recv() => {
+                    if let Some(j) = j {
+                        self.show_summary(j.account, j.messages, j.conversations, j.matches).await;
+                    }
+                }
                 t = self.tray_rx.recv() => {
                     if let Some(t) = t {
                         self.on_tray(t);
@@ -234,7 +353,7 @@ impl Service {
         let mut last = None;
         while let Ok(c) = commands.try_recv() {
             if let Command::Prefs(prefs) = c {
-                last = Some(prefs);
+                last = Some(*prefs);
             }
         }
         if let Some(prefs) = last {
@@ -278,6 +397,7 @@ impl Service {
         result: Result<Result<Connected, DesktopError>, JoinError>,
     ) -> Option<mpsc::UnboundedReceiver<NotificationEvent>> {
         let summaries = std::mem::take(&mut self.queued_summaries);
+        let hits = std::mem::take(&mut self.waiting_hits);
         match result {
             Ok(Ok((client, events))) => {
                 tracing::info!(
@@ -285,8 +405,12 @@ impl Service {
                     "notifications available"
                 );
                 self.client = Some(client);
-                for (account, messages, conversations) in summaries {
-                    self.show_summary(account, messages, conversations).await;
+                for (account, messages, conversations, matches) in summaries {
+                    self.show_summary(account, messages, conversations, matches)
+                        .await;
+                }
+                for n in hits {
+                    self.on_candidate(n).await;
                 }
                 events
             }
@@ -332,6 +456,7 @@ impl Service {
                 self.apply_tray().await;
             }
             Command::Prefs(prefs) => {
+                let prefs = *prefs;
                 let old = std::mem::replace(&mut self.prefs, prefs.clone());
                 if let Err(e) = super::save_prefs(self.files.prefs.clone(), prefs.clone()).await {
                     tracing::warn!(error = %e, "preferences not saved");
@@ -439,6 +564,7 @@ impl Service {
             TrayEvent::Show { token } => self.emit(DesktopEvent::Activate {
                 token,
                 conversation: None,
+                message: None,
             }),
             TrayEvent::Quit => self.emit(DesktopEvent::Quit),
             TrayEvent::Available(a) => {
@@ -456,6 +582,7 @@ impl Service {
                 self.emit(DesktopEvent::Activate {
                     token,
                     conversation: None,
+                    message: None,
                 });
             }
             InstanceRequest::Open { uris, token } => {
@@ -470,13 +597,16 @@ impl Service {
             NotificationEvent::ActivationToken { id, token } => self.book.on_token(id, token),
             NotificationEvent::Action { id, key } => {
                 if let Some(a) = self.book.on_action(id, &key) {
-                    let conversation = match a.target {
-                        Target::Conversation(c) => Some(c),
-                        Target::Summary(_) => None,
+                    // A filter's hit and a summary's newest match open the chat AT the message.
+                    let (conversation, message) = match (a.open, a.target) {
+                        (Some((c, m)), _) => (Some(c), Some(m)),
+                        (None, Target::Conversation(c) | Target::Filter(c, _)) => (Some(c), None),
+                        (None, Target::Summary(_)) => (None, None),
                     };
                     self.emit(DesktopEvent::Activate {
                         token: a.token,
                         conversation,
+                        message,
                     });
                 }
             }
@@ -500,9 +630,9 @@ impl Service {
                 if let Err(e) = sent {
                     tracing::warn!(error = %e, "inline reply not sent");
                 }
-                if let Some(id) = self.book.close_conversation(conv) {
-                    self.close_ids(vec![id]).await;
-                }
+                let mut ids: Vec<u32> = self.book.close_conversation(conv).into_iter().collect();
+                ids.extend(self.book.close_filters(conv));
+                self.close_ids(ids).await;
             }
             NotificationEvent::Closed { id, reason } => self.book.on_closed(id, reason),
         }
@@ -512,39 +642,15 @@ impl Service {
         match e {
             UiEvent::Notify(n) => {
                 crate::trace::notify_event();
-                let now = tokio::time::Instant::now();
-                // Something is collected for this conversation already, or the server is
-                // still being connected: it joins what waits (in order).
-                let waits =
-                    self.connecting.is_some() || self.pending.iter().any(|p| p.conv == n.conv);
-                match self.pace.admit(n.conv, now) {
-                    // The first message of a conversation is announced at once: nothing is
-                    // gained by holding a single message back.
-                    policy::Admit::Now if !waits => {
-                        let conv = n.conv;
-                        self.show_message(Burst {
-                            newest: n,
-                            earlier: Vec::new(),
-                        })
-                        .await;
-                        self.pace.shown(conv, tokio::time::Instant::now());
-                    }
-                    // Its notification changed a moment ago: collected until it has rested.
-                    admit => {
-                        let due = match admit {
-                            policy::Admit::At(at) => at,
-                            policy::Admit::Now => now + policy::COALESCE,
-                        };
-                        self.pending.push(n);
-                        self.flush_at = Some(self.flush_at.map_or(due, |at| at.min(due)));
-                    }
-                }
+                self.on_candidate(n).await;
             }
+            UiEvent::FiltersChanged { .. } => self.refresh_filters().await,
             UiEvent::CatchUpSummary {
                 account,
                 messages,
                 conversations,
-            } => self.show_summary(account, messages, conversations).await,
+                ids,
+            } => self.on_summary(account, messages, conversations, ids).await,
             UiEvent::ConversationsChanged { ids } => {
                 for conv in ids {
                     // (A chat with no notification on screen is looked at only when one of its
@@ -560,26 +666,36 @@ impl Service {
                 for conv in &ids {
                     self.book.forget_expired_text(*conv);
                 }
-                let closed: Vec<u32> = ids
-                    .into_iter()
-                    .filter_map(|c| self.book.close_conversation(c))
-                    .collect();
+                let mut closed: Vec<u32> = Vec::new();
+                for c in ids {
+                    closed.extend(self.book.close_conversation(c));
+                    closed.extend(self.book.close_filters(c));
+                }
                 self.close_ids(closed).await;
             }
             UiEvent::ConversationMerged { from, .. } => {
-                if let Some(id) = self.book.close_conversation(from) {
-                    self.close_ids(vec![id]).await;
-                }
+                let mut closed: Vec<u32> = self.book.close_conversation(from).into_iter().collect();
+                closed.extend(self.book.close_filters(from));
+                self.close_ids(closed).await;
             }
             UiEvent::MessagesChanged { conv, ids } => {
                 let shown = self.book.messages(conv);
                 if shown.iter().any(|(m, _)| ids.contains(m)) {
                     self.check_messages(conv).await;
                 }
+                if self
+                    .book
+                    .filter_messages(conv)
+                    .iter()
+                    .any(|(_, m, _)| ids.contains(m))
+                {
+                    self.check_filter_messages(conv).await;
+                }
             }
             UiEvent::TimelineInvalidated { conv } => {
                 if self.book.is_tracked(conv) {
                     self.check_messages(conv).await;
+                    self.check_filter_messages(conv).await;
                 }
             }
             UiEvent::AccountsChanged => self.refresh_accounts().await,
@@ -589,6 +705,51 @@ impl Service {
                 self.refresh_accounts().await;
             }
             _ => {}
+        }
+    }
+
+    /// A candidate of the core (`UiEvent::Notify`): the filters decide first ([`policy::decide`]),
+    /// then it notifies as before, or as a filter's own notification.
+    async fn on_candidate(&mut self, n: CoreNotification) {
+        match self.filter_verdict(&n).await {
+            Verdict::Drop => {}
+            Verdict::Hit(hit) => {
+                if self.connecting.is_some() {
+                    self.waiting_hits.push(n);
+                } else {
+                    self.show_filter(&n, *hit).await;
+                }
+            }
+            Verdict::Normal => self.on_usual_candidate(n).await,
+        }
+    }
+
+    async fn on_usual_candidate(&mut self, n: CoreNotification) {
+        let now = tokio::time::Instant::now();
+        // Something is collected for this conversation already, or the server is
+        // still being connected: it joins what waits (in order).
+        let waits = self.connecting.is_some() || self.pending.iter().any(|p| p.conv == n.conv);
+        match self.pace.admit(n.conv, now) {
+            // The first message of a conversation is announced at once: nothing is
+            // gained by holding a single message back.
+            policy::Admit::Now if !waits => {
+                let conv = n.conv;
+                self.show_message(Burst {
+                    newest: n,
+                    earlier: Vec::new(),
+                })
+                .await;
+                self.pace.shown(conv, tokio::time::Instant::now());
+            }
+            // Its notification changed a moment ago: collected until it has rested.
+            admit => {
+                let due = match admit {
+                    policy::Admit::At(at) => at,
+                    policy::Admit::Now => now + policy::COALESCE,
+                };
+                self.pending.push(n);
+                self.flush_at = Some(self.flush_at.map_or(due, |at| at.min(due)));
+            }
         }
     }
 
@@ -739,18 +900,61 @@ impl Service {
         })
     }
 
-    async fn show_summary(&mut self, account: AccountId, messages: u32, conversations: u32) {
+    /// A catch-up summary arrived: with ids and a Notify filter (and the mode that may name a
+    /// filter) the caught-up messages are matched in the background (one batched read), and the
+    /// summary is shown when that is done; else at once.
+    async fn on_summary(
+        &mut self,
+        account: AccountId,
+        messages: u32,
+        conversations: u32,
+        ids: Vec<(ConversationId, MessageId)>,
+    ) {
+        let any = self.filters.filters().iter().any(|f| f.spec.notify);
+        let names_ok = self.prefs.notification_content == NotificationContent::NameAndMessage;
+        if ids.is_empty() || !any || !names_ok {
+            self.show_summary(account, messages, conversations, SummaryMatches::default())
+                .await;
+            return;
+        }
+        let core = self.core.clone();
+        let presenter = self.presenter.clone();
+        let set = self.filters.clone();
+        let tx = self.summary_tx.clone();
+        tokio::spawn(async move {
+            let matches = match_caught_up(core, presenter, set, ids).await;
+            let _ = tx.send(SummaryJob {
+                account,
+                messages,
+                conversations,
+                matches,
+            });
+        });
+    }
+
+    async fn show_summary(
+        &mut self,
+        account: AccountId,
+        messages: u32,
+        conversations: u32,
+        matches: SummaryMatches,
+    ) {
         if self.connecting.is_some() {
             // One summary per account: a later one replaces a waiting one.
-            self.queued_summaries.retain(|(a, _, _)| *a != account);
+            self.queued_summaries.retain(|(a, _, _, _)| *a != account);
             self.queued_summaries
-                .push((account, messages, conversations));
+                .push((account, messages, conversations, matches));
             return;
         }
         let Some(client) = &self.client else {
             return;
         };
-        let text = self.presenter.catch_up(messages, conversations);
+        let mut text = self.presenter.catch_up(messages, conversations);
+        // A line per filter (names only in "Name and message" mode: `on_summary`).
+        for (name, count) in matches.filters.iter().take(MAX_SUMMARY_FILTERS) {
+            text.push('\n');
+            text.push_str(&self.presenter.filter_matches(*count, name));
+        }
         let origin = self.origin(account);
         let content = policy::summary_notification(
             &text,
@@ -760,8 +964,14 @@ impl Service {
         );
         match client.notify(&content).await {
             Ok(id) => {
-                tracing::info!(messages, conversations, "catch-up summary shown");
+                tracing::info!(
+                    messages,
+                    conversations,
+                    filters = matches.filters.len(),
+                    "catch-up summary shown"
+                );
                 self.book.shown_summary(account, id);
+                self.book.set_summary_open(account, matches.newest);
             }
             Err(e) => tracing::warn!(error = %e, "summary notification failed"),
         }
@@ -775,9 +985,14 @@ impl Service {
             None => true,
             Some(d) => policy::read_now(&d.row),
         };
-        if read && let Some(id) = self.book.close_conversation(conv) {
-            tracing::debug!(conv = conv.0, "read: notification closed");
-            self.close_ids(vec![id]).await;
+        if read {
+            // The chat's usual notification and its filters' own go together.
+            let mut ids: Vec<u32> = self.book.close_conversation(conv).into_iter().collect();
+            ids.extend(self.book.close_filters(conv));
+            if !ids.is_empty() {
+                tracing::debug!(conv = conv.0, "read: notification closed");
+                self.close_ids(ids).await;
+            }
         }
         detail
     }
@@ -798,6 +1013,9 @@ impl Service {
         if !detail.row.protected {
             return;
         }
+        // A filter's notification always shows text: it goes when the chat becomes protected.
+        let filters = self.book.close_filters(conv);
+        self.close_ids(filters).await;
         let expired = self.book.take_expired_text(conv);
         if !expired.is_empty() {
             tracing::debug!(
@@ -863,6 +1081,119 @@ impl Service {
                 }
                 return;
             }
+        }
+    }
+
+    /// Closes a filter's notification of `conv` whose message was deleted, edited or expired.
+    async fn check_filter_messages(&mut self, conv: ConversationId) {
+        for (filter, message, revision) in self.book.filter_messages(conv) {
+            let Ok(row) = self.message(conv, message).await else {
+                continue;
+            };
+            if policy::withdraw(revision, row.as_ref(), true) != policy::Withdraw::Keep
+                && let Some(id) = self.book.close_filter(conv, filter)
+            {
+                tracing::debug!(
+                    conv = conv.0,
+                    "deleted or edited: filter notification closed"
+                );
+                self.close_ids(vec![id]).await;
+            }
+        }
+    }
+
+    /// Reads the compiled filters (the core's one `Arc`) again.
+    async fn refresh_filters(&mut self) {
+        match self.core.query(Query::Filters).await {
+            Ok(QueryData::Filters(list)) => self.filters = list.set.clone(),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "filters query failed"),
+        }
+    }
+
+    /// What the filters make of a candidate ([`policy::decide`]): a muted chat's candidate that
+    /// no filter wants is dropped, a hit gets its own notification with the filter's name.
+    /// Nothing is read unless a Notify filter exists or the candidate is muted.
+    async fn filter_verdict(&self, n: &CoreNotification) -> Verdict {
+        let fallback = || {
+            if n.muted {
+                Verdict::Drop
+            } else {
+                Verdict::Normal
+            }
+        };
+        if !self.filters.filters().iter().any(|f| f.spec.notify) {
+            return fallback();
+        }
+        let Some(detail) = self.conversation(n.conv).await else {
+            return fallback();
+        };
+        // (A protected chat's texts are not even made: it follows the normal rules only.)
+        if detail.row.protected {
+            return fallback();
+        }
+        let Ok(Some(msg)) = self.message(n.conv, n.message).await else {
+            return fallback();
+        };
+        if msg.deleted.is_some() {
+            return fallback();
+        }
+        let mode = policy::content_mode(self.prefs.notification_content, &detail.row);
+        let texts = self.presenter.filter_texts(&detail, &msg);
+        match policy::decide(&self.filters, &texts.as_texts(), n.muted, false, mode) {
+            FilterDecision::Normal => Verdict::Normal,
+            FilterDecision::Drop => Verdict::Drop,
+            FilterDecision::Hit(filter, name) => Verdict::Hit(Box::new(FilterHit {
+                filter,
+                name,
+                detail,
+                msg,
+            })),
+        }
+    }
+
+    /// A filter's own notification: the chat's usual one with the filter's name in the title,
+    /// one per (chat, filter); the next hit of the same filter in the chat replaces it.
+    async fn show_filter(&mut self, n: &CoreNotification, hit: FilterHit) {
+        if self.client.is_none() {
+            return;
+        }
+        let FilterHit {
+            filter,
+            name,
+            detail,
+            msg,
+        } = hit;
+        if policy::read_now(&detail.row) || policy::call_moved_on(&msg) {
+            return;
+        }
+        let title = self.presenter.conversation_title(&detail);
+        let line = self.presenter.message_line(&detail, &msg);
+        let shown_title = self.presenter.filter_title(&title, &name);
+        let origin = self.origin(detail.row.account);
+        let avatar = self.presenter.avatar(&title, &detail);
+        let content = policy::message_notification(MessageContent {
+            mode: NotificationContent::NameAndMessage,
+            title: &shown_title,
+            line: &line,
+            count_line: None,
+            origin: origin.as_deref(),
+            avatar,
+            can_reply: policy::can_reply(&detail.row),
+            replaces_id: self.book.filter_replaces(n.conv, filter),
+            texts: &self.texts,
+        });
+        let Some(client) = &self.client else {
+            return;
+        };
+        match client.notify(&content).await {
+            Ok(id) => {
+                crate::trace::notify_shown();
+                tracing::debug!(conv = n.conv.0, filter = filter.0, id, "filter notified");
+                self.book
+                    .shown_filter(n.conv, filter, n.account, n.message, msg.revision, id);
+            }
+            Err(e) => tracing::warn!(error = %e, "filter notification failed"),
         }
     }
 

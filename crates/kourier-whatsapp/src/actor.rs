@@ -968,6 +968,10 @@ impl Actor {
             }
             // The phone's history push cannot be skipped or dismissed from here (W4 states no transfer).
             Command::SkipHistoryTransfer | Command::DismissHistoryTransfer => {}
+            // The store's connection lives on its writer thread: released there, by a job.
+            Command::ReleaseMemory => {
+                let _ = self.store.release_memory();
+            }
         }
         self.stop_with.take()
     }

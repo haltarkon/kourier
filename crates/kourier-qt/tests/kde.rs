@@ -136,10 +136,61 @@ fn check_pseudo_rust() {
     );
 }
 
+/// The cache of `translate`: the same answers as KI18n gives, kept, and forgotten when the
+/// languages or a catalog directory change. Mutant: `clear_cache()` left out of
+/// `l10n::set_languages`.
+fn check_translation_cache(t: &KdeTranslator) {
+    let before = l10n::cache_len();
+    for (context, msgid) in [
+        ("@title", "Settings"),
+        ("@action", "Settings"),
+        ("", "Plain %1"),
+        ("@info", "Not translated %1 %2"),
+    ] {
+        let first = t.translate(context, msgid);
+        let second = t.translate(context, msgid);
+        let direct = l10n::translate_uncached(context, msgid);
+        check("a first lookup is KI18n's answer", &first, &direct);
+        check("a cached lookup is KI18n's answer", &second, &direct);
+    }
+    assert!(l10n::cache_len() > before, "the answers are kept");
+    let kept = l10n::cache_len();
+    t.translate("@title", "Settings");
+    assert_eq!(l10n::cache_len(), kept, "a repeat adds nothing");
+    // A language change shows at once, in the cache's own answers too.
+    l10n::set_languages(&["x-none"]);
+    assert_eq!(l10n::cache_len(), 0, "a language change empties the cache");
+    check(
+        "after a language change",
+        &t.translate("@title", "Settings"),
+        "Settings",
+    );
+    l10n::set_languages(&["xx", "x-test"]);
+    check(
+        "after the language is back",
+        &t.translate("@title", "Settings"),
+        "Agordoj",
+    );
+    // A catalog directory change empties it as well.
+    l10n::add_catalog_dir(std::path::Path::new("/nonexistent/kourier-locale"));
+    assert_eq!(l10n::cache_len(), 0, "a directory change empties the cache");
+    check(
+        "after a directory change",
+        &t.translate("@title", "Settings"),
+        "Agordoj",
+    );
+    // Bounded: a flood of distinct texts never grows it past its cap.
+    for i in 0..5_000 {
+        t.translate("@flood", &format!("flood {i}"));
+    }
+    assert!(l10n::cache_len() <= 4096, "{}", l10n::cache_len());
+}
+
 /// The lookups of the translator itself, then the viewmodel's functions over it.
 fn check_rust() {
     let t = KdeTranslator;
     check("a context", &t.translate("@title", "Settings"), "Agordoj");
+    check_translation_cache(&t);
     check(
         "the same text in another context is another message",
         &t.translate("@action", "Settings"),

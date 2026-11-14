@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod judge;
+pub mod pages;
 pub mod send;
 
 use std::future::Future;
@@ -23,6 +24,8 @@ use kourier_model::{AccountId, ConversationId};
 use tokio::sync::broadcast;
 
 pub const CORE_KEY: [u8; 32] = [0xc0; 32];
+/// search.db's own key in these tests (the core refuses the same key for both files).
+pub const SEARCH_KEY: [u8; 32] = [0x5e; 32];
 
 /// Polls `f` every 5 ms until it holds; panics after `timeout`.
 pub async fn eventually<F, Fut>(what: &str, timeout: Duration, mut f: F)
@@ -251,6 +254,31 @@ impl Env {
         f(&conn)
     }
 
+    /// search.db, beside core.db under the same key (the core's default for tests).
+    pub fn search_db(&self) -> PathBuf {
+        kourier_core::search_db_beside(&self.core_db())
+    }
+
+    /// A read-only look at search.db (G1: the index's own file).
+    pub fn peek_search<T>(&self, f: impl FnOnce(&kourier_db::rusqlite::Connection) -> T) -> T {
+        let conn =
+            kourier_db::open_read_only(&self.search_db(), &kourier_db::DbKey::from(SEARCH_KEY))
+                .expect("open search.db");
+        f(&conn)
+    }
+
+    /// Like [`Self::peek_search`], but `None` while search.db cannot be read yet: the search
+    /// task makes it after `UiReady`, so the file can exist before its schema is committed.
+    pub fn try_peek_search<T, E>(
+        &self,
+        f: impl FnOnce(&kourier_db::rusqlite::Connection) -> Result<T, E>,
+    ) -> Option<T> {
+        let conn =
+            kourier_db::open_read_only(&self.search_db(), &kourier_db::DbKey::from(SEARCH_KEY))
+                .ok()?;
+        f(&conn).ok()
+    }
+
     pub fn account_dir(&self, uuid: kourier_model::AccountUuid) -> PathBuf {
         self.data().join("accounts").join(uuid.to_string())
     }
@@ -316,6 +344,7 @@ pub async fn start_core_timed(
     let mut cfg = CoreConfig::new(
         dir.join("data").join("core.db"),
         kourier_db::DbKey::from(CORE_KEY),
+        kourier_db::DbKey::from(SEARCH_KEY),
         networks,
         vault.clone(),
         clock,

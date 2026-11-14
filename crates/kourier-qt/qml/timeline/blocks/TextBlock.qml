@@ -44,8 +44,15 @@ Item {
     // The theme's link color, adjusted until it can be read on this bubble.
     readonly property color linkInk: Style.readable(Kirigami.Theme.linkColor, root.surface)
 
+    // The RegExp filters' marker backgrounds of the shown part (`[{start, len, colour}]`), applied
+    // to the TextEdit's document: a filter change moves only this, never the html.
+    readonly property var marks: root.block.marks ?? []
+    property bool marked: false
+
     onLinkInkChanged: Qt.callLater(root.recolor)
     onInkChanged: Qt.callLater(root.recolor)
+    onMarksChanged: Qt.callLater(root.paintMarks)
+    onSurfaceChanged: Qt.callLater(root.paintMarks)
 
     implicitWidth: Math.max(Math.ceil(edit.contentWidth), root.hasMore ? Math.ceil(readMore.implicitWidth) : 0)
     implicitHeight: Math.ceil(edit.contentHeight) + (root.hasMore ? Kirigami.Units.smallSpacing + Math.ceil(readMore.implicitHeight) : 0)
@@ -107,6 +114,10 @@ Item {
         Component.onCompleted: root.recolor()
 
         onLinkActivated: link => {
+            // A Ctrl+click starts the selection mode (`TimelineView`'s handler); it opens no link.
+            if (TimelineActions.ctrlPress) {
+                return;
+            }
             if (link.indexOf("kourier:mention/") === 0) {
                 root.openMention(link);
                 return;
@@ -143,6 +154,7 @@ Item {
             cursorShape: Qt.PointingHandCursor
         }
         TapHandler {
+            acceptedModifiers: Qt.NoModifier
             onTapped: root.readMoreText()
         }
     }
@@ -150,12 +162,37 @@ Item {
     // Qt would color links from the application palette, which need not match the bubble.
     function recolor(): void {
         // Recoloring edits the document, which emits textChanged again: guard against that.
-        if (root.recoloring || root.block.html.indexOf("<a ") < 0) {
+        if (root.recoloring) {
             return;
         }
         root.recoloring = true;
-        App.colorLinks(edit.textDocument, root.linkInk, root.ink);
+        if (root.block.html.indexOf("<a ") >= 0) {
+            App.colorLinks(edit.textDocument, root.linkInk, root.ink);
+        }
+        root.paintMarks();
         root.recoloring = false;
+    }
+
+    // The marks as backgrounds: the alpha is the strongest that keeps the ink readable on the
+    // surface the text stands on. A text without marks (and none before) costs nothing.
+    function paintMarks(): void {
+        const marks = root.marks;
+        if (marks.length === 0 && !root.marked) {
+            return;
+        }
+        const out = [];
+        for (const m of marks) {
+            out.push({
+                "start": m.start,
+                "len": m.len,
+                "color": App.markerColour(m.colour, root.surface, root.ink)
+            });
+        }
+        const was = root.recoloring;
+        root.recoloring = true;
+        App.applyMarks(edit.textDocument, out);
+        root.recoloring = was;
+        root.marked = out.length > 0;
     }
 
     // Rectangles covering each spoiler range, one per visual line.
@@ -217,6 +254,7 @@ Item {
             radius: Kirigami.Units.cornerRadius / 2
             color: Kirigami.ColorUtils.linearInterpolation(root.surface, root.ink, 0.6)
             TapHandler {
+                acceptedModifiers: Qt.NoModifier
                 onTapped: root.revealed = true
             }
         }

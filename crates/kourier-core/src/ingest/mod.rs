@@ -78,6 +78,9 @@ pub(crate) struct Changes {
     pub notify: Vec<NotifyCandidate>,
     /// One entry per new `catch_up` message (for the summary when `Syncing` ends, §4.5).
     pub catch_up: Vec<ConversationId>,
+    /// The same messages with their ids (the supervisor keeps the newest while some filter
+    /// has Notify).
+    pub catch_up_ids: Vec<(ConversationId, MessageId)>,
     /// Banners.
     pub notices: Vec<BackendNotice>,
     /// History import progress: conversation, progress, has_more.
@@ -141,6 +144,7 @@ impl Changes {
         self.contacts |= other.contacts;
         self.notify.extend(other.notify);
         self.catch_up.extend(other.catch_up);
+        self.catch_up_ids.extend(other.catch_up_ids);
         self.notices.extend(other.notices);
         self.history.extend(other.history);
         self.incoming.extend(other.incoming);
@@ -175,6 +179,8 @@ pub(crate) struct NotifyCandidate {
     pub message: MessageId,
     /// We are mentioned.
     pub mentions_me: bool,
+    /// Muted chat, let through by the muted watch only ([`crate::facade::Notification::muted`]).
+    pub muted: bool,
 }
 
 /// Applies `events` of `account` in one `BEGIN IMMEDIATE` transaction. `scope` is the network's

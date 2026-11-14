@@ -118,6 +118,40 @@ QSize coverSize(const QSize& natural, const QSize& requested)
     return QSize(qMax(1, qRound(natural.width() * scale)), qMax(1, qRound(natural.height() * scale)));
 }
 
+// THE CAP of a decode (picture zoom): the long side is at most 8192 px and the pixel count at most
+// 32,000,000 whatever was asked. A zoomed picture is decoded at its natural size, which would
+// otherwise be a 50 MP file in RAM (128 MB RGBA at 32 MP, about the same in GPU memory plus a third
+// for the mipmaps); 8192 is below every desktop GPU's (and llvmpipe's) texture limit. The sizes
+// are rounded DOWN so the cap holds, and keep the proportions.
+constexpr int kDecodeMaxSide = 8192;
+constexpr qint64 kDecodeMaxPixels = 32000000;
+
+QSize capDecodeSize(const QSize& size)
+{
+    if (!size.isValid() || size.isEmpty()) {
+        return size;
+    }
+    const qint64 pixels = static_cast<qint64>(size.width()) * size.height();
+    const int side = qMax(size.width(), size.height());
+    if (side <= kDecodeMaxSide && pixels <= kDecodeMaxPixels) {
+        return size;
+    }
+    double scale = 1.0;
+    if (side > kDecodeMaxSide) {
+        scale = static_cast<double>(kDecodeMaxSide) / side;
+    }
+    if (pixels > kDecodeMaxPixels) {
+        scale = qMin(scale, std::sqrt(static_cast<double>(kDecodeMaxPixels) / static_cast<double>(pixels)));
+    }
+    QSize capped(qMax(1, static_cast<int>(std::floor(size.width() * scale))),
+                 qMax(1, static_cast<int>(std::floor(size.height() * scale))));
+    // Floating point can leave one pixel over the line on an edge: step down until it holds.
+    while (static_cast<qint64>(capped.width()) * capped.height() > kDecodeMaxPixels && capped.width() > 1) {
+        capped.setWidth(capped.width() - 1);
+    }
+    return capped;
+}
+
 // The centered square of `image`, `side` pixels wide, with corners of `radius` pixels and
 // transparent outside them. A radius of half the side or more is a circle; 0 keeps the
 // square as it is.
@@ -145,6 +179,51 @@ QImage cornerCrop(const QImage& image, int side, qreal radius)
     }
     p.setClipPath(shape);
     p.drawImage(0, 0, square);
+    return out;
+}
+
+// The colour a `thumb/<id>?...&tint=RRGGBB` request asks for (a model's shade picture), or -1 when
+// the request is no thumbnail request or names none. Six hex digits exactly.
+int tintOfId(const QByteArray& id)
+{
+    if (!id.startsWith("thumb/")) {
+        return -1;
+    }
+    const qsizetype query = id.indexOf('?');
+    if (query < 0) {
+        return -1;
+    }
+    for (const QByteArray& part : id.mid(query + 1).split('&')) {
+        if (!part.startsWith("tint=")) {
+            continue;
+        }
+        const QByteArray hex = part.mid(5);
+        if (hex.size() != 6) {
+            return -1;
+        }
+        bool ok = false;
+        const int rgb = hex.toInt(&ok, 16);
+        return ok ? rgb : -1;
+    }
+    return -1;
+}
+
+// A shade picture (grey = light, alpha = coverage) times the colour: RGB multiplied, the
+// premultiplied alpha kept, so the edge stays as soft as it was. A pixel multiply after the normal
+// decode of our own PNG, no second decoder path.
+QImage tinted(const QImage& shade, int rgb)
+{
+    QImage out = shade.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const int r = (rgb >> 16) & 0xff;
+    const int g = (rgb >> 8) & 0xff;
+    const int b = rgb & 0xff;
+    for (int y = 0; y < out.height(); ++y) {
+        auto* line = reinterpret_cast<QRgb*>(out.scanLine(y));
+        for (int x = 0; x < out.width(); ++x) {
+            const QRgb px = line[x];
+            line[x] = qRgba((qRed(px) * r + 127) / 255, (qGreen(px) * g + 127) / 255, (qBlue(px) * b + 127) / 255, qAlpha(px));
+        }
+    }
     return out;
 }
 
@@ -309,7 +388,10 @@ public:
                 rust::Str(utf8.constData(), static_cast<size_t>(utf8.size())),
                 requestedSize.width(),
                 requestedSize.height());
-            const QImage image = decodeMediaPayload(payload, requestedSize);
+            QImage image = decodeMediaPayload(payload, requestedSize);
+            if (const int tint = tintOfId(utf8); tint >= 0 && !image.isNull()) {
+                image = tinted(image, tint);
+            }
             QMutexLocker lock(&job->mutex);
             if (image.isNull()) {
                 job->error = QStringLiteral("unavailable");
@@ -417,6 +499,7 @@ QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
             && qAbs(target.width() - requested.width()) <= 1 && qAbs(target.height() - requested.height()) <= 1) {
             target = requested;
         }
+        target = capDecodeSize(target);
         if (target.isValid() && target != natural && reader.supportsOption(QImageIOHandler::ScaledSize)) {
             reader.setScaledSize(rotated ? target.transposed() : target);
         }
@@ -427,7 +510,7 @@ QImage decodeMediaPayload(rust::Vec<uint8_t>& payload, const QSize& requested)
         // already; scaling to exactly it (not "keeping" the ratio, which truncates one side
         // and can come out a pixel short of what was asked for) gives QML the size it laid
         // the picture out for.
-        const QSize wanted = target.isValid() ? target : coverSize(image.size(), cover);
+        const QSize wanted = target.isValid() ? target : capDecodeSize(coverSize(image.size(), cover));
         if (!image.isNull() && wanted.isValid() && image.size() != wanted) {
             ++t_scaledAfterDecode;
             image = image.scaled(wanted, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
@@ -485,7 +568,9 @@ public:
                 painter.fillRect(image.rect(), color);
             }
         } else if (parts[0] == QLatin1String("swatch")) {
-            image = QImage(requested.isValid() ? requested : QSize(16, 16),
+            // An icon may ask before it is laid out: QSize(0, 0) is "valid" but has no pixel, and
+            // a null image left the "Model Color" button without its swatch.
+            image = QImage(requested.isEmpty() ? QSize(16, 16) : requested,
                 QImage::Format_ARGB32_Premultiplied);
             image.fill(Qt::transparent);
             QPainter painter(&image);
@@ -618,6 +703,35 @@ QImage probeAvatar(rust::Vec<uint8_t> bytes, uint8_t codec, int32_t side, uint16
 }
 
 } // namespace
+
+rust::Vec<uint32_t> tintProbe(rust::Str id, rust::Vec<uint8_t> png)
+{
+    rust::Vec<uint32_t> out;
+    rust::Vec<uint8_t> payload;
+    for (const uint8_t b : {1, 0, 2, 0, 0}) {
+        payload.push_back(b);
+    }
+    for (const uint8_t b : png) {
+        payload.push_back(b);
+    }
+    QImage image = decodeMediaPayload(payload, QSize());
+    if (image.isNull()) {
+        return out;
+    }
+    const QByteArray utf8(id.data(), static_cast<qsizetype>(id.size()));
+    if (const int tint = tintOfId(utf8); tint >= 0) {
+        image = tinted(image, tint);
+    }
+    image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    out.push_back(static_cast<uint32_t>(image.width()));
+    out.push_back(static_cast<uint32_t>(image.height()));
+    // The first, the middle and the last pixel, premultiplied ARGB.
+    const auto raw = [&image](int x, int y) { return reinterpret_cast<const QRgb*>(image.constScanLine(y))[x]; };
+    out.push_back(raw(0, 0));
+    out.push_back(raw(image.width() / 2, image.height() / 2));
+    out.push_back(raw(image.width() - 1, image.height() - 1));
+    return out;
+}
 
 int32_t roundAvatarProbe(rust::Vec<uint8_t> bytes, uint8_t codec, int32_t side)
 {
@@ -891,7 +1005,7 @@ rust::Vec<double> pictureProbe(rust::Vec<uint8_t> file, uint8_t codec, rust::Vec
 rust::Vec<uint8_t> orientedImage(int32_t width, int32_t height, int32_t orientation)
 {
     rust::Vec<uint8_t> out;
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || orientation < 1 || orientation > 8) {
+    if (width <= 0 || height <= 0 || width > 20000 || height > 20000 || orientation < 1 || orientation > 8) {
         return out;
     }
     // Stored left half red, right half blue, with a few thin lines so a decoder has work.

@@ -13,6 +13,8 @@
 //! - [`secret`]: the Secret Service client for the master key (§5.2).
 //! - [`file_manager`]: `org.freedesktop.FileManager1.ShowItems`, the "Show in Folder" of a saved
 //!   file (F3b).
+//! - [`portal`]: `org.freedesktop.portal.OpenURI.OpenFile` with `ask`, the chooser of "Open in
+//!   Slicer" > "Other Application…".
 //! - `testing` (cargo feature `testing`): a private bus and mock desktop services for tests.
 //!
 //! Nothing here knows about conversations or messages: `kourier-app` decides what to show and
@@ -24,6 +26,7 @@ pub mod file_manager;
 pub mod hints;
 pub mod instance;
 pub mod notifications;
+pub mod portal;
 pub mod secret;
 #[cfg(feature = "testing")]
 pub mod testing;

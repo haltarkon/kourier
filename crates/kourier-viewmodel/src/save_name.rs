@@ -351,7 +351,7 @@ fn cut(text: &str, room: usize) -> String {
 }
 
 /// `2026-10-13` and `18.30.05` of an instant in local time.
-fn stamp(ts_ms: i64, calendar: &dyn Calendar) -> (String, String) {
+pub(crate) fn stamp(ts_ms: i64, calendar: &dyn Calendar) -> (String, String) {
     const DAY_S: i64 = 86_400;
     let local_s = ts_ms
         .div_euclid(1000)

@@ -50,6 +50,8 @@ pub(crate) enum Outcome {
         width: u32,
         height: u32,
         blurhash: String,
+        /// The model mark, for a 3D model's still (a picture has none).
+        model: Option<kourier_model::ModelFacts>,
     },
     /// The whole text of the message (a long text, read and decoded).
     LongText(String),
@@ -72,6 +74,9 @@ pub(crate) fn compute(blob_dir: &Path, job: &DeriveJob) -> Outcome {
             Ok(bytes) => Outcome::LongText(String::from_utf8_lossy(&bytes).into_owned()),
             Err(e) => unreadable(job, &e),
         };
+    }
+    if job.is_model() {
+        return compute_model(blob_dir, job, &path, &key);
     }
     if !job.is_picture() {
         // Only check that the file is there and opens.
@@ -108,6 +113,91 @@ pub(crate) fn compute(blob_dir: &Path, job: &DeriveJob) -> Outcome {
             width: derived.width,
             height: derived.height,
             blurhash: derived.blurhash,
+            model: None,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "writing a thumbnail failed");
+            Outcome::Nothing
+        }
+    }
+}
+
+/// Edge of a model's still picture in pixels.
+const MODEL_STILL_EDGE: u32 = 400;
+/// What a triangle without a colour of its own is drawn in, in a coloured model's still.
+const MODEL_FALLBACK: u32 = 0x8FA3_BFFF;
+
+/// Why a model file is not a mesh (the file is unreadable, or its content is not a model).
+pub(crate) enum LoadError {
+    /// The blob is missing or does not decrypt.
+    Blob(BlobError),
+    /// Too large to try, or not a model the bounds allow.
+    Mesh(kourier_mesh::MeshError),
+}
+
+/// Reads and parses the model blob at `path`: the size is checked BEFORE the file is read.
+pub(crate) fn load_mesh(
+    path: &Path,
+    key: &FileKey,
+) -> std::result::Result<kourier_mesh::Mesh, LoadError> {
+    // The file is the plaintext plus a small header and a tag per chunk: a file far above the
+    // bound cannot hold a model within it.
+    let len = std::fs::metadata(path)
+        .map_err(|e| LoadError::Blob(BlobError::from_io(e)))?
+        .len();
+    if len > kourier_mesh::MAX_FILE_BYTES as u64 + kourier_blob::sealed_len(0) + (1 << 20) {
+        return Err(LoadError::Mesh(kourier_mesh::MeshError::TooLarge));
+    }
+    let bytes = kourier_blob::read_all(path, key).map_err(LoadError::Blob)?;
+    kourier_mesh::parse(&bytes, kourier_mesh::NameHint::Model).map_err(LoadError::Mesh)
+}
+
+/// The still picture of a 3D model (blocking): a shade picture for a model without colours
+/// (the front-end tints it), the model's own colours otherwise. A model that does not parse
+/// stays a plain file.
+fn compute_model(blob_dir: &Path, job: &DeriveJob, path: &Path, key: &FileKey) -> Outcome {
+    let mesh = match load_mesh(path, key) {
+        Ok(m) => m,
+        Err(LoadError::Blob(e)) => return unreadable(job, &e),
+        Err(LoadError::Mesh(e)) => {
+            // Only the id and the kind of error: nothing of the file.
+            tracing::debug!(attachment = job.attachment.0, error = %e, "not a readable 3D model");
+            return Outcome::Nothing;
+        }
+    };
+    let tint = mesh.colors.is_none();
+    let mode = if tint {
+        kourier_mesh::StillMode::Shade
+    } else {
+        kourier_mesh::StillMode::Colour {
+            fallback: MODEL_FALLBACK,
+        }
+    };
+    let still = kourier_mesh::render_still(&mesh, MODEL_STILL_EDGE, mode);
+    let png = kourier_mesh::encode_png(&still);
+    let store = match super::core_store(blob_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "opening the blob store failed");
+            return Outcome::Nothing;
+        }
+    };
+    match store.import_volatile(&mut png.as_slice()) {
+        Ok((id, key, size)) => Outcome::Thumb {
+            path: super::core_path(&id),
+            key,
+            size,
+            mime: "image/png",
+            width: still.width,
+            height: still.height,
+            blurhash: String::new(),
+            model: Some(kourier_model::ModelFacts {
+                x_mm: mesh.max[0] - mesh.min[0],
+                y_mm: mesh.max[1] - mesh.min[1],
+                z_mm: mesh.max[2] - mesh.min[2],
+                tris: u32::try_from(mesh.triangle_count()).unwrap_or(u32::MAX),
+                tint,
+            }),
         },
         Err(e) => {
             tracing::warn!(error = %e, "writing a thumbnail failed");
@@ -195,6 +285,7 @@ fn record(
             width,
             height,
             blurhash,
+            model,
         } => {
             tx.prepare_cached(
                 "INSERT INTO files(account_id, path, key, size, mime, purpose)
@@ -211,9 +302,13 @@ fn record(
             // The decoded file is the truth for its display size (EXIF orientation applied);
             // the sender's pointer may claim anything. The sender's blurhash stays: it is what
             // the timeline showed while the file was downloading.
+            // A model's still has no blurhash (an empty one would show as a broken hash).
+            let blurhash = Some(blurhash).filter(|h| !h.is_empty());
             tx.prepare_cached(
                 "UPDATE attachments SET thumb_file_id = ?2, blurhash = coalesce(blurhash, ?3),
-                   width = ?4, height = ?5, derived_at = ?6
+                   width = ?4, height = ?5, derived_at = ?6,
+                   model_x_mm = ?7, model_y_mm = ?8, model_z_mm = ?9, model_tris = ?10,
+                   model_tint = ?11
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -222,7 +317,12 @@ fn record(
                 blurhash,
                 width,
                 height,
-                now
+                now,
+                model.map(|m| f64::from(m.x_mm)),
+                model.map(|m| f64::from(m.y_mm)),
+                model.map(|m| f64::from(m.z_mm)),
+                model.map(|m| i64::from(m.tris)),
+                model.map(|m| i64::from(m.tint)),
             ])?;
             if let Some(old) = old_thumb {
                 let p: Option<String> = tx
@@ -979,5 +1079,188 @@ mod tests {
             .query_row("SELECT count(*) FROM attachments", [], |r| r.get(0))
             .expect("count");
         assert_eq!(left, 0);
+    }
+
+    // ---- 3D models ----
+
+    const TRI: &str = "solid t\nfacet normal 0 0 0\nouter loop\nvertex 0 0 0\nvertex 10 0 0\nvertex 0 10 0\nendloop\nendfacet\nendsolid t\n";
+
+    /// A coloured 3MF of one object (one tetrahedron) built here, never a file.
+    fn coloured_3mf() -> Vec<u8> {
+        use std::io::Write;
+        let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="r" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>"#;
+        let model = r##"<?xml version="1.0"?><model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><basematerials id="1"><base name="a" displaycolor="#E05A1E"/></basematerials><object id="1" type="model" pid="1" pindex="0"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="0" y="10" z="0"/><vertex x="0" y="0" z="10"/></vertices><triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/><triangle v1="1" v2="2" v3="3"/><triangle v1="2" v2="0" v3="3"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>"##;
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in [("_rels/.rels", rels), ("3D/3dmodel.model", model)] {
+            z.start_file(name, o).expect("entry");
+            z.write_all(data.as_bytes()).expect("write");
+        }
+        z.finish().expect("zip").into_inner()
+    }
+
+    /// A harness holding one downloaded file named `name` with the content `bytes`, and its job.
+    fn downloaded(
+        dir: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> (IngestHarness, PathBuf, DeriveJob) {
+        let blobs = dir.join("blobs");
+        let alice = UserId::parse(ALICE).expect("id");
+        let conv = ConvKey::Direct(alice.clone());
+        let mut h = IngestHarness::open(
+            &dir.join("core.db"),
+            &kourier_db::DbKey::from([5; 32]),
+            NetworkKind::Fake,
+            MsgIdScope::AccountAuthor,
+            &[UserId::parse(ME).expect("id")],
+        )
+        .expect("harness");
+        let mut patch = ConversationPatch::new(conv.clone());
+        patch.features = Some(signal_features(false));
+        let mut file =
+            kourier_fake::attachments::synthetic_file(name, "application/octet-stream", 100, 1);
+        file.mime = String::new();
+        let mut m = remote(&conv, &alice, "1", 1_000, "");
+        m.body = Body::Media {
+            attachments: vec![file],
+            caption: None,
+        };
+        h.apply(vec![
+            BackendEvent::ConversationUpsert(patch),
+            BackendEvent::Message(m),
+        ])
+        .expect("apply");
+        let (att, path, key): (i64, String, Vec<u8>) = h
+            .connection()
+            .query_row(
+                "SELECT attachment_id, path, key FROM attachment_downloads",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("a download in flight");
+        let target = blobs.join(&path);
+        std::fs::create_dir_all(target.parent().expect("shard")).expect("shard dir");
+        let key: [u8; 32] = key.try_into().expect("key");
+        kourier_blob::write_all(&target, &FileKey::from_bytes(key), bytes).expect("blob");
+        h.apply(vec![BackendEvent::AttachmentDone {
+            attachment: AttachmentId(att),
+            request: None,
+            result: Ok(AttachmentMeta {
+                size: bytes.len() as u64,
+                mime: None,
+                dims: None,
+                duration_ms: None,
+            }),
+        }])
+        .expect("done");
+        let account = h.account();
+        let jobs = crate::ingest::pending_derives(h.connection(), account).expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        (h, blobs, jobs.into_iter().next().expect("job"))
+    }
+
+    fn facts(h: &IngestHarness) -> (bool, Option<f64>, Option<i64>, Option<i64>) {
+        h.connection()
+            .query_row(
+                "SELECT thumb_file_id IS NOT NULL, model_x_mm, model_tris, model_tint FROM attachments",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("row")
+    }
+
+    #[test]
+    fn deriving_an_stl_writes_a_shade_thumb_and_the_facts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut h, blobs, job) = downloaded(dir.path(), "part.stl", TRI.as_bytes());
+        assert!(job.is_model());
+        let outcome = compute(&blobs, &job);
+        assert!(matches!(
+            &outcome,
+            Outcome::Thumb { mime: "image/png", model: Some(m), .. } if m.tris == 1 && m.tint
+        ));
+        let account = h.account();
+        commit(
+            h.connection_mut(),
+            account,
+            MsgIdScope::AccountAuthor,
+            2_000,
+            &job,
+            outcome,
+        )
+        .expect("commit");
+        assert_eq!(facts(&h), (true, Some(10.0), Some(1), Some(1)));
+    }
+
+    #[test]
+    fn deriving_a_coloured_3mf_writes_a_thumb_in_its_own_colours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut h, blobs, job) = downloaded(dir.path(), "part.3mf", &coloured_3mf());
+        let outcome = compute(&blobs, &job);
+        assert!(matches!(
+            &outcome,
+            Outcome::Thumb { model: Some(m), .. } if m.tris == 4 && !m.tint
+        ));
+        let account = h.account();
+        commit(
+            h.connection_mut(),
+            account,
+            MsgIdScope::AccountAuthor,
+            2_000,
+            &job,
+            outcome,
+        )
+        .expect("commit");
+        assert_eq!(facts(&h), (true, Some(10.0), Some(4), Some(0)));
+    }
+
+    #[test]
+    fn a_malformed_model_stays_a_plain_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut h, blobs, job) = downloaded(dir.path(), "broken.stl", b"solid x\nfacet garbage");
+        let outcome = compute(&blobs, &job);
+        assert!(matches!(outcome, Outcome::Nothing));
+        let account = h.account();
+        commit(
+            h.connection_mut(),
+            account,
+            MsgIdScope::AccountAuthor,
+            2_000,
+            &job,
+            outcome,
+        )
+        .expect("commit");
+        assert_eq!(facts(&h), (false, None, None, None));
+    }
+
+    #[test]
+    fn a_stale_model_derive_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut h, blobs, mut job) = downloaded(dir.path(), "part.stl", TRI.as_bytes());
+        let outcome = compute(&blobs, &job);
+        let Outcome::Thumb { path, .. } = &outcome else {
+            panic!("a thumb")
+        };
+        let thumb = blobs.join(path);
+        assert!(thumb.exists());
+        // The file was replaced meanwhile: the job read another `files` row.
+        job.file_id += 1000;
+        let account = h.account();
+        let ch = commit(
+            h.connection_mut(),
+            account,
+            MsgIdScope::AccountAuthor,
+            2_000,
+            &job,
+            outcome,
+        )
+        .expect("commit");
+        assert_eq!(facts(&h), (false, None, None, None));
+        assert!(
+            !ch.unlink.is_empty(),
+            "the unused thumbnail is scheduled for unlinking"
+        );
     }
 }

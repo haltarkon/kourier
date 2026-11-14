@@ -436,6 +436,33 @@ pub struct ConversationFeatures {
     /// states the features again. Read it through [`Self::lists_for_roaming`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roaming_listed: Option<bool>,
+    /// Whether this chat may be exported to a file ([`ChatExport`]). Skipped from the
+    /// serialised form while `Unstated`, so a chat of a network that says nothing keeps the
+    /// JSON and the [`Self::stable_hash`] it had before the field existed.
+    #[serde(skip_serializing_if = "ChatExport::is_unstated")]
+    pub export: ChatExport,
+}
+
+/// Whether a chat may be exported into a copy outside the encrypted store (Export Selected,
+/// architecture §5.8.3). A network states it per chat; the core refuses to plan or write an
+/// export unless it says [`ChatExport::Allowed`] (`actions::may_export_chat`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatExport {
+    /// The backend says nothing: the chat is NOT exportable (fail closed).
+    #[default]
+    Unstated,
+    /// The network has no restriction on saving this chat (Signal, Threema).
+    Allowed,
+    /// The network forbids saving this chat (Telegram's protected content, WhatsApp's
+    /// "Advanced chat privacy").
+    Restricted,
+}
+
+impl ChatExport {
+    /// Serde's `skip_serializing_if` for the default.
+    pub fn is_unstated(&self) -> bool {
+        *self == Self::Unstated
+    }
 }
 
 /// What a network offers for the invite link of a group.

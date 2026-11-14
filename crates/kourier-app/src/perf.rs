@@ -26,11 +26,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kourier_backend_api::{BackendEvent, Clock, Sleep, SystemClock};
-use kourier_core::facade::{CoreHandle, Query, QueryData, UiCommand};
+use kourier_core::facade::{CoreHandle, Query, QueryData, SearchQuery, UiCommand};
 use kourier_fake::attachments::{synthetic_file, synthetic_image};
 use kourier_fake::fixture::{FixtureSpec, Rng, fixture};
 use kourier_fake::{FakeNetwork, Flavor, Script, Step};
-use kourier_model::{Body, ConvKey, NetworkKind, Text};
+use kourier_model::{Body, ConvKey, NetworkKind, Redacted, Text};
 
 use crate::app::AppError;
 use crate::keys::{KdfParams, KeyError, Keyring, NoSecretStore, PassphraseConfig};
@@ -84,6 +84,10 @@ pub struct PerfOptions {
     /// Deliver one more message this long after the backend is online (the notification
     /// measurement). Works once per copy of a profile.
     pub live_after: Option<Duration>,
+    /// Filters to store in this copy of the profile before the app goes on (`--perf-filters`):
+    /// [`kourier_core::testing::filter_mix`], saved through the core's own `SaveFilter`. Only
+    /// when the profile holds no filter yet, so a second start of the copy adds none.
+    pub filters: usize,
 }
 
 /// What seeding an empty profile took, for the "catch-up ingest" row of the perf table.
@@ -144,6 +148,9 @@ const KDF: KdfParams = KdfParams {
 const SEED_TIMEOUT: Duration = Duration::from_secs(1800);
 /// How long the downloads may take to settle.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long the search index may take to reach the seeded messages (50,000 messages: the
+/// backfill starts 10 s after `UiReady`, then runs paced).
+const INDEX_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn fixture_error(e: impl std::fmt::Display) -> AppError {
     AppError::Fixture(e.to_string())
@@ -602,12 +609,14 @@ pub(crate) async fn seed(
         }
     }
     let downloads = last_change.duration_since(settle);
+    let indexing = wait_for_search_index(core).await?;
     reference.save(home)?;
     tracing::info!(
         messages,
         events,
         files,
         ms = ingest.as_millis(),
+        index_ms = indexing.as_millis(),
         "reference profile seeded"
     );
     Ok(SeedReport {
@@ -617,6 +626,76 @@ pub(crate) async fn seed(
         files,
         downloads,
     })
+}
+
+/// Stores `count` filters of [`kourier_core::testing::filter_mix`] through the core's save
+/// path (`UiCommand::SaveFilter`), then waits until the core answers with all of them. A
+/// profile that holds filters already is left as it is. Returns how many the core holds.
+pub(crate) async fn store_filters(core: &CoreHandle, count: usize) -> Result<usize, AppError> {
+    let held = |data: QueryData| match data {
+        QueryData::Filters(list) => list.filters.len(),
+        _ => 0,
+    };
+    let now = held(core.query(Query::Filters).await?);
+    if count == 0 || now > 0 {
+        return Ok(now);
+    }
+    for spec in kourier_core::testing::filter_mix(count) {
+        core.send(UiCommand::SaveFilter { id: None, spec })?;
+    }
+    let started = Instant::now();
+    loop {
+        let now = held(core.query(Query::Filters).await?);
+        if now >= count {
+            return Ok(now);
+        }
+        if started.elapsed() > SEED_TIMEOUT {
+            return Err(fixture_error(format!(
+                "the core holds {now} of {count} filters"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Lets the search index take every seeded message (decisions M2): a measured start must not
+/// find the seeded history waiting for the index, or its first seconds (the log's prune, the
+/// backfill at +10 s) would be measured as the app's. The index starts at `UiReady`, which no
+/// window sends in a seeding run, so it is sent here; then this waits until the backfill is
+/// done (`index.ready`) and the log holds no row (`Query::SearchQueued`). Returns how long it
+/// took. A profile seeded before this wait is not trusted: `cargo xtask perf` reads the digest
+/// of the core's and this crate's sources (`PROFILE_SOURCES`), so any change of this file
+/// seeds an older profile again.
+async fn wait_for_search_index(core: &CoreHandle) -> Result<Duration, AppError> {
+    let started = Instant::now();
+    core.send(UiCommand::UiReady)?;
+    let ask = SearchQuery {
+        text: Redacted::new("ab".to_owned()),
+        chats: None,
+        limit: 1,
+        before: None,
+        mode: Default::default(),
+    };
+    let mut state = (false, 0u64);
+    while started.elapsed() < INDEX_TIMEOUT {
+        let ready = match core.query(Query::Search(ask.clone())).await? {
+            QueryData::Search(page) => page.index.ready,
+            _ => false,
+        };
+        let queued = match core.query(Query::SearchQueued).await? {
+            QueryData::SearchQueued(n) => n,
+            _ => u64::MAX,
+        };
+        state = (ready, queued);
+        if ready && queued == 0 {
+            return Ok(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(fixture_error(format!(
+        "the search index did not take the seeded messages in time (backfill done: {}, {} rows still in the log)",
+        state.0, state.1
+    )))
 }
 
 impl SeedReport {
@@ -844,6 +923,7 @@ mod tests {
             home: tmp.path().to_path_buf(),
             spec: small(),
             live_after: Some(Duration::from_millis(1777)),
+            filters: 0,
         };
         // An empty profile: the whole script, and what to remember of it. No live message
         // while seeding.
@@ -889,6 +969,7 @@ mod tests {
             home: tmp.path().to_path_buf(),
             spec: small(),
             live_after: None,
+            filters: 0,
         };
         assert!(is_fresh(&opts));
         let paths = paths(&opts).expect("paths");

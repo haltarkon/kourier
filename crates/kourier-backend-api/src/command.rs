@@ -43,6 +43,14 @@ pub enum Command {
     NetworkChanged,
     /// logind reported resume from suspend: check the connection now.
     Resumed,
+    /// The window was let go (`UiCommand::ReleaseMemory`): give back what you keep only for
+    /// speed, the page cache and the prepared statements of your database connections
+    /// (`kourier_db::release_memory`). A hint, not durable and not queued: an actor that is not
+    /// running never sees it, and nothing answers it. It touches no data, starts no connection
+    /// and must not delay the actor's loop: a connection that lives on another thread or task
+    /// is released there, by a job. A one-shot connection (a history stage, a migration) is out
+    /// of scope.
+    ReleaseMemory,
     /// Start a login flow (`"qr"`; later `"pair-code"`, `"id-backup"`).
     StartLogin {
         /// A flow id from `NetworkDescriptor::login_flows`.
@@ -471,6 +479,7 @@ impl Command {
             Self::Logout => "Logout",
             Self::NetworkChanged => "NetworkChanged",
             Self::Resumed => "Resumed",
+            Self::ReleaseMemory => "ReleaseMemory",
             Self::StartLogin { .. } => "StartLogin",
             Self::SubmitLoginInput { .. } => "SubmitLoginInput",
             Self::CancelLogin => "CancelLogin",

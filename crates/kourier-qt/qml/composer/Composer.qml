@@ -45,6 +45,9 @@ QQC2.ToolBar {
     readonly property bool replying: App.composer.replyToId > 0
     readonly property bool editing: App.composer.editId > 0
     readonly property bool blocked: App.timeline.cannotSend !== ""
+    // The selection mode is on: the bar takes the composer's place. The composer stays alive, only
+    // its content is hidden: the draft, the typing state and the restore logic keep running.
+    readonly property bool selecting: App.timeline.selecting
     // Where the keyboard enters the composer: the attach button, else the text.
     readonly property Item firstStop: attachButton.visible ? attachButton : area
     readonly property string kinds: App.timeline.attachKinds
@@ -68,6 +71,23 @@ QQC2.ToolBar {
     readonly property alias textArea: area
     // The emoji picker, created when it is first asked for.
     property EmojiPopup emojiPopup: null
+
+    // The picker (search, Favorites and groups) exists once asked for. A search text given opens
+    // it on that search (the fixture pages).
+    function toggleEmoji(search: string): void {
+        if (root.emojiPopup === null) {
+            root.emojiPopup = emojiComponent.createObject(emojiButton) as EmojiPopup;
+        }
+        if (root.emojiPopup.visible && !search) {
+            root.emojiPopup.close();
+        } else {
+            root.emojiPopup.open();
+            if (search) {
+                root.emojiPopup.grid.searchField.text = search;
+            }
+        }
+        emojiButton.checked = Qt.binding(() => root.emojiPopup !== null && root.emojiPopup.visible);
+    }
     // A text this long may be more than one message of the chat carries: with files waiting
     // it is handed to the plan when it rests (in characters; four bytes each at most, and no
     // network's messages are that short).
@@ -371,7 +391,7 @@ QQC2.ToolBar {
             }
             readonly property color accent: Style.readable(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor)
 
-            visible: (root.replying || root.editing) && !root.blocked
+            visible: (root.replying || root.editing) && !root.blocked && !root.selecting
             spacing: Kirigami.Units.largeSpacing
             Layout.fillWidth: true
             Layout.leftMargin: Kirigami.Units.smallSpacing
@@ -462,7 +482,7 @@ QQC2.ToolBar {
             readonly property bool split: App.composer.messageCount > 1
 
             // An edit changes the text of a message, never its files.
-            visible: root.hasFiles && !root.blocked && !root.editing
+            visible: root.hasFiles && !root.blocked && !root.editing && !root.selecting
             spacing: Kirigami.Units.smallSpacing / 2
             Layout.fillWidth: true
             Layout.leftMargin: Kirigami.Units.smallSpacing
@@ -939,7 +959,7 @@ QQC2.ToolBar {
         // A send the core is still copying and encrypting: its messages show once all of it
         // is stored.
         RowLayout {
-            visible: App.composer.preparing > 0 && !root.blocked
+            visible: App.composer.preparing > 0 && !root.blocked && !root.selecting
             spacing: Kirigami.Units.smallSpacing
             Layout.fillWidth: true
             Layout.leftMargin: Kirigami.Units.smallSpacing
@@ -972,7 +992,7 @@ QQC2.ToolBar {
         }
 
         Kirigami.InlineMessage {
-            visible: root.blocked || App.composer.error !== ""
+            visible: (root.blocked || App.composer.error !== "") && !root.selecting
             type: root.blocked ? Kirigami.MessageType.Information : Kirigami.MessageType.Error
             text: Style.plain(root.blocked ? App.timeline.cannotSend : App.composer.error)
             Layout.fillWidth: true
@@ -980,7 +1000,7 @@ QQC2.ToolBar {
 
         // A small notice from the core, e.g. that sending is not available yet.
         Kirigami.InlineMessage {
-            visible: !root.blocked && App.composer.notice !== ""
+            visible: !root.blocked && App.composer.notice !== "" && !root.selecting
             type: Kirigami.MessageType.Information
             text: Style.plain(App.composer.notice)
             Layout.fillWidth: true
@@ -1006,8 +1026,16 @@ QQC2.ToolBar {
             ]
         }
 
+        SelectionBar {
+            id: selectionBar
+
+            objectName: "selectionBar"
+            visible: root.selecting
+            Layout.fillWidth: true
+        }
+
         RowLayout {
-            visible: !root.blocked
+            visible: !root.blocked && !root.selecting
             spacing: Kirigami.Units.smallSpacing
             Layout.fillWidth: true
 
@@ -1058,68 +1086,117 @@ QQC2.ToolBar {
                 }
             }
 
-            QQC2.ScrollView {
+            // The frame of the text area is drawn by the style into a texture of the area's size
+            // in device pixels. On a display of scale 1.25 an item at a whole logical position
+            // lies between two device pixels (measured: x 561.25, y 948.75 or 952.5 of a 1500x1000
+            // picture), the texture is drawn resampled there, and its top and bottom lines come
+            // out unequal (his report 2026-11-11: the top line wider than the bottom one). The box
+            // takes the layout's room and puts the area on the device pixel grid: its size is
+            // whole device pixels and its position is moved by the fraction its place in the
+            // window leaves (`snapX`, `snapY`, 0 at scale 1).
+            Item {
+                id: fieldBox
+                objectName: "fieldBox"
+                readonly property real dpr: Math.max(1, Screen.devicePixelRatio)
+                // How far the area moves to land on a device pixel (logical pixels).
+                property real snapX: 0
+                property real snapY: 0
                 Layout.fillWidth: true
-                Layout.maximumHeight: Kirigami.Units.gridUnit * 8
+                Layout.maximumHeight: Math.floor(Kirigami.Units.gridUnit * 8 * fieldBox.dpr) / fieldBox.dpr
                 Layout.alignment: Qt.AlignVCenter
+                implicitHeight: Math.ceil(scroll.implicitHeight * fieldBox.dpr) / fieldBox.dpr
 
-                QQC2.TextArea {
-                    id: area
+                function resnap(): void {
+                    const at = fieldBox.mapToItem(null, 0, 0);
+                    const dpr = fieldBox.dpr;
+                    fieldBox.snapX = Math.round(at.x * dpr) / dpr - at.x;
+                    fieldBox.snapY = Math.round(at.y * dpr) / dpr - at.y;
+                }
+                // (Nothing tells an item that its place in the window changed, so the signals of
+                // the box, of the composer and of the window stand in for it.)
+                onXChanged: fieldBox.resnap()
+                onYChanged: fieldBox.resnap()
+                onWidthChanged: fieldBox.resnap()
+                onHeightChanged: fieldBox.resnap()
+                Component.onCompleted: fieldBox.resnap()
+                Connections {
+                    target: root
+                    function onXChanged(): void { fieldBox.resnap(); }
+                    function onYChanged(): void { fieldBox.resnap(); }
+                    function onWidthChanged(): void { fieldBox.resnap(); }
+                    function onHeightChanged(): void { fieldBox.resnap(); }
+                }
+                Connections {
+                    target: fieldBox.Window.window
+                    function onWidthChanged(): void { fieldBox.resnap(); }
+                    function onHeightChanged(): void { fieldBox.resnap(); }
+                }
 
-                    placeholderText: root.editing ? (App.composer.editCaption ? L10n.i18nc("@info:placeholder", "Caption") : L10n.i18nc("@info:placeholder", "Message")) : (root.hasFiles ? L10n.i18nc("@info:placeholder", "Add a caption") : L10n.i18nc("@info:placeholder", "Message"))
-                    Accessible.name: placeholderText
-                    wrapMode: TextEdit.Wrap
-                    textFormat: TextEdit.PlainText
-                    persistentSelection: true
+                QQC2.ScrollView {
+                    id: scroll
+                    x: fieldBox.snapX
+                    y: fieldBox.snapY
+                    width: Math.floor(fieldBox.width * fieldBox.dpr) / fieldBox.dpr
+                    height: Math.floor(fieldBox.height * fieldBox.dpr) / fieldBox.dpr
 
-                    onTextChanged: {
-                        // With files waiting the text is their caption: how they are sent
-                        // can depend on there being one, and on its length when it is long.
-                        App.composer.setHasText(area.text.trim().length > 0);
-                        if (root.hasFiles && !root.editing && (area.length > root.captionWorthTelling || root.captionTold)) {
-                            captionSettle.restart();
-                        }
-                        if (root.restoring || root.editing || root.conversation === 0) {
-                            return;
-                        }
-                        App.composer.setTyping(root.conversation, area.text.length > 0);
-                        if (area.text.length > 0) {
-                            typingStop.restart();
-                        } else {
-                            typingStop.stop();
-                        }
-                    }
+                    QQC2.TextArea {
+                        id: area
 
-                    // Pasting files (copied in a file manager) or an image attaches them; text
-                    // pastes as usual.
-                    Keys.onPressed: event => {
-                        if (event.matches(StandardKey.Paste) && root.canAttach && !root.editing && App.composer.paste()) {
-                            event.accepted = true;
-                        }
-                    }
-                    // Up in an empty composer edits the last own message (as in most chat
-                    // apps); elsewhere it moves the cursor.
-                    Keys.onUpPressed: event => {
-                        event.accepted = area.text.length === 0 && !root.editing && !root.hasFiles && App.composer.editLast(root.conversation);
-                    }
-                    Keys.onEscapePressed: event => {
-                        event.accepted = root.cancel();
-                    }
+                        placeholderText: root.editing ? (App.composer.editCaption ? L10n.i18nc("@info:placeholder", "Caption") : L10n.i18nc("@info:placeholder", "Message")) : (root.hasFiles ? L10n.i18nc("@info:placeholder", "Add a caption") : L10n.i18nc("@info:placeholder", "Message"))
+                        Accessible.name: placeholderText
+                        wrapMode: TextEdit.Wrap
+                        textFormat: TextEdit.PlainText
+                        persistentSelection: true
 
-                    Keys.onReturnPressed: event => {
-                        if (event.modifiers & Qt.ShiftModifier) {
-                            event.accepted = false;
-                        } else {
-                            root.send();
-                            event.accepted = true;
+                        onTextChanged: {
+                            // With files waiting the text is their caption: how they are sent
+                            // can depend on there being one, and on its length when it is long.
+                            App.composer.setHasText(area.text.trim().length > 0);
+                            if (root.hasFiles && !root.editing && (area.length > root.captionWorthTelling || root.captionTold)) {
+                                captionSettle.restart();
+                            }
+                            if (root.restoring || root.editing || root.conversation === 0) {
+                                return;
+                            }
+                            App.composer.setTyping(root.conversation, area.text.length > 0);
+                            if (area.text.length > 0) {
+                                typingStop.restart();
+                            } else {
+                                typingStop.stop();
+                            }
                         }
-                    }
-                    Keys.onEnterPressed: event => {
-                        if (event.modifiers & Qt.ShiftModifier) {
-                            event.accepted = false;
-                        } else {
-                            root.send();
-                            event.accepted = true;
+
+                        // Pasting files (copied in a file manager) or an image attaches them; text
+                        // pastes as usual.
+                        Keys.onPressed: event => {
+                            if (event.matches(StandardKey.Paste) && root.canAttach && !root.editing && App.composer.paste()) {
+                                event.accepted = true;
+                            }
+                        }
+                        // Up in an empty composer edits the last own message (as in most chat
+                        // apps); elsewhere it moves the cursor.
+                        Keys.onUpPressed: event => {
+                            event.accepted = area.text.length === 0 && !root.editing && !root.hasFiles && App.composer.editLast(root.conversation);
+                        }
+                        Keys.onEscapePressed: event => {
+                            event.accepted = root.cancel();
+                        }
+
+                        Keys.onReturnPressed: event => {
+                            if (event.modifiers & Qt.ShiftModifier) {
+                                event.accepted = false;
+                            } else {
+                                root.send();
+                                event.accepted = true;
+                            }
+                        }
+                        Keys.onEnterPressed: event => {
+                            if (event.modifiers & Qt.ShiftModifier) {
+                                event.accepted = false;
+                            } else {
+                                root.send();
+                                event.accepted = true;
+                            }
                         }
                     }
                 }
@@ -1135,18 +1212,7 @@ QQC2.ToolBar {
                 QQC2.ToolTip.visible: hovered
                 QQC2.ToolTip.text: text
                 Layout.alignment: Qt.AlignBottom
-                onClicked: {
-                    // The picker (categories and a grid of every emoji) exists once asked for.
-                    if (root.emojiPopup === null) {
-                        root.emojiPopup = emojiComponent.createObject(emojiButton) as EmojiPopup;
-                    }
-                    if (root.emojiPopup.visible) {
-                        root.emojiPopup.close();
-                    } else {
-                        root.emojiPopup.open();
-                    }
-                    emojiButton.checked = Qt.binding(() => root.emojiPopup !== null && root.emojiPopup.visible);
-                }
+                onClicked: root.toggleEmoji()
 
                 Component {
                     id: emojiComponent

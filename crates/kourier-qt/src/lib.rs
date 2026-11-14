@@ -35,8 +35,9 @@ use cxx_qt_lib_extras::QApplication;
 use kourier_app::AppHandle;
 
 pub use bridge::qobject::{
-    AccountListModel, App, ComposerController, ConversationListModel, LoginController,
-    MediaListModel, MemberListModel, SettingsController, ShareTargetListModel, TimelineModel,
+    AccountListModel, App, ComposerController, ConversationListModel, EmojiLists, EmojiModel,
+    FilterListModel, LoginController, MediaListModel, MemberListModel, SearchListModel,
+    SettingsController, ShareTargetListModel, TimelineModel,
 };
 
 /// Desktop file name, Wayland `app_id` and D-Bus name.
@@ -51,8 +52,9 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// image viewer over it; `compose` = the composer with attachments waiting; `files` = the
 /// composer with many files of every kind at once, split into messages, one of them marked as
 /// not sendable; `album` = a chat with albums of two, three, four and nine pictures;
-/// `albumviewer` = the viewer stepping through an album; `revisions` = the edit history of a
-/// message; `compact` = the list in its compact layout).
+/// `albumviewer` = the viewer stepping through an album; `viewerzoom` = the viewer on the media
+/// chat's photo zoomed to 200 %; `revisions` = the edit history of a message; `compact` = the
+/// list in its compact layout).
 ///
 /// The message actions, on the fixture's showcase chats: `quotes` = replies with their quote
 /// blocks (a known, a missing and a deleted original, a quoted photo) and an edited caption;
@@ -124,6 +126,8 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// of the test network and one that plays WhatsApp) of which the second is hidden and has unread
 /// messages; `accountsdrawer` = the side panel (wide: expanded, one account unticked; narrow: the
 /// open drawer with only the first account shown, its box greyed).
+/// Export Selected, step SEL: `select` = the media chat (a photo, a file, a voice note) in the selection mode
+/// with about three rows selected (a picture among them) and the bar in the composer's place.
 /// A10d: the chat list's own menus and the chat page's, on the fixture's first ordinary chat (no chat is
 /// added): `rowmenu` = the row menu of a list row (Mark as Unread, Pin, Mute, Archive); `rowmenuoff` =
 /// the same with the account's sync switch turned off through `App.setRoamingWrites` (every entry
@@ -132,7 +136,7 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// `muteuntil` = the open chat with the "Mute Until" dialog; `chatmenu` = the open chat with its
 /// overflow menu; `chatmenuoff` = the same with the account's sync switch turned off (every entry
 /// greyed, the reason wrapped under Archive).
-pub const PAGES: [&str; 90] = [
+pub const PAGES: [&str; 107] = [
     "welcome",
     "link",
     "qr",
@@ -147,6 +151,7 @@ pub const PAGES: [&str; 90] = [
     "files",
     "album",
     "albumviewer",
+    "viewerzoom",
     "revisions",
     "compact",
     "quotes",
@@ -183,6 +188,11 @@ pub const PAGES: [&str; 90] = [
     "transferfailed",
     "transferask",
     "networks",
+    "appearance",
+    "filters",
+    "filteredit",
+    "highlight",
+    "regexsearch",
     "warisk",
     "waqr",
     "waphone",
@@ -223,6 +233,17 @@ pub const PAGES: [&str; 90] = [
     "muteuntil",
     "chatmenu",
     "chatmenuoff",
+    "searchresults",
+    "searchchat",
+    "searchindexing",
+    "emojipicker",
+    "emojisearch",
+    "hoverpins",
+    "model3d",
+    "model3dviewer",
+    "select",
+    "exportdialog",
+    "exportdone",
 ];
 
 /// Registers the `image://kourier` and `image://kourierart` providers on `engine` (before it
@@ -292,11 +313,24 @@ pub fn set_context(ctx: UiContext) {
 /// and 300 MB more on an NVIDIA machine, measured 2026-10-14), and the only player is the voice
 /// note's, which plays audio. The empty list means "none" to Qt (the media research of
 /// 2026-10-09 wrote `,`, which does the same); both lists are probed, so both names are needed.
-/// A later in-app video player takes its device types from a setting instead.
-pub const QT_ENV_DEFAULTS: [(&str, &str); 2] = [
+/// A later in-app video player takes its device types from a setting instead. The third is
+/// [`JS_GC_NOT_INCREMENTAL`].
+pub const QT_ENV_DEFAULTS: [(&str, &str); 3] = [
     ("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ""),
     ("QT_FFMPEG_ENCODING_HW_DEVICE_TYPES", ""),
+    JS_GC_NOT_INCREMENTAL,
 ];
+
+/// The QML engine's JavaScript garbage collector runs in one go, as before Qt 6.8, not in timed
+/// steps (Qt's documented switch: a time limit of 0). Qt 6.11.1's incremental collector crashed
+/// in `free()` under `QV4::GCStateMachine::transition()` (a posted event on the Qt thread, no
+/// Kourier frame in the stack): `qml_smoke` 4 times in 167 runs under gdb with the incremental
+/// collector, 0 in 84 without; glibc's heap checks, `QV4_MM_AGGRESSIVE_GC` and Qt's own
+/// cross-check of the incremental marking found nothing of ours (2026-11-11,
+/// `notes/kourier/tests-and-ci.md`). Plasma has the same crash (KDE bugs 492606 and 514249). The
+/// user's answer of 2026-11-11: off in the app and in the tests. The Qt window tests set it too
+/// (`tests/support`).
+pub const JS_GC_NOT_INCREMENTAL: (&str, &str) = ("QV4_GC_TIMELIMIT", "0");
 
 /// The defaults of [`QT_ENV_DEFAULTS`] whose name `is_set` does not know.
 pub fn env_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
@@ -556,21 +590,34 @@ mod qt_environment {
 
     const DECODING: &str = "QT_FFMPEG_DECODING_HW_DEVICE_TYPES";
     const ENCODING: &str = "QT_FFMPEG_ENCODING_HW_DEVICE_TYPES";
+    /// Spelled out, so a typo in `JS_GC_NOT_INCREMENTAL` is caught.
+    const GC: &str = "QV4_GC_TIMELIMIT";
 
-    /// Both lists of hardware device types are set empty when nothing set them.
+    /// Both lists of hardware device types are set empty and the JavaScript collector's time
+    /// limit to 0 (not incremental) when nothing set them.
     #[test]
-    fn both_lists_are_set_empty_when_nobody_set_them() {
+    fn the_defaults_are_set_when_nobody_set_them() {
         assert_eq!(
             env_defaults(|_| false),
-            vec![(DECODING, ""), (ENCODING, "")]
+            vec![(DECODING, ""), (ENCODING, ""), (GC, "0")]
         );
     }
 
-    /// A variable the person set stays theirs, the empty value included: only the other one is set.
+    /// A variable the person set stays theirs, the empty value included: only the others are set.
     #[test]
     fn a_variable_that_is_set_is_left_alone() {
-        assert_eq!(env_defaults(|name| name == DECODING), vec![(ENCODING, "")]);
-        assert_eq!(env_defaults(|name| name == ENCODING), vec![(DECODING, "")]);
+        assert_eq!(
+            env_defaults(|name| name == DECODING),
+            vec![(ENCODING, ""), (GC, "0")]
+        );
+        assert_eq!(
+            env_defaults(|name| name == ENCODING),
+            vec![(DECODING, ""), (GC, "0")]
+        );
+        assert_eq!(
+            env_defaults(|name| name == GC),
+            vec![(DECODING, ""), (ENCODING, "")]
+        );
         assert!(env_defaults(|_| true).is_empty());
     }
 }

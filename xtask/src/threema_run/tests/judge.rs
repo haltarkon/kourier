@@ -848,7 +848,13 @@ fn a_halt_while_the_code_waits_closes_the_login_first() {
 #[test]
 fn a_halt_lets_a_link_at_linking_finish() {
     let rig = Rig::new("j-linking");
-    let run = rig.run("linking-halt", false, quick());
+    // The app leaves by itself on the `quit`; the grace only has to outlast a stand-in that is slow to
+    // write the command down on a loaded machine (the flake of 2026-11-11, `seen` was empty).
+    let timing = crate::threema_run::supervise::Timing {
+        kill_grace: Duration::from_secs(5),
+        ..quick()
+    };
+    let run = rig.run("linking-halt", false, timing);
     let code = run
         .join_within(Duration::from_secs(20))
         .expect("the halt ended the run")

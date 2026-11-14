@@ -59,6 +59,7 @@ MainWindow {
     visible: true
 
     property string step: "start"
+    property real draftAt: -1
     property int waits: 0
     property var ev: null
     property int quiet: 0
@@ -149,6 +150,27 @@ MainWindow {
         win.composerItem.setText(text);
         win.composerItem.focusInput();
         win.ev.keyClick(Qt.Key_Return, Qt.NoModifier, -1);
+    }
+
+    // The conversation list in its order (null while the model is being rebuilt): the chat left
+    // with a draft moves up (the setting "Move chats with a draft to the top").
+    Instantiator {
+        id: chatsInOrder
+        model: App.conversations
+        delegate: QtObject {
+            required property real conversationId
+        }
+    }
+    function listOrder(): var {
+        const ids = [];
+        for (let i = 0; i < chatsInOrder.count; ++i) {
+            const c = chatsInOrder.objectAt(i);
+            if (!c) {
+                return null;
+            }
+            ids.push(c.conversationId);
+        }
+        return ids;
     }
 
     property bool busy: false
@@ -550,9 +572,45 @@ MainWindow {
         case "switched":
             if (App.timeline.conversationId !== OTHER || App.timeline.loading) return win.later("the other chat");
             if (win.dialog !== null || App.composer.locationAsking) return win.later("the switch closes the question");
+            if (win.composerItem === null) return win.later("the other chat's composer");
+            // The other chat is left with a draft: it moves up (the setting is on by default).
+            win.composerItem.setText("a draft for the other chat");
             win.openConversation(MEDIA);
+            win.next("draftOn");
+            return;
+        case "draftOn": {
+            // The other chat was left with a draft: it is the first of the unpinned chats, and
+            // with the setting off it is where its messages put it (further down).
+            const on = win.listOrder();
+            if (on === null || App.timeline.conversationId !== MEDIA || !App.settings.draftsOnTop) return win.later("the list with the draft chat");
+            const onAt = on.indexOf(OTHER);
+            if (onAt < 0) return win.fail("the other chat is not listed");
+            // (The draft is stored behind the switch; the list settles on the chat's place.)
+            if (onAt !== win.draftAt) {
+                win.draftAt = onAt;
+                win.quiet = 0;
+                return;
+            }
+            if (++win.quiet < 25) return;
+            App.settings.draftsOnTop = false;
+            win.next("draftOff");
+            return;
+        }
+        case "draftOff": {
+            const off = win.listOrder();
+            if (off === null || App.settings.draftsOnTop) return win.later("the list with the setting off");
+            const offAt = off.indexOf(OTHER);
+            if (offAt <= win.draftAt) return win.later("the list reorders (the chat is still at " + offAt + ", with the draft at " + win.draftAt + ")");
+            App.settings.draftsOnTop = true;
+            win.next("draftOnAgain");
+            return;
+        }
+        case "draftOnAgain": {
+            const again = win.listOrder();
+            if (again === null || !App.settings.draftsOnTop || again.indexOf(OTHER) !== win.draftAt) return win.later("on again puts the chat back in front");
             win.next("back");
             return;
+        }
         case "back":
             if (App.timeline.conversationId !== MEDIA || App.timeline.loading || win.composerItem === null) return win.later("back in the media chat");
             if (win.composerItem.text !== "draft text") return win.later("the draft comes back: " + win.composerItem.text);

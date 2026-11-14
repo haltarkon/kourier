@@ -161,13 +161,45 @@ FormCard.FormCardPage {
         page.flickable.contentY = Math.max(0, Math.min(expiryHeader.y - page.flickable.height * 0.4, page.flickable.contentHeight - page.flickable.height));
     }
 
+    // Brings "Appearance" on screen (a fixture page shows it), a little below the top of the view.
+    function showAppearance(): void {
+        page.flickable.contentY = Math.max(0, Math.min(appearanceHeader.y - page.flickable.height * 0.1, page.flickable.contentHeight - page.flickable.height));
+    }
+
+    // Brings "Filters" on screen (a fixture page shows it).
+    function showFilters(): void {
+        page.flickable.contentY = Math.max(0, Math.min(filtersHeader.y - page.flickable.height * 0.1, page.flickable.contentHeight - page.flickable.height));
+    }
+
+    // The filter dialog, opened on a filter with one invalid pattern (a fixture page shows it).
+    function showFilterDialog(): void {
+        filterDialog.openWith({
+            "name": L10n.i18nc("@info:placeholder a sample filter name", "Invoices"),
+            "text": "invoice|receipt",
+            "chat": "(accounts",
+            "notify": true,
+            "colour": App.filters.defaultColour()
+        });
+    }
+
+    readonly property alias filterDialogItem: filterDialog
+    readonly property alias filterDeleteItem: filterDeleteDialog
+
+    // Whether the filter dialog stands open (a fixture page waits for it).
+    function filterDialogOpened(): bool {
+        return filterDialog.opened;
+    }
+
     // Brings "Networks" on screen (a fixture page shows it).
     function showNetworks(): void {
         page.flickable.contentY = Math.max(0, Math.min(networksHeader.y, page.flickable.contentHeight - page.flickable.height));
     }
 
     // Nothing is read for this page before it is shown.
-    Component.onCompleted: App.settings.load()
+    Component.onCompleted: {
+        App.settings.load();
+        App.filters.load();
+    }
 
     FormCard.FormHeader {
         title: L10n.i18nc("@title:group", "General")
@@ -212,6 +244,22 @@ FormCard.FormCardPage {
         }
         FormCard.FormDelegateSeparator {}
         FormCard.FormSwitchDelegate {
+            objectName: "drafts-on-top"
+            text: L10n.i18nc("@option:check", "Move chats with a draft to the top")
+            description: L10n.i18nc("@info", "A chat you leave with an unsent message moves up in the list until you send or clear it, or a newer message arrives.")
+            checked: App.settings.draftsOnTop
+            onToggled: App.settings.draftsOnTop = checked
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
+            objectName: "show-account-tags"
+            text: L10n.i18nc("@option:check", "Show account tags in the chat list")
+            description: L10n.i18nc("@info", "Right-click an account in the side panel to give it a short tag. Off: no chat names its account.")
+            checked: App.settings.showAccountTags
+            onToggled: App.settings.showAccountTags = checked
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSwitchDelegate {
             objectName: "quiet-notices"
             text: L10n.i18nc("@option:check", "Show minor notices in the conversation list")
             description: L10n.i18nc("@info", "Safety number changes, refreshed sessions, changed phone numbers and accepted message requests. They always stay in the chat itself.")
@@ -224,13 +272,91 @@ FormCard.FormCardPage {
                 checked = Qt.binding(() => App.settings.quietNotices === "show");
             }
         }
+    }
+
+    FormCard.FormHeader {
+        id: appearanceHeader
+        title: L10n.i18nc("@title:group", "Appearance")
+    }
+    Card {
+        // What the two sliders make, as they move: an incoming and an outgoing message and an
+        // avatar. The preview follows the sliders at once; the preference is written a moment
+        // after the last move.
+        FormCard.AbstractFormDelegate {
+            objectName: "corner-preview"
+            background: null
+            Accessible.role: Accessible.Graphic
+            Accessible.name: L10n.i18nc("@info:whatsthis accessible", "Preview of message and avatar corners")
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+
+                Avatar {
+                    objectName: "corner-preview-avatar"
+                    Layout.alignment: Qt.AlignTop
+                    name: L10n.i18nc("@info:placeholder a sample name for the corner preview", "Olena Kovalenko")
+                    // (The preview's own value, not the saved one.)
+                    cornerOverride: avatarCorners.value
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
+
+                    Rectangle {
+                        objectName: "corner-preview-in"
+                        Layout.alignment: Qt.AlignLeft
+                        implicitWidth: inText.implicitWidth + Kirigami.Units.largeSpacing * 2
+                        implicitHeight: inText.implicitHeight + Kirigami.Units.smallSpacing * 3
+                        radius: Style.bubbleRadiusFor(messageCorners.value)
+                        color: Style.peerBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor)
+                        QQC2.Label {
+                            id: inText
+                            anchors.centerIn: parent
+                            text: L10n.i18nc("@info:placeholder a sample incoming message", "Are we still on for Saturday?")
+                            textFormat: Text.PlainText
+                        }
+                    }
+                    Rectangle {
+                        objectName: "corner-preview-out"
+                        Layout.alignment: Qt.AlignRight
+                        implicitWidth: outText.implicitWidth + Kirigami.Units.largeSpacing * 2
+                        implicitHeight: outText.implicitHeight + Kirigami.Units.smallSpacing * 3
+                        radius: Style.bubbleRadiusFor(messageCorners.value)
+                        color: Style.ownBubble(Kirigami.Theme.backgroundColor, Kirigami.Theme.highlightColor)
+                        QQC2.Label {
+                            id: outText
+                            anchors.centerIn: parent
+                            text: L10n.i18nc("@info:placeholder a sample outgoing message", "Yes, see you at ten.")
+                            textFormat: Text.PlainText
+                        }
+                    }
+                }
+            }
+        }
         FormCard.FormDelegateSeparator {}
-        FormCard.FormSwitchDelegate {
-            objectName: "round-avatars"
-            text: L10n.i18nc("@option:check", "Round avatars")
-            description: L10n.i18nc("@info", "Off: squares with your theme's corners.")
-            checked: App.settings.roundAvatars
-            onToggled: App.settings.roundAvatars = checked
+        FormCard.FormSliderDelegate {
+            id: messageCorners
+            objectName: "message-corners"
+            label: L10n.i18nc("@label:slider", "Message corners")
+            Accessible.name: label
+            description: L10n.i18nc("@info", "From square to very round.")
+            from: 0
+            to: 100
+            stepSize: 5
+            value: App.settings.messageCorners
+            onMoved: commitTimer.restart()
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormSliderDelegate {
+            id: avatarCorners
+            objectName: "avatar-corners"
+            label: L10n.i18nc("@label:slider", "Avatar corners")
+            Accessible.name: label
+            description: L10n.i18nc("@info", "From square to a circle.")
+            from: 0
+            to: 100
+            stepSize: 5
+            value: App.settings.avatarCorners
+            onMoved: commitTimer.restart()
         }
         FormCard.FormDelegateSeparator {}
         FormCard.FormSwitchDelegate {
@@ -247,6 +373,82 @@ FormCard.FormCardPage {
             description: L10n.i18nc("@info", "A faint pattern in the color of the chat's account.")
             checked: App.settings.chatWallpaper
             onToggled: App.settings.chatWallpaper = checked
+        }
+        Timer {
+            id: commitTimer
+            interval: 150
+            onTriggered: {
+                App.settings.messageCorners = Math.round(messageCorners.value);
+                App.settings.avatarCorners = Math.round(avatarCorners.value);
+            }
+        }
+    }
+
+    FormCard.FormHeader {
+        title: L10n.i18nc("@title:group", "3D Models")
+    }
+    Card {
+        // The row draws its swatch itself: FormButtonDelegate draws its icon from `icon.name`
+        // only (an `image://` icon stays empty), and its `leading` item is shown through a
+        // LayoutItemProxy whose `visible` follows the item's own, which stays false for good
+        // when the page is made hidden (qml.md).
+        FormCard.AbstractFormDelegate {
+            id: modelColourRow
+            objectName: "model-colour"
+            readonly property string description: App.settings.modelColour === "" ? L10n.i18nc("@info", "The accent color of your desktop, for models that have no colors of their own.") : L10n.i18nc("@info", "The color you chose, for models that have no colors of their own.")
+            text: L10n.i18nc("@label:button", "Model color")
+            focusPolicy: Qt.StrongFocus
+            Accessible.role: Accessible.Button
+            Accessible.description: modelColourRow.description
+            Accessible.onPressAction: modelColourRow.clicked()
+            onClicked: modelColourMenu.popup(modelColourRow, 0, modelColourRow.height)
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.largeSpacing
+
+                Kirigami.Icon {
+                    objectName: "model-colour-swatch"
+                    implicitWidth: Kirigami.Units.iconSizes.small
+                    implicitHeight: implicitWidth
+                    source: "image://kourierart/swatch/" + Style.modelTint
+                    Accessible.ignored: true
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        text: modelColourRow.text
+                        elide: Text.ElideRight
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 2
+                        Accessible.ignored: true
+                    }
+                    QQC2.Label {
+                        Layout.fillWidth: true
+                        text: modelColourRow.description
+                        wrapMode: Text.Wrap
+                        color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                        Accessible.ignored: true
+                    }
+                }
+                FormCard.FormArrow {
+                    Layout.leftMargin: Kirigami.Units.smallSpacing
+                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                    direction: Qt.RightArrow
+                }
+            }
+
+            ModelColourMenu {
+                id: modelColourMenu
+            }
+        }
+        FormCard.FormDelegateSeparator {}
+        FormCard.FormButtonDelegate {
+            objectName: "model-colour-accent"
+            text: L10n.i18nc("@action:button", "Use Accent Color")
+            enabled: App.settings.modelColour !== ""
+            onClicked: App.settings.modelColour = ""
         }
     }
 
@@ -266,6 +468,180 @@ FormCard.FormCardPage {
             text: L10n.i18nc("@label", "While catching up")
             description: L10n.i18nc("@info", "Messages that arrived while Kourier was offline are summed up in one notification.")
         }
+    }
+
+    FormCard.FormHeader {
+        id: filtersHeader
+        title: L10n.i18nc("@title:group", "Filters")
+    }
+    Card {
+        id: filtersCard
+        objectName: "filters-card"
+
+        FormCard.FormTextDelegate {
+            objectName: "filters-empty"
+            visible: App.filters.loaded && App.filters.count === 0
+            text: L10n.i18nc("@info", "No filters yet")
+            description: L10n.i18nc("@info", "A filter looks for a pattern in what a message says, in who sent it or in the chat's name. It can notify you and mark what it finds.")
+        }
+        Repeater {
+            model: App.filters
+            delegate: FormCard.AbstractFormDelegate {
+                id: filterRow
+
+                required property int index
+                required property real filterId
+                required property string name
+                required property string fields
+                required property string colour
+                required property bool highlight
+                required property bool notify
+                required property bool isFirst
+                required property bool isLast
+
+                objectName: "filter-row-" + filterRow.index
+                Accessible.name: Style.plain(filterRow.name)
+                Accessible.description: Style.plain(filterRow.fields)
+                onClicked: filterDialog.openFor(filterRow.filterId)
+                contentItem: RowLayout {
+                    spacing: Kirigami.Units.largeSpacing
+
+                    // The colour of its marks (only while Highlight is on); the space is kept
+                    // so the names line up.
+                    Item {
+                        implicitWidth: Kirigami.Units.gridUnit
+                        implicitHeight: Kirigami.Units.gridUnit
+                        Rectangle {
+                            objectName: "filter-dot"
+                            anchors.fill: parent
+                            visible: filterRow.highlight
+                            radius: width / 2
+                            color: filterRow.colour
+                            border.width: 1
+                            border.color: Style.frame(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
+                            Accessible.role: Accessible.Graphic
+                            Accessible.name: L10n.i18nc("@info:whatsthis accessible", "Highlight color")
+                        }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+
+                        QQC2.Label {
+                            Layout.fillWidth: true
+                            text: filterRow.name
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                        }
+                        QQC2.Label {
+                            Layout.fillWidth: true
+                            text: filterRow.fields
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            font: Kirigami.Theme.smallFont
+                            color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                        }
+                    }
+                    QQC2.Switch {
+                        objectName: "filter-notify-" + filterRow.index
+                        text: L10n.i18nc("@option:check", "Notify")
+                        checked: filterRow.notify
+                        Accessible.name: L10n.i18nc("@option:check accessible, %1 a filter's name", "Notify for %1", Style.plain(filterRow.name))
+                        onToggled: {
+                            App.filters.setNotify(filterRow.filterId, checked);
+                            checked = Qt.binding(() => filterRow.notify);
+                        }
+                    }
+                    QQC2.ToolButton {
+                        objectName: "filter-menu-" + filterRow.index
+                        icon.name: "overflow-menu"
+                        display: QQC2.AbstractButton.IconOnly
+                        text: L10n.i18nc("@action:button accessible", "Filter Actions")
+                        Accessible.name: L10n.i18nc("@action:button accessible, %1 a filter's name", "Actions for %1", Style.plain(filterRow.name))
+                        onClicked: rowMenu.popup()
+                        QQC2.Menu {
+                            id: rowMenu
+                            QQC2.MenuItem {
+                                objectName: "filter-edit"
+                                icon.name: "document-edit"
+                                text: L10n.i18nc("@action:inmenu", "Edit…")
+                                onTriggered: filterDialog.openFor(filterRow.filterId)
+                            }
+                            QQC2.MenuItem {
+                                objectName: "filter-up"
+                                icon.name: "go-up"
+                                text: L10n.i18nc("@action:inmenu", "Move Up")
+                                enabled: !filterRow.isFirst
+                                onTriggered: App.filters.moveBy(filterRow.filterId, -1)
+                            }
+                            QQC2.MenuItem {
+                                objectName: "filter-down"
+                                icon.name: "go-down"
+                                text: L10n.i18nc("@action:inmenu", "Move Down")
+                                enabled: !filterRow.isLast
+                                onTriggered: App.filters.moveBy(filterRow.filterId, 1)
+                            }
+                            QQC2.MenuSeparator {}
+                            QQC2.MenuItem {
+                                objectName: "filter-delete"
+                                icon.name: "edit-delete"
+                                text: L10n.i18nc("@action:inmenu", "Delete…")
+                                onTriggered: {
+                                    filterDeleteDialog.filterId = filterRow.filterId;
+                                    filterDeleteDialog.filterName = filterRow.name;
+                                    filterDeleteDialog.open();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        FormCard.FormDelegateSeparator {
+            visible: App.filters.count > 0
+        }
+        FormCard.FormButtonDelegate {
+            objectName: "filter-add"
+            icon.name: "list-add"
+            text: L10n.i18nc("@action:button", "Add Filter…")
+            onClicked: filterDialog.openFor(0)
+        }
+    }
+
+    FilterDialog {
+        id: filterDialog
+        objectName: "filterDialog"
+        parent: QQC2.Overlay.overlay
+    }
+
+    // Deleting a filter is asked first.
+    Kirigami.PromptDialog {
+        id: filterDeleteDialog
+        objectName: "filterDeleteDialog"
+        property real filterId: 0
+        property string filterName: ""
+        parent: QQC2.Overlay.overlay
+        title: L10n.i18nc("@title:dialog", "Delete Filter?")
+        subtitle: L10n.i18nc("@info, %1 a filter's name", "The filter \u201c%1\u201d stops notifying and highlighting. This cannot be undone.", Style.plain(filterDeleteDialog.filterName))
+        preferredWidth: Kirigami.Units.gridUnit * 24
+        maximumWidth: Kirigami.Units.gridUnit * 24
+        standardButtons: Kirigami.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action {
+                objectName: "filter-delete-confirm"
+                text: L10n.i18nc("@action:button", "Delete")
+                icon.name: "edit-delete"
+                onTriggered: {
+                    App.filters.remove(filterDeleteDialog.filterId);
+                    filterDeleteDialog.close();
+                }
+            },
+            Kirigami.Action {
+                text: L10n.i18nc("@action:button", "Cancel")
+                icon.name: "dialog-cancel"
+                onTriggered: filterDeleteDialog.close()
+            }
+        ]
     }
 
     FormCard.FormHeader {

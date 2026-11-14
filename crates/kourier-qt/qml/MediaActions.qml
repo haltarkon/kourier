@@ -23,12 +23,26 @@ QtObject {
     // Open a downloaded file with the desktop's default application; `media` = a well-known
     // picture, sound or video type (no confirmation), else the window asks first.
     signal openRequested(real attachment, string name, bool media)
+    // Open the 3D viewer on the model `attachment` (`name` for the header; `save`: the core lists it
+    // among the ones it may save; `tint`: its still is a shade picture the model colour tints).
+    signal modelRequested(real attachment, string name, bool save, bool tint)
+    // Open the 3D model `attachment` in the slicer `slicerId` (a table id, or "other" for the
+    // desktop's chooser); the window asks "Open This File?" first.
+    signal slicerRequested(real attachment, string name, string slicerId)
     // Save these attachments (their numbers) to a folder: one asks where, several ask for a folder
     // (the window asks, `App.askSave` / `App.saveAll`); only ones the core listed as savable.
     signal saveRequested(var attachments)
 
     function view(attachment: real, url: string, animated: bool, media: bool, message: real): void {
         viewRequested(attachment, url, animated, media, message);
+    }
+
+    function viewModel(attachment: real, name: string, save: bool, tint: bool): void {
+        modelRequested(attachment, name, save, tint);
+    }
+
+    function openInSlicer(attachment: real, name: string, slicerId: string): void {
+        slicerRequested(attachment, name, slicerId);
     }
 
     function viewGallery(slot: string, attachment: real, message: real): void {

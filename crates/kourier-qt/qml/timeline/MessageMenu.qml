@@ -49,8 +49,18 @@ QQC2.Menu {
     // The attachments "Save As…" accepts (the core listed them; the row names them), and what the entry says.
     readonly property var saveIds: root.row !== null && root.row.saveIds !== undefined ? root.row.saveIds : []
     readonly property bool canSave: root.offers.saveAttachments === true && root.saveIds.length > 0
+    // "Open in Slicer": the row's one attachment is a 3D model and the core offers it for saving
+    // (the same condition as the save entry: the core decides, QML invents no rule).
+    readonly property real modelAttachment: root.row !== null && root.row.modelAttachment !== undefined ? root.row.modelAttachment : 0
+    readonly property bool canSlicer: root.canSave && root.modelAttachment > 0 && root.saveIds.length === 1 && root.saveIds[0] === root.modelAttachment
+    readonly property var slicerRows: JSON.parse(App.slicers)
+    // The "Open in Slicer" sub-menu (the window tests read its entries).
+    readonly property alias slicerMenu: slicerSub
     readonly property bool hasMedia: root.mediaAction !== "" || root.quoted || root.canSave
-    readonly property bool hasMain: root.offers.react === true || root.offers.reply === true || root.offers.edit === true || root.offers.copy === true || root.hasReactions || (root.row !== null && root.row.edited === true)
+    // "Select" (a window state: no rule of the core's decides it, so it is counted apart from the
+    // row's `actions.any`): every row with a message id has it.
+    readonly property bool hasSelect: root.row !== null && root.row.selectable === true
+    readonly property bool hasMain: root.hasSelect || root.offers.react === true || root.offers.reply === true || root.offers.edit === true || root.offers.copy === true || root.hasReactions || (root.row !== null && root.row.edited === true)
     readonly property bool hasPages: root.pages.length > 0
     readonly property bool hasDeletes: root.offers.retry === true || root.offers.cancelSending === true || root.canDeleteAttachment || (root.canDelete && root.offers.takeBack !== true)
 
@@ -64,6 +74,28 @@ QQC2.Menu {
 
     // In the window's scene (also on Wayland, and in headless screenshots).
     popupType: QQC2.Popup.Item
+
+    // The slicers are looked up again (on a worker thread) each time the menu of a model opens.
+    onAboutToShow: {
+        if (root.canSlicer) {
+            App.refreshSlicers();
+        }
+    }
+
+    // The entry Qt made for the "Open in Slicer" sub-menu: shown (and enabled, and given room) only
+    // while the core offers the model for saving; never removed.
+    Component.onCompleted: {
+        for (let i = 0; i < root.count; ++i) {
+            const item = root.itemAt(i) as QQC2.MenuItem;
+            if (item !== null && item.subMenu === slicerSub) {
+                item.visible = Qt.binding(() => root.canSlicer);
+                item.enabled = Qt.binding(() => root.canSlicer);
+                item.height = Qt.binding(() => root.canSlicer ? item.implicitHeight : 0);
+                item.icon.name = "document-open";
+                break;
+            }
+        }
+    }
 
     // Where the entries of the pages go: right after the separator that comes before them.
     function pagesAt(): int {
@@ -104,7 +136,7 @@ QQC2.Menu {
         spacing: 0
 
         Repeater {
-            model: Emoji.quick
+            model: App.emojiLists.pins
             delegate: QQC2.ToolButton {
                 id: quickButton
 
@@ -122,6 +154,9 @@ QQC2.Menu {
                 Accessible.name: quickButton.chosen ? L10n.i18nc("@action:button accessible", "Remove reaction %1", quickButton.modelData) : L10n.i18nc("@action:button accessible", "React with %1", quickButton.modelData)
                 onClicked: {
                     App.react(root.row.messageId, quickButton.modelData, quickButton.chosen);
+                    if (!quickButton.chosen) {
+                        App.emojiLists.used(quickButton.modelData);
+                    }
                     root.close();
                 }
             }
@@ -160,6 +195,36 @@ QQC2.Menu {
         icon.name: "document-save-as"
         text: root.saveIds.length > 1 ? L10n.i18nc("@action:inmenu", "Save All…") : L10n.i18nc("@action:inmenu", "Save As…")
         onTriggered: MediaActions.save(root.saveIds)
+    }
+    // "Open in Slicer": a sub-menu declared with the menu, never inserted or removed (the Mute
+    // pattern of the chat list's row menu): its generated entry is found at the start and bound.
+    QQC2.Menu {
+        id: slicerSub
+
+        objectName: "menuSlicer"
+        title: L10n.i18nc("@title:menu", "Open in Slicer")
+        popupType: QQC2.Popup.Item
+
+        // The table is fixed: four entries made once (see the viewer's header).
+        Repeater {
+            model: 4
+            QQC2.MenuItem {
+                required property int index
+                readonly property var row: root.slicerRows[index]
+                objectName: "menuSlicer-" + row.id
+                icon.name: "document-open"
+                text: row.installed ? row.name : L10n.i18nc("@action:inmenu, %1 the name of a slicer program", "%1 (not installed)", row.name)
+                enabled: row.installed
+                onTriggered: MediaActions.openInSlicer(root.modelAttachment, root.row.modelName ?? "", row.id)
+            }
+        }
+        QQC2.MenuSeparator {}
+        QQC2.MenuItem {
+            objectName: "menuSlicer-other"
+            icon.name: "document-open"
+            text: L10n.i18nc("@action:inmenu", "Other Application…")
+            onTriggered: MediaActions.openInSlicer(root.modelAttachment, root.row.modelName ?? "", "other")
+        }
     }
     Entry {
         objectName: "menuQuote"
@@ -237,6 +302,14 @@ QQC2.Menu {
         icon.name: "view-history"
         text: L10n.i18nc("@action:inmenu", "Edit History")
         onTriggered: TimelineActions.history(root.row)
+    }
+
+    Entry {
+        objectName: "menuSelect"
+        visible: root.hasSelect
+        icon.name: root.row !== null && root.row.selected === true ? "edit-select-none" : "edit-select"
+        text: root.row !== null && root.row.selected === true ? L10n.i18nc("@action:inmenu", "Deselect") : L10n.i18nc("@action:inmenu", "Select")
+        onTriggered: TimelineActions.select(root.row.messageId)
     }
 
     QQC2.MenuSeparator {

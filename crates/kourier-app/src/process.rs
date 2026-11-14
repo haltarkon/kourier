@@ -95,6 +95,66 @@ fn deny_dumps_if(deny: bool) -> bool {
     !is_dumpable()
 }
 
+/// How many malloc arenas glibc may make: the cap `main` sets before any thread starts.
+///
+/// RAM2 (`target/next/ram2/report.md`, 2026-11-12) measured four Signal accounts on the mock:
+/// anonymous memory shown 112.0 MB uncapped, 107.2 with 2 arenas (-4.8) and 103.3 with 1
+/// (-8.7); hidden 83.6, 79.5 (-4.1) and 77.2 (-6.4); after a five-minute burst of messages
+/// +29.7 MB uncapped against +19.2 MB with 1. The arenas of a long-running instance held 459
+/// of its 720 MB of anonymous memory (48 threads, 9 of them `signal-*`). Two, not one: 1 saves
+/// 1.5 to 4 MB more but makes every thread of the process take one allocator lock, and no speed
+/// A/B stood behind it (RAM2 verdict 1); the batch-1 perf A/B at 2 showed no cost.
+pub const MALLOC_ARENAS: i32 = 2;
+
+/// The environment variable glibc reads for the arena cap.
+pub const ARENA_MAX_ENV: &str = "MALLOC_ARENA_MAX";
+
+/// The environment variable of glibc's tunables, which can set the cap too
+/// (`glibc.malloc.arena_max=<n>`, entries separated by `:`).
+pub const TUNABLES_ENV: &str = "GLIBC_TUNABLES";
+
+/// Whether Kourier sets the arena cap itself: not when the person set one (glibc read it before
+/// `main`, and theirs wins), that is when `MALLOC_ARENA_MAX` is set (empty included) or
+/// `GLIBC_TUNABLES` has an entry `glibc.malloc.arena_max`. Pure: the two variables come in.
+pub fn arena_cap_wanted(
+    arena_max: Option<&std::ffi::OsStr>,
+    tunables: Option<&std::ffi::OsStr>,
+) -> bool {
+    if arena_max.is_some() {
+        return false;
+    }
+    let names_the_cap = tunables.is_some_and(|t| {
+        t.as_encoded_bytes()
+            .split(|b| *b == b':')
+            .any(|entry| entry.split(|b| *b == b'=').next() == Some(b"glibc.malloc.arena_max"))
+    });
+    !names_the_cap
+}
+
+/// Caps glibc's malloc arenas at [`MALLOC_ARENAS`], unless the person set a cap
+/// ([`arena_cap_wanted`]). `main` calls it first, before anything has a thread (an arena that
+/// exists is not given back). Nothing is written to the environment: the children (`xdg-open`,
+/// the TDLib helper) keep the person's. A no-op off glibc. Returns whether it set the cap.
+pub fn cap_malloc_arenas() -> bool {
+    let wanted = arena_cap_wanted(
+        std::env::var_os(ARENA_MAX_ENV).as_deref(),
+        std::env::var_os(TUNABLES_ENV).as_deref(),
+    );
+    wanted && set_arena_cap(MALLOC_ARENAS)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn set_arena_cap(arenas: i32) -> bool {
+    // SAFETY: mallopt only changes glibc's allocator parameters; it is documented as safe to
+    // call at any time and, for M_ARENA_MAX, is meant to run before the threads exist.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) == 1 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn set_arena_cap(_arenas: i32) -> bool {
+    false
+}
+
 /// Whether the kernel would write a core dump of this process (and lets its user read
 /// `/proc/<pid>/smaps_rollup`).
 pub fn is_dumpable() -> bool {
@@ -161,6 +221,50 @@ fn shown_file(file: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The person's own cap wins: either variable names it, whatever the value.
+    #[test]
+    fn the_arena_cap_is_ours_only_when_the_person_set_none() {
+        use std::ffi::OsStr;
+        let os = |s: &'static str| Some(OsStr::new(s));
+        let table: &[(Option<&OsStr>, Option<&OsStr>, bool)] = &[
+            (None, None, true),
+            (os("1"), None, false),
+            (os(""), None, false),
+            (os("8"), os("glibc.malloc.arena_max=4"), false),
+            (None, os("glibc.malloc.arena_max=4"), false),
+            (
+                None,
+                os("glibc.malloc.check=1:glibc.malloc.arena_max=4"),
+                false,
+            ),
+            (None, os("glibc.malloc.arena_max"), false),
+            // Other tunables, and names that only look alike, leave the cap to us.
+            (None, os("glibc.malloc.check=1"), true),
+            (None, os("glibc.malloc.arena_test=2"), true),
+            (None, os("glibc.malloc.arena_max_x=2"), true),
+            (None, os(""), true),
+            (None, os("x=glibc.malloc.arena_max"), true),
+        ];
+        for (arena_max, tunables, ours) in table {
+            assert_eq!(
+                arena_cap_wanted(*arena_max, *tunables),
+                *ours,
+                "{arena_max:?} {tunables:?}"
+            );
+        }
+    }
+
+    /// The cap is 2, and on glibc mallopt takes it (the process may then have arenas already:
+    /// a test binary has threads; the call itself must still be accepted).
+    #[test]
+    fn the_cap_is_two_and_mallopt_accepts_it() {
+        assert_eq!(MALLOC_ARENAS, 2);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(set_arena_cap(MALLOC_ARENAS));
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(!set_arena_cap(MALLOC_ARENAS));
+    }
 
     #[test]
     fn debug_builds_and_measuring_builds_stay_dumpable() {

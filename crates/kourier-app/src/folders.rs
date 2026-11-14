@@ -451,7 +451,7 @@ fn local_time(time: SystemTime) -> Option<zip::DateTime> {
 }
 
 /// How one file is stored: deflate, its times, its permission bits.
-fn entry_options(file: &FolderFile) -> Result<FullFileOptions<'static>, FolderError> {
+fn entry_options(file: &FolderFile) -> Result<FullFileOptions<'static, 'static>, FolderError> {
     let mut options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         // (Without a usable time: 1980-01-01, never the time of packing.)
@@ -471,7 +471,7 @@ fn entry_options(file: &FolderFile) -> Result<FullFileOptions<'static>, FolderEr
         // Flags (bit 0: the modification time follows), then the time, little-endian.
         let mut field = [1u8; 5];
         field[1..].copy_from_slice(&secs.to_le_bytes());
-        options.add_extra_data(EXTENDED_TIMESTAMP, field, false)?;
+        options.add_extra_field(EXTENDED_TIMESTAMP, field, false)?;
     }
     Ok(options)
 }
@@ -1045,7 +1045,10 @@ mod tests {
         let packed = pack(&root, "Old disk", &dest, &Cancel::new(), &mut |_, _| {}).unwrap();
         assert_eq!((packed.files, packed.missing), (5, 0));
         let mut archive = zip::ZipArchive::new(File::open(&dest).unwrap()).unwrap();
-        let mut names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        let mut names: Vec<String> = archive
+            .file_names()
+            .map(|n| n.unwrap().into_owned())
+            .collect();
         names.sort();
         assert_eq!(
             names,
@@ -1121,7 +1124,10 @@ mod tests {
         .unwrap();
         assert_eq!((packed.files, packed.missing), (2, 1));
         let archive = zip::ZipArchive::new(File::open(&dest).unwrap()).unwrap();
-        let mut names: Vec<&str> = archive.file_names().collect();
+        let mut names: Vec<String> = archive
+            .file_names()
+            .map(|n| n.unwrap().into_owned())
+            .collect();
         names.sort_unstable();
         assert_eq!(names, ["Busy/a.txt", "Busy/b.txt"]);
     }
@@ -1187,7 +1193,13 @@ mod tests {
         assert_eq!((packed.files, packed.missing), (1, 2));
         let bytes = fs::read(&dest).unwrap();
         let archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
-        assert_eq!(archive.file_names().collect::<Vec<_>>(), ["Shared/top.txt"]);
+        assert_eq!(
+            archive
+                .file_names()
+                .map(|n| n.unwrap().into_owned())
+                .collect::<Vec<_>>(),
+            ["Shared/top.txt"]
+        );
         assert!(!bytes.windows(7).any(|w| w == b"PRIVATE"));
 
         // The folder that was given may be a link itself; what lies below it is still
@@ -1416,7 +1428,7 @@ mod tests {
         let bytes = fs::read(&dest).unwrap();
         let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_owned())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert_eq!(
             names,

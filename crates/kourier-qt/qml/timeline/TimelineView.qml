@@ -54,6 +54,15 @@ QQC2.ScrollView {
     // The list of rows, the context menu and the list of who reacted (tests drive them with
     // input events).
     readonly property alias rowList: list
+    // The selection mode is on (read here, not through a `Connections` on the timeline: qmllint types
+    // that target as a QObject). When it starts, the keys (Escape, Space, Ctrl+C) go to the list,
+    // whatever had the focus.
+    readonly property bool selecting: App.timeline.selecting
+    onSelectingChanged: {
+        if (root.selecting) {
+            list.forceActiveFocus();
+        }
+    }
     readonly property alias messageMenu: menu
     readonly property alias reactionsPopup: whoReacted
 
@@ -227,6 +236,38 @@ QQC2.ScrollView {
         return 0;
     }
 
+    // The id of the row under a point of the list's content; 0 for a date header, the unread marker,
+    // the loading row and the gaps.
+    function messageAtContent(x: real, y: real): real {
+        const item = list.itemAt(x, y);
+        const id = (item as MessageDelegate)?.messageId ?? (item as SystemRow)?.messageId ?? 0;
+        return id > 0 ? id : 0;
+    }
+
+    // A Ctrl+click at `scene` (a scene position) outside the mode: it starts with that row.
+    function ctrlClick(scene: point): void {
+        const p = list.contentItem.mapFromItem(null, scene.x, scene.y);
+        const id = root.messageAtContent(p.x, p.y);
+        if (id > 0) {
+            App.timeline.selectStart(id);
+        }
+    }
+
+    // A left click on the plate (a point of this view) while selecting: Shift selects the range
+    // from the anchor, any other click flips the row.
+    function plateClick(x: real, y: real, modifiers: int): void {
+        const p = plate.mapToItem(list.contentItem, x, y);
+        const id = root.messageAtContent(p.x, p.y);
+        if (id <= 0) {
+            return;
+        }
+        if (modifiers & Qt.ShiftModifier) {
+            App.timeline.selectExtend(id);
+        } else {
+            App.timeline.selectToggle(id);
+        }
+    }
+
     // Shows the earlier versions of a message; `false` when there is nothing to ask.
     function openHistory(row: var): bool {
         // (A double click on the mark: the history that is opening is the one asked for.)
@@ -296,6 +337,17 @@ QQC2.ScrollView {
         return item !== null;
     }
 
+    // The row is the keyboard's current one, so its toolbar (with the pinned emoji) shows.
+    function toolbarFor(message: real): bool {
+        const item = root.delegateFor(message);
+        if (item === null) {
+            return false;
+        }
+        list.forceActiveFocus();
+        list.makeCurrent(item.index);
+        return true;
+    }
+
     function reactionsFor(message: real): bool {
         const item = root.delegateFor(message);
         item?.openReactions();
@@ -337,7 +389,7 @@ QQC2.ScrollView {
         readonly property real conversation: App.timeline.conversationId
         onConversationChanged: {
             root.followNewest = true;
-            list.held = null;
+            list.letGo();
             list.currentIndex = -1;
             menu.close();
             root.pickerPopup?.close();
@@ -373,6 +425,28 @@ QQC2.ScrollView {
         // the viewport. (A delegate that is destroyed leaves `null` here.)
         property Item held: null
         property real heldAt: 0
+        // The held row's number in the model (-1: none), as its delegate said when it was last seen
+        // in the list, moved along with the rows that come and go before it. It is the way back to
+        // the row when the list lets its delegate go: a row that moves more than about a page out of
+        // the view in one layout (a row below it grows or shrinks by pages) loses its delegate there,
+        // which is deleted a moment later (`held` names it until then, then `null`), and a list left
+        // with no row near its view numbers the positions of its content anew from estimates, so a
+        // position read before that layout leads nowhere (`find`).
+        property int heldRow: -1
+        // The corrections the polish hook ran since the last event of the loop.
+        property int bursts: 0
+        // A correction is asked of the polish hook and has not run yet: the held row moved inside a
+        // layout and the view is not back in place. Until it runs the rows stand where that layout
+        // left them, as they do inside the layout itself. So a move of the user's carries `heldAt`,
+        // the list's own way back into its content is no move of the user's (`moved`), and whatever
+        // holds a row anew outside the list's layout runs the correction first (`flush`); else the
+        // new hold would take the layout's push for the place being read (a wheel step while an
+        // arrival waited for its layout lost the correction that way).
+        property bool pending: false
+        // The held row moved inside a layout in this turn of the event loop (set there, cleared
+        // by a call queued there): what the list does to the view in the rest of that layout
+        // comes in this turn too.
+        property bool laying: false
 
         // Distance of the viewport from the newest end of the content, read from the list:
         // inside a handler of one of these properties a binding on them (`root.fromBottom`)
@@ -406,6 +480,18 @@ QQC2.ScrollView {
             if (list.own > 0 || list.height !== list.tall) {
                 return;
             }
+            // The list's own move in the layout that moved the held row: a row below the reader that
+            // shrinks by more than the content has above the view leaves the view beyond the
+            // content, and the list brings it back before that layout is over, after it let its
+            // rows go and numbered its content anew (164 px to the content's start once, 4346 px to
+            // a place inside it another time: where it ends says nothing). No move of the user's
+            // comes between a layout and the end of its turn of the event loop (a wheel step that
+            // the layout ran inside of came before it, and `onYChanged` took it), so a move in
+            // that turn while the correction is due is the list's: nothing is taken, the
+            // correction puts the row back.
+            if (list.pending && list.laying) {
+                return;
+            }
             if (up && !list.atNewest()) {
                 root.followNewest = false;
             }
@@ -415,11 +501,12 @@ QQC2.ScrollView {
             // that rounds `contentY`) would else be taken for where the user left the view,
             // and what was being read would stay moved by it. Inside a layout the rows are
             // not back in place yet: the held row moves with the view, and `realign` puts
-            // back what the layout moved. At the newest message nothing is held: `rest`
-            // makes the view follow, and what arrives meanwhile may push.
+            // back what the layout moved; the same while that correction is still due
+            // (`pending`). At the newest message nothing is held: `rest` makes the view
+            // follow, and what arrives meanwhile may push.
             if (list.following() || (!App.timeline.hasNewer && list.atNewest())) {
-                list.held = null;
-            } else if (during) {
+                list.letGo();
+            } else if (during || list.pending) {
                 list.heldAt -= by;
             } else {
                 list.hold();
@@ -436,6 +523,7 @@ QQC2.ScrollView {
             if (list.moving || list.count === 0) {
                 return;
             }
+            list.flush();
             if (!App.timeline.hasNewer && list.atNewest()) {
                 root.followNewest = true;
             }
@@ -449,9 +537,25 @@ QQC2.ScrollView {
             list.holdOutside(0, -1);
         }
 
-        // The same, passing over the rows `first` to `last` (the view's own row numbers).
-        function holdOutside(first: int, last: int): void {
+        // Nothing is held, and no correction for the row that was is due any more.
+        function letGo(): void {
             list.held = null;
+            list.heldRow = -1;
+            list.pending = false;
+        }
+
+        // The correction that is still due runs now. Only for callers outside the list's own layout
+        // (an event, a `Qt.callLater`, a model signal): it writes `contentY`.
+        function flush(): void {
+            if (list.pending) {
+                list.correct();
+            }
+        }
+
+        // The same, passing over the rows `first` to `last` (the model's row numbers, which a
+        // delegate's `index` says: the list's own numbers lag behind until it lays a change out).
+        function holdOutside(first: int, last: int): void {
+            list.letGo();
             const x = list.width / 2;
             const end = list.contentY + list.height;
             for (let y = list.contentY + 1; y < end; y += Kirigami.Units.gridUnit) {
@@ -459,13 +563,11 @@ QQC2.ScrollView {
                 if (item === null) {
                     continue;
                 }
-                if (first <= last) {
-                    const at = list.indexAt(x, y);
-                    if (at >= first && at <= last) {
-                        continue;
-                    }
+                if (first <= last && item.index >= first && item.index <= last) {
+                    continue;
                 }
                 list.heldAt = item.y - list.contentY;
+                list.heldRow = item.index;
                 list.held = item;
                 return;
             }
@@ -475,14 +577,12 @@ QQC2.ScrollView {
         // holds on to the topmost row in view that stays, before the list lays the removal
         // out: the delegate of a row that went is destroyed (leaving `null` in `held`), and
         // a change laid out after that would move what is being read with nothing to hold.
+        // (This runs in a model signal, before the removal: nothing is written or laid out here.)
         function spare(first: int, last: int): void {
-            if (list.held === null || list.following()) {
+            if (list.following() || list.heldRow < first || list.heldRow > last) {
                 return;
             }
-            const at = list.indexAt(list.width / 2, list.held.y + list.held.height / 2);
-            if (at >= first && at <= last) {
-                list.holdOutside(first, last);
-            }
+            list.holdOutside(first, last);
         }
 
         // The content changed: back to what the view holds on to, once the change is laid
@@ -505,10 +605,102 @@ QQC2.ScrollView {
                 list.toOldest();
             } else if (list.following()) {
                 list.toNewest();
-            } else if (list.held === null) {
+            } else if (list.held === null && list.heldRow < 0) {
                 list.rest();
             } else {
                 list.realign();
+            }
+        }
+
+        // The held row's correction, at the end of the list's polish (`afterLayout.due`): the
+        // conditions are read now, not when the row's `y` changed.
+        function correct(): void {
+            const due = list.pending;
+            list.pending = false;
+            // Nothing is due: `settle` put the view back meanwhile, or the row was let go or another
+            // one held.
+            if (!due) {
+                return;
+            }
+            // A correction moves the view, the list lays out, and the held row's `y` asks for the next
+            // one inside the same polish pass: a few of them per event settle the estimates of the
+            // rows made anew; a loop that does not settle must not spin the frame.
+            list.bursts += 1;
+            if (list.bursts === 1) {
+                Qt.callLater(list.endBurst);
+            }
+            if (list.bursts > 4) {
+                return;
+            }
+            if (list.following() || list.moving || root.pinToOldest) {
+                return;
+            }
+            list.realign();
+        }
+
+        function endBurst(): void {
+            list.bursts = 0;
+        }
+
+        function laid(): void {
+            list.laying = false;
+        }
+
+        // `held` is made the delegate the held row has in the list now; `false` when the row is not
+        // to be found (another row is held then, where it stands). A delegate the list let go is no
+        // longer the row's (see `heldRow`). The view first goes to where that delegate last stood:
+        // while the list kept a row of the old layout (the row that grew still reaches into the
+        // view), it follows from that row and makes the held row's delegate anew at its real place,
+        // and the rows in view stay the delegates they were. When the row is not there (the list
+        // had let every row go and numbered its positions anew), the view goes to the row by its
+        // number, which makes the list give it a delegate at its real place whatever it estimated
+        // (and makes every row in view anew). Never inside the list's own layout: this lays out.
+        function find(): bool {
+            // (The list's row numbers are the model's only once it has laid the model's changes out.)
+            list.own += 1;
+            list.forceLayout();
+            list.own -= 1;
+            let item = list.held;
+            if (item !== null && list.itemAtIndex(item.index) === item) {
+                list.heldRow = item.index;
+                return true;
+            }
+            const row = list.heldRow;
+            if (row >= 0 && row < list.count) {
+                item = list.itemAtIndex(row);
+                if (item === null && list.held !== null) {
+                    list.place();
+                    item = list.itemAtIndex(row);
+                }
+                if (item === null) {
+                    list.own += 1;
+                    list.positionViewAtIndex(row, ListView.End);
+                    list.own -= 1;
+                    item = list.itemAtIndex(row);
+                }
+                if (item !== null) {
+                    list.held = item;
+                    return true;
+                }
+            }
+            // The row's number is not known any more (the model replaced its rows): back to where its
+            // delegate, which is being deleted, last stood, and the row at the top of the view there
+            // is held.
+            if (list.held !== null) {
+                list.place();
+            }
+            list.hold();
+            return false;
+        }
+
+        // The view to where the held row's delegate stands at `heldAt` in it.
+        function place(): void {
+            const y = list.bounded(list.held.y - list.heldAt);
+            if (Math.abs(y - list.contentY) >= 0.5) {
+                list.own += 1;
+                list.contentY = y;
+                list.layOutAgain();
+                list.own -= 1;
             }
         }
 
@@ -519,26 +711,31 @@ QQC2.ScrollView {
         function realign(): void {
             if (list.own === 0) {
                 list.moved(true);
-                if (list.held === null || list.following()) {
+                if (list.following()) {
                     return;
                 }
             }
-            const y = list.bounded(list.held.y - list.heldAt);
-            if (Math.abs(y - list.contentY) >= 0.5) {
-                list.own += 1;
-                list.contentY = y;
-                list.layOutAgain();
-                list.own -= 1;
+            if ((list.held === null && list.heldRow < 0) || !list.find()) {
+                return;
+            }
+            // This is the correction: none is due after it (a layout it sets off asks anew).
+            list.pending = false;
+            list.place();
+            // A move of more than about a page: the list let its rows go and made them anew at places
+            // it estimates. The row is found again and put in place exactly.
+            if (list.itemAtIndex(list.heldRow) !== list.held && list.find()) {
+                list.place();
             }
         }
 
-        // The rows are laid out once more: at once, or inside a layout at the end of the polish
-        // that runs it, before the frame. `realign` often runs inside the list's loop over its
-        // rows (the held row's `y` below), and its write of `contentY` makes the list fill: a
-        // row leaves the start of the loop's list or joins it while the loop goes on, the loop
-        // passes over a row or takes one twice, and every row after it stands a row off until
-        // the next layout (the one passed over is drawn over its neighbour). A change of this
-        // margin is the one public way to ask for a layout that no model change asks for.
+        // The rows are laid out once more, at once: `realign` moved the view, and the rows must
+        // stand where the new position wants them before a timer tick or the frame sees them.
+        // It never runs inside the list's own loop over its rows (`layoutVisibleItems`): the held
+        // row's `y` path comes here through the polish hook, after that loop, because a write of
+        // `contentY` or a layout inside the loop makes the list refill and release rows the loop
+        // still walks (a use-after-free in Qt; before the hook the loop "passed over a row or took
+        // one twice" when the refill happened to be small). A change of this margin is the one
+        // public way to ask for a layout that no model change asks for.
         function layOutAgain(): void {
             list.displayMarginEnd = 1 - list.displayMarginEnd;
             list.forceLayout();
@@ -690,7 +887,8 @@ QQC2.ScrollView {
                 }
                 i = next;
                 const item = list.itemAtIndex(i);
-                if (item === null || item instanceof MessageDelegate || (item as SystemRow)?.offers === true) {
+                // (While selecting every notice is a row too: it can be selected.)
+                if (item === null || item instanceof MessageDelegate || (item as SystemRow)?.offers === true || (App.timeline.selecting && item instanceof SystemRow)) {
                     break;
                 }
             }
@@ -727,6 +925,7 @@ QQC2.ScrollView {
         // where the text was cut stays where it is and the new text continues below it.
         function readMore(message: real): void {
             root.followNewest = false;
+            list.flush();
             list.hold();
             App.timeline.readMore(message);
         }
@@ -735,6 +934,19 @@ QQC2.ScrollView {
         function currentQuote(): void {
             const item = list.currentItem as MessageDelegate;
             item?.jumpToQuote();
+        }
+
+        // Space while selecting: the keyboard's current row (the first press makes the newest
+        // message current) is selected or not.
+        function selectCurrent(): void {
+            if (list.currentIndex < 0) {
+                list.step(1);
+            }
+            const item = list.currentItem;
+            const id = (item as MessageDelegate)?.messageId ?? (item as SystemRow)?.messageId ?? 0;
+            if (id > 0) {
+                App.timeline.selectToggle(id);
+            }
         }
 
         function enterPressed(event: var): void {
@@ -751,11 +963,27 @@ QQC2.ScrollView {
         // The rows hold no tab stops of their own: Enter acts on the current row.
         Keys.onReturnPressed: event => list.enterPressed(event)
         Keys.onEnterPressed: event => list.enterPressed(event)
-        Keys.onSpacePressed: list.currentActivate()
-        Keys.onEscapePressed: root.composerRequested()
+        Keys.onSpacePressed: event => {
+            if (App.timeline.selecting) {
+                list.selectCurrent();
+            } else {
+                list.currentActivate();
+            }
+        }
+        // Escape ends the selection mode first; only when not selecting does it go back to the composer.
+        Keys.onEscapePressed: {
+            if (App.timeline.selecting) {
+                App.timeline.selectClear();
+            } else {
+                root.composerRequested();
+            }
+        }
         Keys.onPressed: event => {
             if (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
                 list.currentMenu();
+                event.accepted = true;
+            } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && App.timeline.selecting) {
+                App.timeline.copySelected();
                 event.accepted = true;
             }
         }
@@ -767,6 +995,29 @@ QQC2.ScrollView {
             }
         }
 
+        // Ctrl+click outside the selection mode starts it with that row. ONE passive handler for
+        // the list, never one per row; the exact modifier (`acceptedModifiers` is an exact
+        // match), so the blocks' own handlers take `Qt.NoModifier`; a link of a text is not
+        // opened by it (`TimelineActions.ctrlPress`, set from the press to just after the
+        // release).
+        TapHandler {
+            id: ctrlTap
+
+            acceptedButtons: Qt.LeftButton
+            acceptedModifiers: Qt.ControlModifier
+            enabled: !App.timeline.selecting
+            onPressedChanged: {
+                if (ctrlTap.pressed) {
+                    TimelineActions.ctrlPress = true;
+                } else {
+                    Qt.callLater(() => {
+                        TimelineActions.ctrlPress = false;
+                    });
+                }
+            }
+            onTapped: eventPoint => root.ctrlClick(eventPoint.scenePosition)
+        }
+
         // Rows came, went or changed (an arrival, an own send, a page at either end, a
         // message that disappeared, a receipt or a reaction): told here before the list
         // lays the change out, so the view is back in place in the same frame. (The model
@@ -775,18 +1026,29 @@ QQC2.ScrollView {
         Connections {
             target: list.model
             function onRowsInserted(parent: var, first: int, last: int): void {
+                if (list.heldRow >= first) {
+                    list.heldRow += last - first + 1;
+                }
                 list.keep();
             }
             function onRowsAboutToBeRemoved(parent: var, first: int, last: int): void {
                 list.spare(first, last);
             }
             function onRowsRemoved(parent: var, first: int, last: int): void {
+                if (list.heldRow > last) {
+                    list.heldRow -= last - first + 1;
+                } else if (list.heldRow >= first) {
+                    // (The held row went and no other row in view could be held: `spare`.)
+                    list.letGo();
+                }
                 list.keep();
             }
             function onDataChanged(): void {
                 list.keep();
             }
             function onModelReset(): void {
+                // (The rows' numbers mean nothing now; `find` goes by where the delegate stood.)
+                list.heldRow = -1;
                 list.keep();
             }
         }
@@ -796,11 +1058,36 @@ QQC2.ScrollView {
         // event later (`keep`) would come after that frame was drawn, a frame with the whole
         // viewport moved by the change. So the view moves back at once, here, and `keep`
         // finds the rest.
+        //
+        // NOT synchronously, though: `setPosition` of the held row emits this INSIDE the list's own
+        // loop over its rows (`layoutVisibleItems`), and a write of `contentY` or a layout from
+        // here makes the ListView refill and release the rows the loop is still walking (a
+        // use-after-free in Qt, found 2026-11-12 as a crash in the loop's next virtual call). The
+        // correction is asked of the polish hook, which runs it at the end of that polish pass,
+        // right after the list's own layout and before the scene graph is synced: the same frame.
         Connections {
             target: list.held
             function onYChanged(): void {
+                // (Nothing is put back while the view follows, or while a drag or a flick moves it and
+                // holds anew at its every step.)
                 if (!list.following() && !list.moving && !root.pinToOldest) {
-                    list.realign();
+                    // A move of the user's that this layout came inside of (a wheel step while an arrival
+                    // waited for its layout) is taken first, as `realign` does: it only sets properties, and
+                    // `contentYChanged` that follows finds nothing left to take.
+                    if (list.own === 0) {
+                        list.moved(true);
+                    }
+                    // (Reading only: the row's number, for the case that the list lets its delegate go in
+                    // this very layout, when the move was more than a page.)
+                    if (list.held !== null) {
+                        list.heldRow = list.held.index;
+                        list.pending = true;
+                        if (!list.laying) {
+                            list.laying = true;
+                            Qt.callLater(list.laid);
+                        }
+                        afterLayout.request();
+                    }
                 }
                 list.keep();
             }
@@ -880,6 +1167,13 @@ QQC2.ScrollView {
         }
     }
 
+    // The end of the list's polish, for what must not run inside the list's own layout (see
+    // `list.held`'s `onYChanged`): no content, no size, nothing drawn.
+    PolishHook {
+        id: afterLayout
+        onDue: list.correct()
+    }
+
     Connections {
         target: TimelineActions
         enabled: root.visible
@@ -916,7 +1210,15 @@ QQC2.ScrollView {
         function onSafetyRequested(user: string): void {
             root.safetyRequested(user);
         }
+        function onSelectRequested(message: real): void {
+            if (App.timeline.selecting) {
+                App.timeline.selectToggle(message);
+            } else {
+                App.timeline.selectStart(message);
+            }
+        }
     }
+
 
     // A quote was activated and its original is among the rows now: scroll to it, light it up.
     Connections {
@@ -963,6 +1265,24 @@ QQC2.ScrollView {
         onTriggered: App.fetchNewer()
     }
 
+    // While selecting ONE plate over the viewport takes every left click and maps it to a row, so
+    // pictures, albums, links, quotes, "Read more", sender names and text selection rest. Wheel
+    // and touchpad events pass through (no wheel handler: the ScrollView's own takes them), and
+    // so do the other buttons (a right click opens the row's menu). Made of one item for the
+    // whole list, not of anything per row.
+    MouseArea {
+        id: plate
+
+        parent: root
+        anchors.fill: parent
+        // Clear of the scroll bar.
+        anchors.rightMargin: root.QQC2.ScrollBar.vertical && root.QQC2.ScrollBar.vertical.visible ? root.QQC2.ScrollBar.vertical.width : 0
+        visible: App.timeline.selecting
+        enabled: App.timeline.selecting
+        acceptedButtons: Qt.LeftButton
+        onClicked: mouse => root.plateClick(mouse.x, mouse.y, mouse.modifiers)
+    }
+
     Components.FloatingButton {
         id: toLatest
 
@@ -983,7 +1303,7 @@ QQC2.ScrollView {
         text: L10n.i18nc("@action:button", "Jump to Latest")
         onClicked: {
             root.followNewest = true;
-            list.held = null;
+            list.letGo();
             if (App.timeline.hasNewer) {
                 // The newest page replaces the window; the view follows it.
                 App.jumpToLatest();

@@ -2267,12 +2267,16 @@ pub struct SettingsRust {
     /// "Show chats of several accounts together" (`blend-accounts`). The App's choice of
     /// shown accounts follows it; the hidden accounts themselves are the App's to save.
     pub(crate) blend_accounts: bool,
-    pub(crate) round_avatars: bool,
+    /// The avatar corner slider, 0 (square) to 100 (circle).
+    pub(crate) avatar_corners: i32,
+    /// The message corner slider, 0 to 100 (30: the bubbles of old).
+    pub(crate) message_corners: i32,
+    /// "Move chats with a draft to the top".
+    pub(crate) drafts_on_top: bool,
+    /// "Show account tags in the chat list".
+    pub(crate) show_account_tags: bool,
     pub(crate) tint_rows: bool,
     pub(crate) chat_wallpaper: bool,
-    /// The theme's avatar corner as a share of a list avatar's side, as QML last said (not
-    /// saved: the theme is the front-end's).
-    pub(crate) avatar_corner: f64,
     pub(crate) notification_content: i32,
     /// "Files with location data" as the combo's index (0 ask, 1 always send, 2 never send).
     pub(crate) location_files: i32,
@@ -2286,6 +2290,12 @@ pub struct SettingsRust {
     /// The experimental networks the person turned on (the preference; a change takes effect
     /// when Kourier starts again).
     pub(crate) networks_on: QStringList,
+    /// `model-colour`: `#rrggbb`, empty = the accent colour.
+    pub(crate) model_colour: QString,
+    /// `model-box`: a row id of the viewmodel's printer table, empty = none.
+    pub(crate) model_box: QString,
+    /// `model-slicer`: a table id of `kourier_app::slicers`, empty = OrcaSlicer.
+    pub(crate) model_slicer: QString,
     /// Where changes are saved and applied (none in pure UI tests).
     pub(crate) desktop: Option<DesktopHandle>,
     /// The core's own settings are read and changed through the source.
@@ -2308,15 +2318,26 @@ impl SettingsRust {
             start_hidden: prefs.start_hidden,
             compact: prefs.compact,
             blend_accounts: prefs.blend_accounts,
-            round_avatars: prefs.round_avatars,
+            avatar_corners: i32::from(prefs.avatar_corners),
+            message_corners: i32::from(prefs.message_corners),
+            drafts_on_top: prefs.drafts_on_top,
+            show_account_tags: prefs.show_account_tags,
             tint_rows: prefs.tint_rows,
             chat_wallpaper: prefs.chat_wallpaper,
-            avatar_corner: 0.0,
             notification_content: prefs.notification_content.index(),
             location_files: prefs.location_files.index(),
             expiry_policy: QString::default(),
             quiet_notices: QString::default(),
             networks_on: names_list(&prefs.networks_on),
+            model_colour: QString::from(prefs.model_colour.as_str()),
+            // A row id the table no longer has reads as none.
+            model_box: QString::from(
+                kourier_viewmodel::printer_boxes::find(&prefs.model_box)
+                    .map(|b| b.id())
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            model_slicer: QString::from(prefs.model_slicer.as_str()),
             desktop,
             shared: None,
             app: None,
@@ -2335,11 +2356,17 @@ impl SettingsRust {
             start_hidden: self.start_hidden,
             compact: self.compact,
             blend_accounts: self.blend_accounts,
-            round_avatars: self.round_avatars,
+            avatar_corners: u8::try_from(self.avatar_corners.clamp(0, 100)).unwrap_or(100),
+            message_corners: u8::try_from(self.message_corners.clamp(0, 100)).unwrap_or(30),
+            drafts_on_top: self.drafts_on_top,
+            show_account_tags: self.show_account_tags,
             tint_rows: self.tint_rows,
             chat_wallpaper: self.chat_wallpaper,
             notification_content: NotificationContent::from_index(self.notification_content),
             location_files: LocationFiles::from_index(self.location_files),
+            model_colour: self.model_colour.to_string(),
+            model_box: self.model_box.to_string(),
+            model_slicer: self.model_slicer.to_string(),
             ..self
                 .desktop
                 .as_ref()
@@ -2439,9 +2466,39 @@ impl qobject::SettingsController {
         i32::try_from(count).unwrap_or(i32::MAX)
     }
 
-    /// `roundAvatars`. Notification avatars read it from the preferences at each use.
-    pub fn set_round_avatars_pref(self: Pin<&mut Self>, value: bool) {
-        self.update(|s| std::mem::replace(&mut s.round_avatars, value) != value);
+    /// `avatarCorners` (0 to 100). Notification avatars read it from the preferences at each use.
+    pub fn set_avatar_corners_pref(self: Pin<&mut Self>, value: i32) {
+        let value = value.clamp(0, 100);
+        self.update(|s| std::mem::replace(&mut s.avatar_corners, value) != value);
+    }
+
+    /// `messageCorners` (0 to 100).
+    pub fn set_message_corners_pref(self: Pin<&mut Self>, value: i32) {
+        let value = value.clamp(0, 100);
+        self.update(|s| std::mem::replace(&mut s.message_corners, value) != value);
+    }
+
+    /// `draftsOnTop`: saved, then the App tells the list (after the current call returned).
+    pub fn set_drafts_on_top_pref(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut()
+            .update(|s| std::mem::replace(&mut s.drafts_on_top, value) != value);
+        self.list_look_follows();
+    }
+
+    /// `showAccountTags`: saved, then the App tells the list.
+    pub fn set_show_account_tags_pref(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut()
+            .update(|s| std::mem::replace(&mut s.show_account_tags, value) != value);
+        self.list_look_follows();
+    }
+
+    /// Queues the App's re-read of the list's look (the re-entrancy rule: not inside this call).
+    fn list_look_follows(self: Pin<&mut Self>) {
+        if let Some(app) = self.app.as_deref()
+            && app.queue(|app| app.list_look_changed()).is_err()
+        {
+            tracing::debug!("App destroyed before the list look was applied");
+        }
     }
 
     /// `tintRows`.
@@ -2454,15 +2511,54 @@ impl qobject::SettingsController {
         self.update(|s| std::mem::replace(&mut s.chat_wallpaper, value) != value);
     }
 
-    /// `avatarCorner`: kept for QML and handed to the notification avatars. Not a preference,
-    /// so the desktop integration is not told.
-    pub fn set_avatar_corner_pref(mut self: Pin<&mut Self>, value: f64) {
-        if (self.avatar_corner - value).abs() < 1e-6 {
+    /// `modelColour`: `#rrggbb` (kept lower case) or empty for the accent; anything else is
+    /// refused. Written here and nowhere else: the viewer's button goes through this property.
+    pub fn set_model_colour_pref(self: Pin<&mut Self>, value: &QString) {
+        let text = value.to_string().to_ascii_lowercase();
+        if !text.is_empty() && !kourier_app::prefs::is_tint(&text) {
             return;
         }
-        self.as_mut().rust_mut().avatar_corner = value;
-        crate::desktop::set_theme_corner(value);
-        self.changed();
+        let value = QString::from(text.as_str());
+        self.update(|s| std::mem::replace(&mut s.model_colour, value.clone()) != value);
+    }
+
+    /// `modelBox`: a row id of the table, or empty for none; an unknown id is refused.
+    pub fn set_model_box_pref(self: Pin<&mut Self>, value: &QString) {
+        let text = value.to_string();
+        if !text.is_empty() && kourier_viewmodel::printer_boxes::find(&text).is_none() {
+            return;
+        }
+        let value = QString::from(text.as_str());
+        self.update(|s| std::mem::replace(&mut s.model_box, value.clone()) != value);
+    }
+
+    /// `modelSlicer`: a table id of the slicers, or empty for the default (OrcaSlicer); an unknown
+    /// id is refused. Written from the viewer only after a start that happened; "Other
+    /// Application…" is never written.
+    pub fn set_model_slicer_pref(self: Pin<&mut Self>, value: &QString) {
+        let text = value.to_string();
+        if !text.is_empty() && kourier_app::slicers::find(&text).is_none() {
+            return;
+        }
+        let value = QString::from(text.as_str());
+        self.update(|s| std::mem::replace(&mut s.model_slicer, value.clone()) != value);
+    }
+
+    /// `modelBoxes`.
+    pub fn model_boxes(&self) -> QString {
+        let rows: Vec<serde_json::Value> = kourier_viewmodel::printer_boxes::PRINTER_BOXES
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id(),
+                    "label": b.label(),
+                    "w": b.w,
+                    "d": b.d,
+                    "h": b.h,
+                })
+            })
+            .collect();
+        QString::from(serde_json::Value::Array(rows).to_string().as_str())
     }
 
     /// `notificationContent` (0 name and message, 1 name only, 2 nothing).

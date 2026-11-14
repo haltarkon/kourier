@@ -223,6 +223,7 @@ pub(crate) fn attachment(
         // Set by `dispatch::message_body` for a long text the lane could not fetch: the core
         // then downloads it and joins it into the body (`Attachment::long_text`).
         long_text: false,
+        model: None,
         net_ids: net_ids(pointer),
     }
 }
@@ -297,6 +298,7 @@ pub(crate) fn file_pointer_attachment(
         thumb: None,
         mime,
         long_text: false,
+        model: None,
         net_ids: net_ids.into_iter().collect(),
     }
 }

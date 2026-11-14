@@ -36,6 +36,7 @@ fn detail(title: &str, is_self: bool) -> ConversationDetail {
             request_pending: false,
             features_hash: 0,
             has_draft: false,
+            draft_at: 0,
             hidden: false,
             can_send: true,
             roaming: Roaming::Hidden,
@@ -116,9 +117,9 @@ fn run(dump_dir: Option<&Path>) -> Result<(), String> {
         "a marked name draws the same monogram and colour",
     )?;
 
-    // "Round avatars" off: a square with the theme's small corner. The corner pixel is still
-    // cut, the one a little way in is filled, and the picture is the same otherwise.
-    let squared = QtPresenter::new().with_round(false);
+    // "Avatar corners" at 15: a square with a small corner. The corner pixel is cut, the one a
+    // little way in is filled, and the picture is the same otherwise.
+    let squared = QtPresenter::new().with_corners(15);
     let square = squared
         .avatar("Olena Kovalenko", &detail("Olena Kovalenko", false))
         .ok_or("no avatar")?;
@@ -132,6 +133,15 @@ fn run(dump_dir: Option<&Path>) -> Result<(), String> {
         "a square is filled up to its corner",
     )?;
     check(pixel(&square, size / 2, 0)[3] == 255, "opaque edge")?;
+    // At 0 it is a plain square: even the corner pixel is filled.
+    let plain = QtPresenter::new()
+        .with_corners(0)
+        .avatar("Olena Kovalenko", &detail("Olena Kovalenko", false))
+        .ok_or("no avatar")?;
+    check(
+        pixel(&plain, 0, 0)[3] == 255,
+        "a plain square has no cut corner",
+    )?;
     check(
         white_pixels(&square) == white_pixels(&named),
         "the same initials",

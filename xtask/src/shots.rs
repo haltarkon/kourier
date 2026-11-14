@@ -84,9 +84,13 @@ const MAX_DIFFERING_PIXELS: usize = 24;
 /// these pages are compared with the looser [`PICTURE_PAGE_ONE_IN`]; a change of their text or
 /// layout smaller than that is not seen. (The lead decides, after three full runs without a
 /// re-render of a picture page, whether they get the strict limit: stable-screenshots.md step 8.)
-const SHOT_PAGES_WITH_PICTURES: [&str; 25] = [
+const SHOT_PAGES_WITH_PICTURES: [&str; 34] = [
     "media",
+    "select",
+    "exportdialog",
+    "exportdone",
     "viewer",
+    "viewerzoom",
     "files",
     "album",
     "albumviewer",
@@ -106,6 +110,12 @@ const SHOT_PAGES_WITH_PICTURES: [&str; 25] = [
     "quotes",
     "menu",
     "react",
+    "emojipicker",
+    "emojisearch",
+    "hoverpins",
+    // The two 3D models' stills at the end of the albums chat.
+    "model3d",
+    "model3dviewer",
     "edit",
     "reply",
     "delete",
@@ -1614,10 +1624,12 @@ fn read_stamp(dir: &Path) -> Option<u64> {
 }
 
 /// What can change a picture, relative to the workspace root: the crates that draw or feed the
-/// UI, the desktop file and icon, the dependency versions and the render code itself.
-const DIGEST_ROOTS: [&str; 5] = [
+/// UI, the desktop file and icon, the dependency versions, the vendored build helper that compiles
+/// the QML into the binary (patch Q1) and the render code itself.
+const DIGEST_ROOTS: [&str; 6] = [
     "crates",
     "packaging",
+    "third_party/qt-build-utils",
     "Cargo.lock",
     "xtask/src/main.rs",
     "xtask/src/shots.rs",
@@ -2494,6 +2506,8 @@ mod tests {
         tree.write("crates/kourier-core/tests/db.rs", "// test");
         tree.write("crates/kourier-core/target/junk", "junk");
         tree.write("packaging/kourier.desktop", "[Desktop Entry]");
+        tree.write("third_party/qt-build-utils/src/lib.rs", "// helper");
+        tree.write("third_party/libthreema/lib/src/lib.rs", "// threema");
         tree.write("Cargo.lock", "# lock");
         tree.write("xtask/src/main.rs", "// xtask");
         tree.write("xtask/src/shots.rs", "// shots");
@@ -2513,6 +2527,7 @@ mod tests {
             ("crates/kourier-qt/src/new.rs", "// a new file"),
             ("crates/kourier-core/src/lib.rs", "// a new crate file"),
             ("packaging/kourier.desktop", "[Desktop Entry]\nName=K"),
+            ("third_party/qt-build-utils/src/lib.rs", "// helper 2"),
             ("Cargo.lock", "# lock 2"),
             ("xtask/src/main.rs", "// xtask 2"),
             ("xtask/src/shots.rs", "// shots 2"),
@@ -2558,6 +2573,7 @@ mod tests {
             ("crates/kourier-core/tests/db.rs", "// test 2"),
             ("crates/kourier-core/target/junk", "more junk"),
             ("xtask/src/smoke.rs", "// smoke 2"),
+            ("third_party/libthreema/lib/src/lib.rs", "// threema 2"),
             ("docs/architecture.md", "# docs 2"),
         ] {
             tree.write(rel, content);

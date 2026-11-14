@@ -131,6 +131,7 @@ Rectangle {
         cursorShape: root.reachable ? Qt.PointingHandCursor : Qt.ArrowCursor
     }
     TapHandler {
+        acceptedModifiers: Qt.NoModifier
         enabled: root.reachable
         onTapped: root.activate()
     }

@@ -6,7 +6,7 @@ import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import app.kourier
 
-// Add a reaction: a quick row of six, and the whole emoji picker behind the last button. Our
+// Add a reaction: a quick row of the pinned emoji (up to six; Signal's six until the person pins others), and the whole emoji picker behind the last button. Our
 // own reactions show as chosen; picking one of them takes it back.
 QQC2.Popup {
     id: root
@@ -31,7 +31,11 @@ QQC2.Popup {
 
     function pick(emoji: string): void {
         if (root.row) {
-            App.react(root.row.messageId, emoji, root.mine.indexOf(emoji) >= 0);
+            const remove = root.mine.indexOf(emoji) >= 0;
+            App.react(root.row.messageId, emoji, remove);
+            if (!remove) {
+                App.emojiLists.used(emoji);
+            }
         }
         root.close();
     }
@@ -49,7 +53,7 @@ QQC2.Popup {
             Layout.fillWidth: true
 
             Repeater {
-                model: Emoji.quick
+                model: App.emojiLists.pins
                 delegate: QQC2.ToolButton {
                     id: quickButton
 
@@ -91,7 +95,7 @@ QQC2.Popup {
         EmojiGrid {
             id: full
             visible: root.expanded
-            // About as wide as the quick row above it (the eight category tabs set the width).
+            // About as wide as the quick row above it (the ten tabs set the width).
             columns: 7
             rows: 5
             chosen: root.mine

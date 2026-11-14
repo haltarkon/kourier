@@ -1663,6 +1663,7 @@ async fn catch_up_messages_are_summarized_once_when_syncing_ends() {
                 account: a,
                 messages,
                 conversations,
+                ..
             } if *a == account => Some((*messages, *conversations)),
             _ => None,
         })

@@ -18,9 +18,10 @@
 //!   hidden with `toggleAccount`; the last shown account cannot be hidden. "Show chats of
 //!   several accounts together" is on with its hint, and the hidden account is still in the
 //!   preferences after every toggle of the page (the App writes it, the page does not).
-//! - "Round avatars" is on; switching it off makes the avatars on screen ask the image
-//!   provider for squares with the theme's corner at once, switching it on for circles again;
-//!   the preferences hold the last choice.
+//! - "Avatar corners" is 100 (a circle); moving it makes the avatars on screen ask the image
+//!   provider for the new corner at once; "Message corners" is 30 (the bubble of old), 0 is
+//!   square and 100 very round, the tight corner never above the big one; the preferences hold
+//!   the last choices.
 //! - "Show minor notices in the conversation list" (quiet notices): off by default, so no
 //!   chat of the list previews a safety number notice; switching it on makes the two fixture
 //!   chats that END in such a notice (a direct chat and a group, dated just after the next
@@ -62,6 +63,7 @@ const SCRIPT: &str = r##"
 import QtQuick
 import QtQml
 import QtQuick.Controls as QQC2
+import org.kde.kirigami as Kirigami
 import app.kourier
 
 // The app's own main window is the root (narrow: one page at a time).
@@ -317,47 +319,81 @@ MainWindow {
                 win.next("avatars");
                 return;
             case "avatars": {
-                // "Round avatars": on by default, and every avatar on screen is a circle.
-                const sw = win.settingsPage ? win.find(win.settingsPage, i => i.objectName === "round-avatars") : null;
-                win.avatar = win.find(win.contentItem, i => i.pictureRadius !== undefined && i.source !== undefined && i.source !== "");
-                if (!sw || !win.avatar) return win.later("the switch and an avatar with a picture");
-                if (sw.text !== "Round avatars") return win.fail("the label: " + sw.text);
+                // "Avatar corners": a circle (100) by default, and every avatar on screen is one.
+                const sw = win.settingsPage ? win.find(win.settingsPage, i => i.objectName === "avatar-corners") : null;
+                win.avatar = win.find(win.contentItem, i => i.pictureRadius !== undefined && i.source !== undefined && i.source !== "" && i.objectName !== "corner-preview-avatar");
+                if (!sw || !win.avatar) return win.later("the slider and an avatar with a picture");
+                if (sw.label !== "Avatar corners") return win.fail("the label: " + sw.label);
                 // "Show chats of several accounts together": on by default, with its hint.
                 const blend = win.find(win.settingsPage, i => i.objectName === "blend-accounts");
                 if (!blend || blend.text !== "Show chats of several accounts together") return win.fail("the blend switch: " + (blend ? blend.text : "none"));
                 if (!blend.checked || !App.settings.blendAccounts || !App.blend) return win.fail("blending is on by default");
                 if (blend.description !== "Shift+click or Ctrl+click an account in the side panel to add it to the list.") return win.fail("the blend hint: " + blend.description);
-                if (!sw.checked || !App.settings.roundAvatars) return win.fail("avatars are round by default");
-                if (win.avatar.cornerRadius !== win.avatar.side / 2) return win.fail("a round avatar has half its side as corner: " + win.avatar.cornerRadius);
+                if (sw.value !== 100 || App.settings.avatarCorners !== 100) return win.fail("avatars are round by default: " + sw.value);
+                if (Math.abs(win.avatar.cornerRadius - win.avatar.side / 2) > 0.001) return win.fail("a round avatar has half its side as corner: " + win.avatar.cornerRadius);
                 // The provider is asked for a circle (a radius of half the side or more).
                 if (win.avatar.pictureSource.indexOf("&r=") < 0 && win.avatar.pictureSource.indexOf("?r=") < 0) return win.fail("the request has no radius: " + win.avatar.pictureSource);
                 win.roundSource = win.avatar.pictureSource;
                 win.roundRadius = win.avatar.pictureRadius;
-                sw.click();
+                // The preview beside the sliders: an avatar and two bubbles.
+                const prev = win.find(win.settingsPage, i => i.objectName === "corner-preview-avatar");
+                if (!prev || Math.abs(prev.cornerRadius - prev.side / 2) > 0.001) return win.fail("the preview avatar is round by default");
+                App.settings.avatarCorners = 40;
                 win.next("square");
                 return;
             }
             case "square": {
-                const sw = win.find(win.settingsPage, i => i.objectName === "round-avatars");
+                const sw = win.find(win.settingsPage, i => i.objectName === "avatar-corners");
                 // At once, in the open window: the avatars on screen are asked for again, with
-                // the theme's corner and not a circle.
-                if (App.settings.roundAvatars || sw.checked || win.avatar.pictureSource === win.roundSource) return win.later("avatars are not round");
-                if (!(win.avatar.cornerRadius < win.avatar.side / 2)) return win.fail("a square avatar keeps a corner of its own: " + win.avatar.cornerRadius);
+                // 40 % of a circle's radius.
+                if (App.settings.avatarCorners !== 40 || sw.value !== 40 || win.avatar.pictureSource === win.roundSource) return win.later("avatars are not rounder than a square");
+                if (Math.abs(win.avatar.cornerRadius - win.avatar.side / 2 * 0.4) > 0.01) return win.fail("an avatar at 40 keeps 40 % of a circle's corner: " + win.avatar.cornerRadius);
                 if (!(win.avatar.pictureRadius < win.roundRadius)) return win.fail("the request still asks for a circle: " + win.avatar.pictureSource);
-                sw.click();
+                App.settings.avatarCorners = 100;
                 win.next("round again");
                 return;
             }
             case "round again":
-                if (!App.settings.roundAvatars || win.avatar.pictureSource !== win.roundSource) return win.later("avatars are round again");
-                // Left off for the core's check at the end.
-                win.find(win.settingsPage, i => i.objectName === "round-avatars").click();
+                if (App.settings.avatarCorners !== 100 || win.avatar.pictureSource !== win.roundSource) return win.later("avatars are round again");
+                // Left square for the core's check at the end.
+                App.settings.avatarCorners = 0;
                 win.next("off");
                 return;
             case "off":
-                if (App.settings.roundAvatars) return win.later("avatars are not round");
+                if (win.avatar.cornerRadius !== 0 || win.avatar.pictureRadius !== 0) return win.later("avatars are square");
                 win.quiet += 1;
                 if (win.quiet < 10) return;
+                win.next("bubbles");
+                return;
+            case "bubbles": {
+                // "Message corners": 30 is the bubble of old (three times the theme's corner, the
+                // tight corner a third of it); the extremes follow, the tight one never above.
+                const sw = win.find(win.settingsPage, i => i.objectName === "message-corners");
+                if (!sw || sw.label !== "Message corners") return win.fail("the message corners slider");
+                if (sw.value !== 30 || App.settings.messageCorners !== 30) return win.fail("message corners default to the old look: " + sw.value);
+                const unit = Kirigami.Units.cornerRadius;
+                if (Math.abs(Style.bubbleRadius - unit * 3) > 0.001 || Math.abs(Style.bubbleRadiusTight - unit) > 0.001) return win.fail("the default bubble: " + Style.bubbleRadius + " / " + Style.bubbleRadiusTight);
+                App.settings.messageCorners = 0;
+                win.next("bubbles square");
+                return;
+            }
+            case "bubbles square":
+                if (Style.bubbleRadius !== 0 || Style.bubbleRadiusTight !== 0) return win.later("square bubbles");
+                App.settings.messageCorners = 100;
+                win.next("bubbles round");
+                return;
+            case "bubbles round": {
+                const unit = Kirigami.Units.cornerRadius;
+                if (Math.abs(Style.bubbleRadius - unit * 10) > 0.001) return win.later("very round bubbles");
+                if (!(Style.bubbleRadiusTight <= Style.bubbleRadius)) return win.fail("the tight corner is above the big one");
+                const prev = win.find(win.settingsPage, i => i.objectName === "corner-preview-in");
+                if (!prev || Math.abs(prev.radius - unit * 10) > 0.001) return win.fail("the preview's bubble follows the slider: " + (prev ? prev.radius : "none"));
+                App.settings.messageCorners = 30;
+                win.next("off done");
+                return;
+            }
+            case "off done":
+                if (Math.abs(Style.bubbleRadius - Kirigami.Units.cornerRadius * 3) > 0.001) return win.later("the old bubble again");
                 win.next("minor");
                 return;
             case "minor": {
@@ -974,8 +1010,9 @@ fn first_session() {
         std::process::exit(1);
     }
 
-    // The preferences hold the last choice of "Round avatars" (round, square, round, square).
-    assert!(!handle.desktop().prefs().round_avatars);
+    // The preferences hold the last choices of the sliders (avatars 100, 40, 100, 0; bubbles 0, 100, 30).
+    assert_eq!(handle.desktop().prefs().avatar_corners, 0);
+    assert_eq!(handle.desktop().prefs().message_corners, 30);
     // ... and the hidden second account through all of the page's toggles: the App writes
     // `hidden-accounts`, the page does not list it (M3), so its toggles keep it.
     let prefs = handle.desktop().prefs();

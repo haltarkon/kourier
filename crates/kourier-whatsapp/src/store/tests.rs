@@ -206,3 +206,49 @@ async fn the_lookups_for_a_users_state_use_the_primary_key() {
     }
     owner.close();
 }
+
+/// `Command::ReleaseMemory` reaches the store as a job on the writer thread: the page cache of
+/// the connection goes back, the store still answers, and a store that stopped says so.
+#[tokio::test]
+async fn a_release_empties_the_writers_page_cache_and_the_store_still_answers() {
+    let (_dir, owner) = owner();
+    let store = owner.store();
+    store
+        .raw(Priority::High, |conn| {
+            conn.execute_batch("CREATE TABLE ram3_probe(x BLOB)")
+                .map_err(sql("test"))?;
+            for _ in 0..200 {
+                conn.execute("INSERT INTO ram3_probe VALUES (zeroblob(4000))", [])
+                    .map_err(sql("test"))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("fill");
+    let sum = |store: KourierStore| async move {
+        store
+            .read(|conn| {
+                let n: i64 = conn
+                    .query_row("SELECT sum(length(x)) FROM ram3_probe", [], |r| r.get(0))
+                    .map_err(sql("test"))?;
+                Ok((n, kourier_db::cache_used(conn)))
+            })
+            .await
+            .expect("read")
+    };
+    let (n, full) = sum(store.clone()).await;
+    assert_eq!(n, 800_000);
+    assert!(full > 100_000, "the reads filled the cache: {full}");
+    store.release_memory().expect("queued");
+    // A low-priority job of ours runs after the release (same priority, same lane).
+    store.raw(Priority::Low, |_| Ok(())).await.expect("barrier");
+    let after = store
+        .read(|conn| Ok(kourier_db::cache_used(conn)))
+        .await
+        .expect("read");
+    assert!(after < full / 4, "the cache went back: {full} -> {after}");
+    let (n, _) = sum(store.clone()).await;
+    assert_eq!(n, 800_000, "the store still answers");
+    owner.close();
+    assert!(store.release_memory().is_err(), "a stopped writer says so");
+}

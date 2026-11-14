@@ -4,13 +4,12 @@
 //! Qt thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use cxx_qt::CxxQtThread;
 use cxx_qt_lib::QString;
 use kourier_app::AppHandle;
 use kourier_app::desktop::{DesktopEvent, DesktopHandle, ImageData, Presenter, Texts, TrayIcon};
-use kourier_app::facade::{AccountRow, ConversationDetail, MessageRow};
+use kourier_app::facade::{AccountRow, ConversationDetail, MessageRow, OwnedFilterTexts};
 use kourier_viewmodel::notify;
 
 use crate::bridge::qobject;
@@ -22,28 +21,11 @@ pub const TRAY_SIZES: [i32; 4] = [16, 22, 32, 64];
 /// The bundled app icon (qrc path, `icons/kourier.svg`).
 pub const APP_ICON: &str = ":/qt/qml/app/kourier/icons/kourier.svg";
 
-/// The theme's corner radius as thousandths of the side of a list avatar, until the window
-/// has said what it is (Breeze's: about 5 px on 47). Square notification avatars have the
-/// same proportion of corner to side as the avatars in the list.
-const DEFAULT_THEME_CORNER_PERMILLE: u32 = 107;
-static THEME_CORNER_PERMILLE: AtomicU32 = AtomicU32::new(DEFAULT_THEME_CORNER_PERMILLE);
-
-/// Tells the notification avatars the theme's corner as a share of a list avatar's side (QML
-/// knows the theme; this side only draws). Out of range values are clamped to a circle.
-pub(crate) fn set_theme_corner(ratio: f64) {
-    let permille = (ratio.clamp(0.0, 0.5) * 1000.0).round() as u32;
-    THEME_CORNER_PERMILLE.store(permille, Ordering::Relaxed);
-}
-
-/// Corner radius in pixels of a notification avatar of `size` pixels: half the side for a
-/// circle, else the theme's share of it.
-pub fn avatar_corner(round: bool, size: u32) -> i32 {
+/// Corner radius in pixels of a notification avatar of `size` pixels with the corner slider at
+/// `corners` percent (0 a square, 100 a circle: half the side, rounded up; more is a circle).
+pub fn avatar_corner(corners: u8, size: u32) -> i32 {
     let half = size.div_ceil(2);
-    let corner = if round {
-        half
-    } else {
-        (size * THEME_CORNER_PERMILLE.load(Ordering::Relaxed) + 500) / 1000
-    };
+    let corner = (half * u32::from(corners.min(100)) + 50) / 100;
     i32::try_from(corner.min(half)).unwrap_or(i32::MAX)
 }
 
@@ -52,10 +34,10 @@ pub struct QtPresenter {
     texts: Texts,
     icons: Vec<TrayIcon>,
     attention: Vec<TrayIcon>,
-    /// Where "Round avatars" is read at each notification; without it, avatars are round.
+    /// Where the avatar corner slider is read at each notification; without it, avatars are round.
     desktop: Option<DesktopHandle>,
     /// A fixed answer for tests, ahead of the preferences.
-    round: Option<bool>,
+    corners: Option<u8>,
 }
 
 impl std::fmt::Debug for QtPresenter {
@@ -96,28 +78,28 @@ impl QtPresenter {
             icons: tray_icons(false),
             attention: tray_icons(true),
             desktop: None,
-            round: None,
+            corners: None,
         }
     }
 
-    /// Draws avatars as the preferences say ("Round avatars"), also after they change.
+    /// Draws avatars as the preferences say (the corner slider), also after they change.
     #[must_use]
     pub fn following(mut self, desktop: DesktopHandle) -> Self {
         self.desktop = Some(desktop);
         self
     }
 
-    /// Draws avatars round or square whatever the preferences say (tests).
+    /// Draws avatars with this corner slider whatever the preferences say (tests).
     #[must_use]
-    pub fn with_round(mut self, round: bool) -> Self {
-        self.round = Some(round);
+    pub fn with_corners(mut self, corners: u8) -> Self {
+        self.corners = Some(corners);
         self
     }
 
-    fn round_avatars(&self) -> bool {
-        self.round
-            .or_else(|| self.desktop.as_ref().map(|d| d.prefs().round_avatars))
-            .unwrap_or(true)
+    fn avatar_corners(&self) -> u8 {
+        self.corners
+            .or_else(|| self.desktop.as_ref().map(|d| d.prefs().avatar_corners))
+            .unwrap_or(100)
     }
 }
 
@@ -139,6 +121,18 @@ impl Presenter for QtPresenter {
 
     fn message_line(&self, detail: &ConversationDetail, message: &MessageRow) -> String {
         notify::message_line(detail, message)
+    }
+
+    fn filter_texts(&self, detail: &ConversationDetail, message: &MessageRow) -> OwnedFilterTexts {
+        notify::filter_texts(detail, message)
+    }
+
+    fn filter_title(&self, title: &str, filter: &str) -> String {
+        notify::filter_title(title, filter)
+    }
+
+    fn filter_matches(&self, count: u32, filter: &str) -> String {
+        notify::filter_matches(count, filter)
     }
 
     fn new_messages(&self, count: usize) -> String {
@@ -168,7 +162,7 @@ impl Presenter for QtPresenter {
             &QString::from(title),
             notify::is_anonymous_title(title),
             size,
-            avatar_corner(self.round_avatars(), AVATAR_SIZE),
+            avatar_corner(self.avatar_corners(), AVATAR_SIZE),
         );
         ImageData::rgba(AVATAR_SIZE, AVATAR_SIZE, rgba)
     }
@@ -212,11 +206,13 @@ impl qobject::App {
             DesktopEvent::Activate {
                 token,
                 conversation,
+                message,
             } => {
                 tracing::debug!(conversation = conversation.map(|c| c.0), "activation");
                 self.activation_requested(
                     QString::from(token.unwrap_or_default().as_str()),
                     conversation.map_or(0, |c| c.0),
+                    message.map_or(0, |m| m.0),
                 );
             }
             DesktopEvent::Toggle { token } => {
@@ -236,7 +232,7 @@ impl qobject::App {
                 }
                 // §9.4: in M1 a sgnl:// link only brings the window up.
                 tracing::info!(links = uris.len(), "sgnl:// link: showing the window");
-                self.activation_requested(QString::from(token.unwrap_or_default().as_str()), 0);
+                self.activation_requested(QString::from(token.unwrap_or_default().as_str()), 0, 0);
             }
             DesktopEvent::Quit => self.quit_requested(),
             DesktopEvent::TrayAvailable(available) => {
@@ -251,22 +247,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_notification_avatar_has_the_lists_proportion_of_corner_to_side() {
-        // A circle is half the side (rounded up), whatever the theme says.
-        assert_eq!(avatar_corner(true, 96), 48);
-        assert_eq!(avatar_corner(true, 95), 48);
-        // Before the window has said, Breeze's corner (about 5 px on a 47 px list avatar).
-        set_theme_corner(f64::from(DEFAULT_THEME_CORNER_PERMILLE) / 1000.0);
-        assert_eq!(avatar_corner(false, 96), 10);
-        // The window's value: 6 px on a list avatar of 47 px, sharp corners, nonsense.
-        set_theme_corner(6.0 / 47.0);
-        assert_eq!(avatar_corner(false, 96), 12);
-        set_theme_corner(0.0);
-        assert_eq!(avatar_corner(false, 96), 0);
-        set_theme_corner(7.0);
-        assert_eq!(avatar_corner(false, 96), 48, "never more than a circle");
-        set_theme_corner(f64::NAN);
-        assert_eq!(avatar_corner(false, 96), 0);
-        set_theme_corner(f64::from(DEFAULT_THEME_CORNER_PERMILLE) / 1000.0);
+    fn a_notification_avatar_takes_its_corner_from_the_slider() {
+        // 100 is a circle: half the side, rounded up; 0 a square; in between, a share of half.
+        assert_eq!(avatar_corner(100, 96), 48);
+        assert_eq!(avatar_corner(100, 95), 48);
+        assert_eq!(avatar_corner(0, 96), 0);
+        assert_eq!(avatar_corner(50, 96), 24);
+        assert_eq!(avatar_corner(25, 96), 12);
+        assert_eq!(avatar_corner(250, 96), 48, "never more than a circle");
     }
 }

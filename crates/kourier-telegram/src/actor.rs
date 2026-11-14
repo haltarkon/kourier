@@ -429,6 +429,8 @@ enum Kind {
     Disconnect,
     /// `NetworkChanged` or `Resumed` (C8c sets TDLib's network type).
     Hint(Hint),
+    /// `ReleaseMemory`: the account's `backend.db` connection gives back its caches.
+    ReleaseMemory,
     /// `SyncReadMarker` (critic H3): `viewMessages(force_read: true)` on the sync lane.
     ReadMarker {
         cmd: CmdId,
@@ -469,6 +471,7 @@ fn sort(command: Command) -> Kind {
         Command::Disconnect => Kind::Disconnect,
         Command::NetworkChanged => Kind::Hint(Hint::NetworkChanged),
         Command::Resumed => Kind::Hint(Hint::Resumed),
+        Command::ReleaseMemory => Kind::ReleaseMemory,
         Command::SubmitLoginInput { txn, values } => Kind::Input { txn, values },
         Command::Transmit { reply, .. } => {
             let _ = reply.send(TransmitOutcome::Failed(BackendError::unsupported(NOT_DONE)));
@@ -1033,6 +1036,10 @@ impl Actor {
                 self.run_acts(vec![download_answer(attachment, request)])
                     .await
             }
+            Kind::ReleaseMemory => {
+                kourier_db::release_memory(&self.conn);
+                None
+            }
             Kind::Other => None,
         }
     }
@@ -1223,6 +1230,7 @@ impl Actor {
                             Kind::Other
                             | Kind::Connect
                             | Kind::Hint(_)
+                            | Kind::ReleaseMemory
                             | Kind::StartLogin { .. } => {}
                             // Durable: handled after the start, in order.
                             durable @ (Kind::ReadMarker { .. }
@@ -1699,7 +1707,7 @@ impl Actor {
                 biased;
                 shipped = &mut ship => return Some(shipped),
                 command = commands.recv() => match command.map_or(Kind::Shutdown, sort) {
-                    Kind::Other => {}
+                    Kind::Other | Kind::ReleaseMemory => {}
                     stop @ (Kind::Shutdown | Kind::Logout) => {
                         later.push_back(stop);
                         return None;

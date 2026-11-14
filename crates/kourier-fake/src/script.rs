@@ -507,6 +507,12 @@ pub struct Script {
     /// [`PIN_LIMIT`] only to caps that state none. A script whose own caps state the flag and no limit
     /// plays a network without one. Test: `conformance::a_script_states_its_own_pin_limit`.
     pub roaming_writes: Option<bool>,
+    /// What the fake states of the export rule of a chat ([`kourier_model::ChatExport`]) when it
+    /// is not the default: the features the fake delivers say `Allowed` (a Signal- or
+    /// Threema-like network has no restriction); a chat listed here has its delivered features
+    /// say the given state instead (`Restricted`, or `Unstated` as a backend that says nothing).
+    /// Tests of the export rule use it.
+    pub chat_export: Vec<(ConvKey, kourier_model::ChatExport)>,
     /// Delay before each forwarded batch, on the account clock ("slow acks"). On
     /// [`Flavor::TelegramLike`](crate::Flavor::TelegramLike) it also decides the order of the
     /// two things the server says of an accepted message: the echo is committed with the accept,
@@ -710,6 +716,7 @@ impl Script {
             after_connect: Vec::new(),
             reject_changes: false,
             roaming_writes: Some(true),
+            chat_export: Vec::new(),
             forward_delay: None,
             transmit: Vec::new(),
             early_events: Vec::new(),
@@ -770,6 +777,12 @@ impl Script {
     /// States what the fake says of the roaming settings ([`roaming_writes`](Self::roaming_writes)).
     pub fn with_roaming_writes(mut self, roaming_writes: Option<bool>) -> Self {
         self.roaming_writes = roaming_writes;
+        self
+    }
+
+    /// States the export rule of one chat ([`chat_export`](Self::chat_export)).
+    pub fn with_chat_export(mut self, conv: ConvKey, state: kourier_model::ChatExport) -> Self {
+        self.chat_export.push((conv, state));
         self
     }
 

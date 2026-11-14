@@ -295,6 +295,7 @@ mod tests {
             local,
             thumb: None,
             long_text: false,
+            model: None,
             net_ids: Vec::new(),
         }
     }

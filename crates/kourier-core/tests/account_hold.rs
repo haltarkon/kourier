@@ -345,6 +345,7 @@ async fn the_catch_up_summary_is_told_while_a_hold_lasts() {
                 account: a,
                 messages,
                 conversations,
+                ..
             } if *a == account => Some((*messages, *conversations)),
             _ => None,
         })

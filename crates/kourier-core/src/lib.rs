@@ -75,6 +75,7 @@
 
 pub mod error;
 pub mod facade;
+pub mod filters;
 pub mod testing;
 pub mod vault;
 
@@ -83,6 +84,8 @@ mod attachments;
 mod calls;
 mod dispatch;
 mod expiry;
+mod export;
+mod filter_store;
 mod ingest;
 mod local;
 mod media;
@@ -95,6 +98,8 @@ mod restore;
 mod roaming;
 mod rules;
 mod runtime;
+// G1: message search: the index (G1b-G1d) and `Query::Search` (G1e).
+mod search;
 mod sql;
 mod store;
 mod supervisor;
@@ -111,6 +116,16 @@ pub use outbox::{
     backoff_capped as outbox_backoff_capped,
 };
 pub use runtime::{Core, CoreConfig};
+pub use search::compact::FAILPOINT_COMPACT_STEP as FAILPOINT_SEARCH_COMPACT_STEP;
+pub use search::file::{
+    FAILPOINT_CREATE_BEFORE_COMMIT as FAILPOINT_SEARCH_CREATE_BEFORE_COMMIT,
+    FAILPOINT_REBUILD_DELETED as FAILPOINT_SEARCH_REBUILD_DELETED,
+    FAILPOINT_REMOVE_PARTWAY as FAILPOINT_SEARCH_REMOVE_PARTWAY, beside as search_db_beside,
+};
+pub use search::index::{
+    FAILPOINT_AFTER_COMMIT as FAILPOINT_SEARCH_AFTER_COMMIT,
+    FAILPOINT_BEFORE_COMMIT as FAILPOINT_SEARCH_BEFORE_COMMIT,
+};
 pub use store::{HISTORY_CHUNK, MIGRATIONS, UI_READERS};
 pub use supervisor::{
     FAILPOINT_AFTER_PENDING_COMMAND, FAILPOINT_BEFORE_ACK, FAILPOINT_BEFORE_DOWNLOAD_SEND,

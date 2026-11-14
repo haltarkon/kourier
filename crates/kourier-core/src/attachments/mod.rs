@@ -129,6 +129,8 @@ pub(crate) struct DeriveJob {
     /// The file is the whole text of its message (`Attachment.long_text`): it is joined into
     /// the body instead of thumbnailed.
     pub long_text: bool,
+    /// The sender's file name, when known (only the model check reads it; not log-safe).
+    pub file_name: Option<String>,
 }
 
 impl std::fmt::Debug for DeriveJob {
@@ -149,6 +151,16 @@ impl DeriveJob {
                 .mime
                 .as_deref()
                 .is_some_and(|m| m.starts_with("image/"))
+    }
+}
+
+impl DeriveJob {
+    /// Whether the file looks like a 3D model to try (name or MIME; the content decides in
+    /// `kourier_mesh::parse`): not a picture and not a long text.
+    pub(crate) fn is_model(&self) -> bool {
+        !self.long_text
+            && !self.is_picture()
+            && kourier_mesh::looks_like_model(self.file_name.as_deref(), self.mime.as_deref())
     }
 }
 

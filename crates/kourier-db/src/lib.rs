@@ -32,7 +32,9 @@ pub use migrate::{
     Migration, MigrationOutcome, Migrations, Step, check_backend_file, migrate, schema_components,
     schema_version,
 };
-pub use open::{checkpoint_truncate, open, open_read_only, try_checkpoint_truncate};
+pub use open::{
+    cache_used, checkpoint_truncate, open, open_read_only, release_memory, try_checkpoint_truncate,
+};
 pub use outbox::{
     Batch, Forwarder, ForwarderConfig, OutboxRow, OutboxSource, PoisonRow, Refusal, Rejected,
 };

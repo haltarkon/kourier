@@ -11,6 +11,10 @@ kourier-model.workspace = true
 # Only `kourier_core::facade` (cargo xtask deps-check).
 kourier-core.workspace = true
 thiserror.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+# The export's pseudonyms: a keyed hash, so two known members do not give the salt away.
+sha2.workspace = true
 uuid.workspace = true
 # Grapheme clusters, for the cut of a long text ("Read more"). Already in the lock file
 # (through cxx-qt's build dependencies).

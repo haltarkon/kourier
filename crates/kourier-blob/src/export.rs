@@ -26,6 +26,11 @@
 //!   (`linkat`, or `renameat2` with `RENAME_NOREPLACE`). Where the file system has neither (the
 //!   [`Staging::Named`] route on FAT), the existence is looked at first (the one race this
 //!   crate leaves, on a file system that cannot do better).
+//! - The ARCHIVE ([`archive::write_archive`], Export Selected, architecture §5.8.3) is this
+//!   module's second form: the same open folder, staging, `fsync`s and publishing, the same
+//!   modes, but the staged file is a ZIP and is created `0o600` (a whole conversation in
+//!   plaintext; a single saved picture keeps `0o666`). Its entry names are checked by the
+//!   writer, never trusted from the caller.
 //! - The log says that a copy was saved and how big it was, never a path or a name (§9.1).
 
 use crate::{BlobError, BlobReader, FileKey};
@@ -37,6 +42,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use zeroize::Zeroizing;
+
+pub mod archive;
 
 /// The longest file name the writer takes, in bytes (the limit of most Linux file systems).
 pub const MAX_NAME_BYTES: usize = 255;
@@ -85,6 +92,9 @@ pub enum SaveError {
     /// to authenticate, a truncated file, or the reader's own error.
     #[error("the source could not be read: {0}")]
     Source(BlobError),
+    /// The caller cancelled an archive ([`archive::write_archive`]): nothing was published.
+    #[error("the export was cancelled")]
+    Cancelled,
     /// Any other error of the file system.
     #[error("writing the copy failed: {0}")]
     Io(io::Error),
@@ -132,7 +142,7 @@ pub fn save_staged(
     if mode == SaveMode::NoReplace && exists(&dirfd, &target)? {
         return Err(SaveError::Exists);
     }
-    let (mut file, part) = stage(&dirfd, staging)?;
+    let (mut file, part) = stage(&dirfd, staging, 0o666)?;
     let bytes = copy(src, &mut file)?;
     // The data is on the disk before the file has its name.
     sync(file.as_raw_fd())?;
@@ -154,6 +164,21 @@ pub fn check_name(name: &str) -> Result<(), SaveError> {
         && name != "."
         && name != "..";
     ok.then_some(()).ok_or(SaveError::BadName)
+}
+
+/// Free bytes for this user on the file system of `dir` (`statvfs`), `None` when it cannot be
+/// asked. The export's room check (architecture §5.8.3) reads it before an archive is staged.
+// (The widths of `statvfs`'s fields differ by target; on 64-bit Linux they are `u64` already.)
+#[allow(clippy::useless_conversion)]
+pub fn free_space(dir: &Path) -> Option<u64> {
+    let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is plain data for which all-zero is a valid value.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid NUL-terminated string and `st` a valid out pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
 }
 
 /// What the data was written to.
@@ -212,7 +237,7 @@ fn open_dir(dir: &Path) -> Result<OwnedFd, SaveError> {
 }
 
 /// Creates the file the data is written to.
-fn stage(dirfd: &OwnedFd, staging: Staging) -> Result<(File, Part), SaveError> {
+fn stage(dirfd: &OwnedFd, staging: Staging, mode: u32) -> Result<(File, Part), SaveError> {
     if staging == Staging::Auto && Path::new("/proc/self/fd").is_dir() {
         // SAFETY: "." is a valid NUL-terminated string and `dirfd` an open folder.
         let fd = unsafe {
@@ -220,7 +245,7 @@ fn stage(dirfd: &OwnedFd, staging: Staging) -> Result<(File, Part), SaveError> {
                 dirfd.as_raw_fd(),
                 c".".as_ptr(),
                 libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
-                0o666_u32,
+                mode,
             )
         };
         if fd >= 0 {
@@ -243,7 +268,7 @@ fn stage(dirfd: &OwnedFd, staging: Staging) -> Result<(File, Part), SaveError> {
             dirfd.as_raw_fd(),
             hidden.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o666_u32,
+            mode,
         )
     };
     if fd < 0 {

@@ -188,6 +188,11 @@ impl<'de> Deserialize<'de> for LocationFiles {
     }
 }
 
+/// What an old `round-avatars = false` reads as on the slider `avatar-corners`: the square avatar of
+/// old had the theme's own corner radius (Kirigami's `cornerRadius`, 5 px), about a fifth of half a
+/// list avatar's side (`Style.listAvatarSize`, 2.6 grid units), so the look stays as it was.
+pub const OLD_SQUARE_AVATAR_CORNERS: u8 = 20;
+
 /// The preferences.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -202,10 +207,32 @@ pub struct Prefs {
     pub start_hidden: bool,
     /// Compact conversation list.
     pub compact: bool,
-    /// Avatars are circles. Off, they are squares with the corners of the front-end's theme
-    /// (a front-end that has no such corners draws plain squares). On by default: a profile
-    /// from before the setting keeps its round avatars.
-    pub round_avatars: bool,
+    /// How round avatars are (`avatar-corners`, 0 to 100: the corner radius as a percentage of
+    /// half the side, 0 a square, 100 a circle). 100 by default. It replaced the switch
+    /// `round-avatars`: a file that has only the old key reads `true` as 100 and `false` as
+    /// [`OLD_SQUARE_AVATAR_CORNERS`] ([`Self::load`]); the old key is never written again.
+    pub avatar_corners: u8,
+    /// The old switch, read only to carry its value over (`round-avatars`); always `None` after
+    /// [`Self::load`].
+    #[serde(rename = "round-avatars", skip_serializing)]
+    pub legacy_round_avatars: Option<bool>,
+    /// How round the message bubbles are (`message-corners`, 0 to 100): the corner radius is
+    /// this tenth of the theme's corner radius, so 30 (the default) is the bubble of old (three
+    /// times the theme's radius) and 0 a square one.
+    pub message_corners: u8,
+    /// A chat left with a draft moves up in the list (`drafts-on-top`), as in Signal Desktop. On
+    /// by default.
+    pub drafts_on_top: bool,
+    /// The chat list shows the accounts' names and tags (`show-account-tags`). On by default.
+    pub show_account_tags: bool,
+    /// The short tags the person gave accounts (`account-tags`: account uuid to a tag of up to
+    /// [`TAG_MAX`] characters; absent = the account's name shows). Local only, never sent to a
+    /// network. Written by the app's account menu; read leniently like `account-tints`.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "lenient_tags"
+    )]
+    pub account_tags: BTreeMap<String, String>,
     /// Notification content.
     pub notification_content: NotificationContent,
     /// What Send does with a file that holds where it was taken (absent or unknown = Ask).
@@ -255,6 +282,174 @@ pub struct Prefs {
         deserialize_with = "lenient_tints"
     )]
     pub account_tints: BTreeMap<String, String>,
+    /// The pinned emoji (`emoji-pins`): the reaction picker's quick row, and the first three are
+    /// the one-click reactions in a message's hover bar. Absent = Signal's six (`None`; an empty
+    /// list is a person's choice to pin none and is kept). One list for every account, local
+    /// only. NOT listed by the Settings page: the app's emoji lists are its one writer, through
+    /// `DesktopHandle::update_prefs`. Read leniently (`lenient_emoji`).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_emoji_pins"
+    )]
+    pub emoji_pins: Option<Vec<String>>,
+    /// The starred emoji (`emoji-favourites`), the picker's first tab. Same owner and rules.
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_emoji_favourites"
+    )]
+    pub emoji_favourites: Vec<String>,
+    /// The emoji used last, newest first, at most [`EMOJI_RECENT_MAX`] (`emoji-recent`).
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_emoji_recent"
+    )]
+    pub emoji_recent: Vec<String>,
+    /// The colour of 3D models without colours of their own (`model-colour`: `#rrggbb`; absent =
+    /// the desktop's accent colour). ONE owner, the Settings page's controller (LISTED in
+    /// `SettingsRust::prefs()`); the viewer's toolbar button writes through the same property.
+    /// Read leniently: anything but `#rrggbb` reads as the accent.
+    #[serde(
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "lenient_model_colour"
+    )]
+    pub model_colour: String,
+    /// The printer box shown in the 3D viewer (`model-box`: a row id of
+    /// `kourier_viewmodel::printer_boxes`, "256x256x256"; absent = none). Same owner as
+    /// `model-colour`. Read leniently: anything but a short `NxNxN` reads as none (whether the
+    /// row exists is the front-end's to judge).
+    #[serde(
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "lenient_model_box"
+    )]
+    pub model_box: String,
+    /// The slicer "Open in Slicer" starts first (`model-slicer`: an id of
+    /// `crate::slicers::SLICERS`; absent = OrcaSlicer). Same owner as `model-colour`: written
+    /// from the viewer only after a start that happened. Read leniently: anything but a table id
+    /// reads as the default (empty).
+    #[serde(
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "lenient_model_slicer"
+    )]
+    pub model_slicer: String,
+}
+
+/// `model-slicer`: a table id of [`crate::slicers`], else the default (empty).
+fn lenient_model_slicer<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|t| crate::slicers::find(t).is_some())
+        .map(str::to_owned)
+        .unwrap_or_default())
+}
+
+/// `model-colour`: a `#rrggbb` string, else the accent (empty).
+fn lenient_model_colour<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|t| is_tint(t))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default())
+}
+
+/// `model-box`: `NxNxN` of digits, at most 16 characters, else none (empty).
+fn lenient_model_box<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|t| {
+            t.len() <= 16
+                && t.split('x').count() == 3
+                && t.split('x')
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .unwrap_or_default())
+}
+
+/// Most pinned emoji (the reaction picker's quick row).
+pub const EMOJI_PINS_MAX: usize = 6;
+/// Most recently used emoji kept.
+pub const EMOJI_RECENT_MAX: usize = 24;
+/// Most favourites kept.
+pub const EMOJI_FAVOURITES_MAX: usize = 500;
+
+/// A list of emoji from the file: an entry that is not a string, is empty, is longer than 40 bytes
+/// (the longest emoji sequence is 35) or holds a control character is skipped, a repeat is dropped,
+/// the list is cut to `max`, and a value that is not a list reads as `None`. Whether an entry is an
+/// emoji of the table is the front-end's to judge (this crate has no table); a stale entry harms
+/// nothing and goes at the next write of the list.
+fn read_emoji_list<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    max: usize,
+) -> Result<Option<Vec<String>>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    let toml::Value::Array(items) = value else {
+        return Ok(None);
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        if out.len() == max {
+            break;
+        }
+        if let toml::Value::String(s) = item
+            && !s.is_empty()
+            && s.len() <= 40
+            && !s.chars().any(char::is_control)
+            && !out.contains(&s)
+        {
+            out.push(s);
+        }
+    }
+    Ok(Some(out))
+}
+
+fn lenient_emoji_pins<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    read_emoji_list(d, EMOJI_PINS_MAX)
+}
+
+fn lenient_emoji_favourites<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(read_emoji_list(d, EMOJI_FAVOURITES_MAX)?.unwrap_or_default())
+}
+
+fn lenient_emoji_recent<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(read_emoji_list(d, EMOJI_RECENT_MAX)?.unwrap_or_default())
+}
+
+/// The longest account tag, in characters.
+pub const TAG_MAX: usize = 8;
+
+/// A tag as the preference keeps it: one line, trimmed, at most [`TAG_MAX`] characters; empty
+/// when nothing is left.
+pub fn clean_tag(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(TAG_MAX)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// `account-tags` as the entries that are a uuid and a non-empty tag (cut to [`TAG_MAX`]).
+fn lenient_tags<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let value = toml::Value::deserialize(deserializer)?;
+    let toml::Value::Table(table) = value else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(table
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let uuid = uuid::Uuid::parse_str(&k).ok()?.to_string();
+            let tag = clean_tag(v.as_str()?);
+            (!tag.is_empty()).then_some((uuid, tag))
+        })
+        .collect())
 }
 
 /// `#rrggbb`, lower or upper case: the only form `account-tints` holds.
@@ -353,7 +548,12 @@ impl Default for Prefs {
             autostart: false,
             start_hidden: false,
             compact: false,
-            round_avatars: true,
+            avatar_corners: 100,
+            legacy_round_avatars: None,
+            message_corners: 30,
+            drafts_on_top: true,
+            show_account_tags: true,
+            account_tags: BTreeMap::new(),
             notification_content: NotificationContent::NameAndMessage,
             location_files: LocationFiles::Ask,
             networks_on: Vec::new(),
@@ -365,6 +565,12 @@ impl Default for Prefs {
             tint_rows: true,
             chat_wallpaper: true,
             account_tints: BTreeMap::new(),
+            emoji_pins: None,
+            emoji_favourites: Vec::new(),
+            emoji_recent: Vec::new(),
+            model_colour: String::new(),
+            model_box: String::new(),
+            model_slicer: String::new(),
         }
     }
 }
@@ -434,7 +640,26 @@ impl Prefs {
     pub fn load(path: &Path) -> Result<Self, PrefsError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                toml::from_str(&text).map_err(|e| PrefsError::Parse(e.message().to_owned()))
+                let mut prefs: Self =
+                    toml::from_str(&text).map_err(|e| PrefsError::Parse(e.message().to_owned()))?;
+                // The switch `round-avatars` became the slider `avatar-corners`: an old file
+                // keeps its look (false the small corner of old, true a circle); a file with the
+                // slider keeps the slider.
+                let has_slider = text
+                    .parse::<toml::Table>()
+                    .is_ok_and(|t| t.contains_key("avatar-corners"));
+                if let Some(round) = prefs.legacy_round_avatars.take()
+                    && !has_slider
+                {
+                    prefs.avatar_corners = if round {
+                        100
+                    } else {
+                        OLD_SQUARE_AVATAR_CORNERS
+                    };
+                }
+                prefs.avatar_corners = prefs.avatar_corners.min(100);
+                prefs.message_corners = prefs.message_corners.min(100);
+                Ok(prefs)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
@@ -581,7 +806,12 @@ mod tests {
             autostart: true,
             start_hidden: true,
             compact: true,
-            round_avatars: false,
+            avatar_corners: 40,
+            legacy_round_avatars: None,
+            message_corners: 55,
+            drafts_on_top: false,
+            show_account_tags: false,
+            account_tags: BTreeMap::from([(UUID_B.to_owned(), "Work".to_owned())]),
             notification_content: NotificationContent::NameOnly,
             location_files: LocationFiles::Never,
             networks_on: vec!["WhatsApp".to_owned()],
@@ -593,6 +823,12 @@ mod tests {
             tint_rows: false,
             chat_wallpaper: false,
             account_tints: BTreeMap::from([(UUID_A.to_owned(), "#3a76f0".to_owned())]),
+            emoji_pins: Some(vec!["🐶".to_owned()]),
+            emoji_favourites: vec!["😀".to_owned(), "🐶".to_owned()],
+            emoji_recent: vec!["🐶".to_owned()],
+            model_colour: "#e0529c".to_owned(),
+            model_box: "256x256x256".to_owned(),
+            model_slicer: "cura".to_owned(),
         };
         prefs.save(&path).expect("save");
         assert_eq!(Prefs::load(&path).expect("load"), prefs);
@@ -601,7 +837,11 @@ mod tests {
             text.contains("notification-content = \"name-only\""),
             "{text}"
         );
-        assert!(text.contains("round-avatars = false"), "{text}");
+        assert!(text.contains("avatar-corners = 40"), "{text}");
+        assert!(text.contains("model-colour = \"#e0529c\""), "{text}");
+        assert!(text.contains("model-box = \"256x256x256\""), "{text}");
+        assert!(text.contains("model-slicer = \"cura\""), "{text}");
+        assert!(!text.contains("round-avatars"), "{text}");
         assert!(text.contains("location-files = \"never\""), "{text}");
         assert!(text.contains("networks-on = [\"WhatsApp\"]"), "{text}");
         assert!(text.contains("pending-link = \"WhatsApp\""), "{text}");
@@ -642,27 +882,72 @@ mod tests {
         assert!(!Prefs::load(&path).expect("saved off").tray);
     }
 
+    /// The slider replaced the switch: no key, or only a file from before: a circle; the old
+    /// `false` the small corner of old, the old `true` a circle; a file with the slider keeps the slider whatever
+    /// the old key says; the old key is never written back.
+    /// Mutants: `if round { 100 } else { OLD_SQUARE_AVATAR_CORNERS }` swapped; `!has_slider` dropped.
     #[test]
-    fn avatars_are_round_unless_the_file_says_otherwise() {
+    fn the_old_round_avatars_switch_carries_over_to_the_corner_slider() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("kourier.toml");
-        assert!(Prefs::default().round_avatars);
-        assert!(Prefs::load(&path).expect("missing").round_avatars);
-        // A file from before the setting keeps round avatars, whatever else it holds.
+        assert_eq!(Prefs::default().avatar_corners, 100);
+        assert_eq!(Prefs::load(&path).expect("missing").avatar_corners, 100);
         std::fs::write(&path, "tray = true\ncompact = true\n").expect("write");
-        assert!(Prefs::load(&path).expect("old").round_avatars);
+        assert_eq!(Prefs::load(&path).expect("old").avatar_corners, 100);
         std::fs::write(&path, "round-avatars = false\n").expect("write");
         let square = Prefs::load(&path).expect("square");
-        assert!(!square.round_avatars);
-        // Saving other preferences keeps the choice.
+        assert_eq!(square.avatar_corners, 20);
+        assert_eq!(square.legacy_round_avatars, None);
+        std::fs::write(&path, "round-avatars = true\n").expect("write");
+        assert_eq!(Prefs::load(&path).expect("round").avatar_corners, 100);
+        std::fs::write(&path, "round-avatars = false\navatar-corners = 35\n").expect("write");
+        assert_eq!(Prefs::load(&path).expect("both").avatar_corners, 35);
+        // Saving writes the slider alone, and it survives.
         let changed = Prefs {
             tray: true,
             ..square
         };
         changed.save(&path).expect("save");
-        assert!(!Prefs::load(&path).expect("saved").round_avatars);
-        Prefs::default().save(&path).expect("save default");
-        assert!(Prefs::load(&path).expect("default").round_avatars);
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("avatar-corners = 20") && !text.contains("round-avatars"),
+            "{text}"
+        );
+        assert_eq!(Prefs::load(&path).expect("saved").avatar_corners, 20);
+        // A value past the end is cut.
+        std::fs::write(&path, "avatar-corners = 250\nmessage-corners = 200\n").expect("write");
+        let big = Prefs::load(&path).expect("big");
+        assert_eq!((big.avatar_corners, big.message_corners), (100, 100));
+        assert_eq!(
+            Prefs::load(&dir.path().join("none"))
+                .expect("d")
+                .message_corners,
+            30
+        );
+    }
+
+    /// Tags: one line, at most 8 characters, only for an account uuid, never empty.
+    #[test]
+    fn account_tags_are_read_leniently_and_cut_to_eight_characters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[account-tags]\n\"{UUID_A}\" = \"  Work  tag long\"\n\"nope\" = \"x\"\n\"{UUID_B}\" = \"  \"\n"
+            ),
+        )
+        .expect("write");
+        let p = Prefs::load(&path).expect("load");
+        assert_eq!(
+            p.account_tags,
+            BTreeMap::from([(UUID_A.to_owned(), "Work tag".to_owned())])
+        );
+        assert_eq!(clean_tag("abcdefghij"), "abcdefgh");
+        assert_eq!(clean_tag("  a\nb "), "a b");
+        assert!(p.drafts_on_top && p.show_account_tags);
+        std::fs::write(&path, "account-tags = 3\n").expect("write");
+        assert!(Prefs::load(&path).expect("x").account_tags.is_empty());
     }
 
     /// The experimental networks are all off for a profile that never chose (no key in the
@@ -802,6 +1087,118 @@ mod tests {
         let prefs = Prefs::load(&path).expect("another shape still loads");
         assert!(prefs.tray);
         assert!(prefs.account_tints.is_empty());
+    }
+
+    /// The 3D model preferences: `#rrggbb` (kept lower case) and `NxNxN`, anything else reads as
+    /// the default, and the defaults write nothing.
+    #[test]
+    fn the_model_preferences_are_read_leniently() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("kourier.toml");
+        std::fs::write(
+            &path,
+            "tray = true\nmodel-colour = \"#E0529C\"\nmodel-box = \"256x256x260\"\n",
+        )
+        .expect("write");
+        let p = Prefs::load(&path).expect("load");
+        assert_eq!(
+            (p.model_colour.as_str(), p.model_box.as_str()),
+            ("#e0529c", "256x256x260")
+        );
+        std::fs::write(
+            &path,
+            "tray = true\nmodel-colour = 5\nmodel-box = [\"a\"]\n",
+        )
+        .expect("write");
+        let p = Prefs::load(&path).expect("a bad value never fails the file");
+        assert!(p.tray && p.model_colour.is_empty() && p.model_box.is_empty());
+        std::fs::write(&path, "model-colour = \"red\"\nmodel-box = \"1x2\"\n").expect("write");
+        let p = Prefs::load(&path).expect("load");
+        assert!(p.model_colour.is_empty() && p.model_box.is_empty());
+        Prefs::default().save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("model-"), "defaults write nothing: {text}");
+    }
+
+    /// `model-slicer` is a table id; anything else (a number, a list, an unknown or odd-cased id)
+    /// reads as the default, never as a parse error that would reset the other preferences.
+    #[test]
+    fn the_slicer_preference_is_read_leniently() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("kourier.toml");
+        for (text, expected) in [
+            ("model-slicer = \"cura\"\n", "cura"),
+            ("model-slicer = \"bambustudio\"\n", "bambustudio"),
+            ("model-slicer = \"Cura\"\n", ""),
+            ("model-slicer = \"gimp\"\n", ""),
+            ("model-slicer = 5\n", ""),
+            ("model-slicer = [\"cura\"]\n", ""),
+        ] {
+            std::fs::write(&path, format!("tray = true\n{text}")).expect("write");
+            let p = Prefs::load(&path).expect("a bad value never fails the file");
+            assert!(p.tray, "{text}");
+            assert_eq!(p.model_slicer, expected, "{text}");
+        }
+        let prefs = Prefs {
+            model_slicer: "prusaslicer".to_owned(),
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("model-slicer = \"prusaslicer\""), "{text}");
+        Prefs::default().save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains("model-slicer"),
+            "the default writes nothing: {text}"
+        );
+    }
+
+    /// The emoji lists: absent pins are Signal's six (`None`), an empty list is kept as the choice
+    /// to pin none, a bad entry is skipped, a list is cut to its limit, and a value of another
+    /// shape never costs the file's other preferences.
+    #[test]
+    fn the_emoji_lists_are_read_leniently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        let none = Prefs::default();
+        assert!(none.emoji_pins.is_none() && none.emoji_favourites.is_empty());
+        none.save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("emoji-"), "{text}");
+        std::fs::write(&path, "tray = true\nemoji-pins = []\n").expect("write");
+        let p = Prefs::load(&path).expect("load");
+        assert_eq!(p.emoji_pins, Some(Vec::new()));
+        p.save(&path).expect("save");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("emoji-pins = []")
+        );
+        let many: Vec<String> = (0..40).map(|i| format!("\"x{i}\"")).collect();
+        std::fs::write(
+            &path,
+            format!(
+                "tray = true\nemoji-pins = [\"a\", 7, \"\", \"a\", \"b\\u0007\", \"c\", {}]\n\
+                 emoji-recent = [{}]\nemoji-favourites = \"no\"\n",
+                many[..8].join(", "),
+                many.join(", ")
+            ),
+        )
+        .expect("write");
+        let p = Prefs::load(&path).expect("a bad entry still loads");
+        assert!(p.tray);
+        assert_eq!(p.emoji_pins.as_deref().map(<[String]>::len), Some(6));
+        assert_eq!(p.emoji_pins.as_ref().expect("pins")[..2], ["a", "c"]);
+        assert_eq!(p.emoji_recent.len(), EMOJI_RECENT_MAX);
+        assert!(p.emoji_favourites.is_empty());
+        std::fs::write(
+            &path,
+            "tray = true\nemoji-pins = 5\nemoji-recent = {a = 1}\n",
+        )
+        .expect("write");
+        let p = Prefs::load(&path).expect("another shape still loads");
+        assert!(p.tray && p.emoji_pins.is_none() && p.emoji_recent.is_empty());
     }
 
     /// A `location-files` value this version does not know reads as Ask and keeps every

@@ -26,6 +26,7 @@ use std::process::Command;
 mod cleaned;
 mod demo;
 mod dist;
+mod emoji;
 #[cfg(test)]
 mod filter_model;
 mod green;
@@ -121,12 +122,13 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Some("i18n") => i18n::i18n(&args[1..]),
+        Some("emoji") => emoji::emoji(&args[1..]),
         Some("dist") => dist::dist(&args[1..]),
         Some("install") => install::install(&args[1..]),
         Some("uninstall") => install::uninstall(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|threema-run <start|id|answer|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
+                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|threema-run <start|id|answer|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|emoji|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
             );
             std::process::exit(2);
         }
@@ -384,6 +386,7 @@ fn allowed_internal() -> BTreeMap<&'static str, &'static [&'static str]> {
         ("kourier-db", &[][..]),
         ("kourier-blob", &[][..]),
         ("kourier-media", &[][..]),
+        ("kourier-mesh", &[][..]),
         (
             "kourier-core",
             &[
@@ -392,6 +395,7 @@ fn allowed_internal() -> BTreeMap<&'static str, &'static [&'static str]> {
                 "kourier-db",
                 "kourier-blob",
                 "kourier-media",
+                "kourier-mesh",
             ][..],
         ),
         (
@@ -761,7 +765,7 @@ fn target_dir() -> PathBuf {
 /// network's linking walk) for the first three, `--fixture` (the fake account's demo data in
 /// `core.db`) for the rest. Every `--page` value is here (`PAGES` in `crates/kourier-qt/src/lib.rs`;
 /// a test compares the two).
-const SHOT_PAGES: [&str; 90] = [
+const SHOT_PAGES: [&str; 107] = [
     "welcome",
     "link",
     "qr",
@@ -776,6 +780,7 @@ const SHOT_PAGES: [&str; 90] = [
     "files",
     "album",
     "albumviewer",
+    "viewerzoom",
     "revisions",
     "compact",
     "quotes",
@@ -812,6 +817,11 @@ const SHOT_PAGES: [&str; 90] = [
     "transferfailed",
     "transferask",
     "networks",
+    "appearance",
+    "filters",
+    "filteredit",
+    "highlight",
+    "regexsearch",
     "warisk",
     "waqr",
     "waphone",
@@ -852,11 +862,22 @@ const SHOT_PAGES: [&str; 90] = [
     "muteuntil",
     "chatmenu",
     "chatmenuoff",
+    "searchresults",
+    "searchchat",
+    "searchindexing",
+    "emojipicker",
+    "emojisearch",
+    "hoverpins",
+    "model3d",
+    "model3dviewer",
+    "select",
+    "exportdialog",
+    "exportdone",
 ];
 
 /// Pages that look the same in both color schemes: the image viewer covers the window with a
 /// dark overlay and a picture whatever the scheme, so its light rendering is not brighter.
-const SHOT_PAGES_SAME_IN_BOTH_THEMES: [&str; 2] = ["viewer", "albumviewer"];
+const SHOT_PAGES_SAME_IN_BOTH_THEMES: [&str; 3] = ["viewer", "albumviewer", "viewerzoom"];
 
 /// How much brighter (mean luminance, 0-255) the light rendering of a page must be than the dark
 /// one for the color scheme to count as applied.
@@ -1445,6 +1466,7 @@ mod tests {
         assert_eq!(theme_problem("viewer", 115, 111), None);
         assert_eq!(theme_problem("viewer", 46, 54), None);
         assert_eq!(theme_problem("albumviewer", 60, 58), None);
+        assert_eq!(theme_problem("viewerzoom", 60, 58), None);
         // The other new pages are ordinary pages: the scheme must show.
         assert!(theme_problem("files", 120, 110).is_some());
         assert!(theme_problem("album", 120, 110).is_some());

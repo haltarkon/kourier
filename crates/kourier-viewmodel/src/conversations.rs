@@ -128,6 +128,8 @@ pub struct AccountRow {
     pub tint: String,
     /// The color the person gave the account; empty: its network's.
     pub own_tint: String,
+    /// The short tag the person gave the account (only the chat list shows it); empty: none.
+    pub own_tag: String,
     /// State dot.
     pub status: AccountStatus,
     /// State label ("Online").
@@ -191,6 +193,7 @@ pub fn account_row(account: &Account, conn: &ConnState, unread: u32) -> AccountR
         network_name,
         tint: network_tint(account.network).to_owned(),
         own_tint: String::new(),
+        own_tag: String::new(),
         status,
         status_label: status.label(),
         unread,
@@ -293,9 +296,16 @@ pub struct ConversationRow {
     /// The account's place in the panel (0 = first): the key of the pinned block in
     /// [`compare_rows`]. No role; `u32::MAX` for an account the panel does not list.
     pub account_order: u32,
+    /// The list order's time (the unit of [`Self::last_activity`]): the time the chat was left
+    /// with its draft while that is newer than `last_activity` and the user keeps the option
+    /// "Move chats with a draft to the top" on, else `last_activity` ([`order_time`]).
+    pub order_at: i64,
     /// The user protects the chat on another device: the preview is [`protected_preview`]
     /// (no author, icon, receipt or time) and a search finds the chat by its title only.
     pub protected: bool,
+    /// The RegExp filters' marker backgrounds in [`Self::title`] (R3); empty when no highlight
+    /// filter's chat pattern matches it.
+    pub title_marks: Vec<crate::filter_marks::Mark>,
 }
 
 crate::safe_debug!(ConversationRow {
@@ -315,6 +325,7 @@ crate::safe_debug!(ConversationRow {
     receipt,
     badge_number,
     account_order,
+    order_at,
     protected,
 });
 
@@ -524,7 +535,9 @@ pub fn conversation_row(
         tint: String::new(),
         badge_number: 0,
         account_order: 0,
+        order_at: last_activity,
         protected: c.protected,
+        title_marks: Vec::new(),
     };
     if row.protected {
         row.hide_messages();
@@ -539,7 +552,18 @@ pub fn shown_archived(archived: bool, pinned_order: Option<u32>) -> bool {
     archived && pinned_order.is_none()
 }
 
-/// The list order: pinned first, then newest activity, then id. The pinned block goes account
+/// The time a chat sorts by (Signal Desktop's `_getConversationComparator`: the draft's time
+/// while the draft is newer than the last message, else the last message's): `draft_at` counts
+/// only with `on` (the option) and only when it is newer than `last_activity`.
+pub fn order_time(last_activity: i64, draft_at: i64, on: bool) -> i64 {
+    if on && draft_at > last_activity {
+        draft_at
+    } else {
+        last_activity
+    }
+}
+
+/// The list order: pinned first, then newest order time (`order_at`), then id. The pinned block goes account
 /// by account in the panel's order, each account's chats in its phone's pin order (with one
 /// account, or the accounts' `account_order` all equal, that is the pin order alone).
 pub fn compare_rows(a: &ConversationRow, b: &ConversationRow) -> Ordering {
@@ -550,8 +574,8 @@ pub fn compare_rows(a: &ConversationRow, b: &ConversationRow) -> Ordering {
             .then(x.cmp(&y))
             .then(b.id.cmp(&a.id)),
         _ => compare_order(
-            (a.pinned_order, a.last_activity, a.id),
-            (b.pinned_order, b.last_activity, b.id),
+            (a.pinned_order, a.order_at, a.id),
+            (b.pinned_order, b.order_at, b.id),
         ),
     }
 }
@@ -589,6 +613,12 @@ pub struct ConversationFilter {
     pub query: String,
     /// The archive view is shown: its chats instead of the inbox's (when no query is typed).
     pub archived: bool,
+    /// RegExp search is on (R5): `query` is a pattern, and a chat's title passes when the
+    /// core's compiled `pattern` (the page of the message search) matches it; before the first
+    /// answer there is none, and no title passes. Previews are not looked at.
+    pub regex: bool,
+    /// The compiled pattern of the running pattern search (see `regex`).
+    pub pattern: Option<kourier_core::facade::SearchPattern>,
 }
 
 impl std::fmt::Debug for ConversationFilter {
@@ -651,6 +681,12 @@ impl ConversationFilter {
                 Hidden::Unknown => false,
                 Hidden::Ids(ids) => !ids.contains(&row.account) && row.archived == self.archived,
             };
+        }
+        if self.regex {
+            return self
+                .pattern
+                .as_ref()
+                .is_some_and(|p| p.is_match(&row.title));
         }
         let q = q.to_lowercase();
         // A protected chat is found by its title only, never by what it holds (Threema
@@ -922,10 +958,17 @@ pub struct ChatHeader {
     /// Why the disappearing-message timer cannot be changed now (the account's network holds
     /// back what is sent, [`AccountHold`]); empty when it can.
     pub timer_held: String,
+    /// Why Export Selected is off for this chat (the button's tooltip); empty when it is on.
+    pub export_off: String,
     /// What the chat's menu offers of Archive, Pin, Mute and Mark as Unread
     /// ([`crate::roaming::offer_in_account`]); nothing for a chat the source does not know
     /// the account's statement for (the fixture).
     pub offer: crate::roaming::ChatOffer,
+    /// The chat is protected on another device (S-P): its messages show nowhere outside the open
+    /// chat, and Kourier offers no search in it (G1i).
+    pub protected: bool,
+    /// The RegExp filters' marker backgrounds in [`Self::title`] (R3).
+    pub title_marks: Vec<crate::filter_marks::Mark>,
 }
 
 /// The custom timers a conversation takes: every `min + k × step` seconds up to `max`.
@@ -1016,7 +1059,8 @@ crate::safe_debug!(ChatHeader {
     is_self,
     has_details,
     muted,
-    timer_secs
+    timer_secs,
+    protected
 });
 
 /// One entry of the disappearing-message menu.
@@ -1780,7 +1824,10 @@ pub fn chat_header(
         deletes_sync: c.features.delete_for_me,
         still_filling: String::new(),
         timer_held: String::new(),
+        export_off: String::new(),
         offer: crate::roaming::ChatOffer::default(),
+        protected: c.protected,
+        title_marks: Vec::new(),
     }
 }
 
@@ -1825,6 +1872,7 @@ mod tests {
         r.id = ConversationId(id);
         r.pinned_order = pinned;
         r.last_activity = last;
+        r.order_at = last;
         r
     }
 
@@ -1872,6 +1920,47 @@ mod tests {
         r.account = AccountId(1);
         table.decorate(&mut r);
         assert_eq!(r.account_badge, "A1");
+    }
+
+    /// The draft rule (Signal Desktop's comparator): a chat left with a draft sorts by the draft's
+    /// time while it is newer than the last message and the option is on; with the option off, or
+    /// once a newer message arrived, by its last message; a pinned chat stays first; a draft
+    /// with no stamp (0) never moves a chat. Mutants: `>` to `<` in `order_time`; the `on` test
+    /// dropped; `order_at` replaced by `last_activity` in `compare_rows`.
+    #[test]
+    fn a_draft_moves_its_chat_up_only_while_it_is_newer_and_the_option_is_on() {
+        assert_eq!(order_time(10, 50, true), 50, "a newer draft");
+        assert_eq!(order_time(10, 50, false), 10, "the option off");
+        assert_eq!(
+            order_time(60, 50, true),
+            60,
+            "a newer message outranks an older draft"
+        );
+        assert_eq!(order_time(50, 50, true), 50);
+        assert_eq!(order_time(10, 0, true), 10, "no stamp");
+        let list = |on: bool| {
+            // (id, pinned, last message, draft time)
+            let mut rows: Vec<ConversationRow> = [
+                (1, None, 10, 0),
+                (2, None, 30, 0),
+                (3, None, 20, 40),
+                (4, Some(0), 1, 0),
+                (5, None, 50, 45),
+            ]
+            .iter()
+            .map(|&(id, pinned, last, draft)| {
+                let mut r = row(id, pinned, last);
+                r.order_at = order_time(last, draft, on);
+                r
+            })
+            .collect();
+            sort_rows(&mut rows);
+            rows.iter().map(|r| r.id.0).collect::<Vec<_>>()
+        };
+        // On: the pinned chat, then 5 (message 50 beats draft 45), 3 (draft 40), 2, 1.
+        assert_eq!(list(true), [4, 5, 3, 2, 1]);
+        // Off: by messages alone.
+        assert_eq!(list(false), [4, 5, 2, 3, 1]);
     }
 
     #[test]
@@ -2080,6 +2169,7 @@ mod tests {
             hidden: BTreeSet::from([AccountUuid(uuid::Uuid::from_u128(0xabcd_1234))]),
             query: "secret".into(),
             archived: false,
+            ..Default::default()
         };
         let d = format!("{f:?}");
         assert!(d.contains("hidden: 1"), "{d}");

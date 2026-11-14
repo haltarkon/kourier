@@ -66,6 +66,10 @@ pub struct RichText {
     /// Per entry of [`Self::mentions`]: the mention lies under a spoiler (it does not open while
     /// the spoiler hides it).
     pub mention_spoilers: Vec<bool>,
+    /// The marker backgrounds of the RegExp filters (R3), in positions of [`Self::plain`] (the
+    /// shown part). Set by the timeline's row builder, never by the renderer; empty for a text no
+    /// highlight filter matches. The html does not change with them.
+    pub marks: Vec<crate::filter_marks::Mark>,
 }
 
 crate::safe_debug!(RichText {
@@ -1148,6 +1152,7 @@ pub(crate) fn render_with(text: &Text, names: &dyn Names, urls: Vec<(usize, usiz
         links,
         mentions,
         mention_spoilers,
+        marks: Vec::new(),
     }
 }
 

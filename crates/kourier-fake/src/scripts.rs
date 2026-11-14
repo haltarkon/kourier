@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use kourier_backend_api::{BackendEvent, HistoryEdit, HistoryReaction, IncomingMessage};
 use kourier_model::{
-    AccountSettingsPatch, AttachmentKind, Body, CleanedPictures, ContactPatch, ConvKey,
+    AccountSettingsPatch, AttachmentKind, Body, ChatExport, CleanedPictures, ContactPatch, ConvKey,
     ConversationFeatures, ConversationPatch, DisappearKind, FileAlbum, FileLimits, FilePacking,
     FormatKind, GroupInfo, HistorySource, Member, MemberList, MemberRole, MsgTarget, NetMsgId,
     Origin, OutgoingState, Patch, Placeholder, QuoteSnapshot, RangeKind, ReceiptKind,
@@ -215,6 +215,9 @@ pub fn signal_features(group: bool) -> ConversationFeatures {
         // Listed: the fake states the roaming fact only when N4 plays an unlisted chat.
         roaming_listed: None,
         invite_link_on: false,
+        // Signal and Threema have no restriction on saving a chat; a script that plays another
+        // statement says so with `Script::with_chat_export`.
+        export: ChatExport::Allowed,
     }
 }
 

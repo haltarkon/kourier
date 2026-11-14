@@ -522,6 +522,9 @@ impl Apply<'_> {
     /// person sent loses its notices and leaves the list; then the invalidations (`changed`:
     /// messages went).
     fn after_clear(&mut self, conv: ConversationId, remove: bool, mut changed: bool) -> Result<()> {
+        // The words of what went leave search.db as soon as the search task has applied the log
+        // up to here, not within the day of a single delete (G1d): asked at each end, after the
+        // last delete of the clear, so the position covers every log row it appended.
         if remove {
             let left: bool = self
                 .conn
@@ -559,6 +562,7 @@ impl Apply<'_> {
                     self.ch.messages.remove(&conv);
                     self.ch.removed.insert(conv);
                     self.ch.timelines.insert(conv);
+                    crate::search::log::ask_now(self.conn)?;
                     return Ok(());
                 }
             }
@@ -568,6 +572,7 @@ impl Apply<'_> {
             self.ch.timelines.insert(conv);
             self.ch.recount_conv(conv);
         }
+        crate::search::log::ask_now(self.conn)?;
         Ok(())
     }
 

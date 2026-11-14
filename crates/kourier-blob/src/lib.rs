@@ -18,8 +18,13 @@ mod reader;
 mod store;
 mod writer;
 
+pub use export::archive::{
+    ArchiveItem, ArchiveOptions, ArchiveReport, EntryInfo, ManifestMaker, Source, check_entry_name,
+    write_archive,
+};
 pub use export::{
-    MAX_NAME_BYTES, SaveError, SaveMode, Staging, check_name, save_copy, save_staged, save_to,
+    MAX_NAME_BYTES, SaveError, SaveMode, Staging, check_name, free_space, save_copy, save_staged,
+    save_to,
 };
 pub use format::{CHUNK_SIZE, HEADER_LEN, MAGIC, VERSION};
 pub use media::{MediaCache, MediaFile};

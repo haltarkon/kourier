@@ -28,6 +28,36 @@ pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long closing notifications and the tray may take at shutdown.
 pub const DESKTOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The core's configuration for a profile: `core.db` and `search.db` beside it, each under
+/// its own key of the keyring (`core_db_key`, `search_db_key`: different HKDF labels, so the
+/// file of one never opens with the key of the other; the core refuses to start with one key
+/// for both).
+pub(crate) fn core_config(
+    keyring: &AnyKeyring,
+    paths: &Paths,
+    registry: NetworkRegistry,
+    vault: Arc<AppVault>,
+    clock: Arc<dyn Clock>,
+    net_rt: tokio::runtime::Handle,
+) -> CoreConfig {
+    let mut cfg = CoreConfig::new(
+        paths.core_db(),
+        kourier_db::DbKey::from_bytes(*keyring.core_db_key()),
+        kourier_db::DbKey::from_bytes(*keyring.search_db_key()),
+        registry,
+        vault,
+        clock,
+        net_rt,
+    );
+    cfg.search_db = paths.search_db();
+    // Debug builds: the delay of the search backfill (`KOURIER_DEV_SEARCH_BACKFILL_MS`).
+    #[cfg(debug_assertions)]
+    if let Some(after) = crate::dev::search_backfill(|k| std::env::var_os(k)) {
+        cfg.timeouts.search_backfill = after;
+    }
+    cfg
+}
+
 /// How long the core may take to stop its accounts at shutdown before they are cancelled (R-Q1):
 /// the largest stop grace of the registered networks (what a network states in its descriptor,
 /// else the core's default of 5 s) plus [`CORE_SHUTDOWN_MARGIN`]. Signal alone: 10 s, as it
@@ -92,9 +122,13 @@ pub enum AppError {
 
 /// What [`App::start`] runs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "made once per start; the fixture options are a plain list of switches that grows with each fixture page"
+// Not under `perf`: its `PerfOptions` make the variants nearly as large as each other there.
+#[cfg_attr(
+    not(feature = "perf"),
+    expect(
+        clippy::large_enum_variant,
+        reason = "made once per start; the fixture options are a plain list of switches that grows with each fixture page"
+    )
 )]
 pub enum Launch {
     /// The user's profile with the compiled-in networks.
@@ -187,6 +221,29 @@ pub struct FixtureOptions {
     /// person, never verified (state Default), pauses her chat the same way
     /// ([`FixtureInfo::safety_default_conversation`]).
     pub safety_peer: bool,
+    /// With the showcase chats: one plain 1:1 chat (the lowest one no other page uses) is protected
+    /// on another device (S-P): its list row says "Protected chat" and offers no search in it
+    /// (G1i's `search_ui`). No chat is added; a fixture page leaves it off.
+    pub protected_chat: bool,
+    /// With the showcase chats: three read rows holding the search pages' word (`--page=searchresults`,
+    /// `searchchat`, `searchindexing`, G1j): two old English ones in the lowest plain 1:1 chat no other
+    /// page uses, and one in Hebrew a minute before the newest message of all, in that message's chat,
+    /// so it is among the first screen's hits (V5). No chat is added and every chat's newest message stays.
+    pub search_rows: bool,
+    /// With `search_rows`: the search index stops after its FIRST backfill batch (the pause between
+    /// two batches is an hour), so the page `searchindexing` shows the same percent every run; the
+    /// other search pages let the backfill run to its end at once (G1j).
+    pub search_filling: bool,
+    /// Three saved RegExp filters, saved through the core after the start (`--page=filters`,
+    /// `filteredit`, R2); every other run has none.
+    pub filters: bool,
+    /// The page `highlight` (R3): four synthetic filters that highlight (a text, a sender, a chat's
+    /// name) saved through the core after the start, and three rows in the chat the `chat` page
+    /// opens that the marks and the spoiler rule can be looked at on.
+    pub highlight: bool,
+    /// The core's export writer waits this long before each FILE entry of an archive (the window
+    /// test of Export Selected holds an export running with it; `None`: no wait).
+    pub export_pause: Option<Duration>,
     /// With the showcase chats: the last call of the chat with calls starts at the fixture's
     /// "now", rings for this long (at most [`FixtureOptions::RING`]) and then turns into a
     /// missed call; its chat is then the first of the list below the pinned ones
@@ -261,6 +318,10 @@ pub struct FixtureOptions {
     /// sets it. Only for [`FixtureNetwork::Fake`]; `false`: no Telegram in the off list, as
     /// before.
     pub telegram_off: bool,
+    /// Two 3D models (an STL and a coloured 3MF) are delivered at the end of the albums chat
+    /// (`--page=model3d`). PAGE-SCOPED: they move that chat in the list, so no other page sets it.
+    /// Only with the showcase chats; `false`: nothing is added, as before.
+    pub models: bool,
     /// The fixture's build cannot log in to Telegram for this reason ([`AppHandle::telegram_missing`]):
     /// Settings > Networks lists Telegram as "Not available in this build" without a switch,
     /// Add Account skips it, and the banner of every Telegram account says what is missing. A
@@ -468,6 +529,12 @@ impl Default for FixtureOptions {
             group_mentions: false,
             safety_changed: false,
             safety_peer: false,
+            protected_chat: false,
+            search_rows: false,
+            search_filling: false,
+            filters: false,
+            highlight: false,
+            export_pause: None,
             calls_ring_for: None,
             transfer: None,
             history_on_link: false,
@@ -483,6 +550,7 @@ impl Default for FixtureOptions {
             accounts: 0,
             window_sends: false,
             telegram_off: false,
+            models: false,
             telegram_missing: None,
             reject_changes: false,
         }
@@ -2050,9 +2118,8 @@ impl App {
         // An empty reference profile is seeded once the core runs.
         #[cfg(feature = "perf")]
         let perf_seed = setup.perf_seed.take();
-        let core_key = setup.keyring.core_db_key();
         let keyring = Arc::new(setup.keyring);
-        let vault = Arc::new(AppVault::new(keyring, setup.paths.clone()));
+        let vault = Arc::new(AppVault::new(keyring.clone(), setup.paths.clone()));
         // (A network of the off list is not on, whatever the registry holds: a fixture seeds
         // the account of a turned-off network through the fake, which is registered.)
         let networks: Vec<NetworkInfo> = network_info(&setup.registry)
@@ -2061,15 +2128,35 @@ impl App {
             .collect();
         let shutdown = CancellationToken::new();
         let core_timeout = core_shutdown_timeout(&setup.registry);
-        let mut cfg = CoreConfig::new(
-            setup.paths.core_db(),
-            kourier_db::DbKey::from_bytes(*core_key),
+        let mut cfg = core_config(
+            &keyring,
+            &setup.paths,
             setup.registry,
             vault,
             setup.clock.clone(),
             runtime.handle().clone(),
         );
         let expected_number_check = number_check_on(&setup.backend);
+        // The search pages (G1j): the backfill starts at once, and for `searchindexing` stops after
+        // its first batch, so the picture shows the same hits and percent every run. The other two
+        // wait for the whole index, so their backfill takes no pause between batches: with the live
+        // app's pause the fill of a debug build took 9-16 s at a load of 20-33 and ran past the
+        // page's own limit of 12 s at 46 (5 of 12 renders of the landing ci, 2026-11-12).
+        if let Launch::Fixture(f) = &opts.launch
+            && f.search_rows
+        {
+            cfg.timeouts.search_backfill = Duration::ZERO;
+            cfg.timeouts.search_pace = if f.search_filling {
+                Duration::from_secs(3600)
+            } else {
+                Duration::ZERO
+            };
+        }
+        if let Launch::Fixture(f) = &opts.launch
+            && let Some(pause) = f.export_pause
+        {
+            cfg.timeouts.export_entry_pause = pause;
+        }
         cfg.backend = setup.backend;
         // Plaintext playback copies live under $XDG_RUNTIME_DIR (tmpfs); the core uses its
         // `attachments/` subdirectory only (§5.8).
@@ -2077,6 +2164,20 @@ impl App {
         cfg.cancel = shutdown.child_token();
         let core = runtime.block_on(Core::start(cfg))?;
         let handle = core.handle();
+        if let Launch::Fixture(f) = &opts.launch
+            && f.filters
+        {
+            for spec in fixture_filters() {
+                let _ = handle.send(kourier_core::facade::UiCommand::SaveFilter { id: None, spec });
+            }
+        }
+        if let Launch::Fixture(f) = &opts.launch
+            && f.highlight
+        {
+            for spec in fixture_highlight_filters() {
+                let _ = handle.send(kourier_core::facade::UiCommand::SaveFilter { id: None, spec });
+            }
+        }
         #[cfg(feature = "fake")]
         let fixture = match (&opts.launch, &setup.fake) {
             (Launch::Fixture(f), Some(fake)) if !f.link => Some(runtime.block_on(seed_fixture(
@@ -2126,6 +2227,16 @@ impl App {
                 )?),
                 _ => None,
             };
+        // `--perf-filters`: the run's copy of the profile gets its filters before anything is
+        // measured.
+        #[cfg(feature = "perf")]
+        if let Launch::Perf(p) = &opts.launch
+            && p.filters > 0
+        {
+            let held = runtime.block_on(crate::perf::store_filters(&handle, p.filters))?;
+            // (A count: nothing of a pattern or a name is logged.)
+            tracing::info!(filters = held, "perf filters in the profile");
+        }
         crate::trace::mark_with_cpu("startup.app_started", &[]);
         tracing::info!(
             networks = networks.len(),
@@ -2307,6 +2418,82 @@ async fn normal_setup_in(
 }
 
 /// [`normal_setup_in`] of an unscripted start with the parts a test replaces ([`Seams`]).
+/// The three filters of the pages `filters` and `filteredit` (R2): synthetic, one that looks at
+/// the message text and notifies, one at a sender's name, one at a chat's name and the text with
+/// Match Case.
+fn fixture_filters() -> Vec<kourier_core::facade::FilterSpec> {
+    use kourier_core::facade::FilterSpec;
+    use kourier_model::Redacted;
+    let name = |s: &str| Redacted::new(s.to_owned());
+    vec![
+        FilterSpec {
+            name: name("Invoices"),
+            text_pattern: Some(name(r"\b(invoice|receipt)\b")),
+            notify: true,
+            highlight: true,
+            colour: 0xFF_D6_0A,
+            ..FilterSpec::default()
+        },
+        FilterSpec {
+            name: name("Work contacts"),
+            sender_pattern: Some(name("^(Alex|Sam)")),
+            highlight: true,
+            colour: 0xFF_9F_0A,
+            ..FilterSpec::default()
+        },
+        FilterSpec {
+            name: name("Release builds"),
+            text_pattern: Some(name(r"v\d+\.\d+")),
+            chat_pattern: Some(name("Team")),
+            match_case: true,
+            notify: true,
+            notify_muted: true,
+            colour: 0x1F_C8_B4,
+            ..FilterSpec::default()
+        },
+    ]
+}
+
+/// The filters of the page `highlight` (R3): synthetic, all highlighting. Words the generated
+/// chats say, the first names the generated people have, and the name of a generated group.
+fn fixture_highlight_filters() -> Vec<kourier_core::facade::FilterSpec> {
+    use kourier_core::facade::FilterSpec;
+    use kourier_model::Redacted;
+    let name = |s: &str| Redacted::new(s.to_owned());
+    vec![
+        FilterSpec {
+            name: name("Invoices"),
+            text_pattern: Some(name(r"\b(invoice|receipt)\b")),
+            highlight: true,
+            colour: 0xFF_D6_0A,
+            ..FilterSpec::default()
+        },
+        FilterSpec {
+            name: name("Garden talk"),
+            text_pattern: Some(name(r"\b(garden|tomatoes|soup)\b")),
+            highlight: true,
+            colour: 0x30_D1_58,
+            ..FilterSpec::default()
+        },
+        FilterSpec {
+            name: name("First names"),
+            sender_pattern: Some(name(
+                "^(Ari|Bex|Cato|Dima|Eno|Fenna|Gali|Hux|Ivo|Juno|Kel|Lio)",
+            )),
+            highlight: true,
+            colour: 0xFF_9F_0A,
+            ..FilterSpec::default()
+        },
+        FilterSpec {
+            name: name("Garden chats"),
+            chat_pattern: Some(name("Garden|Choir")),
+            highlight: true,
+            colour: 0xBF_5A_F2,
+            ..FilterSpec::default()
+        },
+    ]
+}
+
 #[cfg(test)]
 async fn normal_setup_with(
     paths: Paths,
@@ -2950,6 +3137,9 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
         if let Some(timer) = f.expiring {
             script = crate::fixture_media::with_expiring(script, timer);
         }
+        if f.models {
+            script = crate::fixture_media::with_models(script);
+        }
     }
     let mut seed_steps = None;
     let mut calls_peer = None;
@@ -3014,6 +3204,34 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
                     safety_peer.as_ref(),
                 ],
             );
+        }
+        // A protected chat (S-P): one more plain chat that no other page uses.
+        if f.protected_chat {
+            script = crate::fixture_media::with_protected_chat(
+                script,
+                &[
+                    calls_peer.as_ref(),
+                    unavailable_peer.as_ref(),
+                    person_peer.as_ref(),
+                    safety_peer.as_ref(),
+                    safety_default_peer.as_ref(),
+                ],
+            );
+        }
+        // The three old rows of the search pages (G1j).
+        if f.search_rows {
+            script = crate::fixture_media::with_search_rows(
+                script,
+                &[
+                    calls_peer.as_ref(),
+                    unavailable_peer.as_ref(),
+                    person_peer.as_ref(),
+                ],
+            );
+        }
+        // The three rows of the page `highlight` (R3).
+        if f.highlight {
+            script = crate::fixture_media::with_highlight_rows(script);
         }
         // The group of `--page=group`: a group other than the newest, after the person's
         // deltas (they are in its member count), no chat added.
@@ -3933,6 +4151,51 @@ mod missing_networks_tests {
                 "{missing:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod core_config_tests {
+    use std::ffi::OsString;
+    use std::sync::Arc;
+
+    use kourier_backend_api::{NetworkRegistry, SystemClock};
+
+    use super::core_config;
+    use crate::keys::{KdfParams, Keyring};
+    use crate::paths::{HOME_ENV, Paths, Profile};
+    use crate::vault::{AnyKeyring, AppVault};
+
+    /// The app's configuration of the core carries `search_db_key()` for search.db (and
+    /// `core_db_key()` for core.db): a refactor that drops the key or hands over the core's
+    /// own fails here (privacy P4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_core_config_carries_the_search_key_and_not_the_core_key() {
+        let home = tempfile::tempdir().expect("home");
+        let h = OsString::from(home.path());
+        let paths = Paths::from_env(Profile::default(), |k| (k == HOME_ENV).then(|| h.clone()))
+            .expect("paths");
+        let kdf = KdfParams {
+            m_kib: 64,
+            t: 1,
+            p: 1,
+        };
+        let (keyring, _) = Keyring::create_passphrase(b"test", kdf).expect("keyring");
+        let keyring = Arc::new(AnyKeyring::Passphrase(keyring));
+        let vault = Arc::new(AppVault::new(keyring.clone(), paths.clone()));
+        let cfg = core_config(
+            &keyring,
+            &paths,
+            NetworkRegistry::new(),
+            vault,
+            Arc::new(SystemClock),
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(cfg.search_key.as_bytes(), &*keyring.search_db_key());
+        assert_eq!(cfg.core_key.as_bytes(), &*keyring.core_db_key());
+        assert_ne!(cfg.search_key.as_bytes(), cfg.core_key.as_bytes());
+        assert_eq!(cfg.search_db, paths.search_db());
+        assert_eq!(cfg.core_db, paths.core_db());
     }
 }
 

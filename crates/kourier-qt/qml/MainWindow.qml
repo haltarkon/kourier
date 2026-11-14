@@ -20,6 +20,8 @@ Kirigami.ApplicationWindow {
     property real deactivatedAt: 0
     // A conversation to open once the start page is up (activation before App.loaded).
     property real pendingConversation: 0
+    // The message of that conversation to open at (0: none).
+    property real pendingMessage: 0
 
     // The window went to the tray (closed while a tray icon is shown).
     signal hiddenToTray()
@@ -87,6 +89,7 @@ Kirigami.ApplicationWindow {
         showsNotice: !root.wideScreen || App.timeline.conversationId === 0 || App.timeline.cannotSend !== ""
         searchKeys: root.searchKeys
         onOpenConversation: id => root.pickedChat(id)
+        onOpenSearchHit: (id, message) => root.pickedHit(id, message)
         onArchiveAsked: conv => root.archiveChat(conv)
         onUnarchiveAsked: conv => root.unarchiveChat(conv)
         onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
@@ -110,6 +113,7 @@ Kirigami.ApplicationWindow {
             onArchiveAsked: conv => root.archiveChat(conv)
             onUnarchiveAsked: conv => root.unarchiveChat(conv)
             onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
+            onSearchAsked: root.searchInChat()
         }
     }
     // The chat column of the first frame: the chat page's empty state without the chat page
@@ -329,8 +333,21 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // Opens chat `id`. ONE argument: the dev control calls it by that signature
+    // (`dev/exec.rs`, `invoke_qml_number`; `dev_control` `drives_the_fixture_ui`).
     function openConversation(id: real): void {
-        App.openConversation(id);
+        root.openChatAt(id, 0);
+    }
+
+    // Opens chat `id`; at `message` when one is given (a hit of the message search): the chat
+    // is then read around that message from the start, never its newest page first (which
+    // would mark the chat read, decisions B1), and the page stack does what any open does.
+    function openChatAt(id: real, message: real): void {
+        if (message !== 0) {
+            App.openSearchResult(id, message);
+        } else {
+            App.openConversation(id);
+        }
         root.chatPending = false;
         root.dropStandIn();
         // Keep the chat page when it already follows the list. Otherwise pop down to the list
@@ -350,10 +367,10 @@ Kirigami.ApplicationWindow {
     // notification): in a wide window the list stands beside a link page, and opening a
     // chat rebuilds the stack, which cancels a link waiting at its QR code. Never silently
     // (F3): `leavingLink` asks first when something would be lost, and acts at once
-    // otherwise. `then` runs after the chat is open.
-    function openingChat(id: real, then: var): void {
+    // otherwise. `then` runs after the chat is open; `message` (a search hit) is where it opens.
+    function openingChat(id: real, then: var, message = 0): void {
         root.leavingLink(() => {
-            root.openConversation(id);
+            root.openChatAt(id, message);
             if (then) {
                 then();
             }
@@ -368,15 +385,25 @@ Kirigami.ApplicationWindow {
         root.openingChat(id, () => App.revealChat(id));
     }
 
+    // A hit of the message search was picked: its chat opens at the message and the list stays
+    // as it is, as for a notification (decisions M4): no archive view, the search and its hits
+    // stay.
+    function pickedHit(id: real, message: real): void {
+        root.openingChat(id, null, message);
+    }
+
     // A notification click or a link: open `id` now, or once the start page is up.
-    function openFromActivation(id: real): void {
+    // `message` (not 0): the chat opens at it with the flash, the way a search hit opens
+    // (`openingChat`), the list and its search stay as they are.
+    function openFromActivation(id: real, message = 0): void {
         if (id <= 0) {
             return;
         }
         if (root.started && App.hasAccounts) {
-            root.openingChat(id, null);
+            root.openingChat(id, null, message);
         } else {
             root.pendingConversation = id;
+            root.pendingMessage = message;
         }
     }
 
@@ -545,8 +572,10 @@ Kirigami.ApplicationWindow {
         root.showListWith(!showsChat && root.pendingConversation <= 0);
         if (root.pendingConversation > 0) {
             const id = root.pendingConversation;
+            const message = root.pendingMessage;
             root.pendingConversation = 0;
-            root.openConversation(id);
+            root.pendingMessage = 0;
+            root.openChatAt(id, message);
             return;
         }
         if (showsChat) {
@@ -567,7 +596,7 @@ Kirigami.ApplicationWindow {
             App.settings.compact = true;
         } else if (page === "settings") {
             root.openSettings();
-        } else if (page === "expiry" || page === "networks") {
+        } else if (page === "expiry" || page === "networks" || page === "appearance" || page === "filters" || page === "filteredit") {
             // The settings page at "Disappearing messages" or at "Networks", once the core has
             // said what holds.
             root.openSettings();
@@ -586,6 +615,9 @@ Kirigami.ApplicationWindow {
         } else if (page === "archive") {
             // The list at "Archived Chats", once it says there is one.
             archiveSetup.start();
+        } else if (root.searchPages.indexOf(page) >= 0) {
+            // The chat list with a word typed into its search field (G1j).
+            pageSetup.start();
         } else if (root.rowMenuPages.indexOf(page) >= 0) {
             // The chat list with the menu of one row open (the real path of a right click).
             pageSetup.start();
@@ -667,6 +699,18 @@ Kirigami.ApplicationWindow {
         listPage.focusSearch();
     }
 
+    // Search in the open chat only (G1i): the same as `focusSearch`, with the chat's chip in the
+    // field. A chat that is not open, or is protected (it offers no search), does nothing.
+    function searchInChat(): void {
+        if (App.timeline.conversationId === 0 || !App.timeline.chatSearchable) {
+            return;
+        }
+        if (pageStack.depth > 0 && pageStack.get(0) === listPage) {
+            pageStack.currentIndex = 0;
+        }
+        listPage.searchInChat();
+    }
+
     // Opens the chat `step` rows below (or above) the open one in the list as it is
     // shown; the ends do not wrap.
     function stepConversation(step: int): void {
@@ -706,6 +750,13 @@ Kirigami.ApplicationWindow {
         sequences: ["Ctrl+K", StandardKey.Find]
         enabled: root.keysActive
         onActivated: root.focusSearch()
+    }
+    // Search in the open chat only: a chat page is up and the chat is not protected.
+    Shortcut {
+        id: chatSearchKey
+        sequences: ["Ctrl+Shift+F"]
+        enabled: root.keysActive && root.chatKeys && App.timeline.chatSearchable
+        onActivated: root.searchInChat()
     }
     Shortcut {
         sequences: ["Alt+Down", "Ctrl+PgDown", "Ctrl+Tab"]
@@ -988,20 +1039,29 @@ Kirigami.ApplicationWindow {
 
             property real attachment: 0
             property string name: ""
+            // Open in Slicer: the slicer's table id ("other" = the desktop's chooser, "" = the
+            // default application) and its name.
+            property string slicerId: ""
+            property string slicerName: ""
+            readonly property bool inSlicer: confirm.slicerId !== "" && confirm.slicerId !== "other"
             // The subtitle label guesses its format (AutoText) and the name comes from the
             // sender: a name such as `<img src="https://…">` would be markup that loads things.
             // Escape it and make the text rich on purpose, so it shows exactly as named.
             readonly property string escapedName: confirm.name.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
             title: L10n.i18nc("@title:dialog", "Open This File?")
-            subtitle: "<p>" + L10n.i18nc("@info", "“%1” opens in another application. Files can be harmful: open only what you expect from this sender.", confirm.escapedName) + "</p>"
+            subtitle: confirm.inSlicer ? "<p>" + L10n.i18nc("@info, %1 a file name, %2 the name of a slicer program", "“%1” opens in %2. Files can be harmful: open only what you expect from this sender.", confirm.escapedName, confirm.slicerName) + "</p>" : "<p>" + L10n.i18nc("@info", "“%1” opens in another application. Files can be harmful: open only what you expect from this sender.", confirm.escapedName) + "</p>"
             standardButtons: Kirigami.Dialog.NoButton
             customFooterActions: [
                 Kirigami.Action {
                     text: L10n.i18nc("@action:button", "Open")
                     icon.name: "document-open"
                     onTriggered: {
-                        App.openExternally(confirm.attachment);
+                        if (confirm.slicerId === "") {
+                            App.openExternally(confirm.attachment);
+                        } else {
+                            App.openInSlicer(confirm.attachment, confirm.slicerId);
+                        }
                         confirm.close();
                     }
                 },
@@ -1044,6 +1104,72 @@ Kirigami.ApplicationWindow {
         viewer?.open();
         root.imageViewer = viewer;
         root.viewersOpened += 1;
+        return viewer;
+    }
+
+    // The 3D viewer that was opened last, and how many were opened (tests).
+    property var modelViewer: null
+    property int modelViewersOpened: 0
+    // Whether Quick 3D can draw: the software Quick backend (the shots, the window tests, a machine
+    // without a GPU) cannot, and the model's still is shown instead. Read from an item of the window.
+    readonly property bool software: graphicsProbe.GraphicsInfo.api === GraphicsInfo.Software
+    Item {
+        id: graphicsProbe
+        visible: false
+    }
+
+    // The question before a 3D model goes to a slicer (or to the desktop's chooser): the same
+    // "Open This File?" as any file, with the slicer named.
+    function askOpenInSlicer(attachment: real, name: string, slicerId: string): void {
+        let slicerName = "";
+        for (const row of JSON.parse(App.slicers)) {
+            if (row.id === slicerId) {
+                slicerName = row.name;
+            }
+        }
+        const dialog = confirmOpenComponent.createObject(root, {
+            "attachment": attachment,
+            "name": name,
+            "slicerId": slicerId,
+            "slicerName": slicerName
+        }) as Kirigami.PromptDialog;
+        root.slicerAsk = dialog;
+        dialog?.open();
+    }
+    // The question "Open This File?" of the last Open in Slicer (null once it is gone; window tests).
+    property var slicerAsk: null
+
+    // Opens the 3D viewer on the model `attachment`. Quick 3D is loaded HERE, by its file name, on
+    // the first open: neither the module nor the viewer exists before (§1.3: idle memory). On the
+    // software backend the small still viewer opens instead and Quick 3D stays unloaded.
+    function openModelViewer(attachment: real, name: string, save: bool, tint: bool): var {
+        if (root.modelViewer !== null && root.modelViewer.visible) {
+            root.modelViewer.close();
+        }
+        const file = root.software ? "dialogs/Model3dStill.qml" : "dialogs/Model3dViewer.qml";
+        const component = Qt.createComponent(Qt.resolvedUrl(file));
+        if (component.status !== Component.Ready) {
+            console.warn("the 3D viewer could not be loaded: " + component.errorString());
+            return null;
+        }
+        const viewer = component.createObject(root, {
+            "attachment": attachment,
+            "name": name,
+            "saveOffered": save,
+            "tint": tint
+        });
+        if (viewer === null) {
+            return null;
+        }
+        viewer.closed.connect(() => {
+            if (root.modelViewer === viewer) {
+                root.modelViewer = null;
+            }
+            viewer.destroy();
+        });
+        viewer.open();
+        root.modelViewer = viewer;
+        root.modelViewersOpened += 1;
         return viewer;
     }
 
@@ -1092,6 +1218,12 @@ Kirigami.ApplicationWindow {
                 }
             }
         }
+        function onModelRequested(attachment: real, name: string, save: bool, tint: bool): void {
+            root.openModelViewer(attachment, name, save, tint);
+        }
+        function onSlicerRequested(attachment: real, name: string, slicerId: string): void {
+            root.askOpenInSlicer(attachment, name, slicerId);
+        }
         function onOpenRequested(attachment: real, name: string, media: bool): void {
             if (media) {
                 App.openExternally(attachment);
@@ -1111,6 +1243,15 @@ Kirigami.ApplicationWindow {
         function onCopyTold(text: string): void {
             root.showPassiveNotification(Style.plain(text), "short");
             root.Accessible.announce(text, Accessible.Polite);
+        }
+    }
+
+    // A slicer was started with the copy: it is the one the main button of the viewer starts next
+    // ("Other Application…" is never remembered, and a refused or failed start writes nothing).
+    Connections {
+        target: App
+        function onSlicerStarted(attachment: real, id: string): void {
+            App.settings.modelSlicer = id;
         }
     }
 
@@ -1162,6 +1303,13 @@ Kirigami.ApplicationWindow {
         Accessible.name: root.noticeText
     }
 
+    // The progress of a running export and its Cancel (Export Selected): the window's own
+    // footer, so a chat switch neither hides it nor lets another chat's bar cancel it. Shown
+    // only while `App.exportBusy`.
+    footer: ExportStrip {
+        id: exportStrip
+    }
+
     // Save As… and Save All… (F3b): the dialog is made on first use, from the file that
     // `App.saveDialogSource()` names (empty: the built-in one), so the dialogs module is not loaded
     // by the start. One attachment asks Rust for the name it is offered under (`App.askSave`), then
@@ -1179,17 +1327,64 @@ Kirigami.ApplicationWindow {
         target: saveDialogLoader.item
         ignoreUnknownSignals: true
         function onPicked(chosen: url): void {
+            // The save dialog of an export answers the export, not a save of attachments.
+            if (root.exportSaving !== null && root.exportSaving === saveDialogLoader.item) {
+                root.exportSaved = true;
+                App.exportPicked(chosen);
+                return;
+            }
             root.savePicked(root.saveDialog.attachments, chosen);
         }
         function onClosed(): void {
             // Only the dialog that closed goes: another Save may have made a new one by the time
             // the call runs.
             const closed = saveDialogLoader.item;
+            if (root.exportSaving !== null && root.exportSaving === closed) {
+                root.exportSaving = null;
+                if (!root.exportSaved) {
+                    App.exportAbandon();
+                }
+            }
             Qt.callLater(() => {
                 if (saveDialogLoader.item === closed) {
                     saveDialogLoader.source = "";
                 }
             });
+        }
+    }
+
+    // Any other way the export's save dialog goes (its item replaced or cleared without its
+    // `closed`): the export's plan is dropped, so Export Selected… never stays dead.
+    Connections {
+        target: saveDialogLoader
+        function onItemChanged(): void {
+            if (root.exportSaving !== null && saveDialogLoader.item !== root.exportSaving) {
+                root.exportSaving = null;
+                if (!root.exportSaved) {
+                    App.exportAbandon();
+                }
+            }
+        }
+    }
+
+    // The save dialog an export opened (null while none stands) and whether it answered: a close
+    // with no answer drops the export's plan.
+    property var exportSaving: null
+    property bool exportSaved: false
+    // The export dialog, loaded by URL the first time a plan comes and kept (one instance).
+    property var exportDialog: null
+    function openExportDialog(json: string): void {
+        if (root.exportDialog === null) {
+            const component = Qt.createComponent(Qt.resolvedUrl("dialogs/ExportDialog.qml"));
+            if (component.status !== Component.Ready) {
+                console.error("ExportDialog: " + component.errorString());
+                App.exportAbandon();
+                return;
+            }
+            root.exportDialog = component.createObject(root);
+        }
+        if (root.exportDialog !== null) {
+            root.exportDialog.show(json);
         }
     }
 
@@ -1206,6 +1401,11 @@ Kirigami.ApplicationWindow {
 
     function startSave(attachments: var): void {
         if (!attachments || attachments.length === 0) {
+            return;
+        }
+        // The export's save dialog stands: a second dialog would replace it without its `closed`.
+        if (root.exportSaving !== null) {
+            root.notify(L10n.i18nc("@info:status", "Finish or cancel the export first."), "", null);
             return;
         }
         root.saveWanted = attachments;
@@ -1292,6 +1492,40 @@ Kirigami.ApplicationWindow {
                     "suggested": url,
                     "attachments": root.saveWanted
                 });
+            }
+        }
+        // Export Selected: the plan is here, the dialog opens (loaded by URL on first use).
+        function onExportDialogReady(json: string): void {
+            root.openExportDialog(json);
+        }
+        // Export Selected: the dialog's Export… was pressed; the save dialog starts at the
+        // folder and name Rust built. Its answer goes to `App.exportPicked` (`attachments` is
+        // empty: no attachment is saved).
+        function onExportSaveReady(url: string): void {
+            // Another save dialog stands: it is not replaced, the export is dropped.
+            if (saveDialogLoader.item !== null) {
+                root.notify(L10n.i18nc("@info:status", "Close the other save dialog first."), "", null);
+                App.exportAbandon();
+                return;
+            }
+            root.exportSaved = false;
+            root.openSaveDialog({
+                "folder": false,
+                "suggested": url,
+                "attachments": []
+            });
+            root.exportSaving = saveDialogLoader.item;
+        }
+        // Export Selected ended (or was refused): the notice, with "Show in Folder" after a
+        // written archive; a finished export ends the selection and the composer comes back.
+        function onExportFinished(text: string, url: string, selectionEnds: bool): void {
+            if (url !== "") {
+                root.notify(text, L10n.i18nc("@action:button", "Show in Folder"), () => App.showInFolder(url));
+            } else {
+                root.notify(text, "", null);
+            }
+            if (selectionEnds) {
+                App.timeline.selectClear();
             }
         }
         // The folder is here: the folder dialog of "Save All…" starts there.
@@ -1768,8 +2002,8 @@ Kirigami.ApplicationWindow {
 
     // The fixture pages of the message actions: each opens a chat (`App` does that) and, for
     // `setupPages`, one of its popups or composer modes once the rows are there.
-    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin"]
-    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media", "rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin"]
+    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "viewerzoom", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchchat", "emojipicker", "emojisearch", "hoverpins", "highlight", "model3d", "model3dviewer", "select", "exportdialog", "exportdone"]
+    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "viewerzoom", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "appearance", "filters", "filteredit", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media", "rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchresults", "searchchat", "searchindexing", "emojipicker", "emojisearch", "hoverpins", "highlight", "regexsearch", "model3d", "model3dviewer", "select", "exportdialog", "exportdone"]
     // The fixture pages of blended chats: no chat opens, the list stands with its accounts.
     readonly property list<string> accountsPages: ["accounts", "accountsdrawer"]
     // The fixture pages of the chat list's own menus (A10d): no chat opens; `rowMenuPageReady` opens the
@@ -1777,9 +2011,22 @@ Kirigami.ApplicationWindow {
     readonly property list<string> rowMenuPages: ["rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu"]
     // How far that page has come (0: nothing done yet) and the chat it stands on.
     property int rowMenuStage: 0
+    // The `select` page picked its rows.
+    property bool selectPicked: false
+    property bool exportShown: false
     // The page `chatmenuoff` asked for the switch off (once).
     property bool chatMenuOffAsked: false
     property real rowMenuChat: 0
+    // The fixture pages of the message search (G1j): `searchresults` and `searchindexing` type the word
+    // into the list's field (no chat opens); `searchchat` opens the busiest chat and starts the
+    // one-chat search there. The word is one of the fixture's own (a group's name holds it too).
+    readonly property list<string> searchPages: ["searchresults", "searchindexing", "searchchat", "regexsearch"]
+    readonly property string searchPageWord: "garden"
+    // `regexsearch` (R5): the `.*` toggle is on and the pattern typed matches the same word.
+    readonly property string regexPageWord: "\\bgard\\w+"
+    property int searchPageStage: 0
+    // `searchresults` and `searchchat`: the word was typed again once the index was whole.
+    property bool searchPageFresh: false
     // The fixture pages of a link in a state of a history transfer, with that state.
     readonly property list<string> transferLinkPages: ["transferwait", "transferdownload", "transferread"]
     readonly property list<string> transferPages: ["transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "wahistory", "walost"]
@@ -1840,6 +2087,7 @@ Kirigami.ApplicationWindow {
     Timer {
         id: expirySetup
         property int tries: 0
+        property bool dialogShown: false
         interval: 150
         repeat: true
         onTriggered: {
@@ -1852,8 +2100,26 @@ Kirigami.ApplicationWindow {
             if (root.settingsPage === null || App.settings.expiryPolicy === "") {
                 return;
             }
-            if (App.startPage === "networks") {
+            // The filter pages wait for the core's list too.
+            if ((App.startPage === "filters" || App.startPage === "filteredit") && !App.filters.loaded) {
+                return;
+            }
+            if (App.startPage === "filters" || App.startPage === "filteredit") {
+                root.settingsPage.showFilters();
+                if (App.startPage === "filteredit") {
+                    if (expirySetup.dialogShown !== true) {
+                        expirySetup.dialogShown = true;
+                        root.settingsPage.showFilterDialog();
+                        return;
+                    }
+                    if (!root.settingsPage.filterDialogOpened()) {
+                        return;
+                    }
+                }
+            } else if (App.startPage === "networks") {
                 root.settingsPage.showNetworks();
+            } else if (App.startPage === "appearance") {
+                root.settingsPage.showAppearance();
             } else {
                 root.settingsPage.showExpiry();
             }
@@ -2080,6 +2346,65 @@ Kirigami.ApplicationWindow {
         return true;
     }
 
+    // The pages `searchresults` and `searchindexing`: the word typed into the list's own field (so the
+    // field's own delay and the App's own search run), then the wait for what the page shows: the
+    // hits answered and, for `searchresults`, the index ready; for `searchindexing` its line
+    // standing under the header. The first hit row then holds the keyboard (its frame).
+    function searchPageReady(): bool {
+        const indexing = App.startPage === "searchindexing";
+        const inChat = App.startPage === "searchchat";
+        if (!listPage.rowsShown) {
+            return false;
+        }
+        if (root.searchPageStage === 0) {
+            // `regexsearch`: the toggle first (what the person clicks), then the pattern is typed.
+            if (App.startPage === "regexsearch") {
+                listPage.regexOn = true;
+                listPage.modeChanged();
+            }
+            // `searchchat`: the busiest chat is open (the App opened it); the chip names it.
+            if (inChat) {
+                if (App.timeline.chatSearchable !== true) {
+                    return false;
+                }
+                root.searchInChat();
+            }
+            root.searchPageStage = 1;
+            return false;
+        }
+        const r = App.searchResults;
+        if (root.searchPageStage === 1) {
+            // (After a clear: once the search has ended, so the field's text is a new search.)
+            if (r.active) {
+                return false;
+            }
+            listPage.searchField.text = App.startPage === "regexsearch" ? root.regexPageWord : root.searchPageWord;
+            root.searchPageStage = 2;
+            return false;
+        }
+        if (!r.active || !r.answered || r.loading || r.count === 0 || !listPage.hitsShown || r.indexReady === indexing || (inChat && r.chat !== listPage.searchChat)) {
+            return false;
+        }
+        // `searchresults` and `searchchat`: the word once more, now that the index is whole. How
+        // many hits the first search ends with depends on how far the index had come when it was
+        // answered (pages chained while it filled are read again whole once it is ready), and in a
+        // render where the index won the race the list held one page: the scroll bar's thumb
+        // differed (1 render in 3 under load, 2026-11-12). A search of a whole index answers one
+        // page, every time. The field is emptied (the search ends at once), then typed again.
+        if (!indexing && !root.searchPageFresh) {
+            root.searchPageFresh = true;
+            listPage.searchField.text = "";
+            root.searchPageStage = 1;
+            return false;
+        }
+        // (A few quiet ticks after the hits came: the rows settle before the first one takes the keyboard.)
+        if (root.searchPageStage < 8) {
+            root.searchPageStage += 1;
+            return false;
+        }
+        return listPage.focusHit(0);
+    }
+
     // The chat page's overflow menu: the shown toolbar button that holds actions (found as
     // `handleIn` finds the drawer's button; every toolbar button has a `menuActions` list, the
     // timer's is empty), its menu in the window's scene, opened. True once it is open.
@@ -2146,6 +2471,7 @@ Kirigami.ApplicationWindow {
     Timer {
         id: pageSetup
         property int tries: 0
+        property int settled: 0
         interval: 150
         repeat: true
         onTriggered: {
@@ -2169,6 +2495,14 @@ Kirigami.ApplicationWindow {
             // The pages of the list's own menus need no chat either.
             if (root.rowMenuPages.indexOf(App.startPage) >= 0) {
                 if (root.rowMenuPageReady()) {
+                    pageSetup.stop();
+                    root.pageReady = true;
+                }
+                return;
+            }
+            // The pages of the message search type into the list's field: no chat opens.
+            if (root.searchPages.indexOf(App.startPage) >= 0) {
+                if (root.searchPageReady()) {
                     pageSetup.stop();
                     root.pageReady = true;
                 }
@@ -2199,6 +2533,29 @@ Kirigami.ApplicationWindow {
             case "reactions":
                 done = view.reactionsFor(App.findMessage("reacted"));
                 break;
+            case "hoverpins":
+                done = view.toolbarFor(App.findMessage("photo"));
+                break;
+            case "highlight":
+                // The four filters are saved and listed; the rows were marked in the same change
+                // that listed them (the viewmodel re-reads the timeline with it).
+                pageSetup.settled += 1;
+                done = App.filters.loaded && App.filters.count === 4 && pageSetup.settled > 6;
+                break;
+            case "emojipicker":
+            case "emojisearch":
+                // Some use and a star, so the Favorites tab has both of its parts (the lists are the
+                // fixture's own: nothing of anyone's).
+                if (App.emojiLists.recent.length === 0) {
+                    for (const e of ["😀", "🎉", "🙏", "🔥", "👀", "🚀", "☕", "🌈"]) {
+                        App.emojiLists.used(e);
+                    }
+                    for (const e of ["🐶", "🍕", "🎸"]) {
+                        App.emojiLists.toggleFavourite(e);
+                    }
+                }
+                chatPage.composer.toggleEmoji(App.startPage === "emojisearch" ? "heart" : "");
+                break;
             case "delete":
                 done = view.deleteFor(App.findMessage("deletable"));
                 break;
@@ -2222,10 +2579,45 @@ Kirigami.ApplicationWindow {
                 // Every picture of the albums on screen is downloaded.
                 done = view.albumsShown();
                 break;
+            case "model3d":
+                // The albums chat, with the two models' stills derived and shown.
+                done = view.albumsShown();
+                break;
+            case "model3dviewer":
+                // The 3D viewer open on the coloured 3MF: the still fallback under the software
+                // backend (the shots), the real scene under GL (a run on the PC also saves its
+                // turned, zoomed and panned pictures: `modelScript`).
+                done = root.model3dPageReady(view);
+                break;
             case "albumviewer":
                 // The newest album, at its second picture, once its tiles are downloaded.
                 done = view.albumFor(App.findMessage("album"), 1);
                 break;
+            case "viewerzoom": {
+                // The media chat's photo in the viewer (with its dimensions: the zoom levels need the natural
+                // size), zoomed to 200 % around the viewport's centre; done once the zoomed decode is drawn.
+                // The photo is 640 x 480: the wide window's Fit already shows it above its natural size,
+                // so the viewer asks no zoomed decode there (`sharpAsked` stays false) and `still` is it.
+                const photo = App.findMessage("photo");
+                const shown = root.imageViewer;
+                if (photo <= 0) {
+                    done = false;
+                } else if (root.viewersOpened === 0) {
+                    const items = App.viewerItems(photo);
+                    if (items.length > 0 && items[0].url !== "" && items[0].state === "local") {
+                        root.openAlbumViewer(items, 0, photo);
+                    }
+                    done = false;
+                } else if (shown === null || !shown.opened || !shown.shown || shown.fitW <= 0) {
+                    done = false;
+                } else if (shown.fitted) {
+                    shown.zoomLevel(200);
+                    done = false;
+                } else {
+                    done = shown.zoomPercent === 200 && (shown.sharpReady || !shown.sharpAsked);
+                }
+                break;
+            }
             case "files":
             case "originals":
                 // The core has looked at the files: the list says how they will be sent.
@@ -2309,6 +2701,97 @@ Kirigami.ApplicationWindow {
                 break;
             case "deleteattachment":
                 done = view.albumsShown() && view.attachmentFor(App.findMessage("removable"));
+                break;
+            case "select":
+            case "exportdialog":
+                // The media chat in the selection mode: the newest picture, file, text and notice
+                // are picked (what the chat has), the bar stands in the composer's place.
+                if (!root.selectPicked) {
+                    const list = view.rowList;
+                    const picks = {
+                        "image": 0,
+                        "file": 0,
+                        "text": 0,
+                        "notice": 0
+                    };
+                    for (let i = 0; i < list.count; ++i) {
+                        const item = list.itemAtIndex(i);
+                        const message = item as MessageDelegate;
+                        const id = message?.messageId ?? (item as SystemRow)?.messageId ?? 0;
+                        if (!(id > 0)) {
+                            continue;
+                        }
+                        if (message === null) {
+                            picks.notice = picks.notice || id;
+                            continue;
+                        }
+                        for (const b of message.blocks) {
+                            if (b.type === "image" || b.type === "album") {
+                                picks.image = picks.image || id;
+                            } else if (b.type === "file") {
+                                picks.file = picks.file || id;
+                            } else if (b.type === "text") {
+                                picks.text = picks.text || id;
+                            }
+                        }
+                    }
+                    const ids = [picks.image, picks.file, picks.notice, picks.text].filter(id => id > 0);
+                    if (ids.length >= 2 && picks.image > 0) {
+                        App.timeline.selectStart(ids[0]);
+                        for (let i = 1; i < ids.length && i < 3; ++i) {
+                            App.timeline.selectToggle(ids[i]);
+                        }
+                        root.selectPicked = true;
+                    }
+                    done = false;
+                } else if (App.startPage === "exportdialog") {
+                    // The export dialog over the selection. The media chat holds no video, no
+                    // disappearing and no view-once message, so the numbers are made up
+                    // (`MainWindow.exportDialog.show`, what the plan's answer calls): every kind
+                    // line, the disappearing tick with its warning and the left-out lines. No plan
+                    // stands, so `App.exportNumbers` answers "" and the dialog keeps these.
+                    if (App.timeline.selecting && App.timeline.selectedCount >= 2) {
+                        if (!root.exportShown) {
+                            root.exportShown = true;
+                            root.openExportDialog(JSON.stringify({
+                                "messages": 12,
+                                "disappearing": 2,
+                                "viewOnce": 1,
+                                "gone": 0,
+                                "pictures": {
+                                    "count": 5,
+                                    "bytes": 6710886,
+                                    "size": "6.4 MB"
+                                },
+                                "videos": {
+                                    "count": 1,
+                                    "bytes": 48234496,
+                                    "size": "46 MB"
+                                },
+                                "other": {
+                                    "count": 2,
+                                    "bytes": 183500,
+                                    "size": "179 kB"
+                                },
+                                "totalSize": "52.6 MB",
+                                "notHere": 1
+                            }));
+                        }
+                        done = root.exportDialog !== null && root.exportDialog.opened;
+                    } else {
+                        done = false;
+                    }
+                } else {
+                    done = App.timeline.selecting && App.timeline.selectedCount >= 2;
+                }
+                break;
+            case "exportdone":
+                // The notice a written archive ends with, without a real export (the words are
+                // `flow::end_of`'s for three messages, with the same contexts).
+                if (root.noticeCount === 0) {
+                    root.notify(L10n.i18ncp("@info:status, %1 how many messages were exported", "Exported %1 message", "Exported %1 messages", 3), L10n.i18nc("@action:button", "Show in Folder"), () => {});
+                }
+                done = root.noticeCount > 0;
                 break;
             case "save":
                 // The menu of an album message whose pictures are downloaded: "Save All…" beside the
@@ -2465,6 +2948,208 @@ Kirigami.ApplicationWindow {
             if (App.conversations.count > 0) {
                 archiveSetup.stop();
                 root.pageReady = true;
+            }
+        }
+    }
+
+    // `--page=model3dviewer`: opens the 3D viewer on a model of the albums chat by a tap on its
+    // bubble (the real path), then, under GL only, walks the viewer through its states and saves a
+    // picture per state beside the screenshot (`<name>-<state>.png`); the page is ready after.
+    property bool modelPageDone: false
+    property int modelStep: 0
+    property int modelWait: 0
+    readonly property string modelBase: App.screenshot.replace(/\.png$/, "")
+    function openModelOf(view: var, which: string): bool {
+        const delegate = view.delegateFor(App.findMessage(which));
+        return delegate !== null && delegate.activateMedia();
+    }
+    function model3dPageReady(view: var): bool {
+        if (root.modelPageDone) {
+            return true;
+        }
+        if (root.software) {
+            if (root.modelViewer === null) {
+                root.openModelOf(view, "3mf");
+                return false;
+            }
+            root.modelPageDone = root.modelViewer.opened;
+            return root.modelPageDone;
+        }
+        if (!modelScript.running) {
+            modelScript.start();
+        }
+        // (The walk takes longer than the setup's 80 tries.)
+        pageSetup.tries = 0;
+        return false;
+    }
+    // One step per tick: [what to do, picture name or ""]. A picture is taken a few ticks after the
+    // state was set (llvmpipe needs the frames).
+    Timer {
+        id: modelScript
+        interval: 400
+        repeat: true
+        property int lastStep: -1
+        function shot(name: string, ticks: int): bool {
+            root.modelWait += 1;
+            if (root.modelWait < ticks) {
+                return false;
+            }
+            root.modelWait = 0;
+            App.saveScreenshot(root, root.modelBase + "-" + name + ".png");
+            return true;
+        }
+        function openOn(which: string): bool {
+            const v = root.modelViewer;
+            if (v === null) {
+                root.openModelOf(chatTimeline(), which);
+                return false;
+            }
+            return v.opened && v.meshData.ready;
+        }
+        function chatTimeline(): var {
+            return root.ensureChat().timeline;
+        }
+        onTriggered: {
+            const v = root.modelViewer;
+            const sphere = App.findMessage("sphere") !== 0;
+            const aspect = v ? v.width / Math.max(1, v.height - 60) : 1;
+            if (root.modelStep !== modelScript.lastStep) {
+                modelScript.lastStep = root.modelStep;
+                console.warn("model3d walk: step " + root.modelStep);
+            }
+            switch (root.modelStep) {
+            case 0:
+                // (A file still waiting for its derive: the debug sphere of ~100 k triangles.)
+                if (!sphere && App.findMessage("file") !== 0 && root.modelWait < 120) {
+                    root.modelWait += 1;
+                    break;
+                }
+                if (modelScript.openOn(sphere ? "sphere" : "stl")) {
+                    root.modelStep = 1;
+                    root.modelWait = 0;
+                }
+                break;
+            case 1:
+                if (modelScript.shot(sphere ? "sphere-solid" : "fit-stl", sphere ? 10 : 6)) {
+                    if (sphere) {
+                        v.wireframe = true;
+                        root.modelStep = 20;
+                    } else {
+                        v.close();
+                        root.modelStep = 2;
+                    }
+                }
+                break;
+            case 2:
+                if (modelScript.openOn("3mf")) {
+                    root.modelStep = 3;
+                    root.modelWait = 0;
+                }
+                break;
+            case 3:
+                if (modelScript.shot("fit-3mf", 6)) {
+                    v.rotate(120, -40);
+                    root.modelStep = 4;
+                }
+                break;
+            case 4:
+                if (modelScript.shot("turned", 4)) {
+                    v.fit();
+                    v.zoom(500, 0.5, 0.4, aspect);
+                    root.modelStep = 5;
+                }
+                break;
+            case 5:
+                if (modelScript.shot("zoomed", 4)) {
+                    v.fit();
+                    v.pan(120, -70, v.height - 60);
+                    root.modelStep = 6;
+                }
+                break;
+            case 6:
+                if (modelScript.shot("panned", 4)) {
+                    v.showView("front");
+                    root.modelStep = 7;
+                }
+                break;
+            case 7:
+                if (modelScript.shot("view-front", 4)) {
+                    v.showView("top");
+                    root.modelStep = 8;
+                }
+                break;
+            case 8:
+                if (modelScript.shot("view-top", 4)) {
+                    v.showView("right");
+                    root.modelStep = 9;
+                }
+                break;
+            case 9:
+                if (modelScript.shot("view-right", 4)) {
+                    v.fit();
+                    v.setFreeRotation(true);
+                    v.rotate(150, 90);
+                    root.modelStep = 10;
+                }
+                break;
+            case 10:
+                if (modelScript.shot("free", 4)) {
+                    v.setFreeRotation(false);
+                    v.wireframe = true;
+                    v.fit();
+                    root.modelStep = 11;
+                }
+                break;
+            case 11:
+                if (modelScript.shot("wire-3mf", 5)) {
+                    v.wireframe = false;
+                    v.fit();
+                    // The Bambu A1's box (256 x 256 x 256) around the coloured 3MF.
+                    App.settings.modelBox = "256x256x256";
+                    root.modelStep = 12;
+                }
+                break;
+            case 12:
+                if (modelScript.shot("box-3mf", 6)) {
+                    // The A1 mini's smaller box, from the front: where the model gets out shows.
+                    App.settings.modelBox = "180x180x180";
+                    v.showView("front");
+                    root.modelStep = 13;
+                }
+                break;
+            case 13:
+                if (modelScript.shot("box-3mf-mini-front", 6)) {
+                    App.settings.modelBox = "";
+                    v.fit();
+                    root.modelStep = 30;
+                }
+                break;
+            case 20:
+                if (modelScript.shot("sphere-wire", 10)) {
+                    v.zoom(700, 0, 0, aspect);
+                    root.modelStep = 21;
+                }
+                break;
+            case 21:
+                if (modelScript.shot("sphere-wire-zoom", 10)) {
+                    v.wireframe = false;
+                    v.fit();
+                    App.settings.modelBox = "256x256x256";
+                    root.modelStep = 22;
+                }
+                break;
+            case 22:
+                if (modelScript.shot("box-sphere", 10)) {
+                    App.settings.modelBox = "";
+                    v.close();
+                    // On to the coloured 3MF (steps 2 to 13).
+                    root.modelStep = 2;
+                }
+                break;
+            case 30:
+                modelScript.stop();
+                root.modelPageDone = true;
+                break;
             }
         }
     }

@@ -13,6 +13,7 @@ use kourier_core::facade::UiEvent;
 use kourier_model::{AccountId, AttachmentId, ConversationId, MessageId, NetworkKind, UserId};
 
 use kourier_core::facade::FileRefusal;
+use kourier_core::facade::{SearchHit, Snippet, SnippetMark};
 
 use crate::account_actions::{AccountAction, LogoutNotice};
 use crate::conversations::{
@@ -25,6 +26,7 @@ use crate::login::{LoginView, NetworkChoice, NetworkEntry, network_choices};
 use crate::person::{CopyPart, CopyTarget, CopyUpdate};
 use crate::richtext::RichText;
 use crate::roaming::{ChatOffer, ChatTold};
+use crate::search::SearchView;
 use crate::time::{Calendar, TimeContext};
 use crate::timeline::{self, MessageRow, QuoteBlock, RowKind, WaitLine};
 use crate::transfer::{AbandonQuestion, ReplaceQuestion};
@@ -64,6 +66,27 @@ impl std::fmt::Debug for MediaAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Opened(id, _) => f.debug_tuple("Opened").field(id).finish_non_exhaustive(),
+            Self::Failed(id) => f.debug_tuple("Failed").field(id).finish(),
+        }
+    }
+}
+
+/// The answer to one [`UiSource::open_model`].
+#[derive(Clone)]
+pub enum ModelAnswer {
+    /// The parsed model, shared with the core's event: nobody copies it.
+    Opened(
+        AttachmentId,
+        std::sync::Arc<kourier_core::facade::ModelMesh>,
+    ),
+    /// An open failed, for the attachment the core names; `None` when it names none.
+    Failed(Option<AttachmentId>),
+}
+
+impl std::fmt::Debug for ModelAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opened(id, mesh) => f.debug_tuple("Opened").field(id).field(mesh).finish(),
             Self::Failed(id) => f.debug_tuple("Failed").field(id).finish(),
         }
     }
@@ -320,6 +343,7 @@ pub trait UiSource {
             hidden: filter.hidden.clone(),
             query: String::new(),
             archived: true,
+            ..Default::default()
         };
         u32::try_from(self.conversations(&archive).len()).unwrap_or(u32::MAX)
     }
@@ -460,6 +484,37 @@ pub trait UiSource {
     /// says so. `false`: the command did not leave (the core has stopped), or no core.
     fn set_quiet_notices(&mut self, _shown: bool) -> bool {
         false
+    }
+    /// Asks the core for the saved RegExp filters ([`Self::filter_rows`]); the answer comes with
+    /// [`Changes::filters`]. The settings page asks when it is shown; a change of the list
+    /// (`FiltersChanged`) is read again by itself.
+    fn load_filters(&mut self) {}
+    /// The saved filters in the user's order; `None` until the core has said and for a source
+    /// without filters.
+    fn filter_rows(&self) -> Option<Vec<crate::filters::FilterRow>> {
+        None
+    }
+    /// Saves a filter: a new one (`id` `None`) or the edit of `id`. The core validates it
+    /// again; a refusal comes through [`Self::take_filter_refusal`] ([`Changes::filters`]).
+    /// `false`: the command did not leave.
+    fn save_filter(
+        &mut self,
+        _id: Option<kourier_core::facade::FilterId>,
+        _spec: kourier_core::facade::FilterSpec,
+    ) -> bool {
+        false
+    }
+    /// Deletes a filter. `false`: the command did not leave.
+    fn delete_filter(&mut self, _id: kourier_core::facade::FilterId) -> bool {
+        false
+    }
+    /// Moves a filter to place `to` (0 is the first). `false`: the command did not leave.
+    fn move_filter(&mut self, _id: kourier_core::facade::FilterId, _to: usize) -> bool {
+        false
+    }
+    /// The core's refusal of the last save, worded and placed under a dialog input.
+    fn take_filter_refusal(&mut self) -> Option<crate::filters::FilterNote> {
+        None
     }
     /// Asks how the composer's files would be sent to `conv`: how many messages, which files
     /// the network cannot take. The answer comes through [`UiSource::take_file_plan`]
@@ -764,6 +819,72 @@ pub trait UiSource {
     fn jump_to_latest(&mut self) -> Changes {
         Changes::default()
     }
+
+    /// Opens `id` in the chat page AT `message` (a search hit), in place of
+    /// [`UiSource::open_conversation`]: the window is read around the message BEFORE any page at
+    /// the newest messages, so an old hit marks nothing read and sends no read receipt (critic
+    /// B1); [`Changes::jump`] names the message once it is among the rows. A hit at the newest
+    /// messages reads as any open does. On the open chat: a loaded row at once, else the window
+    /// moves around it (as [`UiSource::jump_to`]). A message that went away meanwhile: a notice
+    /// says so, then the chat opens at its newest messages as any open does. The default opens
+    /// the chat and names the message when its timeline holds it.
+    fn open_at(&mut self, id: ConversationId, message: MessageId) -> Changes {
+        let mut ch = self.open_conversation(Some(id));
+        if self
+            .timeline(id)
+            .iter()
+            .any(|r| r.message_id() == Some(message))
+        {
+            ch.jump = Some(message);
+        }
+        ch
+    }
+
+    /// Searches the messages for `text` (as typed: the core cuts it into words), in `chat` only
+    /// (`None`: every chat of every account, both views). A new text or chat replaces the search
+    /// and every answer still on its way for the old one is dropped; the same text and chat again
+    /// changes nothing; a text of white space alone ends the search. The rows come through
+    /// [`UiSource::search_view`] ([`Changes::search`]).
+    fn search_messages(&mut self, _text: &str, _chat: Option<ConversationId>) -> Changes {
+        Changes::default()
+    }
+    /// The search field's `.*` (a regular expression) and `Aa` (match case) toggles: the mode
+    /// the message search asks in; a search that runs starts again in it (R5).
+    fn set_search_mode(&mut self, _regex: bool, _match_case: bool) -> Changes {
+        Changes::default()
+    }
+    /// The compiled pattern of the running pattern search once the core answered it: the chat
+    /// list's titles are filtered with it (`ConversationFilter::regex`).
+    fn search_pattern(&self) -> Option<kourier_core::facade::SearchPattern> {
+        None
+    }
+    /// The page of hits after the last row (the list scrolled to its end). `false`: no search,
+    /// or no more hits.
+    fn more_search(&mut self) -> bool {
+        false
+    }
+    /// The search ended (Escape, the field emptied): nothing of it is shown or asked any more.
+    fn close_search(&mut self) -> Changes {
+        Changes::default()
+    }
+    /// What the message search shows, its rows decorated for the accounts `filter` leaves
+    /// shown (the account chips, as the list's rows while searching). A hit shows only while
+    /// the list holds its chat and does not call it protected (S-P, fail closed).
+    fn search_view(&self, _filter: &ConversationFilter) -> SearchView {
+        SearchView::default()
+    }
+    /// When the shown hits are read again: a change of one of their chats came (critic H5,
+    /// [`crate::search::REREAD_AFTER`] after the first). The front-end arms one wake-up for it,
+    /// as for [`UiSource::flags_deadline`], and calls [`UiSource::search_due`]. `None`: nothing
+    /// waits.
+    fn search_deadline(&self) -> Option<Instant> {
+        None
+    }
+    /// The [`UiSource::search_deadline`] may have passed: reads the hits again if so (the
+    /// answer comes as [`Changes::search`]).
+    fn search_due(&mut self) -> Changes {
+        Changes::default()
+    }
     /// When the rows' action flags must be read again: the first edit or delete window of a
     /// loaded message ends then (the core sends no event for time). `None`: nothing ends.
     fn flags_deadline(&self) -> Option<Instant> {
@@ -774,6 +895,11 @@ pub trait UiSource {
     /// rows on screen are going to change. A screenshot waits for 0.
     fn queries_in_flight(&self) -> usize {
         0
+    }
+    /// Test-only (G1h): the kinds of the open chat's timeline reads so far ("reload", "older",
+    /// "newer", "around", "newest"), oldest first; empty for a source that does not keep them.
+    fn timeline_fetches(&self) -> Vec<&'static str> {
+        Vec::new()
     }
     /// The [`UiSource::flags_deadline`] may have passed: re-reads the open timeline if so.
     fn refresh_flags(&mut self) -> Changes {
@@ -948,6 +1074,16 @@ pub trait UiSource {
         Vec::new()
     }
 
+    /// Asks the core to read and parse the 3D model `id` for the viewer; the answer comes later
+    /// through [`UiSource::take_models`] (flagged as `Changes::media`).
+    fn open_model(&mut self, _id: AttachmentId) -> bool {
+        false
+    }
+    /// Answers to [`UiSource::open_model`] since the last call.
+    fn take_models(&mut self) -> Vec<ModelAnswer> {
+        Vec::new()
+    }
+
     /// Whether the first answers arrived (the UI picks its start page then).
     fn loaded(&self) -> bool {
         true
@@ -977,6 +1113,58 @@ pub trait UiSource {
     /// another conversation is opened.
     fn read_more(&mut self, _message: MessageId) -> Changes {
         Changes::default()
+    }
+    /// Copy as Text of the selection mode: the text of the messages `ids` of `conv` goes
+    /// through the copy channel ([`UiSource::take_copy`], [`Changes::copy`]), oldest first
+    /// ([`crate::selection::copy_text`]). A core-backed source asks the core for the messages
+    /// by id, so the answer may come later.
+    fn copy_selected(&mut self, _conv: ConversationId, _ids: Vec<MessageId>) -> Changes {
+        Changes::default()
+    }
+    /// Export Selected, the bar's button: asks for the plan of the messages `ids` of `conv`; the
+    /// dialog's numbers come through [`UiSource::take_export`]. Refused (nothing happens) while
+    /// an export is under way.
+    fn export_plan(&mut self, _conv: ConversationId, _ids: Vec<MessageId>) -> Changes {
+        Changes::default()
+    }
+    /// The dialog's Export…: the ticks are taken and the save dialog's name follows
+    /// ([`crate::export::flow::ExportUpdate::SaveName`]); `false` when no dialog stands.
+    fn export_choose(&mut self, _ticks: crate::export::Ticks) -> bool {
+        false
+    }
+    /// The dialog, or the save dialog after it, closed with no answer: the plan is dropped.
+    fn export_abandon(&mut self) {}
+    /// The save dialog's folder and file name: the job a worker thread runs
+    /// ([`crate::export::flow::ExportJob::run`]), then [`UiSource::export_built`].
+    fn export_target(
+        &mut self,
+        _dir: PathBuf,
+        _name: String,
+    ) -> Option<crate::export::flow::ExportJob> {
+        None
+    }
+    /// The worker's documents: the export command goes out.
+    fn export_built(&mut self, _built: crate::export::flow::ExportBuilt) -> Changes {
+        Changes::default()
+    }
+    /// Cancel, at any stage.
+    fn export_cancel(&mut self) -> Changes {
+        Changes::default()
+    }
+    /// An export runs: the plan is asked for, the documents are made or the archive is written
+    /// (the button is off and the bar shows progress). Not while the dialog or the save dialog
+    /// stands: nothing runs then, and a second plan is refused anyway.
+    fn export_busy(&self) -> bool {
+        false
+    }
+    /// The dialog's numbers for these ticks (JSON, numbers and sizes only), from the plan the
+    /// open dialog holds; `None` while no dialog stands.
+    fn export_numbers(&self, _ticks: crate::export::Ticks) -> Option<String> {
+        None
+    }
+    /// What the export flow has to tell, in order.
+    fn take_export(&mut self) -> Vec<crate::export::flow::ExportUpdate> {
+        Vec::new()
     }
     /// Loads the page before the oldest loaded row; `false` when there is none.
     fn fetch_older(&mut self) -> bool {
@@ -1025,6 +1213,12 @@ pub trait UiSource {
         Changes::default()
     }
 
+    /// How the conversation list is ordered and labelled (the preferences `drafts-on-top`,
+    /// `show-account-tags` and `account-tags`).
+    fn set_list_look(&mut self, _look: ListLook) -> Changes {
+        Changes::default()
+    }
+
     fn set_presence(&mut self, _focused: bool, _chat_visible: bool) -> Changes {
         Changes::default()
     }
@@ -1069,6 +1263,12 @@ pub trait UiSource {
 /// The fixture data set as a source (`--fixture`, tests, screenshots).
 pub struct FixtureSource {
     fixture: Fixture,
+    /// The message search asked last: the text and the one chat (G1g).
+    search: Option<(String, Option<ConversationId>)>,
+    /// What its answers say of the index: `(ready, percent)`.
+    search_index: (bool, u8),
+    /// The answer of the last Copy as Text, until it is taken.
+    copied: Option<crate::person::CopyUpdate>,
 }
 
 impl FixtureSource {
@@ -1076,6 +1276,9 @@ impl FixtureSource {
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {
             fixture: Fixture::build().map_err(|_| SourceError::InvalidFixture)?,
+            search: None,
+            search_index: (true, 100),
+            copied: None,
         })
     }
 
@@ -1083,6 +1286,190 @@ impl FixtureSource {
     pub fn fixture(&self) -> &Fixture {
         &self.fixture
     }
+
+    /// What the search's answers say of the index from now on (the page that shows an index
+    /// still being filled: `false`, `40`; critic M2, no hold needed).
+    pub fn set_search_index(&mut self, ready: bool, percent: u8) {
+        self.search_index = (ready, percent.min(100));
+    }
+}
+
+/// The hits of the fixture for `text` in `chat` (or every chat), newest first: the messages
+/// whose text, caption or file name holds a word that starts with each typed word (letters and
+/// digits, any case). Not the core's rules (`search::normalize`): enough for the fixture's pages.
+/// A snippet is the piece on one line, cut around the first match as the core cuts it (40
+/// characters before, 120 in all); a piece with spoilers or mentions is shown whole or not at
+/// all (no cut moves its ranges).
+fn fixture_hits(fixture: &Fixture, text: &str, chat: Option<ConversationId>) -> Vec<SearchHit> {
+    let terms: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let words = |s: &str| -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut start = None;
+        for (i, c) in s.char_indices() {
+            match (c.is_alphanumeric(), start) {
+                (true, None) => start = Some(i),
+                (false, Some(st)) => {
+                    out.push((st, i));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(st) = start {
+            out.push((st, s.len()));
+        }
+        out
+    };
+    let holds = |s: &str, term: &str| {
+        words(s)
+            .iter()
+            .any(|(a, b)| s[*a..*b].to_lowercase().starts_with(term))
+    };
+    let mut hits = Vec::new();
+    for c in &fixture.conversations {
+        if c.protected || chat.is_some_and(|only| only != c.id) {
+            continue;
+        }
+        for m in fixture.messages.get(&c.id).into_iter().flatten() {
+            if m.deleted.is_some() || m.view_once {
+                continue;
+            }
+            let names: Vec<kourier_model::Text>;
+            let mut pieces: Vec<(&kourier_model::Text, Option<u32>)> = Vec::new();
+            match &m.body {
+                kourier_model::Body::Text(t) => pieces.push((t, None)),
+                kourier_model::Body::Media {
+                    attachments,
+                    caption,
+                } => {
+                    if let Some(t) = caption {
+                        pieces.push((t, None));
+                    }
+                    names = attachments
+                        .iter()
+                        .map(|a| {
+                            kourier_model::Text::plain(a.file_name.clone().unwrap_or_default())
+                        })
+                        .collect();
+                    for (i, t) in names.iter().enumerate() {
+                        pieces.push((t, u32::try_from(i).ok()));
+                    }
+                }
+                _ => continue,
+            }
+            let Some((piece, file)) = pieces
+                .into_iter()
+                .find(|(t, _)| terms.iter().all(|term| holds(&t.body, term)))
+            else {
+                continue;
+            };
+            let Some(snippet) = fixture_snippet(piece, file, &terms, &words) else {
+                continue;
+            };
+            let author = m.origin.author().cloned();
+            hits.push(SearchHit {
+                message: m.id,
+                conv: c.id,
+                account: c.account,
+                sort_key: m.sort_key,
+                sent_at: m.sent_at,
+                own: m.origin.is_own(),
+                author_name: author
+                    .as_ref()
+                    .and_then(|a| fixture.names.get(a))
+                    .map(|n| kourier_model::Redacted::new(n.to_owned())),
+                author,
+                snippet,
+            });
+        }
+    }
+    hits.sort_by_key(|h| std::cmp::Reverse((h.sort_key, h.message)));
+    hits.truncate(kourier_core::facade::MAX_SEARCH_PAGE as usize);
+    hits
+}
+
+/// The fixture's snippet of `piece` (see [`fixture_hits`]).
+fn fixture_snippet(
+    piece: &kourier_model::Text,
+    file: Option<u32>,
+    terms: &[String],
+    words: &dyn Fn(&str) -> Vec<(usize, usize)>,
+) -> Option<Snippet> {
+    let (text, ranges) = if piece.ranges.is_empty() {
+        let line = crate::names::single_line(&piece.body);
+        let first = words(&line)
+            .into_iter()
+            .find(|(a, b)| {
+                let w = line[*a..*b].to_lowercase();
+                terms.iter().any(|t| w.starts_with(t.as_str()))
+            })
+            .map_or(0, |(a, _)| a);
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let at = chars.iter().position(|(i, _)| *i == first).unwrap_or(0);
+        let from = at.saturating_sub(40);
+        let to = (from + 120).min(chars.len());
+        let start = chars.get(from).map_or(line.len(), |(i, _)| *i);
+        let end = chars.get(to).map_or(line.len(), |(i, _)| *i);
+        let mut text = String::new();
+        if start > 0 {
+            text.push('\u{2026}');
+        }
+        text.push_str(&line[start..end]);
+        if end < line.len() {
+            text.push('\u{2026}');
+        }
+        (text, Vec::new())
+    } else if piece.body.chars().count() <= 120 && !piece.body.contains(['\n', '\t', '\r']) {
+        (
+            piece.body.clone(),
+            piece
+                .ranges
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.kind,
+                        kourier_model::RangeKind::Spoiler
+                            | kourier_model::RangeKind::Mention(_)
+                            | kourier_model::RangeKind::MentionAll
+                    )
+                })
+                .cloned()
+                .collect(),
+        )
+    } else {
+        return None;
+    };
+    let spoiled = |a: usize, b: usize| {
+        ranges.iter().any(|r: &kourier_model::TextRange| {
+            r.kind == kourier_model::RangeKind::Spoiler
+                && (r.start as usize) <= b
+                && a <= (r.start + r.len) as usize
+        })
+    };
+    let marks = words(&text)
+        .into_iter()
+        .filter(|(a, b)| {
+            let w = text[*a..*b].to_lowercase();
+            terms.iter().any(|t| w.starts_with(t.as_str())) && !spoiled(*a, *b)
+        })
+        .map(|(a, b)| SnippetMark {
+            start: u32::try_from(a).unwrap_or(u32::MAX),
+            len: u32::try_from(b - a).unwrap_or(0),
+        })
+        .collect();
+    Some(Snippet {
+        text,
+        marks,
+        ranges,
+        file,
+    })
 }
 
 impl UiSource for FixtureSource {
@@ -1108,6 +1495,24 @@ impl UiSource for FixtureSource {
 
     fn timeline(&self, id: ConversationId) -> Vec<MessageRow> {
         self.fixture.timeline_rows(id, &self.time())
+    }
+
+    fn copy_selected(&mut self, conv: ConversationId, ids: Vec<MessageId>) -> Changes {
+        let rows: Vec<MessageRow> = self
+            .timeline(conv)
+            .into_iter()
+            .filter(|r| r.message_id().is_some_and(|m| ids.contains(&m)))
+            .collect();
+        let text = crate::selection::copy_text(&rows, &self.time());
+        self.copied = Some(crate::selection::copied(&text));
+        Changes {
+            copy: true,
+            ..Changes::default()
+        }
+    }
+
+    fn take_copy(&mut self) -> Option<crate::person::CopyUpdate> {
+        self.copied.take()
     }
 
     fn demo_conversation(&self) -> Option<ConversationId> {
@@ -1151,6 +1556,62 @@ impl UiSource for FixtureSource {
     ) -> Result<Option<MessageId>, SourceError> {
         let text = crate::composer::outgoing_text(text).ok_or(SourceError::Empty)?;
         self.fixture.send_text(id, text, reply_to).map(Some)
+    }
+
+    fn search_messages(&mut self, text: &str, chat: Option<ConversationId>) -> Changes {
+        if text.trim().is_empty() {
+            return self.close_search();
+        }
+        let asked = Some((text.to_owned(), chat));
+        if self.search == asked {
+            return Changes::default();
+        }
+        self.search = asked;
+        Changes {
+            search: true,
+            ..Changes::default()
+        }
+    }
+
+    fn close_search(&mut self) -> Changes {
+        Changes {
+            search: self.search.take().is_some(),
+            ..Changes::default()
+        }
+    }
+
+    fn search_view(&self, filter: &ConversationFilter) -> SearchView {
+        let Some((text, chat)) = &self.search else {
+            return SearchView::default();
+        };
+        let time = self.time();
+        let hidden = filter.resolve(
+            self.fixture.accounts.iter().map(|(a, _, _)| (a.id, a.uuid)),
+            self.accounts_known(),
+        );
+        let table = self.fixture.account_table(&hidden, true);
+        let chats = self.fixture.conversation_rows(&time);
+        let hits = fixture_hits(&self.fixture, text, *chat);
+        let rows = crate::search::hit_rows(
+            &hits,
+            |conv| chats.iter().find(|c| c.id == conv && !c.protected).cloned(),
+            &table,
+            &self.fixture.names,
+            &time,
+        );
+        SearchView {
+            active: true,
+            chat: *chat,
+            rows,
+            more: false,
+            loading: false,
+            index_ready: self.search_index.0,
+            index_percent: self.search_index.1,
+            capped: false,
+            answered: true,
+            chat_gone: chat.is_some_and(|c| !chats.iter().any(|x| x.id == c)),
+            refusal: String::new(),
+        }
     }
 }
 
@@ -1262,5 +1723,28 @@ mod tests {
         assert_eq!(rows[pinned].preview, "bump");
         assert_eq!(rows[pinned].preview_author, "You");
         assert_eq!(rows[pinned].preview_source, crate::PreviewSource::Own);
+    }
+}
+
+/// The preferences that shape the conversation list ([`UiSource::set_list_look`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListLook {
+    /// A chat left with a draft sorts by the draft's time while that is newer than its last
+    /// message ("Move chats with a draft to the top").
+    pub drafts_on_top: bool,
+    /// The rows show their account's tag or name ("Show account tags in the chat list"); off,
+    /// no row names its account.
+    pub show_tags: bool,
+    /// The tags the person gave accounts; an account without one shows its name.
+    pub tags: std::collections::HashMap<kourier_model::AccountUuid, String>,
+}
+
+impl Default for ListLook {
+    fn default() -> Self {
+        Self {
+            drafts_on_top: true,
+            show_tags: true,
+            tags: std::collections::HashMap::new(),
+        }
     }
 }

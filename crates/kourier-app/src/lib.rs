@@ -14,6 +14,8 @@
 //! - [`media`]: avatar handles for the UI's image provider and pasted composer files (§8.6).
 //! - [`opener`]: the program that opens a link or a file for the person, started with a per-child
 //!   environment (architecture §8.10).
+//! - [`slicers`]: "Open in Slicer": the fixed table of four slicers, finding the installed ones in the
+//!   applications directories and the command that starts one with a copy of a 3D model.
 //! - [`folders`]: a folder given to the composer: the walk, and the one archive made of it.
 //! - [`about`]: name, version, summary, licence, links and credits, as plain data for a front-end's
 //!   About page (§8.10).
@@ -51,6 +53,7 @@ pub mod prefs;
 pub mod process;
 pub mod restart;
 pub mod show;
+pub mod slicers;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 #[cfg(feature = "threema")]

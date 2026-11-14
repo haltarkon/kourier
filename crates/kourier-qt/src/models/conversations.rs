@@ -9,7 +9,7 @@ use super::{Store, list_model_glue, role_hash, role_index, row_at};
 use crate::bridge::qobject;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 23] = [
+pub const ROLES: [&str; 24] = [
     "conversationId",
     "accountId",
     "title",
@@ -33,6 +33,8 @@ pub const ROLES: [&str; 23] = [
     "archived",
     "badgeNumber",
     "tint",
+    // The RegExp filters' marker backgrounds in the title: [{start, len, colour}] (R3).
+    "titleMarks",
 ];
 
 /// Rust side of `ConversationListModel`.
@@ -70,6 +72,7 @@ pub struct ConversationQt {
     badge_number: i32,
     /// The account's color (`#rrggbb`).
     tint: QString,
+    title_marks: QVariant,
 }
 
 fn n(v: u32) -> i32 {
@@ -102,6 +105,7 @@ impl ConversationQt {
             archived: v.archived,
             badge_number: n(v.badge_number),
             tint: QString::from(v.tint.as_str()),
+            title_marks: super::timeline::marks_variant(&v.title_marks),
         }
     }
 
@@ -129,6 +133,7 @@ impl ConversationQt {
             .with_if(20, a.archived != b.archived)
             .with_if(21, a.badge_number != b.badge_number)
             .with_if(22, a.tint != b.tint)
+            .with_if(23, a.title_marks != b.title_marks)
     }
 
     fn key(v: &ConversationRow) -> ConversationId {
@@ -166,7 +171,8 @@ impl qobject::ConversationListModel {
             19 => QVariant::from(&r.preview_source),
             20 => QVariant::from(&r.archived),
             21 => QVariant::from(&r.badge_number),
-            _ => QVariant::from(&r.tint),
+            22 => QVariant::from(&r.tint),
+            _ => r.title_marks.clone(),
         }
     }
 

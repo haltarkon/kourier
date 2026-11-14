@@ -8,9 +8,10 @@ use cxx_qt_lib::{
     QHash, QHashPair_i32_QByteArray, QList, QMap, QMapPair_QString_QVariant, QModelIndex, QString,
     QVariant,
 };
-use kourier_model::MessageId;
+use kourier_model::{ConversationId, MessageId};
 use kourier_viewmodel::diff::RoleSet;
 use kourier_viewmodel::media_layout::AlbumRow;
+use kourier_viewmodel::selection::{self, Selection};
 use kourier_viewmodel::timeline::{Block, ImageBlock, ReactionChip, RowActions, UploadView};
 use kourier_viewmodel::{ChatHeader, ChatOffer, MessageRow, Paging, RevisionList, RowKey};
 
@@ -19,7 +20,7 @@ use crate::bridge::qobject::{self, App};
 use crate::shared::Shared;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 24] = [
+pub const ROLES: [&str; 26] = [
     "kind",
     "messageId",
     "own",
@@ -47,6 +48,10 @@ pub const ROLES: [&str; 24] = [
     "authorId",
     // The pages the row's menu offers (the sender's, the mentioned people's): [{user, label}].
     "pages",
+    // The RegExp filters' marker backgrounds in the author's name: [{start, len, colour}] (R3).
+    "authorMarks",
+    // The row is selected in the selection mode (`kourier_viewmodel::selection`).
+    "selected",
 ];
 
 /// Rust side of `TimelineModel`.
@@ -81,9 +86,21 @@ pub struct TimelineRust {
     pub(crate) still_filling: QString,
     /// Why the timer cannot be changed now (the account is under a send hold); empty when it can.
     pub(crate) timer_held: QString,
+    /// Why Export Selected is off for the open chat; empty when it is on.
+    pub(crate) export_off: QString,
     /// What the chat's menu offers of Archive, Pin, Mute and Mark as Unread
     /// ([`offer_variant`]); an empty map while no chat is open.
     pub(crate) chat_offer: QVariant,
+    /// A search in this chat is offered (G1i): its header is loaded and the chat is not
+    /// protected. `false` while no chat is open or the header is not there yet (fail closed).
+    pub(crate) chat_searchable: bool,
+    /// The open chat is protected (S-P); `false` while no header is loaded. The one-chat search's
+    /// chip ends on it (a header that is still loading says nothing).
+    pub(crate) chat_protected: bool,
+    /// The marker backgrounds in the open chat's title (R3): `[{start, len, colour}]`; and the Rust
+    /// value behind it, to tell when it changes.
+    pub(crate) title_marks: QVariant,
+    marked_title: Vec<kourier_viewmodel::filter_marks::Mark>,
     /// The offer behind `chat_offer` (to tell when it changes); `None` while no chat is open.
     offered: Option<ChatOffer>,
     /// The timers behind `timer_options` (to tell when they change).
@@ -95,6 +112,12 @@ pub struct TimelineRust {
     pub(crate) has_older: bool,
     pub(crate) has_newer: bool,
     pub(crate) loading: bool,
+    /// The selection mode is on (`selection.is_active()`).
+    pub(crate) selecting: bool,
+    /// How many messages are selected.
+    pub(crate) selected_count: i32,
+    /// The selection mode's state: it lives below the seam, not in a delegate.
+    pub(crate) selection: Selection,
     pub(crate) store: Store<MessageRow, MessageQt>,
     /// Where "Read more" goes (set by `App`; `None` in a bare model).
     pub(crate) shared: Option<Shared>,
@@ -127,6 +150,8 @@ pub struct MessageQt {
     wait_timer: QString,
     author_id: QString,
     pages: QVariant,
+    author_marks: QVariant,
+    selected: bool,
 }
 
 fn s(v: &str) -> QVariant {
@@ -203,6 +228,17 @@ fn image_variant(i: &ImageBlock) -> QVariant {
         ("uploadShare", QVariant::from(&upload_share(&i.upload))),
         ("uploadLabel", s(upload_label(&i.upload))),
         ("uploadCancel", QVariant::from(&upload_cancel(&i.upload))),
+        // A 3D model's picture: a tap opens the 3D viewer; `modelTint` says the still is a shade
+        // picture that wants `?tint=RRGGBB` on its URL.
+        ("isModel", QVariant::from(&i.model.is_some())),
+        (
+            "modelTint",
+            QVariant::from(&i.model.as_ref().is_some_and(|m| m.tint)),
+        ),
+        (
+            "modelName",
+            s(i.model.as_ref().map_or("", |m| m.name.as_str())),
+        ),
     ])
 }
 
@@ -237,27 +273,42 @@ fn album_row_variant(row: &AlbumRow) -> QVariant {
 
 /// What the picture viewer steps through for one message: every picture and video of its
 /// row, in order, each with `attachment`, `url` (full size; empty while it is not downloaded),
-/// `animated`, `media`, `kind`, `state`, `progress` and `placeholder`. Empty for a row
-/// without pictures.
+/// `animated`, `media`, `kind`, `state`, `progress`, `placeholder`, `ask`, `save`, and `width` and
+/// `height` (the picture's natural size in pixels, 0 = unknown). Empty for a row without pictures.
 pub fn viewer_items(row: &MessageRow) -> QVariant {
-    list(row.blocks.iter().flat_map(Block::images).map(|i| {
-        let local = i.state.as_str() == "local";
-        map(vec![
-            (
-                "attachment",
-                QVariant::from(&i.attachment.map_or(0, |a| a.0)),
-            ),
-            ("url", s(&i.full_url)),
-            ("animated", QVariant::from(&(i.animated && local))),
-            ("media", QVariant::from(&i.media)),
-            ("kind", s(&format!("{:?}", i.kind).to_ascii_lowercase())),
-            ("state", s(i.state.as_str())),
-            ("progress", QVariant::from(&f64::from(i.progress))),
-            ("placeholder", s(&i.placeholder_url)),
-            ("ask", QVariant::from(&i.ask)),
-            ("save", QVariant::from(&i.save)),
-        ])
-    }))
+    // (A model's picture opens the 3D viewer, never the picture viewer.)
+    list(
+        row.blocks
+            .iter()
+            .flat_map(Block::images)
+            .filter(|i| i.model.is_none())
+            .map(|i| {
+                let local = i.state.as_str() == "local";
+                map(vec![
+                    (
+                        "attachment",
+                        QVariant::from(&i.attachment.map_or(0, |a| a.0)),
+                    ),
+                    ("url", s(&i.full_url)),
+                    ("animated", QVariant::from(&(i.animated && local))),
+                    ("media", QVariant::from(&i.media)),
+                    ("kind", s(&format!("{:?}", i.kind).to_ascii_lowercase())),
+                    ("state", s(i.state.as_str())),
+                    ("progress", QVariant::from(&f64::from(i.progress))),
+                    ("placeholder", s(&i.placeholder_url)),
+                    ("ask", QVariant::from(&i.ask)),
+                    ("save", QVariant::from(&i.save)),
+                    (
+                        "width",
+                        QVariant::from(&i32::try_from(i.width).unwrap_or(0)),
+                    ),
+                    (
+                        "height",
+                        QVariant::from(&i32::try_from(i.height).unwrap_or(0)),
+                    ),
+                ])
+            }),
+    )
 }
 
 /// What the viewer steps through when there is nothing: an empty list (never an invalid value).
@@ -267,9 +318,9 @@ pub fn no_viewer_items() -> QVariant {
 
 /// What the picture viewer steps through for one message of a GALLERY slot: every picture of the
 /// message the slot holds, in the slot's order, each with `attachment`, `url` (full size; empty
-/// while it is not downloaded), `animated`, `media`, `kind`, `state`, `progress`, `placeholder`
-/// and `ask` (the same shape as [`viewer_items`], so the viewer does not know the difference).
-/// Empty when the slot holds none of them.
+/// while it is not downloaded), `animated`, `media`, `kind`, `state`, `progress`, `placeholder`,
+/// `ask`, `save`, `width` and `height` (the same shape as [`viewer_items`], so the viewer does not
+/// know the difference). Empty when the slot holds none of them.
 pub fn gallery_viewer_items(
     rows: &[kourier_viewmodel::chat_media::MediaRow],
     message: kourier_model::MessageId,
@@ -287,6 +338,14 @@ pub fn gallery_viewer_items(
             ("placeholder", s(&r.placeholder_url)),
             ("ask", QVariant::from(&false)),
             ("save", QVariant::from(&r.save)),
+            (
+                "width",
+                QVariant::from(&i32::try_from(r.width).unwrap_or(0)),
+            ),
+            (
+                "height",
+                QVariant::from(&i32::try_from(r.height).unwrap_or(0)),
+            ),
         ])
     }))
 }
@@ -592,6 +651,18 @@ pub fn group_variant(v: &kourier_viewmodel::group::GroupView) -> QVariant {
     ])
 }
 
+/// The marker backgrounds of a text or a name: `[{start, len, colour}]`, the colour as `#rrggbb`
+/// (the alpha is chosen per background in QML by `App.markerColour`).
+pub fn marks_variant(marks: &[kourier_viewmodel::filter_marks::Mark]) -> QVariant {
+    list(marks.iter().map(|m| {
+        map(vec![
+            ("start", QVariant::from(&m.start)),
+            ("len", QVariant::from(&m.len)),
+            ("colour", s(&format!("#{:06x}", m.colour & 0x00FF_FFFF))),
+        ])
+    }))
+}
+
 /// One content block as a `QVariantMap` with a `type` key (see `timeline/blocks/*.qml`).
 pub fn block_variant(b: &Block) -> QVariant {
     let ty = ("type", s(b.type_name()));
@@ -604,6 +675,7 @@ pub fn block_variant(b: &Block) -> QVariant {
             ("plain", s(t.full_plain())),
             ("links", list(t.links.iter().map(|l| s(l)))),
             ("jumbo", QVariant::from(&t.jumbo)),
+            ("marks", marks_variant(&t.marks)),
             ("more", QVariant::from(&t.more)),
             (
                 "moreWords",
@@ -751,6 +823,8 @@ impl MessageQt {
                     ("safety", QVariant::from(&p.safety)),
                 ])
             })),
+            author_marks: marks_variant(&v.author_marks),
+            selected: v.selected,
         }
     }
 
@@ -779,6 +853,8 @@ impl MessageQt {
             .with_if(21, a.wait_timer != b.wait_timer)
             .with_if(22, a.author_id != b.author_id)
             .with_if(23, a.pages != b.pages)
+            .with_if(24, a.author_marks != b.author_marks)
+            .with_if(25, a.selected != b.selected)
     }
 
     fn key(v: &MessageRow) -> RowKey {
@@ -817,7 +893,9 @@ impl qobject::TimelineModel {
             20 => QVariant::from(&r.wait),
             21 => QVariant::from(&r.wait_timer),
             22 => QVariant::from(&r.author_id),
-            _ => r.pages.clone(),
+            23 => r.pages.clone(),
+            24 => r.author_marks.clone(),
+            _ => QVariant::from(&r.selected),
         }
     }
 
@@ -874,6 +952,141 @@ impl qobject::TimelineModel {
         crate::controllers::defer(&shared, self.app.as_deref(), changes);
     }
 
+    /// Takes a new row list of the open chat `conv` (`None`: none open) through the selection:
+    /// it observes the loaded rows (another chat ends the mode, a row that went is dropped) and
+    /// sets every row's `selected` flag, so a reload, a reset and paging keep the flags.
+    pub fn observe_selection(
+        mut self: Pin<&mut Self>,
+        conv: Option<ConversationId>,
+        rows: &mut [MessageRow],
+    ) {
+        {
+            let sel = &mut self.as_mut().rust_mut().selection;
+            sel.observe(conv, selection::selectable(rows));
+            sel.mark(rows);
+        }
+        self.sync_selection_props();
+    }
+
+    /// Writes the mode's two properties from the selection, when they differ.
+    fn sync_selection_props(mut self: Pin<&mut Self>) {
+        let active = self.selection.is_active();
+        let count = i32::try_from(self.selection.len()).unwrap_or(i32::MAX);
+        if *self.selecting() != active {
+            self.as_mut().set_selecting(active);
+        }
+        if *self.selected_count() != count {
+            self.as_mut().set_selected_count(count);
+        }
+    }
+
+    /// After a change of the selection: only the rows whose flag differs are patched and only
+    /// the `selected` role is announced. The timeline is not built again.
+    fn apply_selection(mut self: Pin<&mut Self>) {
+        let changed: Vec<usize> = self
+            .store
+            .view
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                let want = self.selection.is_active()
+                    && r.message_id().is_some_and(|m| self.selection.contains(m));
+                r.selected != want
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for at in changed {
+            let mut row = self.store.view[at].clone();
+            row.selected = !row.selected;
+            super::patch_row(self.as_mut(), at, row);
+        }
+        self.sync_selection_props();
+    }
+
+    /// Whether `message` is a row the mode can select (a row with a message id that is loaded).
+    fn selectable_row(&self, message: i64) -> bool {
+        message > 0 && self.row_of(MessageId(message)).is_some()
+    }
+
+    /// "Select" in a message's menu and Ctrl+click outside the mode: the mode starts with this
+    /// row selected.
+    pub fn select_start(mut self: Pin<&mut Self>, message: i64) {
+        if !self.selectable_row(message) || *self.conversation_id() == 0 {
+            return;
+        }
+        let conv = ConversationId(*self.conversation_id());
+        self.as_mut()
+            .rust_mut()
+            .selection
+            .start(conv, MessageId(message));
+        self.apply_selection();
+    }
+
+    /// A click while selecting: flips the row.
+    pub fn select_toggle(mut self: Pin<&mut Self>, message: i64) {
+        if !self.selectable_row(message) {
+            return;
+        }
+        self.as_mut()
+            .rust_mut()
+            .selection
+            .toggle(MessageId(message));
+        self.apply_selection();
+    }
+
+    /// Shift+click while selecting: selects the rows from the anchor to this one.
+    pub fn select_extend(mut self: Pin<&mut Self>, message: i64) {
+        if !self.selectable_row(message) {
+            return;
+        }
+        let order = selection::selectable(&self.store.view);
+        self.as_mut()
+            .rust_mut()
+            .selection
+            .extend(MessageId(message), &order);
+        self.apply_selection();
+    }
+
+    /// Cancel and Escape: the mode ends.
+    pub fn select_clear(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().selection.clear();
+        self.apply_selection();
+    }
+
+    /// Copy as Text: asks for the selected messages; the text lands on the clipboard when the
+    /// answer comes (the copy channel of `App`). The mode stays on.
+    pub fn copy_selected(self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let Some(conv) = self.selection.conversation() else {
+            return;
+        };
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            return;
+        }
+        let changes = shared.borrow_mut().source.copy_selected(conv, ids);
+        crate::controllers::defer(&shared, self.app.as_deref(), changes);
+    }
+
+    /// Export Selected…: asks for the plan of the selected messages (oldest first is the
+    /// core's order). The mode stays on until an export finishes.
+    pub fn export_selected(self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let Some(conv) = self.selection.conversation() else {
+            return;
+        };
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            return;
+        }
+        let changes = shared.borrow_mut().source.export_plan(conv, ids);
+        crate::controllers::defer(&shared, self.app.as_deref(), changes);
+    }
+
     /// The row index of a message, when it is among the rows.
     pub fn row_of(&self, message: kourier_model::MessageId) -> Option<i32> {
         self.store
@@ -917,6 +1130,10 @@ impl qobject::TimelineModel {
         if *self.still_filling() != filling {
             self.as_mut().set_still_filling(filling);
         }
+        let export_off = text(|h| &h.export_off);
+        if *self.export_off() != export_off {
+            self.as_mut().set_export_off(export_off);
+        }
         let timer_held = text(|h| &h.timer_held);
         if *self.timer_held() != timer_held {
             self.as_mut().set_timer_held(timer_held);
@@ -933,6 +1150,20 @@ impl qobject::TimelineModel {
             let shown = offer.as_ref().map_or_else(no_offer, offer_variant);
             self.as_mut().rust_mut().offered = offer;
             self.as_mut().set_chat_offer(shown);
+        }
+        let marked = header.map(|h| h.title_marks.clone()).unwrap_or_default();
+        if self.marked_title != marked || !self.title_marks().is_valid() {
+            let shown = marks_variant(&marked);
+            self.as_mut().rust_mut().marked_title = marked;
+            self.as_mut().set_title_marks(shown);
+        }
+        let protected = header.is_some_and(|h| h.protected);
+        if *self.chat_protected() != protected {
+            self.as_mut().set_chat_protected(protected);
+        }
+        let searchable = header.is_some_and(|h| !h.protected);
+        if *self.chat_searchable() != searchable {
+            self.as_mut().set_chat_searchable(searchable);
         }
         let cannot = text(|h| &h.cannot_send);
         if *self.cannot_send() != cannot {

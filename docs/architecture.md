@@ -132,6 +132,7 @@ such.
 | Start with Kourier's own files out of the page cache | ≤ 600 ms | 443 to 478 ms (3 starts per run) | same trace; before each start the binary, the profile and Kourier's cache directory are written out and evicted from the page cache, the system's libraries stay cached. A start after boot with cold system libraries stays a manual check |
 | First frame to populated conversation list (from `core.db`, before any network) | ≤ 50 ms | 0 ms: the first frame shows the rows (30 starts) | same trace (`startup.list_populated`) |
 | Open a conversation (first 50 rows visible) | ≤ 80 ms | 50 to 56 ms, slowest 67 ms (21 conversations per run; the query alone 4 ms) | trace span `timeline.open` |
+| Message search, newest 50 hits (2,000,000 messages, SQLCipher, release, G1f) | a rare word ≤ 5 ms p95; a 3-letter prefix ≤ 150 ms p95; a 2-letter prefix ≤ 300 ms p95 (his answer "Keep two letters") | 0.2 ms; 97 ms; 330 ms p95 wall (10 % over the line on a lightly loaded server); a very common word p95 1.56 s | `search_measure::at_scale_on_sqlcipher` (`#[ignore]`, by name, on the server); index 0.43x the `messages` table, backfill 2,500 rows/s paced |
 | Idle memory, window shown | anonymous memory (`Pss_Anon`) ≤ 100 MB on any session; PSS ≤ 150 MB on a session whose programs map the same Qt files, ≤ 170 MB when no library page is shared | 157 to 158 MB PSS with no library page shared (below), so the 170 MB limit applies. Anonymous 87 MB, file-backed 70 MB. Phase J, two quick runs on a session where other processes carried 44 % of the Qt 6 libraries (less than half, so still the 170 MB limit): 138.9 and 138.5 MB PSS, anonymous 88.8 and 88.3 MB, file-backed 50 MB | `/proc/<pid>/smaps_rollup` after 5 min idle, on a release build with cargo feature `dumpable` (release otherwise sets `PR_SET_DUMPABLE 0`, which hides `smaps_rollup` from the same user, §9.4) or read as root. `cargo xtask perf` picks the PSS limit from the same process's `smaps`: the lower one when other processes carry half or more of the resident pages of the Qt 6 libraries (their PSS is at most half of their RSS), the higher one when they carry less; the row says which and why |
 | Idle memory, hidden to tray | anonymous ≤ 70 MB, to be tightened to 60 MB once the SQLite caches are released with the window and a measurement shows it (60 MB is not enforced yet); PSS ≤ 110 MB with shared libraries, ≤ 145 MB unshared (QML root window released after 60 s hidden, §8.2) | 130 to 133 MB PSS with no library page shared, so the 145 MB limit applies. Anonymous 60 to 63 MB. Phase J, with the core's caches released with the window (`UiCommand::ReleaseMemory`, §8.2 step 6), two quick runs, 10 s after the release, the 145 MB limit again: 109.6 and 108.2 MB PSS, anonymous 59.5 and 58.0 MB. That is too little under 60 MB, from too short a run, to enforce the 60 MB limit: a full run after a login decides | same |
 | Idle CPU | On the fake network: ≤ 0.2 wakeups/s over 5 min for all threads, no 100 s part above 0.5/s, process CPU below 50 ms per 5 min. With a Signal connection the target stays in words until it is measured: no periodic wakeups besides the chat keepalive (30 s) and timers that have work | Fake network (no keepalive): 0.04 wakeups/s shown, 0.01 hidden over 300 s, busiest 100 s part 0.09, process CPU under 10 ms. Signal mock with the 30 s keepalive: 0.42 wakeups/s over 90 s for all 9 threads (`kourier-e2e` `signal_idle`, run by hand) | `cargo xtask perf` counts the voluntary context switches of all threads (`/proc/<pid>/task/*/status`) over the idle time and over each of its 100 s parts, and reads the process's CPU time from `/proc/<pid>/stat`: three rows per state. A run that idles for less than 5 min (`--quick`) shows them for information. On a real connection: `powertop` / `perf stat` over 10 min |
@@ -164,7 +165,9 @@ and the two halves of the number behave differently:
   connections: while hidden, the allocator arenas of the other threads held 19.7 MB, the
   largest the size of one connection's 8 MiB cache. The core has `UiCommand::ReleaseMemory`
   for them, and since phase J the UI sends it when the hidden window is let go (§8.2
-  step 6). Phase I expected 10 to 15 MB from it, an estimate from the arena sizes that was
+  step 6); since RAM3 it also reaches every running backend as `Command::ReleaseMemory`, so each
+  account's `backend.db` connection gives its cache back too (`kourier_db::release_memory`; RAM2
+  measured 8.5 of 10.5 MiB of SQLite memory freeable with four accounts). Phase I expected 10 to 15 MB from it, an estimate from the arena sizes that was
   too high. Measured in phase J: the heap in use at the trim is 26 MB instead of 31 MB, and
   the hidden anonymous memory is 59.5 and 58.0 MB in two quick runs against 60.1 to 62.7 MB,
   so between 0.6 and 4.7 MB less. Most of the freed pages stay resident as fragments of
@@ -279,7 +282,8 @@ is in the release gate now: §14.2 item 14.)
 | `kourier-db` | Open SQLCipher files with a raw key, pragmas, forward-only migration runner, `schema_version`, writer-thread helper, synchronous `zone` API, the generic `core_outbox` table (opaque versioned bytes) and its forwarder loop used by every backend (§5.6) | — | rusqlite 0.38, libsqlite3-sys 0.36 (patched), zeroize | anything domain-specific |
 | `kourier-blob` | Encrypted file format (streaming AEAD), atomic writes, `$XDG_RUNTIME_DIR/kourier/media` plaintext cache with cleanup, the writer of a plaintext copy into a folder of the user's (`save_to`, `save_copy`, §5.8.2) | — | aes-gcm (STREAM), rand, zeroize | domain crates |
 | `kourier-media` | Image decode/resize/re-encode, EXIF strip, blurhash, thumbnails; used by core (import) and backends (per-network transcoding) | — | image, blurhash | Qt, protocol crates |
-| `kourier-core` | `core.db` schema and queries, account registry and supervisor, ingest, outbox, pending modifiers, disappearing-message sweeper, typing timers, notification *policy*, read-state logic, `facade` (`CoreHandle`, `UiCommand`, `UiEvent`, query DTOs) | model, backend-api, db, blob, media | tokio, tracing | any backend crate, zbus, Qt |
+| `kourier-mesh` | 3D model parsing (binary and ASCII STL, 3MF with units, components, production parts, standard colours and slicer filament colours (Bambu Studio, OrcaSlicer, PrusaSlicer)) under hard bounds (§13 limits), and the deterministic software still renderer (`render_still`, `encode_png`); one thread, Qt-free (§8.10 R1); the edge `kourier-core -> kourier-mesh` comes with the core's derive step | — | zip, quick-xml, serde, serde_json, png, thiserror | Qt, tokio, rayon, core |
+| `kourier-core` | `core.db` schema and queries, account registry and supervisor, ingest, outbox, pending modifiers, disappearing-message sweeper, typing timers, notification *policy*, read-state logic, `facade` (`CoreHandle`, `UiCommand`, `UiEvent`, query DTOs) | model, backend-api, db, blob, media, mesh | tokio, tracing | any backend crate, zbus, Qt |
 | `kourier-fake` | `FakeNetwork`: scripted backend for core, UI and screenshot tests (login flows, duplicates, permutations, slow acks, crash points), with its own `core_outbox`; contract-conformance suite (§10.2) | model, backend-api, db | tokio | core, Qt |
 | `kourier-signal` | Signal backend (§6) | model, backend-api, db, blob, media | libsignal-* (git tag v0.104.0), prost 0.14, reqwest 0.13 (rustls + ring), tokio | core, app, desktop, Qt, other backends |
 | `kourier-whatsapp` | WhatsApp backend (§7.1): the store contract of whatsapp-rust over `backend.db` (W1), the link and the connection of one account (W2a), the pre-pair refusal of a wrong phone (W2c), the receive path (W3a), the history at the link (W4), the send path (W5a), the media send (W5b), the phone's chat settings and calls from app state (W6a1) and the groups and people (W6a2: the group fetch, roles, names, the address book, merges, admin deletes and the 1:1 timer set); registered by `kourier-app` from W2b (debug builds, while turned on) | model, backend-api, db, blob, media (W5b: the core's encrypted files, the sealed temporary upload file, the re-encode of pictures) | whatsapp-rust, whatsapp-rust-tokio-transport, whatsapp-rust-ureq-http-client, wacore, wacore-binary, waproto (ONE git rev, `default-features = false`), tokio, tokio-util, ureq 3 (rustls only: Kourier's own HTTPS agent, W5b) | core, app, desktop, Qt, other backends |
@@ -619,7 +623,7 @@ when the features are hashed, so a 1:1 chat's hash (and every group stored befor
 A Signal group stored before P2 is restated ONCE at the next start (`refresh_group_features` also sets the
 description from the stored snapshot); a fetch states both with every revision.
 
-**Protected chats (S-P, 2026-10-29; his answer "Like Threema Desktop" for the phone's PIN-protected
+**Protected chats (S-P, 2026-10-29; no export since 2026-11-13: `Refusal::ExportProtected`, §5.8.3; his answer "Like Threema Desktop" for the phone's PIN-protected
 chats: listed and readable, notifications without the text, left out of search).** `Conversation.protected` (and
 `ConversationPatch.protected: Option<bool>`, serde default, left out of the JSON when `None`; a network that has no
 such state never sets it, so no other backend's literal changed) says the user protects the chat on another device:
@@ -960,6 +964,11 @@ pub struct ConversationFeatures {
     pub roaming_listed: Option<bool>,            // A10a: Some(false) = the network does not list this chat for its
                                                  // roaming settings yet (a message request, a person known only by
                                                  // a number): no Archive/Pin/Mute is offered; None/Some(true) = listed
+    pub export: ChatExport,                      // Unstated (default: NOT exportable, fail closed) | Allowed | Restricted;
+                                                 // skipped from the JSON while Unstated (the stable hash is unchanged).
+                                                 // Signal, Threema and the fake state Allowed; WhatsApp and Telegram
+                                                 // state it in their own lanes (Telegram's protected content and
+                                                 // WhatsApp's Advanced chat privacy are Restricted). §5.8.3
 }
 ```
 
@@ -1515,6 +1524,25 @@ Notes:
   A reply to one of his own cards quotes it as Signal Android quotes a card (`Contact.quoteText`): the text "👤 " and
   the card's NAME, never the number (SD5; `outbox::` quote snapshot). `ConversationRow.can_send`
   (`features.cannot_send` absent) is what the share picker lists (§8.3).
+- `Query::MessagesByIds { conv, ids }` -> `QueryData::MessagesByIds(TimelinePage)` (selection mode, Export Selected step SEL):
+  the messages `ids` of one conversation as a timeline page shows them (the same `MSG_SELECT`, `msg_raw`, `PageCtx` and
+  `MessageActions`), oldest first by `(sort_key, id)`, each at most once, only what the timeline would show
+  (`TIMELINE_VISIBLE`: never a message deleted for me or hidden by the expiry rule); an unknown id, an id of another
+  conversation and a hidden row are silently absent. The ids are bound in chunks of 500 per statement, so any number is
+  answered (`has_older` and `has_newer` are false; `kourier-core/tests/messages_by_ids.rs`). Copy as Text uses it now; the
+  export and Forward share it.
+- `Query::ExportPlan { conv, ids }` -> `QueryData::ExportPlan(ExportPlan { conv, chat, members, messages, now })` (Export Selected,
+  step EXP-core, §5.8.3): the chat's verdict (`actions::may_export_chat`: `Err(Refusal::ExportUnstated | ExportRestricted | ExportProtected)`),
+  the full-member count, and per visible asked message (read THROUGH `messages_by_ids`) its `MessageRow`, its
+  `ExportVerdict` (`Included`, `NeedsTick` for a message with a disappearing timer, `LeftOut(ViewOnce | Gone)`), its
+  `stamp` (`ExportStamp { id, deleted, revision }`), the verdict of its quote (`quote: Option<ExportVerdict>`), its files
+  (`PlannedFile`: kind, mime, size, name, the sniffed type, `accepted: Err(ExportFileRefusal::NotHere | LongText)`) and
+  its earlier versions. A `LeftOut` message carries nothing of its content (body `Placeholder::Expired`, no reply, reactions,
+  files or revisions). A chat that may not be exported plans no message. `ConversationDetail::export()` is the same rule
+  for the chat header.
+- `UiCommand::ExportArchive { request, conv, target, mode, with_disappearing, messages, files, documents, manifest }`,
+  `UiCommand::CancelExport { request }`, `Progress::Export { request, done, total }`, `UiEvent::ExportEnded { request,
+  outcome: Done { messages, files, failed: Vec<AttachmentId>, bytes } | Cancelled | Failed(ExportFailure) }`, with `messages: Vec<ExportStamp>`: §5.8.3.
 - `Query::ChatMedia(ChatMediaQuery { conv, kind, before, limit })` -> `QueryData::ChatMedia(ChatMediaPage { items, more, other })`
   (people pages P4, core.db 20): a page of ONE chat's gallery, newest message first, the attachments of one message in
   their order. `kind` is `MediaKind::Visual` (image, video, GIF) or `Files` (file, audio file; a picture sent as a file
@@ -2347,6 +2375,7 @@ is wiped at start and at exit.
   `ksecretd` (R:qt-kirigami §7.3). Kourier works with either; which one the user wants is an open
   decision (switching is a system change the user makes).
 - `core.db` key = HKDF-SHA256(master, info = `"kourier core.db v1"`).
+- `search.db` key = HKDF-SHA256(master, info = `"kourier search.db v1"`) (`Keyring::search_db_key`), another key than core.db's, so neither file opens with the other's; `CoreConfig.search_key` (zeroized, `Debug` redacted like `core_key`; the core refuses to start with one key for both).
 - Per account: a random `db_key` (backend.db) is stored only in `accounts/<uuid>/key.wrap` as
   AES-256-GCM(KEK, random nonce, db_key), header as associated data. KEK = HKDF-SHA256(ikm = master,
   salt = account secret, info = `"kourier account kek v1" ‖ uuid`). The account secret is 32 random
@@ -2533,7 +2562,9 @@ unread_hint + rows)` and `mentions = coalesce(mentions_server, rows)`. No row is
 particular index says so in its SQL (the sweeper's `+account_id`, §13 phase J), and a unit
 test pins the plans of the sweeper's reads.
 
-Not in M1, reserved: `messages_fts` (FTS5) for search, `persons`.
+Not in M1, reserved: `persons`. Message search (G1) keeps only its LOG in core.db: `search_queue(seq INTEGER PRIMARY KEY AUTOINCREMENT, message_id)`, three triggers on `messages`, and the settings `search/epoch` and `search/compact_after`; the index itself is `search.db` beside core.db (§5.9).
+
+RegExp filters (core.db 26, `0026_filters.sql`) keep one table, `filters(id, position UNIQUE and dense from 0, name, text_pattern, sender_pattern, chat_pattern (NULL = field not used), match_case, notify, notify_muted, highlight, colour 0xRRGGBB, created, updated)`: the user's saved patterns, in his order; the core compiles them once per change into one shared `filters::FilterSet` (`kourier-core/src/filters.rs`, reached through `facade::filters`). The set matches each field with one `RegexSet` per case rule; a pattern with a Unicode word boundary (`\b`, `\B` and their forms) goes into the set WITHOUT it and every set hit of such a pattern is confirmed by the filter's own regex (R6: regex's lazy DFA gives up at the first non-ASCII byte under a Unicode boundary, and one such pattern sent the whole set to the slow engine, about 1 ms a text with 50 filters on Cyrillic text; 7 µs after). The filter's own regex is a `regex_automata::meta::Regex` built for the whole match only (`WhichCaptures::Implicit`, no one-pass DFA; same syntax flags and limits as `filters::compile`, which still gives R5's search and the dialog a `regex::Regex`): about half the memory of a `regex::Regex` (R6b: 50 filters of the perf mix keep 6.7 MiB built, 11.6 MiB once the lazy DFA caches are warm). THE START does not wait for the compile (R6b): it reads the rows, sets `notify_watch` and `notify_muted_watch` from their switches, holds an empty placeholder (revision 0) and compiles on a blocking thread; the result is published as revision 1 only if no Save, Delete or Move rebuilt the set meanwhile, and `Query::Filters` waits (in its own query task) until a real set stands, so no reader sees the placeholder.
 
 Access: one writer thread; all writes go through a `CoreStore` job channel with two priorities
 (live envelopes and UI commands, then history chunks; round-robin across accounts inside each), and
@@ -2953,7 +2984,343 @@ The saved file is the sender's original with whatever metadata the sender left: 
   then Ctrl+S in the viewer on one of its pictures) waits in `save_waiting` and is sent when the first is answered, so
   every call gets its own folder, its own retries and its own notice.
 
+#### 5.8.3 The export archive
+
+Export Selected writes the selected messages of one chat as ONE ZIP (the format is `docs/export-format.md`, step EXP-ui).
+Plaintext leaves the store only through `kourier-blob::export`, and the archive is that module's second form
+(`export::archive::write_archive`): the same open folder fd, staging (`O_TMPFILE`, else the hidden `.kourier-<random>.part`),
+`fsync` of the file and the folder, publishing under the final name only at the end, `SaveMode::{Replace, NoReplace}`.
+Differences from a single copy: the staged file is `0o600` (a whole conversation in plaintext; a saved picture keeps
+`0o666`); files are stored, documents deflated; an entry of 4 GiB less a little or more is ZIP64 (the archive and 65,535+
+entries too, through the `zip` crate); entry permissions `0o644`, every entry carries the export time. The writer checks
+ENTRY NAMES itself (`files/<one component>` or a top-level name; each component non-empty, at most 255 bytes, no `/`, `\`,
+NUL or other control character, none of the bidi and zero-width characters U+061C, U+200B, U+200E, U+200F, U+202A-202E,
+U+2060-2064, U+2066-2069, U+FEFF (the joiners U+200C and U+200D stay: Persian words and emoji sequences need them), none of
+`: * ? " < > |`, no trailing `.` or space, not a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or without an
+extension), not `.` or `..`; unique) and one bad name refuses the whole archive (`SaveError::BadName`) before anything is
+written. The place follows the kind: a file (`Source::Blob`) is `files/<name>`, a document (`Source::Bytes`) has no `/`.
+Known limit: NFC and NFD spellings of one name are two names (no normalisation crate is in the lock), so an extractor on a
+normalisation-insensitive file system (APFS) lets one replace the other. A file streams from its blob in chunks and is hashed
+(SHA-256); a source that does not authenticate or is truncated has its entry removed again: the writer
+(`ZipWriter::abort_file`) seeks back to the entry's header, the file's position is read there at once and the file is cut to it
+(`set_len`), so the partial plaintext is not left in the archive or on the disk; a writer that did not move back fails the
+export (`Io`). The file is reported failed and the archive goes on. An entry is ZIP64 when `max(stated size, the blob file's
+length)` reaches the limit (the ciphertext bounds the plaintext; a sender's stated size is not trusted). A cancel flag is read
+between chunks and once more right before the publish; a cancel that comes after that ends `Done`. A cancelled or failed
+archive leaves nothing under the final name and no `.part`. A kill or a power loss on the named route (FAT and exFAT, which
+have no `O_TMPFILE`) can leave a `.kourier-<hex>.part` with partial plaintext; there the mode is the mount's (`fmask`), not
+`0o600`. The log says counts and sizes only; `EntryInfo` and `ArchiveReport` print no name in `Debug`.
+
+The command (`UiCommand::ExportArchive`) runs on the `saves` queue with the writing on the blocking pool, and checks again
+what the plan said: (1) the name and an absolute folder; (2) `actions::may_export_chat` on the chat's CURRENT features;
+(3) every listed message (`ExportStamp`s, deduplicated by id; two stamps of one id that differ fail) read again by id with
+`actions::export_verdict(.., with_disappearing)` (deleted for me, gone, view-once, a timer without the tick, another
+chat's: not exportable) and compared with its stamp: a message deleted for everyone or edited since the plan has the same
+verdict but not the text the documents carry, so a differing `deleted` flag or `revision` is `Changed` too. The plan and
+the command read the same facts through one function; "disappearing" is ONE predicate for both (`expiry_kind IS NOT NULL`);
+(4) every listed file with `may_save_message` and
+`may_save_file` and its message among the listed ones. Anything that fails 3 or 4 fails the WHOLE export as
+`ExportFailure::Changed` before a byte is written (the documents were built from the plan and must not carry a message that
+may no longer leave). Then (5) free space (`NoSpace`), (6) the archive: `files/` entries, the documents in the given order,
+`manifest.json` LAST, written by the core: the UI's head plus `"entries": [{"path", "size", "sha256"}]` for every entry
+before it and `"files_failed"`, and (7) the publish. `CancelExport` sets a flag that stands from the moment the command is
+taken, so a cancel behind a queued job is not lost. A file that is not on this computer is listed in the plan and never
+fetched. A request id that is running is refused at once (`Failed(Io)`, one warning without names) and the first export keeps
+its cancel. Exports and file saves share one serial queue (`saves`): a large export holds up every save and the next
+export until it ends. `Done.messages` counts each id once and `Done.failed` names the files that failed while written
+(they are dropped and reported; the documents still link them, the manifest lists them in `files_failed`).
+QUOTES: the plan states a verdict for the quoted ORIGINAL (`PlannedMessage.quote`), found by the quote's key hidden rows
+included (`query::quote_original_facts`): view-once or hidden is `LeftOut` and the plan STRIPS the quote's text, file name,
+kind, thumb and snapshot (the quote keeps that it exists and its author); a disappearing original is `NeedsTick`, kept, and
+a document shows its content only with the tick (a generic line otherwise); an original core.db does not have is
+`LeftOut(Gone)` when the core remembers the key as expired (`expiry::remembered`), else `Included` (the sender's snapshot, as
+the timeline shows it). The rules cover the text of a quote the same way (his answer of 2026-11-13, "Same rules": what is built
+stays); it lives in `export::quote_verdict`. A file that fails while it is written is dropped from the archive and named in the end
+notice (his decision, 2026-11-13: "Drop and name it"). PROTECTED chats (S-P) are REFUSED (his answer of 2026-11-13, "Refuse
+export", a change of the earlier decision to export them with a warning): `actions::may_export_chat(features, protected)` says
+`Refusal::ExportProtected` first, whatever the network states, and the plan, the command's re-check (the flag is read again in
+the same read as the features, so a chat that turned protected after the plan fails with `ChatRefused(ExportProtected)` and writes
+no file) and `ConversationDetail::export` all ask it. The deleted line of a disappearing message is exported
+without the tick and carries nothing but "deleted" and its time (the tombstone cleared everything else). A chat exports only
+when its features state `ChatExport::Allowed` (§3.8): `Unstated` fails closed.
+A chat stored before this field existed reads `Unstated` until its backend states its features again: Signal does at the
+next start of a linked account (`refresh_features`: `Allowed` changes the features' hash, so every chat is stated once
+more, the chats known only by a number included); Threema states them when it next sends a chat's features. The room
+check reads `kourier_blob::free_space` (`statvfs`; the core itself has no `unsafe`).
+
 ---
+
+### 5.9 Message search (G1)
+
+Code: `crates/kourier-core/src/search/`, the viewmodel's `search.rs`, the Qt list page. His decisions: under the chats, a chip in the list, like a chat row, from two letters, deleted words within a day, the index in its own file. Measured costs (2,000,000 messages): 2-letter prefix p95 330 ms, 3 letters p95 97 ms, a rare word under 1 ms, index 0.43x the `messages` table; `target/next/g1-perf.md`.
+
+
+#### Tokens
+
+One function, `search::normalize::normalize`, cuts a text into tokens for the index AND for a query.
+FTS5's `ascii` tokenizer only splits what it is handed on ASCII punctuation and folds A to Z, so every
+language rule lives in this function and an SQLite upgrade can never change a token. Every token holds
+no ASCII character but letters and digits (so a quoted FTS5 string with one token is never a phrase,
+which `detail=column` refuses) and is at most 64 bytes. Each token comes with the byte range of its
+source in the text, and a token's range gives the token again when normalised alone.
+
+Order of the steps:
+
+1. Extended grapheme clusters of the source, each on its own (the unit NFKC may compose, and the unit of
+   the byte ranges): the five marks `'` U+2019 U+02BC `` ` `` U+00B4 become `'` (UAX #29 joins "м'ята",
+   breaks at a backtick or an acute accent, and NFKC would turn U+00B4 into a space and a combining mark),
+   then NFKC, lower case (per character, so Σ is always σ), and the mapping once more for what NFKC
+   produced (fullwidth apostrophe and grave accent, Greek varia).
+2. UAX #29 word segmentation of that text. A segment with no letter or digit is dropped.
+3. Per word: `'`, `"`, the Hebrew geresh and gershayim and the invisible format characters (soft hyphen,
+   CGJ, Arabic letter mark, ZWNJ, ZWJ, LRM, RLM, the bidi embeddings and isolates, word joiner, variation
+   selectors, BOM) are removed, not split on; then the word is split on any ASCII character that is not a
+   letter or a digit (`_`, `.`, `/`, `-`, `@`, the colon of a URL ...) and on any other punctuation that is
+   not a mark of the character before it (the middle dot and the fraction slash that UAX #29 lets join two
+   letters). The zero-width space separates. A combining or spacing mark with no letter before it in its
+   token is dropped (UAX #29 glues it to what stood in front).
+4. Per token: diacritics fold (Latin and Greek: every combining mark; Cyrillic: only the grave and acute
+   stress marks, so й and ї stay letters), Hebrew points and cantillation go, the Hebrew final forms fold
+   (ם to מ), ß to ss, ς to σ, ё to е, ґ to г.
+5. A token over 64 bytes is dropped (base64, keys, hashes).
+
+| Case | Rule | Example |
+|---|---|---|
+| Ukrainian apostrophe | five marks mapped to `'`, then removed inside a word | "м'ята", "м’ята", "мʼята", "м`ята", "м´ята", "мята" all give `мята` |
+| й, ї | stay letters (decomposed ones compose); not folded to и, і | `йому` is not `иому` |
+| ґ, ё | fold to г, е | "ґанок" = "ганок", "ёлка" = "елка" |
+| Stress marks on Cyrillic | grave and acute go | "за́мок" = "замок" |
+| Latin, Greek | all diacritics fold; ß = ss; final sigma = sigma | "café" = "cafe", "Việt" = "viet", "Straße" = "strasse", "λόγος" = "λογοσ" |
+| Compatibility forms | NFKC | fullwidth "ＡＢＣ" = "abc", "ﬁ" = "fi", "①" = "1" |
+| Hebrew | points and cantillation (U+0591 to U+05C7 but not maqaf, paseq, sof pasuq, nun hafukha) removed; final letters folded; geresh, gershayim and `"` inside a word removed; maqaf separates | "שָׁלוֹם" gives `שלומ`; צה״ל = צה"ל gives `צהל` |
+| CJK | UAX #29 gives each ideograph and each hiragana its own word, a katakana run stays one word; Hangul words are whole. Query "日本語" is three terms ANDed; the adjacency (a token's end is the next one's start) is checked in Rust on the row | |
+| Emoji, symbols | not tokens | |
+| Invisible format characters | removed inside a word (Persian with and without the ZWNJ is one word) | |
+| Over 64 bytes | dropped | |
+
+A query is the first 512 bytes of the typed text, cut with the same function, at most 32 terms
+(`query_terms`). A term of `MIN_PREFIX` (2) or more characters is a prefix term; shorter terms match whole
+words (his answer on short letters changes this one constant).
+
+Known limits to say next to it: no stemmer, so a prefix helps ("файл" finds "файли") and a Hebrew word
+with a particle in front does not match; Thai, Lao, Khmer and Burmese have no word dictionary, so a run
+without spaces is ONE token and is dropped when it is over 64 bytes (21 Thai letters); a mention's name,
+a contact's number, e-mail address and username and a location's coordinates are not indexed; emoji are
+not searchable; Arabic letter variants (ی ي, ک ك), harakat and tatweel are not folded; `ł` `ø` `đ` do not fold to
+`l` `o` `d`; "l'été" gives `lete` (the apostrophe is removed, as for "don't"), so "été" does not find it
+by its start; a compatibility character that expands to several tokens ("℅" is "c/o") gives them one
+range.
+
+#### Snippets
+
+The index is contentless, so the snippet of a hit is cut in Rust from the message's body as it is when the page is read
+(`search::snippet::snippet(&Body, &[QueryTerm]) -> Option<Snippet { text, marks, ranges, file }>`), with the tokens of the
+index. It is also the last check of a hit: `None` when the body no longer holds every term (an edit between the flush and the
+query) or when terms typed side by side (a CJK run, `QueryTerm::joined`) do not stand side by side in one piece of the body
+(the index has no positions); the query drops such a row. The piece shown is the one that holds most of the query (a text, a
+caption, a file name, a contact's name or organization, a place's name or address, a poll's question or option); `file`
+names the attachment (its `idx`) when it is a file name. The cut keeps at most 40 characters before the first match and 120
+in all, both ends on word borders; white space and line breaks become one space and `…` marks a cut end. `text` is the raw
+cut: `ranges` carries the body's spoiler ranges (clipped, joined, widened to character borders, never narrowed) and its
+shown mentions inside the cut, in `text`'s offsets, and the viewmodel renders them as the chat list's previews do (`■■■`,
+`@Name`). A match that touches a spoiler gets no mark (the row stays a hit, as in Signal Desktop's results). The invisible
+and bidi controls are cleaned by the viewmodel when it renders (the rule that keeps a Persian or Hebrew word's joiners).
+`Debug` of a snippet shows counts only.
+
+#### Two files and the writes
+
+The index lives in its own SQLCipher file, `search.db` beside `core.db` (`Paths::search_db()`, the same pragmas,
+`secure_delete` on for every connection), written only by the search task on a connection of its own, so saving a
+message never waits for search: the only search statements on the core's writer are the triggers' appends, a compaction
+ask and the prune's range delete. search.db is never needed: every check that fails ends in THE REBUILD (its `-wal`,
+`-shm`, `-journal` deleted, then the file, a new one made, the backfill started); a backup needs no copy of it and a
+restore without it, or with a stale one, rebuilds. It opens lazily, at `UiReady`, never on the start path.
+
+Three triggers on `messages` append the id of every row that is born, changes what the index may hold (its body, kind,
+delete, view-once flag, chat or sort key, and only when the value really changed) or dies to `search_queue`, in the
+transaction of the change. The seq is AUTOINCREMENT, so it is never used twice, even after the log was emptied (a reused
+seq at or below search.db's `applied` would be skipped for good). Every writer of `messages`, the ON DELETE CASCADEs of an
+account's and a chat's removal included, reaches the index without knowing of it; the triggers hold ids only and call
+no Rust.
+
+search.db holds `messages_fts` (FTS5, contentless with deletes, `detail=column`, `tokenize='ascii'`, no `prefix=`,
+`pgsz` 3900), `indexed(message_id PRIMARY KEY, rowid)` (the rowid each message was indexed under: every delete is exact,
+`dead` counts only real tombstones and a replay is harmless), `meta` (`version`, `norm`, `applied` = the last log seq
+applied, `floor` and `top` of the backfill, `dead`, `dead_since`, `compacted_for`, `checkpoint_due`) and the epoch of the
+core.db it was made for. The rowid is `hour(sort_key) << 36 | id` (`hour = sort_key / (1024 * 3_600_000)` clamped to
+`[0, 2^27 - 1]`: a hostile `sent_at` lands at the last hour, a negative one at 0; time-ordered by hour, reversible).
+
+THE FLUSH (the search task's job): (1) on the task's READ-ONLY core.db connection, in ONE read transaction, up to `batch`
+log rows above `applied`, their distinct ids and those ids' rows (absent = deleted), and the batch's last seq `N`;
+(2) ONE IMMEDIATE search.db transaction: per id the entry `indexed` names goes (a tombstone, `dead + 1`), the row's entry
+comes in if it is searchable now (above `floor`, not deleted, not view-once, the body parses and has words; sorted by
+rowid, FTS5 cuts a segment where a rowid goes down), `indexed` follows, `applied = N`, COMMIT; (3) the core prunes the
+log up to `N` (`DELETE FROM search_queue WHERE seq <= N`, a Low job of the core's writer posted after the commit,
+coalesced, never above what search.db committed; one job deletes at most 5,000 rows and posts itself again while rows at
+or below `N` remain, so a High job never waits for a whole-range delete). The snapshot at (1) holds every log row up to `N` and rows no older
+than them; a change after it appends a row above `N`, which the next batch reads with a newer snapshot. A kill anywhere
+replays from `applied`. THE POISON RULE (fix round 2): a skipped id may lose its words, never keep old ones, and `applied`
+never moves past an id whose take-out did not happen. The FIRST failure of a batch is the job's error (nothing moves; the
+task backs off 30 s and asks again); the SAME batch (same first seq, `applied + 1`) failing a second time is written
+again in one transaction with each id's take-out outside any savepoint (its failure fails the job, never skipped) and
+only the insert of its new entry in a savepoint: a failing insert that is a row's own error (a constraint, a value too
+big) skips the id (counted, never its content; the id is not searchable until its next change, its old words are
+gone); an error of the file or the machine (damaged, disk full, I/O, memory, busy, locked, interrupted, read-only,
+cannot open) is returned at once, and so is a batch whose every insert failed AND a throwaway insert (rolled back) fails
+too (the file, not the rows; a lone bad row, as a new message usually is alone in its batch, is skipped). After three
+failures in a row of the same first seq (the id-by-id pass included) the task builds the file again (`Rebuild::Stuck`),
+but only failures a rebuild can cure count: a file error (full disk, I/O, busy, locked...) backs off for good and never
+throws a healthy index away; the count lives in memory, a restart starts it again. The backfill has the same pass: a
+batch that fails for a row's reason is written again entry by entry, the failing rows are skipped and counted, and
+`floor` still moves (it reaches 0, which the 24 hour compaction rule waits for). The batch starts at 100 log rows and follows the last job's time against 20 ms
+(25 to 500). Every write job of the store that leaves log rows above `applied` wakes the search task, which starts at
+`UiReady` (flushing what a kill left), then sleeps on that wake, gathers for 300 ms and flushes until the log is drained;
+no timer while idle; its waits are `tokio::time`, never the core's clock. Search lags a write by about 300 ms. What can
+flip later (a protected, hidden or expiry-hidden row or chat, an account being removed) is a rule of the query, never of
+the index.
+
+WHICH core.db A search.db BELONGS TO (the open checks, at `UiReady` on the search task; each a rebuild, never a
+migration): the file cannot be opened or decrypted, or is damaged, or was left half made; its `version`
+(`SEARCH_FILE_VERSION`) or `norm` (`NORMALIZER_VERSION`) is not the build's; its epoch is not core.db's
+`search/epoch` (a restore, a rebuilt or replaced core.db); core.db's log position (`sqlite_sequence` of `search_queue`)
+is BELOW its `applied` (an older copy of core.db under the same epoch, whose next seqs would be skipped); the log no
+longer holds every seq above its `applied` (`Rebuild::LogPruned`: an older copy of search.db beside a core.db whose log
+was pruned past it, whose deletes and new rows of that stretch would never be applied: the log is contiguous, so the
+check is "empty and position = applied, or the smallest seq is at most applied + 1", read in the same snapshot as the
+epoch). ANY error of these checks that is not core.db's own (a `meta` without its numbers, an epoch that is not text, a
+renamed column) is a rebuild too (`Rebuild::Unjudged`): search.db is never needed, so no error of reading it leaves
+search not ready. The rebuild deletes the MAIN FILE first, then `-wal`, `-shm`, `-journal` (a kill between leaves side
+files without their file, which the next open clears before it makes a new one; the other order could leave an older main
+file whose log tail was already pruned). Making the file (new or rebuilt): one core.db read snapshot gives the epoch, the
+log position `P`, `max(messages.id)` and the compaction ask; the file gets `applied = P`, `floor = top = max id`,
+`dead = 0`. A path that rewrites message ids or replaces the rows
+wholesale must write a new epoch in its own transaction (`search::log::new_epoch`); there is none in this build.
+
+#### The backfill
+
+The rows that were there when the file was made (`floor = max(messages.id)` then) are written by the backfill: from
+`Timeouts::search_backfill` after `UiReady` (10 s, so the start, the first frame and the memory trim do not pay for it),
+one batch per job on the search task, newest id first, sized as the flush's, with 80 ms between two batches; the log is
+always flushed first. A batch reads the rows at or below `floor` from a core.db read snapshot, writes them, their
+`indexed` rows and the new `floor` in ONE search.db transaction: a kill leaves both or neither. THE INVARIANT: the index
+holds entries only for ids above `floor`, so the flush skips the log rows of ids at or below it (the backfill reads
+those rows as they are when it gets there) and the backfill inserts without looking for an old entry (a duplicate would
+be for good: two entries of one rowid with different text keep the older text findable after any delete and any merge,
+critic H3). Progress is `1 - floor / top`. A new `search::NORMALIZER_VERSION` or `SEARCH_FILE_VERSION`, and a file FTS5
+or SQLCipher finds damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`; once, then the 30 s back-off), take the rebuild: the old
+file is deleted (side files first), a new one made from one core.db snapshot, and the paced backfill writes everything
+again. The core's writer never waits for any of it.
+
+#### Deleted words
+
+A delete in the contentless index writes a tombstone: no query finds the row, but its tokens' bytes stay in the
+segment's pages until the segment is merged. The compaction folds the segments into one: FTS5's `merge` with -64 (about
+64 pages written per step, every level as one) until a step does no work. It runs to its END with NO flush between its
+steps (the writer is the search task's own: the log waits in core.db, the core's writer never waits, the query is
+untouched), with 30 ms between two steps; then `PRAGMA wal_checkpoint(TRUNCATE)` of search.db, asked again every 500 ms
+while a reader holds a snapshot; `checkpoint_due` in `meta` stays set until a TRUNCATE went through (a kill after the
+compaction's end, 120 refused tries (then again after 10 minutes), a rebuild, a large WAL at open). `secure_delete`
+zeroes what the merge frees. It is due when `dead` (tombstones since the last compaction, only deletes that found an entry
+in `indexed`) is above 0 and either core.db's `compact_after` (a clear, a chat's delete here or on the phone, an
+account's removal store the log's position there in their own transaction) is above search.db's `compacted_for` and
+`applied` has reached it, or 24 hours have passed on the core's clock since `dead_since` (the first time a tombstone was
+seen; one ahead of the clock is set to the clock's now) and the backfill is over (`floor` 0). A compaction takes `dead` as
+its snapshot at its start and subtracts it at its end, never setting it to 0, and `compacted_for` becomes the ask it
+answered. The task's one sleep on the core's clock is that 24 hour deadline, armed only while tombstones wait for it.
+So: deleted words leave the file within minutes after a clear, a chat's delete or an account's removal, once the log has
+drained, and within a day of Kourier running after a single delete or an expiry (his answer "Within a day";
+`search::compact::WINDOW_MS`, the one constant to change). FTS5's own `deletemerge` (10 %) also merges a level at the
+flush that left it a tenth deleted, on the search task too.
+
+#### The query
+
+`Query::Search(SearchQuery { text, chats, limit, before })` answers `QueryData::Search(SearchPage { hits, next, capped,
+index })`. The typed text is cut by the index's own rules (at most 512 bytes and 32 words); a word of two letters or
+more is a prefix ("фай" finds "файли"), a one-letter word finds itself only (his answer "From two letters",
+`search::MIN_PREFIX`). The MATCH is built from those terms alone, each quoted, ANDed in `words:(…)`, and a list of chats
+goes into the SAME expression as `meta:("c<id>" OR …)`, so a row of another chat is never stepped or looked up; the
+expression is a bound parameter. No word, or an EMPTY list of chats, answers an empty page (never every chat).
+
+The walk steps search.db's rowids newest first (`hour << 36 | id`) on search.db's read connection, and looks each
+candidate up by primary key on core.db's own read connection with the query-time rules (not deleted, not view-once, not
+hidden by the sweeper; the chat not deleted here and not protected; the account not being removed; and in the list of
+chats, for the moment between a merge and the flush): the index may lag the messages, the query never shows the lag. It
+cuts each snippet (a row whose text no longer holds the words, or whose joined terms do not stand side by side, is
+dropped; no mark touches a spoiler), collects to the end of the HOUR in which the page filled, sorts that hour by
+`(sort_key, id)` and cuts to the limit (at most 100). The cursor is `(sort_key, id)` of the last hit. A page looks up at
+most 5,000 rows and runs at most one second; one that stops so answers what it found with `capped: true`, the hour it
+stopped in comes in id order (arrival, not time), and the cursor's `resume` says where the next page goes on, so every
+hit comes once and the walk ends whatever the size of an hour. A capped page ALWAYS has a `next` (privacy MEDIUM-2): one
+that stopped before it looked at any row gives the cursor it was asked with again, never a final "nothing", and so does
+a search that found the index not ready or a newer search asked; the window asks on for at most 8 capped pages in a
+row and then says that more may exist (`SearchView.capped`), never "No results" while capped pages are still coming.
+`SearchIndexState { ready, percent }` is the backfill's progress (`1 - floor / top`); "not ready" until the search task
+has judged the file.
+
+One search at a time runs on the reader's connections, opened at the first search and closed by `ReleaseMemory` (the
+store keeps both files' paths and `DbKey`s for that, zeroized on drop). A newer search interrupts the running one
+(`sqlite3_interrupt`, tied to the search's generation under one lock, so it never lands on the next search), a search
+queued behind the running one that is older than the newest asked ends at once unanswered (the generation is compared
+when it gets the connection, privacy MEDIUM-3), and the time cap interrupts too, 250 ms after the walk's own check, for a
+single step that runs on (a prefix's doclist is built from every chat before the first row).
+
+Known limits (M11): a scoped reply's TIME, and through the one-second cap `capped` and how many hits it holds, can
+depend on text outside the scope (a prefix term builds its doclist from every chat); G2 owes its own answer for grants.
+
+#### The viewmodel
+
+The viewmodel keeps ONE message search at a time (`UiSource::search_messages(text, chat)`, `more_search`, `close_search`, `search_view(filter)`; `Changes::search`). A new text or chat starts a new search: the query tracker's floor rises, so an answer to an older text, or to a page asked for it, is dropped whenever it comes (one guard, the generations of `QueryTracker`). The first page is `SEARCH_PAGE` = 50 hits from the newest, a page more after the last hit when the list scrolls to its end; a page the core stopped early (`capped`) that leaves fewer than a page shown goes on by itself (the core's walk ends, so this does too).
+
+A hit is a chat row (his answer "Like a chat row"): the chat's picture, name, archive flag and account chip (the list's chip rule while searching, `AccountTable::decorate` + `finish`), the message's time (`list_label`), its sender by the list's rule for a preview's author ("You"; a first name in a group; nobody in a 1:1 chat or in Note to Self) and ONE line, the core's snippet rendered by the rule of the list's previews (`preview::text_line`): a spoiler's stretch is `■■■`, a mention `@Name`, what matched is bold only where no spoiler touches it (the core marks none there; the viewmodel drops such a mark again), the characters that hide or reorder text go by batch 1's rule (`richtext::hides_in_link`: an override, an isolate, a zero-width space go; a Persian word keeps its ZWNJ, an emoji sequence its ZWJ). The line is HTML-escaped for a `Text.StyledText` label (`&`, `<`, `>`, `"`; `<b>` around the matches is its only markup); `SnippetLine.plain` is the same text without markup (the accessible name). A file name's line carries the file icon.
+
+**What may show (S-P, fail closed).** A hit shows only while the list holds its chat and does not call it protected: the view reads the list each time it is built, so a chat that turns protected, is hidden or leaves the list takes its hits off at the list read that says so, before any search answer (`Changes::search` with that list read). A chat removed (`ConversationsRemoved`) and an account removed (`AccountRemoved`) drop their hits from what is kept at once.
+
+**Hits on screen follow changes (critic H5).** `MessagesChanged`, `TimelineInvalidated` and `ConversationsChanged` naming a chat of the shown hits (or the chat a one-chat search is limited to), and `ContactsChanged` of an account of a shown hit, read the hits again from the newest, as many as are shown (up to one query's 100: the rows past it are dropped, so a deleted message never stays, and "more" loads them again), `REREAD_AFTER` = 500 ms after the first such event; later events join it, so a busy chat cannot hold the read back. The front-end arms one wake-up for `UiSource::search_deadline` (as for `flags_deadline`) and calls `UiSource::search_due`. A merge moves a one-chat search to the chat that stays; a lagged channel (`reload`) reads the hits again.
+
+**Opening a hit (critic B1, L1).** `UiSource::open_at(conv, message)` REPLACES `open_conversation` for a hit (one App body, G1m): the window is read AROUND the message before any page at the newest messages, so `maybe_mark_read` (which marks nothing while `has_newer`) marks an old hit's chat nothing read and sends no read receipt; a hit at the newest messages reads as any open. On the open chat a loaded row is shown at once (`Changes::jump`), else the window moves around it; a chat opened a moment ago whose first page is still on its way has that page dropped (the tracker's floor) and the window around the hit asked at once. A hit that went away meanwhile: the notice "The message is no longer available." (search's own words; a quote keeps "The original message is no longer available."), then the newest page and what any open does.
+
+`FixtureSource` answers a search from the fixture's own messages (letters and digits, a word's start, any case: not the core's rules) and says what `set_search_index(ready, percent)` set; `EmptySource` has no search (the defaults).
+
+#### In the window
+
+RegExp mode (RegExp filters R5). `SearchQuery.mode` is `Words` or `Pattern { match_case }`; the field's `.*` and `Aa` toggles set it through `UiSource::set_search_mode(regex, match_case)` (the mode is part of what a search asks, so the same text in another mode is another search, and a running search starts again). The core compiles the pattern on the search's blocking thread with the filters' syntax and limits (`filters::compile`: refused as a typed `CoreError::Filter(FilterRefusal::Pattern(Field::Text, ..))`, never quoted), then SCANS `messages` newest first (`search/pattern.rs`) under the SAME query-time rules as the index walk (`hit_rules!`: not deleted, not view-once, not hidden, the chat not deleted and not protected, the account not being removed) and runs the regex over what search reads (`searched_texts`); the snippet's marks are the regex's matches (`snippet::pattern_snippet`). A search of one chat walks `messages_timeline` (`(sort_key, id)` keyset), every other one the primary key (`id` descending, arrival order). A page ends at `limit` hits, at the end of the table, or at `TIME_CAP` (`capped`, with a `next`: the cursor is the last row LOOKED AT; the clock is read every 256 rows and never before the first). The page carries the compiled pattern (`SearchPattern`, an `Arc<Regex>` with a redacted `Debug`): the viewmodel hands it to `ConversationFilter` (`regex`, `pattern`), so the chat list's titles pass by the pattern the core compiled (before the first answer none passes) and nothing compiles on the Qt thread; the Qt thread runs only `facade::filters::check` on each key for the inline error. "Save as Filter" opens R2's dialog through `FilterDialog.openWith` with the pattern in Message text and `name_from_pattern`. A pattern search does not read the index (its "still being prepared" line is off in this mode). Known limit: a message's mention is its raw text in the scan, as in the word search.
+
+THE HITS. While a message search has hits, the chat list shows them UNDER the chats it filters, in the list's footer: a `Kirigami.ListSectionHeader` "Messages", then one row per hit (`SearchResultDelegate`, laid out like a chat row), newest first. A row holds the chat's picture, the chat's name (with the account chip by the list's rule while searching), the message's time, and one line: the author by the list's preview rule and the snippet, in bold where it matched. The hits are a `Repeater` of the footer (a delegate per loaded hit, not lazy); a page more is asked when the footer's end is within ten grid units of the view (`moreHitsSoon`, through `Qt.callLater`). Without a query there are no hits and the footer is the archive entry, so no picture of the list moves. A message search is always running for a non-empty text (a delay of 200 ms after the last key, `App.searchMessages`), so "No chats match" no longer exists.
+
+KEYS. The field keeps the keyboard while the person types: a letter never moves it and Enter never opens a hit (L13). Enter is the quick switch only: it opens the first chat. Down from the field goes into the list (the first chat; with no chat, the first hit), Down past the last chat enters the hits (no chat row is current), Down and Up move between hits, Up from the first hit goes back to the last chat or to the field. Page Up and Page Down, Home and End are the list's and skip the hits (from a hit they return to a chat row). The hits are not items of the list's accessible List; each row has its own accessible name (the chat, "author: snippet", the time).
+
+ESCAPE (call 2). On a hit it gives the keyboard back to the field (text and hits stay, nothing opens); in the field it clears the text, ends the search and ends a chip. Emptying the field ends the search at once.
+
+THE ONE-CHAT CHIP. Ctrl+Shift+F (the chat page's shortcut) and the chat's overflow menu entry "Search in Chat" (its first entry) put a chip with the open chat's name in front of the field: "In: <chat>" with the chat's picture and an X ("Search All Chats"). What is typed then searches that chat alone, only its hits show (the chats part of the list is empty while the chip stands, Enter does nothing, the archive entry is hidden). The X, or Backspace in an empty field, takes the chip off and the same text searches every chat; Escape ends the chip with the search. The chip ends by itself when another chat opens or the chat turns protected; a protected chat offers no search in it (the menu entry is not shown, the shortcut does nothing; a header still loading counts as not searchable). The chip sits BEFORE the field, not inside it.
+
+THE INDEX LINE. While the index fills, a quiet line "Older messages are still being prepared for search (N %)" stands under the "Messages" header, and with no hit it explains the "No results" line. The viewmodel asks again 2 s after an answer whose index is not ready (`INDEX_REREAD_AFTER`), so the percent moves and the line ends with no key; the line is read from `SearchView.index`.
+
+NO RESULTS. "No results for “<text>”" shows only after the core answered the text typed (`askedText` equals the field's text, the model `answered` this search for this chat, not `capped`, no chat, no hit); between a key and the answer the placeholder is empty.
+
+OPENING A HIT. A click opens the hit's chat through `App.openSearchResult`, which uses the viewmodel's `open_at`: the window is read AROUND the message first and no page of the newest messages, so an old hit's chat is not marked read and no receipt goes out (B1). A hit in an archived chat opens that chat with no reveal: the archive view does not open, the list stays as it is (the text, the hits, the view; M4).
+
+#### Known limits
+
+- Opening a hit (P1, kept as decided): a hit among the newest ~24 rows opens the chat at its end, like a plain open, and
+  reads it like one (the window holds the newest rows, so the chat is marked read and receipts go for what a plain open
+  would send them for). A hit farther back marks nothing read.
+- A shutdown interrupts the search writer's running step or flush and the query's running search (C4); the interrupted
+  write rolls back and is redone at the next start. The search key is never core.db's: the core refuses to start with one
+  key for both files, and `CoreConfig::new` takes it as a required argument.
+- A skipped id (a row the index could not take on two tries) is not searchable until its next change; the file is built
+  again when the same batch fails three times for a reason a rebuild can cure (never for a full disk, an I/O error or a
+  busy file).
+
+- Search lags a write by the flush's 300 ms, and an old profile's rows are found only once the backfill (G1c) reached them.
+- While a compaction runs (82 s at 2M rows in G1f) new messages are not findable; a deleted message is never SHOWN
+  meanwhile (the query looks every hit up in core.db).
+- An old profile's messages are found only once the backfill reached them: newest ids first, about 13 minutes per 2M
+  rows paced (G1f), from 10 s after the window shows.
+- "Within a day" counts from when the search task first saw the tombstone (300 ms after the delete, or after the start
+  for a delete made before a kill), plus the compaction's own run (82 s at 2M rows in G1f) and a reader that holds the
+  checkpoint (`checkpoint_due` asks again).
+- A rebuild deletes the old file at once (its pages go with the file, not zeroed in place: on an SSD the blocks are
+  the filesystem's to reuse).
 
 ## 6. Signal backend (`kourier-signal`)
 
@@ -4426,7 +4793,9 @@ flavours/OnPrem config in `BackendConfig` (Threema).
    At the release the shell reports presence (not focused, no chat on screen), calls
    `App.windowReleasing()`, which sends `UiCommand::ReleaseMemory` (the core lets go of the
    page caches and prepared statements of its connections and reads them again when it is next
-   asked something; the call does not wait for it), and calls `destroy()`, which only
+   asked something, and hands every account's RUNNING backend `Command::ReleaseMemory`, a hint
+   that is neither durable nor queued, so each backend's long-lived `backend.db` connection gives
+   its cache back on the thread or task that owns it; the call does not wait for any of it), and calls `destroy()`, which only
    schedules the deletion. When the window object is really gone (a 50 ms timer polls for
    it), the shell runs `gc()` and `App.windowReleased()`, which calls `malloc_trim(0)` and
    nothing else: it must never touch presence, because an activation can fall between the two
@@ -4508,9 +4877,10 @@ crates/kourier-qt/qml/
                               as original file" toggle, and a quiet note marks a file type some
                               client of the network will not save (features.hard_to_save);
                               emoji popup, reply/edit banner; disabled with reason from features.cannot_send
-  composer/EmojiPopup.qml     popup around composer/EmojiGrid.qml: category tabs and a grid over the
-                              static singleton Emoji.qml (there is no Rust EmojiModel yet); the
-                              reaction picker uses the same grid
+  composer/EmojiPopup.qml     popup around composer/EmojiGrid.qml, the ONE emoji picker (search field,
+                              Favorites + Unicode-group tabs, pin/star menu) over the Rust `EmojiModel`
+                              and `EmojiLists`; the reaction picker uses the same component;
+                              EmojiCells.qml (a grid of cells), EmojiCell.qml (one emoji)
   settings/*.qml              FormCard pages via pageStack.pushDialogLayer: General (tray, autostart,
                               compact layout), Notifications, Privacy (shows synced read-receipt/typing
                               settings read-only in M1; since LOC its first row is the
@@ -4856,6 +5226,59 @@ hold), `History` (`TransferStatus.qml` phase `history`: a quiet line, a bar only
 known, no button) and, for an ended ban, `Error` with "Reconnect" (§4.5). A refusal line under a
 bubble wraps when no timer stands beside it (a reason with a timer still elides).
 
+#### 8.3.1 The selection mode
+
+Selecting messages (Copy as Text now, the export and Forward later) is state below the seam: `kourier_viewmodel::selection::Selection`
+(Qt-free) holds the conversation, whether the mode is on, the selected `MessageId`s, the range anchor and the last loaded order of the
+selectable rows (every row with a message id: messages, notices, calls, "deleted" lines; never a date header, the unread marker or the
+loading row). `TimelineRust` owns one; every new row list of the open chat goes through `observe` and `mark` in `App::refresh_timeline`
+before `set_rows`, so a reload, a reset (`diff_or_reset`) and paging keep the flags (`MessageRow.selected`, the model's `selected` role);
+`observe` drops a selected row that went inside the loaded window (its nearest still-loaded rows before and after it are there), keeps
+a row at an edge, a window that jumped and every id outside the window, and ends the mode in another chat. A toggle patches only the
+rows whose flag changed (`models::patch_row`, the `selected` role): the timeline is not built again. `TimelineModel` has `selecting`,
+`selectedCount` and `selectStart/Toggle/Extend/Clear`, `copySelected`. Copy as Text asks the core for the rows (`Query::MessagesByIds`),
+builds the text from the viewmodel rows the timeline maps (`CoreSource::rows_of`, `selection::copy_text`) and answers through the copy
+channel of `App` (`take_copy`, `Changes::copy`).
+QML: while selecting ONE plate (`MouseArea` over the viewport in `TimelineView.qml`) takes every left click and maps it to a row, so
+pictures, links, quotes, "Read more" and text selection rest; wheel events and the other buttons pass through. Outside the mode ONE
+passive `TapHandler` at list level (`acceptedModifiers: Qt.ControlModifier`, an exact match) starts it, the blocks' own left-tap handlers
+take `Qt.NoModifier`, and `TimelineActions.ctrlPress` keeps a link of a text from opening on that click. Keys: Escape ends the mode before
+it goes back to the composer, Space toggles the keyboard's current row, Ctrl+C copies. "Select" / "Deselect" in the message menu is the one
+entry that is no core rule (a window state): the menu's guard counts it apart from `actions.any`, so every message row has a menu. The bar
+(`composer/SelectionBar.qml`: "%1 selected", Copy as Text, Export Selected…, Cancel; a row too narrow for the words, measured from the texts with `TextMetrics`, shows the three buttons as icons with their text as a tooltip) stands in the composer's place inside the `Composer` (its content is
+hidden, the composer stays alive: draft, typing state and restore logic keep running).
+
+Export Selected (`docs/export-format.md` holds the archive's format). The bar ALWAYS keeps its counter, Copy as Text, [Export Selected…]
+and Cancel; [Export Selected…] is off at none selected, while an export runs ("An export is running.") and when the header says the chat
+may not be exported (`ChatHeader.export_off`, the typed `Refusal` of `ConversationDetail::export()` worded in `export::flow::refusal_text`,
+protected chats included; the tooltip is that text). Cancel and Escape in the bar always end the selection mode, never an export. A click
+is `Query::ExportPlan`; the plan's answer opens `dialogs/ExportDialog.qml` (loaded by URL on first use) with `DialogView::to_json` (numbers
+and sizes only). The dialog words them and adds nothing up: on every tick change it asks `App.exportNumbers(ticks)`, which answers from the
+plan the `Dialog` stage holds (`DialogNumbers::shown`: the messages and, per kind, the files and bytes that go with these ticks; a
+disappearing message's file goes only with the disappearing tick AND its kind's tick; "" in any other stage, where the dialog keeps what
+`show` was given, as on a fixture page). The dialog shows three kind ticks (all on), the disappearing tick (only for such messages, off, with
+its warning), what is left out and why, and the warning (not encrypted). The plan stays in `CoreSource` (`core_source/exporting.rs`, stages
+Idle, Planning, Dialog, Picking, Building, Running) until the export ends or the dialog is closed. [Export…] asks for the save dialog
+(`App.saveDialogSource()`, suggested `<chat> <date> <time>.zip` through `save_name::clean_name`, in the last save folder; the chat's title
+is the one the documents use, gathered once with them in `export_chat_facts`, and a direct chat whose peer's name hides an identity is
+called "Chat", never a number); its answer is `App.exportPicked`, which takes the facts and `OffsetTable::from_plan` on the Qt thread
+(`QtCalendar` is not `Send`) and runs `export::build` on the runtime's blocking pool with a fresh 32-byte salt from the thread-local CSPRNG
+(`rand::rng()`, ChaCha seeded by the OS; the pseudonyms are SHA-256 keyed with it); back on the Qt thread the `UiCommand::ExportArchive` goes
+out (the command sink is not `Send`). A name the file dialog confirmed to replace goes with `SaveMode::Replace`, any other with `NoReplace`;
+an `Exists` answer to a no-replace name is sent again under the next numbered name, as the save flow does, unless the export was cancelled
+meanwhile (`Active.cancelled`): then it ends as cancelled and writes nothing. The archive's entries are the files, `index.html`,
+`messages.jsonl`, `manifest.json`. While it runs the window's FOOTER shows the strip `components/ExportStrip.qml` (the label, a progress bar
+that is indeterminate until the total is known, "Cancel Export"): it belongs to the export, not to the open chat, so a chat switch keeps it
+and its Cancel sends `CancelExport` for THE export. A second plan while one stands (dialog, save dialog, running) answers
+`ExportUpdate::Refused` ("An export is running."): a notice only. An end carries its chat (`ExportEnd.conv`); `sync_export` tells QML
+`ends_selection_in(open chat)`, so a finished export ends only its own chat's selection and a chat opened since keeps its picking. At the end
+`MainWindow.notify` tells "Exported %1 messages" with "Show in Folder" (failed files counted and named on the screen, each name cleaned
+and cut to 60 characters), `Changed`, `Cancelled` and every failure keep the selection. The export's save dialog and the attachments' share
+the window's one loader: while the export's stands, Save on an attachment is refused ("Finish or cancel the export first."), and the export's
+dialog asked while another stands is refused ("Close the other save dialog first.") and its plan dropped; a loader item that goes any other
+way drops the plan too, so Export Selected… never stays off. Known limit: Replace is decided by a `symlink_metadata` stat of the name the file
+dialog confirmed, so a dangling symlink there counts as taken and is replaced. One export per window at a time.
+
 ### 8.4 Rust models and the viewmodel crate
 
 | Model | Rows / roles | Source |
@@ -4866,7 +5289,8 @@ bubble wraps when no timer stands beside it (a reason with a timer still elides)
 | `TimelineModel` | kind, blocks (QVariantList), author, authorId, showAuthor, showDateHeader, time, outState, edited, reactions, replyPreview, actions (what the core allows for the row, §3.8) | windowed (≤ 500 rows), keyset paging, diffs from `kourier-viewmodel` |
 | `MemberListModel` | user, name, avatarUrl, admin, isSelf; key = the member's user id | the group page's member rows (§8.3 P2b): `App.groupMembers` (every listed member, narrowed by its `filter` string through the viewmodel's `member_matches`) and `App.groupPreview` (the first `members_preview` rows), both filled where the group answer arrives and diffed in place |
 | `MediaListModel` | attachment, message, kind, url, fullUrl, placeholderUrl, animated, media, pixelWidth, pixelHeight, mediaState, progress, sizeLabel, fileName, detail, iconName; key = the attachment's id; properties `more`, `other`, `loaded` | the gallery of a chat (§8.3 P4): four instances, `App.groupMedia` and `App.personMedia` (the six squares of a page's section), `App.mediaGrid` and `App.mediaFiles` (the level of all media); each is one `MediaSlot` of the viewmodel and is filled where `Changes.chat_media` arrives, diffed in place (a download is one `dataChanged`, a page an insert at the end, a deletion a remove) |
-| `EmojiModel` | | |
+| `EmojiModel` | glyph, name (interface language); properties `group`, `query`, `count` | the rows of one Unicode group or the hits of a search, positions in the static table of `kourier_viewmodel::emoji` (`crates/kourier-viewmodel/src/emoji/table.rs`, written by `cargo xtask emoji` from `third_party/unicode-emoji`: Emoji 16.0, the newest the system font Noto Color Emoji 2.047 draws; no skin-tone or hair variants, no `Component` group; 1,894 emoji; names and search words in English and Ukrainian from CLDR 49); nothing is built before a picker sets `group` or `query`, and a closed picker sets them back so no rows are kept. Search (`emoji::search`): query words folded (case, Latin accents, apostrophes), each the start of a word of a name or keyword, the interface language's hits first, then the other language's, each in the table's order; a pasted emoji first. |
+| `EmojiLists` | `pins`, `hoverPins` (the first 3), `favourites`, `recent` (QStringList); `used`, `togglePin`, `toggleFavourite`, `flush` | ONE local list for every account (nothing goes to a network; Signal's preferredReactionEmoji is neither read nor written), kept in `kourier.toml` as `emoji-pins` (absent = Signal's six, an empty list is a choice), `emoji-favourites`, `emoji-recent` (newest first, at most 24); `EmojiLists` is the ONE writer through `DesktopHandle::update_prefs` (the Settings page lists none of them); pins and stars are written at once, the recent list 1.5 s after its last change |
 | `LoginController`, `ComposerController`, `SettingsController` | properties + invokables | commands |
 
 `kourier-viewmodel` (no Qt) does row building, grouping flags (same author within 5 min ⇒ no author
@@ -5507,6 +5931,25 @@ draws opaque rectangles over them (from `positionToRectangle`) until clicked. S4
 per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with a per-message
 "select text" mode.
 
+**RegExp filters in the viewmodel (R2, R3; the store and the matcher are §5.4's `filters` table and
+`kourier_core::filters`).** The core holds the one compiled `FilterSet` and hands it to every reader as an `Arc`
+(`CoreSource` keeps it, read again on `FiltersChanged`); nothing compiles a pattern on the Qt thread but the
+dialog's live syntax check (`filters::check`), and the core's save is the gate (`FilterRefusal`, shown under the
+field it names). `FilterSet::filters` is what compiled, and the matcher's indices point into it, never into the
+stored rows. `kourier_viewmodel::filter_marks` is the one place that makes what the filters look at and where they
+mark: `filter_texts` (the message text as shown with mentions as `@Name`, the WHOLE text even when "Read more" cuts
+it; the sender's name without WhatsApp's "~"; the chat's title; the notification path reaches the same function
+through the presenter), and `text_marks` / `sender_marks` / `chat_marks`, UTF-16 ranges of the SHOWN text with the
+filter's colour. Only filters with Highlight mark; the first filter's span wins and a later one is cut around it
+(never stacked); a span is clipped at the "Read more" cut; a span that touches or overlaps a spoiler is dropped whole
+and stays dropped after the reveal (a marker must not show where a hidden word stands); a jumbo-emoji message gets
+none; at most `MAX_SPANS` per text. `marker_colour` lays the filter's colour over the row's background with the
+strongest alpha from 0.45 down to 0.18 that keeps the text at 4.5:1. The rows carry the marks as data; the Qt
+front-end applies them to the message's document as a character background (`applyMarks`, the previous marks undone
+first) and draws a marked NAME as rich text: `markedNameHtml` escapes the name cut by `TextMetrics.elidedText`, wraps
+each range in one `<span style="background-color:#rrggbb">` (the colour blended opaque over the surface, the ellipsis
+never marked), and a name without marks stays plain text; `Accessible.name` stays the plain name.
+
 ### 8.5 Threading between tokio and the Qt thread
 
 - UI → core: invokables call `AppHandle::send(UiCommand)` (non-blocking). Results come back as
@@ -5670,6 +6113,25 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
 - Opening a file in another application asks first unless its MIME type is one of the picture,
   sound and video types the core names the copy after (`kourier-media`'s table); SVG, `image/x-*`
   and unknown types keep the sender's file-name extension and therefore ask.
+- Open in Slicer (a 3D model from a chat, his words of 2026-11-14; `kourier-app` `slicers`, §9.4 for the
+  question): the viewer's toolbar has a split button (a click starts the last slicer used, OrcaSlicer by
+  default; the arrow lists them) and the message menu of a model message an "Open in Slicer" sub-menu (offered
+  where the core offers the attachment for saving, never by a rule of QML). THE LIST IS FIXED, in his order:
+  OrcaSlicer, Bambu Studio, PrusaSlicer, UltiMaker Cura; one that is not installed is greyed with
+  "(not installed)", and the last entry, "Other Application…", is the XDG portal's chooser
+  (`org.freedesktop.portal.OpenURI.OpenFile` with the copy's descriptor and `ask: true`, `kourier-desktop`
+  `portal`; without a portal the copy opens in the desktop's default application). A slicer is found in the
+  applications directories of the XDG base-directory spec (and Flatpak's exports) by its desktop ids, else by
+  `Name=` plus a model MIME type (AppImage integrations); `Hidden`, a missing `TryExec` or Exec program mean
+  "not installed". It is started with the Desktop Entry spec's `Exec` rules, never through a shell and with the
+  environment cleaned as for links ([`opener`]): `%f %F %u %U` are the ABSOLUTE PATH of a copy in the core's
+  media cache (a `file://` URL would become a bogus path in Cura), and `@@u` becomes `@@` so a Flatpak's
+  `--file-forwarding` hands the path through the document portal. The copy ends in `.stl` or `.3mf` (the core
+  names the copy after the model type: a slicer picks its reader by the extension). NO PROTOCOL LINKS and no
+  local web server: no slicer's URL protocol takes a local file (`target/next/v6/research.md`), a slicer that
+  is already open is left to its own preference (no `--single-instance`), and the scan runs on a worker thread
+  (the Qt thread reads no directory). The preference `model-slicer` is written after a start that happened,
+  never for "Other Application…".
 - Blurhash placeholders while thumbnails decode.
 
 ### 8.7 Notifications
@@ -5690,6 +6152,28 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   earlier run of Kourier (their ids are not kept across restarts; whether Plasma 6 keeps its history across a login is
   not known), a server that restarted (ids mean nothing to it), and anything a user copied or a screenshot took. A
   chat that was protected before its first message in this run never shows a text at all.
+- RegExp filters (R4; his answers in `notes/kourier/regexp-filters.md`). Ingest stays regex-free: a
+  muted chat's live message is ALSO a candidate with `muted: true` (`NotifyCandidate`, `facade::Notification`;
+  a muted group's mention stays an ordinary candidate), and the supervisor drops a muted candidate (and a held
+  call line) while `Shared::notify_muted_watch` is off (no valid filter has Notify and "Also in muted chats").
+  `Shared::notify_watch` (a valid filter has Notify) makes the supervisor keep the caught-up `(conv, message)`
+  ids, the newest `CATCH_UP_IDS` (2,000) per summary, carried by `UiEvent::CatchUpSummary { ids }`. The
+  desktop service holds the core's one `Arc<FilterSet>` (read at start, again on `FiltersChanged`) and decides
+  per candidate with `policy::decide` (pure; the three texts come from `Presenter::filter_texts`, which the Qt
+  presenter forwards to `kourier_viewmodel::notify::filter_texts` = R3's `filter_marks::filter_texts`; only
+  filters with Notify count, a muted candidate only those with "Also in muted chats", indices point into
+  `FilterSet::filters`): a muted candidate no filter wants is dropped; a hit in "Name and message" mode (never in
+  a protected chat, whose texts are not even made) is the filter's OWN notification, "chat · filter name"
+  (`Presenter::filter_title`), keyed `(chat, filter)` in the `NotificationBook` beside the chat's usual one
+  (an ordinary message of the chat updates the usual one and leaves the filter's), replaced by the next hit of
+  the same filter, withdrawn with the chat's read state, a delete or edit of its message, a chat that becomes
+  protected; in "Name only", "Hidden" and in a protected chat the message notifies as an ordinary one (a muted
+  one only if a filter matched). A click opens the chat at the message (`DesktopEvent::Activate { message }`,
+  `MainWindow.openFromActivation(id, message)` = the search hit's jump with the flash). The catch-up summary
+  is matched in the background (`Query::CaughtUpMessages`: one batched read of the rows, one read per chat for
+  its row, matching on a blocking thread): a line "%n match %1" per filter (up to 5, `Presenter::filter_matches`,
+  only in "Name and message" mode; a muted chat counts only for "Also in muted chats" filters, a protected
+  chat never) and its click opens the newest match. Nothing logs a pattern, a name or a text.
 - Delivery (`kourier-desktop`): own zbus client for `org.freedesktop.Notifications` with hints
   `desktop-entry=app.kourier.Kourier`, `image-data` (avatar), `category=im.received`,
   `x-kde-origin-name` (account when several), inline reply (`inline-reply` action +
@@ -5744,7 +6228,7 @@ per-delegate cost in the scroll test; the fallback is `Text` + `StyledText` with
   each press and changes it only through the controller's setter. The core's backstop refuses a
   located file that was not agreed to whatever the pref says (§5.8.1).
 - Blended chats (his answers 2026-10-13 to 2026-10-27; §8.3): two keys of `kourier.toml`, both shared
-  preferences like `round-avatars` (§8.10 R7). `blend-accounts` (bool, default `true`, a file from before it
+  preferences like `avatar-corners` (§8.10 R7). `blend-accounts` (bool, default `true`, a file from before it
   blends too): Settings > General, "Show chats of several accounts together" (uk «Показувати чати кількох
   акаунтів разом») after "Compact conversation list", with a small text that says Shift+click or Ctrl+click
   an account in the side panel adds it to the list (`SettingsController.blendAccounts`, LISTED in
@@ -5844,7 +6328,8 @@ front-end except its binary.
    reporter, a sink for `kourier_app::process::install_panic_hook`;
 6. picture decoding that keeps §8.6: bytes from the network go to the decoder
    `Codec::sniff` names, never to one the toolkit picks by content;
-7. the rendering of `RichText`, icons for the icon keys in rows, colours, fonts, the look.
+7. the rendering of `RichText` and of the filter marks (UTF-16 ranges and colours from
+   `kourier_viewmodel::filter_marks`), icons for the icon keys in rows, colours, fonts, the look.
 
 **Rules** (`cargo xtask deps-check` is to enforce R1 and R3; `i18n check` R4):
 - R1 Toolkit and desktop-framework code (cxx-qt, Qt, KDE Frameworks, gtk-rs, libadwaita) is
@@ -5980,7 +6465,9 @@ bus, `KOURIER_DESKTOP=0`).
   confirmation unless their type is a well-known picture, sound or video type (the confirmation
   escapes the sender's file name, because Kirigami's label guesses its text format), message
   RichText generated in Rust from a tag and scheme whitelist with
-  all text escaped (never markup from the network, §8.4), no link whose address holds an invisible or bidi
+  all text escaped (never markup from the network, §8.4), RegExp filter marks applied to that document as a
+  character format and a marked name escaped before its one background `<span>` (§8.4; patterns, like bodies and
+  names, are never logged and a refusal never quotes one), no link whose address holds an invisible or bidi
   character, a zero-width joiner out of context or a user name or password, a word becomes a link only by Signal
   Desktop's rule and opens as https (§8.4), the
   confirmation showing the address as a left-to-right isolate (§8.4), link previews off (not in M1); the
@@ -7127,7 +7614,12 @@ compact list, S13 core side, id fixes; 2026-10-06):
   http, https, mailto and file, so every `Qt.openUrlExternally` of the process (Kirigami's About
   page and link delegates call it themselves) goes there; other schemes keep Qt's services. Media
   research D2 rule 6 ("hardware probing off") is done for voice notes this way; a video player
-  inside the app takes its device types from a setting.
+  inside the app takes its device types from a setting. The same function sets `QV4_GC_TIMELIMIT=0`
+  (`kourier_qt::JS_GC_NOT_INCREMENTAL`, unless the person set it): the QML engine's JavaScript
+  collector runs in one go, as before Qt 6.8, because Qt 6.11.1's incremental collector crashed in
+  `free()` under `QV4::GCStateMachine::transition()` (`qml_smoke` 4 of 167 runs under gdb, 0 of 84
+  with the switch; Plasma has the same crash). The Qt window tests set it too
+  (`tests/support` `answer_list_of`). User decision 2026-11-11.
 - §8.6 avatars: handles live in `kourier-app` (`media::AvatarHandles`; the core's table covers
   attachments only); cropped round in C++ (also on the software renderer); the revision goes up
   when the same file comes back with another key; the table starts over at 16,384 entries. Group
@@ -7478,9 +7970,11 @@ groundwork and follow-ups; 2026-10-06/07):
   (`MessageActions.until`; no polling; it assumes the core clock runs at real-time speed from
   the page's `now`). Reaction chips toggle our reaction, their tooltip names who reacted, right
   click or long press opens the who-reacted list (`ReactionsPopup.qml`, anchored to the bubble;
-  our own entry can be removed). The picker is six quick emoji plus the whole grid
-  (`composer/EmojiGrid.qml`: static list, no search, skin tones or recents; the category tabs
-  share the grid's width and the grid leaves room for its scroll bar).
+  our own entry can be removed). The picker is the quick row of the PINNED emoji (up to six; Signal's
+  six on a fresh profile) plus the whole picker (`composer/EmojiGrid.qml`: see "Emoji" in §8.4; the tabs
+  share the grid's width and the grid leaves room for its scroll bar). The first three pins are also
+  one-click reaction buttons in a message's hover toolbar (`MessageDelegate.qml`, a Loader made only while
+  the toolbar shows, dropped first when the window leaves no room).
 - §8.3 composer modes: edit mode (banner "Edit Message" or "Edit Caption", prefilled text, Send
   = `EditMessage`, empty allowed only for captions, an unchanged text sends nothing, the draft
   typed before comes back afterwards; Up in an empty composer edits the newest editable own
@@ -8004,6 +8498,16 @@ revision history, the desktop side of S15; 2026-10-07):
   | Threema: a directory lookup waits 30 s and reads at most 64 KiB, its positive answers are cached 30 min for 256 IDs, and after a failed one the socket reconnects 60 s after the first hold when idle (10 min at the latest); a contact transaction waits 2 min for another device's and is begun at most 3 times for one message; a group sync request and a creator's answer go at most once an hour per group (and sender); the leader steps aside for the phone at most once in 15 min and asks which devices are online every 60 s while it holds something for the phone; an inbound reflect left unanswered by two sockets is held for the rest of the run (TH6) | `kourier-threema` `leader/directory.rs` `LOOKUP_WITHIN`, `CACHE_FOR_MS`, `CACHE_IDS`; `leader/mod.rs` `DIRECTORY_RETRY`, `DIRECTORY_RECYCLE`, `ASK_AGAIN`, `YIELD_EVERY`, `COOL_AT`; `leader/txn.rs` `TX_WAIT`, `MOST_BEGINS`; `leader/jobs.rs` `THROTTLE` | Kourier's own (the TH6 design review's numbers): the spec names no cache lifetime or wait for a lookup (a 429 asks for 10 s) and Desktop throttles a group sync request to one an hour | Added: a dead directory or an absent phone costs a reconnect a minute at most, never the account |
   | Pins: at most 4 per account (the remote config's `global.pinnedChatLimit`, default 4), counted from the stored account record's entries plus the queued pins (A10) | core `roaming::check` (`Refusal::TooMany`, per account, only when the network states `AccountCaps::max_pinned_chats`); `kourier-signal` `storage::intents::{pin_limit_of, intend}`, `storage::write::plan` (a rebase over the limit drops our newest addition), `Refused::TooManyPins` (answered `TooLarge`, A10d); `kourier-viewmodel` `roaming::offer_in_account` (Pin is greyed at the limit, the account's own count) | the phones: Desktop and Android refuse a 5th pin in their UIs and the pin list is shared with them (interop) | Kept: the phone's number, read from the config |
   | Storage Service writes: one write a second after the last change, at most 6 in 10 minutes and 30 in an hour per account, a 409 waits 1 s, 5 s, 30 s then the normal backoff (never under 30 s), a change not written in 30 days is dropped (A10c) | `kourier-signal` `storage::write::job` (`DEBOUNCE_MS`), `job/rate.rs` (`WINDOWS`), `intents::drop_stale` | nobody known: Kourier's own bound on the load it puts on the Storage Service and on the phone's merge work (BQ4) | Added |
+  | RegExp filters: a pattern at most 10,000 characters, a name at most 64, one compiled pattern at most 1 MiB (`\w{20}`; R6), a lazy DFA cache of 2 MiB per pattern and 8 MiB per field's set, at most 1,000 marks per text; no cap on the number of filters (his answer, 2026-11-13) | `kourier_core::filters` (`MAX_PATTERN_CHARS`, `MAX_NAME_CHARS`, `SIZE_LIMIT`, `DFA_SIZE_LIMIT`, `SET_DFA_SIZE_LIMIT`, `MAX_SPANS`) | resource bound: the core refuses at save with a typed `FilterRefusal` ("too large or too complex", no number); a stored filter that no longer compiles is left out of the set | Added (RegExp filters) |
+  | Caught-up messages kept for the filters' catch-up summary: the newest 2,000 (only while a filter has Notify) | `facade::CATCH_UP_IDS` | resource bound | Added (RegExp filters) |
+  | Pattern search: one page ends at `TIME_CAP` (the clock read every 256 rows) and goes on from the last row looked at | `search::pattern::CLOCK_EVERY` | pacing | Added (RegExp filters) |
+  | A model file tried: 256 MiB (`MAX_FILE_BYTES`); at most 2 M triangles after 3MF instancing (`MAX_TRIANGLES`), counted over instances before a non-finite one is dropped | `kourier-mesh` (size and count refused before any allocation) | Own: 2 M binary triangles are 100 MB, GPU peak ~700 MB (viewer-3d spikes); a larger file stays a file | Kept (new, 3D viewer V1) |
+  | ASCII STL line: 4 KiB (`MAX_ASCII_LINE`); a non-finite coordinate drops its triangle | `kourier-mesh` (line scan; `is_finite` per triangle) | no unbounded line; NaN/inf break the box and the renderer | Kept |
+  | 3MF ZIP: at most 4,096 entries (`MAX_ZIP_ENTRIES`; a linear signature pre-scan before the zip crate walks the file refuses more than 4 end-of-central-directory records or more than `MAX_ZIP_ENTRIES + 16` central headers, `Bound::ZipStructure` / `ZipEntries`; a local header is read once and the compressed bytes read never exceed the file's size), stored or deflate only, model XML at most 512 MiB uncompressed over all parts (`MAX_MODEL_XML_TOTAL`, counted while reading, the header's size never trusted) and no XML token (text, comment, tag) over 1 MiB (`MAX_XML_TOKEN`, plus the reader's 64 KiB read-ahead), `_rels/.rels` and `[Content_Types].xml` 64 KiB each (`MAX_SMALL_PART_BYTES`), slicer config parts 4 MiB each and 8 (`MAX_CONFIG_PART_BYTES`, `MAX_CONFIG_PARTS`; see the slicer config row) | `kourier-mesh` (zip crate features; `Counted` reader) | central-directory and zip bombs | Kept |
+  | 3MF XML: `<!DOCTYPE` refused, depth at most 32 (`MAX_XML_DEPTH`), no entity expansion; vertex index below the vertex count; transform of 12 finite numbers; units micron to meter only; at most 256 colours (`MAX_COLOURS`) | `kourier-mesh` (`threemf.rs`) | XXE, billion laughs, out-of-range index, NaN placement | Kept |
+  | 3MF slicer config parts (`Metadata/model_settings.config` + `project_settings.config` for Bambu Studio and OrcaSlicer, `Slic3r_PE_model.config` + `Slic3r_PE.config` for PrusaSlicer): 4 MiB each (`MAX_CONFIG_PART_BYTES`), at most 8 read (`MAX_CONFIG_PARTS`), at most 256 filament colours (`MAX_COLOURS`), a colour is `#RRGGBB` or `#RRGGBBAA` only; the XML has the same DOCTYPE and depth refusal; a fault of a config (missing, too large, not UTF-8, malformed, a bound broken) is ignored as a whole and never fails the mesh; only the ZIP guard still refuses the file | `kourier-mesh` (`slicer.rs`) | a hostile config part; a config must never cost the picture | Kept (new, 3D viewer V5) |
+  | 3MF structure: at most 64 distinct model part names (`MAX_MODEL_PARTS`, interned at parse time, each part read once), a part name of at most 1 KiB (`MAX_PATH_BYTES`), at most 256 material tables (`MAX_GROUPS`, empty ones count, a duplicate id is refused), component depth 16 (`MAX_COMPONENT_DEPTH`) with a cycle refused, at most 100,000 objects (`MAX_OBJECTS`), 3 M vertices (`MAX_VERTICES`) and 1 M build items, components and instance visits (`MAX_INSTANCES`) | `kourier-mesh` (`threemf.rs`) | part fan-out and instancing bombs; every loop is bounded by a cap, there is no timer | Kept |
+  | The still picture: edge clamped to 8..1024 px (`MIN_STILL_EDGE`, `MAX_STILL_EDGE`), at most 300 M bounding-box pixels visited (`MAX_RASTER_WORK`, the rest of the triangles are skipped) | `kourier-mesh` (`raster.rs`) | stacked full-frame triangles would otherwise take minutes | Kept |
 
   Not limits: the sticker send refusal (a missing feature), sender key needing two recipients
   (a path choice; there is no group size limit), unknown `DataMessage` flags and newer protocol
@@ -9855,6 +10359,18 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   put back), `rest` holds the row at the top again, and a removal of the held row holds the
   topmost row that stays before the list lays it out. `scroll_ui` forces both orders in its
   third and fourth wheel steps; the old code fails them in every run.
+- Nothing writes `contentY`, lays the list out or changes its model from inside the list's own
+  layout (2026-11-12, a crash of the test build after 2 h 40 min in Qt's `layoutVisibleItems`). The held row's
+  `setPosition` inside that loop emits `yChanged`, and the old handler wrote `contentY` there: the write makes the
+  ListView refill, and a move of more than a page releases every visible row while the loop goes on, so the loop's
+  next virtual call reads a freed row (a use-after-free, no longer a "row passed over"). The held row's `y` path
+  now asks the polish hook (`PolishHook`, `crates/kourier-qt/cpp/polishhook.h`: a Quick item with no content whose
+  `updatePolish()` emits `due`), which runs the correction at the end of that polish pass, before the scene graph is
+  synced: the same frame. The list finishes its layout before the hook runs, so by then it may have let the held
+  row's delegate go (a move of more than about a page), numbered the positions of its content anew from estimates
+  and brought the view back inside the content: the way back to the row is its model row number (`heldRow`,
+  `find()`), never a position read before, and that move of the list's is not taken for the user's. The detector
+  and the proof: `.claude/rules/timeline.md`.
 - A change of the list's height is put right in the frame that made it. The composer is the page's footer, so a composer
   that grows (an edit starts, a new line, the reply banner) or shrinks (save, cancel) is a list that changes its height,
   and so is a resized window. `onHeightChanged` calls `settle()` itself: following, the newest message is put back above
@@ -10144,6 +10660,10 @@ the timeline: "I was trying to scroll up but app actively returned me to bottom"
   `rowmenumuted`, `mutemenu`, `muteuntil`, `chatmenu`). Known limits: Ctrl+Shift+U can be taken by IBus's Unicode entry (a real run on the
   user's session decides); after a click on the toast's Undo the keyboard stays in the overlay until it moves; the fixture's two accounts cannot
   tell the first account's facts from the second's, so one mutant of the offer's account lookup is not killable with them.
+
+### Message search limits (G1)
+
+Measured and decided limits of §5.9, each with who enforces it: the query is cut at 5,000 rows looked up and one second a page, and the window asks on for at most 8 capped pages (`SearchView.capped`, the core); a word of 2+ letters is a prefix (`search::MIN_PREFIX`); a text is cut at 512 bytes and 32 words (`query_terms`); a token at 64 bytes (`normalize`); the log prune deletes at most 5,000 rows a job (the core's writer); deleted words leave the file within a day of Kourier running (`search::compact::WINDOW_MS`; PRIVACY.md). A hit among the newest ~24 rows opens the chat at its end and reads it like a plain open.
 
 ## 14. FOSS readiness track (user requirement, 2026-10-06)
 
@@ -10995,19 +11515,44 @@ keep is §8.10):
   dependency's file is shown without the registry path; the line passes `logging::redact`,
   goes to the log and to the front-end's sink, and then the previous hook runs. The line is the same
   with the stripped release binary: the file comes from `core::panic::Location` in `.rodata`.
+- The list's look (his words 2026-11-11, settings batch): three more keys of `kourier.toml`, written by
+  the Settings controller (`drafts-on-top`, `show-account-tags`) and by the App's account menu (`account-tags`).
+  DRAFT ORDER ("in there is draft message - chat should go up in list by default. It should be a setting"):
+  Settings > General > "Move chats with a draft to the top", on by default. Signal Desktop's rule
+  (`maybeUpdateDraftPreview`, `_getConversationComparator`): a chat LEFT with a changed draft is stamped
+  with the time (`conversations.draft_at`, core.db 25, the unit of `last_activity`; `UiCommand::SaveDraft`
+  is what the composer sends when the chat is left, and the core stamps it: a changed text is stamped
+  again, the same text keeps its stamp, a cleared draft loses it); the list sorts a chat by the draft's
+  time while that is newer than its last message (`viewmodel::conversations::order_time`, the row's
+  `order_at`), else by the message, so a newer message outranks an older draft and clearing or sending the
+  draft puts the chat back; pinned chats stay first. core.db's own page order stays `last_activity`: the
+  front-end reads the whole list and sorts it, so the switch is a PREFERENCE (`UiSource::set_list_look`),
+  not a core setting, and no migration of the list query was needed. ACCOUNT TAGS ("a short tag ... only
+  the chat list shows; plus a switch to hide"): the account menu's "Chat List Tag…" gives an account a tag of
+  up to 8 characters (`account-tags`: uuid to tag, local only, never sent to a network); only the chat
+  list's account chip shows it, in place of the account's name (an account without one shows the name; the
+  drawer and Settings keep the name); Settings > General > "Show account tags in the chat list" (on by
+  default): off, no chat row names its account (the network icon and number stay).
 - Avatar shape (user, 2026-10-08: "add option to force disable avatars rounding. May be
-  this should also be theme-dependent"). Settings > General > "Round avatars"
-  (`round-avatars` in `kourier.toml`, default on, a shared preference: §8.10 R7). Off,
-  avatars are squares whose corners have the theme's radius (`Kirigami.Units.cornerRadius`),
-  so the shape follows the theme; everywhere the UI draws an avatar and in the notification
-  avatars. Avatars are cut in the image provider, not clipped in QML: the request is
+  this should also be theme-dependent"; 2026-11-11: "for avatars we also should have radius setting,
+  not just switch"). Settings > Appearance > "Avatar corners" (`avatar-corners` in `kourier.toml`, a
+  slider 0 to 100, default 100, a shared preference: §8.10 R7): the corner radius as a percentage
+  of half the side, 0 a square, 100 a circle; it REPLACED the switch "Round avatars" (`round-avatars`):
+  a file that has only the old key reads `true` as 100 and `false` as 20
+  (`OLD_SQUARE_AVATAR_CORNERS`: the old square had the theme's small corner, about a fifth of half a
+  list avatar), and the old key is never written again. It holds everywhere the UI draws an avatar and in the notification
+  avatars. Beside it Settings > Appearance has "Message corners" (`message-corners`, 0 to 100,
+  default 30): the bubbles' corner is a tenth of the theme's corner radius per step (30 = the
+  bubble of old, three times the theme's radius; `Style.bubbleRadius`), the tight corner of grouped
+  messages a third of it; a small preview (an avatar and two bubbles) follows the sliders as they
+  move, the preferences are written a moment after the last move. Avatars are cut in the image provider, not clipped in QML: the request is
   `image://kourier/avatar/<handle>?v=<rev>&r=<radius>` with the corner in pixels of the
   requested size (a circle at half the side or more, or when `r` is missing), and the
   payload header is `[format, flags, codec, radius u16 LE]`; a change of the setting is a
   new request, so the avatars on screen change at once. `Avatar.qml` draws the tinted
   shape, the initials and the glyph itself, because Kirigami Add-ons' `Avatar` draws a
-  fixed circle outline. The notification avatar takes the theme's corner as a share of the
-  side from QML (`App.settings.avatarCorner`; Breeze's share until the window has said). Like it,
+  fixed circle outline. The notification avatar takes the slider's share of half its side
+  (`kourier_qt::desktop::avatar_corner`). Like it,
   `blend-accounts` and `hidden-accounts` (§8.9) are shared preferences of `kourier.toml`.
 - Two CI tiers (user, 2026-10-08: "tests should be optimized or there should be some lower
   count subset to test regularly and full set for bigger cases"). `cargo xtask ci --quick

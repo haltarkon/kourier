@@ -495,6 +495,8 @@ impl Actor {
             // Handed to a running connection; without one a hint never connects (only `Connect`).
             Command::NetworkChanged => self.nudge(Nudge::NetworkChanged),
             Command::Resumed => self.nudge(Nudge::Resumed),
+            // The connection lives on this thread: released between zones, here.
+            Command::ReleaseMemory => self.db.release_memory(),
             // `relink` and `taken` become the login's `Rules`, checked at `EssentialData` (brief §2.7).
             Command::StartLogin {
                 flow,

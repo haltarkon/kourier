@@ -296,3 +296,39 @@ path = [
 SPDX-FileCopyrightText = "2026 The Kourier developers"
 SPDX-License-Identifier = "AGPL-3.0-only"
 precedence = "override"
+
+# qt-build-utils 0.10.0 (KDAB's cxx-qt build helper) with Kourier's patch Q1, vendored
+# (third_party/qt-build-utils/VENDORED.md). Its .rs files carry their own SPDX headers (KDAB,
+# MIT OR Apache-2.0; the patched qmlcachegen.rs adds Kourier's line); the manifest crates.io
+# normalised carries none, so this override keeps `**/Cargo.toml` (CC0) from claiming it.
+[[annotations]]
+path = "third_party/qt-build-utils/Cargo.toml"
+SPDX-FileCopyrightText = "2022 Klarälvdalens Datakonsult AB, a KDAB Group company <info@kdab.com>"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+precedence = "override"
+
+# Kourier's own record of the vendored copy, and its rustfmt switch.
+[[annotations]]
+path = ["third_party/qt-build-utils/VENDORED.md", "third_party/qt-build-utils/rustfmt.toml"]
+SPDX-FileCopyrightText = "2026 The Kourier developers"
+SPDX-License-Identifier = "AGPL-3.0-only"
+precedence = "override"
+
+# The Unicode emoji data (third_party/unicode-emoji/VENDORED.md: emoji-test.txt and the CLDR annotations for
+# en and uk) and the table `cargo xtask emoji` makes of it: Unicode License v3 (AGPL-compatible), copyright
+# Unicode, Inc. Last, with override, so the `**/*.md` and `crates/**/*.rs` tables do not claim them.
+[[annotations]]
+path = [
+    "third_party/unicode-emoji/**",
+    "crates/kourier-viewmodel/src/emoji/table.rs",
+]
+SPDX-FileCopyrightText = "1991-2026 Unicode, Inc."
+SPDX-License-Identifier = "Unicode-3.0"
+precedence = "override"
+
+# Kourier's own record of that copy.
+[[annotations]]
+path = "third_party/unicode-emoji/VENDORED.md"
+SPDX-FileCopyrightText = "2026 The Kourier developers"
+SPDX-License-Identifier = "AGPL-3.0-only"
+precedence = "override"

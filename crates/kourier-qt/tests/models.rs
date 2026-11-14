@@ -7,10 +7,13 @@ mod support;
 use std::pin::Pin;
 
 use cxx_qt_lib::{QGuiApplication, QModelIndex, QString, QVariant};
-use kourier_model::{AccountId, ConversationId, RangeKind, Text, TextRange, UserId};
+use kourier_model::{
+    AccountId, ConvKind, ConversationId, MessageId, NetworkKind, RangeKind, Text, TextRange, UserId,
+};
 use kourier_qt::bridge::qobject::{self, ConversationListModel, TimelineModel};
 use kourier_qt::models::{self, ListModel};
 use kourier_viewmodel::group::GroupMemberRow;
+use kourier_viewmodel::search::{SearchRow, SearchView, SnippetLine};
 use kourier_viewmodel::share::ShareTarget;
 use kourier_viewmodel::timeline::{AlbumBlock, Block, FileBlock, ImageBlock, UploadView};
 use kourier_viewmodel::{ConversationFilter, FixtureSource, NameMap, UiSource, readmore, richtext};
@@ -25,7 +28,7 @@ fn main() {
     }
     cxx_qt::init_crate!(kourier_qt);
     let _app = QGuiApplication::new();
-    let checks: [Check; 18] = [
+    let checks: [Check; 23] = [
         (
             "timeline rows, roles and an appended message",
             timeline_rows_and_roles,
@@ -45,12 +48,20 @@ fn main() {
         ("accounts", accounts_model),
         ("the member rows of a group's page", members_model),
         (
+            "the search rows: a view shows, a stale one changes nothing, the snippet is escaped",
+            search_rows_model,
+        ),
+        (
             "the share picker lists only the account's chats that can send",
             share_targets_exclude,
         ),
         (
             "a wait line is patched into its row only",
             a_wait_line_is_patched_into_its_row,
+        ),
+        (
+            "the Qt form of a row is built when QML first asks for it",
+            qt_rows_are_built_on_first_data,
         ),
         (
             "a ring is patched into its row only",
@@ -67,6 +78,14 @@ fn main() {
         (
             "a mention keeps the look of the text, a link its own",
             a_mention_keeps_the_look_of_the_text,
+        ),
+        (
+            "marker backgrounds survive the recoloring of links",
+            marks_survive_colorlinks,
+        ),
+        (
+            "a marked name's html escapes the name and holds only the marker spans",
+            a_marked_name_is_escaped,
         ),
         (
             "a row carries the pages its menu offers",
@@ -91,6 +110,10 @@ fn main() {
         (
             "an Until time that is no date is refused",
             an_until_time_that_is_no_date_is_refused,
+        ),
+        (
+            "the selection lives in the model and survives a reset",
+            the_selection_lives_in_the_model,
         ),
     ];
     let mut failed = 0;
@@ -192,6 +215,56 @@ fn timeline_rows_and_roles() {
     assert_eq!(m.rows(), after.as_slice());
 }
 
+/// A reset and an insert build no `QString` and no `QVariant`: a row's Qt form is made by the
+/// first `data()` of the row (structs.md #1: QML reads the visible rows only), a changed row is
+/// emptied and built again when read (its announced roles are the same), and a read gives what
+/// an eager build gave. Mutant: `apply` builds every row again.
+fn qt_rows_are_built_on_first_data() {
+    let mut src = FixtureSource::new().expect("fixture");
+    let conv = src.fixture().long_chat;
+    let rows = src.timeline(conv);
+    assert!(rows.len() > 6, "{}", rows.len());
+    let mut model = qobject::new_timeline_model();
+    let mut m: Pin<&mut TimelineModel> = model.pin_mut();
+    assert!(models::set_rows(m.as_mut(), 1, rows.clone()));
+    assert_eq!(m.row_count(&root()) as usize, rows.len());
+    assert_eq!(m.store().built(), 0, "a reset builds no row");
+    let kind0 = string(timeline_data(&m, 0, "kind"));
+    let kind1 = string(timeline_data(&m, 1, "kind"));
+    assert!(!kind0.is_empty() && !kind1.is_empty());
+    assert_eq!(m.store().built(), 2, "only the rows asked for");
+    // The same row again is not built again.
+    timeline_data(&m, 0, "kind");
+    assert_eq!(m.store().built(), 2);
+    // An insert at the top (a sent message) builds nothing either.
+    let id = src
+        .send_text(conv, "lazy", None)
+        .expect("send")
+        .expect("the fixture assigns ids");
+    let after = src.timeline(conv);
+    assert!(models::set_rows(m.as_mut(), 2, after.clone()));
+    assert_eq!(timeline_data(&m, 0, "messageId").value::<i64>(), Some(id.0));
+    assert!(m.store().built() <= 3, "{}", m.store().built());
+    let built = m.store().built();
+    // A patched row is emptied; it is built again with the new values when it is read.
+    let mut row = after[0].clone();
+    row.blocks.clear();
+    row.edited = !row.edited;
+    let before = m.store().built();
+    if models::patch_row(m.as_mut(), 0, row.clone()) {
+        assert!(m.store().built() < before, "a patched row is emptied");
+    }
+    let _ = built;
+    assert_eq!(m.rows()[0].edited, row.edited);
+    // Whatever was never read is built from the rows as they are now.
+    let last = m.row_count(&root()) - 1;
+    assert_eq!(
+        string(timeline_data(&m, last, "kind")),
+        "date",
+        "the last row builds from its view row"
+    );
+}
+
 fn stale_generations_are_dropped() {
     let src = FixtureSource::new().expect("fixture");
     let conv = src.fixture().long_chat;
@@ -249,6 +322,7 @@ fn conversation_list_ops() {
             .collect(),
         query: String::new(),
         archived: false,
+        ..Default::default()
     };
     let filtered = src.conversations(&work);
     models::set_rows(m.as_mut(), 3, filtered.clone());
@@ -430,6 +504,108 @@ fn members_model() {
     assert!(
         <Members as ListModel>::key(&a) != <Members as ListModel>::key(&member(2, "Anna", false))
     );
+}
+
+fn hit(message: i64, chat: i64, html: &str, plain: &str) -> SearchRow {
+    SearchRow {
+        message: MessageId(message),
+        conv: ConversationId(chat),
+        account: AccountId(1),
+        network: NetworkKind::Fake,
+        kind: ConvKind::Direct,
+        is_self: false,
+        title: format!("Chat {chat}"),
+        avatar_url: String::new(),
+        author: String::new(),
+        snippet: SnippetLine {
+            html: html.to_owned(),
+            plain: plain.to_owned(),
+        },
+        icon: String::new(),
+        time_label: "10:00".to_owned(),
+        sent_at: message,
+        sort_key: message,
+        archived: false,
+        account_badge: String::new(),
+        badge_icon: String::new(),
+        badge_number: 0,
+        tint: String::new(),
+        sender: "Sender".to_owned(),
+        sender_avatar_url: String::new(),
+        own: false,
+    }
+}
+
+fn view_of(rows: Vec<SearchRow>) -> SearchView {
+    SearchView {
+        active: true,
+        rows,
+        ..SearchView::default()
+    }
+}
+
+/// The message search's rows (G1m): the model shows what a search answer holds, an answer of an
+/// older generation changes nothing (rows and properties), a row's snippet role is the escaped
+/// markup and its plain twin is the text, and a re-read that drops a hit removes that row only.
+fn search_rows_model() {
+    let mut model = qobject::new_search_list_model();
+    let mut m = model.pin_mut();
+    let data = |m: &qobject::SearchListModel, row: i32, name: &str| {
+        m.data(
+            &m.index(row, 0, &root()),
+            role(&models::search::ROLES, name),
+        )
+    };
+    // Nothing is shown before a search.
+    assert_eq!(m.row_count(&root()), 0);
+    assert!(!*m.active());
+    assert!(*m.index_ready());
+
+    let rows = vec![
+        hit(30, 7, "a &lt;b&gt; <b>word</b>", "a <b> word"),
+        hit(20, 7, "<b>word</b> again", "word again"),
+        hit(10, 8, "the <b>word</b>", "the word"),
+    ];
+    let mut view = view_of(rows.clone());
+    view.more = true;
+    view.index_ready = false;
+    view.index_percent = 40;
+    assert!(m.as_mut().show(5, view));
+    assert_eq!(m.row_count(&root()), 3);
+    assert_eq!(*m.count(), 3);
+    assert!(*m.active() && *m.more() && !*m.index_ready());
+    assert_eq!(*m.index_percent(), 40);
+    assert_eq!(m.message_at(1), 20);
+    assert_eq!(m.conversation_at(2), 8);
+    assert_eq!(m.message_at(3), 0);
+    // The snippet: escaped markup for a StyledText label, the plain text apart.
+    assert_eq!(
+        string(data(&m, 0, "snippetHtml")),
+        "a &lt;b&gt; <b>word</b>"
+    );
+    assert_eq!(string(data(&m, 0, "snippetPlain")), "a <b> word");
+    assert_eq!(string(data(&m, 1, "title")), "Chat 7");
+
+    // An answer of an older generation changes nothing of the rows or the properties.
+    let mut stale = view_of(vec![hit(99, 9, "x", "x")]);
+    stale.more = false;
+    stale.index_ready = true;
+    assert!(!m.as_mut().show(4, stale));
+    assert_eq!(m.row_count(&root()), 3);
+    assert_eq!(m.message_at(0), 30);
+    assert!(*m.more() && !*m.index_ready());
+
+    // A re-read without the deleted message removes that row alone.
+    let after = vec![rows[0].clone(), rows[2].clone()];
+    assert!(m.as_mut().show(6, view_of(after)));
+    assert_eq!(m.row_count(&root()), 2);
+    assert_eq!(m.message_at(0), 30);
+    assert_eq!(m.message_at(1), 10);
+    // The search ends: the rows and the flags go.
+    assert!(m.as_mut().show(7, SearchView::default()));
+    assert_eq!(m.row_count(&root()), 0);
+    assert!(!*m.active());
+    assert_eq!(m.store().resyncs, 0);
 }
 
 fn share_target(id: i64, account: i64, title: &str, can_send: bool) -> ShareTarget {
@@ -676,6 +852,120 @@ fn a_mention_keeps_the_look_of_the_text() {
         lines[1],
         format!("https://kde.org {} 1 0", hex(&link)),
         "an ordinary link: the link color and the underline"
+    );
+}
+
+/// RegExp filters R3: the marker backgrounds are set on the document by `applyMarks` and
+/// `colorLinks` (which merges a foreground only) leaves them alone; the link keeps its own colour
+/// under a mark.
+fn marks_survive_colorlinks() {
+    use cxx_qt_lib::{QColor, QColorNameFormat, QList, QMap, QMapPair_QString_QVariant};
+    let link = QColor::from_rgb(10, 20, 200);
+    let ink = QColor::from_rgb(30, 40, 50);
+    let hex = |c: &QColor| c.name(QColorNameFormat::HexRgb).to_string();
+    let mark = |start: i32, len: i32, color: &str| {
+        let mut m = QMap::<QMapPair_QString_QVariant>::default();
+        m.insert(QString::from("start"), QVariant::from(&start));
+        m.insert(QString::from("len"), QVariant::from(&len));
+        m.insert(
+            QString::from("color"),
+            QVariant::from(&QString::from(color)),
+        );
+        QVariant::from(&m)
+    };
+    let mut list = QList::<QVariant>::default();
+    list.append(mark(0, 3, "#80ffd60a"));
+    let marks = QVariant::from(&list);
+    let looks = qobject::rich_text_marked(
+        &QString::from("<a href=\"https://kde.org\">kde.org</a> and more"),
+        &marks,
+        &link,
+        &ink,
+    )
+    .to_string();
+    let lines: Vec<&str> = looks.lines().collect();
+    assert_eq!(lines.len(), 1, "one marked fragment: {looks}");
+    assert_eq!(
+        lines[0],
+        format!("0 3 #80ffd60a {}", hex(&link)),
+        "the background stays and the link keeps its colour"
+    );
+}
+
+/// RegExp filters R3 (the third form of rich text, `CLAUDE.md`): `markedNameHtml` makes the html of
+/// a name from the ESCAPED name and nothing else but `<span style="background-color:#rrggbb">`:
+/// a name that carries markup (an `<img>` pointing at a remote address, `&`, a quote) shows as text.
+fn a_marked_name_is_escaped() {
+    use cxx_qt_lib::{QColor, QList, QMap, QMapPair_QString_QVariant};
+    let name = r#"Ann <img src="https://example.invalid/x.png"> & "Co""#;
+    let shown = QString::from(name);
+    let surface = QColor::from_rgb(255, 255, 255);
+    let mark = |start: i32, len: i32| {
+        let mut m = QMap::<QMapPair_QString_QVariant>::default();
+        m.insert(QString::from("start"), QVariant::from(&start));
+        m.insert(QString::from("len"), QVariant::from(&len));
+        m.insert(
+            QString::from("color"),
+            QVariant::from(&QString::from("#80ffd60a")),
+        );
+        QVariant::from(&m)
+    };
+    let mut list = QList::<QVariant>::default();
+    // Over "Ann ", and over the `&` inside the name.
+    list.append(mark(0, 4));
+    let amp = i32::try_from(
+        name.encode_utf16()
+            .position(|u| u == u16::from(b'&'))
+            .expect("&"),
+    )
+    .expect("small");
+    list.append(mark(amp, 1));
+    let html =
+        qobject::marked_name_html(&shown, &shown, &QVariant::from(&list), &surface).to_string();
+    assert!(
+        !html.contains("<img"),
+        "no tag of the name survives: {html}"
+    );
+    assert!(
+        !html.contains('"') || html.matches("style=\"").count() == 2,
+        "{html}"
+    );
+    // Strip the only markup that may be there; what is left holds no raw `<`, `>` or `&`.
+    let mut rest = html.clone();
+    while let Some(i) = rest.find("<span style=\"background-color:#") {
+        let end = rest[i..].find("\">").expect("the tag ends") + i + 2;
+        let tag = &rest[i..end];
+        assert_eq!(
+            tag.len(),
+            "<span style=\"background-color:#rrggbb\">".len(),
+            "{tag}"
+        );
+        rest.replace_range(i..end, "");
+    }
+    rest = rest.replace("</span>", "");
+    for entity in ["&lt;", "&gt;", "&amp;", "&quot;"] {
+        rest = rest.replace(entity, "");
+    }
+    assert!(
+        !rest.contains(['<', '>', '&', '"']),
+        "a raw character is left: {rest}"
+    );
+    assert!(
+        html.contains("&lt;img"),
+        "the name's tag is shown as text: {html}"
+    );
+    assert!(html.contains("&amp;"), "{html}");
+    // Without marks the name is escaped the same way.
+    let plain = qobject::marked_name_html(
+        &shown,
+        &shown,
+        &QVariant::from(&QList::<QVariant>::default()),
+        &surface,
+    )
+    .to_string();
+    assert!(
+        !plain.contains("<img") && !plain.contains("<span"),
+        "{plain}"
     );
 }
 
@@ -1156,4 +1446,80 @@ fn an_until_time_that_is_no_date_is_refused() {
             "a time outside the calendar is refused ({year}-{month}-{day} {hour}:{minute})"
         );
     }
+}
+
+/// The selection mode (Export Selected, SEL): the flag is the `selected` role, a toggle changes that
+/// role of that row alone, a reset of the rows keeps the flags, a row that went inside the window
+/// leaves the count, and another chat ends the mode.
+fn the_selection_lives_in_the_model() {
+    use kourier_viewmodel::MessageRow;
+    let src = FixtureSource::new().expect("fixture");
+    let conv = src.fixture().long_chat;
+    let rows = src.timeline(conv);
+    let ids: Vec<MessageId> = rows.iter().filter_map(MessageRow::message_id).collect();
+    assert!(ids.len() > 6, "the fixture chat has messages");
+    let selected = |m: &TimelineModel, id: MessageId| -> bool {
+        let at = m.row_of(id).expect("the row is there");
+        timeline_data(m, at, "selected")
+            .value::<bool>()
+            .expect("a bool")
+    };
+    let mut model = qobject::new_timeline_model();
+    let mut m: Pin<&mut TimelineModel> = model.pin_mut();
+    m.as_mut().set_header(conv.0, None);
+    let mut shown = rows.clone();
+    m.as_mut().observe_selection(Some(conv), &mut shown);
+    assert!(models::set_rows(m.as_mut(), 1, shown));
+    assert!(!*m.selecting());
+    assert!(ids.iter().all(|id| !selected(&m, *id)));
+
+    // Start, toggle, and the flag of each row.
+    let (first, middle) = (ids[0], ids[ids.len() / 2]);
+    m.as_mut().select_start(first.0);
+    assert!(*m.selecting());
+    assert_eq!(*m.selected_count(), 1);
+    assert!(selected(&m, first) && !selected(&m, middle));
+    m.as_mut().select_toggle(middle.0);
+    assert_eq!(*m.selected_count(), 2);
+    assert!(selected(&m, middle));
+    // A date header is no row to select.
+    let header = m
+        .rows()
+        .iter()
+        .find(|r| r.message_id().is_none())
+        .expect("a date header");
+    assert!(!header.selected);
+
+    // A new row list of the same chat that is a reset (every row in the other order): the flags stay.
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    m.as_mut().observe_selection(Some(conv), &mut reversed);
+    assert!(models::set_rows(m.as_mut(), 2, reversed));
+    assert_eq!(*m.selected_count(), 2);
+    assert!(selected(&m, first) && selected(&m, middle));
+
+    // Shift+click extends from the anchor over the loaded order.
+    m.as_mut().select_extend(ids[3].0);
+    assert!(*m.selected_count() >= 3);
+
+    // A row that was deleted inside the window leaves the count; one at the edge would stay.
+    let mut without: Vec<MessageRow> = rows
+        .iter()
+        .filter(|r| r.message_id() != Some(middle))
+        .cloned()
+        .collect();
+    let before = *m.selected_count();
+    m.as_mut().observe_selection(Some(conv), &mut without);
+    assert!(models::set_rows(m.as_mut(), 3, without));
+    assert_eq!(*m.selected_count(), before - 1);
+    assert!(*m.selecting());
+
+    // Another chat: the mode ends, no flag is left.
+    let mut other = rows.clone();
+    m.as_mut()
+        .observe_selection(Some(ConversationId(conv.0 + 1)), &mut other);
+    assert!(models::set_rows(m.as_mut(), 4, other));
+    assert!(!*m.selecting());
+    assert_eq!(*m.selected_count(), 0);
+    assert!(m.rows().iter().all(|r| !r.selected));
 }

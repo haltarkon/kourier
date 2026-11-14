@@ -471,19 +471,20 @@ impl Apply<'_> {
         if cs.blocked {
             return Ok(());
         }
-        let candidate = NotifyCandidate {
-            conv,
-            message: id,
-            mentions_me: false,
-        };
         if how.catch_up {
             self.ch.catch_up.push(conv);
-        } else if !self.may_notify(&cs, false) {
-            // Muted: unread, and nobody is told.
-        } else if how.held {
-            self.ch.held_calls.push(candidate);
-        } else {
-            self.ch.notify.push(candidate);
+        } else if let Some(muted) = self.may_notify(&cs, false) {
+            let candidate = NotifyCandidate {
+                conv,
+                message: id,
+                mentions_me: false,
+                muted,
+            };
+            if how.held {
+                self.ch.held_calls.push(candidate);
+            } else {
+                self.ch.notify.push(candidate);
+            }
         }
         Ok(())
     }

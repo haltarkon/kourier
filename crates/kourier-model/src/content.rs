@@ -324,10 +324,45 @@ pub struct Attachment {
     /// with the message; never shown.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub net_ids: Vec<String>,
+    /// What the core learned from a downloaded 3D model (STL, 3MF) when it derived the still
+    /// picture; read from the attachment's row, never part of the stored body. `None` for
+    /// every other file and for a model the core could not read.
+    #[serde(skip)]
+    pub model: Option<ModelFacts>,
+}
+
+/// The facts of a 3D model file the core derived with its still picture (core.db `model_*`
+/// columns): the size of its bounding box in millimetres, the triangle count and whether the
+/// still is a shade picture the front-end tints (a model without colours of its own).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModelFacts {
+    /// Width (X) in millimetres.
+    pub x_mm: f32,
+    /// Depth (Y) in millimetres.
+    pub y_mm: f32,
+    /// Height (Z) in millimetres.
+    pub z_mm: f32,
+    /// Triangles.
+    pub tris: u32,
+    /// The still is a shade picture: multiply it by the model colour.
+    pub tint: bool,
+}
+
+// The sizes are finite (the parser drops non-finite coordinates), so `==` is an equivalence.
+impl Eq for ModelFacts {}
+
+impl std::hash::Hash for ModelFacts {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.x_mm.to_bits().hash(state);
+        self.y_mm.to_bits().hash(state);
+        self.z_mm.to_bits().hash(state);
+        self.tris.hash(state);
+        self.tint.hash(state);
+    }
 }
 
 crate::redacting_debug!(Attachment {
-    id, kind, mime, size, dims, duration_ms, caption, state, remote, local, thumb, long_text
+    id, kind, mime, size, dims, duration_ms, caption, state, remote, local, thumb, long_text, model
 } redact { file_name, blurhash, waveform, net_ids });
 
 /// What a backend learned while downloading an attachment.

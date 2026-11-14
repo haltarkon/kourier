@@ -131,6 +131,7 @@ fn kde_libraries() -> Vec<PathBuf> {
 fn main() {
     println!("cargo::rerun-if-changed=qml");
     println!("cargo::rerun-if-changed=icons");
+    println!("cargo::rerun-if-changed=shaders");
     let mut files = Vec::new();
     qml_files(Path::new("qml"), &mut files);
     files.sort();
@@ -144,14 +145,12 @@ fn main() {
         .iter()
         .map(|p| {
             // Shared constants (`Style`), translations (`L10n`), the media actions
-            // (`MediaActions`), the message actions (`TimelineActions`) and the emoji lists
-            // (`Emoji`) are QML singletons.
-            const SINGLETONS: [&str; 5] = [
+            // (`MediaActions`) and the message actions (`TimelineActions`) are QML singletons.
+            const SINGLETONS: [&str; 4] = [
                 "Style.qml",
                 "L10n.qml",
                 "MediaActions.qml",
                 "TimelineActions.qml",
-                "Emoji.qml",
             ];
             let singleton = p
                 .file_name()
@@ -186,8 +185,11 @@ fn main() {
         .cpp_file("cpp/devtools.cpp")
         .cpp_file("cpp/desktop.cpp")
         .cpp_file("cpp/imageprovider.cpp")
+        .cpp_file("cpp/modeldata.cpp")
+        .cpp_file("cpp/modeldata.h")
         .cpp_file("cpp/kde.cpp")
-        .cpp_file("cpp/i18n.cpp");
+        .cpp_file("cpp/i18n.cpp")
+        .cpp_file("cpp/polishhook.h");
     let kde_include_dirs = kde_libraries();
     // SAFETY: only include directories are added; no flag that changes how cxx-qt's own
     // sources are compiled.
@@ -199,5 +201,8 @@ fn main() {
     if dev {
         builder = builder.cpp_file("cpp/devcontrol.cpp");
     }
-    builder.qrc_resources(icons).build().export();
+    let mut resources = icons;
+    resources.push("shaders/wire.frag".to_owned());
+    resources.push("shaders/wirecolor.frag".to_owned());
+    builder.qrc_resources(resources).build().export();
 }

@@ -449,6 +449,8 @@ pub enum CopyAsked {
     Person(CopyPart),
     /// An action on a group's invite link.
     Invite(kourier_model::GroupInviteAction),
+    /// Copy as Text of the selection mode, in this conversation.
+    Selected(ConversationId),
 }
 
 /// The answer to a copy action: what goes on the clipboard and what the toast says. The text

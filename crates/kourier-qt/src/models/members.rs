@@ -94,7 +94,7 @@ impl qobject::MemberListModel {
     pub fn user_at(&self, row: i32) -> QString {
         usize::try_from(row)
             .ok()
-            .and_then(|r| self.store.qt.get(r))
+            .and_then(|r| self.store.qt_row(r))
             .map(|r| r.user.clone())
             .unwrap_or_default()
     }

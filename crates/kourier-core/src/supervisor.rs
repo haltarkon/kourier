@@ -144,6 +144,17 @@ pub struct Timeouts {
     pub restore_answer: Duration,
     /// See [`Self::restore_answer`].
     pub restore_pending: Duration,
+    /// How long after `UiReady` the search index starts on the messages it does not hold yet
+    /// (the backfill, `search::index`; decisions M2: 10 s, so the start, the first frame and
+    /// the memory trim do not pay for it). Tests shorten it.
+    pub search_backfill: Duration,
+    /// The pause between two backfill batches (80 ms, `search::index::PACE`). The fixture page
+    /// `searchindexing` stretches it to an hour, so the index stays at its first batch (G1j).
+    pub search_pace: Duration,
+    /// The wait before each FILE entry of an export's archive (zero by default). Only the
+    /// window test of Export Selected sets it, to hold an export running; a cancel still ends
+    /// it at once.
+    pub export_entry_pause: Duration,
 }
 
 impl Timeouts {
@@ -167,6 +178,9 @@ impl Default for Timeouts {
             restore_pending: Duration::from_millis(
                 crate::ingest::restore::PENDING_WAIT_MS.unsigned_abs(),
             ),
+            search_backfill: crate::search::index::BACKFILL_AFTER,
+            search_pace: crate::search::index::PACE,
+            export_entry_pause: Duration::ZERO,
         }
     }
 }
@@ -227,6 +241,11 @@ pub(crate) enum Control {
     Backend(Command),
     /// A connectivity hint: collected and passed to a running, linked actor as one command.
     Hint(Hint),
+    /// `UiCommand::ReleaseMemory`: tell a RUNNING actor (linked or not) to give back its
+    /// databases' caches ([`Command::ReleaseMemory`]). Not a hint: it never takes the single
+    /// debounced `hint` slot, so a pending `NetworkChanged` or `Resumed` is still delivered, and
+    /// it never starts a connect. An account whose actor does not run ignores it.
+    ReleaseMemory,
     /// Durable commands; resent from `pending_commands` at the next start if not running, or
     /// when the login that runs is done.
     Durable(Vec<(CmdId, DurableCommand)>),
@@ -431,6 +450,8 @@ pub(crate) struct Supervisor {
     /// stayed up for a whole window, so the backoff starts over.
     attempt: u32,
     catch_up: (u32, BTreeSet<ConversationId>),
+    /// The newest caught-up messages, while some filter has Notify ([`CATCH_UP_IDS`]).
+    catch_up_ids: VecDeque<(ConversationId, MessageId)>,
     typing: HashSet<(ConversationId, UserId)>,
     syncing: bool,
     /// The outbox scheduler (§4.8).
@@ -492,6 +513,7 @@ impl Supervisor {
             failures: VecDeque::new(),
             attempt: 0,
             catch_up: (0, BTreeSet::new()),
+            catch_up_ids: VecDeque::new(),
             typing: HashSet::new(),
             syncing: false,
             dispatch: Dispatcher::new(account, rules),
@@ -615,13 +637,31 @@ impl Supervisor {
                     per_second = per_second.round(),
                 );
             }
+            let ids = std::mem::take(&mut self.catch_up_ids).into();
             if n > 0 {
                 self.emit(UiEvent::CatchUpSummary {
                     account: self.account,
                     messages: n,
                     conversations: u32::try_from(convs.len()).unwrap_or(u32::MAX),
+                    ids,
                 });
             }
+        }
+    }
+
+    /// Remembers the caught-up messages for the summary's filter matching: only while some
+    /// valid filter has Notify, the newest [`crate::facade::CATCH_UP_IDS`].
+    fn keep_catch_up_ids(&mut self, ids: Vec<(ConversationId, MessageId)>) {
+        if !self
+            .sh
+            .notify_watch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.catch_up_ids.extend(ids);
+        while self.catch_up_ids.len() > crate::facade::CATCH_UP_IDS {
+            self.catch_up_ids.pop_front();
         }
     }
 
@@ -1022,6 +1062,7 @@ impl Supervisor {
                             "not linked yet; command dropped"
                         );
                     }
+                    Some(Control::ReleaseMemory) => run.send(Command::ReleaseMemory).await,
                     Some(Control::Hint(hint)) => {
                         let resumed = hint == Hint::Resumed
                             && !matches!(self.hint, Some((Hint::Resumed, _)));
@@ -1429,7 +1470,7 @@ impl Supervisor {
             // The backend's answer came after its actor stopped: the pause still lifts.
             Control::Released(user) => self.confirmed(&user).await,
             // Nothing to tell: the next actor connects when it starts.
-            Control::Hint(_) => {}
+            Control::Hint(_) | Control::ReleaseMemory => {}
             other => {
                 tracing::debug!(account = self.account.0, control = ?other, why, "ignored");
             }
@@ -1855,19 +1896,25 @@ impl Supervisor {
             }
         }
         self.sh.notify(account, &ch.notify);
-        self.sh.hold_calls(account, ch.held_calls);
+        let watch_muted = self.sh.watches_muted();
+        let mut held = ch.held_calls;
+        held.retain(|c| !c.muted || watch_muted);
+        self.sh.hold_calls(account, held);
         for conv in ch.catch_up {
             self.catch_up.0 = self.catch_up.0.saturating_add(1);
             self.catch_up.1.insert(conv);
         }
+        self.keep_catch_up_ids(ch.catch_up_ids);
         if !self.syncing && self.catch_up.0 > 0 {
             // Catch-up rows that arrive outside Syncing (boundary already passed) are summarized
             // at once.
             let (n, convs) = std::mem::take(&mut self.catch_up);
+            let ids = std::mem::take(&mut self.catch_up_ids).into();
             self.emit(UiEvent::CatchUpSummary {
                 account,
                 messages: n,
                 conversations: u32::try_from(convs.len()).unwrap_or(u32::MAX),
+                ids,
             });
         }
         for notice in ch.notices {

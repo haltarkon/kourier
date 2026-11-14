@@ -171,6 +171,19 @@ Kirigami.GlobalDrawer {
     handleClosedToolTip: App.hiddenUnread > 0 ? L10n.i18ncp("@info:tooltip, %1 how many", "Open the side panel · %1 unread message in hidden accounts", "Open the side panel · %1 unread messages in hidden accounts", App.hiddenUnread) : L10n.i18nc("@info:tooltip", "Open the side panel")
     handleOpenToolTip: L10n.i18nc("@info:tooltip", "Close the side panel")
 
+    // The dialog of an account's chat list tag, made when first asked for.
+    property AccountTagDialog tagDialogItem: null
+    function tagDialog(): AccountTagDialog {
+        if (drawer.tagDialogItem === null) {
+            drawer.tagDialogItem = tagDialogComponent.createObject(drawer) as AccountTagDialog;
+        }
+        return drawer.tagDialogItem;
+    }
+    Component {
+        id: tagDialogComponent
+        AccountTagDialog {}
+    }
+
     // The context menu of an account's entry (link feedback L4): what Settings → "Accounts"
     // offers for it. Made once an account entry is hovered, focused or pressed.
     property bool menuWanted: false
@@ -292,6 +305,12 @@ Kirigami.GlobalDrawer {
                 }
             }
 
+            QQC2.MenuItem {
+                objectName: "drawer-account-tag"
+                icon.name: "tag"
+                text: L10n.i18nc("@action:inmenu", "Chat List Tag…")
+                onTriggered: drawer.tagDialog().openFor(accountMenu.account, accountMenu.actions.ownTag ?? "")
+            }
             QQC2.MenuItem {
                 objectName: "drawer-copy-name"
                 visible: accountMenu.accountName !== ""

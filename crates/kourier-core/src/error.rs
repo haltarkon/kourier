@@ -54,6 +54,11 @@ pub enum CoreError {
         /// Why, for the log.
         detail: &'static str,
     },
+    /// A filter was refused ([`UiCommand::SaveFilter`](crate::facade::UiCommand::SaveFilter)
+    /// and the other filter commands): the typed reason a dialog words. Log-safe: the
+    /// reason holds no pattern and no name.
+    #[error("filter refused: {0}")]
+    Filter(crate::filters::FilterRefusal),
     /// The blob store (encrypted attachment files) failed.
     #[error("attachment file: {0}")]
     Blob(#[from] kourier_blob::BlobError),
@@ -141,6 +146,17 @@ pub enum Refusal {
     /// and this action would be one more message to it (a change of the disappearing-message
     /// timer is a message of its own on some networks): refused until the hold ends.
     Held,
+    /// The chat cannot be exported: its network has not said whether saving it is allowed (a
+    /// backend that states nothing fails closed), or the chat is not known yet
+    /// ([`crate::actions::may_export_chat`]).
+    ExportUnstated,
+    /// The chat cannot be exported: its network forbids saving it (Telegram's protected content,
+    /// WhatsApp's "Advanced chat privacy").
+    ExportRestricted,
+    /// The chat cannot be exported: it is protected on another device (architecture §3.4), so
+    /// its messages show nowhere outside the open chat, and the archive is the most "outside"
+    /// copy there is. Whatever its network says.
+    ExportProtected,
 }
 
 impl CoreError {
@@ -153,6 +169,14 @@ impl CoreError {
     pub fn refusal(&self) -> Option<Refusal> {
         match self {
             Self::Refused { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// Why the core refused a filter command, when it did.
+    pub fn filter_refusal(&self) -> Option<crate::filters::FilterRefusal> {
+        match self {
+            Self::Filter(r) => Some(*r),
             _ => None,
         }
     }

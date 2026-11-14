@@ -53,6 +53,14 @@ impl AnyKeyring {
         }
     }
 
+    /// The `search.db` key.
+    pub fn search_db_key(&self) -> Key32 {
+        match self {
+            Self::SecretService(k) => k.search_db_key(),
+            Self::Passphrase(k) => k.search_db_key(),
+        }
+    }
+
     async fn create_account(
         &self,
         dir: &Path,

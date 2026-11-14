@@ -21229,6 +21229,11 @@ mod tests {
     /// (the core's row): equal passes, different is the finding. A chat that is not archived yet is
     /// archived first.
     #[test]
+    #[ignore = "load flake (the user's rule: a second failure moves it out of the regular run): \
+                \"no new call line appeared in chat #1 in time\" (its 10 s bound) under the agents \
+                server's load, strike 1 2026-11-12 (lane-ram, load 76), strike 2 2026-11-14 \
+                (lane-3d V6 quick ci, 11.5 s); passes alone in about 5 s; stable once its bound waits \
+                on the step's looks as peer_edit_and_delete's does. Run it with --run-ignored only"]
     fn call_into_archived_compares_the_phone_with_kourier() {
         for (n, (phone, kourier, passes)) in [
             (true, true, true),

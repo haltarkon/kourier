@@ -264,6 +264,63 @@ async fn a_storm_of_hints_reaches_the_backend_as_one_command() {
     assert_eq!(counts(), (1, 1));
 }
 
+/// The hide's `UiCommand::ReleaseMemory` reaches the running backend once per release (its
+/// `backend.db` gives its caches back), beside the hint slot: a `NetworkChanged` that waits for
+/// its settle time is still delivered, and the release itself starts no connect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_reaches_the_backend_once_and_leaves_a_pending_hint_alone() {
+    let (env, account, uuid) = linked(script("release-memory")).await;
+    env.wait_finished(account).await;
+    let settle_ms = u64::try_from(kourier_core::HINT_SETTLE.as_millis()).expect("ms");
+    let start = env.clock.now_ms();
+    env.handle.send(UiCommand::NetworkChanged).expect("send");
+    handled_so_far(&env, account, uuid).await;
+    sleeping_until(&env, start + settle_ms).await;
+    assert_eq!(commands(&env, uuid, "NetworkChanged"), 0, "still waiting");
+
+    env.handle.send(UiCommand::ReleaseMemory).expect("send");
+    let control = env.control.clone();
+    tokio::time::timeout(
+        WAIT,
+        control.wait_for(|c| c.commands(uuid).contains(&"ReleaseMemory")),
+    )
+    .await
+    .expect("the release reaches the backend");
+    settle().await;
+    assert_eq!(commands(&env, uuid, "ReleaseMemory"), 1, "once per release");
+    assert_eq!(
+        commands(&env, uuid, "NetworkChanged"),
+        0,
+        "the hint was not taken or replaced"
+    );
+
+    env.clock.advance(kourier_core::HINT_SETTLE);
+    let control = env.control.clone();
+    tokio::time::timeout(
+        WAIT,
+        control.wait_for(|c| c.commands(uuid).contains(&"NetworkChanged")),
+    )
+    .await
+    .expect("the pending hint is still delivered");
+    settle().await;
+    assert_eq!(commands(&env, uuid, "NetworkChanged"), 1);
+
+    env.handle.send(UiCommand::ReleaseMemory).expect("send");
+    let control = env.control.clone();
+    tokio::time::timeout(
+        WAIT,
+        control.wait_for(|c| {
+            c.commands(uuid)
+                .iter()
+                .filter(|n| **n == "ReleaseMemory")
+                .count()
+                == 2
+        }),
+    )
+    .await
+    .expect("the second release");
+}
+
 /// A hint while a login runs starts nothing: the link connects by itself, and a `Resumed`
 /// (which a backend reads as "connect") must not reach an actor that has no account yet. It is
 /// not delivered late either.

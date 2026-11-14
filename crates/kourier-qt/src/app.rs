@@ -7,7 +7,7 @@
 //! one (pure UI tests) it is the fixture data set or an empty source.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,8 +41,8 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::bridge::qobject::{
     self, AccountListModel, AttachmentListModel, ComposerController, ConversationListModel,
-    LoginController, MediaListModel, MemberListModel, QObject, SettingsController,
-    ShareTargetListModel, TimelineModel,
+    EmojiLists, FilterListModel, LoginController, MediaListModel, MemberListModel, QObject,
+    SearchListModel, SettingsController, ShareTargetListModel, TimelineModel,
 };
 use crate::controllers::SettingsRust;
 use crate::models::{self, ListModel};
@@ -62,6 +62,70 @@ pub fn set_url_launcher(launcher: fn(std::process::Command) -> bool) {
     *URL_LAUNCHER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = launcher;
+}
+
+/// What starts a slicer: [`kourier_app::opener::start`]. A test replaces it
+/// ([`set_slicer_launcher`]) to record the command (program and arguments) without starting
+/// anything.
+static SLICER_LAUNCHER: std::sync::Mutex<fn(std::process::Command) -> bool> =
+    std::sync::Mutex::new(kourier_app::opener::start);
+
+/// Tests: what "Open in Slicer" starts instead of the real program.
+#[doc(hidden)]
+pub fn set_slicer_launcher(launcher: fn(std::process::Command) -> bool) {
+    *SLICER_LAUNCHER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = launcher;
+}
+
+/// How [`App::hand_copy_over`](qobject::App) ended.
+enum SlicerOutcome {
+    Slicer {
+        id: &'static str,
+        started: bool,
+        json: String,
+    },
+    /// The portal's chooser took the request.
+    Asked,
+    /// No portal: the copy opens in the default application (`file://` URL for `externalReady`).
+    NoPortal(String),
+    Failed,
+}
+
+/// The four slicers and whether each is installed (file system: a worker thread only).
+fn scan_slicers(fixture: bool) -> Vec<kourier_app::slicers::Found> {
+    let dirs = kourier_app::slicers::application_dirs_now(fixture);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    kourier_app::slicers::scan(&dirs, &path)
+}
+
+/// `[{id, name, installed}]` in table order: the property `slicers`.
+fn slicers_json(found: &[kourier_app::slicers::Found]) -> String {
+    serde_json::Value::Array(
+        found
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.slicer.id,
+                    "name": f.slicer.name,
+                    "installed": f.entry.is_some(),
+                })
+            })
+            .collect(),
+    )
+    .to_string()
+}
+
+/// The list before the first look: the table, nothing installed.
+fn slicers_unknown() -> String {
+    let none: Vec<_> = kourier_app::slicers::SLICERS
+        .iter()
+        .map(|slicer| kourier_app::slicers::Found {
+            slicer,
+            entry: None,
+        })
+        .collect();
+    slicers_json(&none)
 }
 
 /// What "Show in Folder" does with a saved file: [`kourier_app::show::in_folder`] (the file manager
@@ -91,13 +155,20 @@ fn show_in_file_manager(file: &Path) {
 struct ListView {
     query: String,
     archived: bool,
+    /// RegExp search is on: titles pass by the compiled pattern of the message search.
+    regex: bool,
+    /// The pattern the list was last read with (a new one reads the list again).
+    applied: Option<kourier_app::facade::SearchPattern>,
 }
 
 struct Owned {
     _accounts: UniquePtr<AccountListModel>,
     _group_members: UniquePtr<MemberListModel>,
     _group_preview: UniquePtr<MemberListModel>,
+    _emoji_lists: UniquePtr<EmojiLists>,
     _share_targets: UniquePtr<ShareTargetListModel>,
+    _filters: UniquePtr<FilterListModel>,
+    _search_results: UniquePtr<SearchListModel>,
     _chat_media: [UniquePtr<MediaListModel>; MediaSlot::COUNT],
     _conversations: UniquePtr<ConversationListModel>,
     _timeline: UniquePtr<TimelineModel>,
@@ -111,6 +182,8 @@ struct Owned {
 pub struct AppRust {
     pub(crate) version: QString,
     pub(crate) fixture: bool,
+    /// The slicers of the table and whether each is installed (JSON `[{id, name, installed}]`).
+    pub(crate) slicers: QString,
     pub(crate) start_page: QString,
     pub(crate) screenshot: QString,
     pub(crate) window_width: i32,
@@ -148,6 +221,11 @@ pub struct AppRust {
     pub(crate) archive_shown: bool,
     /// How many archived chats the accounts shown have (the number on the list's last row).
     pub(crate) archived_count: i32,
+    /// An export is under way (Export Selected): the bar's button is off and its place shows progress.
+    pub(crate) export_busy: bool,
+    /// Bytes of the running export written, and in all (0 in all: the documents are made).
+    pub(crate) export_done: i64,
+    pub(crate) export_total: i64,
     pub(crate) banner_kind: QString,
     pub(crate) banner_text: QString,
     pub(crate) banner_action: QString,
@@ -188,7 +266,13 @@ pub struct AppRust {
     pub(crate) group_members: *mut MemberListModel,
     /// The first rows of the group level, unfiltered.
     pub(crate) group_preview: *mut MemberListModel,
+    /// The one local list of pinned, starred and recent emoji (the pickers' state).
+    pub(crate) emoji_lists: *mut EmojiLists,
     pub(crate) share_targets: *mut ShareTargetListModel,
+    /// The saved RegExp filters (Settings, the filter dialog; R2).
+    pub(crate) filters: *mut FilterListModel,
+    /// The hits of the message search (G1m).
+    pub(crate) search_results: *mut SearchListModel,
     /// The gallery of a chat in its five places, in the order of `MediaSlot::index`: the two
     /// sections (group page, person page), the grid and the list of the level of all media, and
     /// the picture viewer's own (a model QML does not see: `galleryViewerItems("viewer", ..)`).
@@ -248,6 +332,9 @@ pub struct AppRust {
     /// The instant a wake-up is scheduled for, to read the rows' action flags again
     /// (`UiSource::flags_deadline`).
     flags_armed: Option<Instant>,
+    /// The instant a wake-up is scheduled for, to read the shown search hits again
+    /// (`UiSource::search_deadline`).
+    search_armed: Option<Instant>,
     /// Timing marks in progress (`KOURIER_TRACE_STARTUP=1`, architecture §1.3).
     trace: UiTrace,
     /// What the window last reported: it has the focus, its chat page is on screen.
@@ -285,6 +372,8 @@ struct ShownActions {
     roaming_note: String,
     /// The color the person gave the account; empty when none.
     own_tint: String,
+    /// The tag the person gave the account; empty when none.
+    own_tag: String,
 }
 
 /// The key `accountActions` names the sync switch's state by: `""` = the row shows no switch
@@ -325,10 +414,54 @@ struct OpenTrace {
 enum Waiter {
     /// A QML view with its request token.
     View(i64),
-    /// `openExternally`.
-    External,
+    /// `openExternally` / `openInSlicer`, with what the copy is for.
+    External(ExternalTarget),
     /// Nobody any more: the copy is closed when it comes.
     Abandoned,
+}
+
+/// What a copy handed to another application is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalTarget {
+    /// The desktop's default application (`externalReady`, then `openExternalUrl`).
+    Default,
+    /// The slicer of the table with this id (`kourier_app::slicers`).
+    Slicer(&'static str),
+    /// "Other Application…": the portal's chooser.
+    Other,
+}
+
+/// Routes the core's answers to `openModel`: the mesh stays behind its `Arc`; a worker thread
+/// builds the viewer's lists from it (the Qt thread never touches the vertices) and hands them to
+/// the `ModelData` that waits, then drops its share of the `Arc`.
+fn deliver_models(answers: Vec<kourier_viewmodel::ModelAnswer>) {
+    use kourier_viewmodel::ModelAnswer;
+    for answer in answers {
+        match answer {
+            ModelAnswer::Failed(id) => qobject::fail_model(id.map_or(0, |a| a.0)),
+            ModelAnswer::Opened(id, mesh) => {
+                // The colour is read here, on the Qt thread, from the object that waits.
+                let fallback = qobject::waiting_fallback(id.0);
+                let spawned = std::thread::Builder::new()
+                    .name("model-lists".into())
+                    .spawn(move || {
+                        let colors = mesh.colors.as_deref().unwrap_or(&[]);
+                        let built = qobject::build_model_buffers(
+                            &mesh.positions,
+                            colors,
+                            fallback,
+                            &mesh.min,
+                            &mesh.max,
+                        );
+                        drop(mesh);
+                        qobject::deliver_model(id.0, built);
+                    });
+                if spawned.is_err() {
+                    qobject::fail_model(id.0);
+                }
+            }
+        }
+    }
 }
 
 /// Bookkeeping of `OpenMedia` requests (§8.6). Every answer names its attachment
@@ -351,8 +484,8 @@ pub(crate) struct MediaRequests {
 pub(crate) enum Delivery {
     /// Emit `mediaOpened(token, url, movie)`.
     View(i64),
-    /// Emit `externalReady(attachment, url)`.
-    External,
+    /// Hand the copy over as the target says (`externalReady(attachment, url)` for the default).
+    External(ExternalTarget),
     /// Close the copy at once.
     Close,
 }
@@ -370,7 +503,7 @@ impl Unanswered {
     fn add(&mut self, waiter: Waiter) {
         match waiter {
             Waiter::View(token) => self.views.push(token),
-            Waiter::External => self.external = true,
+            Waiter::External(_) => self.external = true,
             Waiter::Abandoned => {}
         }
     }
@@ -385,9 +518,9 @@ impl MediaRequests {
         token
     }
 
-    /// `openExternally` asks for `id`.
-    pub(crate) fn request_external(&mut self, id: AttachmentId) {
-        self.pending.push_back((id, Waiter::External));
+    /// `openExternally` / `openInSlicer` ask for `id`.
+    pub(crate) fn request_external(&mut self, id: AttachmentId, target: ExternalTarget) {
+        self.pending.push_back((id, Waiter::External(target)));
     }
 
     /// The view of `token` went; returns the attachment to close when its copy was open. A
@@ -420,9 +553,9 @@ impl MediaRequests {
                 self.answered.insert(token, id);
                 Delivery::View(token)
             }
-            Some((_, Waiter::External)) => {
+            Some((_, Waiter::External(target))) => {
                 self.kept.push(id);
-                Delivery::External
+                Delivery::External(target)
             }
             Some((_, Waiter::Abandoned)) | None => Delivery::Close,
         };
@@ -467,6 +600,7 @@ impl Default for AppRust {
         Self {
             version: QString::from(kourier_app::about::info().version),
             fixture: opts.fixture,
+            slicers: QString::from(slicers_unknown().as_str()),
             start_page: QString::from(opts.page.as_deref().unwrap_or("")),
             screenshot: QString::from(
                 opts.screenshot
@@ -504,6 +638,9 @@ impl Default for AppRust {
             unread_count: 0,
             archive_shown: false,
             archived_count: 0,
+            export_busy: false,
+            export_done: 0,
+            export_total: 0,
             banner_kind: QString::default(),
             banner_text: QString::default(),
             banner_action: QString::default(),
@@ -525,7 +662,10 @@ impl Default for AppRust {
             accounts: std::ptr::null_mut(),
             group_members: std::ptr::null_mut(),
             group_preview: std::ptr::null_mut(),
+            emoji_lists: std::ptr::null_mut(),
             share_targets: std::ptr::null_mut(),
+            filters: std::ptr::null_mut(),
+            search_results: std::ptr::null_mut(),
             chat_media: [std::ptr::null_mut(); MediaSlot::COUNT],
             chat_media_convs: [0; MediaSlot::COUNT],
             slot_calls: crate::models::media::SlotCalls::default(),
@@ -556,6 +696,7 @@ impl Default for AppRust {
             media: MediaRequests::default(),
             banner_url: String::new(),
             flags_armed: None,
+            search_armed: None,
             trace: UiTrace::default(),
             presence: (false, false),
             shown_transfer: None,
@@ -575,6 +716,19 @@ fn account_tints(
         .iter()
         .filter_map(|(uuid, tint)| Some((uuid.parse().ok()?, tint.clone())))
         .collect()
+}
+
+/// What the preferences say about the chat list's order and account tags.
+fn list_look(prefs: &kourier_app::Prefs) -> kourier_viewmodel::source::ListLook {
+    kourier_viewmodel::source::ListLook {
+        drafts_on_top: prefs.drafts_on_top,
+        show_tags: prefs.show_account_tags,
+        tags: prefs
+            .account_tags
+            .iter()
+            .filter_map(|(uuid, tag)| Some((uuid.parse().ok()?, tag.clone())))
+            .collect(),
+    }
 }
 
 fn string_variant(text: &str) -> QVariant {
@@ -786,14 +940,74 @@ fn network_list(source: &dyn UiSource) -> QVariant {
 /// The local calendar as Qt knows it (time zone rules from the system).
 struct QtCalendar {
     zone: UniquePtr<QTimeZone>,
+    /// The offsets already asked for, by time bucket ([`OffsetCache`]): a day label is asked
+    /// for per row, and each ask built a `QDateTime` and looked the zone up (structs.md #6).
+    cache: OffsetCache,
 }
 
-impl Calendar for QtCalendar {
-    fn utc_offset_s(&self, ts_ms: i64) -> i32 {
+impl QtCalendar {
+    fn new(zone: UniquePtr<QTimeZone>) -> Self {
+        Self {
+            zone,
+            cache: OffsetCache::default(),
+        }
+    }
+
+    /// The offset at `ts_ms`, straight from Qt.
+    fn exact_offset_s(&self, ts_ms: i64) -> i32 {
         match self.zone.as_ref() {
             Some(zone) => QDateTime::from_msecs_since_epoch(ts_ms, zone).offset_from_utc(),
             None => 0,
         }
+    }
+}
+
+impl Calendar for QtCalendar {
+    fn utc_offset_s(&self, ts_ms: i64) -> i32 {
+        self.cache.get(ts_ms, |t| self.exact_offset_s(t))
+    }
+}
+
+/// Width of a time bucket of [`OffsetCache`]: every UTC offset and every transition of the zone
+/// database is a multiple of 15 minutes, so a bucket of 30 minutes holds at most one transition.
+const OFFSET_BUCKET_MS: i64 = 30 * 60 * 1000;
+
+/// The most buckets an [`OffsetCache`] keeps (about 10 days of 30-minute buckets, when each is
+/// asked for): a full cache is cleared, never grown.
+const OFFSET_BUCKETS_MAX: usize = 512;
+
+/// UTC offsets by 30-minute bucket of the Unix time. A bucket is kept only when the offset at
+/// its first and at its last millisecond are the same, so a bucket that holds a transition of
+/// the zone is never cached and its instants are computed exactly each time. One cache per
+/// calendar: a new calendar (another zone) starts empty.
+#[derive(Default)]
+struct OffsetCache {
+    buckets: std::cell::RefCell<std::collections::HashMap<i64, i32>>,
+}
+
+impl OffsetCache {
+    /// The offset at `ts_ms` as `exact` answers it, asking `exact` only for a bucket not kept.
+    fn get(&self, ts_ms: i64, exact: impl Fn(i64) -> i32) -> i32 {
+        let bucket = ts_ms.div_euclid(OFFSET_BUCKET_MS);
+        if let Some(offset) = self.buckets.borrow().get(&bucket) {
+            return *offset;
+        }
+        let offset = exact(ts_ms);
+        let first = bucket.saturating_mul(OFFSET_BUCKET_MS);
+        let last = first.saturating_add(OFFSET_BUCKET_MS - 1);
+        if exact(first) == offset && exact(last) == offset {
+            let mut buckets = self.buckets.borrow_mut();
+            if buckets.len() >= OFFSET_BUCKETS_MAX {
+                buckets.clear();
+            }
+            buckets.insert(bucket, offset);
+        }
+        offset
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.borrow().len()
     }
 }
 
@@ -908,9 +1122,7 @@ fn core_source(ctx: &UiContext) -> CoreSource {
     let calendar: Box<dyn Calendar> = if handle.is_fixture() {
         Box::new(FixedOffset(0))
     } else {
-        Box::new(QtCalendar {
-            zone: QTimeZone::system_time_zone(),
-        })
+        Box::new(QtCalendar::new(QTimeZone::system_time_zone()))
     };
     let config = CoreSourceConfig {
         now,
@@ -1006,7 +1218,17 @@ impl cxx_qt::Initialize for qobject::App {
         let accounts = qobject::new_account_list_model();
         let group_members = qobject::new_member_list_model();
         let group_preview = qobject::new_member_list_model();
+        let mut emoji_lists = qobject::new_emoji_lists();
+        if let (Some(ctx), Some(l)) = (&ctx, emoji_lists.as_mut()) {
+            l.attach(
+                &ctx.app.desktop().prefs(),
+                ctx.app.desktop().clone(),
+                ctx.app.runtime().clone(),
+            );
+        }
         let share_targets = qobject::new_share_target_list_model();
+        let mut filters = qobject::new_filter_list_model();
+        let search_results = qobject::new_search_list_model();
         let mut chat_media = [
             qobject::new_media_list_model(),
             qobject::new_media_list_model(),
@@ -1042,6 +1264,8 @@ impl cxx_qt::Initialize for qobject::App {
         if let Some(ctx) = &ctx {
             let tints = account_tints(&ctx.app.desktop().prefs());
             shared.borrow_mut().source.set_account_tints(tints);
+            let look = list_look(&ctx.app.desktop().prefs());
+            shared.borrow_mut().source.set_list_look(look);
         }
         if let (Some(ctx), Some(s)) = (&ctx, settings.as_mut()) {
             let desktop = ctx.app.desktop().clone();
@@ -1051,6 +1275,9 @@ impl cxx_qt::Initialize for qobject::App {
             let mut rust = s.rust_mut();
             rust.shared = Some(shared.clone());
             rust.app = Some(Box::new(self.qt_thread()));
+        }
+        if let Some(f) = filters.as_mut() {
+            f.rust_mut().shared = Some(shared.clone());
         }
         if let Some(c) = composer.as_mut() {
             let mut rust = c.rust_mut();
@@ -1077,7 +1304,10 @@ impl cxx_qt::Initialize for qobject::App {
             rust.accounts = accounts.as_mut_ptr();
             rust.group_members = group_members.as_mut_ptr();
             rust.group_preview = group_preview.as_mut_ptr();
+            rust.emoji_lists = emoji_lists.as_mut_ptr();
             rust.share_targets = share_targets.as_mut_ptr();
+            rust.filters = filters.as_mut_ptr();
+            rust.search_results = search_results.as_mut_ptr();
             for (slot, m) in chat_media.iter_mut().enumerate() {
                 rust.chat_media[slot] = m.as_mut_ptr();
             }
@@ -1094,7 +1324,10 @@ impl cxx_qt::Initialize for qobject::App {
                 _accounts: accounts,
                 _group_members: group_members,
                 _group_preview: group_preview,
+                _emoji_lists: emoji_lists,
                 _share_targets: share_targets,
+                _filters: filters,
+                _search_results: search_results,
                 _chat_media: chat_media,
                 _conversations: conversations,
                 _timeline: timeline,
@@ -1165,7 +1398,7 @@ impl cxx_qt::Initialize for qobject::App {
             Some(
                 "chat" | "history" | "reactions" | "offline" | "loggedout" | "challenge" | "clock"
                 | "clearchat" | "transferbanner" | "transferfailed" | "transferupdate" | "waban"
-                | "waoff" | "wahistory" | "walost",
+                | "waoff" | "wahistory" | "walost" | "searchchat" | "highlight",
             ) => {
                 if let Some(id) = demo {
                     self.as_mut().open_conversation(id.0);
@@ -1186,14 +1419,15 @@ impl cxx_qt::Initialize for qobject::App {
             }
             Some(
                 "quotes" | "menu" | "react" | "edit" | "reply" | "delete" | "muteuntil"
-                | "chatmenu" | "chatmenuoff",
+                | "chatmenu" | "chatmenuoff" | "emojipicker" | "emojisearch" | "hoverpins",
             ) => {
                 if let Some(id) = fixture.and_then(|f| f.quotes_conversation) {
                     self.as_mut().open_conversation(id.0);
                 }
             }
             Some(
-                "album" | "albumviewer" | "revisions" | "mediamenu" | "deleteattachment" | "save",
+                "album" | "albumviewer" | "revisions" | "mediamenu" | "deleteattachment" | "save"
+                | "model3d" | "model3dviewer",
             ) => {
                 if let Some(id) = fixture.and_then(|f| f.albums_conversation) {
                     self.as_mut().open_conversation(id.0);
@@ -1241,9 +1475,9 @@ impl cxx_qt::Initialize for qobject::App {
                 }
             }
             Some(
-                page @ ("media" | "viewer" | "compose" | "files" | "originals" | "folder"
-                | "folderfiles" | "folderzip" | "location" | "locationmany"
-                | "locationnever"),
+                page @ ("media" | "viewer" | "viewerzoom" | "compose" | "files" | "originals"
+                | "folder" | "folderfiles" | "folderzip" | "location" | "locationmany"
+                | "locationnever" | "select" | "exportdialog" | "exportdone"),
             ) => {
                 if let Some(id) = media_conv {
                     self.as_mut().open_conversation(id.0);
@@ -1311,6 +1545,14 @@ impl qobject::App {
             hidden: self.shown.hidden().clone(),
             query: self.list_view.query.clone(),
             archived: self.list_view.archived,
+            regex: self.list_view.regex,
+            pattern: if self.list_view.regex {
+                self.shared
+                    .as_ref()
+                    .and_then(|s| s.borrow().source.search_pattern())
+            } else {
+                None
+            },
         }
     }
 
@@ -1428,6 +1670,52 @@ impl qobject::App {
         self.as_mut().apply_pending();
     }
 
+    /// Gives `account` a short tag the chat list shows in place of its name (empty: the name
+    /// again). Local only: nothing is sent to a network. The App is the one writer of the
+    /// preference, as of the colors.
+    pub fn set_account_tag(self: Pin<&mut Self>, account: i64, tag: &QString) {
+        let tag = kourier_app::prefs::clean_tag(&tag.to_string());
+        let (Some(_), Some(desktop)) = (
+            self.shared.clone(),
+            self.app.as_ref().map(|a| a.desktop().clone()),
+        ) else {
+            return;
+        };
+        let Some(uuid) = self
+            .account_rows
+            .iter()
+            .find(|a| a.id.0 == account)
+            .map(|a| a.uuid)
+        else {
+            return;
+        };
+        desktop.update_prefs(|p| {
+            if tag.is_empty() {
+                p.account_tags.remove(&uuid.to_string());
+            } else {
+                p.account_tags.insert(uuid.to_string(), tag.clone());
+            }
+        });
+        self.list_look_changed();
+    }
+
+    /// The list's look (draft order, account tags) was changed in the preferences: the source
+    /// reads them again and the list follows.
+    pub(crate) fn list_look_changed(mut self: Pin<&mut Self>) {
+        let (Some(shared), Some(desktop)) = (
+            self.shared.clone(),
+            self.app.as_ref().map(|a| a.desktop().clone()),
+        ) else {
+            return;
+        };
+        let ch = shared
+            .borrow_mut()
+            .source
+            .set_list_look(list_look(&desktop.prefs()));
+        shared.borrow_mut().pending.merge(ch);
+        self.as_mut().apply_pending();
+    }
+
     /// The setting "Show chats of several accounts together" changed (queued by the Settings
     /// controller): turning it off with several shown shows all chats (his Q1).
     pub(crate) fn blend_setting_changed(mut self: Pin<&mut Self>, blend: bool) {
@@ -1457,6 +1745,10 @@ impl qobject::App {
             models::set_rows(m, generation, rows);
         }
         self.as_mut().refresh_choice_props();
+        // A hit shows only for a shown account: the hits follow the choice.
+        if pinned(self.search_results).is_some_and(|m| *m.active()) {
+            self.as_mut().refresh_search();
+        }
         self.refresh_conversations();
     }
 
@@ -1699,6 +1991,7 @@ impl qobject::App {
                     roaming: a.roaming_writes,
                     roaming_note: a.roaming_note,
                     own_tint: a.own_tint.clone(),
+                    own_tag: a.own_tag.clone(),
                 }
             })
             .collect();
@@ -1720,6 +2013,7 @@ impl qobject::App {
             m.insert(QString::from("unlink"), QVariant::from(&row.offers_unlink));
             m.insert(QString::from("shown"), QVariant::from(&row.shown));
             m.insert(QString::from("ownTint"), string_variant(&row.own_tint));
+            m.insert(QString::from("ownTag"), string_variant(&row.own_tag));
             m.insert(QString::from("lastShown"), QVariant::from(&row.last_shown));
             m.insert(
                 QString::from("roaming"),
@@ -1861,6 +2155,12 @@ impl qobject::App {
         };
         timeline.as_mut().set_header(id.0, header.as_ref());
         timeline.as_mut().set_paging(paging);
+        // Every new row list goes through the selection first: a reload, a reset and paging
+        // keep the flags, another chat ends the mode.
+        let mut rows = rows;
+        timeline
+            .as_mut()
+            .observe_selection((id.0 != 0).then_some(id), &mut rows);
         if switched {
             // A different conversation: one reset, not a diff of unrelated rows.
             models::apply(timeline.as_mut(), &[ListOp::Reset], &rows);
@@ -1982,11 +2282,28 @@ impl qobject::App {
                 s.show_quiet_notices(quiet);
             }
         }
+        if ch.filters
+            && let Some(mut f) = pinned(self.filters)
+        {
+            f.as_mut().refresh();
+        }
         if ch.accounts {
             self.as_mut().refresh_accounts();
         }
         if ch.conversations {
             self.as_mut().refresh_conversations();
+        }
+        if ch.search {
+            // RegExp search: the chats' titles follow the pattern the core compiled for the
+            // page (it arrives with the first answer).
+            if self.list_view.regex {
+                let pattern = shared.borrow().source.search_pattern();
+                if pattern != self.list_view.applied {
+                    self.as_mut().rust_mut().list_view.applied = pattern;
+                    self.as_mut().refresh_conversations();
+                }
+            }
+            self.as_mut().refresh_search();
         }
         if let Some(moved) = ch.archive_move {
             self.as_mut().archive_moved(moved);
@@ -2041,10 +2358,15 @@ impl qobject::App {
         if ch.media {
             let answers = shared.borrow_mut().source.take_media();
             self.as_mut().deliver_media(answers);
+            let models = shared.borrow_mut().source.take_models();
+            deliver_models(models);
         }
         if ch.saves {
             let answers = shared.borrow_mut().source.take_saves();
             self.as_mut().deliver_saves(answers);
+        }
+        if ch.export {
+            self.as_mut().sync_export();
         }
         if ch.files {
             // Files of a `SendFiles` the core did not take go back into the composer (with
@@ -2172,7 +2494,115 @@ impl qobject::App {
         if *self.timers_active() != timers {
             self.as_mut().set_timers_active(timers);
         }
+        self.as_mut().arm_search();
         self.arm_flags();
+    }
+
+    /// Reads the search view and shows it: the hits and the view's properties go to
+    /// `App.searchResults` together.
+    fn refresh_search(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let filter = self.filter();
+        let view = shared.borrow().source.search_view(&filter);
+        let generation = self.as_mut().next_generation();
+        if let Some(m) = pinned(self.search_results) {
+            m.show(generation, view);
+        }
+    }
+
+    /// Schedules ONE wake-up for the instant the shown hits are read again
+    /// (`UiSource::search_deadline`, critic H5: a deleted or expired message leaves the list
+    /// within a second). Called after every batch of changes is applied and after `search_due`
+    /// itself, so a deadline that a change made or moved is always armed: nothing else ever
+    /// calls `search_due`. An earlier wake-up that finds nothing due does nothing.
+    fn arm_search(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let deadline = shared.borrow().source.search_deadline();
+        let Some(deadline) = deadline else {
+            self.as_mut().rust_mut().search_armed = None;
+            return;
+        };
+        if self.search_armed == Some(deadline) {
+            return;
+        }
+        let Some(runtime) = self.app.as_ref().map(|a| a.runtime().clone()) else {
+            return;
+        };
+        self.as_mut().rust_mut().search_armed = Some(deadline);
+        let thread = self.qt_thread();
+        runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            if thread.queue(|app| app.search_due()).is_err() {
+                tracing::debug!("App destroyed before a search re-read was due");
+            }
+        });
+    }
+
+    /// The search deadline may have passed: the shown hits are read again if so (the answer
+    /// comes as `Changes::search`), then the next deadline is armed.
+    pub fn search_due(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        self.as_mut().rust_mut().search_armed = None;
+        let ch = shared.borrow_mut().source.search_due();
+        shared.borrow_mut().pending.merge(ch);
+        self.apply_pending();
+    }
+
+    /// Starts a message search for `text` in the chat `chat` only (0: every chat). A text of
+    /// white space ends the search.
+    pub fn search_messages(mut self: Pin<&mut Self>, text: &QString, chat: i64) {
+        let chat = (chat > 0).then_some(ConversationId(chat));
+        self.as_mut()
+            .with_source(|s| s.search_messages(&text.to_string(), chat));
+    }
+
+    /// The search field's `.*` and `Aa` toggles: the message search asks in that mode, and the
+    /// chat list's titles are filtered by the pattern once the core has compiled it.
+    pub fn set_search_mode(mut self: Pin<&mut Self>, regex: bool, match_case: bool) {
+        if self.list_view.regex != regex {
+            let mut rust = self.as_mut().rust_mut();
+            rust.list_view.regex = regex;
+            rust.list_view.applied = None;
+            self.as_mut().refresh_conversations();
+        }
+        self.with_source(|s| s.set_search_mode(regex, match_case));
+    }
+
+    /// Asks for the page of hits after the last row.
+    pub fn more_search(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let asked = shared.borrow_mut().source.more_search();
+        if asked {
+            // (`loading` shows at once; the page comes as `Changes::search`.)
+            self.as_mut().refresh_search();
+        }
+    }
+
+    /// Test-only (G1h): the open chat's timeline reads so far (see the bridge).
+    pub fn timeline_fetches(&self) -> QString {
+        let Some(shared) = self.shared.clone() else {
+            return QString::default();
+        };
+        let fetches = shared.borrow().source.timeline_fetches();
+        QString::from(fetches.join(" ").as_str())
+    }
+
+    /// The search ended: nothing of it is shown or asked any more.
+    pub fn close_search(self: Pin<&mut Self>) {
+        self.with_source(|s| s.close_search());
+    }
+
+    /// Opens the chat of a hit at its message: the App's one open for a hit.
+    pub fn open_search_result(self: Pin<&mut Self>, conversation: i64, message: i64) {
+        self.open_conversation_at(conversation, Some(MessageId(message)));
     }
 
     /// Schedules one wake-up for the instant the first edit or delete window of a loaded
@@ -2511,7 +2941,8 @@ impl qobject::App {
     /// The window is being let go after a minute hidden (§8.2 step 6): nothing needs to be
     /// fast for a while, so the core gives back what it only keeps for speed, the page
     /// caches and prepared statements of its database connections (§1.3: up to 8 MiB each,
-    /// in the heaps of the core's threads). It reads them again, bit by bit, when something
+    /// in the heaps of the core's threads) and tells every running account backend to do
+    /// the same with its `backend.db` connection (`Command::ReleaseMemory`). It reads them again, bit by bit, when something
     /// is next asked of it: an activation costs its first queries a few disk reads and no
     /// more. Sent now, before the window is gone, so that the trim in
     /// [`Self::window_released`] finds that memory free. Returns whether the core was asked.
@@ -2566,7 +2997,15 @@ impl qobject::App {
     }
 
     /// Opens `conversation` in the chat page.
-    pub fn open_conversation(mut self: Pin<&mut Self>, conversation: i64) {
+    pub fn open_conversation(self: Pin<&mut Self>, conversation: i64) {
+        self.open_conversation_at(conversation, None);
+    }
+
+    /// The one body of every open of a chat. `at` is the message a search hit opens at: the
+    /// source's `open_at` reads the window around it and marks nothing read (an open of the
+    /// newest page first would mark an old hit's chat read); without it the chat opens at its
+    /// newest messages. Only the source's call differs.
+    fn open_conversation_at(mut self: Pin<&mut Self>, conversation: i64, at: Option<MessageId>) {
         let Some(shared) = self.shared.clone() else {
             return;
         };
@@ -2598,10 +3037,16 @@ impl qobject::App {
                 rows: None,
             });
         }
-        let ch = shared
-            .borrow_mut()
-            .source
-            .open_conversation(Some(ConversationId(conversation)));
+        let ch = match at {
+            Some(message) => shared
+                .borrow_mut()
+                .source
+                .open_at(ConversationId(conversation), message),
+            None => shared
+                .borrow_mut()
+                .source
+                .open_conversation(Some(ConversationId(conversation))),
+        };
         self.as_mut().refresh_timeline(switched);
         shared.borrow_mut().pending.merge(ch);
         // The list shows the draft of the conversation just left.
@@ -2675,6 +3120,33 @@ impl qobject::App {
         self.as_mut().rust_mut().media.request(id)
     }
 
+    /// Test-only: whether a mapped library's path contains `name`.
+    pub fn library_loaded(&self, name: &QString) -> bool {
+        let needle = name.to_string();
+        std::fs::read_to_string("/proc/self/maps")
+            .is_ok_and(|maps| maps.lines().any(|l| l.contains(&needle)))
+    }
+
+    /// Test-only: how many `ModelData` objects are alive.
+    pub fn model_data_alive(&self) -> i32 {
+        qobject::model_data_alive()
+    }
+
+    /// Asks the core for the parsed 3D model `attachment`; its lists reach the `ModelData`
+    /// waiting for it (the viewer's), built on a worker thread.
+    pub fn open_model(self: Pin<&mut Self>, attachment: i64) -> bool {
+        if attachment <= 0 {
+            return false;
+        }
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        shared
+            .borrow_mut()
+            .source
+            .open_model(AttachmentId(attachment))
+    }
+
     /// The view of the `openMedia` request `token` went.
     pub fn release_media(mut self: Pin<&mut Self>, token: i64) {
         if let Some(id) = self.as_mut().rust_mut().media.release(token)
@@ -2685,7 +3157,28 @@ impl qobject::App {
     }
 
     /// Opens `attachment` with the desktop's default application once its copy is ready.
-    pub fn open_externally(mut self: Pin<&mut Self>, attachment: i64) {
+    pub fn open_externally(self: Pin<&mut Self>, attachment: i64) {
+        self.request_copy_for(attachment, ExternalTarget::Default);
+    }
+
+    /// Opens the 3D model `attachment` in a slicer (`id` of the table, `kourier_app::slicers`) or,
+    /// for `"other"`, in the application the person picks in the portal's chooser, once its copy
+    /// is ready. The caller confirmed first ("Open This File?"). A slicer that started is told
+    /// with `slicerStarted(attachment, id)`; one that did not, with a notice. The copy lives until
+    /// the conversation closes.
+    pub fn open_in_slicer(self: Pin<&mut Self>, attachment: i64, id: &QString) {
+        let id = id.to_string();
+        let target = if id == kourier_app::slicers::OTHER {
+            ExternalTarget::Other
+        } else if let Some(slicer) = kourier_app::slicers::find(&id) {
+            ExternalTarget::Slicer(slicer.id)
+        } else {
+            return;
+        };
+        self.request_copy_for(attachment, target);
+    }
+
+    fn request_copy_for(mut self: Pin<&mut Self>, attachment: i64, target: ExternalTarget) {
         if attachment <= 0 {
             return;
         }
@@ -2694,7 +3187,117 @@ impl qobject::App {
             return;
         };
         if shared.borrow_mut().source.open_media(id) {
-            self.as_mut().rust_mut().media.request_external(id);
+            self.as_mut().rust_mut().media.request_external(id, target);
+        }
+    }
+
+    /// Looks for the installed slicers on a worker thread (the Qt thread never reads the file
+    /// system) and sets `slicers` when the answer is not what it holds. Called when the 3D viewer
+    /// and the menu of a model message open; the UI shows the last known list meanwhile.
+    pub fn refresh_slicers(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        let fixture = self.fixture;
+        let spawned = std::thread::Builder::new()
+            .name("scan-slicers".to_owned())
+            .spawn(move || {
+                let json = slicers_json(&scan_slicers(fixture));
+                let _ = thread.queue(move |app| app.set_slicers_if_changed(json));
+            });
+        if spawned.is_err() {
+            tracing::warn!("the thread that looks for slicers could not be started");
+        }
+    }
+
+    fn set_slicers_if_changed(mut self: Pin<&mut Self>, json: String) {
+        if self.slicers.to_string() != json {
+            self.as_mut().set_slicers(QString::from(json.as_str()));
+        }
+    }
+
+    /// The slicer `id` is started with the copy at `path` (or, for `other`, the portal's chooser
+    /// asks for the application): on a worker thread, because it looks at the file system and the
+    /// bus; the answer comes back through [`Self::slicer_finished`].
+    fn hand_copy_over(
+        self: Pin<&mut Self>,
+        attachment: i64,
+        target: ExternalTarget,
+        path: PathBuf,
+    ) {
+        let thread = self.qt_thread();
+        let fixture = self.fixture;
+        let launcher = *SLICER_LAUNCHER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drop_env: Vec<String> = crate::env_set_by_kourier()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let spawned = std::thread::Builder::new()
+            .name("open-in-slicer".to_owned())
+            .spawn(move || {
+                let outcome = match target {
+                    ExternalTarget::Slicer(id) => {
+                        let found = scan_slicers(fixture);
+                        let names: Vec<&str> = drop_env.iter().map(String::as_str).collect();
+                        let started = kourier_app::slicers::has_model_extension(&path)
+                            && found
+                                .iter()
+                                .find(|f| f.slicer.id == id)
+                                .and_then(|f| f.entry.as_ref())
+                                .and_then(|e| kourier_app::slicers::command(e, &path, &names))
+                                .is_some_and(launcher);
+                        SlicerOutcome::Slicer {
+                            id,
+                            started,
+                            json: slicers_json(&found),
+                        }
+                    }
+                    ExternalTarget::Other => {
+                        match kourier_app::slicers::ask_for_application(&path) {
+                            Ok(kourier_app::slicers::Chooser::Asked) => SlicerOutcome::Asked,
+                            // No portal on the bus: the desktop's default application opens the
+                            // copy instead (the same path as "Open in Another Application").
+                            Ok(kourier_app::slicers::Chooser::NoPortal) => {
+                                SlicerOutcome::NoPortal(file_url(&path))
+                            }
+                            Err(_) => SlicerOutcome::Failed,
+                        }
+                    }
+                    ExternalTarget::Default => SlicerOutcome::Failed,
+                };
+                let _ = thread.queue(move |app| app.slicer_finished(attachment, outcome));
+            });
+        if spawned.is_err() {
+            tracing::warn!("the thread that starts a slicer could not be started");
+        }
+    }
+
+    /// The end of [`Self::hand_copy_over`], on the Qt thread.
+    fn slicer_finished(mut self: Pin<&mut Self>, attachment: i64, outcome: SlicerOutcome) {
+        match outcome {
+            SlicerOutcome::Slicer { id, started, json } => {
+                self.as_mut().set_slicers_if_changed(json);
+                if started {
+                    self.as_mut().slicer_started(attachment, QString::from(id));
+                } else {
+                    self.tell_notice(trc("@info:status", "The slicer could not be started."));
+                }
+            }
+            SlicerOutcome::NoPortal(url) => {
+                self.as_mut()
+                    .external_ready(attachment, QString::from(url.as_str()));
+            }
+            SlicerOutcome::Asked => {}
+            SlicerOutcome::Failed => {
+                self.tell_notice(trc("@info:status", "The file could not be opened."));
+            }
+        }
+    }
+
+    /// Shows `text` as the notice of the composer line (what a failed open says).
+    fn tell_notice(&self, text: impl AsRef<str>) {
+        if let Some(c) = pinned(self.composer) {
+            c.set_notice(QString::from(text.as_ref()));
         }
     }
 
@@ -2836,6 +3439,192 @@ impl qobject::App {
                     );
                 }
             }
+        }
+    }
+
+    /// Export Selected: the dialog's Export… (the ticks): the save dialog's start follows.
+    pub fn export_choose(
+        mut self: Pin<&mut Self>,
+        pictures: bool,
+        videos: bool,
+        other_files: bool,
+        disappearing: bool,
+    ) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let ticks = kourier_viewmodel::export::Ticks {
+            pictures,
+            videos,
+            other_files,
+            disappearing,
+        };
+        let ok = shared.borrow_mut().source.export_choose(ticks);
+        self.as_mut().sync_export();
+        ok
+    }
+
+    /// Export Selected: the dialog's numbers (JSON) for the ticks, from the plan the open dialog
+    /// holds; an empty string when no dialog stands (a fixture page has no plan).
+    pub fn export_numbers(
+        &self,
+        pictures: bool,
+        videos: bool,
+        other_files: bool,
+        disappearing: bool,
+    ) -> QString {
+        let ticks = kourier_viewmodel::export::Ticks {
+            pictures,
+            videos,
+            other_files,
+            disappearing,
+        };
+        let json = self
+            .shared
+            .as_ref()
+            .and_then(|shared| shared.borrow().source.export_numbers(ticks));
+        QString::from(json.unwrap_or_default().as_str())
+    }
+
+    /// Export Selected: the dialog or the save dialog closed with no answer.
+    pub fn export_abandon(mut self: Pin<&mut Self>) {
+        if let Some(shared) = self.shared.clone() {
+            shared.borrow_mut().source.export_abandon();
+        }
+        self.as_mut().sync_export();
+    }
+
+    /// Export Selected: the save dialog answered with the file `url`. The documents are made on
+    /// a worker of the runtime (never on the Qt thread), and the command goes out from here when
+    /// it is done (the command sink is this thread's).
+    pub fn export_picked(mut self: Pin<&mut Self>, url: &QString) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let (Some(path), Some(handle)) = (crate::controllers::local_path(url), self.app.clone())
+        else {
+            self.as_mut().export_abandon();
+            return;
+        };
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            self.as_mut().export_abandon();
+            return;
+        };
+        let name = name.to_string_lossy().into_owned();
+        let job = shared
+            .borrow_mut()
+            .source
+            .export_target(dir.to_path_buf(), name);
+        self.as_mut().sync_export();
+        let Some(job) = job else {
+            return;
+        };
+        let thread = self.qt_thread();
+        let closing = handle.shutdown_token();
+        handle.runtime().spawn_blocking(move || {
+            if closing.is_cancelled() {
+                return;
+            }
+            let built = job.run();
+            if thread.queue(move |app| app.export_built(built)).is_err() {
+                tracing::debug!("the app went before an export was built");
+            }
+        });
+    }
+
+    /// The worker's documents are here: the export command goes out.
+    fn export_built(mut self: Pin<&mut Self>, built: kourier_viewmodel::export::flow::ExportBuilt) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let changes = shared.borrow_mut().source.export_built(built);
+        if changes.any() {
+            shared.borrow_mut().pending.merge(changes);
+        }
+        self.as_mut().sync_export();
+    }
+
+    /// Export Selected: Cancel, at any stage.
+    pub fn export_cancel(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let changes = shared.borrow_mut().source.export_cancel();
+        if changes.any() {
+            shared.borrow_mut().pending.merge(changes);
+        }
+        self.as_mut().sync_export();
+    }
+
+    /// Hands what the export flow has to tell to QML and keeps the busy and progress
+    /// properties true.
+    fn sync_export(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let updates = shared.borrow_mut().source.take_export();
+        for update in updates {
+            use kourier_viewmodel::export::flow::ExportUpdate;
+            match update {
+                ExportUpdate::Dialog(json) => {
+                    self.as_mut()
+                        .export_dialog_ready(QString::from(json.as_str()));
+                }
+                ExportUpdate::SaveName(name) => {
+                    let thread = self.qt_thread();
+                    kourier_app::show::start_folder_then(self.last_save_folder(), move |folder| {
+                        let url = file_url(&folder.join(name));
+                        let _ = thread.queue(move |app| {
+                            app.export_save_ready(QString::from(url.as_str()));
+                        });
+                    });
+                }
+                ExportUpdate::Progress { done, total } => {
+                    self.as_mut()
+                        .set_export_done(i64::try_from(done).unwrap_or(i64::MAX));
+                    self.as_mut()
+                        .set_export_total(i64::try_from(total).unwrap_or(i64::MAX));
+                }
+                ExportUpdate::Ended(end) => {
+                    let url = end
+                        .saved
+                        .as_deref()
+                        .map(|p| {
+                            if let Some(app) = self.app.as_ref()
+                                && let Some(dir) = p.parent().and_then(|d| d.to_str())
+                            {
+                                let dir = dir.to_owned();
+                                app.desktop()
+                                    .update_prefs(|p| p.last_save_folder = Some(dir));
+                            }
+                            file_url(p)
+                        })
+                        .unwrap_or_default();
+                    self.as_mut().set_export_done(0);
+                    self.as_mut().set_export_total(0);
+                    // The selection ends only in the export's own chat: the chat open now is the
+                    // timeline's (a chat opened since keeps its picking).
+                    let open = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
+                    let ends = end.ends_selection_in(ConversationId(open));
+                    self.as_mut().export_finished(
+                        QString::from(end.text.as_str()),
+                        QString::from(url.as_str()),
+                        ends,
+                    );
+                }
+                ExportUpdate::Refused(text) => {
+                    // A notice only: the running export's progress stays.
+                    self.as_mut().export_finished(
+                        QString::from(text.as_str()),
+                        QString::default(),
+                        false,
+                    );
+                }
+            }
+        }
+        let busy = shared.borrow().source.export_busy();
+        if *self.export_busy() != busy {
+            self.as_mut().set_export_busy(busy);
         }
     }
 
@@ -4201,6 +4990,17 @@ impl qobject::App {
                         r.actions.delete_attachment
                             && r.blocks.iter().any(|b| matches!(b, Block::Album(_)))
                     }
+                    // The 3D models of `--page=model3d*`: the STL (shade picture, tinted), the 3MF
+                    // (its own colours) and the debug sphere of ~100 k triangles.
+                    "stl" => r.blocks.iter().any(
+                        |b| matches!(b, Block::Image(i) if i.model.as_ref().is_some_and(|m| m.tint && m.name != "sphere.stl")),
+                    ),
+                    "3mf" => r.blocks.iter().any(
+                        |b| matches!(b, Block::Image(i) if i.model.as_ref().is_some_and(|m| !m.tint)),
+                    ),
+                    "sphere" => r.blocks.iter().any(
+                        |b| matches!(b, Block::Image(i) if i.model.as_ref().is_some_and(|m| m.name == "sphere.stl")),
+                    ),
                     "file" => r.blocks.iter().any(|b| matches!(b, Block::File(f) if !f.voice)),
                     "voice" => r.blocks.iter().any(|b| matches!(b, Block::File(f) if f.voice)),
                     "quote" => r.blocks.iter().any(
@@ -4228,7 +5028,12 @@ impl qobject::App {
                     self.as_mut().media_unanswered(lost);
                     match delivery {
                         Delivery::View(token) => self.as_mut().media_opened(token, url, movie),
-                        Delivery::External => self.as_mut().external_ready(id.0, url),
+                        Delivery::External(ExternalTarget::Default) => {
+                            self.as_mut().external_ready(id.0, url);
+                        }
+                        Delivery::External(target) => {
+                            self.as_mut().hand_copy_over(id.0, target, path);
+                        }
                         Delivery::Close => {
                             if let Some(shared) = self.shared.clone() {
                                 shared.borrow_mut().source.close_media(id);
@@ -4495,6 +5300,42 @@ impl qobject::App {
         unsafe { qobject::color_links_of(document, color, ink) };
     }
 
+    /// The marker colour (`#aarrggbb`) of `base` (`#rrggbb`) on `surface` under `ink`.
+    pub fn marker_colour(&self, base: &QString, surface: &QColor, ink: &QColor) -> QString {
+        let rgb = |c: &QColor| {
+            (u32::try_from(c.red()).unwrap_or(0) << 16)
+                | (u32::try_from(c.green()).unwrap_or(0) << 8)
+                | u32::try_from(c.blue()).unwrap_or(0)
+        };
+        let text = base.to_string();
+        let base = u32::from_str_radix(text.trim_start_matches('#'), 16).unwrap_or(0xFFD60A);
+        let argb = kourier_viewmodel::filter_marks::marker_colour(base, rgb(surface), rgb(ink));
+        QString::from(format!("#{argb:08x}"))
+    }
+
+    /// The html of a name with marked parts for a `RichText` label (`marks`: `{start, len, color}`
+    /// with the colors from [`Self::marker_colour`]).
+    pub fn name_html(
+        &self,
+        shown: &QString,
+        whole: &QString,
+        marks: &QVariant,
+        surface: &QColor,
+    ) -> QString {
+        qobject::marked_name_html(shown, whole, marks, surface)
+    }
+
+    /// Gives a message text's document the backgrounds of `marks` (a list of `{start, len,
+    /// color}`, the colors from [`Self::marker_colour`]); the ones marked before are cleared.
+    ///
+    /// # Safety
+    ///
+    /// `document` must be null or a live `QObject`.
+    pub unsafe fn apply_marks(&self, document: *mut QObject, marks: &QVariant) {
+        // SAFETY: forwarded caller contract.
+        unsafe { qobject::apply_marks_of(document, marks) };
+    }
+
     /// The icon theme's name for the application's icon (`APP_ID`) when the theme has an icon
     /// of that name, else an empty string. QML cannot tell: `Kirigami.Icon.valid` is true for a
     /// name the theme lacks. Asked once, by `Style.appIcon`.
@@ -4645,6 +5486,82 @@ impl qobject::App {
 mod tests {
     use super::*;
 
+    /// The calendar's cache gives what Qt gives, at every 5 minutes across the zone's changes
+    /// of rule (and across 1970, where a truncating division would pick the wrong bucket), asks
+    /// Qt once per bucket, stays bounded and starts empty with a new calendar. Mutant: the
+    /// guard that keeps a bucket only when both its ends agree removed and the bucket widened
+    /// to 3 hours.
+    #[test]
+    fn the_offset_cache_answers_what_qt_answers() {
+        use cxx_qt_lib::QByteArray;
+        use std::cell::Cell;
+        const FIVE_MIN: i64 = 5 * 60 * 1000;
+        // 2024-01-01 .. 2026-12-31 and the days around the epoch.
+        let spans = [
+            (1_704_067_200_000_i64, 1_798_761_600_000_i64),
+            (-5 * 86_400_000, 5 * 86_400_000),
+        ];
+        let mut checked = 0;
+        for id in [
+            "Europe/Kyiv",
+            "Europe/Kiev",
+            "America/St_Johns",
+            "Australia/Lord_Howe",
+            "Asia/Kathmandu",
+            "Pacific/Chatham",
+            "America/New_York",
+            "UTC",
+        ] {
+            let zone = QTimeZone::from_iana(&QByteArray::from(id));
+            if zone.as_ref().is_none_or(|z| !z.is_valid()) {
+                eprintln!("the offset cache test skips {id}: this Qt does not know it");
+                continue;
+            }
+            checked += 1;
+            let calendar = QtCalendar::new(zone);
+            assert_eq!(calendar.cache.len(), 0, "{id}: a new calendar starts empty");
+            for (from, to) in spans {
+                let mut ts = from;
+                while ts < to {
+                    assert_eq!(
+                        calendar.utc_offset_s(ts),
+                        calendar.exact_offset_s(ts),
+                        "{id} at {ts}"
+                    );
+                    assert!(calendar.cache.len() <= OFFSET_BUCKETS_MAX);
+                    ts += FIVE_MIN;
+                }
+            }
+            // A bucket of the cache is asked of Qt once, then never.
+            let cache = OffsetCache::default();
+            let asked = Cell::new(0);
+            let counted = |t: i64| {
+                asked.set(asked.get() + 1);
+                calendar.exact_offset_s(t)
+            };
+            let day = 1_719_835_200_000_i64; // 2024-07-01 12:00 UTC: no transition near
+            assert_eq!(cache.get(day, counted), calendar.exact_offset_s(day));
+            let after_first = asked.get();
+            for k in 0..6 {
+                cache.get(day + k * 1000, counted);
+            }
+            assert_eq!(
+                asked.get(),
+                after_first,
+                "{id}: a kept bucket is not asked again"
+            );
+            // Another calendar of the same zone starts empty again.
+            assert_eq!(QtCalendar::new(QTimeZone::utc()).cache.len(), 0);
+        }
+        assert!(checked >= 3, "the zones this Qt knows: {checked}");
+        // Bounded: more buckets than the cap are cleared, not kept.
+        let cache = OffsetCache::default();
+        for b in 0..(OFFSET_BUCKETS_MAX as i64 * 3) {
+            cache.get(b * OFFSET_BUCKET_MS, |_| 3600);
+            assert!(cache.len() <= OFFSET_BUCKETS_MAX);
+        }
+    }
+
     /// A network this build cannot log in to reaches the viewmodel as an entry of Settings with
     /// the reason the application gave (a swap of the two would put the wrong sentence on its
     /// accounts' banner) and as no choice: not available, not on, no flow, no warning.
@@ -4704,6 +5621,7 @@ mod tests {
             avatar_url: String::new(),
             tint: String::new(),
             own_tint: String::new(),
+            own_tag: String::new(),
             number: String::new(),
             offers_history: false,
             offers_unlink: false,
@@ -4740,8 +5658,11 @@ mod tests {
         // An unexpected answer is closed too.
         assert_eq!(m.opened(AttachmentId(9)), (Delivery::Close, none()));
         // External opens are kept until the conversation closes.
-        m.request_external(a);
-        assert_eq!(m.opened(a), (Delivery::External, none()));
+        m.request_external(a, ExternalTarget::Default);
+        assert_eq!(
+            m.opened(a),
+            (Delivery::External(ExternalTarget::Default), none())
+        );
         assert_eq!(m.take_kept(), vec![a]);
         assert!(m.take_kept().is_empty());
         assert!(m.pending.is_empty() && m.answered.is_empty());
@@ -4754,7 +5675,7 @@ mod tests {
         // Three requests wait.
         let ta = m.request(a);
         let tb = m.request(b);
-        m.request_external(c);
+        m.request_external(c, ExternalTarget::Default);
         // The failure names `b`: only its view is told, although `a` was asked for first.
         assert_eq!(
             m.failed(Some(b)),
@@ -4765,7 +5686,13 @@ mod tests {
         );
         // The others still get their own answers.
         assert_eq!(m.opened(a), (Delivery::View(ta), Unanswered::default()));
-        assert_eq!(m.opened(c), (Delivery::External, Unanswered::default()));
+        assert_eq!(
+            m.opened(c),
+            (
+                Delivery::External(ExternalTarget::Default),
+                Unanswered::default()
+            )
+        );
         // Asking again for the attachment that failed is answered: nothing stale is in its way.
         let tb2 = m.request(b);
         assert_eq!(m.opened(b), (Delivery::View(tb2), Unanswered::default()));
@@ -4777,7 +5704,7 @@ mod tests {
         assert_eq!(m.failed(Some(a)).views, vec![t2]);
         // A failed `openExternally` is reported as such; a view that went before its failure
         // is not told; a failure nobody waits for is nothing.
-        m.request_external(c);
+        m.request_external(c, ExternalTarget::Default);
         let gone = m.request(b);
         assert_eq!(m.release(gone), None);
         assert_eq!(
@@ -4805,7 +5732,7 @@ mod tests {
         let (a, b) = (AttachmentId(1), AttachmentId(2));
         // The answer for `a` was lost with lagged events: the answer for `b` shows it.
         let ta = m.request(a);
-        m.request_external(a);
+        m.request_external(a, ExternalTarget::Default);
         let tb = m.request(b);
         assert_eq!(
             m.opened(b),

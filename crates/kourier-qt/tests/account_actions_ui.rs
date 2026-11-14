@@ -314,10 +314,10 @@ MainWindow {
             if (menu === null || !menu.opened) return win.later("the menu opens on the Menu key");
             win.quiet += 1;
             if (win.quiet < 8) return;
-            // Down goes to the first item that is shown, the "Color" submenu, then over the copy
+            // Down goes to the first item that is shown, the "Color" submenu, then over the tag item and the copy
             // actions that are shown; the next Down skips the hidden transfer to the first action
             // that is shown; Return acts on it.
-            const copies = ["drawer-copy-name", "drawer-copy-number", "drawer-copy-link"].filter(name => {
+            const copies = ["drawer-account-tag", "drawer-copy-name", "drawer-copy-number", "drawer-copy-link"].filter(name => {
                 const item = win.find(menu.contentItem, i => i.objectName === name);
                 return item !== null && item.visible;
             }).length;

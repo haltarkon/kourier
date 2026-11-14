@@ -12,7 +12,9 @@ use kourier_desktop::notifications::{
     self, CloseReason, ImageData, InlineReply, Notification, NotificationClient, NotificationEvent,
     Urgency,
 };
-use kourier_desktop::testing::{MockNotifications, MockWatcher, PLASMA_CAPS, PrivateBus};
+use kourier_desktop::testing::{
+    MockNotifications, MockPortal, MockWatcher, PLASMA_CAPS, PrivateBus,
+};
 use kourier_desktop::tray::{Tray, TrayConfig, TrayEvent, TrayState};
 use kourier_desktop::{APP_ID, DesktopError};
 use tokio::sync::mpsc;
@@ -465,6 +467,45 @@ async fn tray(bus: &PrivateBus) -> TestResult {
     Ok(())
 }
 
+/// "Other Application…": `OpenFile` with the file's descriptor and `ask: true`, never writable;
+/// without a portal the call is `NoService` (the caller falls back to the default application).
+async fn portal_open_file(bus: &PrivateBus) -> TestResult {
+    use std::io::Write as _;
+    let client_bus = step_ok("connect the client's bus", bus.connect()).await?;
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let path = dir.path().join("model.stl");
+    let mut out = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    out.write_all(b"solid test").map_err(|e| e.to_string())?;
+    drop(out);
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let missing = step(
+        "call without a portal",
+        kourier_desktop::portal::open_file_asking(&client_bus, &file),
+    )
+    .await?;
+    check(
+        matches!(missing, Err(DesktopError::NoService(_))),
+        "no portal is NoService",
+    )?;
+    let portal = step_ok("start the mock portal", MockPortal::start(bus.address())).await?;
+    step_ok(
+        "open the file",
+        kourier_desktop::portal::open_file_asking(&client_bus, &file),
+    )
+    .await?;
+    let calls = portal.wait_for(1, WAIT).await;
+    check(calls.len() == 1, "one OpenFile call")?;
+    check(calls[0].parent_window.is_empty(), "no parent window")?;
+    check(
+        calls[0].contents == b"solid test",
+        "the descriptor is the file",
+    )?;
+    check(calls[0].ask == Some(true), "ask is true")?;
+    check(calls[0].writable == Some(false), "never writable")?;
+    drop(portal);
+    Ok(())
+}
+
 /// The one test this binary is, for cargo-nextest: it lists a binary with `--list` and runs a
 /// test as `--exact <name> --nocapture`, which a `harness = false` binary does not know.
 const LISTED_AS: &str = "dbus";
@@ -513,7 +554,7 @@ fn main() {
     let filter: Option<String> = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with('-') && a != LISTED_AS);
-    let tests: [(&str, TestFn); 5] = [
+    let tests: [(&str, TestFn); 6] = [
         ("notifications", |b| Box::pin(notifications(b))),
         ("notification_signals_in_order", |b| {
             Box::pin(signal_order(b))
@@ -521,6 +562,7 @@ fn main() {
         ("notifications_plain_server", |b| Box::pin(plain_server(b))),
         ("single_instance", |b| Box::pin(single_instance(b))),
         ("tray", |b| Box::pin(tray(b))),
+        ("portal_open_file", |b| Box::pin(portal_open_file(b))),
     ];
     let mut failed = 0;
     let mut passed = 0;

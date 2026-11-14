@@ -73,6 +73,7 @@ fn attachment() -> Attachment {
         thumb: Some(blob_ref()),
         long_text: true,
         net_ids: vec!["uuid:5f0c".into(), "digest:q83v".into()],
+        model: None,
     }
 }
 

@@ -22,15 +22,26 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::error::Result;
 
+pub use crate::actions::{ExportVerdict, LeftOut};
 /// The error of [`UiEvent::ActionFailed`] and of a failed query, so a UI can tell a refusal
 /// from a network failure by its kind instead of its text, and one refusal from another by
 /// its [`Refusal`] ([`CoreError::refusal`]).
 pub use crate::error::{CoreError, Refusal};
 pub use crate::expiry::ExpiryPolicy;
+/// The RegExp filters: the types, the compiled set and the syntax check (`filters::check`).
+pub use crate::filters;
+pub use crate::filters::{
+    Filter, FilterId, FilterRefusal, FilterSet, FilterSpec, FilterTexts, OwnedFilterTexts,
+};
 pub use crate::media::{MEDIA_HANDLES, MediaBlob, MediaEntry, MediaHandles, MediaVariant};
+pub use crate::search::snippet::{Mark as SnippetMark, Snippet};
 /// What [`UiEvent::Notice`] carries, so a front-end can name the notice it shows (the quiet line
 /// for lost history, W4).
 pub use kourier_backend_api::BackendNotice;
+/// The archive writer's entry-name rule ([`UiCommand::ExportArchive`]: `files/<one component>`
+/// or a top-level name, unique, each component a valid file name), so a front-end names the
+/// entries by the very rule the writer checks.
+pub use kourier_blob::check_entry_name;
 pub use kourier_blob::{SaveError, SaveMode};
 pub use kourier_media::{Look, LookFormat};
 /// Synthetic files that carry a made-up location (the Qt window tests and fixture pages of the
@@ -44,6 +55,10 @@ pub use kourier_model as model;
 /// Capacity of the [`UiEvent`] broadcast. A lagging receiver gets `RecvError::Lagged` and must
 /// reload its visible models (Delta Chat pattern, §8.5).
 pub const UI_EVENT_CAPACITY: usize = 4096;
+
+/// The most caught-up messages one `CatchUpSummary` carries for the filters to look at (the
+/// newest; a longer catch-up is matched over this many).
+pub const CATCH_UP_IDS: usize = 2_000;
 
 /// Identifies one query of one model: `model` is chosen by the UI, `generation` increases with
 /// every query of that model.
@@ -286,6 +301,15 @@ pub enum UiCommand {
         /// The attachment.
         attachment: kourier_model::AttachmentId,
     },
+    /// Read and parse a downloaded 3D model (STL, 3MF) under the `kourier-mesh` bounds, for the
+    /// viewer: answered with [`UiEvent::ModelOpened`], or with `ActionFailed { action:
+    /// "OpenModel", subject: ActionSubject::Attachment(..) }` (the message is gone or hidden,
+    /// the file is not downloaded, is not a model, or is beyond the bounds). No plaintext copy
+    /// is made and nothing is kept here: the viewer drops its mesh when it closes.
+    OpenModel {
+        /// The attachment.
+        attachment: kourier_model::AttachmentId,
+    },
     /// The view that opened the attachment's plaintext file closed.
     CloseMedia {
         /// The attachment.
@@ -314,6 +338,56 @@ pub enum UiCommand {
         /// Whether a file of that name is replaced (the dialog asked) or answered with
         /// `Exists` (several files into one folder).
         mode: SaveMode,
+    },
+    /// Write the export of the selected messages of `conv` as one ZIP in `target` (Export
+    /// Selected, architecture §5.8.3). The UI built `documents` (`index.html`, `messages.jsonl`)
+    /// from an [`Query::ExportPlan`]; the core checks everything again at the command, on the
+    /// `saves` queue, and writes on the blocking pool: (1) the name and an absolute folder; (2)
+    /// [`crate::actions::may_export_chat`] on the chat's current features
+    /// ([`ExportFailure::ChatRefused`]); (3) every message of `messages` read again and its
+    /// [`ExportVerdict`] taken with `with_disappearing`: any that is not included any more
+    /// (deleted for me, gone, view-once, a timer without the tick, another chat's), or whose
+    /// `deleted` flag or `revision` differs from its [`ExportStamp`] (deleted for everyone or
+    /// edited since the plan: the documents carry the old text), fails the
+    /// WHOLE export with [`ExportFailure::Changed`] before anything is written; (4) every file
+    /// re-checked with the save rule and required to belong to a listed message (else `Changed`
+    /// too); (5) free space for the files, the documents and a margin ([`ExportFailure::NoSpace`]);
+    /// (6) the archive: `files/` entries first, then `documents` in the order given, then
+    /// `manifest.json` LAST, written by the core: `manifest` plus `"entries": [{"path", "size",
+    /// "sha256"}]` for every entry before it and `"files_failed": [entry names]`; (7) published
+    /// under the name ([`SaveMode`]). Progress as [`Progress::Export`]; the end as
+    /// [`UiEvent::ExportEnded`]. `UiCommand::CancelExport` stops it.
+    ExportArchive {
+        /// The UI's id of this export, echoed in its events.
+        request: RequestId,
+        /// The conversation.
+        conv: ConversationId,
+        /// The folder and the archive's file name.
+        target: SaveTarget,
+        /// Replace a file of that name, or fail with [`ExportFailure::Exists`].
+        mode: SaveMode,
+        /// The dialog's tick: disappearing messages are exported too.
+        with_disappearing: bool,
+        /// The messages the documents are made of, each with what the plan saw of it
+        /// ([`PlannedMessage::stamp`]): the command reads them again and fails the whole export
+        /// with [`ExportFailure::Changed`] when the row is no longer what the stamp says.
+        messages: Vec<ExportStamp>,
+        /// The files to copy into `files/`.
+        files: Vec<ExportFile>,
+        /// The documents, in the order they are written.
+        documents: Vec<ExportDocument>,
+        /// The head of `manifest.json`.
+        manifest: ExportHead,
+    },
+    /// Stop the export `request` ([`UiEvent::ExportEnded`] with [`ExportOutcome::Cancelled`];
+    /// nothing is left under the final name). Nothing happens for an unknown or finished one. The
+    /// flag is looked at between chunks and once more right before the publish: a cancel that
+    /// comes after that ends [`ExportOutcome::Done`]. A request id that is running is refused
+    /// at once with `Failed(Io)`, and the first export keeps its cancel. Exports and file saves
+    /// share one serial queue.
+    CancelExport {
+        /// The export.
+        request: RequestId,
     },
     /// Re-queue a failed (or paused) own message with its original network id, a fresh retry
     /// budget and only the recipients that do not have it yet (§4.8 step 5). It also lifts a
@@ -465,7 +539,10 @@ pub enum UiCommand {
         /// The attachment ([`model::Attachment::id`] of a timeline row).
         attachment: AttachmentId,
     },
-    /// Store or clear the composer draft (core-local state).
+    /// Store or clear the composer draft (core-local state). The front-end sends it when the
+    /// chat is LEFT with a changed text (and when a refused send gives its text back); a draft
+    /// that differs from the stored one is stamped with the time ([`ConversationRow::draft_at`]),
+    /// a cleared one loses its stamp.
     SaveDraft {
         /// The conversation.
         conv: ConversationId,
@@ -640,6 +717,35 @@ pub enum UiCommand {
     /// cache per connection, four connections). Everything works as before afterwards; the
     /// first queries read their pages again. Send it before the allocator is trimmed.
     ReleaseMemory,
+    /// Saves a RegExp filter: a new one at the end of the list (`id: None`) or the edit of
+    /// `id` in place. The core validates it ([`filters::validate`]: a name of 1 to 64
+    /// characters, at least one field, each pattern at most 10,000 characters and compiling
+    /// under the size limit, a colour of `0xRRGGBB`; no cap on the count) and compiles the
+    /// set on a blocking thread. Applied before anything sent after it is looked at. A
+    /// refusal comes as `ActionFailed { account: None, action: "SaveFilter", error:
+    /// CoreError::Filter(reason), subject: ActionSubject::None }` and nothing changes; a
+    /// save comes as [`UiEvent::FiltersChanged`].
+    SaveFilter {
+        /// The filter to change, `None` for a new one.
+        id: Option<FilterId>,
+        /// What the user typed.
+        spec: FilterSpec,
+    },
+    /// Deletes a filter (the others close the gap). An unknown id is refused as
+    /// `ActionFailed { action: "DeleteFilter" }` with `FilterRefusal::Unknown`.
+    DeleteFilter {
+        /// The filter.
+        id: FilterId,
+    },
+    /// Moves a filter to place `to` (0 is the first; past the end is the end). The order is the
+    /// order of colours: the first matching highlight filter gives a span its colour.
+    /// Refused like a delete when the id is unknown (`action: "MoveFilter"`).
+    MoveFilter {
+        /// The filter.
+        id: FilterId,
+        /// Its new place.
+        to: usize,
+    },
     /// Run a query; answered with [`UiEvent::QueryResult`].
     Query {
         /// Echoed in the result.
@@ -647,6 +753,30 @@ pub enum UiCommand {
         /// What to read.
         query: Query,
     },
+}
+
+/// A parsed 3D model as plain buffers (a front-end needs no mesh crate). `Debug` prints counts
+/// only, never a coordinate.
+pub struct ModelMesh {
+    /// Nine floats per triangle (three corners, x y z), in millimetres.
+    pub positions: Vec<f32>,
+    /// One RGBA value per triangle, `0` = none of its own; `None` for a model without colours.
+    pub colors: Option<Vec<u32>>,
+    /// The corner of the bounding box with the smallest coordinates, in millimetres.
+    pub min: [f32; 3],
+    /// The corner of the bounding box with the largest coordinates, in millimetres.
+    pub max: [f32; 3],
+    /// Number of triangles.
+    pub triangles: usize,
+}
+
+impl std::fmt::Debug for ModelMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelMesh")
+            .field("triangles", &self.triangles)
+            .field("coloured", &self.colors.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the core tells the UI. Invalidations name rows; the UI re-queries.
@@ -776,6 +906,10 @@ pub enum UiEvent {
         messages: u32,
         /// In this many conversations.
         conversations: u32,
+        /// The caught-up messages `(conversation, message)`, the newest [`CATCH_UP_IDS`] of them,
+        /// oldest first; empty while no filter has Notify (the desktop matches them against
+        /// the filters, §8.7).
+        ids: Vec<(ConversationId, MessageId)>,
     },
     /// Where the history transfer of a newly linked account stands (waiting for the phone,
     /// downloading with its bytes, reading, done, skipped, failed with a kind). While the
@@ -851,6 +985,13 @@ pub enum UiEvent {
         /// The plaintext file (personal data, never logged).
         path: PathBuf,
     },
+    /// [`UiCommand::OpenModel`]: the parsed model.
+    ModelOpened {
+        /// The attachment.
+        attachment: kourier_model::AttachmentId,
+        /// The mesh (shared: cloning the event copies no triangle).
+        mesh: Arc<ModelMesh>,
+    },
     /// [`UiCommand::SaveAttachment`]: the copy is in the folder under the name asked for, and
     /// on the disk.
     AttachmentSaved {
@@ -858,6 +999,13 @@ pub enum UiEvent {
         attachment: kourier_model::AttachmentId,
         /// The length of the copy in bytes.
         bytes: u64,
+    },
+    /// [`UiCommand::ExportArchive`] ended.
+    ExportEnded {
+        /// The command's `request`.
+        request: RequestId,
+        /// How it ended.
+        outcome: ExportOutcome,
     },
     /// A banner from the backend.
     Notice {
@@ -911,6 +1059,13 @@ pub enum UiEvent {
         /// Whose safety number.
         user: UserId,
     },
+    /// The saved filters changed (a save, a delete, a move): `revision` is the new one. The
+    /// view model asks [`Query::Filters`] again. The first revision of a run is 1 and every
+    /// change adds one.
+    FiltersChanged {
+        /// The new revision of the list ([`FilterList::revision`]).
+        revision: u64,
+    },
     /// The answer to [`UiCommand::Query`].
     QueryResult {
         /// The query's token.
@@ -918,6 +1073,20 @@ pub enum UiEvent {
         /// The rows, or why not.
         result: std::result::Result<QueryData, Arc<CoreError>>,
     },
+}
+
+/// The answer to [`Query::Filters`].
+#[derive(Clone, Debug)]
+pub struct FilterList {
+    /// Every saved filter, in the user's order: what Settings lists.
+    pub filters: Vec<Filter>,
+    /// The compiled set, shared: one per revision, built by the core on a blocking thread,
+    /// never on the caller's. Callable from any thread. It can hold fewer filters than
+    /// [`Self::filters`] (a stored row that no longer compiles is left out), so the indices
+    /// its matches give are into [`FilterSet::filters`], never into [`Self::filters`].
+    pub set: Arc<FilterSet>,
+    /// Moves on every change (1 for the list a run started with).
+    pub revision: u64,
 }
 
 /// What a failed command was about ([`UiEvent::ActionFailed`]).
@@ -1168,6 +1337,9 @@ pub struct Notification {
     pub message: MessageId,
     /// We are mentioned.
     pub mentions_me: bool,
+    /// The chat is muted and the message is announced only because a RegExp filter with "Also
+    /// in muted chats" may want it: the desktop drops it unless such a filter matches (§8.7).
+    pub muted: bool,
 }
 
 /// Progress events (ephemeral).
@@ -1206,6 +1378,16 @@ pub enum Progress {
         progress: f32,
         /// What the send is doing now; `None` when only the upload share is known.
         phase: Option<kourier_model::SendPhase>,
+    },
+    /// The running [`UiCommand::ExportArchive`]: bytes of content written (of the files and
+    /// documents together), at most every ~200 ms or 1 MiB, the last one `done == total`.
+    Export {
+        /// The command's `request`.
+        request: RequestId,
+        /// Bytes written so far.
+        done: u64,
+        /// Bytes of all files and documents.
+        total: u64,
     },
     /// The core copies the files of a [`UiCommand::SendFiles`] into the blob store. The
     /// first comes before the first file is copied (`files_done` 0), the last when every
@@ -1247,6 +1429,31 @@ pub enum Query {
     Conversations(ConversationListQuery),
     /// A page of a timeline.
     Timeline(TimelineQuery),
+    /// The messages `ids` of the conversation `conv` as a timeline page shows them (the same
+    /// fields and [`MessageRow::actions`]), oldest first (`sort_key`, id), each at most once:
+    /// only what the timeline would show (never a message deleted for me, never one hidden by
+    /// the expiry rule). An unknown id, an id of another conversation and a hidden message are
+    /// silently absent. Answered with [`QueryData::MessagesByIds`] (`has_older` and
+    /// `has_newer` are false). The selection mode's reads (Copy as Text, the export, Forward)
+    /// share it.
+    MessagesByIds {
+        /// The conversation the messages belong to.
+        conv: ConversationId,
+        /// The messages asked for, in any order; chunks of at most 500 are bound per
+        /// statement, so any number is answered.
+        ids: Vec<MessageId>,
+    },
+    /// What an export of the messages `ids` of `conv` would do ([`ExportPlan`]): the chat's
+    /// verdict, the member count, and per message that is visible (through the by-id read of
+    /// [`Query::MessagesByIds`]: never a message deleted for me or hidden by the expiry rule)
+    /// its row, its [`ExportVerdict`], its files with what the file rule says and its earlier
+    /// versions. Answered with [`QueryData::ExportPlan`].
+    ExportPlan {
+        /// The conversation.
+        conv: ConversationId,
+        /// The messages asked for, in any order.
+        ids: Vec<MessageId>,
+    },
     /// One conversation with members and features.
     Conversation(ConversationId),
     /// The files of one attachment (media-handle misses, §8.6; runs on the third read
@@ -1309,6 +1516,22 @@ pub enum Query {
     /// What [`UiCommand::SetQuietNotices`] chose: `true` when quiet notices are shown in the
     /// list (`false` until the user chooses so).
     QuietNotices,
+    /// A page of the messages that hold a typed text (G1), newest first, from every account
+    /// and both views, or from the chats named. Never a message of a protected chat, a deleted
+    /// chat, an account being removed, a deleted, view-once or hidden message (the rules are
+    /// the query's, in its SQL). One search runs at a time on a read connection of its own: a
+    /// newer one ends the running one, which answers what it found (`capped`).
+    Search(SearchQuery),
+    /// How many rows wait in core.db's search log (messages the index has not taken yet). A
+    /// profile whose index is up to date answers 0; the perf seed waits for it (decisions M2).
+    SearchQueued,
+    /// The saved RegExp filters with the compiled set; answered from memory (no database
+    /// read), so a view model can ask on every [`UiEvent::FiltersChanged`].
+    Filters,
+    /// The rows of caught-up messages (at most [`CATCH_UP_IDS`]) that are still there and
+    /// visible, for the desktop's matching of a catch-up summary against the filters; one
+    /// batched read.
+    CaughtUpMessages(Vec<(ConversationId, MessageId)>),
 }
 
 /// The answer to a [`Query`].
@@ -1320,6 +1543,10 @@ pub enum QueryData {
     Conversations(ConversationPage),
     /// [`Query::Timeline`].
     Timeline(TimelinePage),
+    /// [`Query::MessagesByIds`].
+    MessagesByIds(TimelinePage),
+    /// [`Query::ExportPlan`].
+    ExportPlan(Box<ExportPlan>),
     /// [`Query::Conversation`]; `None` when it does not exist.
     Conversation(Option<Box<ConversationDetail>>),
     /// [`Query::Attachment`]; `None` when it does not exist.
@@ -1354,6 +1581,14 @@ pub enum QueryData {
     ExpiryPolicy(ExpiryPolicy),
     /// [`Query::QuietNotices`]: `true` when quiet notices are shown in the list.
     QuietNotices(bool),
+    /// [`Query::Search`].
+    Search(SearchPage),
+    /// [`Query::SearchQueued`]: the rows in the log.
+    SearchQueued(u64),
+    /// [`Query::Filters`].
+    Filters(FilterList),
+    /// [`Query::CaughtUpMessages`]: `(conversation, row)` in the order asked.
+    CaughtUpMessages(Vec<(ConversationId, MessageRow)>),
 }
 
 /// Where an attachment's encrypted files are.
@@ -1375,6 +1610,209 @@ pub struct AttachmentFile {
     pub file: Option<BlobRef>,
     /// The encrypted thumbnail.
     pub thumb: Option<BlobRef>,
+}
+
+/// One file of an export ([`UiCommand::ExportArchive`]). `Debug` shows no entry name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportFile {
+    /// The attachment (of one of the listed messages).
+    pub attachment: kourier_model::AttachmentId,
+    /// Its entry name in the archive, `files/<one component>` (the writer checks it).
+    pub entry: String,
+}
+
+impl std::fmt::Debug for ExportFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportFile")
+            .field("attachment", &self.attachment)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One document of an export ([`UiCommand::ExportArchive`]). `Debug` shows only its length.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportDocument {
+    /// Its entry name (a top-level name; the writer checks it).
+    pub entry: String,
+    /// Its bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExportDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportDocument")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The head of `manifest.json` ([`UiCommand::ExportArchive`]): a JSON object the UI made; the
+/// core adds `entries` and `files_failed`. `Debug` shows nothing of it.
+#[derive(Clone, PartialEq)]
+pub struct ExportHead(pub serde_json::Map<String, serde_json::Value>);
+
+impl std::fmt::Debug for ExportHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExportHead(<redacted>)")
+    }
+}
+
+/// What the plan saw of one message ([`PlannedMessage::stamp`]); the command
+/// ([`UiCommand::ExportArchive`]) carries one per message and the core compares it with the row
+/// as it is then. `Debug` shows the id, the flag and the revision (no content).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExportStamp {
+    /// The message.
+    pub id: MessageId,
+    /// The row was a tombstone of a delete for everyone (`deleted IS NOT NULL`).
+    pub deleted: bool,
+    /// The row's edit revision.
+    pub revision: u16,
+}
+
+impl std::fmt::Debug for ExportStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportStamp")
+            .field("id", &self.id.0)
+            .field("deleted", &self.deleted)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+/// How an export ended ([`UiEvent::ExportEnded`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportOutcome {
+    /// The archive is in the folder and on the disk.
+    Done {
+        /// Messages listed in the command, each id counted once.
+        messages: u32,
+        /// Files in the archive.
+        files: u32,
+        /// Files that could not be read to their end and are not in it (the UI counts them
+        /// and may offer to export again without them). Log-safe ids.
+        failed: Vec<kourier_model::AttachmentId>,
+        /// The archive's size in bytes.
+        bytes: u64,
+    },
+    /// [`UiCommand::CancelExport`]: nothing was left.
+    Cancelled,
+    /// Nothing was left under the final name.
+    Failed(ExportFailure),
+}
+
+/// Why an export failed ([`ExportOutcome::Failed`]). Typed and log-safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExportFailure {
+    /// [`SaveMode::NoReplace`] and a file of that name exists.
+    Exists,
+    /// The folder does not exist (or the name or folder is not a usable one).
+    NoFolder,
+    /// The folder is not writable.
+    NotWritable,
+    /// The file system is too small for the export.
+    NoSpace,
+    /// A message or a file of the export is not exportable any more, or was never part of it:
+    /// the documents may carry it, so nothing was written.
+    Changed,
+    /// The chat may not be exported (the reason: [`Refusal::ExportUnstated`],
+    /// [`Refusal::ExportRestricted`] or [`Refusal::ExportProtected`]).
+    ChatRefused(Refusal),
+    /// Any other error, including a failed archive name.
+    Io,
+}
+
+/// The answer to [`Query::ExportPlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportPlan {
+    /// The conversation.
+    pub conv: ConversationId,
+    /// Whether the chat may be exported at all, or the typed reason it may not
+    /// ([`Refusal::ExportUnstated`], [`Refusal::ExportRestricted`],
+    /// [`Refusal::ExportProtected`]).
+    pub chat: std::result::Result<(), Refusal>,
+    /// Members of the chat (full members; groups of 100 and more get pseudonyms in the export).
+    pub members: u32,
+    /// The asked messages that are visible, in timeline order.
+    pub messages: Vec<PlannedMessage>,
+    /// The core clock (ms) when the plan was read.
+    pub now: i64,
+}
+
+/// One message of an [`ExportPlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedMessage {
+    /// The row as the timeline gives it. A message that is [`ExportVerdict::LeftOut`] carries
+    /// nothing of its content: its body is [`kourier_model::Placeholder::Expired`] (the variant
+    /// that says nothing), with no reply, reactions, avatar, device, edit time, send state,
+    /// timer or actions, and no files and no revisions beside it; it keeps its id, times,
+    /// author and the verdict.
+    pub row: MessageRow,
+    /// What the plan saw of the row; the command carries it back ([`UiCommand::ExportArchive`]).
+    pub stamp: ExportStamp,
+    /// What an export does with it.
+    pub verdict: ExportVerdict,
+    /// The verdict for the quoted original of a reply (`None`: no quote), from the ORIGINAL's
+    /// row, hidden ones too ([`ExportVerdict::LeftOut`] when it is view-once or gone, an
+    /// original the core remembers as expired; [`ExportVerdict::NeedsTick`] for a disappearing
+    /// one; [`ExportVerdict::Included`] otherwise, an original the core never had included: the
+    /// sender's snapshot, as the timeline shows it). A `LeftOut` quote comes with its text, file
+    /// name, kind, thumb and snapshot STRIPPED (the row's `reply` keeps that there was a quote
+    /// and its author). A `NeedsTick` quote is kept whole: a document shows its content only
+    /// with the tick.
+    pub quote: Option<ExportVerdict>,
+    /// Its files (attachments of its body), in order.
+    pub files: Vec<PlannedFile>,
+    /// The earlier versions of an edited message (what [`Query::Revisions`] gives, oldest
+    /// first, the current one last); empty for one never edited.
+    pub revisions: Vec<Revision>,
+}
+
+/// One file of a planned message.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    /// The attachment.
+    pub attachment: kourier_model::AttachmentId,
+    /// Its kind.
+    pub kind: kourier_model::AttachmentKind,
+    /// The stated MIME type.
+    pub mime: String,
+    /// The plaintext size.
+    pub size: u64,
+    /// The file name the sender gave.
+    pub file_name: Option<String>,
+    /// What the first bytes say it is ([`SaveFacts::sniffed`]); `None` for a file that is not
+    /// here or a type the sniffer does not know. A picture is inlined in `index.html` only when
+    /// this is JPEG, PNG, GIF, WebP or AVIF.
+    pub sniffed: Option<String>,
+    /// The file rule ([`crate::actions::may_save_file`]): `Ok` when
+    /// the file may go into the archive (for a message that [`ExportVerdict::NeedsTick`] only
+    /// with the tick), else why not. A file that is not on this computer is listed, never
+    /// fetched.
+    pub accepted: std::result::Result<(), ExportFileRefusal>,
+}
+
+impl std::fmt::Debug for PlannedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedFile")
+            .field("attachment", &self.attachment)
+            .field("kind", &self.kind)
+            .field("size", &self.size)
+            .field("accepted", &self.accepted)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a file of a planned message is not exported ([`PlannedFile::accepted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExportFileRefusal {
+    /// The file is not on this computer (Download would fetch it; an export never does).
+    NotHere,
+    /// The rest of a long text, not a file.
+    LongText,
+    /// The message is left out. (The plan gives a left-out message no files at all, so it does
+    /// not produce this any more; kept for a front-end that matches it.)
+    MessageLeftOut(LeftOut),
 }
 
 /// What the name of a saved file is made of ([`Query::SaveFacts`]). Personal data: `Debug` shows
@@ -1463,9 +1901,12 @@ pub struct AccountRow {
     /// limit. The core refuses a pin beyond a stated limit ([`Refusal::TooMany`]); a front-end
     /// words the refusal with this number.
     pub pin_limit: Option<u32>,
+    /// The account's own ids on its network (the first is the primary one). Personal data: never
+    /// in `Debug`. The export's people table maps each to `me`.
+    pub own_ids: Vec<kourier_model::UserId>,
 }
 
-kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar, linked_at, hold, roaming_writes, pin_limit } redact { display_name, number });
+kourier_model::redacting_debug!(AccountRow { id, uuid, network, state, conn, own_device, avatar, linked_at, hold, roaming_writes, pin_limit } redact { display_name, number, own_ids });
 
 /// Who an account was, read before its row went: what a notice about its removal or unlink
 /// names it by (link feedback L4).
@@ -1584,6 +2025,12 @@ pub struct ConversationRow {
     pub features_hash: u64,
     /// A draft exists.
     pub has_draft: bool,
+    /// When the chat was last LEFT with its draft, in the unit of [`Self::last_activity`]
+    /// (arrival milliseconds * 1024); 0 when there is no draft or it carries no stamp (stored
+    /// before the stamp existed). A front-end that moves a chat with a draft up orders the chat
+    /// by this while it is newer than `last_activity` (Signal Desktop's comparator); core.db's
+    /// own list order stays `last_activity` ([`UiCommand::SaveDraft`] stamps it).
+    pub draft_at: i64,
     /// The conversation was deleted (here with [`UiCommand::DeleteConversation`], or on
     /// another own device) and nothing a person sent is left in it: it is in no page of
     /// [`Query::Conversations`] and comes back with its next message, or when the user
@@ -1634,7 +2081,7 @@ pub enum Roaming {
 kourier_model::redacting_debug!(ConversationRow {
     id, account, kind, is_self, peer, avatar, preview, last_activity, unread, mentions,
     marked_unread, muted_until, local_muted_until, archived, pinned_order, blocked,
-    request_pending, features_hash, has_draft, hidden, can_send, roaming, protected
+    request_pending, features_hash, has_draft, draft_at, hidden, can_send, roaming, protected
 } redact { title });
 
 impl ConversationRow {
@@ -1703,6 +2150,15 @@ pub struct ConversationDetail {
     pub timer: Option<Duration>,
     /// The composer draft (`UiCommand::SaveDraft`).
     pub draft: Option<Text>,
+}
+
+impl ConversationDetail {
+    /// Whether "Export Selected…" is offered for this chat, or why not: the one rule
+    /// ([`crate::actions::may_export_chat`]) on the chat's features. The header reads it.
+    pub fn export(&self) -> std::result::Result<(), Refusal> {
+        crate::actions::may_export_chat(Some(&self.features), self.row.protected)
+            .map_err(|e| e.refusal().unwrap_or(Refusal::ExportUnstated))
+    }
 }
 
 /// One person for their page (people pages P1; architecture §4.2). What the core keeps, not what
@@ -2057,6 +2513,145 @@ pub struct ChatMediaPage {
     /// still says there are files). Only asked for with the first page (`before` is `None`);
     /// `false` on a later one.
     pub other: bool,
+}
+
+/// [`Query::Search`]: a page of the messages that hold every word of a typed text (G1).
+///
+/// The text is cut by the index's own rules (`search::normalize`); each word of two letters or
+/// more ([`SEARCH_MIN_PREFIX`]) also finds the words it starts ("фай" finds "файли"), a shorter
+/// one only itself. A text with no word answers an empty page. `Debug` shows no text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchQuery {
+    /// What he typed (at most its first 512 bytes and 32 words are used).
+    pub text: Redacted<String>,
+    /// Only these chats (`None`: every chat of every account). An EMPTY list answers an empty
+    /// page, never every chat (fail closed: a grant of no chat is no grant).
+    pub chats: Option<Vec<ConversationId>>,
+    /// How many hits at most (clamped to 1 ..= [`MAX_SEARCH_PAGE`]).
+    pub limit: u32,
+    /// After this hit (`None`: from the newest).
+    pub before: Option<SearchCursor>,
+    /// Words (the index) or a pattern (a scan of the messages, R5).
+    pub mode: SearchMode,
+}
+
+/// How [`SearchQuery::text`] is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Every word of the text, through the index.
+    #[default]
+    Words,
+    /// The text is a regular expression (the filters' syntax and limits), found by a scan of
+    /// the messages newest first; `match_case` off ignores case. A pattern the core refuses
+    /// answers `CoreError::Filter(FilterRefusal::Pattern(Field::Text, ..))`.
+    Pattern {
+        /// Case matters.
+        match_case: bool,
+    },
+}
+
+/// The compiled pattern of a pattern search, handed back with the page so the front-end
+/// marks the snippet and filters titles with it (nothing compiles on the UI thread).
+/// `Debug` shows no pattern; equal when the same compile.
+#[derive(Clone)]
+pub struct SearchPattern(pub Arc<regex::Regex>);
+
+impl std::fmt::Debug for SearchPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SearchPattern(..)")
+    }
+}
+
+impl SearchPattern {
+    /// Whether the pattern matches somewhere in `text` (a chat list's title).
+    #[must_use]
+    pub fn is_match(&self, text: &str) -> bool {
+        self.0.is_match(text)
+    }
+}
+
+impl PartialEq for SearchPattern {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SearchPattern {}
+
+/// The most hits one search page holds.
+pub const MAX_SEARCH_PAGE: u32 = 100;
+
+/// The shortest word, in characters, that a search matches as a prefix (his answer "From two
+/// letters"; a shorter word finds whole words only).
+pub const SEARCH_MIN_PREFIX: usize = crate::search::MIN_PREFIX;
+
+/// Where the next page of a search goes on: after the hit `(sort_key, id)`, newest first.
+///
+/// `resume` is set after a page that stopped inside an hour with more rows to look at than one
+/// page may look up (or past the time a page may take, `SearchPage::capped`): the next page
+/// goes on below that place of the index in the order of the messages' ids, which inside that
+/// hour is the order of arrival and not of time; every hit still comes once. Opaque to a
+/// front-end: hand back what [`SearchPage::next`] gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchCursor {
+    /// The sort key of the last hit shown before (a bound: only hits below it follow).
+    pub sort_key: i64,
+    /// Its id.
+    pub id: MessageId,
+    /// The place in the index the walk goes on below, in id order inside its hour.
+    pub resume: Option<i64>,
+}
+
+/// One message a search found. `Debug` shows no text and no name (the snippet's shows counts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    /// The message.
+    pub message: MessageId,
+    /// Its chat.
+    pub conv: ConversationId,
+    /// The chat's account.
+    pub account: AccountId,
+    /// Its timeline order (the hits come newest first by it, then by id).
+    pub sort_key: i64,
+    /// The sender's timestamp.
+    pub sent_at: i64,
+    /// Sent by the account itself (on this or another device).
+    pub own: bool,
+    /// The sender (`None` for an own message).
+    pub author: Option<UserId>,
+    /// The sender's name as the core has it (nickname, address book, profile).
+    pub author_name: Option<Redacted<String>>,
+    /// The bit of the message that shows the hit, with what matched and the spoiler and
+    /// mention ranges a front-end must render (`ranges`: never show `text` without them).
+    pub snippet: Snippet,
+}
+
+/// The answer to [`Query::Search`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchPage {
+    /// The hits, newest first (inside an hour that a page could not look at whole, by id:
+    /// [`SearchCursor::resume`]).
+    pub hits: Vec<SearchHit>,
+    /// Where the next page starts; `None` when there are no more hits.
+    pub next: Option<SearchCursor>,
+    /// The page stopped before it had looked at every candidate it would have (it looked up
+    /// the most rows a page may, or ran out of its time, or a newer search took the
+    /// connection): `hits` is what it found by then, and `next` goes on from there.
+    pub capped: bool,
+    /// How far the index is.
+    pub index: SearchIndexState,
+    /// The compiled pattern of a pattern search (`None` for words).
+    pub pattern: Option<SearchPattern>,
+}
+
+/// How far the search index is: the messages that were there before it (an old profile's
+/// history) are indexed in the background, newest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchIndexState {
+    /// Every message is indexed.
+    pub ready: bool,
+    /// How much of the old messages is indexed (100 when ready).
+    pub percent: u8,
 }
 
 /// A member of a [`GroupDetail`].

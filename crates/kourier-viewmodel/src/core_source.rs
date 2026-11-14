@@ -39,8 +39,8 @@ use crate::conversations::{
     AccountRow, AccountStatus, AccountTable, Banner, BannerContext, BannerKind, Banners,
     ChatHeader, ConversationFilter, ConversationRow, Hidden, PreviewSource, TableAccount,
     account_banner, history_lost_banner, hold_banner, network_icon, network_missing_banner,
-    network_name, network_off_banner, network_tint, shown_archived, timer_menu, timer_secs,
-    timer_span, typing_label,
+    network_name, network_off_banner, network_tint, order_time, shown_archived, timer_menu,
+    timer_secs, timer_span, typing_label,
 };
 use crate::edit::EditForm;
 use crate::files::{ArchiveRule, PlanAnswer, PlanRequest, StripRules, refused_notice};
@@ -52,9 +52,9 @@ use crate::preview::{self, Summary};
 use crate::readmore::ReadMore;
 use crate::roaming::{self, AccountFacts, ChatOffer, ChatTold};
 use crate::source::{
-    EditTarget, FinishedSend, GroupUpdate, MediaAnswer, PersonUpdate, RefusedSend, ReplaceNews,
-    ReturnedFile, RevisionList, RevisionRow, SaveAnswer, SaveFailure, SaveOutcome, SendOutcome,
-    SourceError, UiSource,
+    EditTarget, FinishedSend, GroupUpdate, MediaAnswer, ModelAnswer, PersonUpdate, RefusedSend,
+    ReplaceNews, ReturnedFile, RevisionList, RevisionRow, SaveAnswer, SaveFailure, SaveOutcome,
+    SendOutcome, SourceError, UiSource,
 };
 use crate::time::{Calendar, TimeContext};
 use crate::timeline::{
@@ -95,7 +95,49 @@ pub const MODEL_SAVE: u32 = 17;
 pub const MODEL_READ_AHEAD: u32 = 18;
 /// Token model id of a copy action's person.
 pub const MODEL_COPY: u32 = 19;
+/// Query model id of the saved RegExp filters (after `MODEL_SEARCH` 20).
+pub const MODEL_FILTERS: u32 = 21;
 pub use media_slots::MODEL_CHAT_MEDIA;
+pub use searching::MODEL_SEARCH;
+
+// Every query model has an id of its own: an answer is routed by it, so two models under one id
+// take each other's answers (a rebase once gave the search and the read-ahead both 18). The
+// gallery's five slots are `MODEL_CHAT_MEDIA..+5`.
+const _: () = {
+    let ids = [
+        MODEL_ACCOUNTS,
+        MODEL_CONVERSATIONS,
+        MODEL_CONVERSATION,
+        MODEL_TIMELINE,
+        MODEL_FILE_PLAN,
+        MODEL_REVISIONS,
+        MODEL_SETTINGS,
+        MODEL_QUIET,
+        MODEL_PERSON,
+        MODEL_GROUP,
+        MODEL_CHAT_MEDIA,
+        MODEL_CHAT_MEDIA + 1,
+        MODEL_CHAT_MEDIA + 2,
+        MODEL_CHAT_MEDIA + 3,
+        MODEL_CHAT_MEDIA + 4,
+        MODEL_SAFETY,
+        MODEL_SAVE,
+        MODEL_READ_AHEAD,
+        MODEL_COPY,
+        MODEL_SEARCH,
+        MODEL_FILTERS,
+        MODEL_EXPORT,
+    ];
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i + 1;
+        while j < ids.len() {
+            assert!(ids[i] != ids[j], "two query models share an id");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// How many rows from the top of the list have their chat's features read ahead, so the chat
 /// opens with its composer already right. Rows with features already seen cost nothing.
@@ -202,6 +244,8 @@ pub struct Changes {
     pub person: bool,
     /// A copy action is answered ([`UiSource::take_copy`]).
     pub copy: bool,
+    /// The export flow has something to tell ([`UiSource::take_export`]).
+    pub export: bool,
     /// The group's page changed or ended ([`UiSource::take_group`]).
     pub group: bool,
     /// The safety-number level has a new answer ([`UiSource::take_safety`]).
@@ -211,6 +255,9 @@ pub struct Changes {
     /// A setting the core keeps became known or changed ([`UiSource::expiry_policy`],
     /// [`UiSource::quiet_notices`]).
     pub settings: bool,
+    /// The saved filters became known or changed, or a save was refused
+    /// ([`UiSource::filter_rows`], [`UiSource::take_filter_refusal`]).
+    pub filters: bool,
     /// Conversations were merged ([`UiSource::take_merges`]): what waits for a merged-away
     /// chat (the files in its composer) goes on waiting for the one that is left.
     pub merged: bool,
@@ -224,6 +271,10 @@ pub struct Changes {
     /// A short notice about a change of a chat or of the sync switch waits
     /// ([`UiSource::take_told`]).
     pub told: bool,
+    /// What the message search shows changed ([`UiSource::search_view`]): an answer came, a
+    /// search started or ended, or a list read changed which hits may show (a chat that turned
+    /// protected or left the list takes its hits off at once).
+    pub search: bool,
 }
 
 impl Changes {
@@ -248,14 +299,17 @@ impl Changes {
         revisions: false,
         person: false,
         copy: false,
+        export: false,
         group: false,
         safety: false,
         chat_media: false,
         settings: false,
+        filters: false,
         merged: false,
         transfer: true,
         account_notice: true,
         told: false,
+        search: true,
     };
 
     /// Whether anything changed.
@@ -279,13 +333,16 @@ impl Changes {
             || self.revisions
             || self.person
             || self.copy
+            || self.export
             || self.group
             || self.safety
             || self.chat_media
             || self.settings
+            || self.filters
             || self.merged
             || self.transfer
             || self.told
+            || self.search
     }
 
     /// Adds `other`.
@@ -306,14 +363,17 @@ impl Changes {
         self.revisions |= other.revisions;
         self.person |= other.person;
         self.copy |= other.copy;
+        self.export |= other.export;
         self.group |= other.group;
         self.safety |= other.safety;
         self.chat_media |= other.chat_media;
         self.settings |= other.settings;
+        self.filters |= other.filters;
         self.merged |= other.merged;
         self.transfer |= other.transfer;
         self.account_notice |= other.account_notice;
         self.told |= other.told;
+        self.search |= other.search;
         if other.switch_to.is_some() {
             self.switch_to = other.switch_to;
         }
@@ -423,6 +483,9 @@ impl QueryTracker {
         self.applied
     }
 }
+
+/// How many timeline reads [`CoreSource`]'s test-only log keeps per open chat.
+const FETCH_LOG_MAX: usize = 16;
 
 /// What a timeline query is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -623,6 +686,8 @@ pub struct CoreSource {
     features_asked: HashSet<u64>,
     /// The colors the person gave accounts (the preference `account-tints`).
     own_tints: HashMap<kourier_model::AccountUuid, String>,
+    /// The list's look: draft order, account tags ([`ListLook`]).
+    look: crate::source::ListLook,
     read_ahead_q: QueryTracker,
     timeline_q: QueryTracker,
     fetching: Option<(u64, Fetch)>,
@@ -631,6 +696,13 @@ pub struct CoreSource {
     want_newer: bool,
     /// A quote was activated whose original is not loaded: load the window around it.
     want_around: Option<MessageId>,
+    /// Test-only (G1h): the kinds of the open chat's timeline reads, in the order they were
+    /// asked (at most [`FETCH_LOG_MAX`]; emptied when the chat closes). A Qt test reads it to
+    /// hold that a search hit's open asks no newest page or reload before the window around it.
+    fetch_log: Vec<&'static str>,
+    /// The window around this message was asked for a search hit ([`UiSource::open_at`]): when
+    /// the message went away meanwhile, the notice says so in search's words.
+    around_hit: Option<MessageId>,
     /// "Jump to latest" from a window that ends before the newest message.
     want_newest: bool,
     /// The window was at the newest message when a burst arrived: page newer rows in until it
@@ -689,6 +761,14 @@ pub struct CoreSource {
     /// Whether quiet notices count for the conversation list, as the core holds it (`true`:
     /// shown); `None` until its first answer.
     quiet: Option<bool>,
+    filters_q: QueryTracker,
+    /// The saved filters as the core holds them (every stored row, and the compiled set R3
+    /// matches rows with); `None` until the first answer.
+    filter_list: Option<kourier_core::facade::FilterList>,
+    /// The core's refusal of the last save, waiting for the dialog.
+    filter_refusal: Option<crate::filters::FilterNote>,
+    /// The marks of the open chat's rows (R3), per message; see [`MarkCache`].
+    marks: std::cell::RefCell<MarkCache>,
     focused: bool,
     chat_visible: bool,
     presence_sent: Option<(bool, Option<ConversationId>)>,
@@ -727,6 +807,8 @@ pub struct CoreSource {
     too_late: Option<(MessageId, String)>,
     /// Answers to `OpenMedia` not taken yet.
     media_answers: Vec<MediaAnswer>,
+    /// Answers to `OpenModel` not taken yet.
+    model_answers: Vec<ModelAnswer>,
     /// The save calls: what each `SaveFacts` query in flight is for, by its generation.
     save_asks: HashMap<u64, SaveAsk>,
     /// The generation of the next `SaveFacts` query.
@@ -772,6 +854,8 @@ pub struct CoreSource {
     /// The copy action asked last: its generation (one a counter of its own, every action is
     /// sent) and what it takes. An older action's answer is dropped.
     copy_asked: Option<(u64, crate::person::CopyAsked)>,
+    /// Export Selected: the stage and what the window has not been told ([`exporting`]).
+    export: exporting::Export,
     copy_generation: u64,
     copy_answer: Option<crate::person::CopyUpdate>,
     /// The person the details panel shows, as asked (the canonical id once an answer named it).
@@ -814,6 +898,8 @@ pub struct CoreSource {
     safety_notice: String,
     /// The gallery of a chat in five places: four of the details panel and the picture viewer's own (people pages P4).
     media: media_slots::MediaSlots,
+    /// The message search (G1g).
+    search: searching::Searching,
     /// The history transfers of the accounts, as last reported (`UiEvent::HistoryTransfer`).
     transfers: TransferBook,
     /// What to say once about transfers that ended, until the front-end takes it.
@@ -944,6 +1030,7 @@ impl CoreSource {
             features_seen: HashMap::new(),
             features_asked: HashSet::new(),
             own_tints: HashMap::new(),
+            look: crate::source::ListLook::default(),
             read_ahead_q: QueryTracker::new(MODEL_READ_AHEAD),
             timeline_q: QueryTracker::new(MODEL_TIMELINE),
             fetching: None,
@@ -951,10 +1038,13 @@ impl CoreSource {
             want_older: false,
             want_newer: false,
             want_around: None,
+            fetch_log: Vec::new(),
+            around_hit: None,
             want_newest: false,
             following: false,
             window: Window::default(),
             read_more: ReadMore::default(),
+            marks: std::cell::RefCell::default(),
             unread_from: None,
             flags_deadline: None,
             names: NameMap::new(),
@@ -989,6 +1079,7 @@ impl CoreSource {
             uploads: HashMap::new(),
             too_late: None,
             media_answers: Vec::new(),
+            model_answers: Vec::new(),
             save_asks: HashMap::new(),
             save_next: 1,
             save_runs: HashMap::new(),
@@ -1012,6 +1103,7 @@ impl CoreSource {
             revisions_shown: None,
             person_q: QueryTracker::new(MODEL_PERSON),
             copy_asked: None,
+            export: Default::default(),
             copy_generation: 0,
             copy_answer: None,
             safety_q: QueryTracker::new(MODEL_SAFETY),
@@ -1032,11 +1124,15 @@ impl CoreSource {
             group_answer: None,
             group_last: None,
             media: media_slots::MediaSlots::new(),
+            search: searching::Searching::new(),
             merges: Vec::new(),
             settings_q: QueryTracker::new(MODEL_SETTINGS),
             expiry: None,
             quiet_q: QueryTracker::new(MODEL_QUIET),
             quiet: None,
+            filters_q: QueryTracker::new(MODEL_FILTERS),
+            filter_list: None,
+            filter_refusal: None,
             transfers: TransferBook::default(),
             transfer_notices: Vec::new(),
             replace_asked: None,
@@ -1108,6 +1204,12 @@ impl CoreSource {
         self.query(t, || Query::ExpiryPolicy);
     }
 
+    /// Asks the core for the saved filters.
+    fn request_filters(&mut self) {
+        let t = self.filters_q.request();
+        self.query(t, || Query::Filters);
+    }
+
     /// Asks the core whether quiet notices count for the conversation list.
     fn request_quiet(&mut self) {
         let t = self.quiet_q.request();
@@ -1143,8 +1245,11 @@ impl CoreSource {
 
     /// Remembers what a read of a chat said, for the next time it opens.
     fn remember_detail(&mut self, d: &ConversationDetail) {
+        // The hash is of the features: a hash already seen has these very features, so they
+        // are not copied again (a `ConversationFeatures` holds maps and vectors).
         self.features_seen
-            .insert(d.row.features_hash, d.features.clone());
+            .entry(d.row.features_hash)
+            .or_insert_with(|| d.features.clone());
         if self.known_details.len() >= KNOWN_DETAILS && !self.known_details.contains_key(&d.row.id)
         {
             self.known_details.clear();
@@ -1206,8 +1311,19 @@ impl CoreSource {
                         sort_key: oldest.sort_key,
                         id: MessageId(oldest.id.0.saturating_sub(1)),
                     }),
-                    u32::try_from((rows.len() + TIMELINE_PAGE as usize).min(TIMELINE_WINDOW))
-                        .unwrap_or(TIMELINE_PAGE),
+                    // Room for what came in only while the window follows the newest messages:
+                    // a window away from them (an old search hit) re-reads its own stretch, or
+                    // a few reloads would walk it to the newest and mark the chat read.
+                    u32::try_from(
+                        (rows.len()
+                            + if self.window.has_newer {
+                                0
+                            } else {
+                                TIMELINE_PAGE as usize
+                            })
+                        .min(TIMELINE_WINDOW),
+                    )
+                    .unwrap_or(TIMELINE_PAGE),
                 ),
                 _ => (TimelineAnchor::Newest, TIMELINE_PAGE),
             },
@@ -1234,6 +1350,15 @@ impl CoreSource {
             }
         }
         if let Some(token) = self.timeline_q.request() {
+            if self.fetch_log.len() < FETCH_LOG_MAX {
+                self.fetch_log.push(match fetch {
+                    Fetch::Reload => "reload",
+                    Fetch::Older => "older",
+                    Fetch::Newer => "newer",
+                    Fetch::Around(_) => "around",
+                    Fetch::Newest => "newest",
+                });
+            }
             self.fetching = Some((token.generation, fetch));
             self.send(UiCommand::Query {
                 token,
@@ -1406,7 +1531,7 @@ impl CoreSource {
     fn on_query_result(
         &mut self,
         token: QueryToken,
-        result: &Result<QueryData, std::sync::Arc<impl std::fmt::Display>>,
+        result: &Result<QueryData, std::sync::Arc<kourier_core::facade::CoreError>>,
     ) -> Changes {
         let mut ch = Changes::default();
         match token.model {
@@ -1514,6 +1639,9 @@ impl CoreSource {
                             self.list = rows;
                             ch.told |= self.settle_awaited();
                             ch.chat_media |= self.rerun_media_slots(&withheld);
+                            // The hits show by this list (S-P, H5: a chat that turned protected
+                            // or left it takes its hits off now, before any answer).
+                            ch.search |= self.search_has_hits();
                             self.list_restarts = 0;
                             ch.conversations = true;
                             ch.accounts = true;
@@ -1585,11 +1713,19 @@ impl CoreSource {
                             && Some(page.conv) == self.open
                             && !page.rows.iter().any(|r| r.id == target) =>
                     {
-                        // The original went away meanwhile: the window stays where it is.
-                        self.notice = trc(
-                            "@info:status",
-                            "The original message is no longer available.",
-                        )
+                        // The original went away meanwhile: the window stays where it is (on
+                        // a fresh open it has none: the newest page follows, as any open).
+                        self.notice = if self.around_hit.take() == Some(target) {
+                            trc(
+                                "@info:status a message found by a search was opened",
+                                "The message is no longer available.",
+                            )
+                        } else {
+                            trc(
+                                "@info:status",
+                                "The original message is no longer available.",
+                            )
+                        }
                         .into_owned();
                         ch.notice = true;
                     }
@@ -1600,6 +1736,9 @@ impl CoreSource {
                         ch.timeline = true;
                         if let Fetch::Around(target) = fetch {
                             ch.jump = Some(target);
+                            if self.around_hit == Some(target) {
+                                self.around_hit = None;
+                            }
                         }
                         self.maybe_mark_read();
                     }
@@ -1659,6 +1798,25 @@ impl CoreSource {
                 }
                 let t = self.quiet_q.follow_up();
                 self.query(t, || Query::QuietNotices);
+            }
+            MODEL_FILTERS => {
+                if self.filters_q.complete(token) == Completion::Apply
+                    && let Ok(QueryData::Filters(list)) = result
+                    && self
+                        .filter_list
+                        .as_ref()
+                        .is_none_or(|l| l.revision != list.revision)
+                {
+                    self.filter_list = Some(list.clone());
+                    // The marks of every row are made again from the new set.
+                    self.marks.borrow_mut().entries.clear();
+                    ch.filters = true;
+                    if self.open.is_some() && self.window.loaded {
+                        ch.timeline = true;
+                    }
+                }
+                let t = self.filters_q.follow_up();
+                self.query(t, || Query::Filters);
             }
             MODEL_PERSON => {
                 let asked = self.person_sent.remove(&token.generation);
@@ -1731,6 +1889,12 @@ impl CoreSource {
                                 crate::group::invite_update(action, false, link.clone())
                             }
                             _ => crate::group::invite_update(action, true, None),
+                        },
+                        CopyAsked::Selected(conv) => match result {
+                            Ok(QueryData::MessagesByIds(page)) if page.conv == conv => {
+                                crate::selection::copied(&self.selected_text(&page.rows))
+                            }
+                            _ => crate::selection::copy_failed(),
                         },
                     });
                     ch.copy = true;
@@ -1818,6 +1982,14 @@ impl CoreSource {
                 }
                 let t = self.group_q.follow_up();
                 self.send_group(t);
+            }
+            MODEL_SEARCH => ch.merge(self.on_search_result(token, result)),
+            MODEL_EXPORT => {
+                let plan = match result {
+                    Ok(QueryData::ExportPlan(p)) => Some(p.as_ref()),
+                    _ => None,
+                };
+                ch.merge(self.on_export_plan(token, plan));
             }
             model if media_slots::slot_of_model(model).is_some() => {
                 if let Some(slot) = media_slots::slot_of_model(model) {
@@ -2496,6 +2668,8 @@ impl CoreSource {
         self.want_older = false;
         self.want_newer = false;
         self.want_around = None;
+        self.fetch_log.clear();
+        self.around_hit = None;
         self.want_newest = false;
         self.following = false;
         self.flags_deadline = None;
@@ -2828,6 +3002,14 @@ impl CoreSource {
                 trc("@info:status", "The attachment could not be downloaded.").into_owned(),
             ),
             "SaveAttachment" => self.on_save_failed(error, subject),
+            "OpenModel" => {
+                self.model_answers
+                    .push(ModelAnswer::Failed(subject.attachment()));
+                Changes {
+                    media: true,
+                    ..Changes::default()
+                }
+            }
             "OpenMedia" => {
                 self.media_answers
                     .push(MediaAnswer::Failed(subject.attachment()));
@@ -2873,6 +3055,28 @@ impl CoreSource {
                 self.request_quiet();
                 self.notice_change(
                     trc("@info:status", "The setting could not be saved.").into_owned(),
+                )
+            }
+            // A refused save goes to the open dialog, worded under its input (R2); a refused
+            // delete or move means the list is not what the page shows: it is read again.
+            "SaveFilter" => {
+                self.filter_refusal = Some(
+                    error
+                        .filter_refusal()
+                        .map_or_else(crate::filters::not_saved_note, |r| {
+                            crate::filters::refusal_note(&r)
+                        }),
+                );
+                Changes {
+                    filters: true,
+                    ..Changes::default()
+                }
+            }
+            "DeleteFilter" | "MoveFilter" => {
+                self.filters_q.reset();
+                self.request_filters();
+                self.notice_change(
+                    trc("@info:status", "The filter could not be changed.").into_owned(),
                 )
             }
             // A Mark, Clear or Confirm that failed (P5a). ONLY the backend's refusal of a stale
@@ -3375,6 +3579,7 @@ impl CoreSource {
                     network_name,
                     tint: self.tint_of(a),
                     own_tint: self.own_tints.get(&a.uuid).cloned().unwrap_or_default(),
+                    own_tag: self.look.tags.get(&a.uuid).cloned().unwrap_or_default(),
                     status,
                     status_label: status.label(),
                     unread,
@@ -3915,7 +4120,9 @@ impl CoreSource {
             tint: String::new(),
             badge_number: 0,
             account_order: 0,
+            order_at: order_time(c.last_activity, c.draft_at, self.look.drafts_on_top),
             protected: c.protected,
+            title_marks: Vec::new(),
         };
         // (The core gives a protected chat no preview; the draft this session keeps is hidden
         // here.)
@@ -3932,12 +4139,26 @@ impl CoreSource {
             self.visible_accounts().map(|a| TableAccount {
                 id: a.id,
                 network: a.network,
-                name: Self::account_label(a),
+                name: self.chip_name(a),
                 tint: self.tint_of(a),
             }),
             hidden,
             searching,
         )
+    }
+
+    /// The name an account's chip on a chat row shows: its tag when the person gave it one, else
+    /// its label; nothing when the tags are switched off. Only the chat list uses it.
+    fn chip_name(&self, a: &CoreAccount) -> String {
+        if !self.look.show_tags {
+            return String::new();
+        }
+        self.look
+            .tags
+            .get(&a.uuid)
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_else(|| Self::account_label(a))
     }
 
     /// The color of `a`: the one the person gave it, else its network's.
@@ -4042,7 +4263,14 @@ impl CoreSource {
             deletes_sync: d.features.delete_for_me && !self.logged_out(c.account),
             still_filling: self.still_filling(c.id, c.account),
             timer_held: self.timer_held(c.account, time.now_ms),
+            export_off: crate::export::flow::export_off_text(d.export()),
             offer: self.offer_for(c, time),
+            protected: c.protected,
+            title_marks: self
+                .filter_list
+                .as_ref()
+                .map(|l| crate::filter_marks::chat_marks(&l.set, &conversation_title(c)))
+                .unwrap_or_default(),
         }
     }
 
@@ -4073,11 +4301,36 @@ impl CoreSource {
     }
 
     fn timeline_rows(&self, time: &TimeContext<'_>) -> Vec<MessageRow> {
+        let mut rows = self.rows_of(
+            &self.window.rows,
+            self.unread_from,
+            self.window.has_older,
+            &self.read_more,
+            time,
+        );
+        // The filters' marks belong to the window alone: Copy as Text and the exports build
+        // their rows through `rows_of` too, and their rows must not prune the window's cache.
+        let by_id: HashMap<MessageId, &CoreMessage> =
+            self.window.rows.iter().map(|r| (r.id, r)).collect();
+        self.apply_marks(&mut rows, &by_id);
+        rows
+    }
+
+    /// The viewmodel rows of the core rows `rows` (oldest first), by the one mapping the
+    /// timeline uses; Copy as Text and the exports build theirs through it too.
+    fn rows_of(
+        &self,
+        rows_in: &[CoreMessage],
+        unread_from: Option<MessageId>,
+        has_older: bool,
+        read_more: &ReadMore,
+        time: &TimeContext<'_>,
+    ) -> Vec<MessageRow> {
+        let rows = rows_in;
         let is_group = self
             .detail
             .as_ref()
             .is_some_and(|d| d.row.kind != ConvKind::Direct);
-        let rows = &self.window.rows;
         let by_id: HashMap<MessageId, &CoreMessage> = rows.iter().map(|r| (r.id, r)).collect();
         let names = &self.names;
         let (hold, safety_number, who) = self.wait_context();
@@ -4118,19 +4371,14 @@ impl CoreSource {
         let mut rows = timeline::build_rows(
             items,
             is_group,
-            self.unread_from,
-            self.window.has_older,
+            unread_from,
+            has_older,
             names,
             time,
-            &self.read_more,
+            read_more,
         );
         timeline::apply_progress(&mut rows, &self.downloads);
-        let waiting: Vec<&CoreMessage> = self
-            .window
-            .rows
-            .iter()
-            .filter(|r| r.outbox.is_some())
-            .collect();
+        let waiting: Vec<&CoreMessage> = rows_in.iter().filter(|r| r.outbox.is_some()).collect();
         if !waiting.is_empty() {
             for row in &mut rows {
                 if let Some(core) = row
@@ -4143,6 +4391,89 @@ impl CoreSource {
         }
         self.author_avatars(&mut rows);
         rows
+    }
+
+    /// The RegExp filters' marker backgrounds (R3) on the rows of the window: a text block's
+    /// `marks` (the shown part's positions) and the sender's name's `author_marks`. A row with
+    /// no match costs one set pass per field; the answer is kept per message while its inputs
+    /// (the edit, the shown text, the names) stay, and the entries of messages that left the
+    /// window are dropped. The colour and the Highlight switch come from the COMPILED set.
+    fn apply_marks(&self, rows: &mut [MessageRow], by_id: &HashMap<MessageId, &CoreMessage>) {
+        let Some(list) = self.filter_list.as_ref() else {
+            return;
+        };
+        let set = &*list.set;
+        let mut cache = self.marks.borrow_mut();
+        if cache.revision != list.revision {
+            cache.revision = list.revision;
+            cache.entries.clear();
+        }
+        if set.is_empty() {
+            cache.entries.clear();
+            return;
+        }
+        let title = self
+            .detail
+            .as_ref()
+            .map(|d| conversation_title(&d.row))
+            .unwrap_or_default();
+        let mut seen: HashSet<MessageId> = HashSet::new();
+        for row in rows.iter_mut() {
+            let Some(id) = row.message_id() else {
+                continue;
+            };
+            let Some(core) = by_id.get(&id) else {
+                continue;
+            };
+            if core.view_once || row.deleted {
+                continue;
+            }
+            let at = row
+                .blocks
+                .iter()
+                .position(|b| matches!(b, timeline::Block::Text(_)));
+            let rich = at.and_then(|i| match &row.blocks[i] {
+                timeline::Block::Text(r) => Some(r),
+                _ => None,
+            });
+            let sender = (!row.own).then_some(row.author.as_str());
+            let key = MarkCache::key(core.revision, rich, sender, &title);
+            seen.insert(id);
+            let kept = cache.entries.get(&id).filter(|e| e.key == key).cloned();
+            let entry = match kept {
+                Some(e) => e,
+                None => {
+                    let texts = crate::filter_marks::filter_texts(rich, sender, Some(&title));
+                    let hits: Vec<usize> = set.matches(&texts).collect();
+                    let e = MarkEntry {
+                        key,
+                        text: rich
+                            .map(|r| crate::filter_marks::text_marks(set, &hits, r))
+                            .unwrap_or_default(),
+                        sender: sender
+                            .map(|n| crate::filter_marks::sender_marks(set, &hits, n))
+                            .unwrap_or_default(),
+                    };
+                    cache.entries.insert(id, e.clone());
+                    e
+                }
+            };
+            if let Some(i) = at
+                && let timeline::Block::Text(r) = &mut row.blocks[i]
+            {
+                r.marks = entry.text;
+            }
+            row.author_marks = entry.sender;
+        }
+        cache.entries.retain(|id, _| seen.contains(id));
+    }
+
+    /// The text of Copy as Text for the core rows `rows` (oldest first): the rows the timeline
+    /// would build for them, through [`crate::selection::copy_text`].
+    fn selected_text(&self, rows: &[CoreMessage]) -> String {
+        let time = self.time();
+        let built = self.rows_of(rows, None, false, &ReadMore::default(), &time);
+        crate::selection::copy_text(&built, &time)
     }
 
     /// The bytes reported for `attachment`, while its message's attempt uploads.
@@ -4515,6 +4846,45 @@ fn muted(c: &CoreConversation, now_ms: i64) -> bool {
         .into_iter()
         .flatten()
         .any(|until| until > now_ms)
+}
+
+/// The marks made for one message, kept while their inputs stay the same.
+#[derive(Clone)]
+struct MarkEntry {
+    key: u64,
+    text: Vec<crate::filter_marks::Mark>,
+    sender: Vec<crate::filter_marks::Mark>,
+}
+
+/// The marks of the open chat's rows per message (R3), valid for one filter revision.
+#[derive(Default)]
+struct MarkCache {
+    revision: u64,
+    entries: HashMap<MessageId, MarkEntry>,
+}
+
+impl MarkCache {
+    /// What the marks of a message depend on: its edit, the whole text, the shown part's
+    /// length, the sender's and the chat's name (hashed, never kept).
+    fn key(
+        revision: u16,
+        rich: Option<&crate::richtext::RichText>,
+        sender: Option<&str>,
+        chat: &str,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        revision.hash(&mut h);
+        if let Some(rich) = rich {
+            rich.full_plain().hash(&mut h);
+            rich.plain.len().hash(&mut h);
+            rich.spoilers.hash(&mut h);
+            rich.jumbo.hash(&mut h);
+        }
+        sender.hash(&mut h);
+        chat.hash(&mut h);
+        h.finish()
+    }
 }
 
 pub(crate) fn conversation_title(c: &CoreConversation) -> String {
@@ -5097,6 +5467,7 @@ impl Failure {
     pub(crate) fn of(error: &CoreError) -> Self {
         match error {
             CoreError::InvalidInput(_)
+            | CoreError::Filter(_)
             | CoreError::Refused { .. }
             | CoreError::InvalidState(_)
             | CoreError::UnknownConversation(_)
@@ -5126,6 +5497,18 @@ impl UiSource for CoreSource {
         }
     }
 
+    fn set_list_look(&mut self, look: crate::source::ListLook) -> Changes {
+        if self.look == look {
+            return Changes::default();
+        }
+        self.look = look;
+        Changes {
+            accounts: true,
+            conversations: true,
+            ..Changes::default()
+        }
+    }
+
     fn accounts(&self) -> Vec<AccountRow> {
         self.account_rows()
     }
@@ -5143,6 +5526,12 @@ impl UiSource for CoreSource {
             &hidden,
         );
         table.finish(&mut rows);
+        // The titles the RegExp filters' chat patterns mark (R3).
+        if let Some(list) = self.filter_list.as_ref().filter(|l| !l.set.is_empty()) {
+            for row in &mut rows {
+                row.title_marks = crate::filter_marks::chat_marks(&list.set, &row.title);
+            }
+        }
         rows
     }
 
@@ -5504,6 +5893,37 @@ impl UiSource for CoreSource {
         self.quiet
     }
 
+    fn load_filters(&mut self) {
+        self.request_filters();
+    }
+
+    fn filter_rows(&self) -> Option<Vec<crate::filters::FilterRow>> {
+        self.filter_list
+            .as_ref()
+            .map(|l| crate::filters::rows(&l.filters))
+    }
+
+    fn save_filter(
+        &mut self,
+        id: Option<kourier_core::facade::FilterId>,
+        spec: kourier_core::facade::FilterSpec,
+    ) -> bool {
+        self.filter_refusal = None;
+        self.send(UiCommand::SaveFilter { id, spec })
+    }
+
+    fn delete_filter(&mut self, id: kourier_core::facade::FilterId) -> bool {
+        self.send(UiCommand::DeleteFilter { id })
+    }
+
+    fn move_filter(&mut self, id: kourier_core::facade::FilterId, to: usize) -> bool {
+        self.send(UiCommand::MoveFilter { id, to })
+    }
+
+    fn take_filter_refusal(&mut self) -> Option<crate::filters::FilterNote> {
+        self.filter_refusal.take()
+    }
+
     fn set_quiet_notices(&mut self, shown: bool) -> bool {
         if self.quiet == Some(shown) {
             return true;
@@ -5647,8 +6067,64 @@ impl UiSource for CoreSource {
         true
     }
 
+    fn copy_selected(&mut self, conv: ConversationId, ids: Vec<MessageId>) -> Changes {
+        self.copy_generation += 1;
+        self.copy_asked = Some((
+            self.copy_generation,
+            crate::person::CopyAsked::Selected(conv),
+        ));
+        self.send(UiCommand::Query {
+            token: QueryToken {
+                model: MODEL_COPY,
+                generation: self.copy_generation,
+            },
+            query: Query::MessagesByIds { conv, ids },
+        });
+        Changes::default()
+    }
+
     fn take_copy(&mut self) -> Option<crate::person::CopyUpdate> {
         self.copy_answer.take()
+    }
+
+    fn export_plan(&mut self, conv: ConversationId, ids: Vec<MessageId>) -> Changes {
+        self.export_plan_now(conv, ids)
+    }
+
+    fn export_choose(&mut self, ticks: crate::export::Ticks) -> bool {
+        self.export_choose_now(ticks)
+    }
+
+    fn export_abandon(&mut self) {
+        self.export_abandon_now();
+    }
+
+    fn export_target(
+        &mut self,
+        dir: std::path::PathBuf,
+        name: String,
+    ) -> Option<crate::export::flow::ExportJob> {
+        self.export_target_now(dir, name)
+    }
+
+    fn export_built(&mut self, built: crate::export::flow::ExportBuilt) -> Changes {
+        self.export_built_now(built)
+    }
+
+    fn export_cancel(&mut self) -> Changes {
+        self.export_cancel_now()
+    }
+
+    fn export_busy(&self) -> bool {
+        self.export_running_now()
+    }
+
+    fn export_numbers(&self, ticks: crate::export::Ticks) -> Option<String> {
+        self.export_numbers_now(ticks)
+    }
+
+    fn take_export(&mut self) -> Vec<crate::export::flow::ExportUpdate> {
+        self.take_export_now()
     }
 
     fn request_safety(&mut self, account: AccountId, user: UserId) -> bool {
@@ -6036,8 +6512,86 @@ impl UiSource for CoreSource {
         Changes::default()
     }
 
+    fn open_at(&mut self, id: ConversationId, message: MessageId) -> Changes {
+        if self.open == Some(id) {
+            if self.window.loaded {
+                // L1: a loaded row is shown at once; else the window moves around it.
+                let ch = self.jump_to(message);
+                if ch.jump.is_none() {
+                    self.around_hit = Some(message);
+                }
+                return ch;
+            }
+            // The chat was opened a moment ago and its first page is still on its way: the
+            // window around the hit takes its place, so no page at the newest messages lands
+            // first and marks the chat read (B1). Nothing of that page is shown yet.
+            self.timeline_q.reset();
+            self.fetching = None;
+            self.want_reload = false;
+            self.want_newest = false;
+            self.want_around = Some(message);
+            self.around_hit = Some(message);
+            self.pump_timeline();
+            return Changes::default();
+        }
+        let mut ch = self.close();
+        self.open = Some(id);
+        // BEFORE the first page: the window opens around the hit and never at the newest
+        // messages first (B1: that page would mark the chat read and send read receipts for
+        // messages he has not seen; `maybe_mark_read` marks nothing while `has_newer`).
+        self.want_around = Some(message);
+        self.around_hit = Some(message);
+        self.request_detail();
+        self.pump_timeline();
+        self.send_presence();
+        ch.timeline = true;
+        ch.header = true;
+        ch
+    }
+
+    fn search_messages(&mut self, text: &str, chat: Option<ConversationId>) -> Changes {
+        self.start_search(text, chat)
+    }
+
+    fn more_search(&mut self) -> bool {
+        self.more_search_page()
+    }
+
+    fn set_search_mode(&mut self, regex: bool, match_case: bool) -> Changes {
+        self.apply_search_mode(if regex {
+            kourier_core::facade::SearchMode::Pattern { match_case }
+        } else {
+            kourier_core::facade::SearchMode::Words
+        })
+    }
+
+    fn search_pattern(&self) -> Option<kourier_core::facade::SearchPattern> {
+        self.search_pattern_now()
+    }
+
+    fn close_search(&mut self) -> Changes {
+        self.end_search()
+    }
+
+    fn search_view(&self, filter: &ConversationFilter) -> crate::search::SearchView {
+        self.search_rows_view(filter)
+    }
+
+    fn search_deadline(&self) -> Option<Instant> {
+        self.search_reread_at()
+    }
+
+    fn search_due(&mut self) -> Changes {
+        self.search_reread_due();
+        Changes::default()
+    }
+
     fn flags_deadline(&self) -> Option<Instant> {
         self.flags_deadline
+    }
+
+    fn timeline_fetches(&self) -> Vec<&'static str> {
+        self.fetch_log.clone()
     }
 
     fn queries_in_flight(&self) -> usize {
@@ -6051,6 +6605,8 @@ impl UiSource for CoreSource {
         .into_iter()
         .filter(|q| q.pending())
         .count()
+            // (The hits of a search: an answer on its way, or a read again waiting for its time.)
+            + usize::from(self.search.pending())
     }
 
     fn refresh_flags(&mut self) -> Changes {
@@ -6267,6 +6823,14 @@ impl UiSource for CoreSource {
         std::mem::take(&mut self.media_answers)
     }
 
+    fn open_model(&mut self, id: AttachmentId) -> bool {
+        self.send(UiCommand::OpenModel { attachment: id })
+    }
+
+    fn take_models(&mut self) -> Vec<ModelAnswer> {
+        std::mem::take(&mut self.model_answers)
+    }
+
     fn ask_save(&mut self, id: AttachmentId) -> bool {
         self.ask_save_facts(SaveAsk::Suggest(id))
     }
@@ -6403,6 +6967,8 @@ impl UiSource for CoreSource {
                 let group_ended =
                     self.group_shown.is_some_and(|(a, _)| a == *account) && self.end_group();
                 let media_ended = self.end_media_of_account(*account);
+                // Its hits go at once (the list read that follows would withhold them too).
+                let search = self.drop_search_hits(|h| h.account == *account);
                 self.filling.retain(|_, a| a != account);
                 self.lost_history.remove(account);
                 self.account_errors.remove(account);
@@ -6424,6 +6990,7 @@ impl UiSource for CoreSource {
                     person: person_ended,
                     group: group_ended,
                     chat_media: media_ended,
+                    search,
                     ..Changes::default()
                 }
             }
@@ -6552,17 +7119,22 @@ impl UiSource for CoreSource {
                 if self.group_shown.is_some_and(|(_, g)| ids.contains(&g)) {
                     self.refresh_group();
                 }
+                // The hits of those chats are read again (a clear, a delete, a title).
+                self.reread_search_if(|c| ids.contains(&c));
                 Changes::default()
             }
             UiEvent::ConversationsRemoved { ids } => {
                 self.request_list();
                 let (person_ended, group_ended) = self.end_pages_of(ids);
                 let media_ended = self.end_media_of(ids);
+                // Their hits go at once.
+                let search = self.drop_search_hits(|h| ids.contains(&h.conv));
                 if self.open.is_some_and(|o| ids.contains(&o)) {
                     let mut ch = self.close();
                     ch.person |= person_ended;
                     ch.group |= group_ended;
                     ch.chat_media |= media_ended;
+                    ch.search |= search;
                     return ch;
                 }
                 // A group in common may have gone: the person's page reads again unless it
@@ -6574,6 +7146,7 @@ impl UiSource for CoreSource {
                     person: person_ended,
                     group: group_ended,
                     chat_media: media_ended,
+                    search,
                     ..Changes::default()
                 }
             }
@@ -6585,6 +7158,8 @@ impl UiSource for CoreSource {
                 // The gallery of that chat, wherever it is shown (a picture came, was deleted,
                 // finished downloading).
                 self.refresh_media_of(*conv);
+                // And the hits of that chat (a message deleted, expired or edited; H5).
+                self.reread_search_if(|c| c == *conv);
                 Changes::default()
             }
             // The core stored the messages of a send of files (their rows are announced by
@@ -6594,6 +7169,7 @@ impl UiSource for CoreSource {
                 files: self.end_preparing(*request, SendOutcome::Stored),
                 ..Changes::default()
             },
+            UiEvent::Progress(p @ Progress::Export { .. }) => self.on_export_progress(p),
             UiEvent::Progress(Progress::Import {
                 request,
                 files_done,
@@ -6607,6 +7183,7 @@ impl UiSource for CoreSource {
                     self.person_origin = Some(*into);
                 }
                 self.merge_media_chat(*from, *into);
+                self.merge_search_chat(*from, *into);
                 self.refresh_person();
                 // The composer saves the text of the chat it leaves under the old id: it goes
                 // to the surviving conversation.
@@ -6628,6 +7205,8 @@ impl UiSource for CoreSource {
                 self.reload_timeline();
                 self.refresh_person();
                 self.refresh_group();
+                // The senders' names of its hits.
+                self.reread_search_of_account(*account);
                 if self
                     .safety_shown
                     .as_ref()
@@ -6765,6 +7344,23 @@ impl UiSource for CoreSource {
             // F3b: a finished save is told to the UI as the answer to its own request (the
             // notice "Saved ...").
             UiEvent::AttachmentSaved { attachment, .. } => self.on_attachment_saved(*attachment),
+            // The list is read again (Settings shows it); the marks (R3) follow the same list.
+            UiEvent::FiltersChanged { .. } => {
+                self.request_filters();
+                Changes::default()
+            }
+            // The 3D viewer's answer: the mesh stays behind its `Arc` until the front-end takes it.
+            UiEvent::ModelOpened { attachment, mesh } => {
+                self.model_answers.push(ModelAnswer::Opened(
+                    *attachment,
+                    std::sync::Arc::clone(mesh),
+                ));
+                Changes {
+                    media: true,
+                    ..Changes::default()
+                }
+            }
+            UiEvent::ExportEnded { request, outcome } => self.on_export_ended(*request, outcome),
             UiEvent::Notify(_) | UiEvent::CatchUpSummary { .. } | UiEvent::Notice { .. } => {
                 Changes::default()
             }
@@ -6792,8 +7388,14 @@ impl UiSource for CoreSource {
         self.window.failed = false;
         self.request_accounts();
         self.request_list();
+        // The saved filters (R4, architecture §8.10: what every front-end needs stays below the
+        // seam): the marks of the rows, the titles and the names need the compiled set before
+        // any settings page asks, and a lost `FiltersChanged` is made good here too.
+        self.request_filters();
         self.request_detail();
         self.reload_timeline();
+        // (A lost event may have named a chat of the shown hits.)
+        self.reread_search();
         Changes {
             files,
             transfer: progress,
@@ -7128,14 +7730,25 @@ impl UiSource for CoreSource {
 
 mod media_slots;
 
+mod searching;
+
+mod exporting;
+pub use exporting::MODEL_EXPORT;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod export_tests;
 
 #[cfg(test)]
 mod action_tests;
 
 #[cfg(test)]
 mod save_tests;
+
+#[cfg(test)]
+mod select_tests;
 
 #[cfg(test)]
 mod files_tests;
@@ -7172,3 +7785,9 @@ mod telegram_tests;
 
 #[cfg(test)]
 mod roaming_tests;
+
+#[cfg(test)]
+mod search_tests;
+
+#[cfg(test)]
+mod filters_tests;

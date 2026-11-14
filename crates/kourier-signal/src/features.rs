@@ -179,9 +179,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kourier_backend_api::BackendEvent;
 use kourier_db::rusqlite::Connection;
 use kourier_model::{
-    AttachmentKind, CannotSend, ConvKey, ConversationFeatures, ConversationPatch, DisappearKind,
-    FileAlbum, FileLimits, FilePacking, FormatKind, HistorySource, Support, TimerRange, UserId,
-    Window,
+    AttachmentKind, CannotSend, ChatExport, ConvKey, ConversationFeatures, ConversationPatch,
+    DisappearKind, FileAlbum, FileLimits, FilePacking, FormatKind, HistorySource, Support,
+    TimerRange, UserId, Window,
 };
 use libsignal_core::ServiceId;
 
@@ -586,6 +586,8 @@ pub(crate) fn direct_features(
         // writes (A10b); until then it says nothing, which reads as listed.
         roaming_listed: None,
         invite_link_on: false,
+        // Signal has no restriction on saving a chat.
+        export: ChatExport::Allowed,
     }
 }
 

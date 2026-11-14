@@ -5,14 +5,20 @@
 // cxx drops the `# Safety` sections of extern functions from the code it generates (the same
 // false positive the cxx-qt examples allow).
 #![allow(clippy::missing_safety_doc)]
+// `FilterListModel::save` takes one argument per input of the filter dialog (cxx-qt takes no
+// attribute on a single declaration).
+#![allow(clippy::too_many_arguments)]
 
 pub use crate::app::AppRust;
 pub use crate::controllers::{ComposerRust, LoginRust, SettingsRust};
 pub use crate::models::accounts::AccountsRust;
 pub use crate::models::attachments::AttachmentsRust;
 pub use crate::models::conversations::ConversationsRust;
+pub use crate::models::emoji::{EmojiListsRust, EmojiModelRust};
+pub use crate::models::filters::FiltersRust;
 pub use crate::models::media::MediaRust;
 pub use crate::models::members::MembersRust;
+pub use crate::models::search::SearchRust;
 pub use crate::models::share::ShareTargetsRust;
 pub use crate::models::timeline::TimelineRust;
 
@@ -114,6 +120,35 @@ pub mod qobject {
         #[cxx_name = "colorLinks"]
         unsafe fn color_links_of(document: *mut QObject, color: &QColor, ink: &QColor);
 
+        /// Gives the marks (a list of `{start, len, color}`, the color `#aarrggbb`) a background in a
+        /// `TextEdit.textDocument`, in document positions; what an earlier call marked is
+        /// cleared first (R3).
+        ///
+        /// # Safety
+        ///
+        /// `document` must be null or a live `QObject`.
+        #[cxx_name = "applyMarks"]
+        unsafe fn apply_marks_of(document: *mut QObject, marks: &QVariant);
+
+        /// The html of a name with marked parts, for a `RichText` label (see `devtools.h`).
+        #[cxx_name = "markedNameHtml"]
+        fn marked_name_html(
+            shown: &QString,
+            whole: &QString,
+            marks: &QVariant,
+            surface: &QColor,
+        ) -> QString;
+
+        /// `html` marked and its links recolored, one line per marked fragment: position,
+        /// length, `#aarrggbb`, the foreground (tests: `colorLinks` leaves a background alone).
+        #[cxx_name = "richTextMarked"]
+        fn rich_text_marked(
+            html: &QString,
+            marks: &QVariant,
+            color: &QColor,
+            ink: &QColor,
+        ) -> QString;
+
         /// How the links of `html` look after `colorLinks`, one line per link: the href, the
         /// foreground as `#rrggbb`, `underline` and `bold` as 0 or 1 (tests).
         #[cxx_name = "richTextLinkLooks"]
@@ -186,6 +221,43 @@ pub mod qobject {
         include!("cxx-qt-lib/qqmlapplicationengine.h");
         /// The QML engine.
         type QQmlApplicationEngine = cxx_qt_lib::QQmlApplicationEngine;
+    }
+
+    #[namespace = "kourier"]
+    unsafe extern "C++" {
+        include!("kourier-qt/cpp/modeldata.h");
+        /// The lists the 3D viewer's `ModelData` holds, built off the Qt thread.
+        type ModelBuffers;
+
+        /// Builds the lists of a model (worker thread): `positions` nine floats per triangle,
+        /// `colors` one `0xRRGGBBAA` per triangle (0 = none; empty = no colours), `fallback`
+        /// the colour of a triangle without one, `min` and `max` the box corners.
+        #[cxx_name = "buildModelBuffers"]
+        fn build_model_buffers(
+            positions: &[f32],
+            colors: &[u32],
+            fallback: u32,
+            min: &[f32],
+            max: &[f32],
+        ) -> UniquePtr<ModelBuffers>;
+
+        /// Hands the lists to the `ModelData` that waits for `attachment`, on the Qt thread's
+        /// next turn (any thread may call; dropped when none waits any more).
+        #[cxx_name = "deliverModel"]
+        fn deliver_model(attachment: i64, buffers: UniquePtr<ModelBuffers>);
+
+        /// The open of `attachment` failed (Qt thread; 0: the oldest `ModelData` waiting).
+        #[cxx_name = "failModel"]
+        fn fail_model(attachment: i64);
+
+        /// The colour (`0xRRGGBBAA`) the `ModelData` waiting for `attachment` wants for the
+        /// triangles a coloured model gives none; the neutral blue when none waits.
+        #[cxx_name = "waitingFallback"]
+        fn waiting_fallback(attachment: i64) -> u32;
+
+        /// How many `ModelData` objects are alive (tests).
+        #[cxx_name = "modelDataAlive"]
+        fn model_data_alive() -> i32;
     }
 
     #[namespace = "kourier"]
@@ -292,6 +364,12 @@ pub mod qobject {
         #[cxx_name = "cornerProbe"]
         fn corner_probe(grab: Vec<u8>) -> Vec<f64>;
 
+        /// `[width, height, first, middle and last pixel as premultiplied ARGB]` of the PNG
+        /// `png` after the provider's tint step for the request `id` (`thumb/5?tint=RRGGBB`);
+        /// empty when it does not decode (tests of the model tint).
+        #[cxx_name = "tintProbe"]
+        fn tint_probe(id: &str, png: Vec<u8>) -> Vec<u32>;
+
         /// A gradient PNG (fixture screenshots of the composer).
         #[cxx_name = "samplePng"]
         fn sample_png(width: i32, height: i32, hue: i32) -> Vec<u8>;
@@ -325,6 +403,7 @@ pub mod qobject {
         #[qml_singleton]
         #[qproperty(QString, version, READ, CONSTANT)]
         #[qproperty(bool, fixture, READ, CONSTANT)]
+        #[qproperty(QString, slicers)]
         #[qproperty(QString, start_page, READ, CONSTANT)]
         #[qproperty(QString, screenshot, READ, CONSTANT)]
         #[qproperty(i32, window_width, READ, CONSTANT)]
@@ -348,6 +427,9 @@ pub mod qobject {
         #[qproperty(i32, unread_count)]
         #[qproperty(bool, archive_shown)]
         #[qproperty(i32, archived_count)]
+        #[qproperty(bool, export_busy)]
+        #[qproperty(i64, export_done)]
+        #[qproperty(i64, export_total)]
         #[qproperty(QString, banner_kind)]
         #[qproperty(QString, banner_text)]
         #[qproperty(QString, banner_action)]
@@ -368,7 +450,10 @@ pub mod qobject {
         #[qproperty(*mut AccountListModel, accounts, READ, CONSTANT)]
         #[qproperty(*mut MemberListModel, group_members, READ, CONSTANT)]
         #[qproperty(*mut MemberListModel, group_preview, READ, CONSTANT)]
+        #[qproperty(*mut EmojiLists, emoji_lists, READ, CONSTANT)]
         #[qproperty(*mut ShareTargetListModel, share_targets, READ, CONSTANT)]
+        #[qproperty(*mut FilterListModel, filters, READ, CONSTANT)]
+        #[qproperty(*mut SearchListModel, search_results, READ, CONSTANT)]
         #[qproperty(*mut MediaListModel, group_media, READ, CONSTANT)]
         #[qproperty(*mut MediaListModel, person_media, READ, CONSTANT)]
         #[qproperty(*mut MediaListModel, media_grid, READ, CONSTANT)]
@@ -461,9 +546,16 @@ pub mod qobject {
         fn window_released(self: Pin<&mut App>);
 
         /// Show and raise the window with the XDG activation `token` (may be empty), and open
-        /// `conversation` when it is not 0 (a notification click, another launch, the tray).
+        /// `conversation` when it is not 0 (a notification click, another launch, the tray),
+        /// at `message` when that is not 0 (a RegExp filter's notification, the newest match
+        /// of a catch-up summary: the jump of a search hit).
         #[qsignal]
-        fn activation_requested(self: Pin<&mut App>, token: QString, conversation: i64);
+        fn activation_requested(
+            self: Pin<&mut App>,
+            token: QString,
+            conversation: i64,
+            message: i64,
+        );
 
         /// A tray click: hide a shown and active window, else show and raise it.
         #[qsignal]
@@ -516,6 +608,45 @@ pub mod qobject {
         #[qinvokable]
         fn set_search(self: Pin<&mut App>, query: &QString);
 
+        /// Searches the messages for `text` (as typed), in the chat `chat` only (0: every chat).
+        /// The hits come through `App.searchResults` (G1m).
+        #[qinvokable]
+        fn search_messages(self: Pin<&mut App>, text: &QString, chat: i64);
+
+        /// The search field's `.*` (a regular expression) and `Aa` (match case) toggles (R5):
+        /// the message search asks in that mode, and the chat titles follow the pattern.
+        #[qinvokable]
+        fn set_search_mode(self: Pin<&mut App>, regex: bool, match_case: bool);
+
+        /// The page of hits after the last row (the hit list scrolled to its end).
+        #[qinvokable]
+        fn more_search(self: Pin<&mut App>);
+
+        /// The search ended (Escape, the field emptied): nothing of it is shown or asked.
+        #[qinvokable]
+        fn close_search(self: Pin<&mut App>);
+
+        /// Opens the chat of a hit at its message: the App's ONE open for a hit. It asks the
+        /// core to open AT the message and never opens the newest page first (that would mark
+        /// an old hit's chat read).
+        #[qinvokable]
+        fn open_search_result(self: Pin<&mut App>, conversation: i64, message: i64);
+
+        /// Test-only (G1h): the kinds of the open chat's timeline reads so far, oldest first,
+        /// joined by spaces ("around newer …"); a test holds that a hit's open reads around
+        /// the hit before anything else. No page uses it.
+        #[qinvokable]
+        fn timeline_fetches(self: &App) -> QString;
+
+        /// Test-only (3D viewer): whether a shared library whose path contains `name` is mapped
+        /// into this process (the proof that Quick 3D is not loaded before the first model opens).
+        #[qinvokable]
+        fn library_loaded(self: &App, name: &QString) -> bool;
+
+        /// Test-only (3D viewer): how many `ModelData` objects are alive.
+        #[qinvokable]
+        fn model_data_alive(self: &App) -> i32;
+
         /// Downloads an attachment (or retries a failed download).
         #[qinvokable]
         fn download_attachment(self: Pin<&mut App>, attachment: i64);
@@ -527,6 +658,12 @@ pub mod qobject {
         #[qinvokable]
         fn open_media(self: Pin<&mut App>, attachment: i64) -> i64;
 
+        /// Asks the core to read and parse the 3D model `attachment` for the viewer; the lists
+        /// reach the `ModelData` waiting for that attachment (`ready` or `failed`). False when
+        /// there is no core or nothing to ask.
+        #[qinvokable]
+        fn open_model(self: Pin<&mut App>, attachment: i64) -> bool;
+
         /// The view of an `openMedia` request went.
         #[qinvokable]
         fn release_media(self: Pin<&mut App>, token: i64);
@@ -536,6 +673,17 @@ pub mod qobject {
         /// `externalReady`. The copy lives until the conversation closes.
         #[qinvokable]
         fn open_externally(self: Pin<&mut App>, attachment: i64);
+
+        /// Opens the 3D model `attachment` in the slicer `id` of the table, or, for `"other"`, in
+        /// the application the person picks in the desktop portal's chooser, once its copy is
+        /// ready (the caller asked "Open This File?" first). A slicer that started is told with
+        /// `slicerStarted`, one that did not with a notice.
+        #[qinvokable]
+        fn open_in_slicer(self: Pin<&mut App>, attachment: i64, id: &QString);
+
+        /// Looks for the installed slicers on a worker thread; the property `slicers` follows.
+        #[qinvokable]
+        fn refresh_slicers(self: Pin<&mut App>);
 
         /// Asks the name `attachment` is offered under in the "Save As" dialog (F3b): answered
         /// with `saveSuggested(attachment, url)`, or, when the file is gone, with a failed
@@ -569,6 +717,41 @@ pub mod qobject {
         /// folder opens.
         #[qinvokable]
         fn show_in_folder(self: &App, url: &QString);
+
+        /// The export dialog's Export… (Export Selected): the ticks are taken and
+        /// `exportSaveReady` follows with the save dialog's file URL.
+        #[qinvokable]
+        fn export_choose(
+            self: Pin<&mut App>,
+            pictures: bool,
+            videos: bool,
+            other_files: bool,
+            disappearing: bool,
+        ) -> bool;
+
+        /// The export dialog's numbers for its ticks (JSON: numbers and sizes only), from the plan
+        /// the open dialog holds; empty when no dialog stands.
+        #[qinvokable]
+        fn export_numbers(
+            self: &App,
+            pictures: bool,
+            videos: bool,
+            other_files: bool,
+            disappearing: bool,
+        ) -> QString;
+
+        /// The export dialog, or the save dialog after it, closed with no answer.
+        #[qinvokable]
+        fn export_abandon(self: Pin<&mut App>);
+
+        /// The save dialog's answer (a `file:` URL, the file it asked about replacing): the
+        /// documents are built on a worker and the archive written.
+        #[qinvokable]
+        fn export_picked(self: Pin<&mut App>, url: &QString);
+
+        /// Cancel of an export at any stage.
+        #[qinvokable]
+        fn export_cancel(self: Pin<&mut App>);
 
         /// The full-size URL of the newest picture in the open timeline (`--page=viewer`).
         #[qinvokable]
@@ -1029,6 +1212,11 @@ pub mod qobject {
         #[qinvokable]
         fn set_account_tint(self: Pin<&mut App>, account: i64, tint: &QString);
 
+        /// Gives an account a short tag (up to 8 characters; empty: none) that only the chat
+        /// list shows in place of its name. Local only.
+        #[qinvokable]
+        fn set_account_tag(self: Pin<&mut App>, account: i64, tag: &QString);
+
         /// Put this question to the user: the map of `replaceAsked` and its `action`. The
         /// answer is `confirmAccountAction` or `cancelAccountAction`.
         #[qsignal]
@@ -1086,6 +1274,10 @@ pub mod qobject {
         #[qsignal]
         fn media_failed(self: Pin<&mut App>, token: i64);
 
+        /// The slicer `id` was started with the copy of `attachment` (`openInSlicer`).
+        #[qsignal]
+        fn slicer_started(self: Pin<&mut App>, attachment: i64, id: QString);
+
         /// The copy for `openExternally` is ready: hand `url` to `openExternalUrl`.
         #[qsignal]
         fn external_ready(self: Pin<&mut App>, attachment: i64, url: QString);
@@ -1098,6 +1290,22 @@ pub mod qobject {
         /// The folder `askSaveFolder()` asked for: the folder dialog starts at `url`.
         #[qsignal]
         fn save_folder_ready(self: Pin<&mut App>, url: QString);
+
+        /// The export plan came: open the dialog. `json` holds numbers and sizes only (see
+        /// `export::flow::DialogView::to_json`).
+        #[qsignal]
+        fn export_dialog_ready(self: Pin<&mut App>, json: QString);
+
+        /// The export's save dialog starts at `url` (the last save folder and the suggested
+        /// `<chat> <date> <time>.zip`).
+        #[qsignal]
+        fn export_save_ready(self: Pin<&mut App>, url: QString);
+
+        /// An export (or its refusal) ended: `text` is the notice, `url` the archive's `file:`
+        /// URL when one was written, `selection_ends` when the selection mode of the chat open now
+        /// ends (the export's own chat only).
+        #[qsignal]
+        fn export_finished(self: Pin<&mut App>, text: QString, url: QString, selection_ends: bool);
 
         /// A save or a batch ended: `saved` files were written, `failed` were not; `name` is the
         /// last file's name and `url` its `file:` URL; `reason` is the class of the last failure
@@ -1119,6 +1327,31 @@ pub mod qobject {
         /// `document` must be null or a live `QObject` (QML passes `textDocument`).
         #[qinvokable]
         unsafe fn color_links(self: &App, document: *mut QObject, color: &QColor, ink: &QColor);
+
+        /// Gives a message text's document the backgrounds of `marks` (`{start, len, color}`,
+        /// the colors from `markerColour`); the ones marked before are cleared.
+        ///
+        /// # Safety
+        ///
+        /// `document` must be null or a live `QObject` (QML passes `textDocument`).
+        #[qinvokable]
+        unsafe fn apply_marks(self: &App, document: *mut QObject, marks: &QVariant);
+
+        /// The html of a name (a sender, a chat's title) with its marks, for a `RichText` label:
+        /// `shown` is the name as the label draws it, `whole` the name the marks were made for.
+        #[qinvokable]
+        fn name_html(
+            self: &App,
+            shown: &QString,
+            whole: &QString,
+            marks: &QVariant,
+            surface: &QColor,
+        ) -> QString;
+
+        /// The marker colour (`#aarrggbb`) of a filter's `#rrggbb` on `surface` under `ink`:
+        /// the strongest alpha that keeps the text readable.
+        #[qinvokable]
+        fn marker_colour(self: &App, base: &QString, surface: &QColor, ink: &QColor) -> QString;
 
         /// The icon theme's name for the application's icon when the theme has one (an
         /// installed application), else an empty string: `Style.appIcon` then takes the
@@ -1345,6 +1578,201 @@ pub mod qobject {
         );
     }
 
+    // ---- EmojiModel and EmojiLists -------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// What an emoji picker shows besides the lists: the emoji of one CLDR group, or the
+        /// hits of a search over the whole table (names and keywords, English and Ukrainian).
+        /// The rows are positions in a static table: nothing is built before a picker sets
+        /// `group` or `query`, and setting both back to "none" and "" frees the rows.
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qproperty(i32, count)]
+        #[qproperty(QString, query, READ, WRITE = set_query_text, NOTIFY = query_changed)]
+        #[qproperty(i32, group, READ, WRITE = set_group_index, NOTIFY = group_changed)]
+        type EmojiModel = super::EmojiModelRust;
+
+        #[cxx_override]
+        fn data(self: &EmojiModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &EmojiModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &EmojiModel) -> QHash_i32_QByteArray;
+
+        /// The search text: not empty, the rows are its hits.
+        fn set_query_text(self: Pin<&mut EmojiModel>, text: &QString);
+        /// The group shown while no search text stands (-1 = none).
+        fn set_group_index(self: Pin<&mut EmojiModel>, group: i32);
+
+        /// The query changed.
+        #[qsignal]
+        fn query_changed(self: Pin<&mut EmojiModel>);
+        /// The group changed.
+        #[qsignal]
+        fn group_changed(self: Pin<&mut EmojiModel>);
+
+        /// The glyph of row `row` (empty when there is none).
+        #[qinvokable]
+        fn glyph_at(self: &EmojiModel, row: i32) -> QString;
+        /// The name of `glyph` in the interface language (CLDR; empty when it is no emoji of the table).
+        #[qinvokable]
+        fn name_of(self: &EmojiModel, glyph: &QString) -> QString;
+        /// How many groups the table has.
+        #[qinvokable]
+        fn group_count(self: &EmojiModel) -> i32;
+        /// The Unicode name of group `group` (English; the picker translates it).
+        #[qinvokable]
+        fn group_key(self: &EmojiModel, group: i32) -> QString;
+        /// The emoji of the table that stands for group `group` on its tab.
+        #[qinvokable]
+        fn group_icon(self: &EmojiModel, group: i32) -> QString;
+        /// Whether `glyph` is an emoji of the table.
+        #[qinvokable]
+        fn is_known(self: &EmojiModel, glyph: &QString) -> bool;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut EmojiModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut EmojiModel>);
+    }
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The one local list of pinned, starred and recently used emoji (all accounts, never
+        /// sent anywhere): the app's one writer of `emoji-pins`, `emoji-favourites` and
+        /// `emoji-recent` (`App.emojiLists`). A pick moves to the front of the recent list at
+        /// once; the file is written 1.5 s after the last change.
+        #[qobject]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(QStringList, pins, READ, NOTIFY = changed)]
+        #[qproperty(QStringList, hover_pins, READ, NOTIFY = changed)]
+        #[qproperty(QStringList, favourites, READ, NOTIFY = changed)]
+        #[qproperty(QStringList, recent, READ, NOTIFY = changed)]
+        type EmojiLists = super::EmojiListsRust;
+
+        /// The lists changed.
+        #[qsignal]
+        fn changed(self: Pin<&mut EmojiLists>);
+
+        /// An emoji was picked or sent as a reaction: it goes to the front of the recent list.
+        #[qinvokable]
+        fn used(self: Pin<&mut EmojiLists>, emoji: &QString);
+        /// Pins `emoji` (refused when six are pinned) or unpins it; whether the list changed.
+        #[qinvokable]
+        fn toggle_pin(self: Pin<&mut EmojiLists>, emoji: &QString) -> bool;
+        /// Stars `emoji` or takes the star away; whether the list changed.
+        #[qinvokable]
+        fn toggle_favourite(self: Pin<&mut EmojiLists>, emoji: &QString) -> bool;
+        /// Writes the lists to the preferences now (tests, and the end of the debounce).
+        #[qinvokable]
+        fn flush(self: Pin<&mut EmojiLists>);
+    }
+
+    impl cxx_qt::Threading for EmojiLists {}
+
+    // ---- SearchListModel -----------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The hits of a message search (`App.searchResults`, G1m): chat rows under the chats.
+        /// The properties are the search view's: `active` (a search runs), `chat` (the one
+        /// chat it is limited to, 0 for all), `more`, `loading`, `indexReady`, `indexPercent`
+        /// `capped` (the rows may not be every hit) and `answered` (the core answered this search).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(bool, active)]
+        #[qproperty(i64, chat)]
+        #[qproperty(bool, more)]
+        #[qproperty(bool, loading)]
+        #[qproperty(bool, index_ready)]
+        #[qproperty(i32, index_percent)]
+        #[qproperty(bool, capped)]
+        #[qproperty(bool, answered)]
+        /// The chat a one-chat search is limited to is not in the list any more (it left, or its
+        /// account was removed): the page ends that search (R3 F8, C9).
+        #[qproperty(bool, chat_gone)]
+        /// The core refused the typed pattern (too large to compile): the sentence under the
+        /// search field, empty otherwise (R5).
+        #[qproperty(QString, refusal)]
+        type SearchListModel = super::SearchRust;
+
+        #[cxx_override]
+        fn data(self: &SearchListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &SearchListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &SearchListModel) -> QHash_i32_QByteArray;
+
+        /// The message of listed row `row` (0 when there is none).
+        #[qinvokable]
+        fn message_at(self: &SearchListModel, row: i32) -> i64;
+
+        /// The chat of listed row `row` (0 when there is none).
+        #[qinvokable]
+        fn conversation_at(self: &SearchListModel, row: i32) -> i64;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut SearchListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut SearchListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut SearchListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut SearchListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut SearchListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut SearchListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut SearchListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut SearchListModel>);
+        #[inherit]
+        fn index(
+            self: &SearchListModel,
+            row: i32,
+            column: i32,
+            parent: &QModelIndex,
+        ) -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut SearchListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
     // ---- ShareTargetListModel -----------------------------------------------------------------
 
     #[auto_cxx_name]
@@ -1431,6 +1859,159 @@ pub mod qobject {
         #[qsignal]
         fn data_changed(
             self: Pin<&mut ShareTargetListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
+    // ---- FilterListModel ------------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The saved RegExp filters of Settings and the filter dialog's helper
+        /// (`App.filters`, RegExp filters R2).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(bool, loaded, READ = is_loaded, NOTIFY = loaded_changed)]
+        type FilterListModel = super::FiltersRust;
+
+        #[cxx_override]
+        fn data(self: &FilterListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &FilterListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &FilterListModel) -> QHash_i32_QByteArray;
+
+        /// The core has said what the filters are.
+        fn is_loaded(self: &FilterListModel) -> bool;
+
+        /// `loaded` changed.
+        #[qsignal]
+        fn loaded_changed(self: Pin<&mut FilterListModel>);
+
+        /// The settings page is shown: asks the core for the filters.
+        #[qinvokable]
+        fn load(self: Pin<&mut FilterListModel>);
+
+        /// The live check of a pattern: empty when it is fine, else the sentence for the line
+        /// under its field.
+        #[qinvokable]
+        fn check_pattern(self: &FilterListModel, pattern: &QString) -> QString;
+
+        /// The name "Save as Filter" gives a pattern: its first line, cut short.
+        #[qinvokable]
+        fn name_from_pattern(self: &FilterListModel, pattern: &QString) -> QString;
+
+        /// Whether Save may be enabled.
+        #[qinvokable]
+        fn can_save(
+            self: &FilterListModel,
+            name: &QString,
+            text: &QString,
+            sender: &QString,
+            chat: &QString,
+        ) -> bool;
+
+        /// The eight swatches as `#rrggbb`.
+        #[qinvokable]
+        fn swatches(self: &FilterListModel) -> QStringList;
+
+        /// The colour a new filter starts with.
+        #[qinvokable]
+        fn default_colour(self: &FilterListModel) -> QString;
+
+        /// One value of a filter for the dialog's prefill.
+        #[qinvokable]
+        fn value(self: &FilterListModel, id: i64, key: &QString) -> QVariant;
+
+        /// Saves the dialog's filter (`id` 0: a new one).
+        #[qinvokable]
+        fn save(
+            self: Pin<&mut FilterListModel>,
+            id: i64,
+            name: &QString,
+            text: &QString,
+            sender: &QString,
+            chat: &QString,
+            match_case: bool,
+            notify: bool,
+            notify_muted: bool,
+            highlight: bool,
+            colour: &QString,
+        ) -> bool;
+
+        /// Switches Notify of a filter.
+        #[qinvokable]
+        fn set_notify(self: Pin<&mut FilterListModel>, id: i64, on: bool) -> bool;
+
+        /// Deletes a filter.
+        #[qinvokable]
+        fn remove(self: Pin<&mut FilterListModel>, id: i64) -> bool;
+
+        /// Moves a filter one place (-1 up, 1 down).
+        #[qinvokable]
+        fn move_by(self: Pin<&mut FilterListModel>, id: i64, delta: i32) -> bool;
+
+        /// The core took the dialog's save.
+        #[qsignal]
+        fn saved(self: Pin<&mut FilterListModel>);
+
+        /// The core refused the dialog's save: under which input (`name`, `text`, `sender`,
+        /// `chat`, or empty) and the sentence.
+        #[qsignal]
+        fn refused(self: Pin<&mut FilterListModel>, field: &QString, text: &QString);
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut FilterListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut FilterListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut FilterListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut FilterListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut FilterListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut FilterListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut FilterListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut FilterListModel>);
+        #[inherit]
+        fn index(
+            self: &FilterListModel,
+            row: i32,
+            column: i32,
+            parent: &QModelIndex,
+        ) -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut FilterListModel>,
             top_left: &QModelIndex,
             bottom_right: &QModelIndex,
             roles: &QVector_i32,
@@ -1685,10 +2266,16 @@ pub mod qobject {
         #[qproperty(bool, deletes_sync)]
         #[qproperty(QString, still_filling)]
         #[qproperty(QString, timer_held)]
+        #[qproperty(QString, export_off)]
         #[qproperty(QVariant, chat_offer)]
+        #[qproperty(bool, chat_searchable)]
+        #[qproperty(bool, chat_protected)]
+        #[qproperty(QVariant, title_marks)]
         #[qproperty(bool, has_older)]
         #[qproperty(bool, has_newer)]
         #[qproperty(bool, loading)]
+        #[qproperty(bool, selecting)]
+        #[qproperty(i32, selected_count)]
         type TimelineModel = super::TimelineRust;
 
         #[cxx_override]
@@ -1706,6 +2293,26 @@ pub mod qobject {
         /// in place.
         #[qinvokable]
         fn read_more(self: Pin<&mut TimelineModel>, message: i64);
+
+        /// The selection mode (`kourier_viewmodel::selection`): starts with `message` selected.
+        #[qinvokable]
+        fn select_start(self: Pin<&mut TimelineModel>, message: i64);
+        /// A click while selecting flips `message`.
+        #[qinvokable]
+        fn select_toggle(self: Pin<&mut TimelineModel>, message: i64);
+        /// Shift+click: selects from the anchor to `message`.
+        #[qinvokable]
+        fn select_extend(self: Pin<&mut TimelineModel>, message: i64);
+        /// Ends the mode.
+        #[qinvokable]
+        fn select_clear(self: Pin<&mut TimelineModel>);
+        /// Puts the selected messages on the clipboard as text.
+        #[qinvokable]
+        fn copy_selected(self: Pin<&mut TimelineModel>);
+        /// Export Selected…: asks for the plan of the selected messages; the dialog opens with
+        /// `App.exportDialogReady`. Nothing happens while an export is under way.
+        #[qinvokable]
+        fn export_selected(self: Pin<&mut TimelineModel>);
 
         /// How many pictures, videos and files of the rows shown are downloading (a
         /// `--screenshot` waits for 0).
@@ -2009,15 +2616,20 @@ pub mod qobject {
         #[qproperty(bool, start_hidden, READ, WRITE = set_start_hidden_pref, NOTIFY = changed)]
         #[qproperty(bool, compact, READ, WRITE = set_compact_pref, NOTIFY = changed)]
         #[qproperty(bool, blend_accounts, READ, WRITE = set_blend_accounts_pref, NOTIFY = changed)]
-        #[qproperty(bool, round_avatars, READ, WRITE = set_round_avatars_pref, NOTIFY = changed)]
+        #[qproperty(i32, avatar_corners, READ, WRITE = set_avatar_corners_pref, NOTIFY = changed)]
+        #[qproperty(i32, message_corners, READ, WRITE = set_message_corners_pref, NOTIFY = changed)]
+        #[qproperty(bool, drafts_on_top, READ, WRITE = set_drafts_on_top_pref, NOTIFY = changed)]
+        #[qproperty(bool, show_account_tags, READ, WRITE = set_show_account_tags_pref, NOTIFY = changed)]
         #[qproperty(bool, tint_rows, READ, WRITE = set_tint_rows_pref, NOTIFY = changed)]
         #[qproperty(bool, chat_wallpaper, READ, WRITE = set_chat_wallpaper_pref, NOTIFY = changed)]
-        #[qproperty(f64, avatar_corner, READ, WRITE = set_avatar_corner_pref, NOTIFY = changed)]
         #[qproperty(i32, notification_content, READ, WRITE = set_notification_content_pref, NOTIFY = changed)]
         #[qproperty(i32, location_files, READ, WRITE = set_location_files_pref, NOTIFY = changed)]
         #[qproperty(QString, expiry_policy, READ, WRITE = set_expiry_policy_pref, NOTIFY = changed)]
         #[qproperty(QString, quiet_notices, READ, WRITE = set_quiet_notices_pref, NOTIFY = changed)]
         #[qproperty(QStringList, networks_on, READ, NOTIFY = changed)]
+        #[qproperty(QString, model_colour, READ, WRITE = set_model_colour_pref, NOTIFY = changed)]
+        #[qproperty(QString, model_box, READ, WRITE = set_model_box_pref, NOTIFY = changed)]
+        #[qproperty(QString, model_slicer, READ, WRITE = set_model_slicer_pref, NOTIFY = changed)]
         type SettingsController = super::SettingsRust;
 
         /// Turns the experimental network `kind` on or off in the preferences. Nothing runs
@@ -2066,8 +2678,17 @@ pub mod qobject {
         /// shows all chats).
         fn set_blend_accounts_pref(self: Pin<&mut SettingsController>, value: bool);
 
-        /// Avatars are circles; off, squares with the theme's corners.
-        fn set_round_avatars_pref(self: Pin<&mut SettingsController>, value: bool);
+        /// How round avatars are: 0 (square) to 100 (circle).
+        fn set_avatar_corners_pref(self: Pin<&mut SettingsController>, value: i32);
+
+        /// How round message bubbles are: 0 (square) to 100; 30 is the look of old.
+        fn set_message_corners_pref(self: Pin<&mut SettingsController>, value: i32);
+
+        /// A chat left with a draft moves up in the list.
+        fn set_drafts_on_top_pref(self: Pin<&mut SettingsController>, value: bool);
+
+        /// The chat list shows the accounts' tags (and names).
+        fn set_show_account_tags_pref(self: Pin<&mut SettingsController>, value: bool);
 
         /// Chat rows carry a faint wash of their account's color.
         fn set_tint_rows_pref(self: Pin<&mut SettingsController>, value: bool);
@@ -2075,10 +2696,21 @@ pub mod qobject {
         /// The pattern of small drawings behind a chat's messages.
         fn set_chat_wallpaper_pref(self: Pin<&mut SettingsController>, value: bool);
 
-        /// The corner of a square avatar in the theme, as a share of the side of a list
-        /// avatar. QML sets it from the theme; notification avatars (drawn in Rust, which
-        /// cannot ask the theme) follow it. Not saved.
-        fn set_avatar_corner_pref(self: Pin<&mut SettingsController>, value: f64);
+        /// The colour of 3D models without colours of their own: `#rrggbb`, or empty for the
+        /// desktop's accent colour. Anything else is refused. The one owner of the preference:
+        /// the viewer's colour button writes here too.
+        fn set_model_colour_pref(self: Pin<&mut SettingsController>, value: &QString);
+
+        /// The printer box of the 3D viewer: a row id of the table, empty for none.
+        fn set_model_box_pref(self: Pin<&mut SettingsController>, value: &QString);
+
+        /// The slicer "Open in Slicer" starts first: a table id, empty for OrcaSlicer.
+        fn set_model_slicer_pref(self: Pin<&mut SettingsController>, value: &QString);
+
+        /// The printer boxes as JSON `[{id, label, w, d, h}]`, smallest first (the viewmodel's
+        /// table, names untranslated, "mm" translated).
+        #[qinvokable]
+        fn model_boxes(self: &SettingsController) -> QString;
 
         /// Notification content: 0 name and message, 1 name only, 2 nothing.
         fn set_notification_content_pref(self: Pin<&mut SettingsController>, value: i32);
@@ -2100,7 +2732,16 @@ pub mod qobject {
         fn new_member_list_model() -> UniquePtr<MemberListModel>;
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
+        fn new_emoji_lists() -> UniquePtr<EmojiLists>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_search_list_model() -> UniquePtr<SearchListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
         fn new_share_target_list_model() -> UniquePtr<ShareTargetListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_filter_list_model() -> UniquePtr<FilterListModel>;
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
         fn new_media_list_model() -> UniquePtr<MediaListModel>;

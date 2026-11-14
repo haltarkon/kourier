@@ -29,8 +29,9 @@
 //!   waits in its composer (the dialog does not watch the transfer); once the transfer is
 //!   skipped the same call deletes the chat and the composer's copy goes with it.
 //! - `search`: with chats in the list and a transfer running, a search that matches nothing
-//!   says so ("No chats match ...") and not that the chats are on their way; clearing the
-//!   search brings the list back.
+//!   says so once the message search answered ("No results for ...", G1i; the explanation is
+//!   empty or the index line) and not that the chats are on their way; clearing the search
+//!   brings the list back.
 //! - `failed`: a failure found at the start shows a banner that stays; "Dismiss" removes it
 //!   and the fake received the dismissal. The account is untouched.
 //! - `again`: "Try Again…" on the banner opens the question with the keyboard on "Cancel";
@@ -475,10 +476,12 @@ MainWindow {
         }
         case "search-none": {
             const said = win.emptyList();
-            if (!said) return win.later("the empty list's text");
+            // (Empty between the key and the message search's answer, G1i.)
+            if (!said || said[0] === "") return win.later("the empty list's text");
             // The words around the search are not part of it, and no markup is made of it.
-            if (said[0] !== "No chats match “zzqx ‹b›no‹/b›”") return win.fail("the heading: " + said[0]);
-            if (said[1] !== "") return win.fail("the explanation: " + said[1]);
+            if (said[0] !== "No results for “zzqx ‹b›no‹/b›”") return win.fail("the heading: " + said[0]);
+            // Nothing, or the index line while the index fills: never the transfer.
+            if (said[1] !== "" && !said[1].startsWith("Older messages are still being prepared for search (")) return win.fail("the explanation: " + said[1]);
             win.pageStack.get(0).searchField.text = "";
             win.next("search-cleared");
             return;

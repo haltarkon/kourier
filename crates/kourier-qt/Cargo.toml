@@ -35,6 +35,8 @@ zeroize.workspace = true
 kourier-app = { path = "../kourier-app", default-features = false, features = ["fake"] }
 # `tests/folder_ui.rs` reads back the archive a folder was sent as.
 zip.workspace = true
+# `tests/export_ui.rs` checks the manifest's hashes against the bytes read back.
+sha2.workspace = true
 # `tests/chat_ui.rs` `svQr` decodes the grabbed QR code of a safety number (P5a critic F11).
 image.workspace = true
 quircs.workspace = true
@@ -103,6 +105,14 @@ name = "input_ui"
 harness = false
 
 [[test]]
+name = "select_ui"
+harness = false
+
+[[test]]
+name = "export_ui"
+harness = false
+
+[[test]]
 name = "chat_ui"
 harness = false
 
@@ -127,7 +137,31 @@ name = "group_invite_ui"
 harness = false
 
 [[test]]
+name = "search_ui"
+harness = false
+
+[[test]]
 name = "settings_ui"
+harness = false
+
+[[test]]
+name = "filters_ui"
+harness = false
+
+[[test]]
+name = "regex_search_ui"
+harness = false
+
+[[test]]
+name = "names_probe_ui"
+harness = false
+
+[[test]]
+name = "highlight_ui"
+harness = false
+
+[[test]]
+name = "emoji_ui"
 harness = false
 
 [[test]]
@@ -189,6 +223,11 @@ harness = false
 # the test names in KOURIER_DEV_SAVE_DIALOG (debug builds only), the files are looked at afterwards.
 [[test]]
 name = "save_ui"
+harness = false
+
+# The 3D model viewer: the bubble, the viewer by URL, the lists, the provider's tint (V3).
+[[test]]
+name = "model3d_ui"
 harness = false
 
 [[test]]

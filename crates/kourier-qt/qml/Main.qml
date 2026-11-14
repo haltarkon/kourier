@@ -43,8 +43,9 @@ QtObject {
         return shell.window;
     }
 
-    // Shows and raises the window; opens `conversation` when it is not 0.
-    function activate(token: string, conversation: real): void {
+    // Shows and raises the window; opens `conversation` when it is not 0, at `message` when that
+    // is not 0 (a filter's notification, the jump of a search hit).
+    function activate(token: string, conversation: real, message = 0): void {
         const w = shell.ensureWindow();
         if (token !== "") {
             KWindowSystem.setCurrentXdgActivationToken(token);
@@ -56,7 +57,7 @@ QtObject {
         }
         w.raise();
         KWindowSystem.activateWindow(w);
-        w.openFromActivation(conversation);
+        w.openFromActivation(conversation, message);
     }
 
     // Tray click: hide a window the user is looking at, else bring it up.
@@ -133,8 +134,8 @@ QtObject {
 
     property Connections desktop: Connections {
         target: App
-        function onActivationRequested(token: string, conversation: real): void {
-            shell.activate(token, conversation);
+        function onActivationRequested(token: string, conversation: real, message: real): void {
+            shell.activate(token, conversation, message);
         }
         function onToggleRequested(token: string): void {
             shell.toggle(token);

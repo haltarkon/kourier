@@ -228,7 +228,7 @@ pub mod tests {
     /// JPEG encoder, the fixture's pictures and the blurhash input in `kourier-media`; the
     /// AES-GCM stream of every attachment file in `kourier-blob`), which a generic function
     /// compiles at the opt-level of the crate that names the concrete types.
-    const DEV_OPTIMISED: [&str; 2] = ["kourier-media", "kourier-blob"];
+    const DEV_OPTIMISED: [&str; 3] = ["kourier-media", "kourier-blob", "kourier-mesh"];
 
     /// The `opt-level` a manifest gives `[profile.dev.package.<name>]` (`name` as written in the
     /// header: `"*"` keeps its quotes). Read line by line: `toml` is not an xtask dependency and

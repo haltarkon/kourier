@@ -23,6 +23,8 @@ Item {
     required property string tone
     required property string timeLabel
     required property var actions
+    // The row is selected in the selection mode.
+    required property bool selected
 
     readonly property real iconRoom: glyph.visible ? glyph.width + Kirigami.Units.smallSpacing : 0
     readonly property color quiet: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
@@ -51,15 +53,15 @@ Item {
             "reactions": [],
             "failed": false,
             "edited": false,
-            "system": true
+            "system": true,
+            "selectable": true,
+            "selected": root.selected
         };
     }
 
     // The context menu without a pointer (the Menu key): beside the notice.
     function openMenu(): void {
-        if (root.offers) {
-            TimelineActions.menu(label, root.rowInfo(), -1, 0);
-        }
+        TimelineActions.menu(label, root.rowInfo(), -1, 0);
     }
 
     function openDelete(): void {
@@ -70,31 +72,31 @@ Item {
     implicitHeight: label.implicitHeight + Kirigami.Units.largeSpacing * 2
 
     Accessible.role: Accessible.ListItem
-    Accessible.name: root.text + ", " + root.timeLabel
+    Accessible.name: (root.selected ? L10n.i18nc("@info accessible, said before a selected message", "Selected.") + " " : "") + root.text + ", " + root.timeLabel
+    Accessible.selectable: App.timeline.selecting
+    Accessible.selected: root.selected
 
     TapHandler {
         acceptedButtons: Qt.RightButton
-        enabled: root.offers
         onTapped: point => TimelineActions.menu(root, root.rowInfo(), Math.round(point.position.x), Math.round(point.position.y))
     }
     TapHandler {
         id: longPress
         acceptedDevices: PointerDevice.TouchScreen | PointerDevice.Stylus
-        enabled: root.offers
         onLongPressed: TimelineActions.menu(root, root.rowInfo(), Math.round(longPress.point.position.x), Math.round(longPress.point.position.y))
     }
 
     // The row with the keyboard focus, or the one a popup is about.
     Rectangle {
-        visible: root.current || TimelineActions.activeMessage === root.messageId
+        visible: root.current || root.selected || TimelineActions.activeMessage === root.messageId
         x: Math.round(Math.min(label.x, glyph.visible ? glyph.x : label.x) - Kirigami.Units.largeSpacing)
         y: Math.round(label.y - Kirigami.Units.smallSpacing)
         width: Math.round(label.x + label.width - x + Kirigami.Units.largeSpacing)
         height: Math.round(label.height + Kirigami.Units.smallSpacing * 2)
         radius: height / 2
-        color: "transparent"
-        border.width: root.current ? 2 : 1
-        border.color: Kirigami.Theme.focusColor
+        color: root.selected ? Qt.alpha(Kirigami.Theme.highlightColor, 0.25) : "transparent"
+        border.width: root.current || root.selected ? 2 : 1
+        border.color: root.selected && !root.current ? Kirigami.Theme.highlightColor : Kirigami.Theme.focusColor
     }
 
     QQC2.Label {

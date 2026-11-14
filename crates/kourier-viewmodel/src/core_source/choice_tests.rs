@@ -211,3 +211,86 @@ fn the_unread_total_counts_hidden_accounts() {
         "the hidden account's messages count too"
     );
 }
+
+/// The list's look (settings batch): a chat left with a draft sorts by the draft's time while it
+/// is newer than the last message; "Move chats with a draft to the top" off puts it back; a
+/// newer message outranks an older draft. Mutants: `drafts_on_top` ignored in `conversation_row`;
+/// the `set_list_look` change test dropped (no `Changes`).
+#[test]
+fn a_chat_with_a_draft_moves_up_while_the_option_is_on() {
+    let mut rows = four_chats();
+    // Chat 4 (the oldest) is left with a draft stamped after chat 1's message; chat 3 has a
+    // draft older than its newest message.
+    rows[3].draft_at = 100;
+    rows[3].has_draft = true;
+    rows[2].draft_at = 5;
+    rows[2].has_draft = true;
+    let mut src = two_account_source(&rows);
+    let all = ConversationFilter::default();
+    assert_eq!(ids(&src.conversations(&all)), [4, 1, 2, 3], "on by default");
+    let off = crate::source::ListLook {
+        drafts_on_top: false,
+        ..crate::source::ListLook::default()
+    };
+    let ch = src.set_list_look(off.clone());
+    assert!(ch.conversations, "the list is told");
+    assert_eq!(
+        ids(&src.conversations(&all)),
+        [1, 2, 3, 4],
+        "off: by messages"
+    );
+    assert!(
+        !src.set_list_look(off).conversations,
+        "the same look again changes nothing"
+    );
+    src.set_list_look(crate::source::ListLook::default());
+    assert_eq!(ids(&src.conversations(&all)), [4, 1, 2, 3], "on again");
+}
+
+/// Account tags: the chat list's chip shows the tag in place of the account's name (only with
+/// two accounts shown), an account without a tag keeps its name, and "Show account tags" off
+/// leaves the chip out. The account rows keep their names. Mutants: the tag lookup keyed on
+/// the wrong uuid; `show_tags` ignored.
+#[test]
+fn the_list_shows_an_accounts_tag_in_place_of_its_name_and_the_switch_hides_it() {
+    let mut src = two_account_source(&four_chats());
+    let all = ConversationFilter::default();
+    let chip = |src: &CoreSource, id: i64| {
+        src.conversations(&all)
+            .iter()
+            .find(|r| r.id.0 == id)
+            .map(|r| r.account_badge.clone())
+            .expect("the row")
+    };
+    let name1 = chip(&src, 1);
+    assert!(
+        !name1.is_empty(),
+        "two accounts: the chip names the account"
+    );
+    let names: Vec<String> = src.accounts().iter().map(|a| a.name.clone()).collect();
+    src.set_list_look(crate::source::ListLook {
+        tags: [(uuid(1), "Work".to_owned())].into(),
+        ..crate::source::ListLook::default()
+    });
+    assert_eq!(chip(&src, 1), "Work", "account 1's chats carry its tag");
+    assert_eq!(chip(&src, 3), "Work");
+    // (The two accounts shared a name, so each chip carried its place; with account 1's
+    // tag the other is no twin any more and shows the plain name.)
+    assert_eq!(chip(&src, 2), "Me", "account 2 has no tag: its name stays");
+    assert_eq!(
+        src.accounts()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect::<Vec<_>>(),
+        names,
+        "the account keeps its name everywhere else"
+    );
+    assert_eq!(src.accounts()[0].own_tag, "Work");
+    src.set_list_look(crate::source::ListLook {
+        show_tags: false,
+        tags: [(uuid(1), "Work".to_owned())].into(),
+        ..crate::source::ListLook::default()
+    });
+    assert_eq!(chip(&src, 1), "", "the switch hides the tag");
+    assert_eq!(chip(&src, 2), "", "and the names too");
+}

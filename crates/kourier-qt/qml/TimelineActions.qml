@@ -23,6 +23,9 @@ QtObject {
     property real flashMessage: 0
     // Counts jumps, so a second jump to the same message flashes again.
     property int flashSerial: 0
+    // A Ctrl+click is under way (from its press until just after its release): a link in a text
+    // is not opened by it, it starts the selection mode. (`TimelineView`'s handler sets it.)
+    property bool ctrlPress: false
 
     // Open the context menu of `row` at (`x`, `y`) of `anchor` (a pointer position); with a
     // negative `x`, beside `anchor` instead, so the message stays in view (the Menu key).
@@ -49,6 +52,8 @@ QtObject {
     // Open the person `user`'s page and the level of their safety number on it (P5a: the entry a paused send's
     // message menu offers, BQ-3).
     signal safetyRequested(string user)
+    // The menu's "Select" or "Deselect" on `message`.
+    signal selectRequested(real message)
 
     function menu(anchor: Item, row: var, x: real, y: real): void {
         actions.menuRequested(anchor, row, x, y);
@@ -92,6 +97,10 @@ QtObject {
 
     function safety(user: string): void {
         actions.safetyRequested(user);
+    }
+
+    function select(message: real): void {
+        actions.selectRequested(message);
     }
 
     function flash(message: real): void {

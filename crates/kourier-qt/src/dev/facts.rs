@@ -139,6 +139,7 @@ mod tests {
             request_pending: false,
             features_hash: 0,
             has_draft: false,
+            draft_at: 0,
             hidden: false,
             can_send: true,
             roaming: Roaming::Hidden,

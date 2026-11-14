@@ -127,6 +127,9 @@ impl Playback {
 /// A file-name extension Qt can tell the type from: from the MIME type, else from the original
 /// name (ASCII alphanumerics, ≤ 16), else none.
 fn extension<'a>(mime: Option<&str>, file_name: Option<&'a str>) -> &'a str {
+    if let Some(e) = model_extension(mime, file_name) {
+        return e;
+    }
     if let Some(e) = mime.and_then(kourier_media::extension_for_mime) {
         return e;
     }
@@ -135,6 +138,32 @@ fn extension<'a>(mime: Option<&str>, file_name: Option<&'a str>) -> &'a str {
         .and_then(|e| e.to_str())
         .filter(|e| e.len() <= 16 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
         .unwrap_or("")
+}
+
+/// `stl` or `3mf` for a 3D model (by its name, else its MIME type), whatever the table says for the
+/// MIME type: a slicer picks its reader by the extension of the copy it is started with ("Open in
+/// Slicer"), so the copy of a model always ends in one of the two.
+fn model_extension(mime: Option<&str>, file_name: Option<&str>) -> Option<&'static str> {
+    if let Some(name) = file_name {
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".3mf") {
+            return Some("3mf");
+        }
+        if lower.ends_with(".stl") {
+            return Some("stl");
+        }
+    }
+    let essence = mime?
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match essence.as_str() {
+        "model/3mf" | "application/vnd.ms-package.3dmanufacturing-3dmodel+xml" => Some("3mf"),
+        "model/stl" | "application/sla" | "application/vnd.ms-pki.stl" => Some("stl"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -201,5 +230,19 @@ mod tests {
         );
         assert_eq!(extension(None, Some("x.tar.gz")), "gz");
         assert_eq!(extension(None, Some("weird.ext!")), "");
+    }
+
+    /// The copy of a 3D model ends in `.stl` or `.3mf` whatever the name or the MIME type says.
+    #[test]
+    fn a_model_copy_gets_a_model_extension() {
+        assert_eq!(extension(Some("model/3mf"), Some("part")), "3mf");
+        assert_eq!(
+            extension(Some("application/octet-stream"), Some("Part.STL")),
+            "stl"
+        );
+        assert_eq!(extension(None, Some("a.3mf")), "3mf");
+        assert_eq!(extension(Some("application/sla"), None), "stl");
+        assert_eq!(extension(Some("image/png"), Some("a.png")), "png");
+        assert_eq!(extension(None, Some("a.txt")), "txt");
     }
 }

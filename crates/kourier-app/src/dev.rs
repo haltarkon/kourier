@@ -32,6 +32,10 @@
 //!
 //! `KOURIER_DEV_DEMO_STATE=challenge|offline|clock`: the state the fake network's demo account
 //! ends in once it is linked.
+//!
+//! `KOURIER_DEV_SEARCH_BACKFILL_MS=<ms>`: how long after the first frame the search index starts
+//! on the messages it does not hold yet (`Timeouts::search_backfill`, 10 s by default), so a test
+//! can see the "still being prepared" state for as long as it needs.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -40,6 +44,20 @@ use std::path::Path;
 
 use crate::keys::{KdfParams, KeyError, Keyring, NoSecretStore, PassphraseConfig};
 use crate::paths::{HOME_ENV, Paths};
+
+/// The environment variable that sets `Timeouts::search_backfill` in milliseconds.
+pub const DEV_SEARCH_BACKFILL_ENV: &str = "KOURIER_DEV_SEARCH_BACKFILL_MS";
+
+/// The delay [`DEV_SEARCH_BACKFILL_ENV`] asks for; `None` when it is unset, empty or not a
+/// number (the default stays: a typo never changes the timing silently in a way a run could miss).
+pub fn search_backfill(env: impl Fn(&str) -> Option<OsString>) -> Option<std::time::Duration> {
+    env(DEV_SEARCH_BACKFILL_ENV)?
+        .to_str()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
 
 /// The environment variable that selects the development keyring (`passphrase`).
 pub const DEV_KEYRING_ENV: &str = "KOURIER_DEV_KEYRING";
@@ -249,6 +267,21 @@ fn open_in(config_dir: &Path, fresh_profile: bool) -> Result<Keyring<NoSecretSto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_search_backfill_delay_is_read_from_the_environment() {
+        let with = |v: Option<&'static str>| {
+            search_backfill(move |k| {
+                assert_eq!(k, DEV_SEARCH_BACKFILL_ENV);
+                v.map(OsString::from)
+            })
+        };
+        assert_eq!(with(Some("7000")), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(with(Some(" 0 ")), Some(std::time::Duration::ZERO));
+        assert_eq!(with(Some("soon")), None);
+        assert_eq!(with(Some("")), None);
+        assert_eq!(with(None), None);
+    }
 
     #[cfg(feature = "fake")]
     #[test]

@@ -561,7 +561,7 @@ fn entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
             let mut entry = zip.by_index(i).expect("an entry");
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).expect("its bytes");
-            (entry.name().to_owned(), bytes)
+            (entry.name().unwrap().into_owned(), bytes)
         })
         .collect()
 }

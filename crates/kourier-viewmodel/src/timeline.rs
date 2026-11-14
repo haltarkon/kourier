@@ -240,6 +240,55 @@ pub struct ImageBlock {
     pub save: bool,
     /// Its ring while it waits to go up or goes up (own message on its way).
     pub upload: Option<UploadView>,
+    /// A 3D model (STL, 3MF) whose still the core derived: this block is its picture, and a
+    /// tap opens the 3D viewer, not the picture viewer. `url` is the still (a shade picture
+    /// the image provider tints when `tint` is set); never part of an album.
+    pub model: Option<ModelInfo>,
+}
+
+/// What the bubble knows of a 3D model (the core's `ModelFacts`, copied).
+#[derive(Clone, Default, PartialEq)]
+pub struct ModelInfo {
+    /// The file's name (single line) for the viewer's header; never logged.
+    pub name: String,
+    /// Width (X) in millimetres.
+    pub x_mm: f32,
+    /// Depth (Y) in millimetres.
+    pub y_mm: f32,
+    /// Height (Z) in millimetres.
+    pub z_mm: f32,
+    /// Triangles.
+    pub tris: u32,
+    /// The still is a shade picture: the model colour tints it.
+    pub tint: bool,
+}
+
+impl std::fmt::Debug for ModelInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelInfo")
+            .field("tris", &self.tris)
+            .field("tint", &self.tint)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One edge of a model's box in millimetres as the pill writes it: one decimal under 10 mm,
+/// whole millimetres from there.
+pub fn mm_figure(v: f32) -> String {
+    if v < 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    }
+}
+
+/// The size pill of a model: "60 × 31 × 48 mm".
+pub fn model_size_text(m: &ModelInfo) -> String {
+    trfc(
+        "@info:preview size of a 3D model in millimetres: width, depth, height",
+        "%1 × %2 × %3 mm",
+        &[&mm_figure(m.x_mm), &mm_figure(m.y_mm), &mm_figure(m.z_mm)],
+    )
 }
 
 crate::safe_debug!(ImageBlock {
@@ -254,7 +303,8 @@ crate::safe_debug!(ImageBlock {
     sticker,
     ask,
     save,
-    upload
+    upload,
+    model
 });
 
 /// Several pictures and videos of one message, shown as one album.
@@ -957,6 +1007,8 @@ pub struct MessageRow {
     pub author: String,
     /// Author id (`None` for own messages and markers); the grouping key.
     pub author_id: Option<UserId>,
+    /// The marker backgrounds of the RegExp filters in the author's name as shown (R3).
+    pub author_marks: Vec<crate::filter_marks::Mark>,
     /// Author avatar URL, empty for initials.
     pub avatar_url: String,
     /// Show the author line (groups, first message of a run).
@@ -1000,6 +1052,9 @@ pub struct MessageRow {
     pub wait: String,
     /// The timer of that line: never cut short, it has a label of its own.
     pub wait_timer: String,
+    /// The row is selected in the selection mode ([`crate::selection::Selection::mark`] sets
+    /// it; the builder leaves it false).
+    pub selected: bool,
 }
 
 crate::safe_debug!(MessageRow {
@@ -1017,16 +1072,18 @@ crate::safe_debug!(MessageRow {
     deleted,
     receipt,
     actions,
+    selected,
 });
 
 impl MessageRow {
-    fn marker(key: RowKey, kind: RowKind, text: String) -> Self {
+    pub(crate) fn marker(key: RowKey, kind: RowKind, text: String) -> Self {
         Self {
             key,
             kind,
             own: false,
             author: String::new(),
             author_id: None,
+            author_marks: Vec::new(),
             avatar_url: String::new(),
             show_author: false,
             show_avatar: false,
@@ -1047,6 +1104,7 @@ impl MessageRow {
             expiry: String::new(),
             wait: String::new(),
             wait_timer: String::new(),
+            selected: false,
         }
     }
 
@@ -1266,6 +1324,44 @@ fn type_label(att: &Attachment) -> String {
     }
 }
 
+/// The picture block of a downloaded 3D model whose still the core derived (its `model` mark
+/// is set, and the still's size is known); `None` for anything else, which stays a file.
+fn model_block(att: &Attachment) -> Option<ImageBlock> {
+    let facts = att.model?;
+    let id = att.id?;
+    let (width, height) = att.dims.filter(|(w, h)| *w > 0 && *h > 0)?;
+    let (state, progress) = MediaState::from_attachment(att.state);
+    if state != MediaState::Local {
+        return None;
+    }
+    let name = att
+        .file_name
+        .as_deref()
+        .map(single_line)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| trc("@info:preview attachment type", "3D model").into_owned());
+    let model = ModelInfo {
+        name,
+        x_mm: facts.x_mm,
+        y_mm: facts.y_mm,
+        z_mm: facts.z_mm,
+        tris: facts.tris,
+        tint: facts.tint,
+    };
+    Some(ImageBlock {
+        attachment: Some(id),
+        kind: AttachmentKind::File,
+        url: media::media_url(MediaVariant::Thumb, id, media::revision(att)),
+        width,
+        height,
+        state,
+        progress,
+        label: model_size_text(&model),
+        model: Some(model),
+        ..ImageBlock::default()
+    })
+}
+
 pub(crate) fn attachment_block(att: &Attachment, sticker: bool) -> Block {
     let (state, progress) = MediaState::from_attachment(att.state);
     let media_mime = media::is_media_mime(&att.mime);
@@ -1327,6 +1423,7 @@ pub(crate) fn attachment_block(att: &Attachment, sticker: bool) -> Block {
                 ask: false,
                 save: false,
                 upload: None,
+                model: None,
             })
         }
         AttachmentKind::Voice => Block::File(FileBlock {
@@ -1659,6 +1756,12 @@ fn content_blocks(
                 _ => blocks.push(Block::Album(AlbumBlock::new(std::mem::take(run)))),
             };
             for a in attachments.iter().filter(|a| !a.long_text) {
+                // A model's picture stands alone: it opens another viewer than a photo.
+                if let Some(model) = model_block(a) {
+                    flush(&mut run, &mut blocks);
+                    blocks.push(Block::Image(model));
+                    continue;
+                }
                 match attachment_block(a, false) {
                     Block::Image(image) => run.push(image),
                     other => {
@@ -1842,6 +1945,7 @@ pub(crate) fn build_rows<'a>(
             own: msg.own,
             author,
             author_id: msg.author.cloned(),
+            author_marks: Vec::new(),
             avatar_url: String::new(),
             show_author: false,
             show_avatar: false,
@@ -1872,6 +1976,7 @@ pub(crate) fn build_rows<'a>(
             },
             wait: wait.reason,
             wait_timer: wait.timer,
+            selected: false,
         });
     }
     read_more.end();
@@ -2850,6 +2955,80 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    fn model_attachment(state: AttachmentState) -> Attachment {
+        Attachment {
+            id: Some(AttachmentId(9)),
+            kind: AttachmentKind::File,
+            file_name: Some("bracket.stl".into()),
+            mime: "model/stl".into(),
+            state,
+            dims: Some((400, 300)),
+            model: Some(kourier_model::ModelFacts {
+                x_mm: 60.0,
+                y_mm: 31.2,
+                z_mm: 4.3,
+                tris: 120,
+                tint: true,
+            }),
+            ..Attachment::default()
+        }
+    }
+
+    #[test]
+    fn a_derived_model_is_a_picture_with_a_size_pill() {
+        let att = model_attachment(AttachmentState::Local);
+        let block = model_block(&att).expect("a model block");
+        assert_eq!(block.label, "60 \u{d7} 31 \u{d7} 4.3 mm");
+        assert!(block.url.starts_with("image://kourier/thumb/9?v="));
+        assert_eq!((block.width, block.height), (400, 300));
+        assert!(block.model.as_ref().is_some_and(|m| m.tint));
+        assert_eq!(
+            block.model.as_ref().map(|m| m.name.as_str()),
+            Some("bracket.stl")
+        );
+        assert_eq!(block.kind, AttachmentKind::File);
+        assert_eq!(mm_figure(9.96), "10.0");
+        assert_eq!(mm_figure(9.94), "9.9");
+        assert_eq!(mm_figure(48.4), "48");
+        // Not downloaded, or without the mark: it stays the file block.
+        assert!(model_block(&model_attachment(AttachmentState::Remote)).is_none());
+        let mut plain = att.clone();
+        plain.model = None;
+        assert!(model_block(&plain).is_none());
+        assert!(matches!(attachment_block(&plain, false), Block::File(_)));
+    }
+
+    #[test]
+    fn a_model_never_joins_an_album() {
+        let picture = |n: i64| Attachment {
+            id: Some(AttachmentId(n)),
+            kind: AttachmentKind::Image,
+            state: AttachmentState::Local,
+            dims: Some((100, 100)),
+            ..Attachment::default()
+        };
+        let body = Body::Media {
+            attachments: vec![
+                picture(1),
+                model_attachment(AttachmentState::Local),
+                picture(2),
+                picture(3),
+            ],
+            caption: None,
+        };
+        let blocks = content_blocks(MessageId(1), &body, &NameMap::new(), &ReadMore::default());
+        let shape: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Image(i) if i.model.is_some() => "model",
+                Block::Image(_) => "image",
+                Block::Album(_) => "album",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(shape, ["image", "model", "album"]);
     }
 
     /// The phone's part (S6): asking and its three endings are their own states (their own

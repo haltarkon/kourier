@@ -351,6 +351,29 @@ pub fn deleted_quote() -> Summary {
     )
 }
 
+/// The stand-in for a quote of a disappearing message in an export made without the dialog's
+/// tick: the quoted content is not exported.
+pub fn disappearing_quote() -> Summary {
+    Summary::new(
+        trc(
+            "@info:preview in a quote of an export",
+            "A disappearing message",
+        ),
+        "chronometer",
+    )
+}
+
+/// The stand-in for a quote of a message an export never carries (a view-once or gone one).
+pub fn left_out_quote() -> Summary {
+    Summary::new(
+        trc(
+            "@info:preview in a quote of an export",
+            "A message that is not exported",
+        ),
+        "dialog-question",
+    )
+}
+
 /// Summary of a stand-in.
 pub fn placeholder_summary(p: Placeholder) -> Summary {
     match p {

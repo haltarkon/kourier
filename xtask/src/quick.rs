@@ -65,7 +65,7 @@ const FULL_PREFIXES: [&str; 1] = [".cargo/"];
 
 /// Files outside every package that a test reads: (path, or directory with a trailing `/`,
 /// the packages whose tests read it).
-const READERS: [(&str, &[&str]); 7] = [
+const READERS: [(&str, &[&str]); 8] = [
     // The smoke tool's tests check the runbook against the tool.
     ("docs/smoke-run.md", &["xtask"]),
     // The same for the WhatsApp run tool and its runbook.
@@ -81,6 +81,12 @@ const READERS: [(&str, &[&str]); 7] = [
     // The vendored libthreema: a path dependency of the Threema backend only, outside every
     // package directory of this workspace (its own suite runs by hand, VENDORED.md).
     ("third_party/libthreema/", &["kourier-threema"]),
+    // The vendored qt-build-utils (patch Q1): the build-script helper of the two crates that
+    // build Qt code through cxx-qt-build (VENDORED.md); their dependents follow by the walk.
+    (
+        "third_party/qt-build-utils/",
+        &["kourier-qt", "kourier-coexist"],
+    ),
 ];
 
 /// Files that cannot change a test result.
@@ -175,6 +181,7 @@ pub fn owner(ws: &Workspace, path: &str) -> Owner {
 fn can_change_a_picture(path: &str) -> bool {
     if path == "Cargo.lock"
         || path.starts_with("packaging/")
+        || path.starts_with("third_party/qt-build-utils/")
         || path == "xtask/src/main.rs"
         || path == "xtask/src/shots.rs"
     {
@@ -1035,6 +1042,12 @@ mod tests {
             Owner::Packages(strings(&["kourier-threema"]))
         );
         assert!(!is_neutral("third_party/libthreema/VENDORED.md"));
+        // The vendored qt-build-utils runs qmlcachegen for the two crates that build Qt code.
+        assert_eq!(
+            owns("third_party/qt-build-utils/src/tool/qmlcachegen.rs"),
+            Owner::Packages(strings(&["kourier-qt", "kourier-coexist"]))
+        );
+        assert!(!is_neutral("third_party/qt-build-utils/VENDORED.md"));
         assert_eq!(owns("docs/architecture.md"), Owner::Neutral);
     }
 
@@ -1073,6 +1086,10 @@ mod tests {
         assert!(!can_change_a_picture("crates/kourier-threema/src/lib.rs"));
         assert!(!can_change_a_picture(
             "third_party/libthreema/lib/src/lib.rs"
+        ));
+        // How the QML is compiled into the binary (patch Q1, VENDORED.md).
+        assert!(can_change_a_picture(
+            "third_party/qt-build-utils/src/tool/qmlcachegen.rs"
         ));
     }
 

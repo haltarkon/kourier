@@ -226,6 +226,9 @@ MainWindow {
         // The question, by a click on the row.
         case "open": {
             const row = win.row();
+            // The page's Filters card (RegExp filters R2) takes its place when the core's answer
+            // comes, which moves "Accounts" down: bring it on screen again until the click.
+            win.settingsPage.showAccounts();
             win.quiet += 1;
             if (win.quiet < 10) return;
             if (!row || !row.visible) return win.later("the row");

@@ -233,6 +233,17 @@ impl KourierStore {
             .map_err(|_| error::closed())
     }
 
+    /// Asks the writer thread to give back the connection's caches (`Command::ReleaseMemory`):
+    /// a low-priority job nobody waits for, so live work goes first and the actor's loop is not
+    /// held. `Err` when the writer stopped.
+    pub(crate) fn release_memory(&self) -> Result<(), StoreError> {
+        self.inner
+            .handle
+            .submit(Priority::Low, LANE, |conn| kourier_db::release_memory(conn))
+            .map(drop)
+            .map_err(|_| error::closed())
+    }
+
     /// A job that writes at low priority (expiry sweeps, upkeep): live work is served first.
     pub(crate) async fn sweep<T, F>(&self, op: &'static str, f: F) -> Result<T, StoreError>
     where

@@ -11,11 +11,26 @@ QtObject {
     readonly property string iconBase: "qrc:/qt/qml/app/kourier/icons/"
 
     // Bubble geometry.
-    readonly property real bubbleRadius: Kirigami.Units.cornerRadius * 3
-    readonly property real bubbleRadiusTight: Kirigami.Units.cornerRadius
+    // Settings > Appearance > "Message corners" (0 to 100): a tenth of the theme's corner radius
+    // per step, so the default 30 is the bubble of old, three times the theme's radius. The tight
+    // corner of grouped messages is a third of the big one (the old ratio): never above it.
+    readonly property real bubbleRadius: style.bubbleRadiusFor(App.settings.messageCorners)
+    readonly property real bubbleRadiusTight: style.bubbleRadius / 3
+    function bubbleRadiusFor(corners: real): real {
+        return Kirigami.Units.cornerRadius * Math.max(0, Math.min(100, corners)) / 10;
+    }
     readonly property real bubbleMaxWidth: Kirigami.Units.gridUnit * 26
     readonly property real avatarSize: Kirigami.Units.gridUnit * 1.8
     readonly property real listAvatarSize: Kirigami.Units.gridUnit * 2.6
+    // The colour of a 3D model (the `model_colour` preference when it exists, else the accent: the
+    // desktop's highlight colour) and its `RRGGBB` digits, which tint a model's shade picture in
+    // the image provider (`thumb/<id>?v=…&tint=RRGGBB`: the URL changes with the colour, so the
+    // picture is made again).
+    readonly property color modelColour: App.settings.modelColour !== "" ? App.settings.modelColour : Kirigami.Theme.highlightColor
+    readonly property string modelTint: {
+        const hex = n => ("0" + Math.round(n * 255).toString(16)).slice(-2);
+        return hex(Style.modelColour.r) + hex(Style.modelColour.g) + hex(Style.modelColour.b);
+    }
     readonly property real imageMaxWidth: Kirigami.Units.gridUnit * 16
     // A picture or video is shown whole (§8.6), as large as fits the box between these: at most
     // `imageMaxWidth` wide and `imageMaxHeight` (1.5 x the width limit) tall; a picture thinner
@@ -106,6 +121,21 @@ QtObject {
     // as rich text, and a text with anything from outside in it (a name, a reaction, a reason
     // the network gave) must never become markup: an `<img>` would be fetched from the network
     // (§9.4). Without angle brackets nothing in it can be read as a tag.
+    // A NAME with the RegExp filters' marker backgrounds (R3): the html for a `RichText` label.
+    // `shown` is the name as the label draws it (cut by a `TextMetrics`: a `RichText` label cannot
+    // elide), `whole` the name `marks` (`[{start, len, colour}]` from the model) were made for.
+    function markedName(shown: string, whole: string, marks: var, surface: color, ink: color): string {
+        const list = [];
+        for (const m of marks) {
+            list.push({
+                "start": m.start,
+                "len": m.len,
+                "color": App.markerColour(m.colour, surface, ink)
+            });
+        }
+        return App.nameHtml(shown, whole, list, surface);
+    }
+
     function plain(text: string): string {
         return text.replace(/</g, "\u2039").replace(/>/g, "\u203a");
     }

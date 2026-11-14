@@ -253,6 +253,7 @@ Item {
                 Accessible.name: L10n.i18ncp("@info accessible, %1 how many", "%1 more picture", "%1 more pictures", root.hidden)
 
                 TapHandler {
+                    acceptedModifiers: Qt.NoModifier
                     // The X of the ring is tapped here, by position: a ring has no handler of its
                     // own (the tile's picture leaves the whole tile to this handler, `ringByAlbum`).
                     onTapped: eventPoint => {

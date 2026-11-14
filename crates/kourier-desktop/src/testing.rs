@@ -641,3 +641,113 @@ impl MockSystem {
         .await
     }
 }
+
+/// One `OpenFile` call the mock portal received.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PortalCall {
+    /// The `parent_window` argument.
+    pub parent_window: String,
+    /// What was read from the descriptor that came with the call.
+    pub contents: Vec<u8>,
+    /// The `ask` option, when given.
+    pub ask: Option<bool>,
+    /// The `writable` option, when given.
+    pub writable: Option<bool>,
+}
+
+struct PortalServer {
+    calls: Arc<Mutex<Vec<PortalCall>>>,
+    changed: Arc<Notify>,
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.OpenURI")]
+impl PortalServer {
+    fn open_file(
+        &self,
+        parent_window: String,
+        fd: zbus::zvariant::OwnedFd,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::zvariant::OwnedObjectPath {
+        use std::io::Read as _;
+        let mut file = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
+        let mut contents = Vec::new();
+        let _ = file.read_to_end(&mut contents);
+        let flag = |name: &str| {
+            options
+                .get(name)
+                .and_then(|v| bool::try_from(v.clone()).ok())
+        };
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(PortalCall {
+                parent_window,
+                contents,
+                ask: flag("ask"),
+                writable: flag("writable"),
+            });
+        self.changed.notify_waiters();
+        zbus::zvariant::OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/request/1")
+            .unwrap_or_else(|_| zbus::zvariant::OwnedObjectPath::default())
+    }
+}
+
+/// A mock desktop portal (`org.freedesktop.portal.OpenURI`) that records `OpenFile` calls.
+#[derive(Clone, Debug)]
+pub struct MockPortal {
+    bus: Bus,
+    calls: Arc<Mutex<Vec<PortalCall>>>,
+    changed: Arc<Notify>,
+}
+
+impl MockPortal {
+    /// Serves the mock on a new connection to `bus_address` and takes the portal's name.
+    pub async fn start(bus_address: &str) -> Result<Self, DesktopError> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let changed = Arc::new(Notify::new());
+        let server = PortalServer {
+            calls: calls.clone(),
+            changed: changed.clone(),
+        };
+        let bus = serving(
+            bus_address,
+            crate::portal::PORTAL_PATH,
+            server,
+            crate::portal::PORTAL,
+        )
+        .await?;
+        Ok(Self {
+            bus,
+            calls,
+            changed,
+        })
+    }
+
+    /// The calls received so far.
+    pub fn calls(&self) -> Vec<PortalCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Waits until `n` calls arrived (or `timeout` passed); the calls then.
+    pub async fn wait_for(&self, n: usize, timeout: std::time::Duration) -> Vec<PortalCall> {
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let waiting = self.changed.notified();
+                if self.calls().len() >= n {
+                    return;
+                }
+                waiting.await;
+            }
+        })
+        .await;
+        self.calls()
+    }
+
+    /// The connection (to keep the mock alive).
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+}

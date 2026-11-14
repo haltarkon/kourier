@@ -9,6 +9,8 @@ publish.workspace = true
 [features]
 # Compile `failpoint::hit` into release builds too (debug builds always have it, §10.4).
 failpoints = []
+# Lets a test hook SQLite's statement trace on a connection (`rusqlite::trace`).
+trace = ["rusqlite/trace"]
 
 [dependencies]
 rusqlite.workspace = true

@@ -86,6 +86,7 @@ pub(super) fn account() -> CoreAccount {
         hold: None,
         roaming_writes: None,
         pin_limit: None,
+        own_ids: vec![user(99)],
     }
 }
 
@@ -125,6 +126,7 @@ pub(super) fn conv_row(id: i64, title: &str, last: i64) -> CoreConversation {
         request_pending: false,
         features_hash: 0,
         has_draft: false,
+        draft_at: 0,
         hidden: false,
         can_send: true,
         roaming: kourier_core::facade::Roaming::Hidden,
@@ -193,6 +195,8 @@ pub(super) struct Store {
     pub(super) media_cap: Option<u32>,
     /// The chats the core's rows state as protected (S-P).
     pub(super) protected: Vec<i64>,
+    /// What `Query::ExportPlan` answers (Export Selected); none = a plan of no messages.
+    pub(super) plan: Option<kourier_core::facade::ExportPlan>,
 }
 
 impl Store {
@@ -342,11 +346,46 @@ impl Store {
                     now: NOW,
                 })
             }
+            Query::MessagesByIds { conv, .. } => QueryData::MessagesByIds(TimelinePage {
+                conv: *conv,
+                rows: Vec::new(),
+                has_older: false,
+                has_newer: false,
+                now: NOW,
+            }),
             Query::Attachment(_) => QueryData::Attachment(None),
             Query::SaveFacts(_) => QueryData::SaveFacts(None),
             Query::FilePlan(_) | Query::Revisions(_) => QueryData::Revisions(None),
+            Query::ExportPlan { conv, .. } => {
+                QueryData::ExportPlan(Box::new(self.plan.clone().unwrap_or(
+                    kourier_core::facade::ExportPlan {
+                        conv: *conv,
+                        chat: Ok(()),
+                        members: 0,
+                        messages: Vec::new(),
+                        now: NOW,
+                    },
+                )))
+            }
             Query::ExpiryPolicy => QueryData::ExpiryPolicy(Default::default()),
             Query::QuietNotices => QueryData::QuietNotices(false),
+            Query::Filters => QueryData::Filters(kourier_core::facade::FilterList {
+                filters: Vec::new(),
+                set: std::sync::Arc::new(kourier_core::facade::FilterSet::empty()),
+                revision: 1,
+            }),
+            Query::CaughtUpMessages(_) => QueryData::CaughtUpMessages(Vec::new()),
+            Query::Search(_) => QueryData::Search(kourier_core::facade::SearchPage {
+                hits: Vec::new(),
+                next: None,
+                capped: false,
+                index: kourier_core::facade::SearchIndexState {
+                    ready: true,
+                    percent: 100,
+                },
+                pattern: None,
+            }),
+            Query::SearchQueued => QueryData::SearchQueued(0),
             Query::SafetyNumber { .. } => QueryData::SafetyNumber {
                 answer: Err(kourier_core::facade::model::SafetyUnavailable::Unsupported),
                 waits: false,
@@ -486,10 +525,19 @@ fn first_load_and_coalesced_invalidations() {
     let store = Store::new(&[(1, 10), (2, 5)]);
     src.reload();
     let first = take_queries(&sent);
-    assert_eq!(first.len(), 2, "accounts and the list");
+    assert_eq!(first.len(), 3, "accounts, the list and the filters");
+    assert_eq!(
+        first
+            .iter()
+            .filter(|(_, q)| matches!(q, Query::Filters))
+            .count(),
+        1,
+        "the start reads the filters below the seam (R3 item 1)"
+    );
     for (t, q) in first {
+        let is_filters = matches!(q, Query::Filters);
         let ch = src.on_event(&result(t, store.answer(&q)));
-        assert!(ch.accounts && ch.conversations);
+        assert!(is_filters || (ch.accounts && ch.conversations));
     }
     assert_eq!(src.accounts().len(), 1);
     assert_eq!(src.conversations(&ConversationFilter::default()).len(), 2);
@@ -527,7 +575,7 @@ fn a_read_asked_of_the_core_and_not_applied_is_in_flight() {
     assert_eq!(
         src.queries_in_flight(),
         2,
-        "the accounts and the list are asked for"
+        "the accounts and the list are asked for (the filters' read is no part of this count)"
     );
     for (t, q) in first {
         src.on_event(&result(t, store.answer(&q)));
@@ -1786,7 +1834,9 @@ fn a_failing_timeline_query_is_not_retried_in_a_loop() {
     };
     let first = timeline(&take_queries(&sent));
     assert_eq!(first.len(), 1);
-    let err: Result<QueryData, std::sync::Arc<&str>> = Err(std::sync::Arc::new("disk I/O"));
+    let err: Result<QueryData, std::sync::Arc<kourier_core::facade::CoreError>> = Err(
+        std::sync::Arc::new(kourier_core::facade::CoreError::Stopped),
+    );
     let ch = src.on_query_result(first[0], &err);
     assert!(ch.timeline);
     assert!(
@@ -1853,6 +1903,11 @@ fn nameless_direct_chats_show_a_number_or_a_short_id() {
                 rows: vec![nameless.clone(), phone.clone()],
                 next: None,
             }),
+            Query::Filters => QueryData::Filters(kourier_core::facade::FilterList {
+                filters: Vec::new(),
+                set: std::sync::Arc::new(kourier_core::facade::FilterSet::empty()),
+                revision: 1,
+            }),
             other => panic!("unexpected query {other:?}"),
         };
         src.on_event(&result(t, data));
@@ -1904,6 +1959,11 @@ fn avatars_show_once_ready_and_rows_are_rebuilt_on_a_tick() {
                     next: None,
                 })
             }
+            Query::Filters => QueryData::Filters(kourier_core::facade::FilterList {
+                filters: Vec::new(),
+                set: std::sync::Arc::new(kourier_core::facade::FilterSet::empty()),
+                revision: 1,
+            }),
             other => panic!("unexpected query {other:?}"),
         };
         src.on_event(&result(t, data));
@@ -2068,6 +2128,52 @@ fn media_rows_carry_provider_urls_and_live_progress() {
     // A closed conversation forgets its live progress.
     src.open_conversation(None);
     assert!(src.downloads.is_empty());
+}
+
+#[test]
+fn a_model_answer_keeps_the_core_s_mesh_behind_its_arc() {
+    let (mut src, sent) = source();
+    sent.borrow_mut().clear();
+    assert!(src.open_model(AttachmentId(21)));
+    let cmds: Vec<String> = sent.borrow().iter().map(|c| format!("{c:?}")).collect();
+    assert!(cmds[0].starts_with("OpenModel"), "{cmds:?}");
+    let mesh = std::sync::Arc::new(kourier_core::facade::ModelMesh {
+        positions: vec![0.0; 9],
+        colors: None,
+        min: [0.0; 3],
+        max: [1.0; 3],
+        triangles: 1,
+    });
+    let ch = src.on_event(&UiEvent::ModelOpened {
+        attachment: AttachmentId(21),
+        mesh: std::sync::Arc::clone(&mesh),
+    });
+    assert!(ch.media);
+    let ch = src.on_action_failed(
+        "OpenModel",
+        &CoreError::InvalidInput("not a model"),
+        &ActionSubject::Attachment(AttachmentId(22)),
+    );
+    assert!(ch.media);
+    let answers = src.take_models();
+    assert_eq!(answers.len(), 2);
+    match &answers[0] {
+        ModelAnswer::Opened(id, got) => {
+            assert_eq!(*id, AttachmentId(21));
+            assert!(std::sync::Arc::ptr_eq(got, &mesh), "no copy of the mesh");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        answers[1],
+        ModelAnswer::Failed(Some(AttachmentId(22)))
+    ));
+    assert!(src.take_models().is_empty());
+    assert!(
+        src.take_media().is_empty(),
+        "the media queue is not the models'"
+    );
+    assert!(!format!("{:?}", answers[0]).contains("0.0"), "counts only");
 }
 
 #[test]
