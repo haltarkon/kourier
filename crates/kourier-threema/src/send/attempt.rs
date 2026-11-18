@@ -359,6 +359,7 @@ fn body_of(kind: OutgoingKind) -> Option<NewBody> {
             body: Body::Text(text),
             reply_to: None,
             expiry: None,
+            forward: None,
         } if text.ranges.is_empty() => Some(NewBody::Text(text.body)),
         _ => None,
     }
@@ -844,12 +845,14 @@ mod tests {
             body: Body::text("synthetic"),
             reply_to: None,
             expiry: None,
+            forward: None,
         };
         assert_eq!(body_of(plain), Some(NewBody::Text("synthetic".to_owned())));
         let timed = OutgoingKind::Message {
             body: Body::text("synthetic"),
             reply_to: None,
             expiry: Some(Duration::from_secs(60)),
+            forward: None,
         };
         assert_eq!(body_of(timed), None, "a timer");
         let mut ranged = kourier_model::Text::plain("synthetic");
@@ -862,6 +865,7 @@ mod tests {
             body: Body::Text(ranged),
             reply_to: None,
             expiry: None,
+            forward: None,
         };
         assert_eq!(body_of(marked), None, "markup");
     }

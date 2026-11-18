@@ -162,6 +162,21 @@ Kirigami.ScrollablePage {
     property int menuAnnouncedPoliteness: -1
 
     signal openConversation(real id)
+    // The chooser of "Open Chat Beside" (the window's state `choosingBeside`): while it stands a banner
+    // names the chat it opens beside, and the banner's close button, Escape in the list or in the
+    // search field ask the window to end it.
+    property bool choosing: false
+    property string choosingName: ""
+    readonly property Item chooseBanner: chooseLoader.item
+    readonly property alias openBesideEntry: openBesideEntry
+    readonly property alias closeChatEntry: closeChatEntry
+    readonly property alias swapChatsEntry: swapChatsEntry
+    signal chooseCancelled()
+    // The row menu's "Open in Split View" for chat `id`.
+    signal openBesideAsked(real id)
+    // The row menu's and the hover button's "Close Chat" for chat `id`, and the menu's "Swap Chats".
+    signal closeChatAsked(real id)
+    signal swapChatsAsked
     // A hit of the message search was chosen: its chat opens at `message`, and the list stays
     // as it is (the search, its hits, the view).
     signal openSearchHit(real id, real message)
@@ -449,6 +464,11 @@ Kirigami.ScrollablePage {
         rowMenu.offer = offer;
         rowMenu.row = row;
         rowMenu.conversationId = row.conversationId;
+        // "Open in Split View": a chat is open and this one is shown in no pane.
+        rowMenu.beside = App.timeline.conversationId !== 0 && App.paneOf(row.conversationId) < 0;
+        // "Close Chat" / "Swap Chats": this chat is shown in a pane (the swap needs the split).
+        rowMenu.shownInPane = App.paneOf(row.conversationId) >= 0;
+        rowMenu.swappable = rowMenu.shownInPane && App.split;
         // Whatever line the menu shows (the sync switch's reason, or the pin limit's) a screen
         // reader hears too.
         if (rowMenu.line !== "") {
@@ -538,17 +558,49 @@ Kirigami.ScrollablePage {
     topPadding: 0
     bottomPadding: 0
 
-    Kirigami.ColumnView.minimumWidth: Kirigami.Units.gridUnit * 17
-    Kirigami.ColumnView.maximumWidth: Kirigami.Units.gridUnit * 24
-    Kirigami.ColumnView.preferredWidth: Kirigami.Units.gridUnit * 21
+    // The split's layout asks for the rail (`MainWindow.splitLayout`): the list narrowed to a column of avatars
+    // with their unread counts, a chat's name as its tooltip; no search field. A click opens a chat as ever.
+    property bool rail: false
+    readonly property real fullWidth: Kirigami.Units.gridUnit * 21
+    readonly property real railWidth: Kirigami.Units.gridUnit * 4
+    Kirigami.ColumnView.minimumWidth: page.rail ? page.railWidth : Kirigami.Units.gridUnit * 17
+    Kirigami.ColumnView.maximumWidth: page.rail ? page.railWidth : Kirigami.Units.gridUnit * 24
+    Kirigami.ColumnView.preferredWidth: page.rail ? page.railWidth : page.fullWidth
 
     header: QQC2.Control {
+        // (The rail has no room for the search, the banners and the account's notice.)
+        visible: !page.rail
         topPadding: Kirigami.Units.smallSpacing
         bottomPadding: Kirigami.Units.smallSpacing
         leftPadding: Kirigami.Units.largeSpacing
         rightPadding: Kirigami.Units.largeSpacing
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.smallSpacing
+
+            // The chooser of "Open Chat Beside": the next chat picked here opens beside the open one. The banner is
+            // made only while the chooser stands (the list page is made at the start, and an inline message with its
+            // action bar is no small item; `chooseBanner` is null otherwise).
+            Loader {
+                id: chooseLoader
+
+                active: page.choosing
+                visible: chooseLoader.active
+                Layout.fillWidth: true
+                sourceComponent: Kirigami.InlineMessage {
+                    objectName: "choose-banner"
+                    visible: true
+                    type: Kirigami.MessageType.Information
+                    text: L10n.i18nc("@info, %1 the open chat's name", "Choose a chat to open beside %1", Style.plain(Style.unmarked(page.choosingName)))
+                    actions: [
+                        Kirigami.Action {
+                            icon.name: "dialog-close"
+                            text: L10n.i18nc("@action:button", "Cancel")
+                            displayHint: Kirigami.DisplayHint.IconOnly
+                            onTriggered: page.chooseCancelled()
+                        }
+                    ]
+                }
+            }
 
             // What the archive is (the view has no search field).
             QQC2.Label {
@@ -687,6 +739,11 @@ Kirigami.ScrollablePage {
                     // without a query); with nothing to end it passes on as before. Backspace in an
                     // empty field takes the chip off.
                     Keys.onEscapePressed: event => {
+                        if (page.choosing) {
+                            page.chooseCancelled();
+                            event.accepted = true;
+                            return;
+                        }
                         event.accepted = page.endSearch();
                     }
                     Keys.onPressed: event => {
@@ -849,6 +906,11 @@ Kirigami.ScrollablePage {
         }
         // Esc and Alt+Left leave the archive view while the list has the keyboard.
         Keys.onEscapePressed: event => {
+            if (page.choosing) {
+                page.chooseCancelled();
+                event.accepted = true;
+                return;
+            }
             event.accepted = App.archiveShown;
             if (App.archiveShown) {
                 page.closeArchive();
@@ -888,15 +950,18 @@ Kirigami.ScrollablePage {
         // The way into the archive: the last row, its own stop of the keyboard (below). While a
         // search has hits, the footer holds them instead (the entry never shows with a query).
         header: page.chatsHeaderShown ? chatsHeaderComponent : null
-        footer: page.hitsShown ? hitsComponent : (page.entryShown ? archiveEntryComponent : null)
+        footer: page.rail ? null : (page.hitsShown ? hitsComponent : (page.entryShown ? archiveEntryComponent : null))
 
         delegate: ConversationDelegate {
             id: row
 
             width: ListView.view.width
+            rail: page.rail
             highlighted: App.conversations.currentId === conversationId
             onClicked: page.openConversation(conversationId)
             onMenuRequested: (x, y) => page.openMenu(row, x, y)
+            onBesideRequested: page.openBesideAsked(conversationId)
+            onCloseRequested: page.closeChatAsked(conversationId)
             Component.onCompleted: page.delegatesCreated += 1
         }
 
@@ -1202,7 +1267,8 @@ Kirigami.ScrollablePage {
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.maximumWidth: implicitWidth
-            implicitWidth: Math.ceil(chatsFull.advanceWidth + chatsTitleItem.lead)
+            // (The rail has no room for a title: none is shown, the sidebar beside it has its own buttons.)
+            implicitWidth: page.rail ? 0 : Math.ceil(chatsFull.advanceWidth + chatsTitleItem.lead)
             implicitHeight: Math.ceil(chatsHeadingText.implicitHeight)
 
             TextMetrics {
@@ -1213,6 +1279,7 @@ Kirigami.ScrollablePage {
             Kirigami.Heading {
                 id: chatsHeadingText
                 objectName: "chatsHeadingText"
+                visible: !page.rail
                 anchors.fill: parent
                 anchors.leftMargin: chatsTitleItem.lead
                 maximumLineCount: 1
@@ -1306,6 +1373,11 @@ Kirigami.ScrollablePage {
         property real conversationId: 0
         // `App.chatOffer` of that chat, when the menu opened.
         property var offer: ({})
+        // Whether "Open in Split View" is offered for that chat, when the menu opened.
+        property bool beside: false
+        // Whether the chat is shown in a pane, and whether the split is on too (when the menu opened).
+        property bool shownInPane: false
+        property bool swappable: false
         // The line under the entries: why they are grey, or why Pin is.
         readonly property string why: rowMenu.offer.why ? rowMenu.offer.why : ""
         readonly property string pinWhy: rowMenu.offer.pinWhy ? rowMenu.offer.pinWhy : ""
@@ -1341,6 +1413,43 @@ Kirigami.ScrollablePage {
             rowMenu.muteItem.enabled = Qt.binding(() => rowMenu.muteItem.visible);
             rowMenu.muteItem.height = Qt.binding(() => rowMenu.muteItem.visible ? rowMenu.muteItem.implicitHeight : 0);
             rowMenu.muteItem.icon.name = "player-volume-muted";
+        }
+
+        QQC2.MenuItem {
+            id: openBesideEntry
+
+            objectName: "rowOpenBeside"
+            // An action that does nothing is not shown: only with a chat open that this chat is not.
+            visible: rowMenu.beside
+            enabled: visible
+            height: visible ? implicitHeight : 0
+            icon.name: "view-split-left-right"
+            text: L10n.i18nc("@action:inmenu", "Open in Split View")
+            onTriggered: page.openBesideAsked(rowMenu.conversationId)
+        }
+
+        QQC2.MenuItem {
+            id: closeChatEntry
+
+            objectName: "rowCloseChat"
+            visible: rowMenu.shownInPane
+            enabled: visible
+            height: visible ? implicitHeight : 0
+            icon.name: "view-close"
+            text: L10n.i18nc("@action:inmenu", "Close Chat")
+            onTriggered: page.closeChatAsked(rowMenu.conversationId)
+        }
+
+        QQC2.MenuItem {
+            id: swapChatsEntry
+
+            objectName: "rowSwapChats"
+            visible: rowMenu.swappable
+            enabled: visible
+            height: visible ? implicitHeight : 0
+            icon.name: "exchange-positions"
+            text: L10n.i18nc("@action:inmenu", "Swap Chats")
+            onTriggered: page.swapChatsAsked()
         }
 
         QQC2.MenuItem {
@@ -1505,7 +1614,7 @@ Kirigami.ScrollablePage {
         }
 
         QQC2.MenuSeparator {
-            visible: markReadEntry.visible || rowMenu.offer.shown === true
+            visible: openBesideEntry.visible || closeChatEntry.visible || swapChatsEntry.visible || markReadEntry.visible || rowMenu.offer.shown === true
             height: visible ? implicitHeight : 0
         }
         QQC2.MenuItem {

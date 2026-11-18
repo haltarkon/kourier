@@ -125,11 +125,16 @@ Item {
     }
     Component {
         id: headerPageComponent
-        ChatPage {}
+        ChatPage {
+            chatModel: App.timeline
+            composerModel: App.composer
+        }
     }
     Component {
         id: detailsPanelComponent
-        DetailsPanel {}
+        DetailsPanel {
+            chatModel: App.timeline
+        }
     }
     // The "~" mark of a name a person chose for themself (WhatsApp, W6a2 PRIV-1) is part of the
     // shown string but never of what hashes, splits or speaks the name: the monogram's letters
@@ -588,7 +593,10 @@ Item {
 
     Component {
         id: messageComponent
-        MessageDelegate {}
+        MessageDelegate {
+            chatModel: App.timeline
+            composerModel: App.composer
+        }
     }
 
     // A message row with these blocks, as the timeline makes one.
@@ -619,6 +627,7 @@ Item {
             "expiry": "",
             "wait": "",
             "waitTimer": "",
+            "forwardMark": "",
             "selected": false
         });
     }

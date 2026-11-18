@@ -20,6 +20,10 @@ import app.kourier
 // shows more of the text first.
 Item {
     id: root
+    required property TimelineModel chatModel
+    required property ComposerController composerModel
+    // The pane of the timeline this row is in (its quote jumps within it).
+    property int pane: 0
 
     required property int index
     required property real messageId
@@ -52,8 +56,13 @@ Item {
     required property string waitTimer
     // The row is selected in the selection mode (the model's `selected` role, Rust's state).
     required property bool selected
+    // "", "forwarded" or "many": the message reached this chat as a forward (the core's answer, only
+    // where the network marks forwards).
+    required property string forwardMark
 
-    readonly property bool group: App.timeline.isGroup
+    // A group's rows keep a column for the sender's picture. The pane's chat kind, unless the user of the delegate
+    // sets it (the forward's picture look draws rows of a chat that need not be open).
+    property bool group: root.chatModel.isGroup
     // The row is laid out right to left (the window's layout direction, as anchors and
     // positioners get it): `x` is not mirrored by it, so what is placed by an explicit `x`
     // below goes by `atRight`, the side of the row the bubble leans on: the right for own
@@ -401,7 +410,7 @@ Item {
     }
 
     function reply(): void {
-        App.composer.replyTo(App.timeline.conversationId, root.messageId);
+        root.composerModel.replyTo(root.chatModel.conversationId, root.messageId);
     }
 
     // The other popups of this row, at its bubble (the toolbar and the chips open them at
@@ -461,7 +470,7 @@ Item {
 
     Accessible.role: Accessible.ListItem
     Accessible.name: (root.selected ? L10n.i18nc("@info accessible, said before a selected message", "Selected.") + " " : "") + (root.deleted ? L10n.i18nc("@info accessible, %1 author, %2 time", "%1, %2: deleted message", Style.unmarked(root.author), root.timeLabel) : L10n.i18nc("@info accessible, %1 author, %2 time, %3 text", "%1, %2: %3", Style.unmarked(root.author), root.timeLabel, root.copyText))
-    Accessible.selectable: App.timeline.selecting
+    Accessible.selectable: root.chatModel.selecting
     Accessible.selected: root.selected
     Accessible.description: (root.edited ? L10n.i18nc("@info accessible", "Edited.") + " " : "") + (root.failed ? L10n.i18nc("@info accessible", "Not sent.") + " " : "") + root.waitHint + root.expiry + (root.current && root.keyHint !== "" ? " " + root.keyHint : "")
     // Why the message has not left, without the seconds (a description that changes every
@@ -558,6 +567,33 @@ Item {
             return p.x >= left && p.x < left + w && p.y >= at.y && p.y < at.y + authorLabel.height;
         }
         return false;
+    }
+
+    // S5: whether a drag of this message to the other chat of a split can start at `p` (a point of the row):
+    // the message can be forwarded and `p` lies on its bubble, but not on its text (a press there selects text,
+    // also beside a short line) nor on a slider (a voice note's position). Asked by the timeline while the
+    // pointer hovers, so nothing per row is made for it.
+    function dragStartAt(p: point): bool {
+        if (root.actions.forward !== true || root.chatModel.selecting) {
+            return false;
+        }
+        let at = bubble.mapFromItem(root, p.x, p.y);
+        if (at.x < 0 || at.y < 0 || at.x >= bubble.width || at.y >= bubble.height) {
+            return false;
+        }
+        // Down to the deepest visible item under the point.
+        let item = bubble as Item;
+        for (;;) {
+            if ((item as TextEdit)?.selectByMouse === true || (item as QQC2.Slider) !== null) {
+                return false;
+            }
+            const child = item.childAt(at.x, at.y);
+            if (child === null) {
+                return true;
+            }
+            at = child.mapFromItem(item, at.x, at.y);
+            item = child;
+        }
     }
 
     Avatar {
@@ -660,6 +696,36 @@ Item {
                     }
                 }
 
+                // The forward mark: one small line above the text, below the sender's name.
+                Row {
+                    id: forwardLine
+                    objectName: "forwardMark"
+                    readonly property string words: root.forwardMark === "many" ? L10n.i18nc("@info a message forwarded through many chats", "Forwarded many times") : L10n.i18nc("@info a message that was forwarded to this chat", "Forwarded")
+                    visible: root.forwardMark !== "" && !root.deleted
+                    spacing: Kirigami.Units.smallSpacing
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: forwardLine.words
+                    onImplicitWidthChanged: root.measure()
+
+                    Kirigami.Icon {
+                        source: "mail-forward"
+                        width: Kirigami.Units.iconSizes.small
+                        height: Kirigami.Units.iconSizes.small
+                        color: root.subtleInk
+                        isMask: true
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    QQC2.Label {
+                        text: forwardLine.words
+                        textFormat: Text.PlainText
+                        color: root.subtleInk
+                        font: Kirigami.Theme.smallFont
+                        elide: Text.ElideRight
+                        width: Math.min(implicitWidth, content.width - Kirigami.Units.iconSizes.small - Kirigami.Units.smallSpacing)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+
                 // One delegate per block, KEPT while the blocks' content changes (a new picture
                 // revision when the core derived its thumbnail, download progress): the model is
                 // the number of blocks, and each delegate reads its own block. A model that is
@@ -713,6 +779,7 @@ Item {
                         Component {
                             id: quoteComponent
                             QuoteBlock {
+                                pane: root.pane
                                 block: blockLoader.block
                                 ink: root.inkColor
                                 surface: root.surface
@@ -1002,7 +1069,7 @@ Item {
         readonly property bool showPins: toolbar.pinCount > 0 && !toolbar.compact && toolbar.room >= toolbar.buttonSize * ((root.actions.saveAttachments ? 4 : 3) + toolbar.pinCount) + Kirigami.Units.smallSpacing * (root.actions.saveAttachments ? 3 : 2)
 
         // (Never empty, and not while selecting: a click there selects.)
-        visible: root.actions.any && !App.timeline.selecting && (hover.hovered || root.current || root.active)
+        visible: root.actions.any && !root.chatModel.selecting && (hover.hovered || root.current || root.active)
         y: Math.round(column.y + bubble.y + (bubble.height - height) / 2)
         x: Math.round(root.atRight ? column.x + column.width - bubble.width - width - Kirigami.Units.smallSpacing : column.x + bubble.width + Kirigami.Units.smallSpacing)
         spacing: 0

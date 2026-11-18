@@ -15,6 +15,8 @@ Rectangle {
     id: root
 
     required property var block
+    // The pane the quote is in: a jump (also by the keyboard or a screen reader) stays in it.
+    property int pane: 0
     required property color ink
     // The bubble the quote sits on.
     required property color surface
@@ -35,7 +37,7 @@ Rectangle {
 
     function activate(): void {
         if (root.reachable) {
-            App.jumpTo(root.block.target);
+            App.jumpToIn(root.pane, root.block.target);
         }
     }
 

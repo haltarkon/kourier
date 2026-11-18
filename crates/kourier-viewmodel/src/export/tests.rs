@@ -46,6 +46,7 @@ fn row(id: i64, author: Option<UserId>, body: Body) -> MessageRow {
         view_once: false,
         history: false,
         mentions_me: false,
+        forwarded: None,
         outbox: None,
         actions: MessageActions::default(),
     }

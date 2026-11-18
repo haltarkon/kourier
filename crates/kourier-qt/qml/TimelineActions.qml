@@ -26,6 +26,9 @@ QtObject {
     // A Ctrl+click is under way (from its press until just after its release): a link in a text
     // is not opened by it, it starts the selection mode. (`TimelineView`'s handler sets it.)
     property bool ctrlPress: false
+    // The window's one carrier of a drag of messages to the other chat of a split (S5,
+    // `MessageDragProxy`; null without a window): the timeline starts, moves and ends a drag on it.
+    property Item messageDrag: null
 
     // Open the context menu of `row` at (`x`, `y`) of `anchor` (a pointer position); with a
     // negative `x`, beside `anchor` instead, so the message stays in view (the Menu key).

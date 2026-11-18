@@ -218,6 +218,7 @@ msgid "Open"
 msgstr "Відкрити"
 
 #: crates/kourier-qt/qml/MainWindow.qml
+#: crates/kourier-qt/qml/components/ForwardStrip.qml
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #: crates/kourier-qt/qml/components/TimerPart.qml
 #: crates/kourier-qt/qml/composer/SelectionBar.qml
@@ -228,9 +229,11 @@ msgstr "Відкрити"
 #: crates/kourier-qt/qml/dialogs/ExportDialog.qml
 #: crates/kourier-qt/qml/dialogs/FilterDialog.qml
 #: crates/kourier-qt/qml/dialogs/FolderQuestionDialog.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
 #: crates/kourier-qt/qml/dialogs/MuteUntilDialog.qml
 #: crates/kourier-qt/qml/dialogs/ShareContactDialog.qml
 #: crates/kourier-qt/qml/dialogs/TimerDialog.qml
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #: crates/kourier-qt/qml/pages/LinkAccountPage.qml
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #: crates/kourier-viewmodel/src/account_actions.rs
@@ -239,6 +242,36 @@ msgstr "Відкрити"
 msgctxt "@action:button"
 msgid "Cancel"
 msgstr "Скасувати"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status dragged messages were dropped on the other chat, %1 its name"
+msgid "These messages cannot be forwarded to %1."
+msgstr "Ці повідомлення не можна переслати до %1."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info:status a dragged message was dropped on the other chat, %1 its name"
+msgid "This message cannot be forwarded to %1."
+msgstr "Це повідомлення не можна переслати до %1."
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@title:dialog"
+msgid "Files Not Available"
+msgstr "Файли недоступні"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@info"
+msgid "Some files are no longer available. Send without them?"
+msgstr "Деякі файли більше недоступні. Надіслати без них?"
+
+#: crates/kourier-qt/qml/MainWindow.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Send Without Them"
+msgstr "Надіслати без них"
 
 #: crates/kourier-qt/qml/MainWindow.qml
 #, kde-format
@@ -448,6 +481,19 @@ msgid "Pinned"
 msgstr "Закріплено"
 
 #: crates/kourier-qt/qml/components/ConversationDelegate.qml
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Close Chat"
+msgstr "Закрити чат"
+
+#: crates/kourier-qt/qml/components/ConversationDelegate.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Open in Split View"
+msgstr "Відкрити в розділеному вигляді"
+
+#: crates/kourier-qt/qml/components/ConversationDelegate.qml
 #: crates/kourier-qt/qml/components/SearchResultDelegate.qml
 #, kde-format
 msgctxt "@item:intext, %1 who wrote the message that the row shows"
@@ -533,6 +579,18 @@ msgstr "Підготовка експорту…"
 msgctxt "@action:button"
 msgid "Cancel Export"
 msgstr "Скасувати експорт"
+
+#: crates/kourier-qt/qml/components/ForwardStrip.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Forward progress"
+msgstr "Хід пересилання"
+
+#: crates/kourier-qt/qml/components/ForwardStrip.qml
+#, kde-format
+msgctxt "@info:status, %1 files here, %2 files needed"
+msgid "Forwarding: downloading %1 of %2 files…"
+msgstr "Пересилання: завантажено %1 з %2 файлів…"
 
 #: crates/kourier-qt/qml/components/GroupPage.qml
 #, kde-format
@@ -721,6 +779,15 @@ msgctxt "@info:placeholder nothing in a group's members matches the search"
 msgid "No members match."
 msgstr "Жоден учасник не відповідає пошуку."
 
+#: crates/kourier-qt/qml/components/MessageDragProxy.qml
+#, kde-format
+msgctxt "@info:status the card beside the pointer while messages are dragged to the other chat"
+msgid "Forward %1 message"
+msgid_plural "Forward %1 messages"
+msgstr[0] "Переслати %1 повідомлення"
+msgstr[1] "Переслати %1 повідомлення"
+msgstr[2] "Переслати %1 повідомлень"
+
 #: crates/kourier-qt/qml/components/PersonPage.qml
 #, kde-format
 msgctxt "@info:status toast after a contact card was handed to the core, %1 the chat's name"
@@ -875,6 +942,7 @@ msgid "Cancel Reply"
 msgstr "Скасувати відповідь"
 
 #: crates/kourier-qt/qml/composer/Composer.qml
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
 #, kde-format
 msgctxt "@info:tooltip"
 msgid "%1 (Esc)"
@@ -1197,6 +1265,79 @@ msgctxt "@action:inmenu"
 msgid "Remove from Favorites"
 msgstr "Вилучити з обраного"
 
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#, kde-format
+msgctxt "@info accessible"
+msgid "Forward"
+msgstr "Переслати"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#, kde-format
+msgctxt "@info, %1 how many messages are forwarded, %2 the chat they come from"
+msgid "Forwarding %1 message from %2"
+msgid_plural "Forwarding %1 messages from %2"
+msgstr[0] "Пересилання %1 повідомлення з %2"
+msgstr[1] "Пересилання %1 повідомлень з %2"
+msgstr[2] "Пересилання %1 повідомлень з %2"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@label:listbox the look of a message forwarded to another account"
+msgid "Look:"
+msgstr "Вигляд:"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox forward look"
+msgid "As picture"
+msgstr "Як зображення"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox forward look"
+msgid "Forwarded header"
+msgstr "Заголовок «Переслано»"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox forward look"
+msgid "Header + quoted body"
+msgstr "Заголовок і цитований текст"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@item:inlistbox forward look"
+msgid "Plain copy"
+msgstr "Проста копія"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@label:listbox accessible"
+msgid "Look of the forwarded messages"
+msgstr "Вигляд пересланих повідомлень"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#, kde-format
+msgctxt "@info:status"
+msgid "Sending the forward…"
+msgstr "Надсилання пересланого…"
+
+#: crates/kourier-qt/qml/composer/ForwardCard.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Cancel Forward"
+msgstr "Скасувати пересилання"
+
 #: crates/kourier-qt/qml/composer/SelectionBar.qml
 #, kde-format
 msgctxt "@info accessible"
@@ -1223,6 +1364,18 @@ msgstr "Копіювати як текст"
 msgctxt "@info:tooltip"
 msgid "Select at least one message to copy."
 msgstr "Виберіть хоча б одне повідомлення, щоб скопіювати."
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Forward…"
+msgstr "Переслати…"
+
+#: crates/kourier-qt/qml/composer/SelectionBar.qml
+#, kde-format
+msgctxt "@info:tooltip"
+msgid "Select at least one message to forward."
+msgstr "Виберіть хоча б одне повідомлення, щоб переслати."
 
 #: crates/kourier-qt/qml/composer/SelectionBar.qml
 #, kde-format
@@ -1652,6 +1805,48 @@ msgstr "Свій колір…"
 msgctxt "@info:whatsthis accessible"
 msgid "Custom color"
 msgstr "Свій колір"
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Forward"
+msgstr "Переслати"
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info:placeholder the search field of the chats a message can be forwarded to"
+msgid "Search chats…"
+msgstr "Пошук чатів…"
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info:accessible the chats a message can be forwarded to"
+msgid "Chats"
+msgstr "Чати"
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info:placeholder no chat can take a forwarded message"
+msgid "No chat can take a message."
+msgstr "Жоден чат не може прийняти повідомлення."
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info:placeholder nothing in the chats a message can be forwarded to matches the search"
+msgid "No chats match."
+msgstr "Немає відповідних чатів."
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info"
+msgid "Chats of the same account get the network's own forward"
+msgstr "Чати того самого облікового запису отримують власне пересилання мережі"
+
+#: crates/kourier-qt/qml/dialogs/ForwardDialog.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Add a comment…"
+msgstr "Додати коментар…"
 
 #: crates/kourier-qt/qml/dialogs/ImageViewer.qml
 #, kde-format
@@ -2318,8 +2513,32 @@ msgstr "Таймер тимчасових повідомлень: %1"
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #, kde-format
 msgctxt "@action:button"
+msgid "Show Other Chat"
+msgstr "Показати інший чат"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@info:tooltip, %1 the other chat's name"
+msgid "Show %1"
+msgstr "Показати %1"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:button"
 msgid "Disappearing Messages"
 msgstr "Тимчасові повідомлення"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Open Chat Beside"
+msgstr "Відкрити чат поруч"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:button"
+msgid "Swap Chats"
+msgstr "Поміняти чати місцями"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #, kde-format
@@ -2332,6 +2551,12 @@ msgstr "Пошук у чаті"
 msgctxt "@info:tooltip, %1 a keyboard shortcut"
 msgid "Search in Chat (%1)"
 msgstr "Пошук у чаті (%1)"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Close Split View"
+msgstr "Закрити розділений вигляд"
 
 #: crates/kourier-qt/qml/pages/ChatPage.qml
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
@@ -2461,6 +2686,18 @@ msgctxt "@info:placeholder"
 msgid "Drop files to attach them"
 msgstr "Перетягніть файли сюди, щоб прикріпити їх"
 
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Drop the message to forward it to this chat"
+msgstr "Відпустіть повідомлення, щоб переслати його в цей чат"
+
+#: crates/kourier-qt/qml/pages/ChatPage.qml
+#, kde-format
+msgctxt "@info:placeholder"
+msgid "Drop the messages to forward them to this chat"
+msgstr "Відпустіть повідомлення, щоб переслати їх у цей чат"
+
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, javascript-format, kde-format
 msgctxt "@item:intext, %1 a percentage number"
@@ -2481,6 +2718,12 @@ msgid_plural "%1 messages found"
 msgstr[0] "Знайдено %1 повідомлення"
 msgstr[1] "Знайдено %1 повідомлення"
 msgstr[2] "Знайдено %1 повідомлень"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@info, %1 the open chat's name"
+msgid "Choose a chat to open beside %1"
+msgstr "Виберіть чат, щоб відкрити його поруч із чатом «%1»"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -2706,6 +2949,24 @@ msgstr "Назад до чатів"
 msgctxt "@info:tooltip"
 msgid "Back to Chats"
 msgstr "Назад до чатів"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Open in Split View"
+msgstr "Відкрити в розділеному вигляді"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Close Chat"
+msgstr "Закрити чат"
+
+#: crates/kourier-qt/qml/pages/ConversationListPage.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Swap Chats"
+msgstr "Поміняти чати місцями"
 
 #: crates/kourier-qt/qml/pages/ConversationListPage.qml
 #, kde-format
@@ -3221,6 +3482,24 @@ msgstr "Фільтр «%1» перестане сповіщати й виділ�
 #: crates/kourier-qt/qml/settings/SettingsPage.qml
 #, kde-format
 msgctxt "@title:group"
+msgid "Chats"
+msgstr "Чати"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@label:listbox"
+msgid "Forward to another account as"
+msgstr "Пересилати до іншого облікового запису як"
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@info"
+msgid "How a forwarded message looks in a chat of another account or network. Chats of the same account get the network's own forward."
+msgstr "Як виглядає переслане повідомлення в чаті іншого облікового запису чи мережі. Чати того самого облікового запису отримують власне пересилання мережі."
+
+#: crates/kourier-qt/qml/settings/SettingsPage.qml
+#, kde-format
+msgctxt "@title:group"
 msgid "Privacy"
 msgstr "Конфіденційність"
 
@@ -3491,6 +3770,18 @@ msgstr "Enter: %1."
 
 #: crates/kourier-qt/qml/timeline/MessageDelegate.qml
 #, kde-format
+msgctxt "@info a message that was forwarded to this chat"
+msgid "Forwarded"
+msgstr "Переслано"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#, kde-format
+msgctxt "@info a message forwarded through many chats"
+msgid "Forwarded many times"
+msgstr "Переслано багато разів"
+
+#: crates/kourier-qt/qml/timeline/MessageDelegate.qml
+#, kde-format
 msgctxt "@info message was edited"
 msgid "edited"
 msgstr "змінено"
@@ -3612,6 +3903,12 @@ msgstr "Відповісти"
 msgctxt "@action:inmenu"
 msgid "Edit"
 msgstr "Редагувати"
+
+#: crates/kourier-qt/qml/timeline/MessageMenu.qml
+#, kde-format
+msgctxt "@action:inmenu"
+msgid "Forward…"
+msgstr "Переслати…"
 
 #: crates/kourier-qt/qml/timeline/MessageMenu.qml
 #, kde-format
@@ -4710,6 +5007,7 @@ msgid "Already sent"
 msgstr "Уже надіслано"
 
 #: crates/kourier-viewmodel/src/core_source.rs
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
 #: crates/kourier-viewmodel/src/names.rs
 #: crates/kourier-viewmodel/src/preview.rs
 #: crates/kourier-viewmodel/src/timeline.rs
@@ -4795,6 +5093,37 @@ msgstr "Експорт скасовано. Нічого не збережено.
 msgctxt "@info:status"
 msgid "The export could not be started."
 msgstr "Не вдалося почати експорт."
+
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
+#, kde-format
+msgctxt "@item:intext a chat that is not listed"
+msgid "Unknown chat"
+msgstr "Невідомий чат"
+
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Could not read the messages to forward."
+msgstr "Не вдалося прочитати повідомлення для пересилання."
+
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "None of the messages can be forwarded."
+msgstr "Жодне з повідомлень не можна переслати."
+
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
+#, kde-format
+msgctxt "@info:status"
+msgid "Could not start the forward."
+msgstr "Не вдалося почати пересилання."
+
+#: crates/kourier-viewmodel/src/core_source/forwarding.rs
+#: crates/kourier-viewmodel/src/timeline.rs
+#, kde-format
+msgctxt "@item:intext the author of a message, yourself"
+msgid "You"
+msgstr "Ви"
 
 #: crates/kourier-viewmodel/src/emoji/mod.rs
 #, kde-format
@@ -5649,6 +5978,274 @@ msgstr "Цей шаблон задовгий."
 msgctxt "@info:status"
 msgid "This filter does not exist any more."
 msgstr "Цього фільтра більше не існує."
+
+#. TRANSLATORS: %1 is the name of the person who wrote the forwarded message, %2 the date and time it was sent.
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info forwarded message header"
+msgid "Forwarded from %1 · %2"
+msgstr "Переслано від %1 · %2"
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "This chat is no longer there."
+msgstr "Цього чату вже немає."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "The account of this chat is not linked."
+msgstr "Акаунт цього чату не зв'язано."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "This network is turned off."
+msgstr "Цю мережу вимкнено."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "Too many chats for one forward."
+msgstr "Забагато чатів для одного пересилання."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "None of the messages can be forwarded."
+msgstr "Жодне з повідомлень не можна переслати."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "The messages changed since you chose them."
+msgstr "Повідомлення змінилися після того, як ви їх вибрали."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "A file of the messages is not on this computer."
+msgstr "Файла з цих повідомлень немає на цьому комп’ютері."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status why a forward target is refused"
+msgid "Kourier could not prepare the forward."
+msgstr "Kourier не зміг підготувати пересилання."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages"
+msgid "%1 view-once message is not forwarded."
+msgid_plural "%1 view-once messages are not forwarded."
+msgstr[0] "%1 одноразове повідомлення не пересилається."
+msgstr[1] "%1 одноразові повідомлення не пересилаються."
+msgstr[2] "%1 одноразових повідомлень не пересилаються."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many lines"
+msgid "%1 notice or call line is left out."
+msgid_plural "%1 notices and call lines are left out."
+msgstr[0] "%1 службовий рядок або виклик пропущено."
+msgstr[1] "%1 службові рядки або виклики пропущено."
+msgstr[2] "%1 службових рядків або викликів пропущено."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages"
+msgid "%1 deleted message is left out."
+msgid_plural "%1 deleted messages are left out."
+msgstr[0] "%1 видалене повідомлення пропущено."
+msgstr[1] "%1 видалені повідомлення пропущено."
+msgstr[2] "%1 видалених повідомлень пропущено."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages"
+msgid "%1 message is no longer available."
+msgid_plural "%1 messages are no longer available."
+msgstr[0] "%1 повідомлення більше недоступне."
+msgstr[1] "%1 повідомлення більше недоступні."
+msgstr[2] "%1 повідомлень більше недоступні."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages"
+msgid "%1 message is in a chat that does not allow forwarding."
+msgid_plural "%1 messages are in a chat that does not allow forwarding."
+msgstr[0] "%1 повідомлення з чату, що забороняє пересилання."
+msgstr[1] "%1 повідомлення з чату, що забороняє пересилання."
+msgstr[2] "%1 повідомлень з чату, що забороняє пересилання."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many messages"
+msgid "%1 long message is not fully loaded yet."
+msgid_plural "%1 long messages are not fully loaded yet."
+msgstr[0] "%1 довге повідомлення ще не завантажено повністю."
+msgstr[1] "%1 довгі повідомлення ще не завантажено повністю."
+msgstr[2] "%1 довгих повідомлень ще не завантажено повністю."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many formatting marks"
+msgid "%1 formatting mark the chat cannot show is dropped."
+msgid_plural "%1 formatting marks the chat cannot show are dropped."
+msgstr[0] "%1 позначку форматування, яку чат не показує, відкинуто."
+msgstr[1] "%1 позначки форматування, які чат не показує, відкинуто."
+msgstr[2] "%1 позначок форматування, які чат не показує, відкинуто."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many mentions"
+msgid "%1 mention becomes plain text."
+msgid_plural "%1 mentions become plain text."
+msgstr[0] "%1 згадка стане звичайним текстом."
+msgstr[1] "%1 згадки стануть звичайним текстом."
+msgstr[2] "%1 згадок стануть звичайним текстом."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many links"
+msgid "%1 link becomes text with its address."
+msgid_plural "%1 links become text with their addresses."
+msgstr[0] "%1 посилання стане текстом з адресою."
+msgstr[1] "%1 посилання стануть текстом з адресами."
+msgstr[2] "%1 посилань стануть текстом з адресами."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many files"
+msgid "%1 file is sent as a plain file."
+msgid_plural "%1 files are sent as plain files."
+msgstr[0] "%1 файл буде надіслано як звичайний файл."
+msgstr[1] "%1 файли буде надіслано як звичайні файли."
+msgstr[2] "%1 файлів буде надіслано як звичайні файли."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many files"
+msgid "%1 file is too large and is left out."
+msgid_plural "%1 files are too large and are left out."
+msgstr[0] "%1 файл завеликий і його пропущено."
+msgstr[1] "%1 файли завеликі й їх пропущено."
+msgstr[2] "%1 файлів завеликі й їх пропущено."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many files"
+msgid "%1 file is not accepted and is left out."
+msgid_plural "%1 files are not accepted and are left out."
+msgstr[0] "%1 файл не приймається і його пропущено."
+msgstr[1] "%1 файли не приймаються і їх пропущено."
+msgstr[2] "%1 файлів не приймаються і їх пропущено."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many stickers"
+msgid "%1 sticker is sent as a picture."
+msgid_plural "%1 stickers are sent as pictures."
+msgstr[0] "%1 стікер буде надіслано як зображення."
+msgstr[1] "%1 стікери буде надіслано як зображення."
+msgstr[2] "%1 стікерів буде надіслано як зображення."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many contact cards"
+msgid "%1 contact card is sent as text."
+msgid_plural "%1 contact cards are sent as text."
+msgstr[0] "%1 картку контакту буде надіслано текстом."
+msgstr[1] "%1 картки контактів буде надіслано текстом."
+msgstr[2] "%1 карток контактів буде надіслано текстом."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many locations"
+msgid "%1 location is sent as text with a map link."
+msgid_plural "%1 locations are sent as text with map links."
+msgstr[0] "%1 місце буде надіслано текстом з посиланням на карту."
+msgstr[1] "%1 місця буде надіслано текстом з посиланням на карту."
+msgstr[2] "%1 місць буде надіслано текстом з посиланням на карту."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many polls"
+msgid "%1 poll is sent as text, without votes."
+msgid_plural "%1 polls are sent as text, without votes."
+msgstr[0] "%1 опитування буде надіслано текстом, без голосів."
+msgstr[1] "%1 опитування буде надіслано текстом, без голосів."
+msgstr[2] "%1 опитувань буде надіслано текстом, без голосів."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many replies"
+msgid "%1 reply is sent without its quote."
+msgid_plural "%1 replies are sent without their quotes."
+msgstr[0] "%1 відповідь буде надіслано без цитати."
+msgstr[1] "%1 відповіді буде надіслано без цитат."
+msgstr[2] "%1 відповідей буде надіслано без цитат."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@title:window"
+msgid "Forward Message"
+msgid_plural "Forward %1 Messages"
+msgstr[0] "Переслати %1 повідомлення"
+msgstr[1] "Переслати %1 повідомлення"
+msgstr[2] "Переслати %1 повідомлень"
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 a line of changes, %2 the chats it applies to"
+msgid "%1 in %2."
+msgstr "%1 у %2."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the network's name"
+msgid "%1 forwards to one chat at a time."
+msgstr "%1 пересилає лише в один чат за раз."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the network's name, %2 how many chats"
+msgid "%1 forwards to at most %2 chats at once."
+msgstr "%1 пересилає щонайбільше в %2 чатів за раз."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the network's name"
+msgid "%1 sends a message forwarded many times to one chat at a time."
+msgstr "%1 надсилає багаторазово переслане повідомлення лише в один чат за раз."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the network's name, %2 how many chats"
+msgid "%1 sends a message forwarded many times to at most %2 chats at once."
+msgstr "%1 надсилає багаторазово переслане повідомлення щонайбільше в %2 чатів за раз."
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the title of the chat"
+msgid "Forwarded to %1"
+msgstr "Переслано в %1"
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 how many chats"
+msgid "Forwarded to %1 chat"
+msgid_plural "Forwarded to %1 chats"
+msgstr[0] "Переслано в %1 чат"
+msgstr[1] "Переслано в %1 чати"
+msgstr[2] "Переслано в %1 чатів"
+
+#: crates/kourier-viewmodel/src/forward.rs
+#, kde-format
+msgctxt "@info:status, %1 the title of the chat, %2 why"
+msgid "Not forwarded to %1: %2"
+msgstr "Не переслано в %1: %2"
 
 #: crates/kourier-viewmodel/src/group.rs
 #, kde-format
@@ -8617,12 +9214,6 @@ msgstr "Не надіслано: код безпеки з %1 змінився"
 
 #: crates/kourier-viewmodel/src/timeline.rs
 #, kde-format
-msgctxt "@item:intext the author of a message, yourself"
-msgid "You"
-msgstr "Ви"
-
-#: crates/kourier-viewmodel/src/timeline.rs
-#, kde-format
 msgctxt "@info:preview attachment type"
 msgid "3D model"
 msgstr "3D-модель"
@@ -9028,6 +9619,15 @@ msgstr "Повідомлення і вкладення зберігаються 
 #: packaging/app.kourier.Kourier.metainfo.xml
 msgid "The Kourier developers"
 msgstr "Розробники Kourier"
+
+#, kde-format
+#~ msgctxt "@label:listbox the look of the forwarded messages"
+#~ msgid "Look:"
+#~ msgstr "Вигляд:"
+
+#~ msgctxt "@action:button"
+#~ msgid "Open Beside"
+#~ msgstr "Відкрити поруч"
 
 #, fuzzy, kde-format
 #~| msgctxt "@item:inmenu account color"

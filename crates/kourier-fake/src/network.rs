@@ -616,6 +616,7 @@ mod tests {
                     body: Body::text(text),
                     reply_to: None,
                     expiry: None,
+                    forward: None,
                 },
                 only: None,
                 is_recipient_update: false,

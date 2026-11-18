@@ -89,6 +89,7 @@ fn message(body: Body) -> OutgoingKind {
         body,
         reply_to: None,
         expiry: None,
+        forward: None,
     }
 }
 
@@ -336,6 +337,7 @@ fn a_text_is_a_conversation_unless_something_sits_beside_it() {
             body: Body::text("synthetic timed"),
             reply_to: None,
             expiry: Some(Duration::from_secs(86_400)),
+            forward: None,
         },
     )
     .expect("built");
@@ -460,6 +462,7 @@ fn every_built_message_maps_back_to_the_same_target_and_body() {
             body: Body::Text(text.clone()),
             reply_to: None,
             expiry,
+            forward: None,
         };
         let BackendEvent::Message(event) = mapped_back(&conv, &built(&conv, kind).expect(case))
         else {
@@ -499,6 +502,7 @@ fn every_built_message_maps_back_to_the_same_target_and_body() {
             body: Body::text("synthetic answer"),
             reply_to: Some(quote),
             expiry: None,
+            forward: None,
         };
         let BackendEvent::Message(event) = mapped_back(&conv, &built(&conv, kind).expect(case))
         else {
@@ -1050,6 +1054,7 @@ fn a_number_is_never_written_into_a_group_that_hides_numbers() {
         body: Body::Text(text),
         reply_to,
         expiry: None,
+        forward: None,
     };
     for mode in [Some(Namespace::Lid), None] {
         // The mention of an unmapped number: left out.
@@ -1321,6 +1326,7 @@ fn a_file_message_carries_one_file_with_its_caption_quote_and_mentions() {
             snapshot: None,
         }),
         expiry: Some(Duration::from_secs(86_400)),
+        forward: None,
     };
     let sent = built_file(&group(), picture.clone(), Some(&sent_picture())).expect("a picture");
     assert_eq!(
@@ -1384,6 +1390,7 @@ fn a_file_message_carries_one_file_with_its_caption_quote_and_mentions() {
             snapshot: None,
         }),
         expiry: None,
+        forward: None,
     };
     let sent = built_file(&group(), document, Some(&sent_document(true))).expect("a document");
     assert!(sent.message.document_message.as_option().is_none());
@@ -1489,6 +1496,7 @@ fn every_file_shape_carries_the_chats_timer_where_the_receiver_reads_it() {
             },
             reply_to: None,
             expiry: Some(timer),
+            forward: None,
         };
         let sent = built_file(&dm(), kind, Some(&pointer)).expect(case);
         let wrapped = sent
@@ -1737,6 +1745,7 @@ fn file_kind(
         },
         reply_to: quote,
         expiry: None,
+        forward: None,
     }
 }
 
@@ -1818,6 +1827,7 @@ fn the_checks_before_the_file_work_are_the_builds_own() {
                 body: Body::text("synthetic hello"),
                 reply_to: None,
                 expiry: None,
+                forward: None,
             }
         ),
         Ok(super::FileCheck { captioned: false })
@@ -1906,4 +1916,158 @@ fn the_timer_setting_is_the_protocol_message_the_receive_map_reads_back() {
             Body::System(SystemEvent::TimerChanged { timer: t, .. }) if *t == timer
         ));
     }
+}
+
+fn forwarded_message(body: Body, score: u32) -> OutgoingKind {
+    OutgoingKind::Message {
+        body,
+        reply_to: None,
+        expiry: None,
+        forward: Some(kourier_model::Forwarded { score }),
+    }
+}
+
+#[test]
+fn the_forwarding_score_is_the_count_below_five_and_127_from_five_up() {
+    for (score, wire) in [(0, 0), (4, 4), (5, 127), (128, 127)] {
+        assert_eq!(super::forwarding_score(score), wire, "score {score}");
+    }
+}
+
+#[test]
+fn a_forwarded_text_is_an_extended_text_with_the_mark_and_a_plain_text_stays_a_conversation() {
+    let plain = built(
+        &dm(),
+        message(Body::Text(Text::plain("synthetic forward body"))),
+    )
+    .expect("built");
+    assert_eq!(
+        plain.message.conversation.as_deref(),
+        Some("synthetic forward body")
+    );
+    for (score, wire) in [(0, 0), (4, 4), (5, 127), (128, 127)] {
+        let sent = built(
+            &dm(),
+            forwarded_message(Body::Text(Text::plain("synthetic forward body")), score),
+        )
+        .expect("built");
+        assert!(
+            sent.message.conversation.is_none(),
+            "a bare conversation cannot carry the mark"
+        );
+        let m = sent
+            .message
+            .extended_text_message
+            .as_option()
+            .expect("extendedTextMessage");
+        assert_eq!(m.text.as_deref(), Some("synthetic forward body"));
+        let info = m.context_info.as_option().expect("a context info");
+        assert_eq!(info.is_forwarded, Some(true));
+        assert_eq!(info.forwarding_score, Some(wire));
+        assert!(info.stanza_id.is_none(), "a forward has no quote");
+        // Our phone's receive map reads the same state back.
+        let BackendEvent::Message(event) = mapped_back(&dm(), &sent) else {
+            panic!("a message comes back");
+        };
+        assert_eq!(
+            event.forwarded,
+            Some(kourier_model::Forwarded { score: wire })
+        );
+    }
+}
+
+#[test]
+fn a_forwarded_picture_and_captioned_document_carry_the_mark_in_the_files_context_beside_mentions()
+{
+    let member = user("lid", MEMBER_LID);
+    let caption = ranged(
+        &format!("synthetic {MENTION_PLACEHOLDER} look"),
+        &[(10, 3, RangeKind::Mention(member))],
+    );
+    let picture = forwarded_message(
+        Body::Media {
+            attachments: vec![own_file(AttachmentKind::Image, "image/png", None)],
+            caption: Some(caption.clone()),
+        },
+        7,
+    );
+    let sent = built_file(&group(), picture, Some(&sent_picture())).expect("a picture");
+    let info = sent
+        .message
+        .image_message
+        .as_option()
+        .expect("image")
+        .context_info
+        .as_option()
+        .expect("context");
+    assert_eq!(info.is_forwarded, Some(true));
+    assert_eq!(info.forwarding_score, Some(127));
+    assert_eq!(info.mentioned_jid, vec![format!("{MEMBER_LID}@lid")]);
+
+    let document = forwarded_message(
+        Body::Media {
+            attachments: vec![own_file(
+                AttachmentKind::File,
+                "application/pdf",
+                Some("synthetic-report-83019274.pdf"),
+            )],
+            caption: Some(caption),
+        },
+        2,
+    );
+    let sent = built_file(&group(), document, Some(&sent_document(true))).expect("a document");
+    let info = wrapped_document(&sent.message)
+        .expect("wrapper")
+        .context_info
+        .as_option()
+        .expect("inner context");
+    assert_eq!(info.is_forwarded, Some(true));
+    assert_eq!(info.forwarding_score, Some(2));
+    assert_eq!(info.mentioned_jid, vec![format!("{MEMBER_LID}@lid")]);
+
+    // No caption and no mention: the mark alone still makes the context info.
+    let bare = forwarded_message(
+        Body::Media {
+            attachments: vec![own_file(AttachmentKind::Image, "image/png", None)],
+            caption: None,
+        },
+        0,
+    );
+    let sent = built_file(&dm(), bare, Some(&sent_picture())).expect("a picture");
+    let info = sent
+        .message
+        .image_message
+        .as_option()
+        .expect("image")
+        .context_info
+        .as_option()
+        .expect("context");
+    assert_eq!(
+        (info.is_forwarded, info.forwarding_score),
+        (Some(true), Some(0))
+    );
+}
+
+#[test]
+fn a_new_file_message_is_written_from_the_pointer_it_is_given_never_the_attachments_remote() {
+    let attachment = picture();
+    let remote = attachment
+        .remote
+        .clone()
+        .expect("the received picture has a remote");
+    let kind = forwarded_message(
+        Body::Media {
+            attachments: vec![attachment],
+            caption: None,
+        },
+        0,
+    );
+    let sent = built_file(&dm(), kind, Some(&sent_picture())).expect("a picture");
+    let m = sent.message.image_message.as_option().expect("image");
+    assert_eq!(
+        m.direct_path.as_deref(),
+        Some("/v/t62.7118-24/synthetic-sent-40918273")
+    );
+    let again = MediaPointer::from_blob(&remote).expect("a pointer");
+    assert_ne!(m.direct_path.as_deref(), Some(again.direct_path.as_str()));
 }

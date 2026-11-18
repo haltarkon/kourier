@@ -168,6 +168,8 @@ pub struct PastedFiles {
     cache: Option<MediaCache>,
     /// Directories made by [`PastedFiles::save`] (one per file, so the file keeps its name).
     dirs: Mutex<Vec<PathBuf>>,
+    /// The folder of each forward job's slice pictures (forward line F7), by request.
+    pictures: Mutex<std::collections::HashMap<u64, PathBuf>>,
 }
 
 impl std::fmt::Debug for PastedFiles {
@@ -205,6 +207,7 @@ impl PastedFiles {
         Self {
             cache,
             dirs: Mutex::new(Vec::new()),
+            pictures: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -244,6 +247,44 @@ impl PastedFiles {
         Ok(path)
     }
 
+    /// A new private (0700) folder in the tmpfs media cache for the slice pictures of forward job
+    /// `request` (F7); the same folder again for the same request. Blocking (one `mkdir`).
+    pub fn picture_dir(&self, request: u64) -> Result<PathBuf, MediaError> {
+        let cache = self.cache.as_ref().ok_or(MediaError::NoCache)?;
+        let mut folders = self.pictures.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(dir) = folders.get(&request) {
+            return Ok(dir.clone());
+        }
+        let mut random = [0u8; 12];
+        rand::rng().fill_bytes(&mut random);
+        let dir = cache.dir().join(format!(
+            "fwd-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        folders.insert(request, dir.clone());
+        Ok(dir)
+    }
+
+    /// Deletes the folder of forward job `request`'s slice pictures; `false` when it has none.
+    pub fn release_pictures(&self, request: u64) -> bool {
+        let dir = self
+            .pictures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&request);
+        let Some(dir) = dir else {
+            return false;
+        };
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(error = %e, "removing a forward picture folder failed");
+        }
+        true
+    }
+
     /// Whether `path` is a file [`save`](Self::save) made.
     pub fn owns(&self, path: &Path) -> bool {
         let Some(parent) = path.parent() else {
@@ -276,6 +317,10 @@ impl PastedFiles {
     /// Deletes every pasted file (exit).
     pub fn clear(&self) {
         self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.pictures
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
@@ -361,6 +406,28 @@ mod tests {
             assert_eq!(handles.url(&account, &escape), None, "{bad}");
         }
         assert!(!format!("{handles:?}").contains("avatar"));
+    }
+
+    #[test]
+    fn a_forward_picture_folder_is_private_per_request_and_goes_on_release() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pasted = PastedFiles::new(&dir.path().join("media"));
+        let a = pasted.picture_dir(7).unwrap();
+        assert_eq!(pasted.picture_dir(7).unwrap(), a);
+        let b = pasted.picture_dir(8).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(
+            std::fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::write(a.join("01.png"), b"x").unwrap();
+        assert!(pasted.release_pictures(7));
+        assert!(!a.exists());
+        assert!(b.exists());
+        assert!(!pasted.release_pictures(7));
+        pasted.clear();
+        assert!(!b.exists());
     }
 
     #[test]

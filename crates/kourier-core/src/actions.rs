@@ -670,6 +670,9 @@ pub(crate) fn all(f: &Facts<'_>, now: i64) -> MessageActions {
         delete_for_me: delete(f, false, now).is_ok(),
         delete_attachment: delete_attachment(f).is_ok(),
         copy: copy(f),
+        // Needs the row's view-once flag and the chat's `no_forward`: the timeline query sets it
+        // ([`may_forward`]).
+        forward: false,
         take_back,
         cancel_sending: cancel_sending(f, take_back),
         // Needs the attachments' rows: the timeline query sets it ([`ask_attachments`]).
@@ -849,6 +852,70 @@ pub(crate) fn media_of(
         has_caption: caption.as_ref().is_some_and(|c| !c.body.trim().is_empty()),
         files: attachments.iter().filter(|a| !a.long_text).count(),
     })
+}
+
+/// What forwarding does with one message ([`crate::facade::PlannedForward::verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForwardVerdict {
+    /// The message goes.
+    Goes,
+    /// View-once: never forwarded.
+    ViewOnce,
+    /// A system notice, a call line, a placeholder or an unsupported content: no content of a
+    /// sender to forward.
+    Notice,
+    /// A tombstone.
+    Deleted,
+    /// The chat forbids forwarding out of it (`ConversationFeatures::no_forward`).
+    Protected,
+    /// The text is only the beginning: the rest of a long text has not been fetched yet.
+    Incomplete,
+    /// Asked for, but not visible (deleted for me, hidden by its timer, another chat, unknown).
+    Gone,
+}
+
+/// THE rule of forwarding a message ([`may_forward`] is its yes/no): what the plan states per
+/// message and the flag [`MessageActions::forward`] states on the row. `features` `None` (the
+/// backend stated none) does not forbid forwarding out.
+pub(crate) fn forward_verdict(
+    body: &kourier_model::Body,
+    deleted: Option<&str>,
+    view_once: bool,
+    expiry_hidden: bool,
+    features: Option<&ConversationFeatures>,
+) -> ForwardVerdict {
+    use kourier_model::Body;
+    if expiry_hidden {
+        return ForwardVerdict::Gone;
+    }
+    if deleted.is_some() {
+        return ForwardVerdict::Deleted;
+    }
+    let long_pending = match body {
+        Body::Media { attachments, .. } => attachments.iter().any(|a| a.long_text),
+        _ => false,
+    };
+    match body {
+        Body::System(_) | Body::Placeholder(_) | Body::Unsupported { .. } => ForwardVerdict::Notice,
+        _ if view_once => ForwardVerdict::ViewOnce,
+        _ if features.is_some_and(|x| x.no_forward) => ForwardVerdict::Protected,
+        _ if long_pending => ForwardVerdict::Incomplete,
+        _ => ForwardVerdict::Goes,
+    }
+}
+
+/// Whether the message may be forwarded ([`MessageActions::forward`]): a text, media, sticker,
+/// contact, location or poll that is not deleted, not view-once, not hidden by its timer, not
+/// waiting for the rest of a long text, in a chat whose features do not say `no_forward`. An own
+/// message that still waits or failed may be forwarded: its content is ours.
+pub(crate) fn may_forward(
+    body: &kourier_model::Body,
+    deleted: Option<&str>,
+    view_once: bool,
+    expiry_hidden: bool,
+    features: Option<&ConversationFeatures>,
+) -> bool {
+    forward_verdict(body, deleted, view_once, expiry_hidden, features) == ForwardVerdict::Goes
 }
 
 /// Whether a body has text to copy.
@@ -1884,5 +1951,77 @@ mod tests {
         assert_eq!(export_verdict(None, true, false, true), Out(ViewOnce));
         assert_eq!(export_verdict(None, false, false, true), NeedsTick);
         assert_eq!(export_verdict(None, false, false, false), Included);
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use kourier_model::{Body, ContactCard, Location, Placeholder, Poll, SystemEvent, Text};
+
+    fn goes(body: &Body, deleted: Option<&str>, once: bool, hidden: bool, nf: bool) -> bool {
+        let f = ConversationFeatures {
+            no_forward: nf,
+            ..Default::default()
+        };
+        may_forward(body, deleted, once, hidden, Some(&f))
+    }
+
+    #[test]
+    fn the_kinds_that_go_and_the_ones_that_do_not() {
+        let yes = [
+            Body::text("a"),
+            Body::Media {
+                attachments: Vec::new(),
+                caption: None,
+            },
+            Body::Contact(ContactCard::default()),
+            Body::Location(Location::default()),
+            Body::Poll(Poll::default()),
+        ];
+        for b in &yes {
+            assert!(goes(b, None, false, false, false), "{b:?}");
+        }
+        let no = [
+            Body::Placeholder(Placeholder::Expired),
+            Body::Unsupported {
+                kind_hint: "x".into(),
+                summary: None,
+            },
+            Body::System(SystemEvent::MembersAdded {
+                by: None,
+                users: Vec::new(),
+            }),
+        ];
+        for b in &no {
+            assert!(!goes(b, None, false, false, false), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn the_states_that_stop_a_forward() {
+        let b = Body::Text(Text::plain("a"));
+        assert!(!goes(&b, Some("ForEveryone"), false, false, false));
+        assert!(!goes(&b, None, true, false, false));
+        assert!(!goes(&b, None, false, true, false));
+        assert!(!goes(&b, None, false, false, true));
+        assert!(may_forward(&b, None, false, false, None));
+        assert_eq!(
+            forward_verdict(&b, None, true, false, None),
+            ForwardVerdict::ViewOnce
+        );
+        assert_eq!(
+            forward_verdict(
+                &b,
+                None,
+                false,
+                false,
+                Some(&ConversationFeatures {
+                    no_forward: true,
+                    ..Default::default()
+                })
+            ),
+            ForwardVerdict::Protected
+        );
     }
 }

@@ -868,7 +868,33 @@ impl IngestHarness {
 
     /// A timeline page, as the facade answers it (action flags at the harness clock).
     pub fn timeline(&self, q: &TimelineQuery) -> Result<TimelinePage> {
-        query::timeline(&self.conn, q, self.now, true, &Default::default(), None)
+        query::timeline(
+            &self.conn,
+            q,
+            self.now,
+            true,
+            &Default::default(),
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::timeline`] for a network that states these forward rules
+    /// (`NetworkDescriptor::forwards`; the runtime reads them from the account's network).
+    pub fn timeline_with_forwards(
+        &self,
+        q: &TimelineQuery,
+        forwards: Option<kourier_model::ForwardRules>,
+    ) -> Result<TimelinePage> {
+        query::timeline(
+            &self.conn,
+            q,
+            self.now,
+            true,
+            &Default::default(),
+            None,
+            forwards,
+        )
     }
 
     /// The catch-up summary's read, as the facade answers `Query::CaughtUpMessages`.
@@ -893,6 +919,7 @@ impl IngestHarness {
             self.now,
             true,
             &Default::default(),
+            None,
             None,
         )
     }

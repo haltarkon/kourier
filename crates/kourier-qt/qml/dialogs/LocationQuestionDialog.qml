@@ -29,13 +29,14 @@ import app.kourier
 // key before it is open, no release whose press it did not see, and no auto-repeat (a held
 // key would click a button again and again; qml.md "A held key and a QQC2.Button").
 //
-// Everything it says comes from `App.composer.locationQuestion`; the dialog only shows it.
+// Everything it says comes from `composerModel.locationQuestion`; the dialog only shows it.
 // File names are text from outside: every label is plain text.
 Kirigami.Dialog {
     id: root
+    required property ComposerController composerModel
 
-    readonly property var question: App.composer.locationQuestion
-    readonly property bool asking: App.composer.locationAsking
+    readonly property var question: root.composerModel.locationQuestion
+    readonly property bool asking: root.composerModel.locationAsking
     readonly property color quiet: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
     // What the dialog says, as one text (screen readers read it with the focused control).
     readonly property string body: root.say("accessible")

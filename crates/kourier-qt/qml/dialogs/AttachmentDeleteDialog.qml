@@ -9,9 +9,10 @@ import app.kourier
 // "Delete this attachment?": one picture or file of a message is removed for this account, the
 // message and its other attachments stay. A message with several asks which one. The question
 // says what happens elsewhere: the account's other devices follow where the network has a
-// message for that (`App.timeline.deletesSync`), other people always keep their copies.
+// message for that (`chatModel.deletesSync`), other people always keep their copies.
 Kirigami.PromptDialog {
     id: root
+    required property TimelineModel chatModel
 
     // The message (`TimelineActions` row description; its `attachments` are listed).
     property var row: null
@@ -21,7 +22,7 @@ Kirigami.PromptDialog {
     readonly property var attachments: root.row && root.row.attachments ? root.row.attachments : []
     readonly property bool several: root.attachments.length > 1
     readonly property real attachment: root.chosen >= 0 && root.chosen < root.attachments.length ? root.attachments[root.chosen].attachment : 0
-    readonly property bool sync: App.timeline.deletesSync
+    readonly property bool sync: root.chatModel.deletesSync
 
     title: root.several ? L10n.i18nc("@title:dialog", "Delete an Attachment?") : L10n.i18nc("@title:dialog", "Delete Attachment?")
     subtitle: root.sync ? L10n.i18nc("@info", "It is removed from this message here and on your other devices. The message stays, and the other people in the chat keep their copies.") : L10n.i18nc("@info", "It is removed from this message on this device only. The message stays; your other devices and the other people in the chat keep their copies.")

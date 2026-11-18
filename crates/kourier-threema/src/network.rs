@@ -85,6 +85,7 @@ impl ThreemaNetwork {
                 receipts_always_sent: false,
                 // The clients count what is unread and check the deletes (KT-2).
                 server: ServerRules::default(),
+                forwards: None,
             },
         }
     }

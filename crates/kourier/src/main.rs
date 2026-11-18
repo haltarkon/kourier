@@ -31,7 +31,7 @@ folder|folderfiles|folderzip|expiry|readmore|about|calls|unavailable|transferwai
 transferdownload|transferread|transferupdate|transferbanner|transferfailed|transferask|\
 networks|appearance|filters|filteredit|highlight|regexsearch|warisk|waqr|waphone|wacode|thqr|themoji|tgwarn|tgqr|tgcode|tgpassword|wahistory|waban|\
 walock|waoff|wafailed|walost|uploading|uploadfile|archive|person|group|groupadmin|chatmedia|safety|safetychanged|share|timerpending|save|location|\
-locationmany|locationnever|accounts|accountsdrawer|rowmenu|rowmenuoff|rowmenumuted|mutemenu|muteuntil|chatmenu|chatmenuoff|searchresults|searchchat|searchindexing|emojipicker|emojisearch|hoverpins|model3d|model3dviewer|select|exportdialog|exportdone>] \
+locationmany|locationnever|accounts|accountsdrawer|rowmenu|rowmenuoff|rowmenumuted|mutemenu|muteuntil|chatmenu|chatmenuoff|searchresults|searchchat|searchindexing|emojipicker|emojisearch|hoverpins|model3d|model3dviewer|select|exportdialog|exportdone|forward|forwardcard|split|splitnarrow|splitpick>] \
 [--fixture-transfer=<walk|declined|wait|download|read|link-again|update-app|corrupt|too-large|\
 download-failed|internal>] [--fixture-send=<slow|keys|members|retry|uploading>] \
 [--fixture-network=<fake|whatsapp|threema|telegram>] [--screenshot=<png>] \
@@ -348,7 +348,7 @@ fn page_whatsapp(page: Option<&str>) -> Option<FixtureWhatsApp> {
 /// WhatsApp, `FixtureOptions::accounts`). Every other page has the one account.
 fn page_accounts(page: Option<&str>) -> u8 {
     match page {
-        Some("accounts" | "accountsdrawer") => 3,
+        Some("accounts" | "accountsdrawer" | "forward" | "forwardcard") => 3,
         _ => 0,
     }
 }
@@ -717,7 +717,10 @@ mod tests {
             let Launch::Fixture(f) = start_options(&a).expect("options").launch else {
                 panic!("{page}: not a fixture run");
             };
-            let blended = matches!(page, "accounts" | "accountsdrawer");
+            let blended = matches!(
+                page,
+                "accounts" | "accountsdrawer" | "forward" | "forwardcard"
+            );
             assert_eq!(f.accounts, if blended { 3 } else { 0 }, "{page}");
             if blended {
                 assert!(!f.link && f.network == FixtureNetwork::Fake, "{page}");
@@ -759,6 +762,10 @@ mod tests {
         "start_edit",
         "edit_last",
         "cancel_edit",
+        "stage_forward",
+        "forward_of",
+        "set_forward_look",
+        "drop_forward",
     ];
 
     /// The calls of the application object that make or re-stamp an own message without the

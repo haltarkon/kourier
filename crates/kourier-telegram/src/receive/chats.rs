@@ -48,8 +48,8 @@ use std::time::Duration;
 
 use kourier_backend_api::BackendEvent;
 use kourier_model::{
-    BackendBlob, ContactPatch, ConvKey, ConversationFeatures, ConversationPatch, HistorySource,
-    Identifier, IdentifierKind, Patch, UserId, Window,
+    BackendBlob, CannotSend, ContactPatch, ConvKey, ConversationFeatures, ConversationPatch,
+    HistorySource, Identifier, IdentifierKind, Patch, UserId, Window,
 };
 
 use super::{Fetch, Out};
@@ -167,7 +167,7 @@ fn scope_of(chat: &Chat) -> NotificationScope {
 /// among them), received deletes have no window yet (they are parked until KT-2, G-8), read
 /// receipts and typing are always on (his TG6). The send side (formatting, files, the edit and
 /// delete windows) is T5's.
-pub(crate) fn features() -> ConversationFeatures {
+pub(crate) fn features(protected: bool) -> ConversationFeatures {
     ConversationFeatures {
         edit_receive: Some(Window {
             max_age_secs: None,
@@ -177,6 +177,10 @@ pub(crate) fn features() -> ConversationFeatures {
         read_receipts: true,
         typing: true,
         history: HistorySource::OnDemand,
+        // Telegram does not send yet (T5): this keeps every send UI off its chats.
+        cannot_send: Some(CannotSend::NotYetBuilt),
+        // Protected content forbids forwarding out of the chat.
+        no_forward: protected,
         ..ConversationFeatures::default()
     }
 }
@@ -996,7 +1000,7 @@ impl Chats {
             "protected": chat.has_protected_content,
             "restricted": self.restricted(chat),
         })));
-        patch.features = Some(features());
+        patch.features = Some(features(chat.has_protected_content));
         Some(patch)
     }
 

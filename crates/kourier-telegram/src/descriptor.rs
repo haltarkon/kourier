@@ -79,5 +79,11 @@ pub(crate) fn descriptor() -> NetworkDescriptor {
         // online status, and no setting turns them off; a UI says so in its privacy settings.
         receipts_always_sent: true,
         server: kourier_model::ServerRules::default(),
+        // Telegram has no forward limit and no "many" state; its forwards show the mark.
+        forwards: Some(kourier_model::ForwardRules {
+            max_chats: None,
+            many_from: u32::MAX,
+            many_max_chats: u16::MAX,
+        }),
     }
 }

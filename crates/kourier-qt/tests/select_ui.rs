@@ -234,6 +234,8 @@ Window {
     }
 
     TimelineView {
+        chatModel: App.timeline
+        composerModel: App.composer
         id: view
         anchors.left: parent.left
         anchors.right: parent.right
@@ -242,6 +244,8 @@ Window {
         onComposerRequested: composerItem.focusInput()
     }
     Composer {
+        chatModel: App.timeline
+        composerModel: App.composer
         id: composerItem
         anchors.left: parent.left
         anchors.right: parent.right

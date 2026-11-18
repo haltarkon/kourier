@@ -254,6 +254,7 @@ impl World {
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         })
     }
 
@@ -283,6 +284,7 @@ impl World {
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         })
     }
 

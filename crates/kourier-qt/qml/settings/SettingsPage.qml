@@ -645,6 +645,20 @@ FormCard.FormCardPage {
     }
 
     FormCard.FormHeader {
+        title: L10n.i18nc("@title:group", "Chats")
+    }
+    Card {
+        FormCard.FormComboBoxDelegate {
+            objectName: "forwardLook"
+            text: L10n.i18nc("@label:listbox", "Forward to another account as")
+            description: L10n.i18nc("@info", "How a forwarded message looks in a chat of another account or network. Chats of the same account get the network's own forward.")
+            model: [L10n.i18nc("@item:inlistbox forward look", "Plain copy"), L10n.i18nc("@item:inlistbox forward look", "Forwarded header"), L10n.i18nc("@item:inlistbox forward look", "Header + quoted body"), L10n.i18nc("@item:inlistbox forward look", "As picture")]
+            currentIndex: App.settings.forwardLook
+            onActivated: index => App.settings.forwardLook = index
+        }
+    }
+
+    FormCard.FormHeader {
         title: L10n.i18nc("@title:group", "Privacy")
     }
     Card {

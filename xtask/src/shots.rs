@@ -84,11 +84,13 @@ const MAX_DIFFERING_PIXELS: usize = 24;
 /// these pages are compared with the looser [`PICTURE_PAGE_ONE_IN`]; a change of their text or
 /// layout smaller than that is not seen. (The lead decides, after three full runs without a
 /// re-render of a picture page, whether they get the strict limit: stable-screenshots.md step 8.)
-const SHOT_PAGES_WITH_PICTURES: [&str; 34] = [
+const SHOT_PAGES_WITH_PICTURES: [&str; 38] = [
     "media",
     "select",
     "exportdialog",
     "exportdone",
+    "forward",
+    "forwardcard",
     "viewer",
     "viewerzoom",
     "files",
@@ -124,6 +126,9 @@ const SHOT_PAGES_WITH_PICTURES: [&str; 34] = [
     "uploadfile",
     // The level of all media of a chat: a grid of its pictures (people pages P4).
     "chatmedia",
+    // Two ordinary chats side by side (the right one holds a photo).
+    "split",
+    "splitnarrow",
 ];
 
 /// A page with pictures differs when more than one pixel in this many differs (0.15 %).

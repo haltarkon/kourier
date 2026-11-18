@@ -1092,6 +1092,48 @@ pub trait UiSource {
     fn is_open(&self, _id: ConversationId) -> bool {
         true
     }
+    /// Split view: opens `id` in the second pane and makes that pane the active one (no split
+    /// yet: the split starts; with one: pane 1 takes the chat; a chat a pane shows already just
+    /// activates that pane). A source without a split does nothing.
+    fn open_side(&mut self, _id: ConversationId) -> Changes {
+        Changes::default()
+    }
+    /// Split view: closes pane `pane` (0 left, 1 right). Closing the pane in hand moves the
+    /// other pane's chat into the single pane 0; without a split it closes the open chat.
+    fn close_pane(&mut self, _pane: u8) -> Changes {
+        self.open_conversation(None)
+    }
+    /// Split view: makes pane `pane` the active one ([`Changes::pane`]).
+    fn activate_pane(&mut self, _pane: u8) -> Changes {
+        Changes::default()
+    }
+    /// Split view: the two chats exchange places; the active chat stays the active one
+    /// ([`Changes::pane`]). Nothing without a split.
+    fn swap_sides(&mut self) -> Changes {
+        Changes::default()
+    }
+    /// The active pane (0 left, 1 right).
+    fn active_pane(&self) -> u8 {
+        0
+    }
+    /// Whether the split is on (two panes).
+    fn side_open(&self) -> bool {
+        false
+    }
+    /// The pane that shows `id`.
+    fn pane_of(&self, id: ConversationId) -> Option<u8> {
+        self.is_open(id).then_some(0)
+    }
+    /// Lends the getters and the paging calls to pane `pane` until [`UiSource::end_visit`]
+    /// (no mark-read, no presence meanwhile). No effect for the pane in hand or without a split.
+    fn visit_pane(&mut self, _pane: u8) {}
+    /// Ends a visit ([`UiSource::visit_pane`]).
+    fn end_visit(&mut self) {}
+    /// The front-end says whether the pane that is not active is on screen (a window too
+    /// narrow for two chats hides it): the notification rule counts it only while shown.
+    fn set_side_shown(&mut self, _shown: bool) -> Changes {
+        Changes::default()
+    }
     /// Takes one core event (§8.5).
     fn on_event(&mut self, _event: &UiEvent) -> Changes {
         Changes::default()
@@ -1164,6 +1206,93 @@ pub trait UiSource {
     }
     /// What the export flow has to tell, in order.
     fn take_export(&mut self) -> Vec<crate::export::flow::ExportUpdate> {
+        Vec::new()
+    }
+
+    /// Forward, the dialog: opens it for the messages `messages` of `source`. The view arrives
+    /// through [`UiSource::take_forward`] as [`crate::forward::ForwardUpdate::Dialog`].
+    fn forward_open(&mut self, _source: ConversationId, _messages: Vec<MessageId>) -> Changes {
+        Changes::default()
+    }
+    /// Every chat of the list as a forward target, before
+    /// [`crate::forward::listed_forward_targets`] narrows them.
+    fn forward_targets(&self) -> Vec<crate::forward::ForwardTarget> {
+        Vec::new()
+    }
+    /// The dialog's ticked chats changed: the plan is asked again (the newest ticks win).
+    fn forward_tick(&mut self, _targets: Vec<ConversationId>) -> Changes {
+        Changes::default()
+    }
+    /// The dialog's Forward: starts a job and returns its request id; `None` when the forward
+    /// may not go.
+    fn forward_send(
+        &mut self,
+        _look: kourier_core::facade::ForwardLook,
+        _comment: &str,
+    ) -> Option<u64> {
+        None
+    }
+    /// The dialog closed without Forward.
+    fn forward_abandon(&mut self) {}
+    /// The answer to [`crate::forward::ForwardUpdate::AskWithout`]: `send` goes on without the
+    /// files the network no longer has, else the job ends.
+    fn forward_without(&mut self, _request: u64, _send: bool) -> Changes {
+        Changes::default()
+    }
+    /// Cancel of a running forward job (downloads it asked stay).
+    fn forward_cancel(&mut self, _request: u64) -> Changes {
+        Changes::default()
+    }
+    /// The rows the picture look of job `request` draws (F7): the going messages as the open
+    /// timeline builds its rows, newest first (empty: none).
+    fn forward_render_rows(&self, _request: u64) -> Vec<MessageRow> {
+        Vec::new()
+    }
+    /// The pictures the front end rendered for
+    /// [`crate::forward::ForwardUpdate::RenderPictures`] (empty: none could be made).
+    fn forward_pictures(&mut self, _request: u64, _paths: Vec<std::path::PathBuf>) -> Changes {
+        Changes::default()
+    }
+    /// THE CONTRACT with the split-view line: stages a forward of `messages` of `source` into
+    /// `target`'s composer. `false` when the chat cannot take it or none of the messages may be
+    /// forwarded. One staged forward per target; a new one replaces the old.
+    fn stage_forward(
+        &mut self,
+        _target: ConversationId,
+        _source: ConversationId,
+        _messages: Vec<MessageId>,
+    ) -> bool {
+        false
+    }
+    /// The staged forward of `conv`, for the composer's card.
+    fn forward_of(&self, _conv: ConversationId) -> Option<crate::forward::StagedForward> {
+        None
+    }
+    /// Changes the staged forward's look.
+    fn set_forward_look(
+        &mut self,
+        _conv: ConversationId,
+        _look: kourier_core::facade::ForwardLook,
+    ) -> bool {
+        false
+    }
+    /// Drops the staged forward (and cancels its job).
+    fn drop_forward(&mut self, _conv: ConversationId) -> bool {
+        false
+    }
+    /// Sends the staged forward with `comment` (the composer's text): a job with that one
+    /// target; the stage stays, waiting, until the job ends.
+    fn send_staged_forward(&mut self, _conv: ConversationId, _comment: &str) -> bool {
+        false
+    }
+    /// The Settings default look (from the `forward-look` pref).
+    fn set_forward_default(&mut self, _look: kourier_core::facade::ForwardLook) {}
+    /// The look a new forward starts with (`Header` until set).
+    fn forward_default(&self) -> kourier_core::facade::ForwardLook {
+        kourier_core::facade::ForwardLook::Header
+    }
+    /// What the forward flow tells the window.
+    fn take_forward(&mut self) -> Vec<crate::forward::ForwardUpdate> {
         Vec::new()
     }
     /// Loads the page before the oldest loaded row; `false` when there is none.

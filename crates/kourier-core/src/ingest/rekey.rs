@@ -846,6 +846,7 @@ mod tests {
                 body: kourier_model::Body::text("hello"),
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
             only: None,
             is_recipient_update: false,

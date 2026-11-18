@@ -14,6 +14,7 @@ import app.kourier
 // core changes the line (a ring becomes a missed call), so everything here follows `tone`.
 Item {
     id: root
+    required property TimelineModel chatModel
 
     required property int index
     required property real messageId
@@ -73,7 +74,7 @@ Item {
 
     Accessible.role: Accessible.ListItem
     Accessible.name: (root.selected ? L10n.i18nc("@info accessible, said before a selected message", "Selected.") + " " : "") + root.text + ", " + root.timeLabel
-    Accessible.selectable: App.timeline.selecting
+    Accessible.selectable: root.chatModel.selecting
     Accessible.selected: root.selected
 
     TapHandler {

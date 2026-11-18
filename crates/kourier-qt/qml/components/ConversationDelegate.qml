@@ -42,10 +42,15 @@ Delegates.RoundedItemDelegate {
     readonly property bool hasUnread: root.unread > 0 || root.markedUnread
     readonly property bool isDraft: root.previewSource === "draft"
     readonly property bool compact: App.settings.compact
+    // The split's rail (`ConversationListPage.rail`): only the avatar, with the unread count on it.
+    property bool rail: false
 
     // The row's context menu was asked for, at (`x`, `y`) of the row (the page owns the menu;
     // the keyboard's Menu key reaches it through the list).
     signal menuRequested(real x, real y)
+    // The hover button's two meanings: open this chat beside the open one, or close it (it is shown in a pane).
+    signal besideRequested
+    signal closeRequested
 
     // What the row's text stands on: the page, or the row's own tint while it is the open
     // chat (RoundedItemDelegate tints the background with the accent by 0.3). The quiet and
@@ -95,6 +100,10 @@ Delegates.RoundedItemDelegate {
         return parts.join(". ");
     }
     Accessible.selected: root.highlighted
+    // The rail's row has no words: the chat's name is its tooltip (the accessible name is the same).
+    QQC2.ToolTip.visible: root.rail && root.hovered
+    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+    QQC2.ToolTip.text: root.rail ? Style.plain(root.title) : ""
     Accessible.onPressAction: root.clicked()
     // The list holds the keyboard for all its rows (one tab stop; see the page).
     focusPolicy: Qt.NoFocus
@@ -109,6 +118,63 @@ Delegates.RoundedItemDelegate {
         id: longPress
         acceptedDevices: PointerDevice.TouchScreen | PointerDevice.Stylus
         onLongPressed: root.menuRequested(longPress.point.position.x, longPress.point.position.y)
+    }
+
+    // The hover button (split view): ONE `Loader`, active only while the row is hovered, a chat is open and the
+    // list is not the rail (rows are made many times: no item per row otherwise). The row stays `hovered` while the
+    // pointer is on the button (Qt keeps the hover of a hovered item's ancestors), so `active` does not read the
+    // button's own `hovered` (that would bind `active` to the item it makes). The click is the button's own
+    // (the press goes to the topmost item, so the row is not clicked); the button never takes the keyboard (the
+    // row menu is the keyboard's way). The pane test is read while the button shows and follows the panes.
+    Loader {
+        id: hoverButton
+
+        active: !root.rail && root.hovered && App.timeline.conversationId !== 0
+        anchors.right: parent.right
+        anchors.rightMargin: Kirigami.Units.smallSpacing
+        anchors.verticalCenter: parent.verticalCenter
+        sourceComponent: QQC2.ToolButton {
+            id: button
+
+            // The panes' chats and the split are what this reads: `paneOf` has no change signal.
+            readonly property int pane: {
+                App.split;
+                App.activePane;
+                App.timeline.conversationId;
+                App.sideTimeline.conversationId;
+                return App.paneOf(root.conversationId);
+            }
+            readonly property bool closes: button.pane >= 0
+
+            objectName: "rowHoverButton"
+            flat: true
+            display: QQC2.AbstractButton.IconOnly
+            focusPolicy: Qt.NoFocus
+            icon.name: button.closes ? "view-close" : "view-split-left-right"
+            text: button.closes ? L10n.i18nc("@action:button", "Close Chat") : L10n.i18nc("@action:button", "Open in Split View")
+            Accessible.name: button.text
+            QQC2.ToolTip.visible: button.hovered
+            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+            QQC2.ToolTip.text: button.text
+            // (A plain fill under the icon: the button lies over the time and the pills.) Its size does not hang on
+            // the icon: without the theme's icon the button was its padding alone (12 px), and a scroll bar laid over
+            // the row's end took the click.
+            background: Rectangle {
+                implicitWidth: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing * 2
+                implicitHeight: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing * 2
+                radius: Kirigami.Units.smallSpacing
+                color: button.down ? Kirigami.ColorUtils.tintWithAlpha(root.surface, Kirigami.Theme.highlightColor, 0.3) : root.surface
+                border.width: 1
+                border.color: Style.frame(root.surface, Kirigami.Theme.textColor, Kirigami.Theme.frameContrast)
+            }
+            onClicked: {
+                if (button.closes) {
+                    root.closeRequested();
+                } else {
+                    root.besideRequested();
+                }
+            }
+        }
     }
 
     // The row the keyboard is on (the list is one tab stop and holds the focus itself); and
@@ -132,12 +198,31 @@ Delegates.RoundedItemDelegate {
             badge: root.badgeIcon
             badgeNumber: root.badgeNumber
             selfChat: root.isSelf
-            Layout.alignment: Qt.AlignVCenter
+            Layout.alignment: Qt.AlignVCenter | Qt.AlignHCenter
             Layout.preferredWidth: root.compact ? Style.compactAvatarSize : Style.listAvatarSize
             Layout.preferredHeight: root.compact ? Style.compactAvatarSize : Style.listAvatarSize
+            // (In the rail the avatar's cell takes the row's width and the avatar stands in its middle.)
+            Layout.maximumWidth: root.compact ? Style.compactAvatarSize : Style.listAvatarSize
+            Layout.fillWidth: root.rail
+
+            // The unread count of the rail on the avatar's top end corner: one `Loader`, active only in the
+            // rail and with news (a row of the full list makes no item for it).
+            Loader {
+                active: root.rail && root.hasUnread
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.rightMargin: -Kirigami.Units.smallSpacing
+                anchors.topMargin: -Kirigami.Units.smallSpacing
+                sourceComponent: UnreadPill {
+                    count: root.unread
+                    muted: root.muted
+                    dot: root.unread === 0
+                }
+            }
         }
 
         ColumnLayout {
+            visible: !root.rail
             spacing: Kirigami.Units.smallSpacing / 2
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter

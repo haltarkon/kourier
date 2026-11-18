@@ -182,6 +182,7 @@ fn request(to: &To) -> OutgoingRequest {
             body: Body::text(TEXT),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,

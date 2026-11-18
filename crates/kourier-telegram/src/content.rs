@@ -277,6 +277,8 @@ pub(crate) struct Mapped {
     pub(crate) restricted: bool,
     pub(crate) expiry: Option<Expiry>,
     pub(crate) meta: Option<BackendBlob>,
+    /// The message carries `forward_info`: a forward (Telegram counts none, so the score is 0).
+    pub(crate) forwarded: Option<kourier_model::Forwarded>,
     /// The row is said by one of our own devices whatever its sender: a call line the peer may not
     /// say (an incoming call answered or declined elsewhere). See [`origin`].
     pub(crate) own: bool,
@@ -481,6 +483,10 @@ pub(crate) fn message(msg: &Message, me: Me<'_>, now_ms: i64) -> Mapped {
         view_once,
         restricted,
         expiry,
+        forwarded: msg
+            .forward_info
+            .as_ref()
+            .map(|_| kourier_model::Forwarded { score: 0 }),
         own,
     }
 }

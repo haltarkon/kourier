@@ -6,16 +6,30 @@ import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import app.kourier
 
-// ONE instance; App.timeline switches conversations (§8.3).
+// ONE instance; chatModel switches conversations (§8.3).
 Kirigami.Page {
     id: page
+    required property TimelineModel chatModel
+    required property ComposerController composerModel
+    // Which pane this page is (0: the first chat, 1: the one beside it) and whether it is the active one.
+    property int pane: 0
+    property bool active: true
+    // Split view layout (the window sets them, `MainWindow.splitLayout`): both chats stand side by side
+    // (`beside`; the first one has the width `columnWidth` and a divider to drag), or the split shows this chat
+    // alone (`single`: the header offers the other one), and the other chat's name for that button.
+    property bool beside: false
+    property real columnWidth: 0
+    property bool single: false
+    property string otherName: ""
+    // The divider ended a drag: the first column's width.
+    signal dividerReleased(real width)
 
-    readonly property bool open: App.timeline.conversationId !== 0
+    readonly property bool open: page.chatModel.conversationId !== 0
     // The conversation has a disappearing-message timer, or offers one to set.
-    readonly property bool hasTimer: App.timeline.timerSecs > 0
-    readonly property bool timerOffered: App.timeline.timerOptions.length > 0
+    readonly property bool hasTimer: page.chatModel.timerSecs > 0
+    readonly property bool timerOffered: page.chatModel.timerOptions.length > 0
     // The conversation takes timers besides the ones its menu lists.
-    readonly property bool timerCustom: App.timeline.timerCustomMax > 0
+    readonly property bool timerCustom: page.chatModel.timerCustomMax > 0
 
     // ---- the details panel (people pages P1; architecture §8.3) ----
     // The panel is made when it is first opened (a `Loader`), stands on the page's trailing edge
@@ -41,9 +55,9 @@ Kirigami.Page {
     property var headerItems: []
     // The header opens the details panel: a 1:1 chat (and Note to Self) shows the person, a
     // group the group. (A channel or a broadcast list has no page: its header stays a title.)
-    readonly property bool detailsShown: page.open && App.timeline.hasDetails
+    readonly property bool detailsShown: page.open && page.chatModel.hasDetails
     // A 1:1 chat (and Note to Self) has a person to show.
-    readonly property bool personShown: page.open && !App.timeline.isGroup
+    readonly property bool personShown: page.open && !page.chatModel.isGroup
 
     // What a screen reader says for the header: the chat's name WITHOUT WhatsApp's "~" mark
     // (`Style.unmarked`: the mark is for labels, a screen reader would say "tilde"; W6a2 PRIV-1,
@@ -74,7 +88,7 @@ Kirigami.Page {
         if (!page.detailsShown) {
             return;
         }
-        const group = App.timeline.isGroup;
+        const group = page.chatModel.isGroup;
         if (!(group ? App.showGroupOfChat() : App.showPersonOfChat())) {
             return;
         }
@@ -196,7 +210,7 @@ Kirigami.Page {
     // Another chat opens (list, notification, quick switch, step keys, a group in common) or
     // this one is gone: the panel was about the person or the group of the chat it was opened
     // from.
-    readonly property real openedChat: App.timeline.conversationId
+    readonly property real openedChat: page.chatModel.conversationId
     onOpenedChatChanged: page.closeDetails(false)
 
     // The disappearing-message menu, below the header at the page's trailing edge.
@@ -214,10 +228,10 @@ Kirigami.Page {
             return;
         }
         page.timerDialog = timerComponent.createObject(page, {
-            "min": App.timeline.timerCustomMin,
-            "max": App.timeline.timerCustomMax,
-            "step": App.timeline.timerCustomStep,
-            "current": App.timeline.timerSecs
+            "min": page.chatModel.timerCustomMin,
+            "max": page.chatModel.timerCustomMax,
+            "step": page.chatModel.timerCustomStep,
+            "current": page.chatModel.timerSecs
         }) as TimerDialog;
         page.timerDialog?.open();
     }
@@ -263,13 +277,29 @@ Kirigami.Page {
     Component {
         id: chatDeleteComponent
         ChatDeleteDialog {
+            chatModel: page.chatModel
             onClosed: destroy()
         }
     }
 
-    title: App.timeline.title
+    title: page.chatModel.title
     padding: 0
-    Kirigami.ColumnView.fillWidth: true
+    // A split with both chats shown: each column has the width the window gives it (the first its share of the
+    // room, a divider to drag; the second the rest: a fill column of Kirigami ignores the list's width and runs
+    // past the window); a chat alone fills.
+    Kirigami.ColumnView.fillWidth: !page.beside
+    Kirigami.ColumnView.preferredWidth: page.beside ? page.columnWidth : 0
+    Kirigami.ColumnView.minimumWidth: page.beside ? Kirigami.Units.gridUnit * 20 : 0
+    // (A maximum is stated too: the list page does, and a column's width is bounded by it.)
+    Kirigami.ColumnView.maximumWidth: page.beside ? Kirigami.Units.gridUnit * 400 : 0
+    Kirigami.ColumnView.interactiveResizeEnabled: page.beside && page.pane === 0
+    Kirigami.ColumnView.onInteractiveResizingChanged: {
+        if (!page.Kirigami.ColumnView.interactiveResizing && page.beside && page.pane === 0) {
+            page.dividerReleased(page.width);
+            // (A drag writes the column's width itself, which ends the binding: the share is the rule again.)
+            page.Kirigami.ColumnView.preferredWidth = Qt.binding(() => page.beside ? page.columnWidth : 0);
+        }
+    }
     Kirigami.Theme.colorSet: Kirigami.Theme.View
     Kirigami.Theme.inherit: false
 
@@ -281,7 +311,7 @@ Kirigami.Page {
         implicitHeight: headerRow.implicitHeight
         activeFocusOnTab: page.detailsShown
         Accessible.role: Accessible.Button
-        Accessible.name: page.headerName(App.timeline.title, page.detailsShown)
+        Accessible.name: page.headerName(page.chatModel.title, page.detailsShown)
         Accessible.focusable: page.detailsShown
         Accessible.onPressAction: page.toggleDetails()
         objectName: "chatHeader"
@@ -330,9 +360,9 @@ Kirigami.Page {
             spacing: Kirigami.Units.largeSpacing
 
             Avatar {
-                name: App.timeline.title
-                source: App.timeline.avatarUrl
-                selfChat: App.timeline.isSelf
+                name: page.chatModel.title
+                source: page.chatModel.avatarUrl
+                selfChat: page.chatModel.isSelf
                 implicitWidth: Kirigami.Units.gridUnit * 1.8
                 implicitHeight: Kirigami.Units.gridUnit * 1.8
             }
@@ -342,21 +372,21 @@ Kirigami.Page {
                 QQC2.Label {
                     id: headerTitle
                     // A marked title is a `RichText` label cut by `headerFit` (`Style.markedName`).
-                    readonly property var titleMarks: App.timeline.titleMarks ?? []
+                    readonly property var titleMarks: page.chatModel.titleMarks ?? []
                     readonly property bool marked: headerTitle.titleMarks.length > 0
-                    text: headerTitle.marked ? Style.markedName(headerFit.elidedText, App.timeline.title, headerTitle.titleMarks, Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor) : App.timeline.title
+                    text: headerTitle.marked ? Style.markedName(headerFit.elidedText, page.chatModel.title, headerTitle.titleMarks, Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor) : page.chatModel.title
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold
                     })
                     elide: Text.ElideRight
                     textFormat: headerTitle.marked ? Text.RichText : Text.PlainText
-                    Accessible.name: App.timeline.title
+                    Accessible.name: page.chatModel.title
                     Layout.fillWidth: true
 
                     TextMetrics {
                         id: headerFit
                         font: headerTitle.font
-                        text: headerTitle.marked ? App.timeline.title : ""
+                        text: headerTitle.marked ? page.chatModel.title : ""
                         elide: Qt.ElideRight
                         elideWidth: headerTitle.width
                     }
@@ -366,10 +396,10 @@ Kirigami.Page {
                     Layout.fillWidth: true
 
                     QQC2.Label {
-                        text: App.timeline.subtitle
+                        text: page.chatModel.subtitle
                         elide: Text.ElideRight
                         font: Kirigami.Theme.smallFont
-                        color: App.timeline.typing ? Style.readable(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor) : Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
+                        color: page.chatModel.typing ? Style.readable(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor) : Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
                         textFormat: Text.PlainText
                         // As wide as its text when there is room; the marks follow it.
                         Layout.maximumWidth: Math.ceil(implicitWidth)
@@ -377,7 +407,7 @@ Kirigami.Page {
                         Layout.horizontalStretchFactor: 1000
                     }
                     Kirigami.Icon {
-                        visible: App.timeline.muted
+                        visible: page.chatModel.muted
                         source: "notifications-disabled"
                         implicitWidth: Kirigami.Units.iconSizes.small
                         implicitHeight: Kirigami.Units.iconSizes.small
@@ -397,11 +427,11 @@ Kirigami.Page {
                     QQC2.Label {
                         id: timerLabel
                         visible: page.hasTimer
-                        text: App.timeline.timerLabel
+                        text: page.chatModel.timerLabel
                         font: Kirigami.Theme.smallFont
                         color: Style.secondary(Kirigami.Theme.textColor, Kirigami.Theme.backgroundColor)
                         textFormat: Text.PlainText
-                        Accessible.name: L10n.i18nc("@info accessible", "Messages disappear after %1", App.timeline.timerLabel)
+                        Accessible.name: L10n.i18nc("@info accessible", "Messages disappear after %1", page.chatModel.timerLabel)
                     }
                     Item {
                         Layout.fillWidth: true
@@ -414,6 +444,20 @@ Kirigami.Page {
     }
 
     actions: [
+        // A split that shows one chat only (the window is too narrow for two): the other chat, one press away
+        // (F6 does the same). `go-next-view`: it reads as "the next view", which is what it is.
+        Kirigami.Action {
+            id: otherAction
+
+            objectName: "otherChatAction"
+            icon.name: "go-next-view"
+            text: L10n.i18nc("@action:button", "Show Other Chat")
+            displayHint: Kirigami.DisplayHint.IconOnly | Kirigami.DisplayHint.KeepVisible
+            visible: page.open && App.split && page.single
+            enabled: visible
+            tooltip: L10n.i18nc("@info:tooltip, %1 the other chat's name", "Show %1", Style.plain(page.otherName))
+            onTriggered: App.activatePane(1 - page.pane)
+        },
         Kirigami.Action {
             icon.name: "chronometer"
             text: L10n.i18nc("@action:button", "Disappearing Messages")
@@ -421,9 +465,49 @@ Kirigami.Page {
             visible: page.open && page.timerOffered
             // Off while the account's network holds back what is sent (the core refuses the
             // change then); the tooltip says why.
-            enabled: visible && App.timeline.timerHeld === ""
-            tooltip: App.timeline.timerHeld
+            enabled: visible && page.chatModel.timerHeld === ""
+            tooltip: page.chatModel.timerHeld
             onTriggered: page.openTimerMenu()
+        },
+        // Beside another chat (split view): starts the chooser (the window asks which chat). Not shown
+        // while the split is on: the chats are beside each other then.
+        Kirigami.Action {
+            id: besideAction
+
+            objectName: "besideAction"
+            icon.name: "view-split-left-right"
+            text: L10n.i18nc("@action:button", "Open Chat Beside")
+            // Kept in the header like Swap and Close below (his "Chat header icon"); it and Swap never show together.
+            displayHint: Kirigami.DisplayHint.IconOnly | Kirigami.DisplayHint.KeepVisible
+            visible: page.open && !App.split
+            enabled: visible
+            onTriggered: page.chooseBesideAsked()
+        },
+        // The two chats exchange places (the window does it: drafts and files follow their chats). Swap and Close
+        // keep their place in the header (his buttons): a split chat's header is narrow, and the title would take the
+        // room and put them into the overflow menu; the timer goes there first.
+        Kirigami.Action {
+            id: swapAction
+
+            objectName: "swapAction"
+            icon.name: "exchange-positions"
+            text: L10n.i18nc("@action:button", "Swap Chats")
+            displayHint: Kirigami.DisplayHint.IconOnly | Kirigami.DisplayHint.KeepVisible
+            visible: page.open && App.split
+            enabled: visible
+            onTriggered: page.swapChatsAsked()
+        },
+        // Closes this chat, in both states (one chat: the placeholder shows; two: the other stays).
+        Kirigami.Action {
+            id: closeAction
+
+            objectName: "closeAction"
+            icon.name: "view-close"
+            text: L10n.i18nc("@action:button", "Close Chat")
+            displayHint: Kirigami.DisplayHint.IconOnly | Kirigami.DisplayHint.KeepVisible
+            visible: page.open
+            enabled: visible
+            onTriggered: page.closeChatAsked(page.pane)
         },
         // Search in this chat only (G1i): the list's search field takes the keyboard with a chip
         // naming the chat. Not shown (not merely greyed) for a protected chat: it offers no search.
@@ -431,11 +515,21 @@ Kirigami.Page {
             icon.name: "edit-find"
             text: L10n.i18nc("@action:inmenu", "Search in Chat")
             displayHint: Kirigami.DisplayHint.AlwaysHide
-            visible: page.open && App.timeline.chatSearchable
+            visible: page.open && page.chatModel.chatSearchable
             enabled: visible
             // (The window's key is Ctrl+Shift+F; an action's own shortcut would be ambiguous with it.)
             tooltip: L10n.i18nc("@info:tooltip, %1 a keyboard shortcut", "Search in Chat (%1)", "Ctrl+Shift+F")
             onTriggered: page.searchAsked()
+        },
+        // Keeps this pane and closes the other one.
+        Kirigami.Action {
+            objectName: "closeSplitAction"
+            icon.name: "view-close"
+            text: L10n.i18nc("@action:inmenu", "Close Split View")
+            displayHint: Kirigami.DisplayHint.AlwaysHide
+            visible: page.open && App.split
+            enabled: visible
+            onTriggered: App.closePane(1 - page.pane)
         },
         // What the chat offers of the settings the phone shares (A10d), from the core's offer for
         // the open chat: Mark as Unread, Pin, Mute (with its times), Archive. All in the overflow
@@ -448,7 +542,7 @@ Kirigami.Page {
             visible: page.open && page.offer.shown === true && page.offer.hasUnread !== true
             enabled: page.offer.on === true
             tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
-            onTriggered: App.setMarkedUnread(App.timeline.conversationId, true)
+            onTriggered: App.setMarkedUnread(page.chatModel.conversationId, true)
         },
         Kirigami.Action {
             id: pinAction
@@ -460,7 +554,7 @@ Kirigami.Page {
             visible: page.open && page.offer.shown === true
             enabled: page.offer.on === true && (pinAction.pinned || page.offer.pinAtLimit !== true)
             tooltip: pinAction.enabled ? "" : Style.plain(page.offer.on === true ? page.offer.pinWhy : page.offer.why)
-            onTriggered: App.setPinned(App.timeline.conversationId, !pinAction.pinned)
+            onTriggered: App.setPinned(page.chatModel.conversationId, !pinAction.pinned)
         },
         // Mute with its times (Signal Desktop's order) while the chat can be muted and the sync is
         // on; the greyed flat entry below stands for the off state (a sub-menu's entries do not
@@ -473,27 +567,27 @@ Kirigami.Page {
             enabled: visible
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "1 Hour")
-                onTriggered: App.muteFor(App.timeline.conversationId, "hour")
+                onTriggered: App.muteFor(page.chatModel.conversationId, "hour")
             }
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "8 Hours")
-                onTriggered: App.muteFor(App.timeline.conversationId, "eight")
+                onTriggered: App.muteFor(page.chatModel.conversationId, "eight")
             }
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "1 Day")
-                onTriggered: App.muteFor(App.timeline.conversationId, "day")
+                onTriggered: App.muteFor(page.chatModel.conversationId, "day")
             }
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "1 Week")
-                onTriggered: App.muteFor(App.timeline.conversationId, "week")
+                onTriggered: App.muteFor(page.chatModel.conversationId, "week")
             }
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "Until…")
-                onTriggered: page.untilAsked(App.timeline.conversationId, null)
+                onTriggered: page.untilAsked(page.chatModel.conversationId, null)
             }
             Kirigami.Action {
                 text: L10n.i18nc("@action:inmenu", "Always")
-                onTriggered: App.muteFor(App.timeline.conversationId, "always")
+                onTriggered: App.muteFor(page.chatModel.conversationId, "always")
             }
         },
         Kirigami.Action {
@@ -539,7 +633,7 @@ Kirigami.Page {
             visible: page.open && page.offer.shown === true && page.offer.muteOffered === true && page.offer.muted === true
             enabled: page.offer.on === true
             tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
-            onTriggered: App.unmute(App.timeline.conversationId)
+            onTriggered: App.unmute(page.chatModel.conversationId)
         },
         Kirigami.Action {
             id: archiveAction
@@ -551,7 +645,7 @@ Kirigami.Page {
             visible: page.open && page.offer.shown === true
             enabled: page.offer.on === true
             tooltip: page.offer.on === true ? "" : Style.plain(page.offer.why)
-            onTriggered: archiveAction.archived ? page.unarchiveAsked(App.timeline.conversationId) : page.archiveAsked(App.timeline.conversationId)
+            onTriggered: archiveAction.archived ? page.unarchiveAsked(page.chatModel.conversationId) : page.archiveAsked(page.chatModel.conversationId)
         },
         // Why the entries above are grey, or why Pin is: right under Archive, as in the row menu
         // (a wrapping label: the sentence is long). Known limit: Kirigami's overflow gives the page
@@ -591,14 +685,14 @@ Kirigami.Page {
         },
         // What is done to the chat as a whole lives in the page's menu; both ask first.
         // While the chat's message history still arrives both wait, and the menu says why
-        // (`App.timeline.stillFilling`; link feedback L3).
+        // (`chatModel.stillFilling`; link feedback L3).
         Kirigami.Action {
             icon.name: "edit-clear-history"
             text: L10n.i18nc("@action:inmenu", "Clear Chat History…")
             displayHint: Kirigami.DisplayHint.AlwaysHide
             visible: page.open
-            enabled: App.timeline.stillFilling === ""
-            tooltip: App.timeline.stillFilling
+            enabled: page.chatModel.stillFilling === ""
+            tooltip: page.chatModel.stillFilling
             onTriggered: page.askClear()
         },
         Kirigami.Action {
@@ -606,15 +700,15 @@ Kirigami.Page {
             text: L10n.i18nc("@action:inmenu", "Delete Chat…")
             displayHint: Kirigami.DisplayHint.AlwaysHide
             visible: page.open
-            enabled: App.timeline.stillFilling === ""
-            tooltip: App.timeline.stillFilling
+            enabled: page.chatModel.stillFilling === ""
+            tooltip: page.chatModel.stillFilling
             onTriggered: page.askDelete()
         },
         Kirigami.Action {
             icon.name: "documentinfo"
-            text: App.timeline.stillFilling
+            text: page.chatModel.stillFilling
             displayHint: Kirigami.DisplayHint.AlwaysHide
-            visible: page.open && App.timeline.stillFilling !== ""
+            visible: page.open && page.chatModel.stillFilling !== ""
             enabled: false
         }
     ]
@@ -632,7 +726,7 @@ Kirigami.Page {
             text: L10n.i18nc("@title:menu", "Messages Disappear After")
         }
         Instantiator {
-            model: App.timeline.timerOptions
+            model: page.chatModel.timerOptions
             delegate: QQC2.MenuItem {
                 id: option
 
@@ -641,13 +735,13 @@ Kirigami.Page {
                 text: option.modelData.label
                 checkable: true
                 autoExclusive: true
-                checked: option.modelData.secs === App.timeline.timerSecs
+                checked: option.modelData.secs === page.chatModel.timerSecs
                 onTriggered: {
-                    if (option.modelData.secs !== App.timeline.timerSecs) {
+                    if (option.modelData.secs !== page.chatModel.timerSecs) {
                         App.setTimer(option.modelData.secs);
                     }
                     // The mark follows what the network confirms, not the click.
-                    option.checked = Qt.binding(() => option.modelData.secs === App.timeline.timerSecs);
+                    option.checked = Qt.binding(() => option.modelData.secs === page.chatModel.timerSecs);
                 }
             }
             onObjectAdded: (index, object) => timerMenu.insertItem(index + 1, object as QQC2.MenuItem)
@@ -676,7 +770,7 @@ Kirigami.Page {
         // The drawings behind the messages, in the color of the chat's account (Settings →
         // General). One tile per color, made the first time it is asked for: not at the start.
         Image {
-            readonly property string tint: App.timeline.tint
+            readonly property string tint: page.chatModel.tint
 
             anchors.fill: parent
             visible: page.open && App.settings.chatWallpaper && !Style.highContrast && tint !== ""
@@ -689,6 +783,38 @@ Kirigami.Page {
         }
     }
 
+    // "Focus decides": a press anywhere in this pane (the page with its composer, and its header in the
+    // window's toolbar) makes it the active one. The handlers are passive (`PointHandler` takes only a
+    // passive grab), so the press still reaches what is under it; activating moves no focus and no scroll.
+    component PaneTouch: PointHandler {
+        acceptedButtons: Qt.AllButtons
+        onActiveChanged: {
+            if (active && !page.active) {
+                App.activatePane(page.pane);
+            }
+        }
+    }
+    PaneTouch {
+        parent: page
+    }
+    PaneTouch {
+        parent: page.globalToolBarItem
+    }
+    // The inactive pane's header (title and actions) is drawn at 70 % opacity: a veil of the header's own
+    // background colour at 30 % over it. (The header's `opacity` would let the timeline that scrolls under
+    // the toolbar show through.)
+    readonly property alias headerDim: headerDim
+    Rectangle {
+        id: headerDim
+        readonly property Item header: page.globalToolBarItem
+        parent: header
+        z: 1000
+        visible: header !== null && !page.active
+        width: header ? header.width : 0
+        height: header ? header.height : 0
+        color: header ? Qt.alpha(header.Kirigami.Theme.backgroundColor, 0.3) : "transparent"
+    }
+
     // `--page=history`: keep the view at the oldest message while older pages load.
     property alias pinToOldest: timelineView.pinToOldest
     // The timeline's message popups (the fixture pages open them).
@@ -698,6 +824,9 @@ Kirigami.Page {
 
     TimelineView {
         id: timelineView
+        chatModel: page.chatModel
+        composerModel: page.composerModel
+        pane: page.pane
         anchors.fill: parent
         anchors.rightMargin: page.panelReserved
         // A covering panel takes the timeline out of the keyboard's reach (Tab, Shift+Tab).
@@ -730,6 +859,7 @@ Kirigami.Page {
         height: page.height
         width: page.panelWidth
         sourceComponent: DetailsPanel {
+            chatModel: page.chatModel
             beside: page.panelBeside
             onCloseRequested: page.closeDetails(true)
             onChatRequested: id => page.conversationRequested(id)
@@ -746,12 +876,17 @@ Kirigami.Page {
     signal untilAsked(real conv, var back)
     // The menu's "Search in Chat": the window brings the list's search field forward.
     signal searchAsked
+    // The header's "Open Chat Beside": the window starts its chooser.
+    signal chooseBesideAsked
+    // The header's "Swap Chats" and "Close Chat" (pane `pane`): the window does them and moves the keyboard.
+    signal swapChatsAsked
+    signal closeChatAsked(int pane)
 
     // What the open chat offers (the core's offer, a map; empty while no chat is open) and the
     // line under the menu's entries: why they are grey, else why Pin is.
     // (Read only while a chat is open: until the model has had a header the property is an invalid
     // variant, which QML must never read.)
-    readonly property var offer: page.open ? App.timeline.chatOffer : ({})
+    readonly property var offer: page.open ? page.chatModel.chatOffer : ({})
     readonly property string offerLine: page.offer.why ? page.offer.why : (page.offer.pinAtLimit === true && page.offer.pinned !== true && page.offer.pinWhy ? page.offer.pinWhy : "")
 
     // Files dragged in (Dolphin, the desktop) are attached to the message being written.
@@ -784,8 +919,63 @@ Kirigami.Page {
         }
     }
 
+    // S5: messages dragged from the OTHER chat of a split (`MessageDragProxy`) stage a forward into this
+    // chat's composer: the card shows there, Enter sends it, its X takes it back. A drag from this chat's own
+    // pane is not taken. The chat becomes the active one and its composer gets the keyboard.
+    DropArea {
+        id: forwardDrop
+        objectName: "forwardDrop"
+
+        anchors.fill: parent
+        anchors.rightMargin: page.panelReserved
+        enabled: page.open && !page.panelCovers && !composer.blocked && !composer.editing
+        keys: ["kourier/messages"]
+        onEntered: drag => {
+            const from = drag.source as MessageDragProxy;
+            drag.accepted = from !== null && from.fromPane !== page.pane && from.messages.length > 0;
+        }
+        onDropped: drop => {
+            const from = drop.source as MessageDragProxy;
+            if (from === null || from.fromPane === page.pane) {
+                return;
+            }
+            const count = from.messages.length;
+            if (!page.composerModel.stageForward(page.chatModel.conversationId, from.fromConversation, from.messages)) {
+                page.forwardRefused(count, page.chatModel.title);
+                return;
+            }
+            drop.accept(Qt.CopyAction);
+            if (from.fromModel !== null && from.fromModel.selecting) {
+                from.fromModel.selectClear();
+            }
+            App.activatePane(page.pane);
+            Qt.callLater(() => composer.focusInput());
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.largeSpacing
+            visible: forwardDrop.containsDrag
+            radius: Kirigami.Units.cornerRadius * 2
+            color: Qt.alpha(Kirigami.Theme.highlightColor, 0.12)
+            border.width: 2
+            border.color: Kirigami.Theme.highlightColor
+            Kirigami.PlaceholderMessage {
+                anchors.centerIn: parent
+                width: parent.width - Kirigami.Units.gridUnit * 4
+                icon.name: "mail-forward"
+                text: (forwardDrop.drag.source as MessageDragProxy)?.messages.length > 1 ? L10n.i18nc("@info:placeholder", "Drop the messages to forward them to this chat") : L10n.i18nc("@info:placeholder", "Drop the message to forward it to this chat")
+            }
+        }
+    }
+    // A drop of `count` messages that this chat (titled `chat`) could not take: the forward could not be staged.
+    signal forwardRefused(int count, string chat)
+
     footer: Composer {
         id: composer
+        chatModel: page.chatModel
+        composerModel: page.composerModel
+        active: page.active
         visible: page.open
         // A covering panel takes the composer out of the keyboard's reach: nothing typed lands in it.
         enabled: !page.panelCovers
@@ -795,7 +985,7 @@ Kirigami.Page {
         // note goes once the question is up (a row that is not on screen keeps the note).
         onDeleteNoteRequested: message => {
             if (timelineView.deleteFor(message)) {
-                App.composer.clearNotice();
+                page.composerModel.clearNotice();
             }
         }
     }

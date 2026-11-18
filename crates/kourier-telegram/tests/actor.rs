@@ -68,6 +68,7 @@ fn every_command_with_a_reply_is_answered() {
                 body: Body::Text(Text::plain("x")),
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
             only: None,
             is_recipient_update: false,

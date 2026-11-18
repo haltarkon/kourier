@@ -213,6 +213,7 @@ pub(crate) fn file_request(
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,

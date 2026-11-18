@@ -69,6 +69,7 @@ pub fn threema_features() -> kourier_model::ConversationFeatures {
         roaming_listed: None,
         invite_link_on: false,
         export: kourier_model::ChatExport::Allowed,
+        no_forward: false,
     }
 }
 

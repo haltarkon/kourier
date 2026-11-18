@@ -10,8 +10,8 @@ publish.workspace = true
 default = ["signal", "fake", "whatsapp", "telegram", "threema"]
 # The Signal backend.
 signal = ["kourier-app/signal"]
-# The WhatsApp backend: compiled in, registered only in a debug build while its switch is on
-# (kourier-app `whatsapp_registration`).
+# The WhatsApp backend: compiled in, registered in every build while its switch is on, listed as off
+# otherwise (kourier-app `whatsapp_registration`).
 whatsapp = ["kourier-app/whatsapp"]
 # The Telegram backend: compiled in, registered only in a debug build while its switch is on
 # (kourier-app `telegram_registration`); `cargo xtask dist` leaves it out.

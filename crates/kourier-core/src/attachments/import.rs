@@ -34,7 +34,8 @@ use kourier_blob::{BlobStore, FileKey};
 
 use super::core_path;
 use kourier_model::{
-    Attachment, AttachmentKind, AttachmentState, BlobKey, BlobRef, ConversationFeatures, PlanFile,
+    Attachment, AttachmentKind, AttachmentState, BackendBlob, BlobKey, BlobRef,
+    ConversationFeatures, PlanFile,
 };
 use zeroize::Zeroizing;
 
@@ -175,6 +176,10 @@ pub(crate) struct Imported {
     pub file: Written,
     /// The encrypted thumbnail of a picture.
     pub thumb: Option<Written>,
+    /// The network pointer of the source attachment of a native forward: carried by the outbox
+    /// REQUEST only (a backend may reuse it), never stored on the attachment row. `None` for
+    /// every file the user picked.
+    pub remote: Option<BackendBlob>,
 }
 
 impl std::fmt::Debug for Imported {
@@ -206,6 +211,11 @@ impl Imported {
             dims: self.dims,
             blurhash: self.blurhash.clone(),
             state: AttachmentState::Local,
+            remote: if with_files {
+                self.remote.clone()
+            } else {
+                None
+            },
             local: with_files.then(|| blob_ref(&self.file)),
             thumb: if with_files {
                 self.thumb.as_ref().map(blob_ref)
@@ -404,7 +414,7 @@ const SYNC_BATCH: usize = 1024;
 /// (`tests/scale.rs` `measure_durable_import`, 1,000 small files, three rounds): 5.6, 12.0
 /// and 8.4 ms per file as one batch against 11.9, 38.4 and 24.1 ms with a sync after every
 /// file. Thumbnails are left out: they can be derived again (`derive::repair_thumbs`).
-fn make_durable(blob_dir: &Path, imported: &[Imported]) -> std::io::Result<()> {
+pub(crate) fn make_durable(blob_dir: &Path, imported: &[Imported]) -> std::io::Result<()> {
     let mut dirs = std::collections::BTreeSet::new();
     for i in imported {
         let path = blob_dir.join(&i.file.path);
@@ -637,6 +647,7 @@ fn import_one(
                 mime,
             },
             thumb: None,
+            remote: None,
         });
     }
     let mut bytes = Zeroizing::new(Vec::with_capacity(usize::try_from(size).unwrap_or(0)));
@@ -680,6 +691,7 @@ fn import_one(
                 blurhash: None,
                 file: file_written,
                 thumb: None,
+                remote: None,
             });
         }
     };
@@ -707,6 +719,7 @@ fn import_one(
         blurhash: Some(derived.blurhash),
         file: file_written,
         thumb,
+        remote: None,
     })
 }
 

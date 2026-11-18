@@ -13,10 +13,10 @@ autotests = false
 default = ["signal", "fake", "whatsapp", "telegram", "threema"]
 # The Signal backend (libsignal).
 signal = ["dep:kourier-signal"]
-# The WhatsApp backend (whatsapp-rust). Compiled into every default build, but REGISTERED only in a
-# debug build and only while `networks-on` of `kourier.toml` names it (W2b, decision L1: a release
-# build, so every archive, cannot link a real account until the receive path and the send path have
-# landed; `app.rs` `whatsapp_registration`). Architecture §7.4.
+# The WhatsApp backend (whatsapp-rust). Compiled into every default build and REGISTERED, in a
+# release build as in a debug one, while `networks-on` of `kourier.toml` names it, listed as off
+# otherwise (W2b; the release gate of decision L1 was lifted at the user's word on 2026-11-18;
+# `app.rs` `whatsapp_registration`). Architecture §7.4.
 whatsapp = ["dep:kourier-whatsapp"]
 # The Telegram backend (TDLib in the `kourier-tdlib` helper process). Compiled into a default build,
 # but REGISTERED only in a debug build and only while `networks-on` of `kourier.toml` names it (TG-1

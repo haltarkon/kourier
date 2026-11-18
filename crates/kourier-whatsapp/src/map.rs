@@ -547,6 +547,7 @@ pub(crate) fn message_events(input: Input<'_>, ctx: &Ctx) -> Result<Mapped, Fail
         event.arrival = arrival;
         event.catch_up = catch_up;
         event.view_once = message.is_view_once();
+        event.forwarded = context::forwarded(info);
         event.raw = raw;
         // A message carries only its own timer; the notice of a timer change carries none.
         event.expiry = carried

@@ -92,7 +92,7 @@ fn group(chat: i64) -> ConvKey {
 /// window here.
 #[test]
 fn the_fake_playing_telegram_states_the_features_this_backend_states() {
-    let stated = chats::features();
+    let stated = chats::features(false);
     for group in [false, true] {
         assert_eq!(
             kourier_fake::telegram::telegram_features(group),
@@ -110,6 +110,25 @@ fn the_fake_playing_telegram_states_the_features_this_backend_states() {
     assert!(stated.delete_receive.is_none());
     assert!(stated.read_receipts && stated.typing);
     assert_eq!(stated.history, kourier_model::HistorySource::OnDemand);
+}
+
+/// Forward line F1: the chats state that nothing is sent yet (every send UI stays off), and
+/// protected content forbids forwarding out of the chat.
+#[test]
+fn the_chat_features_state_no_send_and_the_protected_content() {
+    let open = chats::features(false);
+    assert_eq!(
+        open.cannot_send,
+        Some(kourier_model::CannotSend::NotYetBuilt)
+    );
+    assert!(!open.no_forward);
+    let closed = chats::features(true);
+    assert_eq!(
+        closed.cannot_send,
+        Some(kourier_model::CannotSend::NotYetBuilt)
+    );
+    assert!(closed.no_forward);
+    assert_ne!(open.stable_hash(), closed.stable_hash());
 }
 
 /// Critic H1, from the scrubbed login fixture (`login-flow.jsonl` lines 150-173: Ready, then

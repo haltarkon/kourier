@@ -506,7 +506,7 @@ fn autostart_target(paths: &Paths) -> (PathBuf, AutostartEntry) {
         name => format!("{APP_ID}-{name}"),
     };
     let path = autostart::entry_path(&paths.autostart_config_home(), &file);
-    let program = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kourier"));
+    let program = autostart_program(crate::appimage::current(), std::env::current_exe());
     let mut args = Vec::new();
     if profile.name() != "default" {
         args.push(format!("--profile={}", profile.name()));
@@ -519,6 +519,19 @@ fn autostart_target(paths: &Paths) -> (PathBuf, AutostartEntry) {
         icon: APP_ID.to_owned(),
     };
     (path, entry)
+}
+
+/// The program an autostart entry runs: the AppImage's file when this process runs from one (the
+/// program itself lies in a mount or an unpacked folder that is gone after the run, §14.1), else
+/// this program, else the name `kourier` on the `PATH`.
+fn autostart_program(
+    appimage: Option<crate::appimage::AppImage>,
+    exe: std::io::Result<PathBuf>,
+) -> PathBuf {
+    match appimage {
+        Some(appimage) => appimage.file,
+        None => exe.unwrap_or_else(|_| PathBuf::from("kourier")),
+    }
 }
 
 /// Starts the desktop task on `runtime`: loads the preferences, syncs the autostart entry,
@@ -782,6 +795,29 @@ mod tests {
             PathBuf::from("/tmp/k/kourier/config/autostart/app.kourier.Kourier.desktop")
         );
         assert!(entry.args.is_empty());
+    }
+
+    /// A run from the AppImage starts the AppImage's file at login, never the program in its
+    /// mount; any other run starts this program.
+    #[test]
+    fn the_autostart_entry_of_an_appimage_runs_its_file() {
+        let appimage = crate::appimage::AppImage {
+            file: PathBuf::from("/home/u/Apps/Kourier-x86_64.AppImage"),
+            dir: PathBuf::from("/tmp/.mount_KourieAbC123"),
+        };
+        let mounted = PathBuf::from("/tmp/.mount_KourieAbC123/usr/bin/kourier");
+        assert_eq!(
+            autostart_program(Some(appimage), Ok(mounted)),
+            PathBuf::from("/home/u/Apps/Kourier-x86_64.AppImage")
+        );
+        assert_eq!(
+            autostart_program(None, Ok(PathBuf::from("/usr/bin/kourier"))),
+            PathBuf::from("/usr/bin/kourier")
+        );
+        assert_eq!(
+            autostart_program(None, Err(std::io::Error::other("no /proc"))),
+            PathBuf::from("kourier")
+        );
     }
 
     #[test]

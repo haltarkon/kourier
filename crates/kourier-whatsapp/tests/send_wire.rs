@@ -85,6 +85,7 @@ const RATE_ID: &str = "3EB0C0DE5B1140A1";
 const STRANGER_LID: &str = "77700193507264";
 /// The id of the token case (fix F17): a 1:1 text sent with a stored trusted-contact token.
 const TOKEN_TEXT_ID: &str = "3EB0C0DE5B3362C3";
+const FORWARD_ID: &str = "3EB0C0DE5C7741A9";
 /// The stored token's bytes (synthetic; never printed).
 const STORED_TOKEN: [u8; 32] = [0x6B; 32];
 /// The own phone's synthetic key ids (its responder bundle in the `encrypt` rule).
@@ -156,6 +157,7 @@ pub(crate) fn text_request(local: &str) -> OutgoingRequest {
             body: Body::Text(Text::plain(TEXT)),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     )
 }
@@ -1175,6 +1177,7 @@ async fn a_migrated_account_writes_a_number_chat_as_its_lid() {
             body: Body::Text(Text::plain(TEXT)),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     );
     assert!(
@@ -1649,6 +1652,42 @@ async fn a_stored_token_goes_out_with_the_text() {
     rig.finish().await;
 }
 
+/// F4: a native forward of a text goes out as an `extendedTextMessage` whose context info says forwarded and the score
+/// (a source forwarded 6 times before is written as 127), and the peer reads exactly that.
+async fn a_forwarded_text_carries_the_mark_the_peer_reads() {
+    let (dir, device) = account_dir().await;
+    let rig = Rig::start(dir.path(), server_of(&Script::acked())).await;
+    let mut peer = Peer::new(&device, None).await;
+    rig.peer_writes_first(&mut peer).await;
+    let forwarded = request(
+        FORWARD_ID,
+        OutgoingKind::Message {
+            body: Body::Text(Text::plain(TEXT)),
+            reply_to: None,
+            expiry: None,
+            forward: Some(kourier_model::Forwarded { score: 6 }),
+        },
+    );
+    assert!(
+        matches!(rig.transmit(&forwarded).await, TransmitOutcome::Sent { .. }),
+        "the forward is not answered Sent"
+    );
+    let frames = rig.message_frames(FORWARD_ID);
+    assert_eq!(frames.len(), 1, "one frame for one forward");
+    let read = peer
+        .read(&frames[0])
+        .await
+        .expect("the peer reads the frame");
+    let info = read
+        .extended_text_message
+        .as_option()
+        .and_then(|m| m.context_info.as_option())
+        .expect("an extendedTextMessage with a context info");
+    assert_eq!(info.is_forwarded, Some(true));
+    assert_eq!(info.forwarding_score, Some(127));
+    rig.finish().await;
+}
+
 /// The case the child runs (set by the parent).
 const CASE: &str = "WA_SEND_WIRE_CASE";
 
@@ -1744,6 +1783,11 @@ fn a_stored_token_goes_out_with_the_text_over_the_wire() {
     parent("token");
 }
 
+#[test]
+fn a_forwarded_text_carries_the_mark_the_peer_reads_over_the_wire() {
+    parent("forward");
+}
+
 /// The child (a no-op as an ordinary test): every log line is recorded, and none may hold a secret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_child() {
@@ -1770,6 +1814,7 @@ async fn send_child() {
         "group" => a_group_text_is_one_stanza_with_sender_keys().await,
         "typing" => a_typing_state_goes_only_into_a_chat_the_phone_started().await,
         "token" => a_stored_token_goes_out_with_the_text().await,
+        "forward" => a_forwarded_text_carries_the_mark_the_peer_reads().await,
         "silent" => a_silent_ack_ends_the_connection_and_the_resend_uses_the_same_id().await,
         other => panic!("unknown case {other}"),
     }

@@ -15,11 +15,13 @@ import app.kourier
 // selection mode, never an export.
 RowLayout {
     id: root
+    required property TimelineModel chatModel
 
-    readonly property int count: App.timeline.selectedCount
+    readonly property int count: root.chatModel.selectedCount
     // The bar's own tab stops, for the keyboard (tests).
     readonly property alias copyButton: copy
     readonly property alias exportButton: exportSelected
+    readonly property alias forwardButton: forwardSelected
     readonly property alias cancelButton: cancel
 
     spacing: Kirigami.Units.smallSpacing
@@ -34,9 +36,9 @@ RowLayout {
         id: words
 
         font: copy.font
-        text: counter.text + copy.text + exportSelected.text + cancel.text
+        text: counter.text + copy.text + forwardSelected.text + exportSelected.text + cancel.text
     }
-    readonly property bool compact: root.width < words.advanceWidth + 3 * (Kirigami.Units.iconSizes.small + 4 * Kirigami.Units.largeSpacing) + 3 * root.spacing
+    readonly property bool compact: root.width < words.advanceWidth + 4 * (Kirigami.Units.iconSizes.small + 4 * Kirigami.Units.largeSpacing) + 4 * root.spacing
 
     QQC2.Label {
         id: counter
@@ -71,8 +73,8 @@ RowLayout {
             Accessible.description: copy.enabled ? "" : copy.toolTipText
             // The reason it is off (a control that is off for a reason the user can change says which).
             readonly property string toolTipText: L10n.i18nc("@info:tooltip", "Select at least one message to copy.")
-            onClicked: App.timeline.copySelected()
-            Keys.onEscapePressed: App.timeline.selectClear()
+            onClicked: root.chatModel.copySelected()
+            Keys.onEscapePressed: root.chatModel.selectClear()
         }
         MouseArea {
             id: copyGuard
@@ -86,6 +88,44 @@ RowLayout {
             acceptedButtons: Qt.NoButton
             QQC2.ToolTip.visible: copyGuard.tipShown
             QQC2.ToolTip.text: copy.toolTipText
+            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+        }
+    }
+
+    // Forward…: the same guard as Copy as Text; the core's verdict per message is in the dialog it opens.
+    Item {
+        implicitWidth: forwardSelected.implicitWidth
+        implicitHeight: forwardSelected.implicitHeight
+
+        QQC2.Button {
+            id: forwardSelected
+
+            objectName: "selectionForward"
+            anchors.fill: parent
+            icon.name: "mail-forward"
+            text: L10n.i18nc("@action:button", "Forward…")
+            display: root.compact ? QQC2.AbstractButton.IconOnly : QQC2.AbstractButton.TextBesideIcon
+            QQC2.ToolTip.visible: root.compact && forwardSelected.hovered
+            QQC2.ToolTip.text: forwardSelected.text
+            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+            enabled: root.count > 0
+            Accessible.name: forwardSelected.text
+            Accessible.description: forwardSelected.enabled ? "" : forwardSelected.toolTipText
+            readonly property string toolTipText: L10n.i18nc("@info:tooltip", "Select at least one message to forward.")
+            onClicked: App.forwardOpen(root.chatModel.selectedIds())
+            Keys.onEscapePressed: root.chatModel.selectClear()
+        }
+        MouseArea {
+            id: forwardGuard
+
+            objectName: "selectionForwardGuard"
+            readonly property bool tipShown: forwardGuard.enabled && forwardGuard.containsMouse
+            anchors.fill: parent
+            enabled: !forwardSelected.enabled
+            hoverEnabled: true
+            acceptedButtons: Qt.NoButton
+            QQC2.ToolTip.visible: forwardGuard.tipShown
+            QQC2.ToolTip.text: forwardSelected.toolTipText
             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
         }
     }
@@ -106,14 +146,14 @@ RowLayout {
             QQC2.ToolTip.visible: root.compact && exportSelected.hovered
             QQC2.ToolTip.text: exportSelected.text
             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-            enabled:root.count > 0 && App.timeline.exportOff === "" && !App.exportBusy
+            enabled:root.count > 0 && root.chatModel.exportOff === "" && !App.exportBusy
             Accessible.name: exportSelected.text
             Accessible.description: exportSelected.enabled ? "" : exportSelected.toolTipText
             // Why it is off: nothing selected, or the chat's refusal (text from the view model,
             // shown through the guard's plain-text tooltip).
-            readonly property string toolTipText: root.count <= 0 ? L10n.i18nc("@info:tooltip", "Select at least one message to export.") : App.exportBusy ? L10n.i18nc("@info:tooltip", "An export is running.") : Style.plain(App.timeline.exportOff)
-            onClicked: App.timeline.exportSelected()
-            Keys.onEscapePressed: App.timeline.selectClear()
+            readonly property string toolTipText: root.count <= 0 ? L10n.i18nc("@info:tooltip", "Select at least one message to export.") : App.exportBusy ? L10n.i18nc("@info:tooltip", "An export is running.") : Style.plain(root.chatModel.exportOff)
+            onClicked: root.chatModel.exportSelected()
+            Keys.onEscapePressed: root.chatModel.selectClear()
         }
         MouseArea {
             id: exportGuard
@@ -142,9 +182,9 @@ RowLayout {
         QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
         Accessible.name: cancel.text
         // Always ends the mode; a running export has its own Cancel in the window's strip.
-        onClicked: App.timeline.selectClear()
-        Keys.onEscapePressed: App.timeline.selectClear()
+        onClicked: root.chatModel.selectClear()
+        Keys.onEscapePressed: root.chatModel.selectClear()
     }
 
-    Keys.onEscapePressed: App.timeline.selectClear()
+    Keys.onEscapePressed: root.chatModel.selectClear()
 }

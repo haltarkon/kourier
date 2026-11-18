@@ -81,6 +81,14 @@ name = "core_ui"
 harness = false
 
 [[test]]
+name = "split_ui"
+harness = false
+
+[[test]]
+name = "split_win_ui"
+harness = false
+
+[[test]]
 name = "desktop"
 harness = false
 
@@ -110,6 +118,10 @@ harness = false
 
 [[test]]
 name = "export_ui"
+harness = false
+
+[[test]]
+name = "forward_ui"
 harness = false
 
 [[test]]

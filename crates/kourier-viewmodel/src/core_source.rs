@@ -127,6 +127,7 @@ const _: () = {
         MODEL_SEARCH,
         MODEL_FILTERS,
         MODEL_EXPORT,
+        MODEL_FORWARD,
     ];
     let mut i = 0;
     while i < ids.len() {
@@ -246,6 +247,8 @@ pub struct Changes {
     pub copy: bool,
     /// The export flow has something to tell ([`UiSource::take_export`]).
     pub export: bool,
+    /// The forward flow has something to tell ([`UiSource::take_forward`]).
+    pub forward: bool,
     /// The group's page changed or ended ([`UiSource::take_group`]).
     pub group: bool,
     /// The safety-number level has a new answer ([`UiSource::take_safety`]).
@@ -275,6 +278,66 @@ pub struct Changes {
     /// search started or ended, or a list read changed which hits may show (a chat that turned
     /// protected or left the list takes its hits off at once).
     pub search: bool,
+    /// What changed in the pane that is NOT in hand (split view): the front-end refreshes
+    /// that pane's models inside a visit of it ([`UiSource::visit_pane`]).
+    pub side: PaneChanges,
+    /// The split's shape or the active pane changed (a pane opened, closed, activated, or the
+    /// split collapsed): the front-end reads [`UiSource::side_open`] and
+    /// [`UiSource::active_pane`] again and refreshes both panes.
+    pub pane: bool,
+}
+
+/// The per-pane part of [`Changes`] for the pane that is not in hand: the flags of the same
+/// names, and `switch_to` (the parked pane's chat was merged into this one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaneChanges {
+    /// The timeline's rows.
+    pub timeline: bool,
+    /// The chat's header (or the pane was closed).
+    pub header: bool,
+    /// The lines under the messages on their way.
+    pub waits: bool,
+    /// The rings of the files that wait or upload.
+    pub uploads: bool,
+    /// Scroll to this message and highlight it.
+    pub jump: Option<MessageId>,
+    /// The chat's stored draft became known.
+    pub draft: bool,
+    /// The pane's chat was merged into this one: the pane switches to it.
+    pub switch_to: Option<ConversationId>,
+}
+
+impl PaneChanges {
+    /// Nothing changed.
+    pub const NONE: Self = Self {
+        timeline: false,
+        header: false,
+        waits: false,
+        uploads: false,
+        jump: None,
+        draft: false,
+        switch_to: None,
+    };
+
+    /// Whether anything changed.
+    pub fn any(&self) -> bool {
+        *self != Self::NONE
+    }
+
+    /// Adds `other`.
+    pub fn merge(&mut self, other: PaneChanges) {
+        self.timeline |= other.timeline;
+        self.header |= other.header;
+        self.waits |= other.waits;
+        self.uploads |= other.uploads;
+        self.draft |= other.draft;
+        if other.switch_to.is_some() {
+            self.switch_to = other.switch_to;
+        }
+        if other.jump.is_some() {
+            self.jump = other.jump;
+        }
+    }
 }
 
 impl Changes {
@@ -300,6 +363,7 @@ impl Changes {
         person: false,
         copy: false,
         export: false,
+        forward: false,
         group: false,
         safety: false,
         chat_media: false,
@@ -310,7 +374,27 @@ impl Changes {
         account_notice: true,
         told: false,
         search: true,
+        side: PaneChanges::NONE,
+        pane: false,
     };
+
+    /// The per-pane flags (timeline, header, waits, uploads, jump, draft, switch_to) of
+    /// `self` moved to [`Changes::side`]: what a visit of the pane that is not in hand found
+    /// out is about THAT pane; the global flags (notice, accounts, …) stay.
+    #[must_use]
+    pub fn moved_to_side(mut self) -> Self {
+        let moved = PaneChanges {
+            timeline: std::mem::take(&mut self.timeline),
+            header: std::mem::take(&mut self.header),
+            waits: std::mem::take(&mut self.waits),
+            uploads: std::mem::take(&mut self.uploads),
+            jump: self.jump.take(),
+            draft: std::mem::take(&mut self.draft),
+            switch_to: self.switch_to.take(),
+        };
+        self.side.merge(moved);
+        self
+    }
 
     /// Whether anything changed.
     pub fn any(&self) -> bool {
@@ -334,6 +418,7 @@ impl Changes {
             || self.person
             || self.copy
             || self.export
+            || self.forward
             || self.group
             || self.safety
             || self.chat_media
@@ -343,6 +428,8 @@ impl Changes {
             || self.transfer
             || self.told
             || self.search
+            || self.side.any()
+            || self.pane
     }
 
     /// Adds `other`.
@@ -364,6 +451,7 @@ impl Changes {
         self.person |= other.person;
         self.copy |= other.copy;
         self.export |= other.export;
+        self.forward |= other.forward;
         self.group |= other.group;
         self.safety |= other.safety;
         self.chat_media |= other.chat_media;
@@ -374,6 +462,8 @@ impl Changes {
         self.account_notice |= other.account_notice;
         self.told |= other.told;
         self.search |= other.search;
+        self.pane |= other.pane;
+        self.side.merge(other.side);
         if other.switch_to.is_some() {
             self.switch_to = other.switch_to;
         }
@@ -400,6 +490,9 @@ pub enum Completion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryTracker {
     model: u32,
+    /// The first generation this tracker issues (a split view's second pane counts from its own
+    /// base, so a token tells which pane asked).
+    base: u64,
     next: u64,
     in_flight: Option<u64>,
     dirty: bool,
@@ -410,9 +503,16 @@ pub struct QueryTracker {
 impl QueryTracker {
     /// A tracker for `model`.
     pub fn new(model: u32) -> Self {
+        Self::with_base(model, 1)
+    }
+
+    /// A tracker for `model` whose generations start at `base` (at least 1).
+    pub fn with_base(model: u32, base: u64) -> Self {
+        let base = base.max(1);
         Self {
             model,
-            next: 1,
+            base,
+            next: base,
             in_flight: None,
             dirty: false,
             applied: 0,
@@ -446,7 +546,9 @@ impl QueryTracker {
 
     /// A result arrived for `token`.
     pub fn complete(&mut self, token: QueryToken) -> Completion {
-        if token.model != self.model {
+        // A generation this tracker never issued (a pane that was dropped asked it, or a later
+        // pane): never raises `applied`.
+        if !self.issued(token) {
             return Completion::Stale;
         }
         if self.in_flight == Some(token.generation) {
@@ -457,6 +559,11 @@ impl QueryTracker {
         }
         self.applied = token.generation;
         Completion::Apply
+    }
+
+    /// Whether `token` is one this tracker issued (its model, a generation in `[base, next)`).
+    pub fn issued(&self, token: QueryToken) -> bool {
+        token.model == self.model && token.generation >= self.base && token.generation < self.next
     }
 
     /// The coalesced follow-up query, when invalidations arrived while one was in flight.
@@ -771,7 +878,7 @@ pub struct CoreSource {
     marks: std::cell::RefCell<MarkCache>,
     focused: bool,
     chat_visible: bool,
-    presence_sent: Option<(bool, Option<ConversationId>)>,
+    presence_sent: Option<(bool, Option<ConversationId>, Option<ConversationId>)>,
     last_marked: Option<(ConversationId, MessageId)>,
     /// Clicks whose notice waits for the list to show the change ([`Awaited`]).
     awaited: Vec<Awaited>,
@@ -856,6 +963,8 @@ pub struct CoreSource {
     copy_asked: Option<(u64, crate::person::CopyAsked)>,
     /// Export Selected: the stage and what the window has not been told ([`exporting`]).
     export: exporting::Export,
+    /// Forward: the dialog's plan, the jobs and the staged forwards ([`forwarding`]).
+    forward: forwarding::Forward,
     copy_generation: u64,
     copy_answer: Option<crate::person::CopyUpdate>,
     /// The person the details panel shows, as asked (the canonical id once an answer named it).
@@ -916,6 +1025,23 @@ pub struct CoreSource {
     /// tells the ones that came before the front-end was ready once more at `UiReady`, and an
     /// outcome told live in between may have a higher number than ones only the replay brings.
     logout_seen: std::collections::BTreeSet<u64>,
+
+    // Split view (`split.rs`): the pane that is NOT in hand. With `side == None` nothing of it
+    // runs and every line behaves as before the split existed.
+    /// The pane not in hand (its per-open-chat fields, see [`split::PaneState`]).
+    side: Option<Box<split::PaneState>>,
+    /// Which pane (0 left, 1 right) the fields of this struct hold now.
+    here: u8,
+    /// The in-hand fields are only borrowed from the inactive pane ([`CoreSource::visit_pane`]):
+    /// no mark-read, no presence, no typing.
+    visiting: bool,
+    /// `on_event` runs for the pane in hand inside [`CoreSource::on_split_event`].
+    in_event: bool,
+    /// The front-end says the pane not in hand is on screen (a window too narrow for two chats
+    /// hides it): it counts for the notification rule only.
+    side_shown: bool,
+    /// How many panes were made: the base of a new pane's query generations.
+    pane_epoch: u64,
 }
 
 /// How long a click on Archive, Unarchive or Mark as Unread waits for the core's row to say it
@@ -1104,6 +1230,7 @@ impl CoreSource {
             person_q: QueryTracker::new(MODEL_PERSON),
             copy_asked: None,
             export: Default::default(),
+            forward: Default::default(),
             copy_generation: 0,
             copy_answer: None,
             safety_q: QueryTracker::new(MODEL_SAFETY),
@@ -1139,6 +1266,12 @@ impl CoreSource {
             action_asked: None,
             logout_notices: Vec::new(),
             logout_seen: std::collections::BTreeSet::new(),
+            side: None,
+            here: 0,
+            visiting: false,
+            in_event: false,
+            side_shown: false,
+            pane_epoch: 0,
         }
     }
 
@@ -1533,6 +1666,13 @@ impl CoreSource {
         token: QueryToken,
         result: &Result<QueryData, std::sync::Arc<kourier_core::facade::CoreError>>,
     ) -> Changes {
+        // An answer to the pane that is not in hand is handled inside a visit of it.
+        if self.parked_issued(token) {
+            self.begin_visit();
+            let ch = self.on_query_result(token, result);
+            self.end_visit();
+            return ch.moved_to_side();
+        }
         let mut ch = Changes::default();
         match token.model {
             MODEL_ACCOUNTS => {
@@ -1990,6 +2130,10 @@ impl CoreSource {
                     _ => None,
                 };
                 ch.merge(self.on_export_plan(token, plan));
+            }
+            MODEL_FORWARD => {
+                let data = result.as_ref().ok();
+                ch.merge(self.on_forward_plan(token, data));
             }
             model if media_slots::slot_of_model(model).is_some() => {
                 if let Some(slot) = media_slots::slot_of_model(model) {
@@ -2513,6 +2657,10 @@ impl CoreSource {
     /// Sends `MarkRead` when the open conversation is visible, focused, scrolled to its newest
     /// messages and has an incoming message not marked yet.
     fn maybe_mark_read(&mut self) {
+        // Only the active pane marks read: a visit borrows the inactive one.
+        if self.visiting {
+            return;
+        }
         let Some(conv) = self.open else { return };
         if !(self.focused && self.chat_visible && self.window.loaded && !self.window.has_newer) {
             return;
@@ -2633,13 +2781,25 @@ impl CoreSource {
     }
 
     fn send_presence(&mut self) {
+        // A visit borrows the inactive pane: what it says is not what the window shows.
+        if self.visiting {
+            return;
+        }
         let visible = if self.chat_visible { self.open } else { None };
-        let now = (self.focused, visible);
+        // The chat of the pane not in hand counts for the notification rule only, and only
+        // while the front-end shows that pane.
+        let beside = if self.chat_visible && self.side_shown {
+            self.side.as_ref().and_then(|s| s.open)
+        } else {
+            None
+        };
+        let now = (self.focused, visible, beside);
         if self.presence_sent != Some(now) {
             self.presence_sent = Some(now);
             self.send(UiCommand::SetPresence {
                 focused: self.focused,
                 visible,
+                beside,
             });
         }
     }
@@ -2648,7 +2808,10 @@ impl CoreSource {
         if self.open.is_none() {
             return Changes::default();
         }
-        if let Some((conv, _)) = self.typing_sent.take() {
+        // (A visit borrows the inactive pane: its close leaves what is the active pane's alone.)
+        if !self.visiting
+            && let Some((conv, _)) = self.typing_sent.take()
+        {
             self.send(UiCommand::SetTyping { conv, on: false });
         }
         self.open = None;
@@ -2676,7 +2839,9 @@ impl CoreSource {
         self.downloads.clear();
         self.send_phases.clear();
         self.uploads.clear();
-        self.revisions_shown = None;
+        if !self.visiting {
+            self.revisions_shown = None;
+        }
         self.send_presence();
         Changes {
             timeline: true,
@@ -3268,8 +3433,15 @@ impl CoreSource {
     fn on_download_progress(&mut self, attachment: AttachmentId, done: u64, total: u64) -> Changes {
         // The gallery slots that hold the attachment (people pages P4) show it too.
         let mut ch = self.media_download_progress(attachment, done, total);
+        ch.timeline |= self.pane_download_progress(attachment, done, total);
+        ch
+    }
+
+    /// The pane in hand's part of [`Self::on_download_progress`] (the pane not in hand repeats
+    /// it in a visit): whether the shown percentage of a row's file changed.
+    fn pane_download_progress(&mut self, attachment: AttachmentId, done: u64, total: u64) -> bool {
         if self.open.is_none() || total == 0 {
-            return ch;
+            return false;
         }
         let shown = self
             .window
@@ -3278,12 +3450,11 @@ impl CoreSource {
             .flat_map(|r| attachments_of(&r.body))
             .any(|a| a.id == Some(attachment));
         if !shown {
-            return ch;
+            return false;
         }
         let p = (done as f64 / total as f64).clamp(0.0, 1.0) as f32;
         let old = self.downloads.insert(attachment, p).unwrap_or(0.0);
-        ch.timeline |= (p * 100.0).floor() != (old * 100.0).floor();
-        ch
+        (p * 100.0).floor() != (old * 100.0).floor()
     }
 
     /// `UiEvent::HistoryTransfer`: where the transfer of `account` stands now. The same
@@ -3794,7 +3965,18 @@ impl CoreSource {
     /// The end (ms) of the open chat's own mute, when it has a bounded one: "always" (the
     /// largest instant) never ends and needs no tick.
     fn open_mute_end(&self) -> Option<i64> {
-        let row = self.row_of(self.open?)?;
+        self.mute_end_of(self.open?)
+    }
+
+    /// As [`Self::open_mute_end`] for any shown chat (the pane not in hand too).
+    fn mute_end_of(&self, conv: ConversationId) -> Option<i64> {
+        let row = self.row_of(conv).or_else(|| {
+            self.side
+                .as_ref()
+                .and_then(|s| s.detail.as_ref())
+                .map(|d| &d.row)
+                .filter(|r| r.id == conv)
+        })?;
         [row.muted_until, row.local_muted_until]
             .into_iter()
             .flatten()
@@ -4317,7 +4499,8 @@ impl CoreSource {
     }
 
     /// The viewmodel rows of the core rows `rows` (oldest first), by the one mapping the
-    /// timeline uses; Copy as Text and the exports build theirs through it too.
+    /// timeline uses; Copy as Text and the exports build theirs through it too. The author lines
+    /// follow the OPEN chat's kind.
     fn rows_of(
         &self,
         rows_in: &[CoreMessage],
@@ -4326,11 +4509,25 @@ impl CoreSource {
         read_more: &ReadMore,
         time: &TimeContext<'_>,
     ) -> Vec<MessageRow> {
-        let rows = rows_in;
         let is_group = self
             .detail
             .as_ref()
             .is_some_and(|d| d.row.kind != ConvKind::Direct);
+        self.rows_of_kind(rows_in, unread_from, has_older, read_more, time, is_group)
+    }
+
+    /// `rows_of` for rows of a chat that need not be the open one: `is_group` decides the author
+    /// lines and pictures (the forward's picture look, F7).
+    fn rows_of_kind(
+        &self,
+        rows_in: &[CoreMessage],
+        unread_from: Option<MessageId>,
+        has_older: bool,
+        read_more: &ReadMore,
+        time: &TimeContext<'_>,
+        is_group: bool,
+    ) -> Vec<MessageRow> {
+        let rows = rows_in;
         let by_id: HashMap<MessageId, &CoreMessage> = rows.iter().map(|r| (r.id, r)).collect();
         let names = &self.names;
         let (hold, safety_number, who) = self.wait_context();
@@ -4366,6 +4563,7 @@ impl CoreSource {
                 }),
                 expiry: r.expiry.as_ref(),
                 wait,
+                forward: timeline::ForwardMark::of(r.forwarded),
             }
         });
         let mut rows = timeline::build_rows(
@@ -4795,6 +4993,7 @@ fn row_actions(a: &MessageActions) -> RowActions {
         save_attachments: !a.save_attachments.is_empty(),
         show_sender: a.show_sender,
         show_people: !a.show_people.is_empty(),
+        forward: a.forward,
     }
 }
 
@@ -6127,6 +6326,87 @@ impl UiSource for CoreSource {
         self.take_export_now()
     }
 
+    fn forward_open(&mut self, source: ConversationId, messages: Vec<MessageId>) -> Changes {
+        self.forward_open_now(source, messages)
+    }
+
+    fn forward_targets(&self) -> Vec<crate::forward::ForwardTarget> {
+        self.forward_targets_now()
+    }
+
+    fn forward_tick(&mut self, targets: Vec<ConversationId>) -> Changes {
+        self.forward_tick_now(targets)
+    }
+
+    fn forward_send(
+        &mut self,
+        look: kourier_core::facade::ForwardLook,
+        comment: &str,
+    ) -> Option<u64> {
+        self.forward_send_now(look, comment)
+    }
+
+    fn forward_abandon(&mut self) {
+        self.forward_abandon_now();
+    }
+
+    fn forward_without(&mut self, request: u64, send: bool) -> Changes {
+        self.forward_without_now(request, send)
+    }
+
+    fn forward_cancel(&mut self, request: u64) -> Changes {
+        self.forward_cancel_now(request)
+    }
+
+    fn forward_pictures(&mut self, request: u64, paths: Vec<std::path::PathBuf>) -> Changes {
+        self.forward_pictures_now(request, paths)
+    }
+
+    fn forward_render_rows(&self, request: u64) -> Vec<MessageRow> {
+        self.forward_render_rows_now(request)
+    }
+
+    fn stage_forward(
+        &mut self,
+        target: ConversationId,
+        source: ConversationId,
+        messages: Vec<MessageId>,
+    ) -> bool {
+        self.stage_forward_now(target, source, messages)
+    }
+
+    fn forward_of(&self, conv: ConversationId) -> Option<crate::forward::StagedForward> {
+        self.forward_of_now(conv)
+    }
+
+    fn set_forward_look(
+        &mut self,
+        conv: ConversationId,
+        look: kourier_core::facade::ForwardLook,
+    ) -> bool {
+        self.set_forward_look_now(conv, look)
+    }
+
+    fn drop_forward(&mut self, conv: ConversationId) -> bool {
+        self.drop_forward_now(conv)
+    }
+
+    fn send_staged_forward(&mut self, conv: ConversationId, comment: &str) -> bool {
+        self.send_staged_forward_now(conv, comment)
+    }
+
+    fn set_forward_default(&mut self, look: kourier_core::facade::ForwardLook) {
+        self.set_forward_default_now(look);
+    }
+
+    fn forward_default(&self) -> kourier_core::facade::ForwardLook {
+        self.forward_default_now()
+    }
+
+    fn take_forward(&mut self) -> Vec<crate::forward::ForwardUpdate> {
+        self.take_forward_now()
+    }
+
     fn request_safety(&mut self, account: AccountId, user: UserId) -> bool {
         self.safety_shown = Some((account, user));
         self.safety_answer = None;
@@ -6513,6 +6793,11 @@ impl UiSource for CoreSource {
     }
 
     fn open_at(&mut self, id: ConversationId, message: MessageId) -> Changes {
+        if !self.visiting && self.side.as_ref().is_some_and(|s| s.open == Some(id)) {
+            let mut ch = self.activate_pane(self.here ^ 1);
+            ch.merge(self.open_at(id, message));
+            return ch;
+        }
         if self.open == Some(id) {
             if self.window.loaded {
                 // L1: a loaded row is shown at once; else the window moves around it.
@@ -6587,7 +6872,13 @@ impl UiSource for CoreSource {
     }
 
     fn flags_deadline(&self) -> Option<Instant> {
-        self.flags_deadline
+        [
+            self.flags_deadline,
+            self.side.as_ref().and_then(|s| s.flags_deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn timeline_fetches(&self) -> Vec<&'static str> {
@@ -6607,6 +6898,10 @@ impl UiSource for CoreSource {
         .count()
             // (The hits of a search: an answer on its way, or a read again waiting for its time.)
             + usize::from(self.search.pending())
+            + self
+                .side
+                .as_ref()
+                .map_or(0, |s| usize::from(s.detail_q.pending()) + usize::from(s.timeline_q.pending()))
     }
 
     fn refresh_flags(&mut self) -> Changes {
@@ -6614,6 +6909,17 @@ impl UiSource for CoreSource {
             // Read once; the answer sets the next deadline.
             self.flags_deadline = None;
             self.reload_timeline();
+        }
+        if !self.visiting
+            && self
+                .side
+                .as_ref()
+                .is_some_and(|s| s.flags_deadline.is_some_and(|at| at <= Instant::now()))
+        {
+            self.begin_visit();
+            self.flags_deadline = None;
+            self.reload_timeline();
+            self.end_visit();
         }
         Changes::default()
     }
@@ -6864,10 +7170,15 @@ impl UiSource for CoreSource {
     }
 
     fn is_open(&self, id: ConversationId) -> bool {
-        self.open == Some(id)
+        self.open == Some(id) || self.side.as_ref().is_some_and(|s| s.open == Some(id))
     }
 
     fn on_event(&mut self, event: &UiEvent) -> Changes {
+        // With a split the event goes through `on_split_event` (split.rs), which comes back
+        // here for the pane in hand and then lets the other pane react.
+        if self.side.is_some() && !self.visiting && !self.in_event {
+            return self.on_split_event(event);
+        }
         match event {
             // The hold is a state: the event is the newest word (the rows carry it for a
             // start). The banner and the line under the messages that wait say it.
@@ -7160,7 +7471,8 @@ impl UiSource for CoreSource {
                 self.refresh_media_of(*conv);
                 // And the hits of that chat (a message deleted, expired or edited; H5).
                 self.reread_search_if(|c| c == *conv);
-                Changes::default()
+                // A forward that waits for files of that chat asks its plan again.
+                self.forward_source_changed(*conv)
             }
             // The core stored the messages of a send of files (their rows are announced by
             // `MessagesChanged`): it is no longer in preparation, and the composer may
@@ -7169,6 +7481,12 @@ impl UiSource for CoreSource {
                 files: self.end_preparing(*request, SendOutcome::Stored),
                 ..Changes::default()
             },
+            // The end of a forward (F5 shows it); nothing to do below the card yet.
+            UiEvent::ForwardEnded {
+                request,
+                sent,
+                refused,
+            } => self.on_forward_ended(*request, sent, refused),
             UiEvent::Progress(p @ Progress::Export { .. }) => self.on_export_progress(p),
             UiEvent::Progress(Progress::Import {
                 request,
@@ -7367,7 +7685,48 @@ impl UiSource for CoreSource {
         }
     }
 
+    fn open_side(&mut self, id: ConversationId) -> Changes {
+        CoreSource::open_side(self, id)
+    }
+
+    fn close_pane(&mut self, pane: u8) -> Changes {
+        CoreSource::close_pane(self, pane)
+    }
+
+    fn activate_pane(&mut self, pane: u8) -> Changes {
+        CoreSource::activate_pane(self, pane)
+    }
+
+    fn swap_sides(&mut self) -> Changes {
+        CoreSource::swap_sides(self)
+    }
+
+    fn active_pane(&self) -> u8 {
+        CoreSource::active_pane(self)
+    }
+
+    fn side_open(&self) -> bool {
+        self.side.is_some()
+    }
+
+    fn pane_of(&self, id: ConversationId) -> Option<u8> {
+        CoreSource::pane_of(self, id)
+    }
+
+    fn visit_pane(&mut self, pane: u8) {
+        CoreSource::visit_pane(self, pane);
+    }
+
+    fn end_visit(&mut self) {
+        CoreSource::end_visit(self);
+    }
+
+    fn set_side_shown(&mut self, shown: bool) -> Changes {
+        CoreSource::set_side_shown(self, shown)
+    }
+
     fn reload(&mut self) -> Changes {
+        let side = self.reload_side();
         // After a lagged channel an `AccountAdded` may be lost: do not wait for it forever.
         self.adds.clear();
         if let Some(r) = self.replacing.take() {
@@ -7396,15 +7755,27 @@ impl UiSource for CoreSource {
         self.reload_timeline();
         // (A lost event may have named a chat of the shown hits.)
         self.reread_search();
-        Changes {
+        let mut ch = Changes {
             files,
             transfer: progress,
             accounts: progress,
             ..Changes::default()
-        }
+        };
+        ch.merge(side);
+        ch
     }
 
     fn open_conversation(&mut self, id: Option<ConversationId>) -> Changes {
+        if !self.visiting && self.side.is_some() {
+            match id {
+                // The same chat is never in both panes: the pane that shows it is activated.
+                Some(id) if self.side.as_ref().is_some_and(|s| s.open == Some(id)) => {
+                    return self.activate_pane(self.here ^ 1);
+                }
+                None => return self.close_pane(self.here),
+                _ => {}
+            }
+        }
         if id == self.open {
             return Changes::default();
         }
@@ -7638,12 +8009,14 @@ impl UiSource for CoreSource {
     fn tick(&mut self) -> Changes {
         let now = self.now_ms();
         let mut ch = Changes::default();
+        let parked = self.side.as_ref().and_then(|s| s.open);
         for (conv, list) in &mut self.typing {
             let before = list.len();
             list.retain(|(_, until)| *until > now);
             if list.len() != before {
                 ch.conversations = true;
                 ch.header |= self.open == Some(*conv);
+                ch.side.header |= parked == Some(*conv);
             }
         }
         self.typing.retain(|_, l| !l.is_empty());
@@ -7653,6 +8026,7 @@ impl UiSource for CoreSource {
             self.avatars_waiting.set(false);
             ch.conversations = true;
             ch.header = true;
+            ch.side.header = self.side.is_some();
         }
         // A banner that is written for a time (a ban's end, a hold's end) changes when the
         // time comes: the core sends no event for it.
@@ -7666,12 +8040,18 @@ impl UiSource for CoreSource {
         // and a mute that ends offers Mute again: the core sends no event for either, so the
         // header (which carries the offer) is raised when the end passed between two ticks or
         // the local date changed under a muted chat (M2).
-        if let Some(before) = before
-            && let Some(end) = self.open_mute_end()
-        {
-            let time = TimeContext::new(now, self.calendar.as_ref());
-            if (end > before && end <= now) || time.day_number(before) != time.day_number(now) {
+        let time = TimeContext::new(now, self.calendar.as_ref());
+        if let Some(before) = before {
+            let passed = |end: i64| {
+                (end > before && end <= now) || time.day_number(before) != time.day_number(now)
+            };
+            if self.open_mute_end().is_some_and(passed) {
                 ch.header = true;
+            }
+            if let Some(conv) = parked
+                && self.mute_end_of(conv).is_some_and(passed)
+            {
+                ch.side.header = true;
             }
         }
         // A pushed history nobody has heard of for a while is over for the person: the
@@ -7686,10 +8066,12 @@ impl UiSource for CoreSource {
             let open_here = self
                 .open
                 .is_some_and(|c| self.filling.get(&c) == Some(&account));
+            let parked_here = parked.is_some_and(|c| self.filling.get(&c) == Some(&account));
             if self.end_fills(account) {
                 ch.accounts = true;
                 ch.transfer = true;
                 ch.header |= open_here;
+                ch.side.header |= parked_here;
             }
         }
         // The line under a message on its way counts the seconds once it is shown: those
@@ -7704,6 +8086,16 @@ impl UiSource for CoreSource {
         {
             ch.waits = true;
         }
+        if let Some(side) = self.side.as_ref()
+            && side.open.is_some()
+            && side
+                .window
+                .rows
+                .iter()
+                .any(|r| r.outbox.is_some() && r.sent_at <= shown_from)
+        {
+            ch.side.waits = true;
+        }
         ch
     }
 
@@ -7715,6 +8107,12 @@ impl UiSource for CoreSource {
             || !self.fills.is_empty()
             || self.banner_instants().any(|t| t > now)
             || self.open_mute_end().is_some_and(|t| t > now)
+            || self.side.as_ref().is_some_and(|s| {
+                s.sends_waiting()
+                    || s.open
+                        .and_then(|c| self.mute_end_of(c))
+                        .is_some_and(|t| t > now)
+            })
     }
 
     fn unread_total(&self) -> u32 {
@@ -7728,6 +8126,8 @@ impl UiSource for CoreSource {
     }
 }
 
+mod split;
+
 mod media_slots;
 
 mod searching;
@@ -7735,11 +8135,17 @@ mod searching;
 mod exporting;
 pub use exporting::MODEL_EXPORT;
 
+mod forwarding;
+pub use forwarding::MODEL_FORWARD;
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod export_tests;
+
+#[cfg(test)]
+mod forward_tests;
 
 #[cfg(test)]
 mod action_tests;
@@ -7791,3 +8197,6 @@ mod search_tests;
 
 #[cfg(test)]
 mod filters_tests;
+
+#[cfg(test)]
+mod split_tests;

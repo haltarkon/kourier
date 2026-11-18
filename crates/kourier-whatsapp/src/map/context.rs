@@ -27,6 +27,16 @@ pub(super) fn info_of(base: &wa::Message) -> Option<&wa::ContextInfo> {
     base.context_info()
 }
 
+/// The forward state a context info states: `Some` when the message reached us as a forward, with the
+/// wire's count of earlier forwards as it is (127, WA Web's "frequently forwarded" sentinel, is kept; a
+/// forward that states no score is a first one, 0). Every content kind that has a context info carries it.
+pub(super) fn forwarded(info: Option<&wa::ContextInfo>) -> Option<kourier_model::Forwarded> {
+    let info = info.filter(|i| i.is_forwarded == Some(true))?;
+    Some(kourier_model::Forwarded {
+        score: info.forwarding_score.unwrap_or(0),
+    })
+}
+
 /// The people a context mentions, in the order it lists them. A JID that is not a person (a bot, a
 /// community) is dropped: its `@name` stays plain text. `me` is set for one of our own ids, a LID or a number.
 fn mentioned(info: Option<&wa::ContextInfo>, ctx: &Ctx) -> Vec<Mentioned> {

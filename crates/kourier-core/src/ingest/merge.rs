@@ -903,6 +903,13 @@ impl Apply<'_> {
                 .prepare_cached("DELETE FROM reactions WHERE message_id = ?1")?
                 .execute([keep.id.0])?;
         }
+        // The forward state: the surviving row's, or the other's when the survivor has none.
+        self.conn
+            .prepare_cached(
+                "UPDATE messages SET forwarded = (SELECT forwarded FROM messages WHERE id = ?2)
+                 WHERE id = ?1 AND forwarded IS NULL",
+            )?
+            .execute((keep.id.0, drop.id.0))?;
         self.delete_attachments(drop.id)?;
         self.conn
             .prepare_cached("DELETE FROM messages WHERE id = ?1")?

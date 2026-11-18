@@ -856,6 +856,15 @@ impl AccountTable {
         }
     }
 
+    /// The chip text and the color of an account, as its chat rows would carry them where
+    /// several accounts are shown (the forward dialog's rows); `None` for an unlisted account.
+    pub fn chip_and_tint(&self, id: AccountId) -> Option<(String, String)> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.chip.clone(), e.tint.clone()))
+    }
+
     /// Sets the icon, chip, number and panel place of `row` (its `account` names the entry).
     pub fn decorate(&self, row: &mut ConversationRow) {
         row.badge_icon = if self.badge {

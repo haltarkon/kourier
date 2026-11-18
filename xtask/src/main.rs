@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod appimage;
 mod cleaned;
 mod demo;
 mod dist;
@@ -128,7 +129,7 @@ fn real_main() -> Result<()> {
         Some("uninstall") => install::uninstall(&args[1..]),
         _ => {
             eprintln!(
-                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|threema-run <start|id|answer|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|emoji|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]>"
+                "usage: cargo xtask <ci [--quick [--since <rev>]] [--keep-target] [--no-wait] [--force]|lock [--no-wait] -- <command>|prune [--dry-run]|deps-check|symbols-check [binary]|shots [dir] [--page a,b] [--theme light|dark] [--size wide|narrow] [--jobs N] [--no-build] [--accept] [--no-compare] [--no-wait] [--matrix [--variant a,b]]|demo [--out <dir>] [--interactive]|smoke <start|step|steps|state|report|stop|backup|wipe|rehearse> …|wa-run <start|tail|step|steps|state|report|stop|backup|wipe|rehearse> …|tg-run <connect|rehearse|wipe|ranges> …|threema-run <start|id|answer|step|steps|state|report|stop|backup|wipe|rehearse> …|perf [--out <file>] [--quick] [--report-only]|tdlib <build [--jobs N] [--fetch-gperf] [--detach|--foreground] [--unpatched]|check [--lib <path>] [--unpatched]|path [--unpatched]>|i18n <extract|check|build [--out <dir>]>|emoji|install (--prefix <dir>|--user)|uninstall (--prefix <dir>|--user)|dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build] [--no-appimage]>"
             );
             std::process::exit(2);
         }
@@ -765,7 +766,7 @@ fn target_dir() -> PathBuf {
 /// network's linking walk) for the first three, `--fixture` (the fake account's demo data in
 /// `core.db`) for the rest. Every `--page` value is here (`PAGES` in `crates/kourier-qt/src/lib.rs`;
 /// a test compares the two).
-const SHOT_PAGES: [&str; 107] = [
+const SHOT_PAGES: [&str; 112] = [
     "welcome",
     "link",
     "qr",
@@ -873,6 +874,11 @@ const SHOT_PAGES: [&str; 107] = [
     "select",
     "exportdialog",
     "exportdone",
+    "forward",
+    "forwardcard",
+    "split",
+    "splitnarrow",
+    "splitpick",
 ];
 
 /// Pages that look the same in both color schemes: the image viewer covers the window with a

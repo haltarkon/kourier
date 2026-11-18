@@ -196,6 +196,7 @@ fn the_attempt_reads_a_file_messages_own_record_and_a_caption_edits_targets() {
         body,
         reply_to: None,
         expiry: None,
+        forward: None,
     };
     assert_eq!(
         key_of(&req("3EB0F11E00000029384756", message(files()))),

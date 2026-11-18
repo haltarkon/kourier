@@ -170,6 +170,7 @@ pub(super) fn message(conv: i64, n: i64, unread: bool) -> CoreMessage {
         view_once: false,
         history: false,
         mentions_me: false,
+        forwarded: None,
         outbox: None,
         actions: Default::default(),
     }
@@ -197,6 +198,8 @@ pub(super) struct Store {
     pub(super) protected: Vec<i64>,
     /// What `Query::ExportPlan` answers (Export Selected); none = a plan of no messages.
     pub(super) plan: Option<kourier_core::facade::ExportPlan>,
+    /// What `Query::ForwardPlan` answers (Forward); none = an empty plan of the asked source.
+    pub(super) forward_plan: Option<kourier_core::facade::ForwardPlan>,
 }
 
 impl Store {
@@ -366,6 +369,23 @@ impl Store {
                         now: NOW,
                     },
                 )))
+            }
+            Query::ForwardPlan { source, .. } if self.forward_plan.is_some() => {
+                let mut p = self.forward_plan.clone().expect("checked");
+                p.source = *source;
+                QueryData::ForwardPlan(Box::new(p))
+            }
+            Query::ForwardPlan { source, .. } => {
+                QueryData::ForwardPlan(Box::new(kourier_core::facade::ForwardPlan {
+                    source: *source,
+                    now: NOW,
+                    messages: Vec::new(),
+                    targets: Vec::new(),
+                    to_download: Vec::new(),
+                    lost: Vec::new(),
+                    limits: Vec::new(),
+                    many: false,
+                }))
             }
             Query::ExpiryPolicy => QueryData::ExpiryPolicy(Default::default()),
             Query::QuietNotices => QueryData::QuietNotices(false),
@@ -1531,7 +1551,8 @@ fn mark_read_when_visible_and_focused() {
         c,
         UiCommand::SetPresence {
             focused: true,
-            visible: Some(ConversationId(1))
+            visible: Some(ConversationId(1)),
+            beside: None,
         }
     )));
     src.set_presence(true, true);

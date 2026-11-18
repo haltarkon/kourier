@@ -22,7 +22,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::error::Result;
 
-pub use crate::actions::{ExportVerdict, LeftOut};
+pub use crate::actions::{ExportVerdict, ForwardVerdict, LeftOut};
 /// The error of [`UiEvent::ActionFailed`] and of a failed query, so a UI can tell a refusal
 /// from a network failure by its kind instead of its text, and one refusal from another by
 /// its [`Refusal`] ([`CoreError::refusal`]).
@@ -33,6 +33,15 @@ pub use crate::filters;
 pub use crate::filters::{
     Filter, FilterId, FilterRefusal, FilterSet, FilterSpec, FilterTexts, OwnedFilterTexts,
 };
+pub use crate::forward::{
+    Converted, ForwardChange, ForwardFile, ForwardLook, ForwardPart, ForwardPlan, ForwardRefusal,
+    PlannedForward, PlannedTarget,
+};
+/// Test door: the next forward job of this conversation fails after its first part was stored.
+#[doc(hidden)]
+pub fn inject_forward_fault(conv: Option<kourier_model::ConversationId>) {
+    crate::runtime::inject_forward_fault(conv);
+}
 pub use crate::media::{MEDIA_HANDLES, MediaBlob, MediaEntry, MediaHandles, MediaVariant};
 pub use crate::search::snippet::{Mark as SnippetMark, Snippet};
 /// What [`UiEvent::Notice`] carries, so a front-end can name the notice it shows (the quiet line
@@ -161,6 +170,10 @@ pub enum UiCommand {
         focused: bool,
         /// The open conversation.
         visible: Option<ConversationId>,
+        /// A second conversation shown beside the open one (split view). It counts for the
+        /// notification rule only (a focused window does not announce it), never for the
+        /// networks' presence.
+        beside: Option<ConversationId>,
     },
     /// The user read the conversation up to its newest message (durable read sync and read
     /// receipts, §4.8). Every unread row is read, imported ones too, and our other devices
@@ -281,6 +294,37 @@ pub enum UiCommand {
         account: AccountId,
         /// Whose card it is.
         user: UserId,
+    },
+    /// Forward messages of `source` to every chat of `targets` (forward line F3, architecture
+    /// §4.8). The core plans it again ([`Query::ForwardPlan`]'s function) and re-asks the
+    /// flag's rule, then makes ONE job per target through that chat's compose queue: all of its
+    /// messages are stored and queued or none, the files are copied into the target account's
+    /// blob store first. Ended by exactly one [`UiEvent::ForwardEnded`] naming the targets that
+    /// were queued and the refused ones; one target's refusal leaves the others. Nothing of
+    /// any target's draft is touched.
+    Forward {
+        /// The UI's id of this request, echoed in [`UiEvent::ForwardEnded`].
+        request: RequestId,
+        /// The chat the messages are in.
+        source: ConversationId,
+        /// The messages the UI shows, each of which must still go (else every target is
+        /// refused with [`ForwardRefusal::SourceChanged`]).
+        messages: Vec<MessageId>,
+        /// The chats to forward to, native (same account) or converted.
+        targets: Vec<ConversationId>,
+        /// The look of a converted forward.
+        look: ForwardLook,
+        /// The UI's header line for the FIRST message of each run (converted targets, looks
+        /// `Header` and `Quoted` only).
+        headers: Vec<(MessageId, Text)>,
+        /// The comment: sent first, as a text, to every target (with the look `Picture` the
+        /// caption of the first picture of a converted target).
+        comment: Option<Text>,
+        /// The pictures of the look `Picture` (the front end renders them; converted targets
+        /// only). Paths are personal data: `Debug` hides them.
+        pictures: kourier_model::Redacted<Vec<PathBuf>>,
+        /// Files the user agreed to leave out (not here, or lost).
+        without: Vec<kourier_model::AttachmentId>,
     },
     /// Download an attachment the policy left for a click, or retry a failed download (§5.8).
     /// Answered with invalidations (`Downloading`, then `Local` or `Failed`) and
@@ -960,6 +1004,15 @@ pub enum UiEvent {
         /// More batches follow.
         has_more: bool,
     },
+    /// A [`UiCommand::Forward`] is over: every target is queued or refused.
+    ForwardEnded {
+        /// The command's `request`.
+        request: RequestId,
+        /// The targets that were queued, in the order asked.
+        sent: Vec<ConversationId>,
+        /// The refused targets and why.
+        refused: Vec<(ConversationId, ForwardRefusal)>,
+    },
     /// The messages of a [`UiCommand::SendFiles`] exist: every file is copied and the whole
     /// send is stored and queued (the invalidations for the rows come with it). It ends the
     /// request: the UI can stop saying "preparing" and may delete the source files it made
@@ -1454,6 +1507,19 @@ pub enum Query {
         /// The messages asked for, in any order.
         ids: Vec<MessageId>,
     },
+    /// What forwarding the messages `messages` of `source` to the chats `targets` would do
+    /// ([`ForwardPlan`]): per message its verdict, per target whether it is native, why it is
+    /// refused and what the conversion changes, the files to download first and the lost ones,
+    /// and the limits. The rows come through the by-id read of [`Query::MessagesByIds`].
+    /// Answered with [`QueryData::ForwardPlan`].
+    ForwardPlan {
+        /// The conversation the messages are in.
+        source: ConversationId,
+        /// The messages asked for, in any order.
+        messages: Vec<MessageId>,
+        /// The target chats, in the order the user ticked them.
+        targets: Vec<ConversationId>,
+    },
     /// One conversation with members and features.
     Conversation(ConversationId),
     /// The files of one attachment (media-handle misses, §8.6; runs on the third read
@@ -1547,6 +1613,8 @@ pub enum QueryData {
     MessagesByIds(TimelinePage),
     /// [`Query::ExportPlan`].
     ExportPlan(Box<ExportPlan>),
+    /// [`Query::ForwardPlan`].
+    ForwardPlan(Box<ForwardPlan>),
     /// [`Query::Conversation`]; `None` when it does not exist.
     Conversation(Option<Box<ConversationDetail>>),
     /// [`Query::Attachment`]; `None` when it does not exist.
@@ -2745,6 +2813,13 @@ pub enum OriginKind {
     OwnOtherDevice,
 }
 
+/// The forward mark of a message ([`MessageRow::forwarded`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForwardedMark {
+    /// Forwarded many times (`ForwardRules::is_many` of the row's network).
+    pub many: bool,
+}
+
 /// One timeline row.
 ///
 /// A call line (`body.call_line()`, `Body::System(SystemEvent::Call(..))`) is one row per
@@ -2808,6 +2883,9 @@ pub struct MessageRow {
     pub history: bool,
     /// We are mentioned.
     pub mentions_me: bool,
+    /// The message reached this chat as a forward: `Some` only when the row's stored forward
+    /// state is set AND its network states `forwards` (`NetworkDescriptor::forwards`).
+    pub forwarded: Option<ForwardedMark>,
     /// Where the own send of this message stands while it is still on its way: `Some` for an
     /// own message whose send row is in the outbox and not `Failed` (queued, being stored as
     /// part of a large send, in flight, or waiting for its next try); `None` otherwise. Durable:
@@ -2875,6 +2953,11 @@ pub struct MessageActions {
     pub delete_attachment: bool,
     /// The row has text to copy (a text, or a caption).
     pub copy: bool,
+    /// The message may be forwarded ([`crate::actions::may_forward`], the one rule the forward
+    /// plan's [`ForwardVerdict::Goes`] is too): a text, media, sticker, contact, location or poll
+    /// that is not deleted, not view-once, not hidden by its timer, not waiting for the rest of
+    /// a long text, in a chat that does not forbid forwarding out of it.
+    pub forward: bool,
     /// No recipient has the message yet (queued, or refused by the network): either delete
     /// simply takes it back, so one "Delete" is enough. False for a message that waits for a
     /// retry or whose send gave up on attempts without an answer: it may be with the server,

@@ -442,8 +442,14 @@ fn protected_message_carries_meta() {
         (f.origin.as_str(), f.date),
         ("messageOriginUser", 1_700_000_100)
     );
+    // The forward state (F1): a message with `forward_info` is a first-count forward.
+    assert_eq!(
+        mapped(27).forwarded,
+        Some(kourier_model::Forwarded { score: 0 })
+    );
     // An ordinary message has none.
     assert!(mapped(1).meta.is_none());
+    assert_eq!(mapped(1).forwarded, None);
 }
 
 #[test]

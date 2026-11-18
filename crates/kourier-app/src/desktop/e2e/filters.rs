@@ -241,6 +241,7 @@ async fn filters_name_their_notifications_and_follow_the_rules() {
         .send(UiCommand::SetPresence {
             focused: true,
             visible: Some(alice_conv),
+            beside: None,
         })
         .expect("send");
     env.advance().await; // 5 -> a hit in the focused chat
@@ -254,6 +255,7 @@ async fn filters_name_their_notifications_and_follow_the_rules() {
         .send(UiCommand::SetPresence {
             focused: false,
             visible: None,
+            beside: None,
         })
         .expect("send");
     // "Name only" mode: no filter name either.

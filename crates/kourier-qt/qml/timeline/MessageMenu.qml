@@ -13,6 +13,8 @@ import app.kourier
 // do inside a row is here too, so the keyboard reaches it (the timeline is one tab stop).
 QQC2.Menu {
     id: root
+    required property TimelineModel chatModel
+    required property ComposerController composerModel
 
     // The message (`TimelineActions` row description).
     property var row: null
@@ -60,7 +62,7 @@ QQC2.Menu {
     // "Select" (a window state: no rule of the core's decides it, so it is counted apart from the
     // row's `actions.any`): every row with a message id has it.
     readonly property bool hasSelect: root.row !== null && root.row.selectable === true
-    readonly property bool hasMain: root.hasSelect || root.offers.react === true || root.offers.reply === true || root.offers.edit === true || root.offers.copy === true || root.hasReactions || (root.row !== null && root.row.edited === true)
+    readonly property bool hasMain: root.hasSelect || root.offers.react === true || root.offers.reply === true || root.offers.edit === true || root.offers.copy === true || root.offers.forward === true || root.hasReactions || (root.row !== null && root.row.edited === true)
     readonly property bool hasPages: root.pages.length > 0
     readonly property bool hasDeletes: root.offers.retry === true || root.offers.cancelSending === true || root.canDeleteAttachment || (root.canDelete && root.offers.takeBack !== true)
 
@@ -248,13 +250,20 @@ QQC2.Menu {
         visible: root.offers.reply === true
         icon.name: "mail-reply-sender"
         text: L10n.i18nc("@action:inmenu", "Reply")
-        onTriggered: App.composer.replyTo(App.timeline.conversationId, root.row.messageId)
+        onTriggered: root.composerModel.replyTo(root.chatModel.conversationId, root.row.messageId)
     }
     Entry {
         visible: root.offers.edit === true
         icon.name: "document-edit"
         text: L10n.i18nc("@action:inmenu", "Edit")
-        onTriggered: App.composer.startEdit(App.timeline.conversationId, root.row.messageId)
+        onTriggered: root.composerModel.startEdit(root.chatModel.conversationId, root.row.messageId)
+    }
+    Entry {
+        objectName: "menuForward"
+        visible: root.offers.forward === true
+        icon.name: "mail-forward"
+        text: L10n.i18nc("@action:inmenu", "Forward…")
+        onTriggered: App.forwardOpen([root.row.messageId])
     }
     Entry {
         id: copyEntry

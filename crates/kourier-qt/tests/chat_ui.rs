@@ -2252,18 +2252,18 @@ MainWindow {
                 // fixture's about text is short enough to need no "More", which would be another stop.)
                 if (!win.shown("detailsAbout") || win.shown("detailsAboutMore")) return win.fail("the person page needs an about text that fits its three lines, whose one stop the Tab count is made for");
                 win.inPanel("detailsClose").forceActiveFocus();
-                // (19 presses, one whole cycle of the page since the copy button by the number (18 with F1's about text, 17 with P5c's "Share Contact…", 16 with
+                // (20 presses, one whole cycle of the page since the header's "Open Chat Beside" (S3b2; 19 before it; 18 with the copy button by the number (18 with F1's about text, 17 with P5c's "Share Contact…", 16 with
                 // P5b's "Copy Link", 15 with P5a's "View Safety Number", 14 in P4): the walk ends on the close button again,
                 // where the count of Tab presses below starts.)
-                for (let i = 0; i < 19; i++) {
+                for (let i = 0; i < 20; i++) {
                     win.key(Qt.Key_Backtab, Qt.ShiftModifier);
                     if (win.inChat(win.activeFocusItem)) return win.fail("Shift+Tab reached the covered chat (" + win.focusName() + ", press " + (i + 1) + ")");
                 }
                 win.chat.panel.forceActiveFocus();
-                // (36 presses, not 24: the media part of the person page has one more stop, "All Media and Files" (P4: 26),
+                // (36 presses, not 24 (S3b2: the header's "Open Chat Beside" stands AFTER the timer button, so the cycle is 20 stops but the item the count is made for, the first toolbar item right after the header, is reached by the same 36 presses; the Shift+Tab walk above is 20): the media part of the person page has one more stop, "All Media and Files" (P4: 26),
                 // P5a adds "View Safety Number" (28), P5b "Copy Link" (30), P5c "Share Contact…" (32), F1 the about text (34)
                 // and the copy button by the number (36), so the cycle is 19 stops and 36 ends on the same item as 24 did in 13
-                // (count = 2 x cycle - 2): the first unnamed toolbar item after the header, where the Space typed below is harmless.)
+                // (count = 2 x cycle - 2): the first unnamed toolbar item after the header.)
                 const names = [];
                 for (let i = 0; i < 36; i++) {
                     win.key(Qt.Key_Tab, Qt.NoModifier);
@@ -2274,9 +2274,14 @@ MainWindow {
                 // later in `groupTabs` after the typed Space closed the panel.
                 const endsOn = names[names.length - 1];
                 const after = names[names.length - 2];
-                if (names.length !== 36 || after !== "chatHeader" || endsOn !== "(unnamed)") return win.fail(names.length + " presses of Tab end on '" + endsOn + "' after '" + after + "', not on the unnamed item right after chatHeader, where the count of 36 was made; the cycle of the page is: " + names.slice(0, 20).join(", "));
-                // Typing wherever the keyboard is does not write into the composer under the panel.
-                for (const k of [Qt.Key_H, Qt.Key_I, Qt.Key_Space]) win.key(k, Qt.NoModifier);
+                const endAction = win.activeFocusItem && win.activeFocusItem.action ? (win.activeFocusItem.action.objectName || "(an unnamed action)") : "(no action)";
+                if (names.length !== 36 || after !== "chatHeader" || endsOn !== "(unnamed)") return win.fail(names.length + " presses of Tab end on '" + endsOn + "' (" + endAction + ") after '" + after + "', not on the unnamed item right after chatHeader, where the count of 36 was made; the cycle of the page is: " + names.slice(0, 20).join(", "));
+                console.warn("chat_ui: focusCover ends on the header button of " + endAction);
+                // Typing wherever the keyboard is does not write into the composer under the panel. Letters only (S4b): the
+                // first toolbar item after the header is a button the header keeps whatever its width ("Open Chat Beside",
+                // kept beside "Close Chat"; the timer button goes to the overflow first), and a Space there presses it
+                // (the chooser starts and takes the keyboard to the list), which is not what this step is about.
+                for (const k of [Qt.Key_H, Qt.Key_I]) win.key(k, Qt.NoModifier);
                 if (win.composerItem.text !== before) return win.fail("typed text landed in the covered composer");
                 win.next("groupTabs");
                 return;

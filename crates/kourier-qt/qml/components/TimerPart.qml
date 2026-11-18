@@ -28,6 +28,7 @@ import app.kourier
 // by a time that is the choice (a peer's change keeps a choice that still differs).
 Column {
     id: root
+    required property TimelineModel chatModel
 
     // The chat whose timer this is, and the values of its page.
     property real conversation: 0
@@ -57,7 +58,7 @@ Column {
     property int appliedSecs: 0
     property bool applying: false
     // Why the combo is grey: the account's network holds back what is sent (empty: it does not).
-    readonly property string holdReason: App.timeline.timerHeld
+    readonly property string holdReason: root.chatModel.timerHeld
     // The choice is not the chat's time: "Apply" and "Cancel" are shown.
     readonly property bool differs: root.hasPending && root.pendingSecs !== root.timerSecs
     // What the combo shows.

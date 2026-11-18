@@ -140,6 +140,8 @@ pub fn telegram_features(_group: bool) -> ConversationFeatures {
         read_receipts: true,
         typing: true,
         history: HistorySource::OnDemand,
+        // Telegram does not send yet (T5).
+        cannot_send: Some(kourier_model::CannotSend::NotYetBuilt),
         ..ConversationFeatures::default()
     }
 }

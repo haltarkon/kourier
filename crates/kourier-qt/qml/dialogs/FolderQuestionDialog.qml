@@ -17,13 +17,14 @@ import app.kourier
 // Adding very many files is asked about once more (`confirming`). Escape, the close button and
 // "Cancel" take the folders out of the list again.
 //
-// What it says comes from `App.composer.folderQuestion`; the dialog only shows it. Folder
+// What it says comes from `composerModel.folderQuestion`; the dialog only shows it. Folder
 // names are text from outside (a name can be anything): every label is plain text.
 Kirigami.Dialog {
     id: root
+    required property ComposerController composerModel
 
-    readonly property var question: App.composer.folderQuestion
-    readonly property bool asking: App.composer.folderAsking
+    readonly property var question: root.composerModel.folderQuestion
+    readonly property bool asking: root.composerModel.folderAsking
     // The second question: this many files, really?
     readonly property bool confirming: root.asking && root.question.confirming === true
     readonly property bool canZip: root.asking && root.question.canZip === true
@@ -36,7 +37,7 @@ Kirigami.Dialog {
 
     // `add`, `zip`, `back` or `cancel`.
     function answer(what: string): void {
-        App.composer.answerFolders(what);
+        root.composerModel.answerFolders(what);
     }
 
     title: root.say("title")

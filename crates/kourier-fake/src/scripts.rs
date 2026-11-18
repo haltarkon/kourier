@@ -218,6 +218,7 @@ pub fn signal_features(group: bool) -> ConversationFeatures {
         // Signal and Threema have no restriction on saving a chat; a script that plays another
         // statement says so with `Script::with_chat_export`.
         export: ChatExport::Allowed,
+        no_forward: false,
     }
 }
 
@@ -546,6 +547,67 @@ pub fn as_whatsapp(mut script: Script) -> Script {
         .after_connect
         .iter_mut()
         .for_each(|(_, event)| restate(event));
+    script
+}
+
+/// Forward line F1 (the WhatsApp fixture only, `FixtureNetwork::WhatsApp`): the two newest incoming texts of the
+/// group "Garden Swap" (the chat the `chat` page opens) arrive as forwards (the older one forwarded, the newer
+/// one forwarded many times, WhatsApp's score 127), so a picture of the WhatsApp fixture shows both marks. No
+/// row, chat or text is added (the fixture is the plain one row for row,
+/// `lifecycle::the_whatsapp_fixture_has_the_plain_fixtures_chats_row_for_row`), and the plain fixture is
+/// untouched (the test network marks no forward).
+pub fn with_forwarded_pair(mut script: Script) -> Script {
+    // The group the `chat` page opens (`fixture::GROUPS`).
+    let group = script.steps.iter().find_map(|step| {
+        match step {
+        Step::Deliver(d) => d.events.iter().find_map(|e| match e {
+            BackendEvent::ConversationUpsert(p)
+                if matches!(&p.title, Patch::Set(t) if t == "Garden Swap") =>
+            {
+                Some(p.key.clone())
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+    });
+    let Some(group) = group else {
+        return script;
+    };
+    let marked = |m: &IncomingMessage| {
+        m.conv == group
+            && matches!(m.origin, kourier_model::Origin::Remote { .. })
+            && matches!(m.body, kourier_model::Body::Text(_))
+    };
+    let mut times: Vec<i64> = script
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Deliver(d) => Some(&d.events),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|e| match e {
+            BackendEvent::Message(m) if marked(m) => Some(m.sent_at),
+            _ => None,
+        })
+        .collect();
+    times.sort_unstable();
+    // The newest is forwarded many times (WhatsApp's sentinel 127), the one before it once.
+    let scores: Vec<(i64, u32)> = times.iter().rev().copied().zip([127, 0]).collect();
+    for step in &mut script.steps {
+        let Step::Deliver(d) = step else {
+            continue;
+        };
+        for event in &mut d.events {
+            if let BackendEvent::Message(m) = event
+                && marked(m)
+                && let Some(&(_, score)) = scores.iter().find(|(at, _)| *at == m.sent_at)
+            {
+                m.forwarded = Some(kourier_model::Forwarded { score });
+            }
+        }
+    }
     script
 }
 

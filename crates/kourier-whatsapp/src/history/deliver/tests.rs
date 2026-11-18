@@ -1415,6 +1415,7 @@ async fn a_transmit_into_a_history_chat_with_no_real_message_writes_no_frame() {
                 body: Content::Text(Text::plain("synthetic reply")),
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
             only: None,
             is_recipient_update: false,

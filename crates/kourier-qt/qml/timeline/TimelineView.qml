@@ -23,6 +23,11 @@ import app.kourier
 // the text was cut where it is).
 QQC2.ScrollView {
     id: root
+    required property TimelineModel chatModel
+    required property ComposerController composerModel
+    // Which pane this view is in (0 or 1): the calls it makes without a press (paging, the jump to the
+    // newest message) name it, the active pane is not necessarily this one.
+    property int pane: 0
 
     // The view shows the oldest loaded row, or the newest message, give or take a line. By
     // distance (see `fromTop` below): a programmatic jump to the newest row lands one margin
@@ -57,7 +62,7 @@ QQC2.ScrollView {
     // The selection mode is on (read here, not through a `Connections` on the timeline: qmllint types
     // that target as a QObject). When it starts, the keys (Escape, Space, Ctrl+C) go to the list,
     // whatever had the focus.
-    readonly property bool selecting: App.timeline.selecting
+    readonly property bool selecting: root.chatModel.selecting
     onSelectingChanged: {
         if (root.selecting) {
             list.forceActiveFocus();
@@ -249,7 +254,7 @@ QQC2.ScrollView {
         const p = list.contentItem.mapFromItem(null, scene.x, scene.y);
         const id = root.messageAtContent(p.x, p.y);
         if (id > 0) {
-            App.timeline.selectStart(id);
+            root.chatModel.selectStart(id);
         }
     }
 
@@ -262,10 +267,35 @@ QQC2.ScrollView {
             return;
         }
         if (modifiers & Qt.ShiftModifier) {
-            App.timeline.selectExtend(id);
+            root.chatModel.selectExtend(id);
         } else {
-            App.timeline.selectToggle(id);
+            root.chatModel.selectToggle(id);
         }
+    }
+
+    // S5, a drag to the other chat of a split. The message a drag from `scene` (a scene position) would carry:
+    // a message that can be forwarded, pressed on its bubble but not on its text or a voice note's slider
+    // (`MessageDelegate.dragStartAt`); 0 for none. Asked while the pointer hovers, never during a press.
+    property real dragFrom: 0
+    // The drag handler's grab was taken (`canceled` comes after `active` turns false): no drop.
+    property bool dragCanceled: false
+    function dragStartAt(scene: point): real {
+        const p = list.contentItem.mapFromItem(null, scene.x, scene.y);
+        const item = list.itemAt(p.x, p.y) as MessageDelegate;
+        if (item === null) {
+            return 0;
+        }
+        return item.dragStartAt(item.mapFromItem(null, scene.x, scene.y)) ? item.messageId : 0;
+    }
+    function dragOut(ids: var, scene: point): void {
+        TimelineActions.messageDrag?.start(root.pane, root.chatModel, ids, scene);
+    }
+    function dragOn(scene: point): void {
+        TimelineActions.messageDrag?.move(scene);
+    }
+    function dragEnded(): void {
+        TimelineActions.messageDrag?.finish(!root.dragCanceled);
+        root.dragCanceled = false;
     }
 
     // Shows the earlier versions of a message; `false` when there is nothing to ask.
@@ -363,7 +393,7 @@ QQC2.ScrollView {
     ListView {
         id: list
 
-        model: App.timeline
+        model: root.chatModel
         verticalLayoutDirection: ListView.BottomToTop
         spacing: 0
         topMargin: Kirigami.Units.largeSpacing
@@ -386,7 +416,7 @@ QQC2.ScrollView {
         Accessible.name: L10n.i18nc("@info accessible", "Messages")
 
         // A new conversation starts at its newest message.
-        readonly property real conversation: App.timeline.conversationId
+        readonly property real conversation: root.chatModel.conversationId
         onConversationChanged: {
             root.followNewest = true;
             list.letGo();
@@ -504,7 +534,7 @@ QQC2.ScrollView {
             // back what the layout moved; the same while that correction is still due
             // (`pending`). At the newest message nothing is held: `rest` makes the view
             // follow, and what arrives meanwhile may push.
-            if (list.following() || (!App.timeline.hasNewer && list.atNewest())) {
+            if (list.following() || (!root.chatModel.hasNewer && list.atNewest())) {
                 list.letGo();
             } else if (during || list.pending) {
                 list.heldAt -= by;
@@ -524,7 +554,7 @@ QQC2.ScrollView {
                 return;
             }
             list.flush();
-            if (!App.timeline.hasNewer && list.atNewest()) {
+            if (!root.chatModel.hasNewer && list.atNewest()) {
                 root.followNewest = true;
             }
             if (!list.following()) {
@@ -888,7 +918,7 @@ QQC2.ScrollView {
                 i = next;
                 const item = list.itemAtIndex(i);
                 // (While selecting every notice is a row too: it can be selected.)
-                if (item === null || item instanceof MessageDelegate || (item as SystemRow)?.offers === true || (App.timeline.selecting && item instanceof SystemRow)) {
+                if (item === null || item instanceof MessageDelegate || (item as SystemRow)?.offers === true || (root.chatModel.selecting && item instanceof SystemRow)) {
                     break;
                 }
             }
@@ -927,7 +957,7 @@ QQC2.ScrollView {
             root.followNewest = false;
             list.flush();
             list.hold();
-            App.timeline.readMore(message);
+            root.chatModel.readMore(message);
         }
 
         // Ctrl+Enter: to the message the current row quotes.
@@ -945,7 +975,7 @@ QQC2.ScrollView {
             const item = list.currentItem;
             const id = (item as MessageDelegate)?.messageId ?? (item as SystemRow)?.messageId ?? 0;
             if (id > 0) {
-                App.timeline.selectToggle(id);
+                root.chatModel.selectToggle(id);
             }
         }
 
@@ -964,7 +994,7 @@ QQC2.ScrollView {
         Keys.onReturnPressed: event => list.enterPressed(event)
         Keys.onEnterPressed: event => list.enterPressed(event)
         Keys.onSpacePressed: event => {
-            if (App.timeline.selecting) {
+            if (root.chatModel.selecting) {
                 list.selectCurrent();
             } else {
                 list.currentActivate();
@@ -972,8 +1002,8 @@ QQC2.ScrollView {
         }
         // Escape ends the selection mode first; only when not selecting does it go back to the composer.
         Keys.onEscapePressed: {
-            if (App.timeline.selecting) {
-                App.timeline.selectClear();
+            if (root.chatModel.selecting) {
+                root.chatModel.selectClear();
             } else {
                 root.composerRequested();
             }
@@ -982,8 +1012,8 @@ QQC2.ScrollView {
             if (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)) {
                 list.currentMenu();
                 event.accepted = true;
-            } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && App.timeline.selecting) {
-                App.timeline.copySelected();
+            } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && root.chatModel.selecting) {
+                root.chatModel.copySelected();
                 event.accepted = true;
             }
         }
@@ -1005,7 +1035,7 @@ QQC2.ScrollView {
 
             acceptedButtons: Qt.LeftButton
             acceptedModifiers: Qt.ControlModifier
-            enabled: !App.timeline.selecting
+            enabled: !root.chatModel.selecting
             onPressedChanged: {
                 if (ctrlTap.pressed) {
                     TimelineActions.ctrlPress = true;
@@ -1016,6 +1046,54 @@ QQC2.ScrollView {
                 }
             }
             onTapped: eventPoint => root.ctrlClick(eventPoint.scenePosition)
+        }
+
+        // S5: a message dragged to the other chat of a split stages a forward there (the card in that chat's
+        // composer). The press must be on a bubble but not on its text (a drag there selects text) nor on a
+        // slider: decided while the pointer HOVERS (`dragFrom`), so the drag handler is on only over such a
+        // place and never takes a press from the text; it can then take over from any item (a button of a file
+        // row, the list's own flick). Mouse and touchpad only (a finger scrolls). ONE hover and ONE drag handler
+        // for the list, nothing per row. (In the selection mode the plate below carries the selection.)
+        HoverHandler {
+            id: dragHover
+
+            enabled: App.split && !root.chatModel.selecting
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            onPointChanged: {
+                if (!messageDragger.active && dragHover.point.pressedButtons === Qt.NoButton) {
+                    root.dragFrom = root.dragStartAt(dragHover.point.scenePosition);
+                }
+            }
+            onHoveredChanged: {
+                if (!dragHover.hovered && !messageDragger.active) {
+                    root.dragFrom = 0;
+                }
+            }
+        }
+        DragHandler {
+            id: messageDragger
+
+            target: null
+            enabled: messageDragger.active || (App.split && !root.chatModel.selecting && root.dragFrom > 0)
+            acceptedButtons: Qt.LeftButton
+            acceptedModifiers: Qt.NoModifier
+            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            grabPermissions: PointerHandler.CanTakeOverFromAnything | PointerHandler.ApprovesCancellation
+            onActiveChanged: {
+                if (messageDragger.active) {
+                    root.dragCanceled = false;
+                    root.dragOut([String(root.dragFrom)], messageDragger.centroid.scenePosition);
+                } else {
+                    // (`canceled` follows `active`: the end waits for it.)
+                    Qt.callLater(root.dragEnded);
+                }
+            }
+            onCanceled: root.dragCanceled = true
+            onCentroidChanged: {
+                if (messageDragger.active) {
+                    root.dragOn(messageDragger.centroid.scenePosition);
+                }
+            }
         }
 
         // Rows came, went or changed (an arrival, an own send, a page at either end, a
@@ -1097,7 +1175,11 @@ QQC2.ScrollView {
             role: "kind"
             DelegateChoice {
                 roleValue: "message"
-                MessageDelegate {}
+                MessageDelegate {
+                    chatModel: root.chatModel
+                    composerModel: root.composerModel
+                    pane: root.pane
+                }
             }
             DelegateChoice {
                 roleValue: "date"
@@ -1109,7 +1191,9 @@ QQC2.ScrollView {
             }
             DelegateChoice {
                 roleValue: "system"
-                SystemRow {}
+                SystemRow {
+                    chatModel: root.chatModel
+                }
             }
             DelegateChoice {
                 roleValue: "loading"
@@ -1121,6 +1205,8 @@ QQC2.ScrollView {
     // The popups come after the list: a ScrollView takes its first child as the view to scroll.
     MessageMenu {
         id: menu
+        chatModel: root.chatModel
+        composerModel: root.composerModel
     }
     // (Made on first use, with this view as its parent: see `pickerPopup`.)
     Component {
@@ -1163,6 +1249,7 @@ QQC2.ScrollView {
     Component {
         id: attachmentComponent
         AttachmentDeleteDialog {
+            chatModel: root.chatModel
             onClosed: destroy()
         }
     }
@@ -1211,10 +1298,10 @@ QQC2.ScrollView {
             root.safetyRequested(user);
         }
         function onSelectRequested(message: real): void {
-            if (App.timeline.selecting) {
-                App.timeline.selectToggle(message);
+            if (root.chatModel.selecting) {
+                root.chatModel.selectToggle(message);
             } else {
-                App.timeline.selectStart(message);
+                root.chatModel.selectStart(message);
             }
         }
     }
@@ -1254,15 +1341,15 @@ QQC2.ScrollView {
         interval: 150
         repeat: true
         triggeredOnStart: true
-        running: root.visible && list.count > 0 && App.timeline.hasOlder && root.fromTop < list.height
-        onTriggered: App.fetchOlder()
+        running: root.visible && list.count > 0 && root.chatModel.hasOlder && root.fromTop < list.height
+        onTriggered: App.fetchOlderIn(root.pane)
     }
     Timer {
         interval: 150
         repeat: true
         triggeredOnStart: true
-        running: root.visible && list.count > 0 && App.timeline.hasNewer && root.fromBottom < list.height
-        onTriggered: App.fetchNewer()
+        running: root.visible && list.count > 0 && root.chatModel.hasNewer && root.fromBottom < list.height
+        onTriggered: App.fetchNewerIn(root.pane)
     }
 
     // While selecting ONE plate over the viewport takes every left click and maps it to a row, so
@@ -1277,10 +1364,52 @@ QQC2.ScrollView {
         anchors.fill: parent
         // Clear of the scroll bar.
         anchors.rightMargin: root.QQC2.ScrollBar.vertical && root.QQC2.ScrollBar.vertical.visible ? root.QQC2.ScrollBar.vertical.width : 0
-        visible: App.timeline.selecting
-        enabled: App.timeline.selecting
+        visible: root.chatModel.selecting
+        enabled: root.chatModel.selecting
         acceptedButtons: Qt.LeftButton
-        onClicked: mouse => root.plateClick(mouse.x, mouse.y, mouse.modifiers)
+        // S5: in a split a press on a SELECTED message that moves past the drag distance carries every
+        // selected message to the other chat (`MessageDragProxy`); the click that would flip the row is
+        // dropped after a drag.
+        property point pressAt: Qt.point(0, 0)
+        property bool fromSelected: false
+        property bool dragged: false
+        // (`Qt.styleHints` is typed QObject for qmllint.)
+        readonly property var hints: Qt.styleHints
+        preventStealing: plate.fromSelected
+        onPressed: mouse => {
+            plate.dragged = false;
+            plate.pressAt = Qt.point(mouse.x, mouse.y);
+            const p = plate.mapToItem(list.contentItem, mouse.x, mouse.y);
+            const item = list.itemAt(p.x, p.y) as MessageDelegate;
+            plate.fromSelected = App.split && mouse.modifiers === Qt.NoModifier && item !== null && item.selected && root.chatModel.selectedCount > 0;
+        }
+        onPositionChanged: mouse => {
+            const scene = plate.mapToItem(null, mouse.x, mouse.y);
+            if (plate.dragged) {
+                root.dragOn(scene);
+            } else if (plate.fromSelected && Math.hypot(mouse.x - plate.pressAt.x, mouse.y - plate.pressAt.y) >= plate.hints.startDragDistance) {
+                plate.dragged = true;
+                root.dragOut(root.chatModel.selectedIds(), scene);
+            }
+        }
+        onReleased: {
+            if (plate.dragged) {
+                root.dragEnded();
+            }
+            plate.fromSelected = false;
+        }
+        onCanceled: {
+            if (plate.dragged) {
+                root.dragCanceled = true;
+                root.dragEnded();
+            }
+            plate.fromSelected = false;
+        }
+        onClicked: mouse => {
+            if (!plate.dragged) {
+                root.plateClick(mouse.x, mouse.y, mouse.modifiers);
+            }
+        }
     }
 
     Components.FloatingButton {
@@ -1298,15 +1427,15 @@ QQC2.ScrollView {
         anchors.rightMargin: Kirigami.Units.largeSpacing + (root.QQC2.ScrollBar.vertical && root.QQC2.ScrollBar.vertical.visible ? root.QQC2.ScrollBar.vertical.width : 0)
         // A good way from the newest message (not for a line or two), or the window ends
         // before it (a quote jumped back).
-        visible: root.fromBottom > Kirigami.Units.gridUnit * 6 || App.timeline.hasNewer
+        visible: root.fromBottom > Kirigami.Units.gridUnit * 6 || root.chatModel.hasNewer
         icon.name: "go-down"
         text: L10n.i18nc("@action:button", "Jump to Latest")
         onClicked: {
             root.followNewest = true;
             list.letGo();
-            if (App.timeline.hasNewer) {
+            if (root.chatModel.hasNewer) {
                 // The newest page replaces the window; the view follows it.
-                App.jumpToLatest();
+                App.jumpToLatestIn(root.pane);
             } else {
                 list.toNewest();
             }

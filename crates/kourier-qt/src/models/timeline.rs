@@ -6,7 +6,7 @@ use std::pin::Pin;
 use cxx_qt::{CxxQtThread, CxxQtType};
 use cxx_qt_lib::{
     QHash, QHashPair_i32_QByteArray, QList, QMap, QMapPair_QString_QVariant, QModelIndex, QString,
-    QVariant,
+    QStringList, QVariant,
 };
 use kourier_model::{ConversationId, MessageId};
 use kourier_viewmodel::diff::RoleSet;
@@ -20,7 +20,7 @@ use crate::bridge::qobject::{self, App};
 use crate::shared::Shared;
 
 /// Role names, in role-index order.
-pub const ROLES: [&str; 26] = [
+pub const ROLES: [&str; 27] = [
     "kind",
     "messageId",
     "own",
@@ -52,6 +52,8 @@ pub const ROLES: [&str; 26] = [
     "authorMarks",
     // The row is selected in the selection mode (`kourier_viewmodel::selection`).
     "selected",
+    // The forward mark above the text: "", "forwarded" or "many" (forward line F1).
+    "forwardMark",
 ];
 
 /// Rust side of `TimelineModel`.
@@ -152,13 +154,14 @@ pub struct MessageQt {
     pages: QVariant,
     author_marks: QVariant,
     selected: bool,
+    forward_mark: QString,
 }
 
 fn s(v: &str) -> QVariant {
     QVariant::from(&QString::from(v))
 }
 
-fn map(entries: Vec<(&str, QVariant)>) -> QVariant {
+pub(crate) fn map(entries: Vec<(&str, QVariant)>) -> QVariant {
     let mut m = QMap::<QMapPair_QString_QVariant>::default();
     for (k, v) in entries {
         m.insert(QString::from(k), v);
@@ -786,6 +789,7 @@ fn actions_variant(a: &RowActions) -> QVariant {
         ("saveAttachments", QVariant::from(&a.save_attachments)),
         ("showSender", QVariant::from(&a.show_sender)),
         ("showPeople", QVariant::from(&a.show_people)),
+        ("forward", QVariant::from(&a.forward)),
         ("any", QVariant::from(&a.any())),
     ])
 }
@@ -825,6 +829,7 @@ impl MessageQt {
             })),
             author_marks: marks_variant(&v.author_marks),
             selected: v.selected,
+            forward_mark: QString::from(v.forward_mark.as_str()),
         }
     }
 
@@ -855,6 +860,7 @@ impl MessageQt {
             .with_if(23, a.pages != b.pages)
             .with_if(24, a.author_marks != b.author_marks)
             .with_if(25, a.selected != b.selected)
+            .with_if(26, a.forward_mark != b.forward_mark)
     }
 
     fn key(v: &MessageRow) -> RowKey {
@@ -895,7 +901,8 @@ impl qobject::TimelineModel {
             22 => QVariant::from(&r.author_id),
             23 => r.pages.clone(),
             24 => r.author_marks.clone(),
-            _ => QVariant::from(&r.selected),
+            25 => QVariant::from(&r.selected),
+            _ => QVariant::from(&r.forward_mark),
         }
     }
 
@@ -1085,6 +1092,15 @@ impl qobject::TimelineModel {
         }
         let changes = shared.borrow_mut().source.export_plan(conv, ids);
         crate::controllers::defer(&shared, self.app.as_deref(), changes);
+    }
+
+    /// The selected messages' ids as strings, for `App.forwardOpen`.
+    pub fn selected_ids(&self) -> QStringList {
+        let mut list = QList::<QString>::default();
+        for m in self.selection.ids() {
+            list.append(QString::from(m.0.to_string().as_str()));
+        }
+        QStringList::from(&list)
     }
 
     /// The row index of a message, when it is among the rows.

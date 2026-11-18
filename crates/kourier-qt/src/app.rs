@@ -15,13 +15,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cxx::UniquePtr;
 use cxx_qt::{CxxQtThread, CxxQtType, Threading};
 use cxx_qt_lib::{
-    QColor, QDateTime, QList, QMap, QMapPair_QString_QVariant, QString, QTimeZone, QUrl, QVariant,
+    QColor, QDateTime, QList, QMap, QMapPair_QString_QVariant, QString, QStringList, QTimeZone,
+    QUrl, QVariant,
 };
 use kourier_app::facade::{UiCommand, UiEvent};
 use kourier_app::{AppHandle, NetworkInfo, TelegramMissing, trace};
 use kourier_model::{AccountId, AttachmentId, ConversationId, MessageId, NetworkKind, UserId};
 use kourier_viewmodel::chat_media::MediaSlot;
 use kourier_viewmodel::conversations::BannerKind;
+use kourier_viewmodel::core_source::PaneChanges;
 use kourier_viewmodel::diff::ListOp;
 use kourier_viewmodel::i18n::trc;
 use kourier_viewmodel::login::{NetworkEntry, network_choices, privacy_note, welcome_footnote};
@@ -41,8 +43,9 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::bridge::qobject::{
     self, AccountListModel, AttachmentListModel, ComposerController, ConversationListModel,
-    EmojiLists, FilterListModel, LoginController, MediaListModel, MemberListModel, QObject,
-    SearchListModel, SettingsController, ShareTargetListModel, TimelineModel,
+    EmojiLists, FilterListModel, ForwardTargetListModel, LoginController, MediaListModel,
+    MemberListModel, QObject, SearchListModel, SettingsController, ShareTargetListModel,
+    TimelineModel,
 };
 use crate::controllers::SettingsRust;
 use crate::models::{self, ListModel};
@@ -167,13 +170,18 @@ struct Owned {
     _group_preview: UniquePtr<MemberListModel>,
     _emoji_lists: UniquePtr<EmojiLists>,
     _share_targets: UniquePtr<ShareTargetListModel>,
+    _forward_targets: UniquePtr<ForwardTargetListModel>,
+    _forward_rows: UniquePtr<TimelineModel>,
     _filters: UniquePtr<FilterListModel>,
     _search_results: UniquePtr<SearchListModel>,
     _chat_media: [UniquePtr<MediaListModel>; MediaSlot::COUNT],
     _conversations: UniquePtr<ConversationListModel>,
     _timeline: UniquePtr<TimelineModel>,
+    _side_timeline: UniquePtr<TimelineModel>,
     _attachments: UniquePtr<AttachmentListModel>,
+    _side_attachments: UniquePtr<AttachmentListModel>,
     _composer: UniquePtr<ComposerController>,
+    _side_composer: UniquePtr<ComposerController>,
     _login: UniquePtr<LoginController>,
     _settings: UniquePtr<SettingsController>,
 }
@@ -226,6 +234,12 @@ pub struct AppRust {
     /// Bytes of the running export written, and in all (0 in all: the documents are made).
     pub(crate) export_done: i64,
     pub(crate) export_total: i64,
+    /// A forward job downloads files (the footer strip), its files done and needed.
+    pub(crate) forward_busy: bool,
+    pub(crate) forward_done: i64,
+    pub(crate) forward_total: i64,
+    /// The job the strip's Cancel ends (the newest that reported progress), 0 for none.
+    pub(crate) forward_request: u64,
     pub(crate) banner_kind: QString,
     pub(crate) banner_text: QString,
     pub(crate) banner_action: QString,
@@ -269,6 +283,10 @@ pub struct AppRust {
     /// The one local list of pinned, starred and recent emoji (the pickers' state).
     pub(crate) emoji_lists: *mut EmojiLists,
     pub(crate) share_targets: *mut ShareTargetListModel,
+    /// The chats of the forward dialog (forward line F6).
+    pub(crate) forward_targets: *mut ForwardTargetListModel,
+    /// The rows of the picture look being drawn (F7): the timeline's model type, its roles.
+    pub(crate) forward_rows: *mut TimelineModel,
     /// The saved RegExp filters (Settings, the filter dialog; R2).
     pub(crate) filters: *mut FilterListModel,
     /// The hits of the message search (G1m).
@@ -286,8 +304,34 @@ pub struct AppRust {
     pub(crate) media_grid: *mut MediaListModel,
     pub(crate) media_files: *mut MediaListModel,
     pub(crate) conversations: *mut ConversationListModel,
+    /// The ACTIVE pane's timeline and composer (every invokable acts on them); the QML
+    /// properties `timeline` / `composer` are pane 0's whatever is active ([`Self::panes`]).
     pub(crate) timeline: *mut TimelineModel,
     pub(crate) composer: *mut ComposerController,
+    /// The pane that is not active (the same two models as `timeline` / `composer` when no split).
+    pub(crate) side_timeline: *mut TimelineModel,
+    pub(crate) side_composer: *mut ComposerController,
+    /// The fixed table: pane 0's and pane 1's models.
+    pub(crate) pane_timelines: [*mut TimelineModel; 2],
+    pub(crate) pane_composers: [*mut ComposerController; 2],
+    /// Split view is on (mirrors the source's `side_open`).
+    pub(crate) split: bool,
+    /// The active pane (0 left, 1 right).
+    pub(crate) active_pane: i32,
+    /// The divider of the split: the first pane's share of the room the two chats have
+    /// (0.25 to 0.75; the `split-width` preference).
+    pub(crate) split_width: f64,
+    /// This run restores the open chats and keeps them in the preferences: a real start (not
+    /// `--fixture`, `--screenshot`, `--page` or `--dev-control`), or a test's seed.
+    restore_allowed: bool,
+    /// The test's stored chats ([`crate::RestoreSeed`]), taken by the restore.
+    restore_seed: Option<crate::RestoreSeed>,
+    /// The chats last written to the preferences (`open-chat`, `split-chat`); `None` until the
+    /// restore has run (or was skipped), so the empty start never overwrites what it restores.
+    chats_saved: Option<(i64, i64)>,
+    /// A visit of the pane that is not active is under way ([`Self::in_pane`]): nothing
+    /// applies pending changes, the pointers above are swapped.
+    visiting: bool,
     pub(crate) login: *mut LoginController,
     pub(crate) settings: *mut SettingsController,
     owned: Option<Owned>,
@@ -641,6 +685,10 @@ impl Default for AppRust {
             export_busy: false,
             export_done: 0,
             export_total: 0,
+            forward_busy: false,
+            forward_done: 0,
+            forward_total: 0,
+            forward_request: 0,
             banner_kind: QString::default(),
             banner_text: QString::default(),
             banner_action: QString::default(),
@@ -664,6 +712,8 @@ impl Default for AppRust {
             group_preview: std::ptr::null_mut(),
             emoji_lists: std::ptr::null_mut(),
             share_targets: std::ptr::null_mut(),
+            forward_targets: std::ptr::null_mut(),
+            forward_rows: std::ptr::null_mut(),
             filters: std::ptr::null_mut(),
             search_results: std::ptr::null_mut(),
             chat_media: [std::ptr::null_mut(); MediaSlot::COUNT],
@@ -676,6 +726,17 @@ impl Default for AppRust {
             conversations: std::ptr::null_mut(),
             timeline: std::ptr::null_mut(),
             composer: std::ptr::null_mut(),
+            side_timeline: std::ptr::null_mut(),
+            side_composer: std::ptr::null_mut(),
+            pane_timelines: [std::ptr::null_mut(); 2],
+            pane_composers: [std::ptr::null_mut(); 2],
+            split: false,
+            active_pane: 0,
+            split_width: kourier_app::prefs::SPLIT_WIDTH_DEFAULT,
+            restore_allowed: false,
+            restore_seed: None,
+            chats_saved: None,
+            visiting: false,
             login: std::ptr::null_mut(),
             settings: std::ptr::null_mut(),
             owned: None,
@@ -877,6 +938,14 @@ pub fn file_url(path: &Path) -> String {
         }
     }
     out
+}
+
+/// The numbers in a list of strings (what QML's arrays of ids arrive as); others are skipped.
+pub(crate) fn ids_of(list: &QStringList) -> Vec<i64> {
+    QList::<QString>::from(list)
+        .iter()
+        .filter_map(|s| s.to_string().trim().parse::<i64>().ok())
+        .collect()
 }
 
 /// A pinned reference to a sub-object owned by `App`.
@@ -1227,6 +1296,8 @@ impl cxx_qt::Initialize for qobject::App {
             );
         }
         let share_targets = qobject::new_share_target_list_model();
+        let forward_targets = qobject::new_forward_target_list_model();
+        let forward_rows = qobject::new_timeline_model();
         let mut filters = qobject::new_filter_list_model();
         let search_results = qobject::new_search_list_model();
         let mut chat_media = [
@@ -1245,8 +1316,17 @@ impl cxx_qt::Initialize for qobject::App {
             rust.shared = Some(shared.clone());
             rust.app = Some(Box::new(self.qt_thread()));
         }
+        let mut side_timeline = qobject::new_timeline_model();
+        if let Some(mut t) = side_timeline.as_mut() {
+            t.as_mut().set_header(0, None);
+            let mut rust = t.rust_mut();
+            rust.shared = Some(shared.clone());
+            rust.app = Some(Box::new(self.qt_thread()));
+        }
         let attachments = qobject::new_attachment_list_model();
+        let side_attachments = qobject::new_attachment_list_model();
         let mut composer = qobject::new_composer_controller();
+        let mut side_composer = qobject::new_composer_controller();
         let mut login = qobject::new_login_controller();
         let mut settings = qobject::new_settings_controller();
         // The saved choice of shown accounts, put to work BEFORE the first list is built (the
@@ -1275,6 +1355,11 @@ impl cxx_qt::Initialize for qobject::App {
             let mut rust = s.rust_mut();
             rust.shared = Some(shared.clone());
             rust.app = Some(Box::new(self.qt_thread()));
+            // The Settings default look of a forward goes to the viewmodel at start.
+            shared
+                .borrow_mut()
+                .source
+                .set_forward_default(crate::controllers::look_of(rust.forward_look));
         }
         if let Some(f) = filters.as_mut() {
             f.rust_mut().shared = Some(shared.clone());
@@ -1285,6 +1370,16 @@ impl cxx_qt::Initialize for qobject::App {
             rust.app = Some(Box::new(self.qt_thread()));
             rust.handle = ctx.as_ref().map(|c| c.app.clone());
             rust.files = attachments.as_mut_ptr();
+        }
+        if let Some(c) = side_composer.as_mut() {
+            let mut rust = c.rust_mut();
+            rust.shared = Some(shared.clone());
+            rust.app = Some(Box::new(self.qt_thread()));
+            rust.handle = ctx.as_ref().map(|c| c.app.clone());
+            rust.files = side_attachments.as_mut_ptr();
+            // Entry ids and plan serials of the two composers never meet (an answer of the
+            // core fits the strip that asked, whichever composer it is shown to).
+            rust.set_strip_origin(1 << 24);
         }
         // The image provider reads from this app from now on (§8.6).
         if let Some(ctx) = &ctx {
@@ -1306,6 +1401,8 @@ impl cxx_qt::Initialize for qobject::App {
             rust.group_preview = group_preview.as_mut_ptr();
             rust.emoji_lists = emoji_lists.as_mut_ptr();
             rust.share_targets = share_targets.as_mut_ptr();
+            rust.forward_targets = forward_targets.as_mut_ptr();
+            rust.forward_rows = forward_rows.as_mut_ptr();
             rust.filters = filters.as_mut_ptr();
             rust.search_results = search_results.as_mut_ptr();
             for (slot, m) in chat_media.iter_mut().enumerate() {
@@ -1318,6 +1415,10 @@ impl cxx_qt::Initialize for qobject::App {
             rust.conversations = conversations.as_mut_ptr();
             rust.timeline = timeline.as_mut_ptr();
             rust.composer = composer.as_mut_ptr();
+            rust.side_timeline = side_timeline.as_mut_ptr();
+            rust.side_composer = side_composer.as_mut_ptr();
+            rust.pane_timelines = [timeline.as_mut_ptr(), side_timeline.as_mut_ptr()];
+            rust.pane_composers = [composer.as_mut_ptr(), side_composer.as_mut_ptr()];
             rust.login = login.as_mut_ptr();
             rust.settings = settings.as_mut_ptr();
             rust.owned = Some(Owned {
@@ -1326,13 +1427,18 @@ impl cxx_qt::Initialize for qobject::App {
                 _group_preview: group_preview,
                 _emoji_lists: emoji_lists,
                 _share_targets: share_targets,
+                _forward_targets: forward_targets,
+                _forward_rows: forward_rows,
                 _filters: filters,
                 _search_results: search_results,
                 _chat_media: chat_media,
                 _conversations: conversations,
                 _timeline: timeline,
+                _side_timeline: side_timeline,
                 _attachments: attachments,
+                _side_attachments: side_attachments,
                 _composer: composer,
+                _side_composer: side_composer,
                 _login: login,
                 _settings: settings,
             });
@@ -1382,6 +1488,21 @@ impl cxx_qt::Initialize for qobject::App {
                 && opts.screenshot.is_none()
                 && opts.page.is_none();
             rust.fixture = ctx.app.is_fixture();
+            // The restore of the open chats and their keeping in the preferences: a real start only
+            // (the fixture, a screenshot, a page and the dev control run on a profile that is not
+            // the person's), or a test's seed.
+            #[cfg(debug_assertions)]
+            let scripted = opts.dev_control;
+            #[cfg(not(debug_assertions))]
+            let scripted = false;
+            rust.restore_seed = opts.restore_seed;
+            rust.restore_allowed = opts.restore_seed.is_some()
+                || (!ctx.app.is_fixture()
+                    && !opts.fixture
+                    && opts.screenshot.is_none()
+                    && opts.page.is_none()
+                    && !scripted);
+            rust.split_width = desktop.prefs().split_width;
             rust.pending_link = QString::from(ctx.app.pending_link().map_or("", |k| k.as_str()));
             rust.pump = Some(queue);
             rust.app = Some(ctx.app);
@@ -1398,10 +1519,20 @@ impl cxx_qt::Initialize for qobject::App {
             Some(
                 "chat" | "history" | "reactions" | "offline" | "loggedout" | "challenge" | "clock"
                 | "clearchat" | "transferbanner" | "transferfailed" | "transferupdate" | "waban"
-                | "waoff" | "wahistory" | "walost" | "searchchat" | "highlight",
+                | "waoff" | "wahistory" | "walost" | "searchchat" | "highlight" | "splitpick",
             ) => {
                 if let Some(id) = demo {
                     self.as_mut().open_conversation(id.0);
+                }
+            }
+            // Two ordinary chats side by side: the `chat` page's on the left, the plain quotes chat on
+            // the right, which is the active one (the page stack builds the second column).
+            Some("split" | "splitnarrow") => {
+                if let Some(id) = demo {
+                    self.as_mut().open_conversation(id.0);
+                }
+                if let Some(id) = fixture.and_then(|f| f.quotes_conversation) {
+                    self.as_mut().open_in_split(id.0);
                 }
             }
             // An own message refused as a first contact, or one that waits for the lock to end,
@@ -1477,7 +1608,8 @@ impl cxx_qt::Initialize for qobject::App {
             Some(
                 page @ ("media" | "viewer" | "viewerzoom" | "compose" | "files" | "originals"
                 | "folder" | "folderfiles" | "folderzip" | "location" | "locationmany"
-                | "locationnever" | "select" | "exportdialog" | "exportdone"),
+                | "locationnever" | "select" | "exportdialog" | "exportdone" | "forward"
+                | "forwardcard"),
             ) => {
                 if let Some(id) = media_conv {
                     self.as_mut().open_conversation(id.0);
@@ -2128,6 +2260,7 @@ impl qobject::App {
             }
         };
         if id.0 == 0
+            && !self.visiting
             && let Some(c) = pinned(self.conversations)
         {
             c.set_current_id(0);
@@ -2222,6 +2355,633 @@ impl qobject::App {
         }
     }
 
+    // ---- Split view: the App mirrors the viewmodel's two panes ----
+
+    fn swap_pointers(mut self: Pin<&mut Self>) {
+        let mut rust = self.as_mut().rust_mut();
+        let r = &mut *rust;
+        std::mem::swap(&mut r.timeline, &mut r.side_timeline);
+        std::mem::swap(&mut r.composer, &mut r.side_composer);
+    }
+
+    /// Puts the active/other pointer arrangement and the `split` / `activePane` properties
+    /// in line with the source (idempotent). A split that ended moves the surviving chat
+    /// into pane 0's models ([`Self::collapse_panes`]).
+    fn sync_arrangement(mut self: Pin<&mut Self>) {
+        if self.visiting {
+            return;
+        }
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let (split, active) = {
+            let st = shared.borrow();
+            let split = st.source.side_open();
+            (
+                split,
+                if split {
+                    i32::from(st.source.active_pane().min(1))
+                } else {
+                    0
+                },
+            )
+        };
+        let was_split = self.split;
+        {
+            let mut rust = self.as_mut().rust_mut();
+            let r = &mut *rust;
+            let a = usize::from(active == 1);
+            r.timeline = r.pane_timelines[a];
+            r.side_timeline = r.pane_timelines[a ^ 1];
+            r.composer = r.pane_composers[a];
+            r.side_composer = r.pane_composers[a ^ 1];
+        }
+        if self.split != split {
+            self.as_mut().set_split(split);
+        }
+        if self.active_pane != active {
+            self.as_mut().set_active_pane(active);
+        }
+        if was_split && !split {
+            self.collapse_panes();
+        }
+    }
+
+    /// Empties a pane's models (no chat).
+    fn blank_pane(t: *mut TimelineModel, c: *mut ComposerController) {
+        if let Some(mut t) = pinned(t) {
+            t.as_mut().set_header(0, None);
+            t.as_mut().set_paging(Default::default());
+            models::apply(t.as_mut(), &[ListOp::Reset], &[]);
+            t.update_count(0);
+        }
+        if let Some(c) = pinned(c) {
+            c.cancel_edit();
+        }
+        if let Some(c) = pinned(c) {
+            c.cancel_reply();
+        }
+        if let Some(c) = pinned(c) {
+            c.set_conversation(0);
+        }
+    }
+
+    /// The files parked for `conversation` in composer `from` follow the chat to `to`.
+    fn hand_parked(from: *mut ComposerController, to: *mut ComposerController, conversation: i64) {
+        if from == to || conversation == 0 {
+            return;
+        }
+        let strip = pinned(from).and_then(|c| c.rust_mut().take_parked(conversation));
+        if let (Some(strip), Some(c)) = (strip, pinned(to)) {
+            c.rust_mut().give_parked(conversation, strip);
+        }
+    }
+
+    /// The split ended: the one chat still open is in pane 0's models, pane 1's are empty.
+    fn collapse_panes(self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let [t0, t1] = self.pane_timelines;
+        let [c0, c1] = self.pane_composers;
+        let id_of = |t: *mut TimelineModel| pinned(t).map_or(0, |t| *t.conversation_id());
+        let (id0, id1) = (id_of(t0), id_of(t1));
+        let open = |id: i64| id != 0 && shared.borrow().source.is_open(ConversationId(id));
+        let (open0, open1) = (open(id0), open(id1));
+        if open1 && !open0 {
+            // Pane 1's chat becomes the single pane's: its files go with it.
+            if let Some(c) = pinned(c1) {
+                c.cancel_edit();
+            }
+            if let Some(c) = pinned(c1) {
+                c.cancel_reply();
+            }
+            if let Some(c) = pinned(c1) {
+                c.set_conversation(0);
+            }
+            Self::blank_pane(t0, c0);
+            Self::hand_parked(c1, c0, id1);
+            if let Some(t) = pinned(t0) {
+                t.set_conversation_id(id1);
+            }
+            if let Some(c) = pinned(c0) {
+                c.set_conversation(id1);
+            }
+            Self::blank_pane(t1, c1);
+            if let Some(t) = pinned(t1) {
+                t.set_conversation_id(0);
+            }
+        } else {
+            if !open0 && id0 != 0 {
+                Self::blank_pane(t0, c0);
+                if let Some(t) = pinned(t0) {
+                    t.set_conversation_id(0);
+                }
+            }
+            if id1 != 0 || pinned(c1).is_some_and(|c| c.conversation != 0) {
+                Self::blank_pane(t1, c1);
+                if let Some(t) = pinned(t1) {
+                    t.set_conversation_id(0);
+                }
+            }
+        }
+    }
+
+    /// Runs `f` on pane `pane`'s models and source state. With no split, or when `pane` is the
+    /// active one, that is a plain call. Otherwise the App's pointers and the source's pane are
+    /// swapped for the duration (`visit_pane` .. `end_visit`), and nothing inside may run
+    /// `apply_pending`: the changes a source call returns there are
+    /// [`Changes::moved_to_side`]'d (`f` gets `true` for "this is a visit") and merged after.
+    fn in_pane<R>(
+        mut self: Pin<&mut Self>,
+        pane: i32,
+        f: impl FnOnce(Pin<&mut Self>, bool) -> R,
+    ) -> R {
+        let Some(shared) = self.shared.clone() else {
+            return f(self, false);
+        };
+        if self.visiting {
+            return f(self, true);
+        }
+        if shared.borrow().pending.pane {
+            self.as_mut().sync_arrangement();
+        }
+        let Ok(p) = u8::try_from(pane) else {
+            return f(self, false);
+        };
+        if !self.split || pane == self.active_pane || p > 1 {
+            return f(self, false);
+        }
+        self.as_mut().swap_pointers();
+        self.as_mut().rust_mut().visiting = true;
+        shared.borrow_mut().source.visit_pane(p);
+        let r = f(self.as_mut(), true);
+        shared.borrow_mut().source.end_visit();
+        self.as_mut().rust_mut().visiting = false;
+        self.swap_pointers();
+        r
+    }
+
+    /// The model side of opening `conversation` in the active pane (`open_conversation_at`
+    /// and `open_in_split` share it): the timeline's id, the list's current row, what the
+    /// leaving chat kept, the composer's chat with its parked files. Returns whether the pane
+    /// switched chats.
+    fn prepare_open(mut self: Pin<&mut Self>, conversation: i64) -> bool {
+        let switched = pinned(self.timeline).is_some_and(|t| *t.conversation_id() != conversation);
+        if let Some(t) = pinned(self.timeline) {
+            t.set_conversation_id(conversation);
+        }
+        if !self.visiting
+            && let Some(c) = pinned(self.conversations)
+        {
+            c.set_current_id(conversation);
+        }
+        if switched {
+            self.as_mut().close_kept();
+            if let Some(c) = pinned(self.composer) {
+                c.cancel_edit();
+            }
+            if let Some(c) = pinned(self.composer) {
+                c.cancel_reply();
+            }
+            // (The files waiting in the composer stay with their chat: `set_conversation`;
+            // those parked in the other pane's composer for this chat come over first.)
+            Self::hand_parked(self.side_composer, self.composer, conversation);
+        }
+        if let Some(c) = pinned(self.composer) {
+            c.set_conversation(conversation);
+        }
+        switched
+    }
+
+    /// The pane that is visited merged into `into`: it shows that chat now.
+    fn switch_visited(mut self: Pin<&mut Self>, into: ConversationId, visited: bool) -> Changes {
+        let Some(shared) = self.shared.clone() else {
+            return Changes::default();
+        };
+        let ch = shared.borrow_mut().source.open_conversation(Some(into));
+        self.as_mut().prepare_open(into.0);
+        self.as_mut().refresh_timeline(true);
+        if visited { ch.moved_to_side() } else { ch }
+    }
+
+    /// `ch.side`: the pane that is not active changed.
+    fn apply_side(mut self: Pin<&mut Self>, side: PaneChanges) -> Changes {
+        let Some(shared) = self.shared.clone() else {
+            return Changes::default();
+        };
+        let other = 1 - self.active_pane;
+        let mut more = Changes::default();
+        self.as_mut().in_pane(other, |mut app, visited| {
+            if let Some(into) = side.switch_to {
+                more = app.as_mut().switch_visited(into, visited);
+                more.conversations = true;
+            } else if side.timeline || side.header {
+                app.as_mut().refresh_timeline(false);
+            } else {
+                app.as_mut().refresh_paging();
+                if side.waits {
+                    app.as_mut().refresh_waits();
+                }
+                if side.uploads {
+                    app.as_mut().refresh_uploads();
+                }
+            }
+            if let Some(message) = side.jump
+                && let Some(timeline) = pinned(app.timeline)
+                && let Some(row) = timeline.row_of(message)
+            {
+                timeline.jump_requested(message.0, row);
+            }
+            if side.draft {
+                let open = pinned(app.timeline).map_or(0, |t| *t.conversation_id());
+                if open != 0
+                    && let Some(c) = pinned(app.composer)
+                {
+                    c.draft_loaded(open);
+                }
+            }
+        });
+        drop(shared);
+        more
+    }
+
+    /// After a change of the split's shape: both panes are read in full and the list's current
+    /// row is the active pane's chat.
+    fn refresh_panes(mut self: Pin<&mut Self>, active_done: bool) {
+        if !active_done {
+            self.as_mut().refresh_timeline(false);
+        }
+        if self.split {
+            let other = 1 - self.active_pane;
+            self.as_mut().in_pane(other, |mut app, _| {
+                app.as_mut().refresh_timeline(false);
+            });
+        }
+        let id = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
+        if let Some(c) = pinned(self.conversations) {
+            c.set_current_id(id);
+        }
+    }
+
+    /// `with_source` for pane `pane`: the call runs on that pane's state.
+    fn with_source_in(
+        mut self: Pin<&mut Self>,
+        pane: i32,
+        f: impl FnOnce(&mut dyn UiSource) -> Changes,
+    ) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let ch = self.as_mut().in_pane(pane, |_, visited| {
+            let ch = f(shared.borrow_mut().source.as_mut());
+            if visited { ch.moved_to_side() } else { ch }
+        });
+        shared.borrow_mut().pending.merge(ch);
+        self.apply_pending();
+    }
+
+    pub fn pane0_timeline(&self) -> *mut TimelineModel {
+        self.pane_timelines[0]
+    }
+
+    pub fn pane0_composer(&self) -> *mut ComposerController {
+        self.pane_composers[0]
+    }
+
+    pub fn pane1_timeline(&self) -> *mut TimelineModel {
+        self.pane_timelines[1]
+    }
+
+    pub fn pane1_composer(&self) -> *mut ComposerController {
+        self.pane_composers[1]
+    }
+
+    /// Opens `conversation` in the second pane and makes it active.
+    pub fn open_in_split(mut self: Pin<&mut Self>, conversation: i64) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        if conversation <= 0 || self.visiting {
+            return;
+        }
+        let ch = shared
+            .borrow_mut()
+            .source
+            .open_side(ConversationId(conversation));
+        self.as_mut().sync_arrangement();
+        let switched = pinned(self.timeline).is_some_and(|t| *t.conversation_id() != conversation)
+            && shared
+                .borrow()
+                .source
+                .pane_of(ConversationId(conversation))
+                .is_some();
+        if switched {
+            self.as_mut().prepare_open(conversation);
+            self.as_mut().refresh_timeline(true);
+        }
+        let mut st = shared.borrow_mut();
+        st.pending.merge(ch);
+        st.pending.conversations = true;
+        drop(st);
+        self.apply_pending();
+    }
+
+    /// Closes pane `pane`; the other chat stays as the single pane.
+    pub fn close_pane(mut self: Pin<&mut Self>, pane: i32) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        if !self.split {
+            self.close_conversation();
+            return;
+        }
+        let Ok(p) = u8::try_from(pane) else { return };
+        if p > 1 || self.visiting {
+            return;
+        }
+        self.as_mut().close_kept();
+        let ch = shared.borrow_mut().source.close_pane(p);
+        let mut st = shared.borrow_mut();
+        st.pending.merge(ch);
+        st.pending.conversations = true;
+        drop(st);
+        self.apply_pending();
+    }
+
+    /// The two chats exchange places. The viewmodel flips the pane index of each chat (the chat
+    /// in hand stays in hand); the models of the two panes are fixed objects, so their CONTENTS
+    /// move: each composer gives its chat's files over to the other and takes the other's, both
+    /// timelines show the other chat (read again from the top: the scroll place resets), and
+    /// the drafts follow because the page saves its text before this call and loads the new
+    /// chat's draft when its timeline changes chat (`Composer.switchTo`). A reply or an edit
+    /// in progress is cancelled (its state lives in `controllers.rs`, per composer, and is
+    /// not exchangeable from here), as with any chat switch.
+    pub fn swap_panes(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        if !self.split || self.visiting {
+            return;
+        }
+        let [t0, t1] = self.pane_timelines;
+        let [c0, c1] = self.pane_composers;
+        let id_of = |t: *mut TimelineModel| pinned(t).map_or(0, |t| *t.conversation_id());
+        let (id0, id1) = (id_of(t0), id_of(t1));
+        if id0 == 0 || id1 == 0 || id0 == id1 {
+            return;
+        }
+        let ch = shared.borrow_mut().source.swap_sides();
+        if !ch.pane {
+            return;
+        }
+        // The composers: reply and edit end, the files go with their chats.
+        for c in [c0, c1] {
+            if let Some(c) = pinned(c) {
+                c.cancel_edit();
+            }
+            if let Some(c) = pinned(c) {
+                c.cancel_reply();
+            }
+            if let Some(c) = pinned(c) {
+                c.set_conversation(0);
+            }
+        }
+        Self::hand_parked(c0, c1, id0);
+        Self::hand_parked(c1, c0, id1);
+        if let Some(c) = pinned(c0) {
+            c.set_conversation(id1);
+        }
+        if let Some(c) = pinned(c1) {
+            c.set_conversation(id0);
+        }
+        // The timelines: each takes the other chat (the QML composers swap their drafts on it).
+        if let Some(t) = pinned(t0) {
+            t.set_conversation_id(id1);
+        }
+        if let Some(t) = pinned(t1) {
+            t.set_conversation_id(id0);
+        }
+        // Pointers to the new arrangement, then both panes read again from the top.
+        self.as_mut().sync_arrangement();
+        self.as_mut().refresh_timeline(true);
+        let other = 1 - self.active_pane;
+        self.as_mut().in_pane(other, |mut app, _| {
+            app.as_mut().refresh_timeline(true);
+        });
+        let id = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
+        if let Some(c) = pinned(self.conversations) {
+            c.set_current_id(id);
+        }
+        let mut st = shared.borrow_mut();
+        st.pending.conversations = true;
+        drop(st);
+        self.apply_pending();
+    }
+
+    /// Makes pane `pane` the active one.
+    pub fn activate_pane(self: Pin<&mut Self>, pane: i32) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let Ok(p) = u8::try_from(pane) else { return };
+        if p > 1 || self.visiting {
+            return;
+        }
+        let ch = shared.borrow_mut().source.activate_pane(p);
+        shared.borrow_mut().pending.merge(ch);
+        self.apply_pending();
+    }
+
+    /// Whether the pane that is not active is on screen.
+    pub fn set_side_shown(self: Pin<&mut Self>, shown: bool) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let ch = shared.borrow_mut().source.set_side_shown(shown);
+        shared.borrow_mut().pending.merge(ch);
+    }
+
+    /// The divider ended a drag (or the window sets it): pane 0's share of the room of the two
+    /// chats. Clamped to the range the preference keeps; written only when it differs from what
+    /// is stored and only in a run that keeps its chats.
+    pub fn store_split_width(mut self: Pin<&mut Self>, share: f64) {
+        let share = kourier_app::prefs::clamp_split_width(share);
+        if (self.split_width - share).abs() > f64::EPSILON {
+            self.as_mut().set_split_width(share);
+        }
+        if !self.restore_allowed {
+            return;
+        }
+        if let Some(desktop) = self.app.as_ref().map(|a| a.desktop()) {
+            let stored = desktop.prefs().split_width;
+            if (stored - share).abs() > 1e-6 {
+                desktop.update_prefs(|p| p.split_width = share);
+            }
+        }
+    }
+
+    /// What the preferences hold of the open chats, as `open;split;width` (tests read it back).
+    pub fn stored_chats(&self) -> QString {
+        let Some(desktop) = self.app.as_ref().map(|a| a.desktop()) else {
+            return QString::default();
+        };
+        let p = desktop.prefs();
+        QString::from(format!("{};{};{:.4}", p.open_chat, p.split_chat, p.split_width).as_str())
+    }
+
+    /// The window's first frame of the list is up: reopens the chats of the last run
+    /// (`open-chat`, `split-chat`; [`kourier_app::restore::plan`]) and from here on keeps them in the
+    /// preferences. Returns false while the list is not known yet and `give_up` is not set (the
+    /// window asks again); never opens anything in a run that does not restore.
+    pub fn restore_chats(mut self: Pin<&mut Self>, give_up: bool) -> bool {
+        if self.chats_saved.is_some() || !self.restore_allowed {
+            return true;
+        }
+        let (Some(shared), Some(desktop)) = (
+            self.shared.clone(),
+            self.app.as_ref().map(|a| a.desktop().clone()),
+        ) else {
+            return true;
+        };
+        let rows_of = |app: &Self, archived: bool| {
+            let filter = ConversationFilter {
+                hidden: app.shown.hidden().clone(),
+                query: String::new(),
+                archived,
+                regex: false,
+                pattern: None,
+            };
+            shared.borrow().source.conversations(&filter)
+        };
+        let mut known: Vec<i64> = rows_of(&self, false).iter().map(|r| r.id.0).collect();
+        known.extend(rows_of(&self, true).iter().map(|r| r.id.0));
+        if let Some(seed) = self.as_mut().rust_mut().restore_seed.take() {
+            let id_of = |c: crate::SeedChat| match c {
+                crate::SeedChat::None => 0,
+                crate::SeedChat::Row(n) => rows_of(&self, false).get(n).map_or(0, |r| r.id.0),
+                crate::SeedChat::Id(id) => id,
+            };
+            let (open, split) = (id_of(seed.open), id_of(seed.split));
+            let width =
+                kourier_app::prefs::clamp_split_width(f64::from(seed.width_permille) / 1000.0);
+            desktop.update_prefs(|p| {
+                p.open_chat = open;
+                p.split_chat = split;
+                p.split_width = width;
+            });
+        }
+        let stored = desktop.prefs();
+        if known.is_empty() && !give_up && (stored.open_chat > 0 || stored.split_chat > 0) {
+            return false;
+        }
+        self.as_mut().set_split_width(stored.split_width);
+        match kourier_app::restore::plan(stored.open_chat, stored.split_chat, |id| {
+            known.contains(&id)
+        }) {
+            kourier_app::restore::Restore::Nothing => {}
+            kourier_app::restore::Restore::One(id) => self.as_mut().open_conversation(id),
+            kourier_app::restore::Restore::Both(first, second) => {
+                self.as_mut().open_conversation(first);
+                self.as_mut().open_in_split(second);
+                // The left chat ends active (nothing stores which was).
+                self.as_mut().activate_pane(0);
+            }
+        }
+        self.as_mut().rust_mut().chats_saved = Some((stored.open_chat, stored.split_chat));
+        true
+    }
+
+    /// The start already opened a chat of its own (a notification, a link): nothing is restored,
+    /// and the chats are kept from here on.
+    pub fn restore_skipped(mut self: Pin<&mut Self>) {
+        if self.restore_allowed && self.chats_saved.is_none() {
+            self.as_mut().rust_mut().chats_saved = Some((-1, -1));
+            self.save_chats();
+        }
+    }
+
+    /// Writes `open-chat` and `split-chat` when a pane's conversation differs from what was
+    /// last written (no write per event).
+    fn save_chats(mut self: Pin<&mut Self>) {
+        if self.visiting {
+            return;
+        }
+        let Some(saved) = self.chats_saved else {
+            return;
+        };
+        let first = pinned(self.pane_timelines[0]).map_or(0, |t| *t.conversation_id());
+        let second = if self.split {
+            pinned(self.pane_timelines[1]).map_or(0, |t| *t.conversation_id())
+        } else {
+            0
+        };
+        if (first, second) == saved {
+            return;
+        }
+        self.as_mut().rust_mut().chats_saved = Some((first, second));
+        if let Some(desktop) = self.app.as_ref().map(|a| a.desktop()) {
+            desktop.update_prefs(|p| {
+                p.open_chat = first;
+                p.split_chat = second;
+            });
+        }
+    }
+
+    /// The pane that shows `conversation`, -1 for none.
+    pub fn pane_of(&self, conversation: i64) -> i32 {
+        if self.split
+            && let Some(shared) = &self.shared
+        {
+            return shared
+                .borrow()
+                .source
+                .pane_of(ConversationId(conversation))
+                .map_or(-1, i32::from);
+        }
+        match pinned(self.pane_timelines[0]) {
+            Some(t) if conversation != 0 && *t.conversation_id() == conversation => 0,
+            _ => -1,
+        }
+    }
+
+    /// `fetch_older` for pane `pane`.
+    pub fn fetch_older_in(mut self: Pin<&mut Self>, pane: i32) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        self.as_mut().in_pane(pane, |app, _| {
+            if shared.borrow_mut().source.fetch_older() {
+                app.refresh_paging();
+            }
+        });
+    }
+
+    /// `fetch_newer` for pane `pane`.
+    pub fn fetch_newer_in(mut self: Pin<&mut Self>, pane: i32) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        self.as_mut().in_pane(pane, |app, _| {
+            if shared.borrow_mut().source.fetch_newer() {
+                app.refresh_paging();
+            }
+        });
+    }
+
+    /// `jump_to` for pane `pane`.
+    pub fn jump_to_in(self: Pin<&mut Self>, pane: i32, message: i64) {
+        if message <= 0 {
+            return;
+        }
+        self.with_source_in(pane, |s| s.jump_to(MessageId(message)));
+    }
+
+    /// `jump_to_latest` for pane `pane`.
+    pub fn jump_to_latest_in(self: Pin<&mut Self>, pane: i32) {
+        self.with_source_in(pane, |s| s.jump_to_latest());
+    }
+
     fn refresh_paging(self: Pin<&mut Self>) {
         let Some(shared) = self.shared.clone() else {
             return;
@@ -2257,14 +3017,21 @@ impl qobject::App {
             return;
         };
         let ch = std::mem::take(&mut shared.borrow_mut().pending);
+        if ch.pane {
+            // The split's shape or the active pane changed: the pointers first (the in-hand
+            // flags of these very changes describe the new active pane).
+            self.as_mut().sync_arrangement();
+        }
         if ch.merged {
             // Merges (§3.3), of the open chat or of any other: the files that waited in the
             // composer of a chat that went wait for the chat that is left, and two lists
-            // become one.
+            // become one. Both panes' composers.
             let merges = shared.borrow_mut().source.take_merges();
             for (from, into) in merges {
-                if let Some(c) = pinned(self.composer) {
-                    c.merge_conversations(from.0, into.0);
+                for c in self.pane_composers {
+                    if let Some(c) = pinned(c) {
+                        c.merge_conversations(from.0, into.0);
+                    }
                 }
             }
         }
@@ -2321,7 +3088,8 @@ impl qobject::App {
                 );
             }
         }
-        if ch.timeline || ch.header {
+        let active_done = ch.timeline || ch.header;
+        if active_done {
             self.as_mut().refresh_timeline(false);
         } else {
             self.as_mut().refresh_paging();
@@ -2331,6 +3099,13 @@ impl qobject::App {
             if ch.uploads {
                 self.as_mut().refresh_uploads();
             }
+        }
+        let mut side_more = Changes::default();
+        if ch.side.any() && self.split {
+            side_more = self.as_mut().apply_side(ch.side);
+        }
+        if ch.pane {
+            self.as_mut().refresh_panes(active_done);
         }
         if ch.login {
             self.as_mut().show_login();
@@ -2368,36 +3143,66 @@ impl qobject::App {
         if ch.export {
             self.as_mut().sync_export();
         }
+        if ch.forward {
+            self.as_mut().sync_forward();
+        }
         if ch.files {
             // Files of a `SendFiles` the core did not take go back into the composer (with
             // the quote, when the whole request came back); what is still being prepared
             // for sending may have changed too.
-            let open = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
             // (Every lot that came back: a send that went out again without its refused
-            // files may have been refused once more since the last look.)
+            // files may have been refused once more since the last look.) It goes to the
+            // composer that holds its chat, else the active one.
             loop {
                 let refused = shared.borrow_mut().source.take_refused_files();
-                let (Some(refused), Some(c)) = (refused, pinned(self.composer)) else {
-                    break;
-                };
-                c.restore_refused(refused, open);
+                let Some(refused) = refused else { break };
+                let at = [self.composer, self.side_composer]
+                    .iter()
+                    .position(|c| pinned(*c).is_some_and(|c| c.conversation == refused.conv.0))
+                    .unwrap_or(0);
+                let open = pinned([self.timeline, self.side_timeline][at])
+                    .map_or(0, |t| *t.conversation_id());
+                if let Some(c) = pinned([self.composer, self.side_composer][at]) {
+                    c.restore_refused(refused, open);
+                }
             }
             // Sends the core answered: the pasted files made for them can go.
             let finished = shared.borrow_mut().source.take_finished_sends();
-            if let Some(mut c) = pinned(self.composer) {
-                c.as_mut().sends_finished(&finished);
-                c.refresh_preparing();
+            for c in self.pane_composers {
+                if let Some(mut c) = pinned(c) {
+                    c.as_mut().sends_finished(&finished);
+                    c.refresh_preparing();
+                }
             }
         }
         if ch.plan {
             // What the core makes of the composer's files: the split and the refusals.
+            // (Each composer's strips count serials from a range of their own: the one the
+            // answer does not fit ignores it.)
             let answer = shared.borrow_mut().source.take_file_plan();
-            if let (Some(answer), Some(c)) = (answer, pinned(self.composer)) {
-                c.plan_ready(&answer);
+            if let Some(answer) = answer {
+                for c in self.pane_composers {
+                    if let Some(c) = pinned(c) {
+                        c.plan_ready(&answer);
+                    }
+                }
             }
             let failed = shared.borrow_mut().source.take_plan_failure();
-            if let (Some(serial), Some(c)) = (failed, pinned(self.composer)) {
-                c.plan_failed(serial);
+            if let Some(serial) = failed {
+                for c in self.pane_composers {
+                    if let Some(c) = pinned(c) {
+                        c.plan_failed(serial);
+                    }
+                }
+            }
+            if self.split {
+                // The viewmodel waits for ONE plan: a composer whose request the other
+                // composer's displaced asks again now (a no-op for a strip that is planned).
+                for c in self.pane_composers {
+                    if let Some(c) = pinned(c) {
+                        c.replan();
+                    }
+                }
             }
         }
         if ch.revisions {
@@ -2495,7 +3300,12 @@ impl qobject::App {
             self.as_mut().set_timers_active(timers);
         }
         self.as_mut().arm_search();
-        self.arm_flags();
+        self.as_mut().arm_flags();
+        self.as_mut().save_chats();
+        if side_more.any() {
+            shared.borrow_mut().pending.merge(side_more);
+            self.apply_pending();
+        }
     }
 
     /// Reads the search view and shows it: the hits and the view's properties go to
@@ -3009,26 +3819,24 @@ impl qobject::App {
         let Some(shared) = self.shared.clone() else {
             return;
         };
-        let switched = pinned(self.timeline).is_some_and(|t| *t.conversation_id() != conversation);
-        if let Some(t) = pinned(self.timeline) {
-            t.set_conversation_id(conversation);
-        }
-        if let Some(c) = pinned(self.conversations) {
-            c.set_current_id(conversation);
-        }
-        if switched {
-            self.as_mut().close_kept();
-            if let Some(c) = pinned(self.composer) {
-                c.cancel_edit();
+        // A chat the other pane shows is not opened twice: that pane becomes the active one.
+        if conversation != 0 && self.split {
+            let other = shared
+                .borrow()
+                .source
+                .pane_of(ConversationId(conversation))
+                .map(i32::from);
+            if let Some(pane) = other
+                && pane != self.active_pane
+            {
+                self.as_mut().activate_pane(pane);
+                if let Some(at) = at {
+                    self.jump_to(at.0);
+                }
+                return;
             }
-            if let Some(c) = pinned(self.composer) {
-                c.cancel_reply();
-            }
-            // (The files waiting in the composer stay with their chat: `set_conversation`.)
         }
-        if let Some(c) = pinned(self.composer) {
-            c.set_conversation(conversation);
-        }
+        let switched = self.as_mut().prepare_open(conversation);
         if switched && conversation != 0 {
             // `timeline.open` (§1.3): from here to the frame that shows the rows.
             self.as_mut().rust_mut().trace.open = trace::Span::begin().map(|span| OpenTrace {
@@ -3059,6 +3867,11 @@ impl qobject::App {
         let Some(shared) = self.shared.clone() else {
             return;
         };
+        if self.split {
+            let active = self.active_pane;
+            self.close_pane(active);
+            return;
+        }
         self.as_mut().close_kept();
         let ch = shared.borrow_mut().source.open_conversation(None);
         if let Some(c) = pinned(self.conversations) {
@@ -3625,6 +4438,218 @@ impl qobject::App {
         let busy = shared.borrow().source.export_busy();
         if *self.export_busy() != busy {
             self.as_mut().set_export_busy(busy);
+        }
+    }
+
+    /// "Forward…": the dialog for `messages` of the open chat. Fills `forwardTargets` (the shown
+    /// accounts' chats the user can write in, the search emptied) and asks the source for the plan.
+    pub fn forward_open(mut self: Pin<&mut Self>, messages: &QStringList) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let source = pinned(self.timeline).map_or(0, |t| *t.conversation_id());
+        let ids = ids_of(messages);
+        if source == 0 || ids.is_empty() {
+            return false;
+        }
+        let all = shared.borrow().source.forward_targets();
+        let source_account = all
+            .iter()
+            .find(|t| t.id.0 == source)
+            .map_or(AccountId(0), |t| t.account);
+        let shown: Vec<AccountId> = self
+            .account_rows
+            .iter()
+            .filter(|r| r.shown)
+            .map(|r| r.id)
+            .collect();
+        if let Some(mut m) = pinned(self.forward_targets) {
+            m.as_mut().set_filter_text(&QString::default());
+            m.set_targets(source_account, shown, all);
+        }
+        let changes = shared.borrow_mut().source.forward_open(
+            ConversationId(source),
+            ids.into_iter().map(MessageId).collect(),
+        );
+        shared.borrow_mut().pending.merge(changes);
+        self.as_mut().apply_pending();
+        self.as_mut().sync_forward();
+        true
+    }
+
+    /// The dialog's ticks changed: the plan is asked again (the newest ticks win).
+    pub fn forward_tick(mut self: Pin<&mut Self>, targets: &QStringList) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let ids: Vec<ConversationId> = ids_of(targets).into_iter().map(ConversationId).collect();
+        let changes = shared.borrow_mut().source.forward_tick(ids);
+        shared.borrow_mut().pending.merge(changes);
+        self.as_mut().apply_pending();
+    }
+
+    /// The dialog's Forward: starts the job (look from the combo's index).
+    pub fn forward_send(mut self: Pin<&mut Self>, look: i32, comment: &QString) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let started = shared
+            .borrow_mut()
+            .source
+            .forward_send(crate::controllers::look_of(look), &comment.to_string());
+        self.as_mut().sync_forward();
+        started.is_some()
+    }
+
+    /// The dialog closed without Forward.
+    pub fn forward_abandon(self: Pin<&mut Self>) {
+        if let Some(shared) = self.shared.clone() {
+            shared.borrow_mut().source.forward_abandon();
+        }
+    }
+
+    /// The answer to `forwardAsk`.
+    pub fn forward_without(mut self: Pin<&mut Self>, request: i64, send: bool) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let changes = shared
+            .borrow_mut()
+            .source
+            .forward_without(u64::try_from(request).unwrap_or(0), send);
+        shared.borrow_mut().pending.merge(changes);
+        self.as_mut().apply_pending();
+        self.as_mut().sync_forward();
+    }
+
+    /// The folder of the slice pictures of job `request` (F7), made here: Rust owns its
+    /// creation, mode and deletion. Empty when none could be made.
+    pub fn forward_pictures_dir(self: Pin<&mut Self>, request: i64) -> QString {
+        let dir = self
+            .app
+            .as_ref()
+            .zip(u64::try_from(request).ok())
+            .and_then(|(handle, r)| handle.forward_picture_dir(r));
+        QString::from(dir.as_ref().and_then(|d| d.to_str()).unwrap_or(""))
+    }
+
+    /// The slices are written (or none could be): the job goes on with them.
+    pub fn forward_pictures_done(mut self: Pin<&mut Self>, request: i64, paths: &QStringList) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let paths: Vec<std::path::PathBuf> = QList::<QString>::from(paths)
+            .iter()
+            .map(|p| std::path::PathBuf::from(p.to_string()))
+            .collect();
+        if let Some(model) = pinned(self.forward_rows) {
+            models::apply(model, &[ListOp::Reset], &[]);
+        }
+        let changes = shared
+            .borrow_mut()
+            .source
+            .forward_pictures(u64::try_from(request).unwrap_or(0), paths);
+        shared.borrow_mut().pending.merge(changes);
+        self.as_mut().apply_pending();
+        self.as_mut().sync_forward();
+    }
+
+    /// Cancel of the running forward job (the footer strip's button).
+    pub fn forward_cancel(mut self: Pin<&mut Self>) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let request = self.forward_request;
+        let changes = shared.borrow_mut().source.forward_cancel(request);
+        shared.borrow_mut().pending.merge(changes);
+        self.as_mut().apply_pending();
+        self.as_mut().sync_forward();
+    }
+
+    /// Hands what the forward flow has to tell to QML and keeps the strip's properties true.
+    fn sync_forward(mut self: Pin<&mut Self>) {
+        use kourier_viewmodel::forward::ForwardUpdate;
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let updates = shared.borrow_mut().source.take_forward();
+        for update in updates {
+            match update {
+                ForwardUpdate::Dialog(json) => {
+                    self.as_mut()
+                        .forward_dialog_ready(QString::from(json.as_str()));
+                }
+                ForwardUpdate::Progress {
+                    request,
+                    done,
+                    total,
+                } => {
+                    self.as_mut().rust_mut().forward_request = request;
+                    self.as_mut().set_forward_done(i64::from(done));
+                    self.as_mut().set_forward_total(i64::from(total));
+                    self.as_mut().set_forward_busy(true);
+                }
+                ForwardUpdate::AskWithout { request, count } => {
+                    self.as_mut().forward_ask(
+                        i64::try_from(request).unwrap_or(0),
+                        i32::try_from(count).unwrap_or(i32::MAX),
+                    );
+                }
+                ForwardUpdate::RenderPictures { request, .. } => {
+                    // The picture look is drawn by `ForwardPicture.qml` from the rows of the
+                    // job's plan; `forwardPicturesDone` answers. Without rows or a window to
+                    // draw in, no picture can be made: the empty answer.
+                    let rows = shared.borrow().source.forward_render_rows(request);
+                    let drawn = !rows.is_empty() && pinned(self.forward_rows).is_some();
+                    if drawn {
+                        // The viewmodel names senders only in a group's rows.
+                        let group = rows.iter().any(|r| r.show_author || r.show_avatar);
+                        if let Some(model) = pinned(self.forward_rows) {
+                            models::apply(model, &[ListOp::Reset], &rows);
+                        }
+                        self.as_mut()
+                            .forward_render(i64::try_from(request).unwrap_or(0), group);
+                    } else {
+                        let changes = shared
+                            .borrow_mut()
+                            .source
+                            .forward_pictures(request, Vec::new());
+                        shared.borrow_mut().pending.merge(changes);
+                        let _ = self.qt_thread().queue(|app| app.apply_pending());
+                    }
+                }
+                ForwardUpdate::Ended { request, notice } => {
+                    if let Some(handle) = &self.app {
+                        handle.release_forward_pictures(request);
+                    }
+                    self.as_mut()
+                        .forward_render_stopped(i64::try_from(request).unwrap_or(0));
+                    if let Some(model) = pinned(self.forward_rows) {
+                        models::apply(model, &[ListOp::Reset], &[]);
+                    }
+                    if request == self.forward_request {
+                        self.as_mut().rust_mut().forward_request = 0;
+                        self.as_mut().set_forward_busy(false);
+                        self.as_mut().set_forward_done(0);
+                        self.as_mut().set_forward_total(0);
+                    }
+                    if !notice.is_empty() {
+                        self.as_mut().forward_notice(QString::from(notice.as_str()));
+                    }
+                }
+                ForwardUpdate::StagedChanged(_) => {
+                    // The staged forwards are kept by conversation in the source; both panes' composers show theirs
+                    // (split view: a drop stages into the other pane's chat).
+                    for c in self.pane_composers {
+                        if let Some(c) = pinned(c) {
+                            c.forwards_changed();
+                        }
+                    }
+                }
+                ForwardUpdate::Refused(text) => {
+                    self.as_mut().forward_notice(QString::from(text.as_str()));
+                }
+            }
         }
     }
 

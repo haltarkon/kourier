@@ -14,6 +14,7 @@ import app.kourier
 // alive (hidden) while a page is open on top of it. Every text from the network is plain text.
 Item {
     id: root
+    required property TimelineModel chatModel
 
     readonly property var person: App.person
     // The page has arrived (an empty map before).
@@ -113,7 +114,7 @@ Item {
     // Message opens her chat, unless it is the open one; her timer is her chat's, open or not
     // (the viewmodel offers none for a chat the user deleted).
     readonly property bool timerShown: root.loaded && root.person.chat !== 0 && root.person.timers.length > 0
-    readonly property bool messageShown: root.loaded && root.person.chat !== 0 && root.person.chat !== App.timeline.conversationId
+    readonly property bool messageShown: root.loaded && root.person.chat !== 0 && root.person.chat !== root.chatModel.conversationId
     readonly property bool groupsShown: root.loaded && root.person.groups.length > 0
     // The groups in common as the rows were last made from. `App.person` is a new map at every
     // refresh (a profile, a contact, a group changing), and a model that is a new array each time
@@ -326,6 +327,7 @@ Item {
             // ---- Disappearing Messages: her chat's timer ----
             TimerPart {
                 id: timerPart
+                chatModel: root.chatModel
                 objectName: "detailsTimer"
                 visible: root.timerShown && !root.allGroups
                 x: Kirigami.Units.largeSpacing

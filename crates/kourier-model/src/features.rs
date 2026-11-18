@@ -441,6 +441,11 @@ pub struct ConversationFeatures {
     /// JSON and the [`Self::stable_hash`] it had before the field existed.
     #[serde(skip_serializing_if = "ChatExport::is_unstated")]
     pub export: ChatExport,
+    /// The network forbids forwarding OUT of this chat (Telegram's protected content). Skipped
+    /// from the serialised form while off, so a chat that does not set it keeps the JSON and the
+    /// [`Self::stable_hash`] it had before the field existed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_forward: bool,
 }
 
 /// Whether a chat may be exported into a copy outside the encrypted store (Export Selected,
@@ -815,6 +820,48 @@ pub struct NetworkDescriptor {
     /// onto it.
     #[serde(default)]
     pub server: ServerRules,
+    /// `Some` = the network marks a forward on the wire and its clients show it; the limits per
+    /// forward (D2 of the forward line). `None` (Signal, Threema, a plain fake) = no mark: a
+    /// stored forward state is not shown for such a network. Skipped from the serialised form
+    /// when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwards: Option<ForwardRules>,
+}
+
+/// The limits of one forward on a network that marks forwards ([`NetworkDescriptor::forwards`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRules {
+    /// The most chats one forward may name; `None` = no limit.
+    pub max_chats: Option<u16>,
+    /// A message whose [`Forwarded::score`] is at least this is "forwarded many times".
+    pub many_from: u32,
+    /// The most chats a message forwarded many times may go to at once.
+    pub many_max_chats: u16,
+}
+
+impl ForwardRules {
+    /// Whether a message with this forward state is "forwarded many times".
+    pub fn is_many(&self, f: Forwarded) -> bool {
+        f.score >= self.many_from
+    }
+}
+
+/// The network's count of earlier forwards of a message that reached here as a forward,
+/// WhatsApp's semantics: 0 for a first forward. The wire's 127 sentinel is the backend's business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Forwarded {
+    /// Earlier forwards of the message.
+    pub score: u32,
+}
+
+impl Forwarded {
+    /// The state of a forward of a message that was `prev` (`None`: not a forward itself):
+    /// `prev.score + 1`, or 0 for the first forward.
+    pub fn next(prev: Option<Forwarded>) -> Forwarded {
+        Forwarded {
+            score: prev.map_or(0, |p| p.score.saturating_add(1)),
+        }
+    }
 }
 
 /// What a network's backend cleans of the location (LOC, [`NetworkDescriptor::cleaned_pictures`]).
@@ -917,6 +964,40 @@ mod tests {
         assert!(!w.allows(86_401, 0));
         assert!(!w.allows(0, 10));
         assert!(Window::default().allows(u64::MAX, u16::MAX));
+    }
+
+    #[test]
+    fn forward_state_rules() {
+        assert_eq!(Forwarded::next(None), Forwarded { score: 0 });
+        assert_eq!(Forwarded::next(Some(Forwarded { score: 0 })).score, 1);
+        assert_eq!(Forwarded::next(Some(Forwarded { score: 4 })).score, 5);
+        let rules = ForwardRules {
+            max_chats: Some(5),
+            many_from: 5,
+            many_max_chats: 1,
+        };
+        assert!(!rules.is_many(Forwarded { score: 4 }));
+        assert!(rules.is_many(Forwarded { score: 5 }));
+        let json = serde_json::to_string(&rules).unwrap();
+        assert_eq!(serde_json::from_str::<ForwardRules>(&json).unwrap(), rules);
+        let f = Forwarded { score: 127 };
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(serde_json::from_str::<Forwarded>(&json).unwrap(), f);
+    }
+
+    #[test]
+    fn no_forward_is_skipped_while_off() {
+        let f = ConversationFeatures::default();
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("no_forward"), "{json}");
+        let mut g = f.clone();
+        g.no_forward = true;
+        assert_ne!(f.stable_hash(), g.stable_hash());
+        let back: ConversationFeatures =
+            serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.no_forward);
+        let old: ConversationFeatures = serde_json::from_str(&json).unwrap();
+        assert!(!old.no_forward);
     }
 
     #[test]

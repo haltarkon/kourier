@@ -66,6 +66,29 @@ pub fn dev_env_names_now() -> Vec<std::ffi::OsString> {
     dev_env_names(std::env::vars_os().map(|(name, _)| name))
 }
 
+/// The names among `names` that a program Kourier starts for the person must not get: the
+/// development variables ([`dev_env_names`]) and what the AppImage runtime set for Kourier
+/// ([`crate::appimage::RUNTIME_ENV`]). A program that is an AppImage itself, or one that updates
+/// itself when `APPIMAGE` names a file (Electron's updater does), would take Kourier's file for
+/// its own.
+pub fn child_env_drop(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    let names: Vec<_> = names.into_iter().collect();
+    let mut drop = dev_env_names(names.iter().cloned());
+    drop.extend(names.into_iter().filter(|name| {
+        crate::appimage::RUNTIME_ENV
+            .iter()
+            .any(|runtime| name.as_encoded_bytes() == runtime.as_bytes())
+    }));
+    drop
+}
+
+/// [`child_env_drop`] of this process's environment right now.
+pub fn child_env_drop_now() -> Vec<std::ffi::OsString> {
+    child_env_drop(std::env::vars_os().map(|(name, _)| name))
+}
+
 /// Whether `env` asks a debug build to make itself non-dumpable ([`NO_DUMP_ENV`] is `1`).
 /// Release builds decide by themselves ([`denies_dumps`]) and never read it.
 pub fn asked_to_deny_dumps(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {

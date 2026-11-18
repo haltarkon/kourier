@@ -3131,6 +3131,7 @@ async fn an_abort_right_behind_the_transmit_finds_the_attempt() {
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     );
     h.send(command).await;
@@ -3174,6 +3175,7 @@ async fn text_edits_and_reactions_cannot_be_stopped() {
             body: Body::Text(Text::plain("synthetic unstoppable")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         OutgoingKind::Edit {
             target: target(),
@@ -4448,6 +4450,7 @@ async fn a_transmit_runs_off_the_loop_and_a_disconnect_ends_its_wait() {
             body: Body::Text(Text::plain("synthetic hello")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,
@@ -4534,6 +4537,7 @@ async fn a_quit_waits_for_the_ack_of_a_frame_in_the_air_and_the_next_start_sends
             body: Body::Text(Text::plain("synthetic hello")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,
@@ -4661,6 +4665,7 @@ fn a_picture_in_the_blobs(h: &H) -> kourier_backend_api::OutgoingKind {
         },
         reply_to: None,
         expiry: None,
+        forward: None,
     }
 }
 
@@ -4766,6 +4771,7 @@ async fn a_quit_ends_the_attempts_it_gave_up_waiting_for_before_the_client_stops
             body: Body::Text(Text::plain("synthetic hello")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     );
     h.send(command).await;
@@ -4987,6 +4993,7 @@ async fn started_hold_chat(client: &Made) -> kourier_backend_api::OutgoingReques
             body: Body::Text(Text::plain("synthetic held text")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,

@@ -108,6 +108,8 @@ impl Flavor {
                 },
                 Self::SignalLike | Self::WhatsAppLike | Self::ThreemaLike => ServerRules::default(),
             },
+            // No forward mark in the plain fake; the one that plays WhatsApp states WhatsApp's.
+            forwards: None,
         }
     }
 
@@ -179,6 +181,12 @@ impl Flavor {
             cleaned_pictures: Some(crate::scripts::whatsapp_cleaned_pictures()),
             // The real backend's rules (KT-2), whatever the flavour that plays it.
             server: ServerRules::default(),
+            // WhatsApp's limits, as `kourier-whatsapp` states them.
+            forwards: Some(kourier_model::ForwardRules {
+                max_chats: Some(5),
+                many_from: 5,
+                many_max_chats: 1,
+            }),
             ..self.descriptor()
         }
     }
@@ -265,6 +273,12 @@ impl Flavor {
             // The real Telegram descriptor keeps both flags off until its lane maps onto them
             // (KT-2), whatever the flavour that plays it.
             server: ServerRules::default(),
+            // Telegram has no forward limit and no "many" state (the real backend states the same).
+            forwards: Some(kourier_model::ForwardRules {
+                max_chats: None,
+                many_from: u32::MAX,
+                many_max_chats: u16::MAX,
+            }),
             ..self.descriptor()
         }
     }

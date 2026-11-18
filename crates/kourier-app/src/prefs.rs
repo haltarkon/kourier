@@ -188,13 +188,87 @@ impl<'de> Deserialize<'de> for LocationFiles {
     }
 }
 
+/// How a forward to another account or network looks (`forward-look`; the Settings default of
+/// the forward dialog and the composer's forward card). The viewmodel's look is mapped from it in
+/// the front end; a forward on the same account ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForwardLookPref {
+    /// The content alone ("Plain copy").
+    Plain,
+    /// A "Forwarded from" line above each run of messages ("Forwarded header").
+    #[default]
+    Header,
+    /// The header, and the body quoted ("Header + quoted body").
+    Quoted,
+    /// The messages as one picture ("As picture").
+    Picture,
+}
+
+impl ForwardLookPref {
+    /// The settings page's combo box index (0 to 3, in the order of the variants).
+    pub fn index(self) -> i32 {
+        match self {
+            ForwardLookPref::Plain => 0,
+            ForwardLookPref::Header => 1,
+            ForwardLookPref::Quoted => 2,
+            ForwardLookPref::Picture => 3,
+        }
+    }
+
+    /// The choice at a combo box index (out of range = Header, the default).
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            0 => ForwardLookPref::Plain,
+            2 => ForwardLookPref::Quoted,
+            3 => ForwardLookPref::Picture,
+            _ => ForwardLookPref::Header,
+        }
+    }
+}
+
+/// Written by hand like [`LocationFiles`]: a value this version does not know reads as Header
+/// and keeps every other preference.
+impl<'de> Deserialize<'de> for ForwardLookPref {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = ForwardLookPref;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"plain\", \"header\", \"quoted\" or \"picture\"")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ForwardLookPref, E> {
+                Ok(match v {
+                    "plain" => ForwardLookPref::Plain,
+                    "quoted" => ForwardLookPref::Quoted,
+                    "picture" => ForwardLookPref::Picture,
+                    _ => ForwardLookPref::Header,
+                })
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<ForwardLookPref, E> {
+                Ok(ForwardLookPref::Header)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<ForwardLookPref, E> {
+                Ok(ForwardLookPref::Header)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<ForwardLookPref, E> {
+                Ok(ForwardLookPref::Header)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<ForwardLookPref, E> {
+                Ok(ForwardLookPref::Header)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// What an old `round-avatars = false` reads as on the slider `avatar-corners`: the square avatar of
 /// old had the theme's own corner radius (Kirigami's `cornerRadius`, 5 px), about a fifth of half a
 /// list avatar's side (`Style.listAvatarSize`, 2.6 grid units), so the look stays as it was.
 pub const OLD_SQUARE_AVATAR_CORNERS: u8 = 20;
 
 /// The preferences.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Prefs {
     /// Show a tray icon; closing the window keeps Kourier running there. Off by default (KDE
@@ -237,6 +311,9 @@ pub struct Prefs {
     pub notification_content: NotificationContent,
     /// What Send does with a file that holds where it was taken (absent or unknown = Ask).
     pub location_files: LocationFiles,
+    /// How a forward to another account or network looks by default (absent or unknown =
+    /// Header).
+    pub forward_look: ForwardLookPref,
     /// The experimental networks the user turned on (`networks-on`, the names of
     /// [`NetworkKind::as_str`]; absent = none). It is read when Kourier starts: the app
     /// registers an experimental network only while it is on, so a change takes effect at the
@@ -331,6 +408,75 @@ pub struct Prefs {
         deserialize_with = "lenient_model_slicer"
     )]
     pub model_slicer: String,
+    /// The conversation the first chat pane showed when Kourier last ran (`open-chat`, a core
+    /// conversation id; absent = none, 0 and anything that is no positive integer read as none).
+    /// ONE owner, the App (`DesktopHandle::update_prefs`), not listed by the Settings page; the
+    /// restore after the first frame of the list reads it (`restore_plan`, kourier-qt).
+    #[serde(
+        skip_serializing_if = "is_no_chat",
+        deserialize_with = "lenient_chat_id"
+    )]
+    pub open_chat: i64,
+    /// The conversation of the second pane while the split was on (`split-chat`; absent = no
+    /// split). Same owner and reading as `open-chat`.
+    #[serde(
+        skip_serializing_if = "is_no_chat",
+        deserialize_with = "lenient_chat_id"
+    )]
+    pub split_chat: i64,
+    /// The first pane's share of the room the two chats have (`split-width`, from
+    /// [`SPLIT_WIDTH_MIN`] to [`SPLIT_WIDTH_MAX`], default [`SPLIT_WIDTH_DEFAULT`] and absent
+    /// while it is the default). Same owner. A stored value outside the range is clamped, one
+    /// that is no number is the default.
+    #[serde(
+        skip_serializing_if = "is_default_split_width",
+        deserialize_with = "lenient_split_width"
+    )]
+    pub split_width: f64,
+}
+
+/// The smallest and the largest share the divider of the split may keep, and the default.
+pub const SPLIT_WIDTH_MIN: f64 = 0.25;
+/// See [`SPLIT_WIDTH_MIN`].
+pub const SPLIT_WIDTH_MAX: f64 = 0.75;
+/// See [`SPLIT_WIDTH_MIN`].
+pub const SPLIT_WIDTH_DEFAULT: f64 = 0.5;
+
+/// `Prefs` holds no NaN (`split_width` is clamped on every way in), so equality is total.
+impl Eq for Prefs {}
+
+fn is_no_chat(id: &i64) -> bool {
+    *id <= 0
+}
+
+fn is_default_split_width(w: &f64) -> bool {
+    (*w - SPLIT_WIDTH_DEFAULT).abs() < f64::EPSILON
+}
+
+/// `open-chat`, `split-chat`: a positive integer, else none (0).
+fn lenient_chat_id<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value.as_integer().filter(|n| *n > 0).unwrap_or(0))
+}
+
+/// The share a value of `split-width` stands for: a number is clamped to the range, anything
+/// else (and NaN) is the default.
+pub fn clamp_split_width(value: f64) -> f64 {
+    if value.is_nan() {
+        SPLIT_WIDTH_DEFAULT
+    } else {
+        value.clamp(SPLIT_WIDTH_MIN, SPLIT_WIDTH_MAX)
+    }
+}
+
+/// `split-width`: a float or an integer, clamped; else the default.
+fn lenient_split_width<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(match value {
+        toml::Value::Float(f) => clamp_split_width(f),
+        toml::Value::Integer(n) => clamp_split_width(n as f64),
+        _ => SPLIT_WIDTH_DEFAULT,
+    })
 }
 
 /// `model-slicer`: a table id of [`crate::slicers`], else the default (empty).
@@ -556,6 +702,7 @@ impl Default for Prefs {
             account_tags: BTreeMap::new(),
             notification_content: NotificationContent::NameAndMessage,
             location_files: LocationFiles::Ask,
+            forward_look: ForwardLookPref::Header,
             networks_on: Vec::new(),
             networks_off: Vec::new(),
             pending_link: None,
@@ -571,6 +718,9 @@ impl Default for Prefs {
             model_colour: String::new(),
             model_box: String::new(),
             model_slicer: String::new(),
+            open_chat: 0,
+            split_chat: 0,
+            split_width: SPLIT_WIDTH_DEFAULT,
         }
     }
 }
@@ -766,6 +916,69 @@ mod tests {
         assert!(!text.contains("hidden-accounts"), "{text}");
     }
 
+    /// Split view: a profile from before the keys has no chat to reopen, no split and the
+    /// middle share, and the file stays free of the three keys while they hold those.
+    #[test]
+    fn the_split_keys_default_and_stay_out_of_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        let none = Prefs::load(&path).expect("missing");
+        assert_eq!((none.open_chat, none.split_chat), (0, 0));
+        assert_eq!(none.split_width, SPLIT_WIDTH_DEFAULT);
+        std::fs::write(&path, "tray = true\n").expect("write");
+        let old = Prefs::load(&path).expect("old");
+        assert_eq!(
+            (old.open_chat, old.split_chat, old.split_width),
+            (0, 0, 0.5)
+        );
+        Prefs::default().save(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        for key in ["open-chat", "split-chat", "split-width"] {
+            assert!(!text.contains(key), "{key}: {text}");
+        }
+    }
+
+    /// A bad value of the split keys is the default, a width outside the range is clamped, and
+    /// the rest of the file is kept (the whole file never fails over one key).
+    #[test]
+    fn a_bad_split_value_reads_as_the_default_and_a_wide_one_is_clamped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        for (text, chat, width) in [
+            (
+                "open-chat = 7\nsplit-chat = 9\nsplit-width = 0.6\n",
+                (7, 9),
+                0.6,
+            ),
+            (
+                "open-chat = -3\nsplit-chat = 0\nsplit-width = 0.1\n",
+                (0, 0),
+                0.25,
+            ),
+            (
+                "open-chat = \"x\"\nsplit-chat = 2.5\nsplit-width = 3\n",
+                (0, 0),
+                0.75,
+            ),
+            (
+                "open-chat = true\nsplit-chat = [1]\nsplit-width = \"wide\"\n",
+                (0, 0),
+                0.5,
+            ),
+            ("split-width = nan\n", (0, 0), 0.5),
+            ("split-width = 0.0\n", (0, 0), 0.25),
+        ] {
+            std::fs::write(&path, format!("tray = true\n{text}")).expect("write");
+            let p = Prefs::load(&path).expect("a bad value is not an error");
+            assert_eq!(
+                ((p.open_chat, p.split_chat), p.split_width),
+                (chat, width),
+                "{text}"
+            );
+            assert!(p.tray, "{text}");
+        }
+    }
+
     /// A bad `hidden-accounts` entry (not a uuid, not a string) is skipped and the rest of
     /// the list and of the file is kept; a value that is no list reads as none hidden (L3).
     #[test]
@@ -814,6 +1027,7 @@ mod tests {
             account_tags: BTreeMap::from([(UUID_B.to_owned(), "Work".to_owned())]),
             notification_content: NotificationContent::NameOnly,
             location_files: LocationFiles::Never,
+            forward_look: ForwardLookPref::Quoted,
             networks_on: vec!["WhatsApp".to_owned()],
             networks_off: vec!["Threema".to_owned()],
             pending_link: Some("WhatsApp".to_owned()),
@@ -829,6 +1043,9 @@ mod tests {
             model_colour: "#e0529c".to_owned(),
             model_box: "256x256x256".to_owned(),
             model_slicer: "cura".to_owned(),
+            open_chat: 41,
+            split_chat: 42,
+            split_width: 0.375,
         };
         prefs.save(&path).expect("save");
         assert_eq!(Prefs::load(&path).expect("load"), prefs);
@@ -841,8 +1058,12 @@ mod tests {
         assert!(text.contains("model-colour = \"#e0529c\""), "{text}");
         assert!(text.contains("model-box = \"256x256x256\""), "{text}");
         assert!(text.contains("model-slicer = \"cura\""), "{text}");
+        assert!(text.contains("open-chat = 41"), "{text}");
+        assert!(text.contains("split-chat = 42"), "{text}");
+        assert!(text.contains("split-width = 0.375"), "{text}");
         assert!(!text.contains("round-avatars"), "{text}");
         assert!(text.contains("location-files = \"never\""), "{text}");
+        assert!(text.contains("forward-look = \"quoted\""), "{text}");
         assert!(text.contains("networks-on = [\"WhatsApp\"]"), "{text}");
         assert!(text.contains("pending-link = \"WhatsApp\""), "{text}");
         assert!(text.contains("blend-accounts = false"), "{text}");
@@ -1060,6 +1281,70 @@ mod tests {
         assert!(text.contains("location-files = \"never\""), "{text}");
         assert_eq!(LocationFiles::from_index(7), LocationFiles::Ask);
         assert_eq!(LocationFiles::from_index(-1), LocationFiles::Ask);
+    }
+
+    /// "Forward to another account as": Header for a profile that never chose, each choice
+    /// round trips through the file and a combo index out of range is Header.
+    #[test]
+    fn forward_look_is_header_unless_the_file_says_otherwise() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        assert_eq!(Prefs::default().forward_look, ForwardLookPref::Header);
+        assert_eq!(
+            Prefs::load(&path).expect("missing").forward_look,
+            ForwardLookPref::Header
+        );
+        std::fs::write(&path, "tray = true\n").expect("write");
+        assert_eq!(
+            Prefs::load(&path).expect("old").forward_look,
+            ForwardLookPref::Header
+        );
+        for (choice, index, word) in [
+            (ForwardLookPref::Plain, 0, "plain"),
+            (ForwardLookPref::Header, 1, "header"),
+            (ForwardLookPref::Quoted, 2, "quoted"),
+            (ForwardLookPref::Picture, 3, "picture"),
+        ] {
+            let p = Prefs {
+                forward_look: choice,
+                ..Prefs::default()
+            };
+            p.save(&path).expect("save");
+            assert_eq!(Prefs::load(&path).expect("load"), p);
+            assert_eq!(choice.index(), index);
+            assert_eq!(ForwardLookPref::from_index(index), choice);
+            let text = std::fs::read_to_string(&path).expect("read");
+            assert!(
+                text.contains(&format!("forward-look = \"{word}\"")),
+                "{text}"
+            );
+        }
+        assert_eq!(ForwardLookPref::from_index(7), ForwardLookPref::Header);
+        assert_eq!(ForwardLookPref::from_index(-1), ForwardLookPref::Header);
+    }
+
+    /// A `forward-look` value this version does not know reads as Header and keeps every other
+    /// preference.
+    #[test]
+    fn an_unknown_forward_look_value_keeps_the_other_prefs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kourier.toml");
+        for value in ["\"bogus\"", "\"Picture\"", "3", "true"] {
+            std::fs::write(
+                &path,
+                format!("tray = true\nnetworks-on = [\"WhatsApp\"]\nforward-look = {value}\n"),
+            )
+            .expect("write");
+            let p = Prefs::load(&path).expect("an unknown value is not an error");
+            assert_eq!(p.forward_look, ForwardLookPref::Header, "{value}");
+            assert!(p.tray, "{value}");
+            assert!(p.network_on(NetworkKind::WhatsApp), "{value}");
+        }
+        std::fs::write(&path, "forward-look = \"picture\"\n").expect("write");
+        assert_eq!(
+            Prefs::load(&path).expect("picture").forward_look,
+            ForwardLookPref::Picture
+        );
     }
 
     /// `account-tints` keeps what is a uuid and a color, a value of any other shape reads as empty, and neither costs

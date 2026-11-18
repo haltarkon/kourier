@@ -1987,6 +1987,7 @@ async fn transmit(
             body: Body::Text(kourier_model::Text::plain("hello")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only,
         is_recipient_update: false,
@@ -2225,6 +2226,7 @@ async fn transmit_files(
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,
@@ -2453,6 +2455,7 @@ fn text_message(
             body: Body::text("hello"),
             reply_to,
             expiry: None,
+            forward: None,
         },
     )
 }

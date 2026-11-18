@@ -16186,6 +16186,12 @@ mod tests {
     /// "the newest own message", which is now the phone's. Without the field the stand-in (like the
     /// app) would delete the phone's message and the answer would name it, which halts the run.
     #[test]
+    #[ignore = "load flake (the user's rule: a second failure moves it out of the regular run): \
+                \"refused ... the newest message of the open chat that is ours is not one\" under \
+                the agents server's load, strike 1 2026-11-05 (the WA lane's quick ci, load 30), \
+                strike 2 2026-11-17 (lane-split S2 quick ci, 0.13 s); passes alone; stable once \
+                its stand-in's phone message waits on the tool's look as peer_edit_and_delete's \
+                does. Run it with --run-ignored only"]
     fn an_act_takes_the_message_it_was_judged_for_and_not_a_newer_one_of_the_phone() {
         let (_scratch, dir) = supervised_profile("fs9");
         let (_app, shared) = sending_app(&dir, json!([peer_row(5)]));

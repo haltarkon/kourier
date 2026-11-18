@@ -34,6 +34,8 @@ import app.kourier
 // drops the reply.
 QQC2.ToolBar {
     id: root
+    required property TimelineModel chatModel
+    required property ComposerController composerModel
 
     // The note "Already sent" offers Delete for Everyone for `message`: the page asks the
     // delete question for that row (the same dialog as the message menu's).
@@ -41,18 +43,20 @@ QQC2.ToolBar {
 
     // Room kept free on the trailing side (the chat page's details panel stands there).
     property real rightReserved: 0
+    // Whether the composer is in the active pane: `App.noticeMessage()` reads the active one's notice.
+    property bool active: true
 
-    readonly property bool replying: App.composer.replyToId > 0
-    readonly property bool editing: App.composer.editId > 0
-    readonly property bool blocked: App.timeline.cannotSend !== ""
+    readonly property bool replying: root.composerModel.replyToId > 0
+    readonly property bool editing: root.composerModel.editId > 0
+    readonly property bool blocked: root.chatModel.cannotSend !== ""
     // The selection mode is on: the bar takes the composer's place. The composer stays alive, only
     // its content is hidden: the draft, the typing state and the restore logic keep running.
-    readonly property bool selecting: App.timeline.selecting
+    readonly property bool selecting: root.chatModel.selecting
     // Where the keyboard enters the composer: the attach button, else the text.
     readonly property Item firstStop: attachButton.visible ? attachButton : area
-    readonly property string kinds: App.timeline.attachKinds
+    readonly property string kinds: root.chatModel.attachKinds
     readonly property bool canAttach: root.kinds !== ""
-    readonly property bool hasFiles: App.composer.attachmentCount > 0
+    readonly property bool hasFiles: root.composerModel.attachmentCount > 0
     // The conversation whose text the area holds (drafts are saved when it changes).
     property real conversation: 0
     // Set while the text is replaced programmatically (no typing notifications).
@@ -61,7 +65,10 @@ QQC2.ToolBar {
     property string stash: ""
     // Something can be sent: a text, files the network takes, or an edit (a caption may be
     // emptied).
-    readonly property bool canSend: root.editing ? (area.text.trim().length > 0 || App.composer.editCaption) : (area.text.trim().length > 0 || App.composer.sendableCount > 0)
+    // A forward is staged and not on its way: Send takes it, with the text as its comment (also an empty one).
+    readonly property bool forwarding: forwardCard.standing && forwardCard.staged.waiting !== true
+    readonly property alias forwardCard: forwardCard
+    readonly property bool canSend: root.editing ? (area.text.trim().length > 0 || root.composerModel.editCaption) : (area.text.trim().length > 0 || root.composerModel.sendableCount > 0 || root.forwarding)
     // The list of waiting files (tests drive it).
     readonly property alias fileList: strip
 
@@ -107,10 +114,10 @@ QQC2.ToolBar {
     // told to go is let go of at once: it closes in its own time (a transition), and a new
     // question that comes meanwhile gets a dialog of its own.
     function syncFolderDialog(): void {
-        if (App.composer.folderAsking && root.folderDialog === null && !root.blocked) {
+        if (root.composerModel.folderAsking && root.folderDialog === null && !root.blocked) {
             root.folderDialog = folderComponent.createObject(root) as FolderQuestionDialog;
             root.folderDialog?.open();
-        } else if (!App.composer.folderAsking && root.folderDialog !== null) {
+        } else if (!root.composerModel.folderAsking && root.folderDialog !== null) {
             const answered = root.folderDialog;
             root.folderDialog = null;
             answered.close();
@@ -123,10 +130,10 @@ QQC2.ToolBar {
     // nothing remembered, the files and the text stay; the next Send asks again about what
     // stands then, with the text of that press.
     function syncLocationDialog(): void {
-        if (App.composer.locationAsking && root.locationDialog === null && !root.blocked) {
+        if (root.composerModel.locationAsking && root.locationDialog === null && !root.blocked) {
             root.locationDialog = locationComponent.createObject(root) as LocationQuestionDialog;
             root.locationDialog?.open();
-        } else if (!App.composer.locationAsking && root.locationDialog !== null) {
+        } else if (!root.composerModel.locationAsking && root.locationDialog !== null) {
             const answered = root.locationDialog;
             root.locationDialog = null;
             answered.close();
@@ -149,10 +156,10 @@ QQC2.ToolBar {
     // nothing and the question comes again: nothing is remembered then), through Settings
     // (its one owner, so the Settings page shows it): 1 always send, 2 never send.
     function answerLocation(answer: string, remember: bool): void {
-        if (!App.composer.locationAsking) {
+        if (!root.composerModel.locationAsking) {
             return;
         }
-        const applied = App.composer.answerLocation(answer);
+        const applied = root.composerModel.answerLocation(answer);
         if (applied && remember) {
             App.settings.locationFiles = answer === "send" ? 1 : 2;
         }
@@ -161,7 +168,7 @@ QQC2.ToolBar {
     // The setting "Files with location data" as it is now: a change shows at once in the
     // list (the rows' notes, the counts), not only at the next change of the list.
     readonly property int locationPref: App.settings.locationFiles
-    onLocationPrefChanged: App.composer.refreshLocationPref()
+    onLocationPrefChanged: root.composerModel.refreshLocationPref()
 
     // (A composer that could not be written to asks once it can again.)
     onBlockedChanged: {
@@ -181,14 +188,15 @@ QQC2.ToolBar {
         id: folderComponent
         FolderQuestionDialog {
             id: asked
+            composerModel: root.composerModel
             // Closed without an answer (Escape, the close button): the folders leave the
             // list, as with "Cancel".
             onClosed: {
                 // Still the question's dialog: nobody answered, the user closed it.
                 if (root.folderDialog === asked) {
                     root.folderDialog = null;
-                    if (App.composer.folderAsking) {
-                        App.composer.answerFolders("cancel");
+                    if (root.composerModel.folderAsking) {
+                        root.composerModel.answerFolders("cancel");
                     }
                 }
                 asked.destroy();
@@ -200,6 +208,7 @@ QQC2.ToolBar {
         id: locationComponent
         LocationQuestionDialog {
             id: located
+            composerModel: root.composerModel
             onAnswered: (answer, remember) => root.answerLocation(answer, remember)
             // Closed without an answer (Escape, the close button, a click outside): the
             // question is dismissed, with nothing sent, held or remembered. After an answer
@@ -208,8 +217,8 @@ QQC2.ToolBar {
                 // Still the question's dialog: nobody answered, the user closed it.
                 if (root.locationDialog === located) {
                     root.locationDialog = null;
-                    if (App.composer.locationAsking) {
-                        App.composer.answerLocation("dismiss");
+                    if (root.composerModel.locationAsking) {
+                        root.composerModel.answerLocation("dismiss");
                     }
                 }
                 located.destroy();
@@ -219,7 +228,7 @@ QQC2.ToolBar {
 
     function tellCaption(): void {
         root.captionTold = area.length > root.captionWorthTelling;
-        App.composer.setCaption(area.text);
+        root.composerModel.setCaption(area.text);
     }
 
     onHasFilesChanged: {
@@ -259,7 +268,7 @@ QQC2.ToolBar {
         for (const u of urls) {
             all.push(u.toString());
         }
-        App.composer.addFiles(all);
+        root.composerModel.addFiles(all);
         area.forceActiveFocus();
     }
 
@@ -273,7 +282,7 @@ QQC2.ToolBar {
         captionSettle.stop();
         // An edit that was saved gives the text area back what it held before (`editFinished`).
         const edit = root.editing;
-        if (App.composer.send(App.timeline.conversationId, area.text) && !edit) {
+        if (root.composerModel.send(root.chatModel.conversationId, area.text) && !edit) {
             root.restoring = true;
             area.clear();
             root.restoring = false;
@@ -281,38 +290,53 @@ QQC2.ToolBar {
         }
     }
 
-    // Escape: leave edit mode, else drop the reply. `false` when there was neither.
+    // Escape: leave edit mode, else drop the staged forward, else the reply. `false` when there was none.
     function cancel(): bool {
         if (root.editing) {
-            App.composer.cancelEdit();
+            root.composerModel.cancelEdit();
+            return true;
+        }
+        if (forwardCard.standing && !root.blocked && !root.selecting) {
+            root.composerModel.dropForward(root.openConversation);
             return true;
         }
         if (root.replying) {
-            App.composer.cancelReply();
+            root.composerModel.cancelReply();
             return true;
         }
         return false;
     }
 
+    // Saves what is typed as the draft of the conversation, without leaving it (the two chats of a split
+    // swap places: each page must hand its text over before the other page's chat changes).
+    function keepDraft(): void {
+        root.composerModel.cancelEdit();
+        if (root.conversation !== 0) {
+            typingStop.stop();
+            root.composerModel.setTyping(root.conversation, false);
+            root.composerModel.saveDraft(root.conversation, area.text);
+        }
+    }
+
     // Leaving a conversation saves its draft; entering one restores its draft.
     function switchTo(id: real): void {
         // An edit ends with its conversation: the text typed before it is the draft to keep.
-        App.composer.cancelEdit();
+        root.composerModel.cancelEdit();
         if (root.conversation !== 0) {
             typingStop.stop();
-            App.composer.setTyping(root.conversation, false);
-            App.composer.saveDraft(root.conversation, area.text);
+            root.composerModel.setTyping(root.conversation, false);
+            root.composerModel.saveDraft(root.conversation, area.text);
         }
         root.conversation = id;
         root.restoring = true;
-        area.text = id !== 0 ? App.composer.draft(id) : "";
+        area.text = id !== 0 ? root.composerModel.draft(id) : "";
         area.cursorPosition = area.length;
         root.restoring = false;
-        App.composer.clearNotice();
+        root.composerModel.clearNotice();
     }
 
     // The open conversation; a change saves the old draft and restores the new one.
-    readonly property real openConversation: App.timeline.conversationId
+    readonly property real openConversation: root.chatModel.conversationId
     onOpenConversationChanged: root.switchTo(root.openConversation)
     Component.onCompleted: {
         root.switchTo(root.openConversation);
@@ -321,7 +345,7 @@ QQC2.ToolBar {
     }
 
     Connections {
-        target: App.composer
+        target: root.composerModel
         function onFolderAskingChanged(): void {
             root.syncFolderDialog();
         }
@@ -337,12 +361,12 @@ QQC2.ToolBar {
         }
         function onDraftLoaded(conversation: real): void {
             if (conversation === root.conversation && area.text === "" && !root.editing) {
-                root.setText(App.composer.draft(conversation));
+                root.setText(root.composerModel.draft(conversation));
             }
         }
         function onEditStarted(text: string): void {
             typingStop.stop();
-            App.composer.setTyping(root.conversation, false);
+            root.composerModel.setTyping(root.conversation, false);
             root.stash = area.text;
             root.setText(text);
             area.forceActiveFocus();
@@ -362,7 +386,7 @@ QQC2.ToolBar {
     Timer {
         id: typingStop
         interval: 3000
-        onTriggered: App.composer.setTyping(root.conversation, false)
+        onTriggered: root.composerModel.setTyping(root.conversation, false)
     }
 
     function insert(text: string): void {
@@ -373,21 +397,32 @@ QQC2.ToolBar {
     contentItem: ColumnLayout {
         spacing: Kirigami.Units.smallSpacing
 
+        // The staged forward (forward line F6).
+        ForwardCard {
+            id: forwardCard
+
+            composerModel: root.composerModel
+            Layout.fillWidth: true
+            Layout.leftMargin: Kirigami.Units.smallSpacing
+            conversation: root.openConversation
+            visible: forwardCard.standing && !root.blocked && !root.selecting
+        }
+
         // What is being edited, or what the next message replies to.
         RowLayout {
             id: banner
 
             readonly property string title: {
                 if (root.editing) {
-                    return App.composer.editCaption ? L10n.i18nc("@info", "Edit Caption") : L10n.i18nc("@info", "Edit Message");
+                    return root.composerModel.editCaption ? L10n.i18nc("@info", "Edit Caption") : L10n.i18nc("@info", "Edit Message");
                 }
-                return L10n.i18nc("@info", "Reply to %1", App.composer.replyAuthor);
+                return L10n.i18nc("@info", "Reply to %1", root.composerModel.replyAuthor);
             }
             readonly property string snippet: {
                 if (!root.editing) {
-                    return App.composer.replyText;
+                    return root.composerModel.replyText;
                 }
-                return App.composer.editText !== "" ? App.composer.editText : L10n.i18nc("@info", "No caption yet");
+                return root.composerModel.editText !== "" ? root.composerModel.editText : L10n.i18nc("@info", "No caption yet");
             }
             readonly property color accent: Style.readable(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor)
 
@@ -426,8 +461,8 @@ QQC2.ToolBar {
                     spacing: Kirigami.Units.smallSpacing
                     Layout.fillWidth: true
                     Kirigami.Icon {
-                        visible: !root.editing && App.composer.replyIcon !== ""
-                        source: App.composer.replyIcon
+                        visible: !root.editing && root.composerModel.replyIcon !== ""
+                        source: root.composerModel.replyIcon
                         implicitWidth: Kirigami.Units.iconSizes.small
                         implicitHeight: Kirigami.Units.iconSizes.small
                         color: snippetLabel.color
@@ -447,8 +482,8 @@ QQC2.ToolBar {
             // The quoted picture.
             Image {
                 id: replyThumb
-                visible: !root.editing && App.composer.replyThumb !== "" && status !== Image.Error
-                source: root.editing ? "" : App.composer.replyThumb
+                visible: !root.editing && root.composerModel.replyThumb !== "" && status !== Image.Error
+                source: root.editing ? "" : root.composerModel.replyThumb
                 asynchronous: true
                 smooth: true
                 fillMode: Image.PreserveAspectCrop
@@ -479,7 +514,7 @@ QQC2.ToolBar {
             // height, more when a larger font needs it.
             readonly property real rowHeight: Math.max(Math.round(Kirigami.Units.gridUnit * 2.5), Math.ceil(nameMetrics.height + detailMetrics.height) + Kirigami.Units.smallSpacing * 2)
             // The messages are numbered once there is more than one.
-            readonly property bool split: App.composer.messageCount > 1
+            readonly property bool split: root.composerModel.messageCount > 1
 
             // An edit changes the text of a message, never its files.
             visible: root.hasFiles && !root.blocked && !root.editing && !root.selecting
@@ -511,7 +546,7 @@ QQC2.ToolBar {
                 QQC2.Label {
                     id: summaryLabel
                     objectName: "fileSummary"
-                    text: App.composer.summary
+                    text: root.composerModel.summary
                     font: Style.styled(Kirigami.Theme.defaultFont, {
                         "weight": Font.DemiBold
                     })
@@ -521,7 +556,7 @@ QQC2.ToolBar {
                 }
                 // The core is still looking at the files.
                 Spinner {
-                    visible: !App.composer.planned
+                    visible: !root.composerModel.planned
                     implicitWidth: Kirigami.Units.iconSizes.small
                     implicitHeight: Kirigami.Units.iconSizes.small
                 }
@@ -533,19 +568,19 @@ QQC2.ToolBar {
                     QQC2.ToolTip.visible: hovered && display === QQC2.AbstractButton.IconOnly
                     QQC2.ToolTip.text: text
                     QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-                    onClicked: App.composer.clearAttachments()
+                    onClicked: root.composerModel.clearAttachments()
                 }
             }
 
             // What needs saying about the selection: files that stay behind, a text that
             // goes first.
             RowLayout {
-                visible: App.composer.hint !== ""
+                visible: root.composerModel.hint !== ""
                 spacing: Kirigami.Units.smallSpacing
                 Layout.fillWidth: true
 
                 Kirigami.Icon {
-                    visible: App.composer.refusedCount > 0
+                    visible: root.composerModel.refusedCount > 0
                     source: "data-warning"
                     implicitWidth: Kirigami.Units.iconSizes.small
                     implicitHeight: Kirigami.Units.iconSizes.small
@@ -553,9 +588,9 @@ QQC2.ToolBar {
                 }
                 QQC2.Label {
                     objectName: "fileHint"
-                    text: App.composer.hint
+                    text: root.composerModel.hint
                     font: Kirigami.Theme.smallFont
-                    color: App.composer.refusedCount > 0 ? files.warn : files.quiet
+                    color: root.composerModel.refusedCount > 0 ? files.warn : files.quiet
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
@@ -579,7 +614,7 @@ QQC2.ToolBar {
                 ListView {
                     id: strip
 
-                    model: App.composer.files
+                    model: root.composerModel.files
                     clip: true
                     spacing: 0
                     boundsBehavior: Flickable.StopAtBounds
@@ -609,7 +644,7 @@ QQC2.ToolBar {
                     Keys.onSpacePressed: {
                         const row = strip.currentItem as FileRowItem;
                         if (row !== null && row.canOriginal) {
-                            App.composer.setOriginal(row.index, !row.original);
+                            root.composerModel.setOriginal(row.index, !row.original);
                         }
                     }
                     Keys.onEscapePressed: area.forceActiveFocus()
@@ -619,7 +654,7 @@ QQC2.ToolBar {
                         if (at < 0) {
                             return;
                         }
-                        App.composer.removeAttachment(at);
+                        root.composerModel.removeAttachment(at);
                         if (strip.count === 0) {
                             area.forceActiveFocus();
                         } else {
@@ -878,7 +913,7 @@ QQC2.ToolBar {
                             QQC2.ToolTip.text: fileRow.original ? L10n.i18nc("@info:tooltip", "Sent as the original file. Click to send it as a picture again.") : L10n.i18nc("@info:tooltip", "Send as original file: unchanged, shown as a file and not in an album")
                             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
                             onClicked: {
-                                App.composer.setOriginal(fileRow.index, !fileRow.original);
+                                root.composerModel.setOriginal(fileRow.index, !fileRow.original);
                                 // The mark follows what the list holds, not the click.
                                 originalButton.checked = Qt.binding(() => fileRow.original);
                             }
@@ -902,7 +937,7 @@ QQC2.ToolBar {
                             // (Taking a folder out of the list stops the work on it.)
                             QQC2.ToolTip.text: fileRow.working ? L10n.i18nc("@action:button stop packing a folder and take it out of the list", "Stop and Remove") : L10n.i18nc("@action:button", "Remove")
                             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-                            onClicked: App.composer.removeAttachment(fileRow.index)
+                            onClicked: root.composerModel.removeAttachment(fileRow.index)
                         }
                     }
                 }
@@ -959,7 +994,7 @@ QQC2.ToolBar {
         // A send the core is still copying and encrypting: its messages show once all of it
         // is stored.
         RowLayout {
-            visible: App.composer.preparing > 0 && !root.blocked && !root.selecting
+            visible: root.composerModel.preparing > 0 && !root.blocked && !root.selecting
             spacing: Kirigami.Units.smallSpacing
             Layout.fillWidth: true
             Layout.leftMargin: Kirigami.Units.smallSpacing
@@ -971,7 +1006,7 @@ QQC2.ToolBar {
             QQC2.Label {
                 objectName: "preparingFiles"
                 // The core says how far it is: "Preparing 40 files to send… 12 copied".
-                text: App.composer.preparing > 1 && App.composer.preparingDone > 0 ? L10n.i18ncp("@info, %1 how many, %2 how many of them are copied", "Preparing %1 file to send… %2 copied", "Preparing %1 files to send… %2 copied", App.composer.preparing, App.composer.preparingDone) : L10n.i18ncp("@info, %1 how many", "Preparing %1 file to send…", "Preparing %1 files to send…", App.composer.preparing)
+                text: root.composerModel.preparing > 1 && root.composerModel.preparingDone > 0 ? L10n.i18ncp("@info, %1 how many, %2 how many of them are copied", "Preparing %1 file to send… %2 copied", "Preparing %1 files to send… %2 copied", root.composerModel.preparing, root.composerModel.preparingDone) : L10n.i18ncp("@info, %1 how many", "Preparing %1 file to send…", "Preparing %1 files to send…", root.composerModel.preparing)
                 font: Kirigami.Theme.smallFont
                 color: files.quiet
                 elide: Text.ElideRight
@@ -980,10 +1015,10 @@ QQC2.ToolBar {
             }
             QQC2.ProgressBar {
                 objectName: "preparingProgress"
-                visible: App.composer.preparing > 1
+                visible: root.composerModel.preparing > 1
                 from: 0
-                to: Math.max(1, App.composer.preparing)
-                value: App.composer.preparingDone
+                to: Math.max(1, root.composerModel.preparing)
+                value: root.composerModel.preparingDone
                 Layout.preferredWidth: Kirigami.Units.gridUnit * 6
                 // (As for a folder's bar below: the style's bar has no height of its own
                 // while it is made invisible, and keeps none.)
@@ -992,17 +1027,17 @@ QQC2.ToolBar {
         }
 
         Kirigami.InlineMessage {
-            visible: (root.blocked || App.composer.error !== "") && !root.selecting
+            visible: (root.blocked || root.composerModel.error !== "") && !root.selecting
             type: root.blocked ? Kirigami.MessageType.Information : Kirigami.MessageType.Error
-            text: Style.plain(root.blocked ? App.timeline.cannotSend : App.composer.error)
+            text: Style.plain(root.blocked ? root.chatModel.cannotSend : root.composerModel.error)
             Layout.fillWidth: true
         }
 
         // A small notice from the core, e.g. that sending is not available yet.
         Kirigami.InlineMessage {
-            visible: !root.blocked && App.composer.notice !== "" && !root.selecting
+            visible: !root.blocked && root.composerModel.notice !== "" && !root.selecting
             type: Kirigami.MessageType.Information
-            text: Style.plain(App.composer.notice)
+            text: Style.plain(root.composerModel.notice)
             Layout.fillWidth: true
             actions: [
                 // "Already sent": the X came after the message went out. The core has recorded
@@ -1013,7 +1048,7 @@ QQC2.ToolBar {
                 Kirigami.Action {
                     icon.name: "edit-delete"
                     text: L10n.i18nc("@action:button", "Delete for Everyone")
-                    visible: App.composer.notice !== "" && App.noticeMessage() !== 0
+                    visible: root.active && root.composerModel.notice !== "" && App.noticeMessage() !== 0
                     enabled: visible
                     onTriggered: root.deleteNoteRequested(App.noticeMessage())
                 },
@@ -1021,13 +1056,14 @@ QQC2.ToolBar {
                     icon.name: "dialog-close"
                     text: L10n.i18nc("@action:button", "Dismiss")
                     displayHint: Kirigami.DisplayHint.IconOnly
-                    onTriggered: App.composer.clearNotice()
+                    onTriggered: root.composerModel.clearNotice()
                 }
             ]
         }
 
         SelectionBar {
             id: selectionBar
+            chatModel: root.chatModel
 
             objectName: "selectionBar"
             visible: root.selecting
@@ -1142,7 +1178,7 @@ QQC2.ToolBar {
                     QQC2.TextArea {
                         id: area
 
-                        placeholderText: root.editing ? (App.composer.editCaption ? L10n.i18nc("@info:placeholder", "Caption") : L10n.i18nc("@info:placeholder", "Message")) : (root.hasFiles ? L10n.i18nc("@info:placeholder", "Add a caption") : L10n.i18nc("@info:placeholder", "Message"))
+                        placeholderText: root.editing ? (root.composerModel.editCaption ? L10n.i18nc("@info:placeholder", "Caption") : L10n.i18nc("@info:placeholder", "Message")) : (root.hasFiles ? L10n.i18nc("@info:placeholder", "Add a caption") : L10n.i18nc("@info:placeholder", "Message"))
                         Accessible.name: placeholderText
                         wrapMode: TextEdit.Wrap
                         textFormat: TextEdit.PlainText
@@ -1151,14 +1187,14 @@ QQC2.ToolBar {
                         onTextChanged: {
                             // With files waiting the text is their caption: how they are sent
                             // can depend on there being one, and on its length when it is long.
-                            App.composer.setHasText(area.text.trim().length > 0);
+                            root.composerModel.setHasText(area.text.trim().length > 0);
                             if (root.hasFiles && !root.editing && (area.length > root.captionWorthTelling || root.captionTold)) {
                                 captionSettle.restart();
                             }
                             if (root.restoring || root.editing || root.conversation === 0) {
                                 return;
                             }
-                            App.composer.setTyping(root.conversation, area.text.length > 0);
+                            root.composerModel.setTyping(root.conversation, area.text.length > 0);
                             if (area.text.length > 0) {
                                 typingStop.restart();
                             } else {
@@ -1169,14 +1205,14 @@ QQC2.ToolBar {
                         // Pasting files (copied in a file manager) or an image attaches them; text
                         // pastes as usual.
                         Keys.onPressed: event => {
-                            if (event.matches(StandardKey.Paste) && root.canAttach && !root.editing && App.composer.paste()) {
+                            if (event.matches(StandardKey.Paste) && root.canAttach && !root.editing && root.composerModel.paste()) {
                                 event.accepted = true;
                             }
                         }
                         // Up in an empty composer edits the last own message (as in most chat
                         // apps); elsewhere it moves the cursor.
                         Keys.onUpPressed: event => {
-                            event.accepted = area.text.length === 0 && !root.editing && !root.hasFiles && App.composer.editLast(root.conversation);
+                            event.accepted = area.text.length === 0 && !root.editing && !root.hasFiles && root.composerModel.editLast(root.conversation);
                         }
                         Keys.onEscapePressed: event => {
                             event.accepted = root.cancel();

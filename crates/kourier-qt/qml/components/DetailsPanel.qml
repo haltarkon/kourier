@@ -25,6 +25,7 @@ import app.kourier
 // timeline or over the chat. Every text from the network is plain text.
 FocusScope {
     id: root
+    required property TimelineModel chatModel
 
     readonly property var person: App.person
     readonly property var group: App.group
@@ -255,7 +256,7 @@ FocusScope {
     // A chat of the panel's pages was chosen. The group the panel was opened from is already
     // open: that goes back to its page instead of doing nothing.
     function openChat(id: real): void {
-        if (id === App.timeline.conversationId) {
+        if (id === root.chatModel.conversationId) {
             // Nothing lies below the page (it was opened from the timeline of this very chat): the
             // chat asked for is the one behind the panel, so the panel closes.
             if (root.levels.length <= 1) {
@@ -338,6 +339,7 @@ FocusScope {
 
     PersonPage {
         id: personPage
+        chatModel: root.chatModel
         anchors.fill: parent
         visible: root.level === "person"
         beside: root.beside
@@ -362,6 +364,7 @@ FocusScope {
 
     GroupPage {
         id: groupPage
+        chatModel: root.chatModel
         anchors.fill: parent
         visible: root.level === "group"
         beside: root.beside

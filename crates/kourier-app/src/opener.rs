@@ -11,7 +11,9 @@
 //! `KOURIER_DEV_*` variable is taken out as well, whoever set it: a development run may hold the
 //! last digits of a phone number there (`KOURIER_DEV_EXPECT_NUMBER_TAIL`), and a child's
 //! environment is readable by every process of the same user. So is the WhatsApp call test switch
-//! (`KOURIER_WA_CALL_BUILTIN`, [`crate::process::WA_CALL_BUILTIN_ENV`]).
+//! (`KOURIER_WA_CALL_BUILTIN`, [`crate::process::WA_CALL_BUILTIN_ENV`]), and so is what the
+//! AppImage runtime set for Kourier ([`crate::appimage::RUNTIME_ENV`]): the program must not take
+//! Kourier's AppImage for its own ([`crate::process::child_env_drop`]).
 //!
 //! Log safety (§9.1): a URL or a path is never logged here.
 
@@ -45,18 +47,18 @@ pub fn has_scheme(url: &str) -> bool {
 /// (Ctrl-C at Kourier's terminal does not reach it). `None` for a string without a scheme.
 /// Nothing is started.
 pub fn command_for(program: impl AsRef<OsStr>, url: &str, drop_env: &[&str]) -> Option<Command> {
-    command_for_in(program, url, drop_env, crate::process::dev_env_names_now())
+    command_for_in(program, url, drop_env, crate::process::child_env_drop_now())
 }
 
-/// [`command_for`] with the development variables to take out named by the caller. EVERY
-/// `KOURIER_DEV_*` variable of the process goes ([`crate::process::DEV_ENV_PREFIX`]): one of them
-/// holds the last digits of a phone number, and the environment of a child is readable by every
-/// process of the same user (W2c, C0).
+/// [`command_for`] with the inherited variables to take out named by the caller
+/// ([`crate::process::child_env_drop`]). EVERY `KOURIER_DEV_*` variable of the process goes
+/// ([`crate::process::DEV_ENV_PREFIX`]): one of them holds the last digits of a phone number, and
+/// the environment of a child is readable by every process of the same user (W2c, C0).
 fn command_for_in(
     program: impl AsRef<OsStr>,
     url: &str,
     drop_env: &[&str],
-    dev_env: Vec<OsString>,
+    inherited: Vec<OsString>,
 ) -> Option<Command> {
     if !has_scheme(url) {
         return None;
@@ -71,7 +73,7 @@ fn command_for_in(
     for name in drop_env {
         command.env_remove(name);
     }
-    for name in dev_env {
+    for name in inherited {
         command.env_remove(name);
     }
     Some(command)
@@ -139,8 +141,8 @@ mod tests {
     }
 
     /// W2c C0: no `KOURIER_DEV_*` variable reaches the program a link opens in (one holds the last
-    /// digits of a phone number), whoever set it, nor does the WhatsApp call test switch; a name that
-    /// only looks like one stays.
+    /// digits of a phone number), whoever set it, nor does the WhatsApp call test switch, nor what
+    /// the AppImage runtime set for Kourier; a name that only looks like one stays.
     #[test]
     fn a_link_command_takes_out_every_development_variable() {
         let environ = [
@@ -152,16 +154,26 @@ mod tests {
             "KOURIER_WA_CALL_BUILTIN",
             "KOURIER_WA_CALL_BUILTIN_X",
             "XKOURIER_WA_CALL_BUILTIN",
+            "APPIMAGE",
+            "APPDIR",
+            "OWD",
+            "ARGV0",
+            "APPIMAGE_EXTRACT_AND_RUN",
+            "XAPPDIR",
         ];
-        let dev = crate::process::dev_env_names(environ.map(OsString::from));
+        let inherited = crate::process::child_env_drop(environ.map(OsString::from));
         let command =
-            command_for_in(PROGRAM, "https://example.org/", &["QT_X"], dev).expect("a URL");
+            command_for_in(PROGRAM, "https://example.org/", &["QT_X"], inherited).expect("a URL");
         assert_eq!(
             removed(&command),
             [
+                "APPDIR",
+                "APPIMAGE",
+                "ARGV0",
                 "KOURIER_DEV_EXPECT_NUMBER_TAIL",
                 "KOURIER_DEV_KEYRING",
                 "KOURIER_WA_CALL_BUILTIN",
+                "OWD",
                 "QT_X"
             ]
         );
@@ -179,6 +191,7 @@ mod tests {
             ])
             .env("KOURIER_OPENER_CHILD", "1")
             .env("KOURIER_DEV_EXPECT_NUMBER_TAIL", "47110815")
+            .env("APPIMAGE", "/nonexistent/Kourier-x86_64.AppImage")
             .output()
             .expect("the child starts");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -194,10 +207,12 @@ mod tests {
             return;
         }
         let command = command("https://example.org/", &[]).expect("a URL");
-        assert!(
-            removed(&command).contains(&"KOURIER_DEV_EXPECT_NUMBER_TAIL".to_owned()),
-            "the child's environment held the variable, the command did not remove it"
-        );
+        for name in ["KOURIER_DEV_EXPECT_NUMBER_TAIL", "APPIMAGE"] {
+            assert!(
+                removed(&command).contains(&name.to_owned()),
+                "the child's environment held {name}, the command did not remove it"
+            );
+        }
     }
 
     #[test]

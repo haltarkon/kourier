@@ -964,6 +964,7 @@ fn number_only_features() -> ConversationFeatures {
         cannot_send: Some(CannotSend::NotAccepted),
         // Signal has no restriction on saving a chat (its history may be exported).
         export: kourier_model::ChatExport::Allowed,
+        no_forward: false,
         ..ConversationFeatures::default()
     }
 }

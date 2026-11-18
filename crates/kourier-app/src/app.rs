@@ -1045,8 +1045,8 @@ impl AppHandle {
     /// The WhatsApp backend's usage-statistics counters `(sent, looked)` of this process
     /// (`kourier_whatsapp::wam_sent`, `wam_looked`), for the development state: `Some` only when
     /// the REAL WhatsApp backend is registered in this run, else `None` (a rehearsal, a fixture, a
-    /// release build and a build without the backend have no client that could send or look at a
-    /// frame, so a 0 would prove nothing). A run that expects `sent == 0` must see `looked` grow.
+    /// start with WhatsApp off and a build without the backend have no client that could send or
+    /// look at a frame, so a 0 would prove nothing). A run that expects `sent == 0` must see `looked` grow.
     pub fn wam_counts(&self) -> Option<(u64, u64)> {
         #[cfg(feature = "whatsapp")]
         {
@@ -1241,6 +1241,17 @@ impl AppHandle {
         self.pasted.save(name, bytes)
     }
 
+    /// The private folder for the slice pictures of forward job `request` (the picture look,
+    /// F7), in the tmpfs media cache; `None` without a cache. Blocking (one `mkdir`).
+    pub fn forward_picture_dir(&self, request: u64) -> Option<std::path::PathBuf> {
+        self.pasted.picture_dir(request).ok()
+    }
+
+    /// Deletes that folder (the job ended or was cancelled); other requests are ignored.
+    pub fn release_forward_pictures(&self, request: u64) -> bool {
+        self.pasted.release_pictures(request)
+    }
+
     /// Deletes a file Kourier made for the composer (a pasted picture, the archive of a
     /// folder) once the composer no longer needs it; other paths are ignored. Never waits
     /// for a disk.
@@ -1407,22 +1418,25 @@ enum WhatsAppRegistration {
     Registered,
     /// Compiled in and turned off: on K-A's "compiled in but off" list, not registered.
     Listed,
-    /// Not offered at all: neither registered nor listed.
+    /// Not offered at all: neither registered nor listed. No build returns it since the release arm
+    /// was lifted (2026-11-18); the caller still asks, so a gate is again one edit of
+    /// [`whatsapp_registration`].
     Absent,
 }
 
-/// THE RULE for the WhatsApp backend (W2b, lane decision L1): a RELEASE build never registers it
-/// and never lists it, so no archive (the user's install, a test archive) links a real account until
-/// W3a, W4, W5 and the first real runs have landed and the user says so; a debug build registers it
-/// while `networks-on` of `kourier.toml` names it, else lists it as off (K-A, §7.4). The release rule
-/// goes away by one edit of this function, when that has happened (and `cargo xtask dist`'s check of
-/// the packed binary, which fails on WhatsApp in `kourier --print-networks`, goes with it).
+/// THE RULE for the WhatsApp backend (W2b, K-A, §7.4): EVERY build, a release build as a debug one,
+/// registers it while `networks-on` of `kourier.toml` names it and lists it as off otherwise (K-A's
+/// "compiled in but off"; linking still shows the network's risk notice first). Until 2026-11-18 a
+/// RELEASE build neither registered nor listed it (lane decision L1: no archive linked a real account
+/// "until W3a, W4, W5 and the first real runs have landed and the user says so"); the user said so
+/// then ("But I have real runs. I'm actevelly using it on other PC"), and this edit lifted it.
+/// `cargo xtask dist`'s check of the packed binary (`kourier --print-networks`) now requires both
+/// arms of a release build: registered while on, listed as off with nothing in the file.
 #[cfg(feature = "whatsapp")]
 fn whatsapp_registration(build: Build, prefs: &Prefs) -> WhatsAppRegistration {
     match (build, prefs.network_on(NetworkKind::WhatsApp)) {
-        (Build::Release, _) => WhatsAppRegistration::Absent,
-        (Build::Debug, true) => WhatsAppRegistration::Registered,
-        (Build::Debug, false) => WhatsAppRegistration::Listed,
+        (Build::Debug | Build::Release, true) => WhatsAppRegistration::Registered,
+        (Build::Debug | Build::Release, false) => WhatsAppRegistration::Listed,
     }
 }
 
@@ -2734,11 +2748,12 @@ const NETWORKS_LINE_HEAD: &str = "networks";
 /// commas, a list may be empty). It resolves the profile the way a start does (`KOURIER_HOME`, the
 /// XDG directories), reads `kourier.toml` and builds the registry through the one function a start
 /// uses ([`start_networks`]); it opens no window, no database and no keyring and contacts nothing.
-/// `cargo xtask dist` runs it on the packed (release) binary with `networks-on = ["whatsapp",
-/// "threema"]`, which is the only proof that a release build takes the release arm of
-/// [`whatsapp_registration`] (the archive builds Threema in since `4d03eb2`, and a person's start
-/// of a release build offers it; the run tool's start keeps the release arm that the unit tests
-/// of `threema_registration` prove).
+/// `cargo xtask dist` runs it on the packed (release) binary twice, on a profile whose file has
+/// `networks-on = ["whatsapp"]` and on one whose file names nothing, which is the only proof that
+/// a release build takes [`whatsapp_registration`]'s rule (registered while on, listed as off
+/// otherwise) and has Threema on by default (the archive builds Threema in since `4d03eb2`, and a
+/// person's start of a release build offers it; the run tool's start keeps the release arm that the
+/// unit tests of `threema_registration` prove).
 pub fn networks_line(profile: Profile) -> Result<String, AppError> {
     let paths = Paths::resolve(profile)?;
     networks_line_in(&paths, |k| std::env::var_os(k), Seams::probe())
@@ -3492,7 +3507,7 @@ fn demo_network(f: &FixtureOptions) -> Result<Demo, AppError> {
         // Every chat states WhatsApp's features (W5b, L8: the composer offers what WhatsApp's does).
         FixtureNetwork::WhatsApp | FixtureNetwork::WhatsAppOff => FakeNetwork::playing(
             NetworkKind::WhatsApp,
-            kourier_fake::scripts::as_whatsapp(script),
+            kourier_fake::scripts::with_forwarded_pair(kourier_fake::scripts::as_whatsapp(script)),
         ),
         // The same script and ids, the chats as the plain fixture's (TH4 KH1c: the pages are the
         // link's, no chat of Threema's own is shown). Threema writes no roaming setting yet, so
@@ -5311,8 +5326,8 @@ mod threema_registration_tests {
     }
 }
 
-/// W2b B2: the WhatsApp backend is registered by a debug build while it is on, listed while it is
-/// off, and absent from a release build.
+/// W2b B2: the WhatsApp backend is registered by every build while it is on and listed while it is
+/// off (a release build too since 2026-11-18).
 #[cfg(all(test, feature = "whatsapp"))]
 mod whatsapp_registration_tests {
     use super::{Build, Prefs, WhatsAppRegistration, whatsapp_registration};
@@ -5324,18 +5339,18 @@ mod whatsapp_registration_tests {
         prefs
     }
 
-    /// The rule for every case: a release build neither registers nor lists it, whatever the
-    /// preferences say (a test archive must not link a real account); a debug build registers it
-    /// while `networks-on` names it and lists it as off otherwise.
+    /// The rule for every case: a release build and a debug build alike register it while
+    /// `networks-on` names it and list it as off otherwise (the release arm that offered nothing was
+    /// lifted at the user's word of 2026-11-18).
     #[test]
-    fn a_release_build_never_offers_whatsapp_and_a_debug_build_follows_the_switch() {
+    fn every_build_registers_whatsapp_while_it_is_on_and_lists_it_otherwise() {
         assert_eq!(
             whatsapp_registration(Build::Release, &prefs(true)),
-            WhatsAppRegistration::Absent
+            WhatsAppRegistration::Registered
         );
         assert_eq!(
             whatsapp_registration(Build::Release, &prefs(false)),
-            WhatsAppRegistration::Absent
+            WhatsAppRegistration::Listed
         );
         assert_eq!(
             whatsapp_registration(Build::Debug, &prefs(true)),
@@ -5350,6 +5365,10 @@ mod whatsapp_registration_tests {
         by_hand.networks_on.push("whatsapp".to_owned());
         assert_eq!(
             whatsapp_registration(Build::Debug, &by_hand),
+            WhatsAppRegistration::Registered
+        );
+        assert_eq!(
+            whatsapp_registration(Build::Release, &by_hand),
             WhatsAppRegistration::Registered
         );
     }
@@ -5400,9 +5419,9 @@ mod whatsapp_registration_tests {
 
     /// `kourier --print-networks` (hidden; `cargo xtask dist` runs it on the packed binary): the line
     /// of kinds a normal start of the profile would register and list as off, built by the same
-    /// function a start uses. A debug build registers WhatsApp while `networks-on` names it and
-    /// lists it as off otherwise; a release build names it in neither list whatever the switch says
-    /// (`on=` still shows that the file was read, which is what makes the empty lists a proof). The
+    /// function a start uses. Every build, a release build as a debug one (since 2026-11-18),
+    /// registers WhatsApp while `networks-on` names it and lists it as off otherwise (`on=` shows
+    /// that the file was read, so a missing WhatsApp in both lists cannot hide behind it). The
     /// line is one line of kinds, it makes no client, opens no database and does not clear the
     /// one-shot `pending-link` a start would.
     #[test]
@@ -5452,8 +5471,8 @@ mod whatsapp_registration_tests {
                 listed(&line, "off"),
                 listed(&line, "on"),
             );
-            let registered_here = build == Build::Debug && on;
-            let listed_here = build == Build::Debug && !on;
+            // Literal expectations, whatever the build: registered while on, listed as off otherwise.
+            let (registered_here, listed_here) = (on, !on);
             assert_eq!(registered.contains(&"WhatsApp"), registered_here, "{case}");
             assert_eq!(off.contains(&"WhatsApp"), listed_here, "{case}");
             // The switch as the file has it, in a release build too. Threema is on by default and
@@ -5489,8 +5508,8 @@ mod whatsapp_registration_tests {
 
     /// THE WIRING (debug builds only: the test starts from the development keyring, which release
     /// builds lack): a normal start registers the WhatsApp backend only while `networks-on` names
-    /// it, lists it as off otherwise (described for the UI, and asking first), offers nothing in a
-    /// release build, and in none of them makes a client: the parts' maker is not called until an
+    /// it, lists it as off otherwise (described for the UI, and asking first), in a release build as
+    /// in a debug one, and in none of them makes a client: the parts' maker is not called until an
     /// account connects or starts a login.
     #[cfg(debug_assertions)]
     #[tokio::test]
@@ -5547,20 +5566,16 @@ mod whatsapp_registration_tests {
                 .filter(|n| n.kind == NetworkKind::WhatsApp)
                 .collect();
             let case = format!("{build:?}, on={on}");
-            match whatsapp_registration(build, &prefs(on)) {
-                WhatsAppRegistration::Registered => {
-                    assert!(registered && listed.is_empty(), "{case}");
-                }
-                WhatsAppRegistration::Listed => {
-                    assert!(!registered && listed.len() == 1, "{case}");
-                    // Described for the UI: experimental, and K-A's page asks first.
-                    let info = listed[0];
-                    assert!(info.experimental && !info.history_transfer, "{case}");
-                    assert!(info.risk_notice.is_some(), "{case}: it asks first");
-                }
-                WhatsAppRegistration::Absent => {
-                    assert!(!registered && listed.is_empty(), "{case}");
-                }
+            // Literal expectations, not read from the rule: registered while on, listed as off
+            // otherwise, whatever the build.
+            if on {
+                assert!(registered && listed.is_empty(), "{case}");
+            } else {
+                assert!(!registered && listed.len() == 1, "{case}");
+                // Described for the UI: experimental, and K-A's page asks first.
+                let info = listed[0];
+                assert!(info.experimental && !info.history_transfer, "{case}");
+                assert!(info.risk_notice.is_some(), "{case}: it asks first");
             }
             assert_eq!(
                 made.load(Ordering::SeqCst),
@@ -5680,13 +5695,20 @@ mod whatsapp_registration_tests {
         assert!(off.registry.get(NetworkKind::WhatsApp).is_none());
         assert_eq!(off.networks_off.len(), 1);
 
-        // A release build never offers WhatsApp, the rehearsal's either.
+        // A release build's slot follows the same rule since 2026-11-18 (registered while on): with
+        // the switch it holds the rehearsal fake and the real maker is not called either. (A real
+        // release binary never sees the switch: `dev::rehearsal_requested` reads it in a debug
+        // build only, and the archive has no `fake` feature.)
         let (release, calls, _) =
             start_with_rehearsal(Build::Release, true, Some("whatsapp")).await;
         let release = release.expect("a release setup");
-        assert_eq!(calls, 0);
-        assert!(release.registry.get(NetworkKind::WhatsApp).is_none());
-        assert!(release.networks_off.is_empty() && release.rehearsal.is_none());
+        assert_eq!(calls, 0, "the rehearsal never makes the real parts");
+        let network = release
+            .registry
+            .get(NetworkKind::WhatsApp)
+            .expect("registered while on, in a release build too");
+        assert!(network.descriptor().risk_notice.is_none(), "the fake's");
+        assert!(release.networks_off.is_empty() && release.rehearsal.is_some());
     }
 
     /// Anything but exactly `whatsapp` fails the start: a typo must not start a real run while the
@@ -5716,9 +5738,9 @@ mod whatsapp_registration_tests {
     }
 
     /// T1a (A4): the usage-statistics counters of the development state are the REAL backend's,
-    /// so `whatsapp_real` is true only when the real WhatsApp backend is made AND registered. A
-    /// rehearsal (its fake has no client), the backend listed as off, a release build and a start
-    /// with the backend not asked for all say false: a counter read there would be a 0 that proves
+    /// so `whatsapp_real` is true only when the real WhatsApp backend is made AND registered (a
+    /// release build's too since 2026-11-18). A rehearsal (its fake has no client) and the backend
+    /// listed as off, in either build, say false: a counter read there would be a 0 that proves
     /// nothing. Mutants: the rehearsal's branch sets it; the registry check is dropped.
     #[cfg(all(debug_assertions, feature = "fake"))]
     #[tokio::test]
@@ -5736,8 +5758,17 @@ mod whatsapp_registration_tests {
             !off.expect("a setup with the network off").whatsapp_real,
             "listed as off is not registered"
         );
-        let (release, ..) = start_with_rehearsal(Build::Release, true, None).await;
-        assert!(!release.expect("a release setup").whatsapp_real);
+        let (release, calls, made) = start_with_rehearsal(Build::Release, true, None).await;
+        assert_eq!((calls, made), (1, 0), "made once, no client yet");
+        assert!(
+            release.expect("a release setup").whatsapp_real,
+            "a release build registers the real one while it is on"
+        );
+        let (release_off, ..) = start_with_rehearsal(Build::Release, false, None).await;
+        assert!(
+            !release_off.expect("a release setup, off").whatsapp_real,
+            "listed as off is not registered, in a release build either"
+        );
     }
 }
 
@@ -5897,7 +5928,7 @@ mod telegram_registration_tests {
     /// `networks-on` names it, lists it as off in a debug build otherwise (TG-2, critic H3), and in
     /// no case starts a helper (the refusing parts count every spawn).
     /// Signal is registered whatever Telegram does, and WhatsApp's own rule is unchanged (off here:
-    /// listed in a debug build, absent in a release build).
+    /// listed as off, in a release build too since 2026-11-18).
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn a_normal_start_registers_telegram_only_when_on() {
@@ -5965,7 +5996,10 @@ mod telegram_registration_tests {
                     .networks_off
                     .iter()
                     .any(|n| n.kind == NetworkKind::WhatsApp);
-                assert_eq!(listed, build == Build::Debug, "{case}: WhatsApp's rule");
+                assert!(
+                    listed,
+                    "{case}: WhatsApp's rule (off: listed, whatever the build)"
+                );
             }
         }
     }

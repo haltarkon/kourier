@@ -532,7 +532,13 @@ impl<T: SignalTransport> Uploader<'_, T> {
             }
             let arrived_with = attachment.remote.as_ref().and_then(remote_pointer);
             slots.push(match arrived_with {
-                Some(pointer) if edit || attachment.local.is_none() => {
+                // An edit, or a file with no local copy, re-sends the pointer it arrived with; a NEW message with a
+                // local file (a forward, F4) reuses a pointer uploaded recently, else uploads the local blob.
+                Some(pointer)
+                    if edit
+                        || attachment.local.is_none()
+                        || reuse_pointer(&pointer, self.shared.now_ms()) =>
+                {
                     Slot::Pointer(Box::new(pointer))
                 }
                 _ => Slot::Upload(Box::new(self.attachment_job(index, attachment)?)),
@@ -815,6 +821,21 @@ pub(crate) fn cap_incremental_macs(pointers: &mut [proto::AttachmentPointer], ke
             pointer.chunk_size = None;
         }
     }
+}
+
+/// How long a pointer's upload counts as recent enough to send again without an upload: Signal Android's
+/// `AttachmentUploadJob.UPLOAD_REUSE_THRESHOLD`, 3 days.
+const UPLOAD_REUSE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+
+/// Whether a NEW message may send `pointer` as it is (a forward, F4): its `upload_timestamp` is present and
+/// `0 <= now - upload_timestamp < 3 days` (Android's `UPLOAD_REUSE_THRESHOLD`). A missing timestamp or one in the
+/// future means upload (our own rule: a pointer from the future is no proof of a recent upload). `now_ms` is the
+/// actor's clock.
+fn reuse_pointer(pointer: &proto::AttachmentPointer, now_ms: u64) -> bool {
+    pointer
+        .upload_timestamp
+        .and_then(|at| now_ms.checked_sub(at))
+        .is_some_and(|age| age < UPLOAD_REUSE_MS)
 }
 
 /// The `AttachmentPointer` an attachment arrived with (`Attachment::remote`, what
@@ -1975,6 +1996,110 @@ mod tests {
         assert!(size < 128 * 1024, "{size}");
         assert!(is_video("video/mp4") && is_video("VIDEO/webm"));
         assert!(!is_video("image/gif") && !is_video("vid"));
+    }
+
+    /// F4: a pointer is sent again by a new message only when its upload is recent (Android's three days).
+    #[test]
+    fn reuse_pointer_follows_the_three_day_rule() {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        let now = 10 * DAY;
+        let at = |t: Option<u64>| proto::AttachmentPointer {
+            upload_timestamp: t,
+            ..Default::default()
+        };
+        assert!(reuse_pointer(&at(Some(now - DAY)), now), "1 day old");
+        assert!(
+            reuse_pointer(&at(Some(now - 3 * DAY + 1)), now),
+            "3 days minus 1 ms"
+        );
+        assert!(reuse_pointer(&at(Some(now)), now), "just uploaded");
+        assert!(
+            !reuse_pointer(&at(Some(now - 3 * DAY)), now),
+            "exactly 3 days"
+        );
+        assert!(!reuse_pointer(&at(Some(now - 4 * DAY)), now), "4 days");
+        assert!(!reuse_pointer(&at(None), now), "no timestamp");
+        assert!(
+            !reuse_pointer(&at(Some(now + 60_000)), now),
+            "a minute in the future"
+        );
+    }
+
+    /// F4: through the send path, a NEW message whose attachment has a local file and a fresh `remote` sends that
+    /// pointer with no upload; with an old `remote` the local file is uploaded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_new_message_reuses_a_fresh_remote_pointer_and_uploads_an_old_one() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let world = upload_world(Duration::from_millis(1));
+                let now = world.shared.now_ms();
+                let remote_of = |size: u32, stamp: u64| {
+                    let pointer = proto::AttachmentPointer {
+                        attachment_identifier: Some(
+                            proto::attachment_pointer::AttachmentIdentifier::CdnKey(
+                                "synthetic-cdn-key-4417".to_owned(),
+                            ),
+                        ),
+                        cdn_number: Some(3),
+                        key: Some(vec![6; 64]),
+                        digest: Some(vec![5; 32]),
+                        size: Some(size),
+                        upload_timestamp: Some(stamp),
+                        ..Default::default()
+                    };
+                    kourier_model::BackendBlob::new(
+                        POINTER_BLOB_V,
+                        prost::Message::encode_to_vec(&pointer),
+                    )
+                };
+                let mut fresh = core_attachment(
+                    &world,
+                    "core/aa/fresh",
+                    AttachmentKind::File,
+                    "application/pdf",
+                    &[1u8; 5_000],
+                );
+                fresh.remote = Some(remote_of(111, now - 60_000));
+                let mut old = core_attachment(
+                    &world,
+                    "core/aa/old-file",
+                    AttachmentKind::File,
+                    "application/pdf",
+                    &[2u8; 6_000],
+                );
+                old.remote = Some(remote_of(222, now - 4 * 24 * 60 * 60 * 1000));
+                let body = Body::Media {
+                    attachments: vec![fresh, old],
+                    caption: None,
+                };
+                let socket = Arc::new(StubSocket);
+                let stop = Stop::open();
+                let uploader = Uploader {
+                    shared: &world.shared,
+                    socket: &socket,
+                    local: kourier_model::MessageId(21),
+                    net_local: "1700000000021",
+                    stop: &stop,
+                };
+                let prepared = uploader.prepare(&body).await.expect("prepare");
+                assert_eq!(prepared.attachments.len(), 2);
+                assert_eq!(
+                    prepared.attachments[0].size,
+                    Some(111),
+                    "the fresh pointer as it is"
+                );
+                assert_ne!(
+                    prepared.attachments[1].size,
+                    Some(222),
+                    "the old one is not reused"
+                );
+                assert_eq!(
+                    world.cdn.seen.lock().unwrap().len(),
+                    1,
+                    "only the old attachment's local file went up"
+                );
+            })
+            .await;
     }
 
     #[test]

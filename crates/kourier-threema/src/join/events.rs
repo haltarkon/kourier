@@ -257,6 +257,7 @@ pub(crate) fn features() -> ConversationFeatures {
             .collect(),
         // Threema has no restriction on saving a chat.
         export: ChatExport::Allowed,
+        no_forward: false,
         ..ConversationFeatures::default()
     }
 }
@@ -710,6 +711,7 @@ mod tests {
             roaming_listed: None,
             invite_link_on: false,
             export: kourier_model::ChatExport::Allowed,
+            no_forward: false,
         }
     }
 

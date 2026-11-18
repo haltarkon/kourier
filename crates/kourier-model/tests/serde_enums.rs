@@ -630,6 +630,7 @@ fn structs_roundtrip_and_default_missing_fields() {
             owns_unread: true,
             validates_deletes: true,
         },
+        forwards: None,
     });
     // A descriptor that states no grace (an older one, or Signal's) reads back as none.
     let mut plain = serde_json::to_value(NetworkDescriptor {
@@ -655,6 +656,7 @@ fn structs_roundtrip_and_default_missing_fields() {
             owns_unread: true,
             validates_deletes: true,
         },
+        forwards: None,
     })
     .expect("to value");
     let fields = plain.as_object_mut().expect("an object");
@@ -907,6 +909,7 @@ fn cleaned_pictures_are_left_out_when_none_and_bound_by_type_and_size() {
         cleaned_pictures: None,
         receipts_always_sent: false,
         server: ServerRules::default(),
+        forwards: None,
     })
     .expect("to value");
     assert!(

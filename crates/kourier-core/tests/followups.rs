@@ -292,17 +292,18 @@ async fn a_second_edit_names_the_original_where_the_network_says_so() {
         for (n, body) in ["second version", "third version"].into_iter().enumerate() {
             env.clock.advance(Duration::from_secs(60));
             edit(&env, mine, body);
-            // Stored (the row's revision moved) and sent (nothing waits in the outbox).
+            // Stored (the row's revision moved) and sent (nothing waits in the outbox), read in
+            // that order: the edit raises the revision and queues its row in one transaction.
             let want = i64::try_from(n).expect("small") + 1;
             until(&env, "the edit is stored and sent", move |c| {
-                count(c, "SELECT count(*) FROM outbox") == 0
-                    && count(
-                        c,
-                        &format!(
-                            "SELECT count(*) FROM messages WHERE id = {} AND revision = {want}",
-                            mine.0
-                        ),
-                    ) == 1
+                count(
+                    c,
+                    &format!(
+                        "SELECT count(*) FROM messages WHERE id = {} AND revision = {want}",
+                        mine.0
+                    ),
+                ) == 1
+                    && count(c, "SELECT count(*) FROM outbox") == 0
             })
             .await;
         }
@@ -954,14 +955,18 @@ async fn note_to_self_is_not_bound_by_the_edit_window_or_count() {
 
     for n in 1..=12u16 {
         edit(&env, note, &format!("shopping list v{n}"));
+        // The revision FIRST: the edit raises it and queues its outbox row in one transaction,
+        // so an empty outbox read after it is the sent edit. Read the other way round, the
+        // edit could commit between the two reads and pass the wait unsent (11 of 12 transmits,
+        // F3's `ci --quick` of 2026-11-17).
         until(&env, "the edit is sent", move |c| {
-            count(c, "SELECT count(*) FROM outbox") == 0
-                && c.query_row(
-                    "SELECT revision FROM messages WHERE id = ?1",
-                    [note.0],
-                    |r| r.get::<_, i64>(0),
-                )
-                .is_ok_and(|r| r == i64::from(n))
+            c.query_row(
+                "SELECT revision FROM messages WHERE id = ?1",
+                [note.0],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|r| r == i64::from(n))
+                && count(c, "SELECT count(*) FROM outbox") == 0
         })
         .await;
     }

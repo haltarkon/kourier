@@ -39,6 +39,7 @@ pub mod files;
 pub mod filter_marks;
 pub mod filters;
 pub mod fixture;
+pub mod forward;
 pub mod group;
 pub mod i18n;
 pub mod login;

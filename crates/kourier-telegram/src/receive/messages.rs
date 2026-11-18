@@ -1224,6 +1224,7 @@ impl Messages {
             || self.updating
             || self.start_ms.saturating_sub(date_ms) > CATCH_UP_AGE_MS;
         m.meta = mapped.meta;
+        m.forwarded = mapped.forwarded;
         if own {
             // Q-B4: an own message the peer of a private chat has read is `Read`.
             m.initial_out_state = Some(if read_out {

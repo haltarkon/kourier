@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls as QQC2
+import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import app.kourier
 
@@ -18,6 +19,12 @@ Kirigami.ApplicationWindow {
     property bool quitting: false
     // When the window last lost focus (ms): a tray click right after it still means "hide".
     property real deactivatedAt: 0
+    // A chat was opened before the restore of the last run's chats ran (a notification, a link, a click):
+    // the restore then opens nothing.
+    property bool chatOpenedEarly: false
+    // The restore asked for the chats of the last run once (split view S4).
+    property bool restoreAsked: false
+    property int restoreTries: 0
     // A conversation to open once the start page is up (activation before App.loaded).
     property real pendingConversation: 0
     // The message of that conversation to open at (0: none).
@@ -28,12 +35,12 @@ Kirigami.ApplicationWindow {
     // Closing without a tray, or the Quit key: the application should quit.
     signal closedForGood()
     // The chat column is on screen with a conversation (read markers, notifications).
-    readonly property bool chatShown: App.timeline.conversationId !== 0 && root.chatPage !== null && root.chatPage.Kirigami.ColumnView.inViewport && !root.chatPage.panelCovers && (root.wideScreen || root.pageStack.currentItem === root.chatPage)
+    readonly property bool chatShown: root.activeChat !== null && root.activeChat.chatModel.conversationId !== 0 && root.activeChat.Kirigami.ColumnView.inViewport && !root.activeChat.panelCovers && (root.wideScreen || root.pageStack.currentItem === root.activeChat)
     // What the keys Ctrl+Shift+A and Ctrl+Shift+U need (A10d, H2): the chat is shown AND its page is a page of
     // the stack. A wide window with Settings over the chat keeps the page counted "in the viewport" after it
     // left the stack (`chatShown` stays true; found by `roaming_ui` `keys`), and a key must not archive a
     // chat nobody sees.
-    readonly property bool chatKeys: root.chatShown && root.inStack(root.chatPage)
+    readonly property bool chatKeys: root.chatShown && root.inStack(root.activeChat)
     // The first frame was presented.
     property bool framed: false
     // The chat page takes its column right after the first frame (see `showListWith`).
@@ -41,7 +48,7 @@ Kirigami.ApplicationWindow {
     // What stands in the chat column of a wide window until then.
     property Kirigami.Page standIn: null
 
-    title: App.timeline.conversationId !== 0 && App.timeline.title !== "" ? App.timeline.title + " — Kourier" : "Kourier"
+    title: root.activeTimeline.conversationId !== 0 && root.activeTimeline.title !== "" ? root.activeTimeline.title + " — Kourier" : "Kourier"
     width: App.windowWidth > 0 ? App.windowWidth : Kirigami.Units.gridUnit * 64
     height: App.windowHeight > 0 ? App.windowHeight : Kirigami.Units.gridUnit * 42
     minimumWidth: Kirigami.Units.gridUnit * 20
@@ -50,6 +57,36 @@ Kirigami.ApplicationWindow {
     // Wide: conversation list and chat side by side (§8.3).
     wideScreen: width >= Kirigami.Units.gridUnit * 46
 
+    // ---- the layout of a split (split view S4) ----
+    // A chat column needs at least 20 grid units. With the split on the window has three layouts, by the
+    // room the page stack has (the window less a side panel that stands beside it):
+    //   "full": the list (21 gu) and two chats fit (61 gu): list | chat | chat;
+    //   "rail": the list narrowed to a rail of avatars (4 gu) and two chats fit (44 gu): rail | chat | chat;
+    //   "one":  else the active chat alone (with the list beside it when the window is wide, alone when not),
+    //           the other chat one press away (F6, the header's "Show Other Chat").
+    // ONE rule, here; everything that asked `wideScreen` for the split asks `bothShown` or `splitLayout`.
+    readonly property real splitChatMin: Kirigami.Units.gridUnit * 20
+    readonly property real splitRoom: root.pageStack.columnView.width > 0 ? root.pageStack.columnView.width : root.width
+    readonly property string splitLayout: root.splitRoom >= listPage.fullWidth + 2 * root.splitChatMin ? "full" : (root.splitRoom >= listPage.railWidth + 2 * root.splitChatMin ? "rail" : "one")
+    // Both chats stand in the stack (a window without a split shows what `wideScreen` says).
+    readonly property bool bothShown: root.wideScreen && (!App.split || root.splitLayout !== "one")
+    // The width of the first chat's column: its share of what the list leaves. A share, not pixels: a
+    // window resized keeps it.
+    // (Whole pixels, rounded down: the two columns of an equal split are the same width, as the page row's own
+    // default widths were.)
+    readonly property real splitFirstExact: {
+        const room = Math.max(0, root.splitRoom - (root.splitLayout === "rail" ? listPage.railWidth : listPage.fullWidth));
+        return Math.max(root.splitChatMin, Math.min(room - root.splitChatMin, room * App.splitWidth));
+    }
+    readonly property real splitFirstWidth: Math.floor(root.splitFirstExact)
+    // The second chat's: what is left.
+    readonly property real splitSecondWidth: Math.max(root.splitChatMin, Math.floor(root.splitRoom - (root.splitLayout === "rail" ? listPage.railWidth : listPage.fullWidth) - root.splitFirstExact))
+    onSplitLayoutChanged: Qt.callLater(root.syncSplit)
+    // A drag of the divider ended: the first column's width is stored as a share of the room.
+    function dividerReleased(width: real): void {
+        const room = Math.max(1, root.splitRoom - (root.splitLayout === "rail" ? listPage.railWidth : listPage.fullWidth));
+        App.storeSplitWidth(width / room);
+    }
     pageStack.columnView.columnResizeMode: root.wideScreen ? Kirigami.ColumnView.DynamicColumns : Kirigami.ColumnView.SingleColumn
     pageStack.globalToolBar.style: Kirigami.ApplicationHeaderStyle.ToolBar
     pageStack.globalToolBar.showNavigationButtons: Kirigami.ApplicationHeaderStyle.ShowBackButton
@@ -86,10 +123,20 @@ Kirigami.ApplicationWindow {
         id: listPage
         visible: false
         // In a narrow window the list is on screen only while the chat is not.
-        showsNotice: !root.wideScreen || App.timeline.conversationId === 0 || App.timeline.cannotSend !== ""
+        rail: App.split && root.splitLayout === "rail"
+        showsNotice: !root.wideScreen || root.activeTimeline.conversationId === 0 || root.activeTimeline.cannotSend !== ""
         searchKeys: root.searchKeys
         onOpenConversation: id => root.pickedChat(id)
         onOpenSearchHit: (id, message) => root.pickedHit(id, message)
+        choosing: root.choosingBeside
+        choosingName: root.choosingName
+        onChooseCancelled: {
+            root.endChoosing();
+            listPage.conversations.forceActiveFocus(Qt.TabFocusReason);
+        }
+        onOpenBesideAsked: id => root.askedBeside(id)
+        onCloseChatAsked: id => root.closeChat(App.paneOf(id))
+        onSwapChatsAsked: root.swapChats(false)
         onArchiveAsked: conv => root.archiveChat(conv)
         onUnarchiveAsked: conv => root.unarchiveChat(conv)
         onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
@@ -98,6 +145,17 @@ Kirigami.ApplicationWindow {
     }
 
     property ChatPage chatPage: null
+    // The second chat page, the column after the first one: made while `App.split` is on (`syncSplit`).
+    property ChatPage sideChatPage: null
+    property int pageSetupSplitTries: 0
+    // The page `splitpick` started its chooser (once).
+    property bool pageSetupPickStarted: false
+    // The chat page the window's chat keys act on: the active pane's (`App.activePane`). The first page
+    // alone without a split.
+    readonly property ChatPage activeChat: App.activePane === 1 && root.sideChatPage !== null ? root.sideChatPage : root.chatPage
+    // The models of that chat (pane 0's while no chat page exists yet).
+    readonly property TimelineModel activeTimeline: root.activeChat !== null ? root.activeChat.chatModel : App.timeline
+    readonly property ComposerController activeComposer: root.activeChat !== null ? root.activeChat.composerModel : App.composer
     property WelcomePage welcomePage: null
     property LinkAccountPage linkPage: null
     property SettingsPage settingsPage: null
@@ -108,12 +166,49 @@ Kirigami.ApplicationWindow {
         id: chatComponent
         ChatPage {
             visible: false
+            chatModel: App.timeline
+            composerModel: App.composer
+            pane: 0
+            active: App.activePane === 0
+            beside: App.split && root.bothShown
+            columnWidth: root.splitFirstWidth
+            single: App.split && !root.bothShown
+            otherName: App.sideTimeline.title
+            onDividerReleased: width => root.dividerReleased(width)
             // A group in common (or "Message") on the details panel opens that chat.
             onConversationRequested: id => root.pickedChat(id)
             onArchiveAsked: conv => root.archiveChat(conv)
             onUnarchiveAsked: conv => root.unarchiveChat(conv)
             onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
             onSearchAsked: root.searchInChat()
+            onChooseBesideAsked: root.startChoosing()
+            onSwapChatsAsked: root.swapChats(true)
+            onCloseChatAsked: pane => root.closeChat(pane)
+            onForwardRefused: (count, chat) => root.forwardRefused(count, chat)
+        }
+    }
+    // The second chat column of a split: the same page with pane 1's models.
+    Component {
+        id: sideChatComponent
+        ChatPage {
+            visible: false
+            chatModel: App.sideTimeline
+            composerModel: App.sideComposer
+            pane: 1
+            active: App.activePane === 1
+            beside: App.split && root.bothShown
+            columnWidth: root.splitSecondWidth
+            single: App.split && !root.bothShown
+            otherName: App.timeline.title
+            onConversationRequested: id => root.pickedChat(id)
+            onArchiveAsked: conv => root.archiveChat(conv)
+            onUnarchiveAsked: conv => root.unarchiveChat(conv)
+            onUntilAsked: (conv, back) => root.askMuteUntil(conv, back)
+            onSearchAsked: root.searchInChat()
+            onChooseBesideAsked: root.startChoosing()
+            onSwapChatsAsked: root.swapChats(true)
+            onCloseChatAsked: pane => root.closeChat(pane)
+            onForwardRefused: (count, chat) => root.forwardRefused(count, chat)
         }
     }
     // The chat column of the first frame: the chat page's empty state without the chat page
@@ -173,6 +268,183 @@ Kirigami.ApplicationWindow {
         }
         return root.chatPage;
     }
+
+    // ---- the split: list | chat | chat ----
+    // Whether `item` is `page` or below it.
+    function within(item: Item, page: Item): bool {
+        for (let i = item; i !== null && i !== undefined; i = i.parent) {
+            if (i === page) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Where `page` stands in the stack, -1 when it is not there.
+    function stackIndex(page: Item): int {
+        for (let i = 0; page !== null && i < pageStack.depth; ++i) {
+            if (pageStack.get(i) === page) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // The second chat page stands in the stack right after the first one while the split is on in a wide
+    // window; a narrow window shows the active chat alone (`showActive`). The page is destroyed (its
+    // composer text saved as the draft first, as `freshChat` does) when the split ends. Called wherever the
+    // stack of the chat column is rebuilt.
+    function syncSplit(): void {
+        if (App.split) {
+            root.dragCarrier = true;
+        }
+        if (!App.split) {
+            const shown = !root.wideScreen && root.sideChatPage !== null && pageStack.lastItem === root.sideChatPage;
+            root.dropSide(true);
+            if (shown && App.timeline.conversationId !== 0) {
+                // A narrow window that showed the closed pane shows the chat that stays.
+                pageStack.push(root.freshChat());
+                pageStack.currentIndex = pageStack.depth - 1;
+            }
+            return;
+        }
+        if (!root.bothShown) {
+            root.showActive();
+            return;
+        }
+        const chatAt = root.stackIndex(root.chatPage);
+        const sideAt = root.stackIndex(root.sideChatPage);
+        if (chatAt < 0) {
+            if (sideAt >= 0) {
+                // Wide again after a narrow window showed the second chat alone: the first goes before it.
+                pageStack.insertPage(sideAt, root.freshChat());
+            }
+            // (No chat column now, as under the stand-in: the split waits for it.)
+            return;
+        }
+        if (sideAt < 0) {
+            pageStack.insertPage(chatAt + 1, root.freshSide());
+        }
+    }
+
+    // The second chat page to push: one that left the stack is made anew (as `freshChat` does).
+    function freshSide(): ChatPage {
+        if (root.sideChatPage !== null && !root.inStack(root.sideChatPage)) {
+            root.sideChatPage.composer.switchTo(0);
+            root.sideChatPage.destroy();
+            root.sideChatPage = null;
+        }
+        if (root.sideChatPage === null) {
+            root.sideChatPage = sideChatComponent.createObject(root) as ChatPage;
+        }
+        return root.sideChatPage;
+    }
+
+    // The side page leaves the stack; `destroy`: the split is over, the page goes.
+    function dropSide(destroy: bool): void {
+        const side = root.sideChatPage;
+        if (side === null) {
+            return;
+        }
+        if (root.inStack(side)) {
+            pageStack.removePage(side);
+        }
+        if (destroy) {
+            side.composer.switchTo(0);
+            side.destroy();
+            root.sideChatPage = null;
+        }
+    }
+
+    // A narrow window shows the active chat only: while a chat is what it shows (not the list alone, not a
+    // page over the chat), the chat page after the list is the active pane's and the other is not in the stack.
+    function showActive(): void {
+        if (root.bothShown || root.chatPage === null) {
+            return;
+        }
+        const last = pageStack.lastItem;
+        if (pageStack.depth < 2 || last === null || (last !== root.chatPage && last !== root.sideChatPage)) {
+            return;
+        }
+        const second = App.split && App.activePane === 1;
+        const other = second ? root.chatPage : root.sideChatPage;
+        if (other !== null && root.inStack(other)) {
+            pageStack.removePage(other);
+        }
+        const want = second ? root.freshSide() : root.freshChat();
+        if (pageStack.lastItem !== want) {
+            pageStack.push(want);
+        }
+        pageStack.currentIndex = pageStack.depth - 1;
+    }
+
+    // F6 and Shift+F6: the keyboard goes list, first chat, second chat (the timeline's rows, the first stop
+    // of the chat), and round; without a split the list and the chat take turns.
+    function cycleFocus(back: bool): void {
+        if (!root.bothShown) {
+            // A split that shows one chat: F6 and Shift+F6 switch to the other one.
+            if (App.split && root.splitLayout === "one" && root.activeChat !== null && root.activeChat.open) {
+                App.activatePane(1 - App.activePane);
+                Qt.callLater(() => root.activeChat?.timeline.rowList.forceActiveFocus(Qt.TabFocusReason));
+            }
+            return;
+        }
+        const stops = [listPage];
+        if (root.chatPage !== null && root.chatPage.open) {
+            stops.push(root.chatPage);
+        }
+        if (App.split && root.sideChatPage !== null && root.sideChatPage.open && root.inStack(root.sideChatPage)) {
+            stops.push(root.sideChatPage);
+        }
+        let at = -1;
+        const focused = root.activeFocusItem;
+        for (let i = 0; i < stops.length; ++i) {
+            if (focused && root.within(focused, stops[i])) {
+                at = i;
+            }
+        }
+        const next = stops[(at + (back ? stops.length - 1 : 1) + stops.length) % stops.length];
+        if (next === listPage) {
+            listPage.conversations.forceActiveFocus(Qt.TabFocusReason);
+        } else {
+            next.timeline.rowList.forceActiveFocus(Qt.TabFocusReason);
+        }
+    }
+
+    // The keyboard entering a pane makes it the active one ("focus decides"; a press does it in `ChatPage`).
+    // Only in a wide window: a narrow one shows the active pane's page alone (`showActive`), so the page that
+    // takes the keyboard there follows the active pane and never decides it (the start pushes the first chat
+    // page before the split shows its active one).
+    onActiveFocusItemChanged: {
+        const item = root.activeFocusItem;
+        if (!App.split || item === null || !root.bothShown) {
+            return;
+        }
+        if (root.sideChatPage !== null && root.within(item, root.sideChatPage)) {
+            App.activatePane(1);
+        } else if (root.chatPage !== null && root.within(item, root.chatPage)) {
+            App.activatePane(0);
+        }
+    }
+
+    Connections {
+        target: App
+        function onSplitChanged(): void {
+            root.syncSplit();
+            root.showActive();
+            if (App.split) {
+                Qt.callLater(() => root.activeChat?.composer.focusInput());
+            }
+        }
+        function onActivePaneChanged(): void {
+            root.showActive();
+        }
+    }
+
+    // Whether the pane that is not active is on screen (the core's notification rule).
+    readonly property ChatPage inactiveChat: App.activePane === 1 ? root.chatPage : root.sideChatPage
+    readonly property bool inactiveShown: App.split && root.inactiveChat !== null && root.inactiveChat.visible && root.inactiveChat.Kirigami.ColumnView.inViewport
+    onInactiveShownChanged: App.setSideShown(root.inactiveShown)
 
     function ensureWelcome(): WelcomePage {
         if (root.welcomePage === null) {
@@ -290,6 +562,7 @@ Kirigami.ApplicationWindow {
             }
             pageStack.currentIndex = 0;
         }
+        root.syncSplit();
         // In the stack the list has its size: its rows can come (with the first frame).
         listPage.showRows();
     }
@@ -324,6 +597,7 @@ Kirigami.ApplicationWindow {
             pageStack.replace(root.freshChat());
             pageStack.currentIndex = 0;
             page.destroy();
+            root.syncSplit();
             return;
         }
         root.dropStandIn();
@@ -331,6 +605,7 @@ Kirigami.ApplicationWindow {
             pageStack.push(root.freshChat());
             pageStack.currentIndex = 0;
         }
+        root.syncSplit();
     }
 
     // Opens chat `id`. ONE argument: the dev control calls it by that signature
@@ -343,6 +618,9 @@ Kirigami.ApplicationWindow {
     // is then read around that message from the start, never its newest page first (which
     // would mark the chat read, decisions B1), and the page stack does what any open does.
     function openChatAt(id: real, message: real): void {
+        root.chatOpenedEarly = true;
+        // Opening a chat any way that is not a pick of the chooser ends the chooser.
+        root.choosingBeside = false;
         if (message !== 0) {
             App.openSearchResult(id, message);
         } else {
@@ -355,11 +633,13 @@ Kirigami.ApplicationWindow {
         // one that left the stack is made anew (`freshChat`).
         const chat = root.chatPage;
         if (chat !== null && root.pageStack.depth > 1 && root.pageStack.get(1) === chat) {
-            root.popAfter(chat);
+            // (The second chat of a split stays.)
+            root.popAfter(root.sideChatPage !== null && root.inStack(root.sideChatPage) ? root.sideChatPage : chat);
         } else {
             root.popToList();
             pageStack.push(root.freshChat());
         }
+        root.syncSplit();
         pageStack.currentIndex = 1;
     }
 
@@ -368,9 +648,17 @@ Kirigami.ApplicationWindow {
     // chat rebuilds the stack, which cancels a link waiting at its QR code. Never silently
     // (F3): `leavingLink` asks first when something would be lost, and acts at once
     // otherwise. `then` runs after the chat is open; `message` (a search hit) is where it opens.
-    function openingChat(id: real, then: var, message = 0): void {
+    function openingChat(id: real, then: var, message = 0, pick = false): void {
+        // The chooser of "Open Chat Beside" stands: a PICK (list click, Return, the quick switch, a search
+        // hit) opens beside; every other way to open a chat (`pick` false) just ends it (`openChatAt`).
+        const beside = pick && root.choosingBeside;
+        root.choosingBeside = false;
         root.leavingLink(() => {
-            root.openChatAt(id, message);
+            if (beside) {
+                root.openBeside(id);
+            } else {
+                root.openChatAt(id, message);
+            }
             if (then) {
                 then();
             }
@@ -382,14 +670,120 @@ Kirigami.ApplicationWindow {
     // Desktop's rule). A notification does not (`openFromActivation`): it opens its chat and
     // leaves the list as it is.
     function pickedChat(id: real): void {
-        root.openingChat(id, () => App.revealChat(id));
+        root.openingChat(id, () => App.revealChat(id), 0, true);
     }
 
     // A hit of the message search was picked: its chat opens at the message and the list stays
     // as it is, as for a notification (decisions M4): no archive view, the search and its hits
     // stay.
     function pickedHit(id: real, message: real): void {
-        root.openingChat(id, null, message);
+        root.openingChat(id, null, message, true);
+    }
+
+    // ---- the second chat beside the first (split view) ----
+    // The chooser of the header's "Open Chat Beside": the list shows a banner and the NEXT chat picked
+    // there opens beside the open one (`openingChat`'s `pick`). Escape, the banner's close button, F3 and
+    // any other way of opening a chat end it; so does the open chat going away.
+    property bool choosingBeside: false
+    // The name the banner shows (the open chat's, as it was when the chooser started).
+    property string choosingName: ""
+
+    function startChoosing(): void {
+        if (App.split || root.activeTimeline.conversationId === 0) {
+            return;
+        }
+        root.choosingName = root.activeTimeline.title;
+        root.choosingBeside = true;
+        if (!root.wideScreen) {
+            // A narrow window shows the list (as Back does) with the banner.
+            root.popAfter(listPage);
+            pageStack.currentIndex = 0;
+        }
+        Qt.callLater(() => listPage.conversations.forceActiveFocus(Qt.TabFocusReason));
+    }
+
+    function endChoosing(): void {
+        root.choosingBeside = false;
+    }
+
+    // Chat `id` opens in the second pane (the row menu's "Open in Split View", a pick of the chooser) and
+    // that pane is active; a chat a pane shows already is only activated (`App.openInSplit`).
+    function openBeside(id: real): void {
+        root.chatOpenedEarly = true;
+        root.choosingBeside = false;
+        App.openInSplit(id);
+        root.chatPending = false;
+        root.dropStandIn();
+        if (!root.wideScreen && root.pageStack.depth > 0 && root.pageStack.get(0) === listPage) {
+            // The list stood alone (the chooser): now the active chat alone.
+            root.popToList();
+            const want = App.split && App.activePane === 1 ? root.freshSide() : root.freshChat();
+            pageStack.push(want);
+            pageStack.currentIndex = pageStack.depth - 1;
+        }
+        root.syncSplit();
+    }
+
+    // Closes the chat in pane `pane` (the header's Close Chat, the list's hover button and row menu): one chat
+    // closes into the placeholder, with the split the other chat stays alone (as the main one when the main
+    // closed). The keyboard goes to the conversation list every time, whose current row is the chat that
+    // stays (or none); a narrow window shows the list (a chat that stays is not pushed over it).
+    function closeChat(pane: int): void {
+        if (pane < 0) {
+            return;
+        }
+        root.choosingBeside = false;
+        App.closePane(pane);
+        root.syncSplit();
+        if (!root.wideScreen) {
+            root.popAfter(listPage);
+            pageStack.currentIndex = 0;
+        }
+        Qt.callLater(() => listPage.conversations.forceActiveFocus(Qt.TabFocusReason));
+    }
+
+    // The two chats exchange places. Each page saves its typed text as its chat's draft first; the chats'
+    // pages then show the other draft when their timelines change chat (`Composer.switchTo`). `fromChat`: the
+    // press came from a chat header, so the keyboard goes to the composer of the active chat (the pane that
+    // had it now shows the other chat); from the list it stays where it is.
+    function swapChats(fromChat: bool): void {
+        if (!App.split) {
+            return;
+        }
+        root.chatPage?.composer.keepDraft();
+        root.sideChatPage?.composer.keepDraft();
+        App.swapPanes();
+        root.showActive();
+        if (fromChat) {
+            Qt.callLater(() => root.activeChat?.composer.focusInput());
+        }
+    }
+
+    function askedBeside(id: real): void {
+        root.leavingLink(() => root.openBeside(id));
+    }
+
+    // F3: with the split on it closes the inactive pane; off, a list row whose chat is not open opens
+    // beside, else the chooser starts (or, standing, ends).
+    function splitKey(): void {
+        if (App.split) {
+            root.choosingBeside = false;
+            App.closePane(1 - App.activePane);
+            return;
+        }
+        if (root.choosingBeside) {
+            root.endChoosing();
+            return;
+        }
+        if (App.timeline.conversationId === 0) {
+            return;
+        }
+        const row = listPage.conversations.activeFocus ? listPage.conversations.currentItem as ConversationDelegate : null;
+        if (row !== null && row.conversationId !== 0 && App.paneOf(row.conversationId) < 0) {
+            root.askedBeside(row.conversationId);
+            return;
+        }
+        root.startChoosing();
     }
 
     // A notification click or a link: open `id` now, or once the start page is up.
@@ -526,6 +920,11 @@ Kirigami.ApplicationWindow {
         // After the first page is up.
         Qt.callLater(root.openPendingLink);
         const page = App.startPage;
+        if (page === "splitnarrow" && App.fixture && root.wideScreen) {
+            // The page of the rail: a wide window too narrow for the full list and two chats (1000 px is
+            // between the two limits at any usual size of the theme's font).
+            root.width = 1000;
+        }
         // The pages that walk a link: the link page, its QR code, and its states of a
         // history transfer.
         const links = page === "link" || page === "qr" || root.transferLinkPages.indexOf(page) >= 0;
@@ -566,7 +965,7 @@ Kirigami.ApplicationWindow {
             }
             return;
         }
-        const chatPages = ["chat", "history", "media", "viewer", "compose", "files", "originals", "folder", "folderfiles", "folderzip", "location", "locationmany", "locationnever"].concat(root.actionPages);
+        const chatPages = ["chat", "split", "splitnarrow", "history", "media", "viewer", "compose", "files", "originals", "folder", "folderfiles", "folderzip", "location", "locationmany", "locationnever"].concat(root.actionPages);
         const showsChat = chatPages.indexOf(page) >= 0 && App.timeline.conversationId !== 0;
         // An ordinary start opens no chat: the chat column can wait for the first frame.
         root.showListWith(!showsChat && root.pendingConversation <= 0);
@@ -582,6 +981,8 @@ Kirigami.ApplicationWindow {
             const chatPage = root.ensureChat();
             if (!root.wideScreen) {
                 pageStack.push(chatPage);
+                // (A split shows its active chat.)
+                root.syncSplit();
             }
             pageStack.currentIndex = 1;
             chatPage.pinToOldest = page === "history";
@@ -640,6 +1041,7 @@ Kirigami.ApplicationWindow {
         if (root.started && !root.chatPending) {
             root.attachChat();
         }
+        Qt.callLater(root.syncSplit);
     }
 
     onActiveChanged: {
@@ -702,7 +1104,7 @@ Kirigami.ApplicationWindow {
     // Search in the open chat only (G1i): the same as `focusSearch`, with the chat's chip in the
     // field. A chat that is not open, or is protected (it offers no search), does nothing.
     function searchInChat(): void {
-        if (App.timeline.conversationId === 0 || !App.timeline.chatSearchable) {
+        if (root.activeTimeline.conversationId === 0 || !root.activeTimeline.chatSearchable) {
             return;
         }
         if (pageStack.depth > 0 && pageStack.get(0) === listPage) {
@@ -714,8 +1116,8 @@ Kirigami.ApplicationWindow {
     // Opens the chat `step` rows below (or above) the open one in the list as it is
     // shown; the ends do not wrap.
     function stepConversation(step: int): void {
-        const id = App.adjacentConversation(App.timeline.conversationId, step);
-        if (id !== 0 && id !== App.timeline.conversationId) {
+        const id = App.adjacentConversation(root.activeTimeline.conversationId, step);
+        if (id !== 0 && id !== root.activeTimeline.conversationId) {
             root.openingChat(id, null);
         }
     }
@@ -727,8 +1129,8 @@ Kirigami.ApplicationWindow {
             // field is emptied: the search is what lists it.)
             App.revealChat(id);
             listPage.searchField.text = "";
-            Qt.callLater(() => root.chatPage?.composer.focusInput());
-        });
+            Qt.callLater(() => root.activeChat?.composer.focusInput());
+        }, 0, true);
     }
 
     // The banner's button. Only "Link Again" of a logged-out account takes the link page's
@@ -755,8 +1157,34 @@ Kirigami.ApplicationWindow {
     Shortcut {
         id: chatSearchKey
         sequences: ["Ctrl+Shift+F"]
-        enabled: root.keysActive && root.chatKeys && App.timeline.chatSearchable
+        enabled: root.keysActive && root.chatKeys && root.activeTimeline.chatSearchable
         onActivated: root.searchInChat()
+    }
+    // The keyboard round the panes: list, first chat, second chat of a split.
+    Shortcut {
+        sequences: ["F6"]
+        enabled: root.keysActive
+        onActivated: root.cycleFocus(false)
+    }
+    Shortcut {
+        sequences: ["Shift+F6"]
+        enabled: root.keysActive
+        onActivated: root.cycleFocus(true)
+    }
+    // Split view: closes the inactive pane; off, opens the focused row's chat beside or starts the chooser.
+    Shortcut {
+        sequences: ["F3"]
+        enabled: root.keysActive && (root.chatKeys || root.choosingBeside)
+        onActivated: root.splitKey()
+    }
+    // Escape ends the chooser wherever the keyboard is (a dialog's own Escape comes first: `keysActive`).
+    Shortcut {
+        sequences: ["Escape"]
+        enabled: root.keysActive && root.choosingBeside
+        onActivated: {
+            root.endChoosing();
+            listPage.conversations.forceActiveFocus(Qt.TabFocusReason);
+        }
     }
     Shortcut {
         sequences: ["Alt+Down", "Ctrl+PgDown", "Ctrl+Tab"]
@@ -803,8 +1231,8 @@ Kirigami.ApplicationWindow {
     // Kirigami's own order puts the chat's
     // footer and toolbar ahead of the list. While the account banner shows a button the
     // search field keeps the natural order, so that the button stays in reach.
-    readonly property Item timelineStop: root.wideScreen && root.chatPage !== null && root.chatPage.open ? root.chatPage.timeline.rowList : null
-    readonly property Item composerStop: root.timelineStop !== null ? root.chatPage.composer.firstStop : null
+    readonly property Item timelineStop: root.wideScreen && root.activeChat !== null && root.activeChat.open ? root.activeChat.timeline.rowList : null
+    readonly property Item composerStop: root.timelineStop !== null ? root.activeChat.composer.firstStop : null
     Binding {
         target: listPage.searchField.KeyNavigation
         property: "tab"
@@ -929,15 +1357,18 @@ Kirigami.ApplicationWindow {
 
     // The open chat went away (the user deleted it, here or on another device): a narrow
     // window goes back to the list instead of showing an empty chat page.
-    readonly property real openChat: App.timeline.conversationId
+    readonly property real openChat: root.activeTimeline.conversationId
     onOpenChatChanged: {
-        if (root.openChat === 0 && !root.wideScreen && root.chatPage !== null && root.pageStack.lastItem === root.chatPage && root.pageStack.depth > 1) {
+        if (root.openChat === 0) {
+            root.choosingBeside = false;
+        }
+        if (root.openChat === 0 && !root.wideScreen && root.activeChat !== null && root.pageStack.lastItem === root.activeChat && root.pageStack.depth > 1) {
             Qt.callLater(root.backToList);
         }
     }
 
     function backToList(): void {
-        if (App.timeline.conversationId === 0 && root.chatPage !== null && root.pageStack.lastItem === root.chatPage) {
+        if (root.activeTimeline.conversationId === 0 && root.activeChat !== null && root.pageStack.lastItem === root.activeChat) {
             root.popAfter(listPage);
         }
     }
@@ -963,6 +1394,42 @@ Kirigami.ApplicationWindow {
     }
 
     // Backends connect after the first frame (§8.2 step 4).
+    // The chats of the last run reopen after the first frame of the list (the start budget stays the
+    // list's: never before it), once. `App.restoreChats` answers false while the list is not known yet; after
+    // 3 s (30 asks) it takes what is there. A start that opened a chat of its own restores nothing.
+    Timer {
+        interval: 100
+        repeat: true
+        running: root.framed && root.started && App.hasAccounts && listPage.rowsShown && !root.restoreAsked
+        onTriggered: {
+            if (root.chatOpenedEarly || root.pendingConversation > 0) {
+                root.restoreAsked = true;
+                App.restoreSkipped();
+            } else if (root.restoreStep()) {
+                root.restoreAsked = true;
+            }
+        }
+    }
+
+    // One ask of the restore; true when it is over. A split the restore made (not one a page made) ends with
+    // the left chat active.
+    function restoreStep(): bool {
+        const wasSplit = App.split;
+        if (!App.restoreChats(root.restoreTries++ >= 30)) {
+            return false;
+        }
+        if (App.split && !wasSplit) {
+            // Both chats reopened: the left one ends active. The split's own start puts the keyboard in the
+            // active pane a moment later (`onSplitChanged`) and a focus that lands in the right chat
+            // would activate it, so the left chat takes it back after that.
+            Qt.callLater(() => {
+                App.activatePane(0);
+                root.chatPage?.composer.focusInput();
+            });
+        }
+        return true;
+    }
+
     Connections {
         id: firstFrame
         target: root
@@ -1306,14 +1773,56 @@ Kirigami.ApplicationWindow {
     // The progress of a running export and its Cancel (Export Selected): the window's own
     // footer, so a chat switch neither hides it nor lets another chat's bar cancel it. Shown
     // only while `App.exportBusy`.
-    footer: ExportStrip {
-        id: exportStrip
+    footer: ColumnLayout {
+        spacing: 0
+
+        ExportStrip {
+            id: exportStrip
+
+            Layout.fillWidth: true
+        }
+        // The progress of a forward that downloads its files first (forward line F6).
+        ForwardStrip {
+            id: forwardStrip
+
+            Layout.fillWidth: true
+        }
     }
 
     // Save As… and Save All… (F3b): the dialog is made on first use, from the file that
     // `App.saveDialogSource()` names (empty: the built-in one), so the dialogs module is not loaded
     // by the start. One attachment asks Rust for the name it is offered under (`App.askSave`), then
     // the dialog starts there; several ask for a folder.
+    // The "As picture" look of a forward draws here, outside the visible area (forward line F7).
+    ForwardPicture {
+        id: forwardPicture
+    }
+    // The picture look's item (tests).
+    readonly property alias forwardPictureItem: forwardPicture
+
+    // S5: the one carrier of messages dragged from one chat of a split to the other (the timelines start it,
+    // the chat pages' drop areas take it). Made with the window's first split (`syncSplit` sets `dragCarrier`) and
+    // kept after it, so a drag that runs while the split ends keeps its item; a window that never splits makes none.
+    property bool dragCarrier: false
+    Loader {
+        id: messageDragLoader
+
+        active: root.dragCarrier
+        z: 1000
+        sourceComponent: MessageDragProxy {}
+    }
+    readonly property MessageDragProxy messageDragItem: messageDragLoader.item as MessageDragProxy
+    Binding {
+        target: TimelineActions
+        property: "messageDrag"
+        value: messageDragLoader.item
+    }
+
+    // A chat could not take messages dropped on it: says so, by its name.
+    function forwardRefused(count: int, chat: string): void {
+        root.notify(count === 1 ? L10n.i18nc("@info:status a dragged message was dropped on the other chat, %1 its name", "This message cannot be forwarded to %1.", chat) : L10n.i18nc("@info:status dragged messages were dropped on the other chat, %1 its name", "These messages cannot be forwarded to %1.", chat), "", null);
+    }
+
     Loader {
         id: saveDialogLoader
         objectName: "saveDialogLoader"
@@ -1371,6 +1880,77 @@ Kirigami.ApplicationWindow {
     // with no answer drops the export's plan.
     property var exportSaving: null
     property bool exportSaved: false
+    // The forward dialog, loaded by URL the first time a plan comes and kept (one instance): a plan that comes while
+    // it stands renews its lines, else it opens (forward line F6).
+    property var forwardDialog: null
+    // The timeline the forward dialog's messages came from (the active pane's when it opened).
+    property TimelineModel forwardFrom: null
+    // The job whose files are gone, while its question stands.
+    property real forwardAsked: 0
+    function openForwardDialog(json: string): void {
+        if (root.forwardDialog !== null && root.forwardDialog.opened) {
+            root.forwardDialog.update(json);
+            return;
+        }
+        if (root.forwardDialog === null) {
+            const component = Qt.createComponent(Qt.resolvedUrl("dialogs/ForwardDialog.qml"));
+            if (component.status !== Component.Ready) {
+                console.error("ForwardDialog: " + component.errorString());
+                App.forwardAbandon();
+                return;
+            }
+            root.forwardDialog = component.createObject(root);
+            root.forwardDialog.forwarded.connect(() => {
+                // A forward that goes ends the selection it was made from.
+                if (root.forwardDialog.fromSelection && root.forwardFrom !== null) {
+                    root.forwardFrom.selectClear();
+                }
+            });
+        }
+        if (root.forwardDialog !== null) {
+            // The selection is the active pane's (split view): the one `App.forwardOpen` took the messages from.
+            root.forwardFrom = root.activeTimeline;
+            root.forwardDialog.fromSelection = root.activeTimeline.selecting;
+            root.forwardDialog.show(json);
+        }
+    }
+
+    // "Some files are no longer available. Send without them?" (a job whose files the network no longer has).
+    Kirigami.PromptDialog {
+        id: forwardAskDialog
+
+        objectName: "forwardAskDialog"
+        property bool answered: false
+
+        title: L10n.i18nc("@title:dialog", "Files Not Available")
+        subtitle: L10n.i18nc("@info", "Some files are no longer available. Send without them?")
+        standardButtons: Kirigami.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action {
+                objectName: "forwardAskSend"
+                text: L10n.i18nc("@action:button", "Send Without Them")
+                icon.name: "mail-forward"
+                onTriggered: {
+                    forwardAskDialog.answered = true;
+                    App.forwardWithout(root.forwardAsked, true);
+                    forwardAskDialog.close();
+                }
+            },
+            Kirigami.Action {
+                objectName: "forwardAskCancel"
+                text: L10n.i18nc("@action:button", "Cancel")
+                icon.name: "dialog-cancel"
+                onTriggered: forwardAskDialog.close()
+            }
+        ]
+        // Any close without "Send Without Them" ends the job.
+        onClosed: {
+            if (!forwardAskDialog.answered) {
+                App.forwardWithout(root.forwardAsked, false);
+            }
+        }
+    }
+
     // The export dialog, loaded by URL the first time a plan comes and kept (one instance).
     property var exportDialog: null
     function openExportDialog(json: string): void {
@@ -1494,6 +2074,26 @@ Kirigami.ApplicationWindow {
                 });
             }
         }
+        // Forward…: the plan is here, the dialog opens or renews its lines.
+        function onForwardDialogReady(json: string): void {
+            root.openForwardDialog(json);
+        }
+        function onForwardAsk(request: real, count: int): void {
+            root.forwardAsked = request;
+            forwardAskDialog.answered = false;
+            forwardAskDialog.open();
+        }
+        // The picture look: the rows are in `App.forwardRows`, the item outside the window draws and cuts them.
+        function onForwardRender(request: real, group: bool): void {
+            forwardPicture.start(request, group);
+        }
+        function onForwardRenderStopped(request: real): void {
+            forwardPicture.stop(request);
+        }
+        // A forward ended or was refused: the usual passive notice.
+        function onForwardNotice(text: string): void {
+            root.notify(text, "", null);
+        }
         // Export Selected: the plan is here, the dialog opens (loaded by URL on first use).
         function onExportDialogReady(json: string): void {
             root.openExportDialog(json);
@@ -1525,7 +2125,7 @@ Kirigami.ApplicationWindow {
                 root.notify(text, "", null);
             }
             if (selectionEnds) {
-                App.timeline.selectClear();
+                root.activeTimeline.selectClear();
             }
         }
         // The folder is here: the folder dialog of "Save All…" starts there.
@@ -1936,14 +2536,14 @@ Kirigami.ApplicationWindow {
             undoTimer.stop();
         }
         App.undoArchive(standing.conv, standing.wasPinned);
-        if (standing.reopen && App.timeline.conversationId === 0) {
+        if (standing.reopen && root.activeTimeline.conversationId === 0) {
             root.openingChat(standing.conv, null);
         }
     }
 
     // The ONE path of the menu's Archive and the key: the notice comes when the row says so.
     function archiveChat(conv: real): void {
-        root.archivedOpen = conv === App.timeline.conversationId ? conv : 0;
+        root.archivedOpen = conv === root.activeTimeline.conversationId ? conv : 0;
         App.setArchived(conv, true);
     }
 
@@ -1978,11 +2578,11 @@ Kirigami.ApplicationWindow {
     // Ctrl+Shift+A (`archive`) and Ctrl+Shift+U on the open chat, as Signal Desktop's: nothing
     // when it already is so. With the sync switch off the greyed line's words are the answer.
     function keyArchive(archive: bool): void {
-        const conv = App.timeline.conversationId;
+        const conv = root.activeTimeline.conversationId;
         if (conv === 0) {
             return;
         }
-        const offer = App.timeline.chatOffer;
+        const offer = root.activeTimeline.chatOffer;
         if (!offer.shown) {
             return;
         }
@@ -2002,8 +2602,8 @@ Kirigami.ApplicationWindow {
 
     // The fixture pages of the message actions: each opens a chat (`App` does that) and, for
     // `setupPages`, one of its popups or composer modes once the rows are there.
-    readonly property list<string> actionPages: ["quotes", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "viewerzoom", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchchat", "emojipicker", "emojisearch", "hoverpins", "highlight", "model3d", "model3dviewer", "select", "exportdialog", "exportdone"]
-    readonly property list<string> setupPages: ["menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "viewerzoom", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "appearance", "filters", "filteredit", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media", "rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchresults", "searchchat", "searchindexing", "emojipicker", "emojisearch", "hoverpins", "highlight", "regexsearch", "model3d", "model3dviewer", "select", "exportdialog", "exportdone"]
+    readonly property list<string> actionPages: ["quotes", "split", "splitnarrow", "splitpick", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "placeholders", "readmore", "calls", "unavailable", "album", "albumviewer", "viewerzoom", "revisions", "timercustom", "clearchat", "mediamenu", "deleteattachment", "wafailed", "uploading", "uploadfile", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchchat", "emojipicker", "emojisearch", "hoverpins", "highlight", "model3d", "model3dviewer", "select", "exportdialog", "exportdone", "forward", "forwardcard"]
+    readonly property list<string> setupPages: ["split", "splitnarrow", "splitpick", "menu", "react", "reactions", "edit", "reply", "delete", "timer", "album", "albumviewer", "viewerzoom", "revisions", "files", "originals", "timercustom", "clearchat", "mediamenu", "deleteattachment", "folder", "folderfiles", "folderzip", "expiry", "networks", "appearance", "filters", "filteredit", "waqr", "waphone", "wacode", "thqr", "themoji", "tgqr", "tgcode", "tgpassword", "wahistory", "walost", "transferwait", "transferdownload", "transferread", "transferupdate", "transferbanner", "transferfailed", "transferask", "archive", "person", "group", "chatmedia", "safety", "safetychanged", "share", "timerpending", "save", "location", "locationmany", "locationnever", "accounts", "accountsdrawer", "media", "rowmenu", "rowmenuoff", "rowmenumuted", "mutemenu", "muteuntil", "chatmenu", "chatmenuoff", "groupadmin", "searchresults", "searchchat", "searchindexing", "emojipicker", "emojisearch", "hoverpins", "highlight", "regexsearch", "model3d", "model3dviewer", "select", "exportdialog", "exportdone", "forward", "forwardcard"]
     // The fixture pages of blended chats: no chat opens, the list stands with its accounts.
     readonly property list<string> accountsPages: ["accounts", "accountsdrawer"]
     // The fixture pages of the chat list's own menus (A10d): no chat opens; `rowMenuPageReady` opens the
@@ -2014,6 +2614,9 @@ Kirigami.ApplicationWindow {
     // The `select` page picked its rows.
     property bool selectPicked: false
     property bool exportShown: false
+    property bool forwardShown: false
+    property bool forwardTicked: false
+    property bool forwardStaged: false
     // The page `chatmenuoff` asked for the switch off (once).
     property bool chatMenuOffAsked: false
     property real rowMenuChat: 0
@@ -2536,6 +3139,28 @@ Kirigami.ApplicationWindow {
             case "hoverpins":
                 done = view.toolbarFor(App.findMessage("photo"));
                 break;
+            case "split":
+            case "splitnarrow":
+                // Both panes show their rows (the second page is made by `syncSplit` with the split; a narrow
+                // window shows the second alone); the keyboard is in the second one, which stays the active pane.
+                if (root.sideChatPage !== null && App.activePane !== 1 && root.pageSetupSplitTries++ < 3) {
+                    root.sideChatPage.composer.focusInput();
+                }
+                done = App.activePane === 1 && App.split && App.sideTimeline.count > 0 && !App.sideTimeline.loading && root.sideChatPage !== null && root.inStack(root.sideChatPage) && root.sideChatPage.timeline.rowList.count > 0 && (!root.bothShown || chatPage.timeline.rowList.count > 0);
+                break;
+            case "splitpick":
+                // The `chat` page's chat open and the chooser of "Open Chat Beside" started, once the
+                // chat's rows are there (a narrow window then shows the list with the banner).
+                if (!root.pageSetupPickStarted) {
+                    if (chatPage.timeline.rowList.count > 0 && !App.timeline.loading) {
+                        root.pageSetupPickStarted = true;
+                        root.startChoosing();
+                    }
+                    done = false;
+                } else {
+                    done = root.choosingBeside && listPage.chooseBanner !== null && listPage.chooseBanner.visible && (!root.wideScreen || chatPage.timeline.rowList.count > 0);
+                }
+                break;
             case "highlight":
                 // The four filters are saved and listed; the rows were marked in the same change
                 // that listed them (the viewmodel re-reads the timeline with it).
@@ -2704,6 +3329,7 @@ Kirigami.ApplicationWindow {
                 break;
             case "select":
             case "exportdialog":
+            case "forward":
                 // The media chat in the selection mode: the newest picture, file, text and notice
                 // are picked (what the chat has), the bar stands in the composer's place.
                 if (!root.selectPicked) {
@@ -2744,6 +3370,37 @@ Kirigami.ApplicationWindow {
                         root.selectPicked = true;
                     }
                     done = false;
+                } else if (App.startPage === "forward") {
+                    // The forward dialog over the selection (the real plan of the core): the selection goes in, two
+                    // chats are ticked, the first of the source's account and the first of another one (the Look
+                    // shows for it), and the page waits for the answer to the newest ticks.
+                    if (App.timeline.selecting && App.timeline.selectedCount >= 2) {
+                        if (!root.forwardShown) {
+                            root.forwardShown = true;
+                            App.forwardOpen(App.timeline.selectedIds());
+                        }
+                        const dialog = root.forwardDialog;
+                        if (dialog !== null && dialog.opened && dialog.view.title !== "" && App.forwardTargets.count >= 2 && !root.forwardTicked) {
+                            let own = 0;
+                            let other = 0;
+                            for (let i = 0; i < App.forwardTargets.count; ++i) {
+                                const id = App.forwardTargets.conversationAt(i);
+                                if (App.forwardTargets.isNative(id)) {
+                                    own = own || id;
+                                } else {
+                                    other = other || id;
+                                }
+                            }
+                            if (own > 0 && other > 0) {
+                                root.forwardTicked = true;
+                                dialog.toggle(own);
+                                dialog.toggle(other);
+                            }
+                        }
+                        done = dialog !== null && root.forwardTicked && !dialog.planPending && dialog.view.lookShown === true;
+                    } else {
+                        done = false;
+                    }
                 } else if (App.startPage === "exportdialog") {
                     // The export dialog over the selection. The media chat holds no video, no
                     // disappearing and no view-once message, so the numbers are made up
@@ -2783,6 +3440,45 @@ Kirigami.ApplicationWindow {
                     }
                 } else {
                     done = App.timeline.selecting && App.timeline.selectedCount >= 2;
+                }
+                break;
+            case "forwardcard":
+                // A forward staged into a chat of ANOTHER account: the first two messages of the media chat, staged into
+                // the first chat of the list whose account chip differs from the media chat's, which then opens (the
+                // card with its Look, the text area, Send on).
+                if (!root.forwardStaged) {
+                    const list = view.rowList;
+                    const ids = [];
+                    for (let i = 0; i < list.count && ids.length < 2; ++i) {
+                        const id = (list.itemAtIndex(i) as MessageDelegate)?.messageId ?? 0;
+                        if (id > 0) {
+                            ids.push(String(id));
+                        }
+                    }
+                    const rows = listPage.conversations;
+                    const source = App.timeline.conversationId;
+                    let chip = "";
+                    for (let i = 0; i < rows.count; ++i) {
+                        const row = rows.itemAtIndex(i) as ConversationDelegate;
+                        if (row !== null && row.conversationId === source) {
+                            chip = row.accountBadge;
+                        }
+                    }
+                    let target = 0;
+                    for (let i = 0; i < rows.count && chip !== "" && target === 0; ++i) {
+                        const row = rows.itemAtIndex(i) as ConversationDelegate;
+                        if (row !== null && !row.isSelf && row.accountBadge !== "" && row.accountBadge !== chip) {
+                            target = row.conversationId;
+                        }
+                    }
+                    if (ids.length === 2 && target !== 0 && App.composer.stageForward(target, source, ids)) {
+                        root.forwardStaged = true;
+                        root.openConversation(target);
+                    }
+                    done = false;
+                } else {
+                    const card = chatPage.composer.forwardCard;
+                    done = App.timeline.conversationId !== 0 && card.standing && card.staged.native === false && card.lookBox.visible;
                 }
                 break;
             case "exportdone":
@@ -2866,7 +3562,7 @@ Kirigami.ApplicationWindow {
                 if (App.timeline.chatOffer.shown !== true || App.timeline.chatOffer.on !== true) {
                     done = false;
                 } else {
-                    done = root.openChatMenu(chatPage);
+                    done = root.openChatMenu(root.activeChat);
                 }
                 break;
             case "chatmenuoff":
@@ -2881,7 +3577,7 @@ Kirigami.ApplicationWindow {
                     }
                     done = false;
                 } else {
-                    done = root.openChatMenu(chatPage);
+                    done = root.openChatMenu(root.activeChat);
                 }
                 break;
             case "timerpending":
@@ -3216,7 +3912,7 @@ Kirigami.ApplicationWindow {
             if (loading !== "") {
                 holds.push(loading);
             }
-            const downloading = App.timeline.downloadingAttachments();
+            const downloading = App.timeline.downloadingAttachments() + (App.split ? App.sideTimeline.downloadingAttachments() : 0);
             if (downloading > 0) {
                 holds.push("downloading " + downloading);
             }

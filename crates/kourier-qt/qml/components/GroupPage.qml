@@ -17,6 +17,7 @@ import app.kourier
 // plain text.
 Item {
     id: root
+    required property TimelineModel chatModel
 
     // A button of the invite link's part; Return and Enter press it as Space does.
     component InviteButton: QQC2.Button {
@@ -206,6 +207,7 @@ Item {
             // ---- Disappearing Messages: the group's timer ----
             TimerPart {
                 id: timerPart
+                chatModel: root.chatModel
                 objectName: "groupTimer"
                 visible: root.loaded
                 x: Kirigami.Units.largeSpacing

@@ -86,6 +86,7 @@ fn text(conv: &ConvKey, body: &str) -> OutgoingRequest {
             body: Body::text(body),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     )
 }
@@ -567,6 +568,7 @@ async fn one_to_one_modifiers_reach_the_contact_and_the_phone() {
                 }),
             }),
             expiry: None,
+            forward: None,
         },
     );
     assert_sent(&core.transmit(reply.clone()).await, 1);
@@ -1394,6 +1396,7 @@ async fn a_one_to_one_timer_changes_both_ways() {
             body: Body::text("this will go"),
             reply_to: None,
             expiry: Some(Duration::from_secs(2)),
+            forward: None,
         },
     );
     assert_sent(&core.transmit(message.clone()).await, 1);
@@ -1545,6 +1548,7 @@ async fn a_one_to_one_timer_changes_both_ways() {
             body: Body::text("three seconds"),
             reply_to: None,
             expiry: Some(Duration::from_secs(3)),
+            forward: None,
         },
     );
     assert_sent(&core.transmit(next).await, 1);

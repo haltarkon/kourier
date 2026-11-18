@@ -203,6 +203,7 @@ mod tests {
             view_once: false,
             history: false,
             mentions_me: false,
+            forwarded: None,
             outbox: None,
             actions: Default::default(),
         }

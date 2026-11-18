@@ -588,6 +588,7 @@ pub(crate) fn direct_features(
         invite_link_on: false,
         // Signal has no restriction on saving a chat.
         export: ChatExport::Allowed,
+        no_forward: false,
     }
 }
 

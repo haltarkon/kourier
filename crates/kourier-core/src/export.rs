@@ -190,7 +190,8 @@ pub(crate) fn plan(
     let mut messages = Vec::new();
     // A chat that may not be exported plans no message.
     if chat.is_ok() {
-        let page = query::messages_by_ids(conn, conv, ids, now, registered, uploading, paused)?;
+        let page =
+            query::messages_by_ids(conn, conv, ids, now, registered, uploading, paused, None)?;
         for mut row in page.rows {
             let Some(facts) = row_facts(conn, row.id.0)? else {
                 continue;

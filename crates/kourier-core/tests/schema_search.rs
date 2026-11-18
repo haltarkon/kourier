@@ -123,7 +123,13 @@ fn the_migration_adds_the_log_and_the_epoch_and_touches_no_row() {
             kourier_core::MIGRATIONS.latest()
         )
     );
-    assert_eq!(messages(&conn), rows, "no row of messages is touched");
+    // (Later steps add NULL columns to `messages`, `forwarded` of 0028 the last: they are cut off here, so
+    // the comparison is of the columns the rows had before the step.)
+    let after: Vec<String> = messages(&conn)
+        .into_iter()
+        .map(|row| row.strip_suffix("|Null").unwrap_or(&row).to_owned())
+        .collect();
+    assert_eq!(after, rows, "no row of messages is touched");
     let epoch = setting(&conn, "epoch").expect("the epoch is written");
     assert!(is_epoch(&epoch), "an epoch of 16 random bytes");
     assert_eq!(search::epoch(&conn).expect("epoch"), epoch);

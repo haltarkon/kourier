@@ -4,7 +4,7 @@
 //! of whatsapp-rust (`wacore::store::traits::Backend`) over one SQLCipher file per account,
 //! `accounts/<uuid>/backend.db`, on a dedicated writer thread. Nothing in the crate talks to WhatsApp
 //! by itself: a client is built only when an account's actor first connects or starts a login, and
-//! `kourier-app` registers the network in a debug build only, while the user has it on (W2b).
+//! `kourier-app` registers the network while the user has it on (W2b; every build since 2026-11-18).
 //!
 //! whatsapp-rust and wacore types stay inside this crate (CLAUDE.md rule: no protocol types in a
 //! public item outside a backend crate). The one public type that implements their traits is

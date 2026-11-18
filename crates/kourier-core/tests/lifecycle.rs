@@ -1885,6 +1885,7 @@ async fn query_tokens_typing_and_notification_focus() {
         .send(UiCommand::SetPresence {
             focused: true,
             visible: Some(alice_conv),
+            beside: None,
         })
         .expect("send");
     let clock = env.clock.clone();
@@ -1928,6 +1929,101 @@ async fn query_tokens_typing_and_notification_focus() {
     );
     env.wait_finished(account).await;
     env.stop().await;
+}
+
+/// Split view: a chat shown BESIDE the open one is quiet while the window has the focus, and
+/// announces as usual when it has not (the notification rule only; presence is the open chat's).
+/// A third chat, shown nowhere, is the barrier: it always notifies, and comes last.
+async fn notified_with_beside(
+    focused: bool,
+) -> (
+    Vec<kourier_model::ConversationId>,
+    kourier_model::ConversationId,
+) {
+    let me = uid("aci:00000000-0000-4000-8000-0000000000aa");
+    let alice = uid("aci:00000000-0000-4000-8000-0000000a11ce");
+    let bob = uid("aci:00000000-0000-4000-8000-000000000b0b");
+    let carol = uid("aci:00000000-0000-4000-8000-0000000ca201");
+    let keys: Vec<_> = [&alice, &bob, &carol]
+        .iter()
+        .map(|u| kourier_model::ConvKey::Direct((*u).clone()))
+        .collect();
+    let t = |n: i64| scripts::T0 + n * 1000;
+    let mut script = Script::new("beside", vec![me]).deliver(
+        keys.iter()
+            .map(|k| {
+                BackendEvent::ConversationUpsert(kourier_model::ConversationPatch::new(k.clone()))
+            })
+            .collect(),
+    );
+    script = script
+        .step(Step::WaitAcked)
+        .step(Step::Sleep(Duration::from_secs(10)));
+    for (n, (k, u)) in keys.iter().zip([&alice, &bob, &carol]).enumerate() {
+        let n = n as i64 + 1;
+        script = script.deliver(vec![BackendEvent::Message(scripts::remote(
+            k,
+            u,
+            &t(n).to_string(),
+            t(n),
+            "hello",
+        ))]);
+    }
+    let mut env = Env::new(Flavor::SignalLike, script).await;
+    env.handle.send(UiCommand::UiReady).expect("send");
+    let _account = add_linked(&mut env).await;
+    let env_ref = &env;
+    eventually("three conversations", WAIT, || async move {
+        env_ref.conversations().await.len() == 3
+    })
+    .await;
+    let convs = env.conversations().await;
+    let of = |u: &kourier_model::UserId| {
+        convs
+            .iter()
+            .find(|c| c.peer.as_ref() == Some(u))
+            .expect("conversation")
+            .id
+    };
+    let (alice_conv, bob_conv, carol_conv) = (of(&alice), of(&bob), of(&carol));
+    env.handle
+        .send(UiCommand::SetPresence {
+            focused,
+            visible: Some(alice_conv),
+            beside: Some(bob_conv),
+        })
+        .expect("send");
+    let clock = env.clock.clone();
+    eventually("script sleeping", WAIT, || {
+        let c = clock.clone();
+        async move { c.sleepers() > 0 }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    env.clock.advance_to_next();
+    let mut notified = Vec::new();
+    env.event("carol's message notified", |e| match e {
+        UiEvent::Notify(n) => {
+            notified.push(n.conv);
+            (n.conv == carol_conv).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+    env.stop().await;
+    (notified, carol_conv)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chat_beside_the_open_one_is_quiet_only_while_focused() {
+    let (focused, carol) = notified_with_beside(true).await;
+    assert_eq!(focused, [carol], "both shown chats are quiet while focused");
+    let (away, _) = notified_with_beside(false).await;
+    assert_eq!(
+        away.len(),
+        3,
+        "a window without focus announces all: {away:?}"
+    );
 }
 
 /// Slow acks: a backend that waits before forwarding never loses or reorders events; its

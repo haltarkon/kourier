@@ -475,6 +475,33 @@ MainWindow {
                 if (combo.description !== "Such files stay in the list; everything else is sent.") return win.fail("the never sentence: " + combo.description);
                 win.quiet += 1;
                 if (win.quiet < 10) return;
+                win.quiet = 0;
+                win.next("forward");
+                return;
+            }
+            case "forward": {
+                // "Forward to another account as" (Chats): the header look by default, chosen with the keyboard.
+                const combo = win.find(win.settingsPage, i => i.objectName === "forwardLook");
+                if (!combo) return win.later("the forward look combo");
+                if (combo.text !== "Forward to another account as") return win.fail("the label: " + combo.text);
+                if (combo.count !== 4 || combo.currentIndex !== 1 || App.settings.forwardLook !== 1) return win.fail("the header look by default: " + combo.currentIndex + " of " + combo.count);
+                if (combo.currentText !== "Forwarded header") return win.fail("the shown choice: " + combo.currentText);
+                combo.clicked();
+                win.next("forward open");
+                return;
+            }
+            case "forward open":
+                win.quiet += 1;
+                if (win.quiet < 5) return;
+                win.ev.keyClick(Qt.Key_Down, Qt.NoModifier, -1);
+                win.ev.keyClick(Qt.Key_Return, Qt.NoModifier, -1);
+                win.next("forward quoted");
+                return;
+            case "forward quoted": {
+                const combo = win.find(win.settingsPage, i => i.objectName === "forwardLook");
+                if (App.settings.forwardLook !== 2 || combo.currentIndex !== 2) return win.later("the choice is header + quoted body (" + App.settings.forwardLook + ")");
+                win.quiet += 1;
+                if (win.quiet < 10) return;
                 Qt.exit(0);
                 return;
             }
@@ -1022,6 +1049,11 @@ fn first_session() {
     assert_eq!(
         handle.desktop().prefs().location_files,
         kourier_app::LocationFiles::Never
+    );
+    // ... and "Header + quoted body" for a forward to another account.
+    assert_eq!(
+        handle.desktop().prefs().forward_look,
+        kourier_app::ForwardLookPref::Quoted
     );
     // The core holds what the page chose last, and the erased message is gone from it.
     assert_eq!(policy(&handle), ExpiryPolicy::KeepUntilConfirmed);

@@ -6,6 +6,7 @@ pub mod attachments;
 pub mod conversations;
 pub mod emoji;
 pub mod filters;
+pub mod forward;
 pub mod media;
 pub mod members;
 pub mod search;

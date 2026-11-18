@@ -41,6 +41,7 @@ pub(crate) fn file_of(req: &OutgoingRequest) -> Option<(&Attachment, Option<&Tex
         },
         reply_to: None,
         expiry: None,
+        forward: None,
     } = &req.kind
     else {
         return None;
@@ -319,6 +320,7 @@ mod tests {
                 },
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
             only: None,
             is_recipient_update: false,

@@ -121,6 +121,8 @@ impl std::fmt::Debug for CoreConfig {
 pub(crate) struct Presence {
     pub focused: bool,
     pub visible: Option<(AccountId, ConversationId, ConvKey)>,
+    /// The split view's second shown chat: the notification rule only.
+    pub beside: Option<ConversationId>,
 }
 
 /// State shared by the core task and the supervisors.
@@ -411,7 +413,8 @@ impl Shared {
                 && presence
                     .visible
                     .as_ref()
-                    .is_some_and(|(_, c, _)| *c == n.conv);
+                    .is_some_and(|(_, c, _)| *c == n.conv)
+                || (presence.focused && presence.beside == Some(n.conv));
             if !focused_here {
                 self.emit(UiEvent::Notify(crate::facade::Notification {
                     account,
@@ -1033,6 +1036,12 @@ enum Subject {
     Attachment(kourier_model::AttachmentId),
 }
 
+mod forward;
+
+pub(crate) fn inject_forward_fault(conv: Option<ConversationId>) {
+    forward::inject_fault_after_first_part(conv);
+}
+
 /// The core task: serves commands and queries.
 async fn run_core(
     sh: Arc<Shared>,
@@ -1121,6 +1130,24 @@ async fn run_core(
     }
 }
 
+/// What a page of `conv` needs of its account's network, from one read: whether the network
+/// is registered at this start (a paused account, its network turned off, offers nothing that
+/// needs it; no such chat counts as registered) and its forward rules
+/// (`NetworkDescriptor::forwards`, `None` where it marks no forward or is not registered).
+fn page_network(
+    sh: &Arc<Shared>,
+    c: &kourier_db::rusqlite::Connection,
+    conv: ConversationId,
+) -> Result<(bool, Option<kourier_model::ForwardRules>)> {
+    Ok(match outbox::network_of(c, conv)? {
+        None => (true, None),
+        Some((_, kind)) => match sh.networks.get(kind) {
+            None => (false, None),
+            Some(n) => (true, n.descriptor().forwards),
+        },
+    })
+}
+
 /// The answer to [`Query::Person`]: the person, with what their network offers for them.
 async fn person_answer(sh: &Arc<Shared>, account: AccountId, user: UserId) -> Result<QueryData> {
     let (detail, kind) = sh
@@ -1203,10 +1230,9 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             let (page, media) = sh
                 .store
                 .read(move |c| {
-                    // A paused account (its network turned off) offers nothing that needs it.
-                    let registered = outbox::network_of(c, q.conv)?
-                        .is_none_or(|(_, kind)| sh2.networks.get(kind).is_some());
-                    let page = query::timeline(c, &q, now, registered, &uploading, paused)?;
+                    let (registered, forwards) = page_network(&sh2, c, q.conv)?;
+                    let page =
+                        query::timeline(c, &q, now, registered, &uploading, paused, forwards)?;
                     let media = query::page_media(c, &page)?;
                     Ok((page, media))
                 })
@@ -1236,10 +1262,10 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
             let (page, media) = sh
                 .store
                 .read(move |c| {
-                    let registered = outbox::network_of(c, conv)?
-                        .is_none_or(|(_, kind)| sh2.networks.get(kind).is_some());
-                    let page =
-                        query::messages_by_ids(c, conv, &ids, now, registered, &uploading, paused)?;
+                    let (registered, forwards) = page_network(&sh2, c, conv)?;
+                    let page = query::messages_by_ids(
+                        c, conv, &ids, now, registered, &uploading, paused, forwards,
+                    )?;
                     let media = query::page_media(c, &page)?;
                     Ok((page, media))
                 })
@@ -1296,6 +1322,18 @@ async fn run_query(sh: &Arc<Shared>, q: Query) -> Result<QueryData> {
                 }
             }
             Ok(QueryData::ExportPlan(Box::new(plan)))
+        }
+        Query::ForwardPlan {
+            source,
+            messages,
+            targets,
+        } => {
+            let read = forward::read_plan(sh, source, messages, targets, false).await?;
+            for m in read.media {
+                sh.register_media(m);
+            }
+            let plan = read.plan;
+            Ok(QueryData::ForwardPlan(Box::new(plan)))
         }
         Query::Conversation(id) => sh
             .store
@@ -1870,7 +1908,11 @@ async fn ui_command(
                 fail(Some(account), "RestartAccount", e);
             }
         }
-        UiCommand::SetPresence { focused, visible } => {
+        UiCommand::SetPresence {
+            focused,
+            visible,
+            beside,
+        } => {
             let resolved = match visible {
                 Some(conv) => sh
                     .store
@@ -1884,6 +1926,7 @@ async fn ui_command(
             sh.presence.send_replace(Presence {
                 focused,
                 visible: resolved,
+                beside,
             });
         }
         UiCommand::MarkRead { conv } => {
@@ -1970,6 +2013,32 @@ async fn ui_command(
                 }
             });
         }
+        UiCommand::Forward {
+            request,
+            source,
+            messages,
+            targets,
+            look,
+            headers,
+            comment,
+            pictures,
+            without,
+        } => forward::start(
+            sh,
+            queues,
+            senders(slots),
+            forward::Ask {
+                request,
+                source,
+                messages,
+                targets,
+                look,
+                headers,
+                comment,
+                pictures: pictures.into_inner(),
+                without,
+            },
+        ),
         UiCommand::SendContact {
             conv,
             account,

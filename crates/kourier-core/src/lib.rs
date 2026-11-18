@@ -86,6 +86,7 @@ mod dispatch;
 mod expiry;
 mod export;
 mod filter_store;
+mod forward;
 mod ingest;
 mod local;
 mod media;

@@ -174,6 +174,7 @@ pub(crate) async fn build<T: SignalTransport>(
             body,
             reply_to,
             expiry,
+            ..
         } => {
             let prepared = uploader.prepare(body).await?;
             let quote = match reply_to {

@@ -5,11 +5,11 @@ the maintainer, 2026-10-08: "At first we should publish only in archives on gith
 Flathub, distribution packages and the rest come after it.
 
 **Nothing in this repository pushes, uploads or publishes by itself.** `cargo xtask dist` writes
-five files on this machine's disk and stops. Every command below that leaves the machine
+six files on this machine's disk and stops. Every command below that leaves the machine
 (`git push`, `gh release create`) is typed by the maintainer, in a session of his own, when he
 decides to. A tool or an agent that is not told to do it does not run them.
 
-**Nothing signs the archives.** None of the archives (binary, source, names) nor the two sums files carry a signature; the
+**Nothing signs the archives.** None of the archives (binary, source, names), the AppImage nor the two sums files carry a signature; the
 only signature in the process is the one on the git tag (step 4). `SHA256SUMS` tells a download
 from the file that was uploaded, not who made it. A detached signature (`gpg --detach-sign`) is
 the maintainer's decision; the tool makes none.
@@ -19,6 +19,24 @@ machine's Qt 6 and KDE Frameworks 6. It uses Qt's private API, which ties it to 
 version (`README.txt` in the archive says which, and the KDE Frameworks version it was built with).
 The build is **not** reproducible: two builds of one commit give two binaries. What is repeatable
 is the packing: the same stage gives the same archive, byte for byte.
+
+**The AppImage brings its libraries.** For every other system `cargo xtask dist` also makes
+`kourier-<version>-linux-<arch>.AppImage`: one file with the same shipped binary and the Qt, KDE
+Frameworks, FFmpeg and other libraries of the build machine that it needs (linuxdeploy collects
+them), a reviewed list of Qt plugins and the QML modules the program imports. The system must have
+a glibc at least as new as the build machine's (2.39 on Ubuntu 24.04: Ubuntu 24.04 and newer,
+Debian 13, Fedora 40 and newer, Arch, Manjaro, openSUSE Tumbleweed), its graphics drivers and GL
+libraries (`libGL`, `libEGL`, `libGLX`, `libOpenGL`: every desktop has them; on a minimal Debian or
+Ubuntu install `libopengl0`, on Fedora `libglvnd-opengl`), and FUSE
+to mount the file (without FUSE: `--appimage-extract-and-run`, or `APPIMAGE_EXTRACT_AND_RUN=1`). Its
+only platform theme is Qt's xdg-desktop-portal one: file dialogs and the colour scheme come from the
+system's portal, and no theme of a desktop is bundled. It carries no update information (no zsync
+file; that comes with the first public release, after the rename). What it bundles, from which
+package and under which licence, is in `usr/share/licenses/kourier/` inside it (`BUNDLED.txt` and the
+copyright file of each package). The tools are pinned by version and SHA-256 in
+`xtask/src/appimage.rs` (linuxdeploy, appimagetool and the type2 runtime, from their GitHub
+release pages): the first run downloads them into `target/appimage-tools/`, every run checks them.
+`--no-appimage` leaves the AppImage out of a development run; `--release` refuses it.
 
 **The source archive is the repository only.** The binary links libsignal and hundreds of other
 crates; their sources are fetched by cargo and are in neither archive. The AGPL-3.0 asks for the
@@ -43,9 +61,9 @@ shows absolute addresses, or a `RUST_BACKTRACE` stack, is read with the names fi
 release (the commands are in the archive's `README.txt`; a names file of another release gives
 wrong names silently in a backtrace, which is why its name carries the build-id).
 Packagers: a Flatpak built from source strips and writes its `.Debug` extension itself, from the
-unstripped profile build (never set `strip = "symbols"` in the profile); an AppImage recipe uses
-`names::split` (or `NO_STRIP=1` after the split) because linuxdeploy strips every ELF with a
-`strip` older than RELR; distro packagers' debuginfo tools work on the unstripped build as usual.
+unstripped profile build (never set `strip = "symbols"` in the profile); the AppImage gets the
+split binary and linuxdeploy runs with `NO_STRIP=1`, because it strips every ELF with a `strip`
+older than RELR; distro packagers' debuginfo tools work on the unstripped build as usual.
 
 ## What you need
 
@@ -53,7 +71,8 @@ unstripped profile build (never set `strip = "symbols"` in the profile); an AppI
 `objcopy`, `readelf` and `nm` (binutils, the names split and its checks), `cargo-about`
 (`cargo install cargo-about --locked`), `desktop-file-validate` (`desktop-file-utils`), `appstreamcli` (`appstream`), `reuse`, `pkg-config` (the KDE Frameworks
 version) and `zstd` (the search of the compressed Qt resources; without it the tool says they
-were not searched), the toolchain's documentation component (the Rust standard library's
+were not searched), `curl` and the network for the first AppImage (the pinned tools), `dpkg`
+(the package of each file the AppImage bundles), the toolchain's documentation component (the Rust standard library's
 licence files), and for the last two steps `gh` (GitHub's command line tool) and a signing key
 for git tags.
 
@@ -115,9 +134,9 @@ tree.
    so an old archive never stands beside a refusal. Then it refuses a tree with changes,
    writes `NOT-READY.txt` and stops while a finding is left, and builds the release binary
    into `target/dist-build` with every absolute path of this machine mapped away and with
-   `--no-default-features --features signal,whatsapp` (the Signal backend and the WhatsApp
-   backend, which a release build compiles in and does not register; no test network: the binary
-   has no `--fixture`). When the build is done it reads the commit and `git status` again and
+   `--no-default-features --features signal,whatsapp,threema` (the Signal backend; the WhatsApp
+   backend, which a release build registers while the user has it on and lists as off otherwise;
+   the Threema backend, on by default; no test network: the binary has no `--fixture`). When the build is done it reads the commit and `git status` again and
    fails if either moved, and writes a stamp beside the binary (commit, dirty flag, features,
    Qt, KDE Frameworks and rustc versions, checksum of the binary). It prints `objcopy
    --version`, splits the binary (a build with debug information is refused: a policy of the
@@ -132,14 +151,16 @@ tree.
    ```
    kourier-<version>-linux-<arch>.tar.gz        the installed tree (binary without its symbol
                                                 table), README.txt, licences
+   kourier-<version>-linux-<arch>.AppImage      the same binary with its libraries, one file
    kourier-<version>-linux-<arch>-names.tar.gz  bin/.debug/kourier-<build-id>.debug
    kourier-<version>-source.tar.gz              git archive of the commit
-   SHA256SUMS                                   over the binary and the source archive
+   SHA256SUMS                                   over the binary archive, the AppImage and
+                                                the source archive
    SHA256SUMS.names                             over the names archive
    ```
 
    Only a `--release` run that found nothing writes these bare names. Every other run
-   writes `…-unreleased.tar.gz` (a tree with changes: `…-dirty.tar.gz`), and the top
+   writes `…-unreleased.tar.gz` and `…-unreleased.AppImage` (a tree with changes: `…-dirty`), and the top
    directory inside each archive ends the same way; the grade goes last in the names
    archive's name (`…-names-unreleased.tar.gz`).
 
@@ -151,6 +172,7 @@ tree.
    ```bash
    mkdir -p /tmp/kourier-try && tar -xzf target/dist/kourier-*-linux-x86_64.tar.gz -C /tmp/kourier-try
    /tmp/kourier-try/kourier-*/bin/kourier --version
+   target/dist/kourier-*-linux-x86_64.AppImage --version
    (cd target/dist && sha256sum -c SHA256SUMS && sha256sum -c SHA256SUMS.names)
    ```
 
@@ -194,6 +216,7 @@ tree.
    gh release create v0.1.0 --draft --verify-tag --title "Kourier 0.1.0" \
        --notes-file release-notes.md \
        target/dist/kourier-0.1.0-linux-x86_64.tar.gz \
+       target/dist/kourier-0.1.0-linux-x86_64.AppImage \
        target/dist/kourier-0.1.0-source.tar.gz \
        target/dist/SHA256SUMS
    # only if the names archive is published too (the maintainer's call, see below):
@@ -212,8 +235,9 @@ tree.
    is not signed (see the top of this file): the tag is.
 
 6. **After publishing**, from a clean directory: download the files that were
-   attached (three, or five with the names archive and `SHA256SUMS.names`), run
-   `sha256sum -c SHA256SUMS` (and `sha256sum -c SHA256SUMS.names` beside the names archive), unpack the archive and run `bin/kourier --version`.
+   attached (four, or six with the names archive and `SHA256SUMS.names`), run
+   `sha256sum -c SHA256SUMS` (and `sha256sum -c SHA256SUMS.names` beside the names archive), unpack the archive and run `bin/kourier --version`,
+   then `chmod +x` the AppImage and run it with `--version`.
 
 ## What `cargo xtask dist` checks, and what it does not
 
@@ -221,7 +245,7 @@ tree.
 
 - the names are the bare ones, and they are the commit's: the tree had no changes, the commit
   and `git status` were the same at the end of the build as at its start, the binary's stamp
-  names that commit, a clean tree, the feature set `--no-default-features --features signal,whatsapp`
+  names that commit, a clean tree, the feature set `--no-default-features --features signal,whatsapp,threema`
   and the checksum of the build output (the packed binary is that output without its symbol
   table: the same build-id, and the CRC of the names file in its debuglink), and the source archive is
   `git archive <that commit hash>` (not `HEAD`) with modes 0644 and 0755 (it carries the commit
@@ -231,12 +255,11 @@ tree.
 - the binary is no measuring build (never `perf` or `dumpable`) and has no test network:
   `bin/kourier --version` prints `Kourier <version>`, `--fixture` is refused, and no code of
   the test network crate is in it;
-- the binary does not offer WhatsApp or Threema: `bin/kourier --print-networks`, run on a temporary
-  profile whose `kourier.toml` has `networks-on = ["whatsapp", "threema"]`, names neither of them among
-  the networks it would register nor among those it would list as off, and names both in `on=`
-  (a release build offers them in neither list until the user lifts that rule; the only proof of the
-  release arm on the packed binary, since the tests are debug builds; Threema is not in the archive's
-  features at all, so it is safe by construction and the check guards the day it joins);
+- the binary offers WhatsApp only while it is turned on and Threema by default:
+  `bin/kourier --print-networks`, run on a temporary profile whose `kourier.toml` has
+  `networks-on = ["whatsapp"]`, registers WhatsApp and Threema and names both in `on=`, and run on one
+  whose `kourier.toml` is empty, lists WhatsApp as off (not registered) and registers Threema (the only
+  proof of the rule on the packed binary, since the tests are debug builds);
 - the home directory, the user name, a rooted `/media/`, the host name, git's `user.name` and
   `user.email` and the project's former name are in neither the binary (also inside its zstd
   frames, when `zstd` is installed) nor any packed file;
@@ -255,6 +278,14 @@ tree.
   `kourier-<build-id>.debug` and the names file's CRC, the packed binary has no `.symtab`, and
   its dynamic symbols are the build output's; the names archive holds exactly that one file and
   is searched for private names like every packed file;
+- the AppImage holds the packed binary (the same build-id; linuxdeploy changes its run path, so
+  not the same bytes), as `usr/bin/kourier` with mode 0755, the `qt.conf` beside it that keeps its
+  Qt to its own plugins and QML modules, `AppRun` as a link to that program, every plugin of the
+  list, `LICENSE`, `THIRD-PARTY.html` and `BUNDLED.txt`, and desktop files that claim no
+  `x-scheme-handler`; every file inside it is searched for the private names above; its program,
+  started from the unpacked tree, prints `Kourier <version>`, refuses `--fixture` and offers neither
+  WhatsApp nor Threema, and the packed file itself (extracting itself: no FUSE needed) prints the
+  version too;
 - the checksums match, in `SHA256SUMS` and in `SHA256SUMS.names`.
 
 `--no-build` and `--allow-dirty` also check the stamp (a binary built from another commit or
@@ -262,7 +293,8 @@ tree state, with other features, or replaced since, is refused); they never writ
 names. With a tree that has changes the stamp cannot tell which changes it was built from.
 
 **It does not check:** that the application starts and works (that is `ci`, `perf` and the
-smoke run), that the build is reproducible, that other distributions can run the binary, that
+smoke run), that the build is reproducible, that other distributions can run the binary or the
+AppImage (the AppImage's window was shown in containers on Manjaro and Ubuntu 24.04 when it was made), that
 the licence texts are complete beyond generating them with `cargo about` and copying the files
 named above, that the dependencies' sources are attached (they are not), or that anything is
 signed (nothing is).

@@ -12,8 +12,9 @@ use kourier_model::ids::validate_local;
 use kourier_model::{
     AccountCaps, AccountHold, AccountProgress, AccountSettingsPatch, AttachmentId, AttachmentMeta,
     BackendBlob, BackendError, Body, CmdId, ContactPatch, ConvKey, ConversationPatch, DownloadId,
-    Expiry, HistoryTransfer, IdError, LocalMsgId, LoginStep, LogoutReport, MsgTarget, NetMsgId,
-    Origin, OutgoingState, PersistError, ReceiptKind, RecipientState, Redacted, ReplyTo, UserId,
+    Expiry, Forwarded, HistoryTransfer, IdError, LocalMsgId, LoginStep, LogoutReport, MsgTarget,
+    NetMsgId, Origin, OutgoingState, PersistError, ReceiptKind, RecipientState, Redacted, ReplyTo,
+    UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -954,6 +955,12 @@ pub struct IncomingMessage {
     /// Raw payload (kept for `Body::Unsupported`).
     #[serde(default)]
     pub raw: Option<BackendBlob>,
+    /// The message reached here as a forward, and the network's count of earlier forwards
+    /// (`kourier_model::Forwarded`). `None`: not a forward, or the network does not say. Stored
+    /// for a NEW row (live and history); a second delivery, an edit and a merge keep what the
+    /// row has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<Forwarded>,
     /// Backend per-row metadata.
     #[serde(default)]
     pub meta: Option<BackendBlob>,
@@ -992,6 +999,7 @@ impl IncomingMessage {
             edits: Vec::new(),
             linked_local: None,
             raw: None,
+            forwarded: None,
             meta: None,
         }
     }

@@ -988,7 +988,7 @@ fn contact_of(conn: &Connection, account: AccountId, user: &UserId) -> Result<Op
 const MSG_SELECT: &str = "SELECT id, sort_key, net_author, origin, device, body, reply_to, sent_at,
       server_at, received_at, revision, edited_at, deleted, deleted_by, out_state, read_state,
       expiry_kind, expiry_timer_ms, expiry_started_at, view_once, history, mentions_me, account_id,
-      net_local <> ''
+      net_local <> '', forwarded
     FROM messages";
 
 struct MsgRaw {
@@ -1017,6 +1017,8 @@ struct MsgRaw {
     account: i64,
     /// The message has a network id the other device can be asked about.
     named: bool,
+    /// `messages.forwarded`: the stored forward state (NULL = not a forward).
+    forwarded: Option<i64>,
 }
 
 fn msg_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<MsgRaw> {
@@ -1045,6 +1047,7 @@ fn msg_raw(r: &Row<'_>) -> kourier_db::rusqlite::Result<MsgRaw> {
         mentions_me: r.get(21)?,
         account: r.get(22)?,
         named: r.get(23)?,
+        forwarded: r.get(24)?,
     })
 }
 
@@ -1073,6 +1076,10 @@ struct PageCtx {
     /// The conversation is a group (`ConvKey::Group`): its messages name their sender.
     group: bool,
     features: Option<ConversationFeatures>,
+    /// The network's forward rules (`NetworkDescriptor::forwards`), one per page: the descriptor
+    /// is the account's, so no row looks anything up. `None`: the network marks no forward, and
+    /// no row of the page shows one.
+    forwards: Option<kourier_model::ForwardRules>,
     /// One of our ids is an admin of the conversation.
     admin: bool,
     own_ids: Vec<UserId>,
@@ -1202,6 +1209,7 @@ impl PageCtx {
                 None => Some(1),
             },
             features,
+            forwards: None,
             admin,
             own_ids,
             queued,
@@ -1257,9 +1265,11 @@ pub(crate) fn timeline(
     registered: bool,
     uploading: &HashSet<MessageId>,
     paused: Option<UserId>,
+    forwards: Option<kourier_model::ForwardRules>,
 ) -> Result<TimelinePage> {
     let limit = i64::from(q.limit.clamp(1, MAX_PAGE));
     let mut ctx = PageCtx::load(conn, q.conv, now, registered, uploading)?;
+    ctx.forwards = forwards;
     ctx.paused = paused.filter(|_| registered);
     let visible = TIMELINE_VISIBLE;
     let older = |key: i64, id: i64, n: i64, inclusive: bool| -> Result<Vec<MsgRaw>> {
@@ -1392,6 +1402,8 @@ const IDS_PER_STATEMENT: usize = 500;
 /// rows the timeline would show ([`TIMELINE_VISIBLE`]); an unknown id, an id of another
 /// conversation and a hidden row are absent. The ids are bound in chunks of
 /// [`IDS_PER_STATEMENT`].
+// (`forwards` is the page's one descriptor lookup, passed in beside the rest of the runtime's facts.)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn messages_by_ids(
     conn: &Connection,
     conv: ConversationId,
@@ -1400,11 +1412,13 @@ pub(crate) fn messages_by_ids(
     registered: bool,
     uploading: &HashSet<MessageId>,
     paused: Option<UserId>,
+    forwards: Option<kourier_model::ForwardRules>,
 ) -> Result<TimelinePage> {
     let mut ids: Vec<i64> = ids.iter().map(|m| m.0).collect();
     ids.sort_unstable();
     ids.dedup();
     let mut ctx = PageCtx::load(conn, conv, now, registered, uploading)?;
+    ctx.forwards = forwards;
     ctx.paused = paused.filter(|_| registered);
     let mut raws: Vec<MsgRaw> = Vec::new();
     for chunk in ids.chunks(IDS_PER_STATEMENT) {
@@ -1625,6 +1639,14 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
         };
     // "Show Sender's Page" and one "Show <name>'s Page" per person the text mentions: from the
     // body's own ranges and the conversation's kind, never from the UI (`actions::show_people`).
+    // (The SELECT leaves out rows hidden by their timer, as for `save_attachments` below.)
+    flags.forward = actions::may_forward(
+        &body,
+        raw.deleted.as_deref(),
+        raw.view_once,
+        false,
+        ctx.features.as_ref(),
+    );
     flags.show_sender = actions::show_sender(own, ctx.group);
     flags.show_people = actions::show_people(raw.deleted.is_some(), &body, &ctx.own_ids);
     // Every own message of a queue that waits for a safety number names the person (BQ-3, U4):
@@ -1690,6 +1712,15 @@ fn message_row(conn: &Connection, raw: MsgRaw, ctx: &mut PageCtx) -> Result<Mess
         view_once: raw.view_once,
         history: raw.history,
         mentions_me: raw.mentions_me,
+        // Shown only where the row's network marks forwards (`ctx.forwards`, one per page).
+        forwarded: match (raw.forwarded, ctx.forwards) {
+            (Some(score), Some(rules)) => Some(crate::facade::ForwardedMark {
+                many: rules.is_many(kourier_model::Forwarded {
+                    score: u32::try_from(score.max(0)).unwrap_or(u32::MAX),
+                }),
+            }),
+            _ => None,
+        },
         outbox: if own {
             ctx.queued.get(&raw.id).and_then(QueuedRaw::wait)
         } else {

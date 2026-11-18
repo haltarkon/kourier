@@ -75,6 +75,7 @@ fn text(conv: &ConvKey, local: &str) -> OutgoingRequest {
             body: Body::Text(Text::plain("synthetic hello")),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     )
 }
@@ -2110,6 +2111,7 @@ fn file_message(
             },
             reply_to: None,
             expiry: None,
+            forward: None,
         },
     )
 }
@@ -2199,6 +2201,63 @@ async fn a_file_is_uploaded_and_recorded_before_its_frame() {
         } if (*progress - 1.0).abs() < f32::EPSILON
     ));
     assert_eq!(files.temporary(), 0, "no temporary file left");
+    rig.ack(
+        LOCAL,
+        Answer::Acked {
+            server_t: Some(1_761_500_011),
+        },
+    );
+    assert!(matches!(
+        attempt.await.expect("ends"),
+        TransmitOutcome::Sent { .. }
+    ));
+}
+
+/// F4: a NEW file message whose request attachment still carries a `remote` pointer (a forward of a file) is uploaded
+/// again: one upload, and the frame holds the upload's pointer, never the remote's.
+#[tokio::test]
+async fn a_new_file_message_with_a_remote_pointer_is_uploaded_again() {
+    let rig = Rig::new().await;
+    let conv = dm(PEER_PN);
+    let mut files = file_rig();
+    let mut picture = files.picture();
+    let remote = crate::media::MediaPointer {
+        media_type: "image".into(),
+        direct_path: "/v/t62.7118-24/synthetic-remote-93018274".into(),
+        media_key: crate::media::hex(&[0x77; 32]),
+        file_sha256: Some(crate::media::hex(&[7; 32])),
+        file_enc_sha256: Some(crate::media::hex(&[8; 32])),
+        file_length: 1_234,
+        mimetype: Some("image/jpeg".into()),
+        shape: Some("image".into()),
+        ..crate::media::MediaPointer::default()
+    };
+    picture.remote = Some(kourier_model::BackendBlob::new(
+        crate::media::POINTER_V,
+        serde_json::to_vec(&remote).expect("json"),
+    ));
+    let stop = Stop::open();
+    let attempt = spawn_with(
+        files.parts(&rig, &stop),
+        file_message(&conv, LOCAL, vec![picture]),
+    );
+    rig.frames(1).await;
+    assert_eq!(
+        rig.session
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Upload(crate::send::route::Shape::Image)))
+            .count(),
+        1,
+        "one upload"
+    );
+    let image = sent_picture(&rig.session.sent()[0]);
+    let path = crate::session::fake::fake_direct_path(1);
+    assert_eq!(image.direct_path.as_deref(), Some(path.as_str()));
+    assert_ne!(
+        image.direct_path.as_deref(),
+        Some(remote.direct_path.as_str())
+    );
     rig.ack(
         LOCAL,
         Answer::Acked {

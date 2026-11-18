@@ -1162,6 +1162,7 @@ pub fn text_request_in(conv: ConvKey, text: &str) -> OutgoingRequest {
             body: Body::text(text),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,

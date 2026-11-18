@@ -36,8 +36,8 @@ use kourier_app::AppHandle;
 
 pub use bridge::qobject::{
     AccountListModel, App, ComposerController, ConversationListModel, EmojiLists, EmojiModel,
-    FilterListModel, LoginController, MediaListModel, MemberListModel, SearchListModel,
-    SettingsController, ShareTargetListModel, TimelineModel,
+    FilterListModel, ForwardTargetListModel, LoginController, MediaListModel, MemberListModel,
+    SearchListModel, SettingsController, ShareTargetListModel, TimelineModel,
 };
 
 /// Desktop file name, Wayland `app_id` and D-Bus name.
@@ -136,7 +136,7 @@ const MAIN_QML: &str = "qrc:/qt/qml/app/kourier/qml/Main.qml";
 /// `muteuntil` = the open chat with the "Mute Until" dialog; `chatmenu` = the open chat with its
 /// overflow menu; `chatmenuoff` = the same with the account's sync switch turned off (every entry
 /// greyed, the reason wrapped under Archive).
-pub const PAGES: [&str; 107] = [
+pub const PAGES: [&str; 112] = [
     "welcome",
     "link",
     "qr",
@@ -244,6 +244,11 @@ pub const PAGES: [&str; 107] = [
     "select",
     "exportdialog",
     "exportdone",
+    "forward",
+    "forwardcard",
+    "split",
+    "splitnarrow",
+    "splitpick",
 ];
 
 /// Registers the `image://kourier` and `image://kourierart` providers on `engine` (before it
@@ -272,6 +277,33 @@ pub struct UiOptions {
     /// runs (`startup`, `session[:<idle seconds>]`, `notify`; `cargo xtask perf`).
     #[cfg(feature = "perf")]
     pub perf_scenario: Option<String>,
+    /// TEST ONLY (split view S4): a fixture run that behaves as a normal start for the restore
+    /// of the open chats: the App writes these chats (by row of the list, or by id) and the
+    /// divider's share into the fixture's own preferences first and then reads them back as a
+    /// real start does. A real run never sets it (the binary builds its options without it).
+    pub restore_seed: Option<RestoreSeed>,
+}
+
+/// One chat of a [`RestoreSeed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedChat {
+    /// None stored.
+    None,
+    /// The chat at this row of the list (inbox, newest first).
+    Row(usize),
+    /// This conversation id, whether or not it exists.
+    Id(i64),
+}
+
+/// What a test stores before the restore ([`UiOptions::restore_seed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreSeed {
+    /// `open-chat`.
+    pub open: SeedChat,
+    /// `split-chat`.
+    pub split: SeedChat,
+    /// `split-width` in thousandths.
+    pub width_permille: u16,
 }
 
 /// What `App` needs from the running app: commands, events and facts (§8.1).
@@ -332,10 +364,29 @@ pub const QT_ENV_DEFAULTS: [(&str, &str); 3] = [
 /// (`tests/support`).
 pub const JS_GC_NOT_INCREMENTAL: (&str, &str) = ("QV4_GC_TIMELIMIT", "0");
 
-/// The defaults of [`QT_ENV_DEFAULTS`] whose name `is_set` does not know.
-pub fn env_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+/// What a run from the AppImage (`kourier_app::appimage`, architecture §14.1) sets on top of
+/// [`QT_ENV_DEFAULTS`]: Qt's portal platform theme. The AppImage holds no theme of a desktop
+/// ("Portal theme only", the maintainer's choice of 2026-11-18): a KDE or GNOME platform theme
+/// of the system is built against the system's Qt and cannot load into the bundled one. The
+/// portal theme asks the desktop's portal for its file dialogs and its colour scheme and draws
+/// the rest with Qt's own theme of the desktop. A theme the person set (`qt6ct`, `kde`, the
+/// empty value) stays theirs; one that is not in the AppImage makes Qt fall back on its own.
+pub const APPIMAGE_ENV_DEFAULTS: [(&str, &str); 1] = [("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")];
+
+/// The defaults of [`QT_ENV_DEFAULTS`], and in a run from the AppImage of
+/// [`APPIMAGE_ENV_DEFAULTS`], whose name `is_set` does not know.
+pub fn env_defaults(
+    is_set: impl Fn(&str) -> bool,
+    appimage: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let extra: &[(&str, &str)] = if appimage {
+        &APPIMAGE_ENV_DEFAULTS
+    } else {
+        &[]
+    };
     QT_ENV_DEFAULTS
         .iter()
+        .chain(extra)
         .copied()
         .filter(|(name, _)| !is_set(name))
         .collect()
@@ -344,8 +395,9 @@ pub fn env_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'stati
 /// The names [`prepare_environment`] set (a variable the person set is not among them).
 static ENV_SET_BY_KOURIER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
-/// Sets [`QT_ENV_DEFAULTS`] in the process environment (a variable that is set stays as it is)
-/// and remembers which it set, for [`env_set_by_kourier`].
+/// Sets [`QT_ENV_DEFAULTS`] (and [`APPIMAGE_ENV_DEFAULTS`] when this process runs from the
+/// AppImage) in the process environment (a variable that is set stays as it is) and remembers
+/// which it set, for [`env_set_by_kourier`].
 ///
 /// # Safety
 ///
@@ -356,7 +408,8 @@ pub unsafe fn prepare_environment() {
     let mut ours = ENV_SET_BY_KOURIER
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    for (name, value) in env_defaults(|name| std::env::var_os(name).is_some()) {
+    let appimage = kourier_app::appimage::current().is_some();
+    for (name, value) in env_defaults(|name| std::env::var_os(name).is_some(), appimage) {
         // SAFETY: the caller's promise above.
         unsafe { std::env::set_var(name, value) };
         ours.push(name);
@@ -366,7 +419,8 @@ pub unsafe fn prepare_environment() {
 /// The names [`prepare_environment`] set. A program Kourier starts for the person (their
 /// browser, the application a file opens in) gets its environment WITHOUT these
 /// (`kourier_app::opener`: the child's own copy, the process's is not touched): a player built
-/// on Qt Multimedia would decode in software with the empty lists.
+/// on Qt Multimedia would decode in software with the empty lists, and a program of the system
+/// would look for the AppImage's platform theme in the system's Qt.
 pub fn env_set_by_kourier() -> Vec<&'static str> {
     ENV_SET_BY_KOURIER
         .lock()
@@ -499,6 +553,66 @@ mod qml_rules {
         assert!(users.is_empty(), "QtQuick.Shapes is imported by {users:?}");
     }
 
+    /// The chat page takes its models (split view S3a): nothing the chat page makes reads pane 0's
+    /// `App.timeline` / `App.composer`, so a second page can have models of its own. Only
+    /// `MainWindow.qml` (which hands them to the page) and `ConversationListPage.qml` may.
+    #[test]
+    fn the_chat_page_reads_no_app_timeline_or_composer() {
+        let qml = Path::new(env!("CARGO_MANIFEST_DIR")).join("qml");
+        let mut files = Vec::new();
+        qml_files(&qml, &mut files);
+        assert!(files.len() > 20, "the QML files were not found");
+        let listed = [
+            "pages/ChatPage.qml",
+            "dialogs/AttachmentDeleteDialog.qml",
+            "dialogs/ChatDeleteDialog.qml",
+            "dialogs/FolderQuestionDialog.qml",
+            "dialogs/LocationQuestionDialog.qml",
+            "components/DetailsPanel.qml",
+            "components/GroupPage.qml",
+            "components/PersonPage.qml",
+            "components/TimerPart.qml",
+        ];
+        let mut checked = 0;
+        let mut users = Vec::new();
+        for f in &files {
+            let rel = f
+                .strip_prefix(&qml)
+                .expect("under qml/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !(rel.starts_with("timeline/")
+                || rel.starts_with("composer/")
+                || listed.contains(&rel.as_str()))
+            {
+                continue;
+            }
+            checked += 1;
+            let text = std::fs::read_to_string(f).expect("a QML file");
+            for (n, line) in text.lines().enumerate() {
+                for name in ["App.timeline", "App.composer"] {
+                    let mut rest = line;
+                    while let Some(at) = rest.find(name) {
+                        let after = rest[at + name.len()..].chars().next();
+                        if !after.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                            users.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                        }
+                        rest = &rest[at + name.len()..];
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= listed.len() + 10,
+            "only {checked} files were checked"
+        );
+        assert!(
+            users.is_empty(),
+            "the chat page's files take `chatModel` / `composerModel`, not App.timeline / App.composer:\n{}",
+            users.join("\n")
+        );
+    }
+
     /// The 30 s cap of a `--screenshot` run counts from the FIRST start of `shotTimer`
     /// (`MainWindow.qml`): when the start condition flips (a history page that loads more), the
     /// timer starts again but the cap does not, so a page that keeps flipping still ends.
@@ -598,7 +712,7 @@ mod qt_environment {
     #[test]
     fn the_defaults_are_set_when_nobody_set_them() {
         assert_eq!(
-            env_defaults(|_| false),
+            env_defaults(|_| false, false),
             vec![(DECODING, ""), (ENCODING, ""), (GC, "0")]
         );
     }
@@ -607,17 +721,43 @@ mod qt_environment {
     #[test]
     fn a_variable_that_is_set_is_left_alone() {
         assert_eq!(
-            env_defaults(|name| name == DECODING),
+            env_defaults(|name| name == DECODING, false),
             vec![(ENCODING, ""), (GC, "0")]
         );
         assert_eq!(
-            env_defaults(|name| name == ENCODING),
+            env_defaults(|name| name == ENCODING, false),
             vec![(DECODING, ""), (GC, "0")]
         );
         assert_eq!(
-            env_defaults(|name| name == GC),
+            env_defaults(|name| name == GC, false),
             vec![(DECODING, ""), (ENCODING, "")]
         );
-        assert!(env_defaults(|_| true).is_empty());
+        assert!(env_defaults(|_| true, false).is_empty());
+        assert!(env_defaults(|_| true, true).is_empty());
+    }
+
+    /// A run from the AppImage also takes the portal platform theme, unless the person chose a
+    /// theme; any other run leaves the platform theme to Qt.
+    #[test]
+    fn only_a_run_from_the_appimage_takes_the_portal_theme() {
+        const THEME: &str = "QT_QPA_PLATFORMTHEME";
+        assert_eq!(
+            env_defaults(|_| false, true),
+            vec![
+                (DECODING, ""),
+                (ENCODING, ""),
+                (GC, "0"),
+                (THEME, "xdgdesktopportal")
+            ]
+        );
+        assert_eq!(
+            env_defaults(|name| name == THEME, true),
+            vec![(DECODING, ""), (ENCODING, ""), (GC, "0")]
+        );
+        assert!(
+            env_defaults(|_| false, false)
+                .iter()
+                .all(|(name, _)| *name != THEME)
+        );
     }
 }

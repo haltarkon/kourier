@@ -8,11 +8,12 @@ import app.kourier
 // where the network has a message for that (`sync`), other people always keep their copies.
 Kirigami.PromptDialog {
     id: root
+    required property TimelineModel chatModel
 
     // Delete the chat (`true`), or only its messages.
     property bool remove: false
     // The account's other devices are told.
-    property bool sync: App.timeline.deletesSync
+    property bool sync: root.chatModel.deletesSync
 
     title: root.remove ? L10n.i18nc("@title:dialog", "Delete Chat?") : L10n.i18nc("@title:dialog", "Clear Chat History?")
     subtitle: {

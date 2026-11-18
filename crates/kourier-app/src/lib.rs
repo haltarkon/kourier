@@ -3,6 +3,7 @@
 //! and the core; the UI gets an [`AppHandle`].
 //!
 //! - [`paths`]: XDG directories, `KOURIER_HOME`, `--profile`.
+//! - [`appimage`]: whether this process runs from the AppImage `cargo xtask dist` makes (§14.1).
 //! - [`keys`]: master key (Secret Service or passphrase), `core.db` key, `key.wrap` files.
 //! - [`vault`]: the core's `AccountVault` over the keyring.
 //! - [`config`]: the backend environment (`KOURIER_SIGNAL_ENV` in debug builds).
@@ -31,6 +32,7 @@
 
 pub mod about;
 pub mod app;
+pub mod appimage;
 pub mod config;
 pub mod desktop;
 #[cfg(debug_assertions)]
@@ -52,6 +54,7 @@ pub mod perf;
 pub mod prefs;
 pub mod process;
 pub mod restart;
+pub mod restore;
 pub mod show;
 pub mod slicers;
 #[cfg(feature = "telegram")]
@@ -73,4 +76,4 @@ pub use kourier_core::facade;
 /// depends on no model crate).
 pub use kourier_model::{HistoryTransfer, HistoryTransferFailure, SendPhase};
 pub use paths::{Paths, Profile};
-pub use prefs::{LocationFiles, NotificationContent, Prefs};
+pub use prefs::{ForwardLookPref, LocationFiles, NotificationContent, Prefs};

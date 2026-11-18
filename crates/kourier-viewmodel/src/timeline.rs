@@ -537,6 +537,9 @@ pub struct RowActions {
     /// The message mentions people the menu offers a page of (the core's
     /// `MessageActions::show_people` is not empty; the row's `pages` carry them).
     pub show_people: bool,
+    /// "Forward…" is offered (the core's `MessageActions::forward`: not view-once, not a notice,
+    /// not deleted, and the chat allows forwarding out of it).
+    pub forward: bool,
 }
 
 impl RowActions {
@@ -554,6 +557,7 @@ impl RowActions {
             || self.save_attachments
             || self.show_sender
             || self.show_people
+            || self.forward
     }
 }
 
@@ -994,6 +998,38 @@ pub(crate) fn row_wait_line(
 
 crate::safe_debug!(Reaction { user, at });
 
+/// The forward mark above a bubble's text (forward line F1, D6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardMark {
+    /// Not a forward, or a network that marks none.
+    #[default]
+    None,
+    /// "Forwarded".
+    Forwarded,
+    /// "Forwarded many times".
+    Many,
+}
+
+impl ForwardMark {
+    /// Stable name for the front-end (`""`, `forwarded`, `many`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Forwarded => "forwarded",
+            Self::Many => "many",
+        }
+    }
+
+    /// The mark of the core's row.
+    pub fn of(mark: Option<kourier_core::facade::ForwardedMark>) -> Self {
+        match mark {
+            None => Self::None,
+            Some(m) if m.many => Self::Many,
+            Some(_) => Self::Forwarded,
+        }
+    }
+}
+
 /// One timeline row.
 #[derive(Clone, PartialEq)]
 pub struct MessageRow {
@@ -1055,6 +1091,9 @@ pub struct MessageRow {
     /// The row is selected in the selection mode ([`crate::selection::Selection::mark`] sets
     /// it; the builder leaves it false).
     pub selected: bool,
+    /// The message was forwarded to this chat (the core's answer, only where the network marks
+    /// forwards); drawn as one line above the text.
+    pub forward_mark: ForwardMark,
 }
 
 crate::safe_debug!(MessageRow {
@@ -1073,6 +1112,7 @@ crate::safe_debug!(MessageRow {
     receipt,
     actions,
     selected,
+    forward_mark,
 });
 
 impl MessageRow {
@@ -1105,6 +1145,7 @@ impl MessageRow {
             wait: String::new(),
             wait_timer: String::new(),
             selected: false,
+            forward_mark: ForwardMark::None,
         }
     }
 
@@ -1834,6 +1875,8 @@ pub(crate) struct Item<'a> {
     /// What the line under it says while it is on its way (own messages; `None`: nothing
     /// known, e.g. the fixture).
     pub wait: Option<SendWait>,
+    /// The forward mark (the core's answer; `None` for the fixture's model messages).
+    pub forward: ForwardMark,
 }
 
 /// The common part of every timeline: date headers, the unread marker, system rows, bubbles
@@ -1977,6 +2020,11 @@ pub(crate) fn build_rows<'a>(
             wait: wait.reason,
             wait_timer: wait.timer,
             selected: false,
+            forward_mark: if deleted {
+                ForwardMark::None
+            } else {
+                msg.forward
+            },
         });
     }
     read_more.end();
@@ -2048,6 +2096,8 @@ fn model_actions(msg: &Message) -> RowActions {
         // (No core here: the pure fixture offers no page.)
         show_sender: false,
         show_people: false,
+        // (No core here to judge view-once or a protected chat: content may be forwarded.)
+        forward: content,
     }
 }
 
@@ -2159,6 +2209,7 @@ pub fn build_timeline(
         waits_for: None,
         expiry: msg.expiry.as_ref(),
         wait: None,
+        forward: ForwardMark::None,
     });
     build_rows(
         items,

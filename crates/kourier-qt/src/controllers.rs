@@ -43,6 +43,29 @@ pub(crate) fn defer(shared: &Shared, app: Option<&CxxQtThread<App>>, changes: Ch
     }
 }
 
+/// The core's look of a forward at a combo index (the order of the `forward-look` pref).
+pub(crate) fn look_of(index: i32) -> kourier_viewmodel::forward::ForwardLook {
+    use kourier_app::ForwardLookPref as P;
+    use kourier_viewmodel::forward::ForwardLook as L;
+    match P::from_index(index) {
+        P::Plain => L::Plain,
+        P::Header => L::Header,
+        P::Quoted => L::Quoted,
+        P::Picture => L::Picture,
+    }
+}
+
+/// The combo index of a look.
+pub(crate) fn look_index(look: kourier_viewmodel::forward::ForwardLook) -> i32 {
+    use kourier_viewmodel::forward::ForwardLook as L;
+    match look {
+        L::Plain => 0,
+        L::Header => 1,
+        L::Quoted => 2,
+        L::Picture => 3,
+    }
+}
+
 /// How many files a press of Send would take now under `pref`. Files held by the answer
 /// [Don't Send] count under "Ask each time" (the press asks about them again) and "Always
 /// send" (the press lets them go), or Send would be dead for a lone held file with no text
@@ -518,6 +541,25 @@ impl ComposerRust {
         // sent, and the text stays there as its draft (F6).
         self.location_asked = None;
         dropped
+    }
+
+    /// Split view: the strips of this composer count entry ids and serials from `origin` up
+    /// (the second composer's range is disjoint from the first's).
+    pub(crate) fn set_strip_origin(&mut self, origin: u64) {
+        self.strips_made = origin;
+        self.strip = FileStrip::starting_at(origin << 32);
+    }
+
+    /// Split view: takes the files parked for `conversation` out (they follow the chat to the
+    /// other pane's composer).
+    pub(crate) fn take_parked(&mut self, conversation: i64) -> Option<FileStrip> {
+        self.parked.remove(&conversation)
+    }
+
+    /// Split view: parks `strip` for `conversation` ([`Self::switch_to`] then takes it as the
+    /// open list).
+    pub(crate) fn give_parked(&mut self, conversation: i64, strip: FileStrip) {
+        self.parked.insert(conversation, strip);
     }
 
     /// The setting "Files with location data" as it is now (Settings keep the one copy, F1);
@@ -1070,7 +1112,7 @@ impl qobject::ComposerController {
     }
 
     /// Asks the core how the files would be sent, unless its answer for this selection is in.
-    fn replan(mut self: Pin<&mut Self>) {
+    pub(crate) fn replan(mut self: Pin<&mut Self>) {
         let reply = *self.reply_to_id() > 0;
         let has_text = self.has_text;
         let long = self.long_caption.clone();
@@ -1623,6 +1665,20 @@ impl qobject::ComposerController {
             return self.send_edit(&shared, conversation, &text.to_string());
         }
         let body = text.to_string();
+        // A staged forward goes first: the text is its comment (also an empty one).
+        let staged = shared
+            .borrow()
+            .source
+            .forward_of(ConversationId(conversation))
+            .is_some_and(|s| !s.waiting);
+        if staged {
+            let sent = shared
+                .borrow_mut()
+                .source
+                .send_staged_forward(ConversationId(conversation), &body);
+            self.as_mut().forwards_changed();
+            return sent;
+        }
         let pref = self.location_pref();
         match self
             .as_mut()
@@ -1651,6 +1707,73 @@ impl qobject::ComposerController {
             FilesSend::Files(send) => self.dispatch_files(&shared, conversation, send),
             FilesSend::Text => self.send_text(&shared, conversation, &body),
         }
+    }
+
+    /// Stages a forward into `target`'s composer (the contract with the split-view line).
+    pub fn stage_forward(
+        mut self: Pin<&mut Self>,
+        target: i64,
+        source: i64,
+        ids: &QStringList,
+    ) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let ids: Vec<MessageId> = crate::app::ids_of(ids).into_iter().map(MessageId).collect();
+        let staged = shared.borrow_mut().source.stage_forward(
+            ConversationId(target),
+            ConversationId(source),
+            ids,
+        );
+        self.as_mut().forwards_changed();
+        staged
+    }
+
+    /// The staged forward of `conversation` as the card's map (empty when none stands).
+    pub fn forward_of(&self, conversation: i64) -> QVariant {
+        let staged = self
+            .shared
+            .as_ref()
+            .and_then(|s| s.borrow().source.forward_of(ConversationId(conversation)));
+        match staged {
+            Some(s) => crate::models::timeline::map(vec![
+                (
+                    "count",
+                    QVariant::from(&i32::try_from(s.count).unwrap_or(i32::MAX)),
+                ),
+                ("from", QVariant::from(&QString::from(s.from.as_str()))),
+                ("look", QVariant::from(&look_index(s.look))),
+                ("native", QVariant::from(&s.native)),
+                ("waiting", QVariant::from(&s.waiting)),
+            ]),
+            None => crate::models::timeline::map(Vec::new()),
+        }
+    }
+
+    /// The card's Look combo.
+    pub fn set_forward_look(mut self: Pin<&mut Self>, conversation: i64, look: i32) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let done = shared
+            .borrow_mut()
+            .source
+            .set_forward_look(ConversationId(conversation), look_of(look));
+        self.as_mut().forwards_changed();
+        done
+    }
+
+    /// The card's X: drops the staged forward (and cancels its job).
+    pub fn drop_forward(mut self: Pin<&mut Self>, conversation: i64) -> bool {
+        let Some(shared) = self.shared.clone() else {
+            return false;
+        };
+        let done = shared
+            .borrow_mut()
+            .source
+            .drop_forward(ConversationId(conversation));
+        self.as_mut().forwards_changed();
+        done
     }
 
     /// Sends `body` by itself.
@@ -2280,6 +2403,8 @@ pub struct SettingsRust {
     pub(crate) notification_content: i32,
     /// "Files with location data" as the combo's index (0 ask, 1 always send, 2 never send).
     pub(crate) location_files: i32,
+    /// "Forward to another account as": the combo's index (0 plain, 1 header, 2 quoted, 3 picture).
+    pub(crate) forward_look: i32,
     /// What happens to disappearing messages whose time has come while this computer's
     /// clock is unconfirmed: the core's name of the option (`hide`, `keep`, `erase`); empty
     /// until the core has said.
@@ -2326,6 +2451,7 @@ impl SettingsRust {
             chat_wallpaper: prefs.chat_wallpaper,
             notification_content: prefs.notification_content.index(),
             location_files: prefs.location_files.index(),
+            forward_look: prefs.forward_look.index(),
             expiry_policy: QString::default(),
             quiet_notices: QString::default(),
             networks_on: names_list(&prefs.networks_on),
@@ -2364,6 +2490,7 @@ impl SettingsRust {
             chat_wallpaper: self.chat_wallpaper,
             notification_content: NotificationContent::from_index(self.notification_content),
             location_files: LocationFiles::from_index(self.location_files),
+            forward_look: kourier_app::ForwardLookPref::from_index(self.forward_look),
             model_colour: self.model_colour.to_string(),
             model_box: self.model_box.to_string(),
             model_slicer: self.model_slicer.to_string(),
@@ -2571,6 +2698,19 @@ impl qobject::SettingsController {
     pub fn set_location_files_pref(self: Pin<&mut Self>, value: i32) {
         let value = LocationFiles::from_index(value).index();
         self.update(|s| std::mem::replace(&mut s.location_files, value) != value);
+    }
+
+    /// `forwardLook` (0 plain copy, 1 forwarded header, 2 header and quoted body, 3 as picture;
+    /// out of range = header). The viewmodel's default follows at once.
+    pub fn set_forward_look_pref(self: Pin<&mut Self>, value: i32) {
+        let value = kourier_app::ForwardLookPref::from_index(value).index();
+        if let Some(shared) = self.shared.clone() {
+            shared
+                .borrow_mut()
+                .source
+                .set_forward_default(look_of(value));
+        }
+        self.update(|s| std::mem::replace(&mut s.forward_look, value) != value);
     }
 
     /// The settings page is shown: what the core keeps is asked for (`expiryPolicy` follows

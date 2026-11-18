@@ -51,9 +51,10 @@ pub use conversation::{ConvKind, Conversation, ConversationChange, ConversationP
 pub use error::{BackendError, ErrorKind, PersistError};
 pub use features::{
     AccountCaps, CannotSend, ChatExport, CleanedPictures, ConversationFeatures, EditTarget,
-    FileAlbum, FileLimits, FilePacking, FilePlan, FormatKind, GroupActions, GroupInfo,
-    GroupInviteAction, GroupInvites, HistoryReadState, HistorySource, LoginFlow, NetworkDescriptor,
-    OutboxPolicy, PlanFile, RiskNotice, ServerRules, Support, TimerRange, TypingPolicy, Window,
+    FileAlbum, FileLimits, FilePacking, FilePlan, FormatKind, ForwardRules, Forwarded,
+    GroupActions, GroupInfo, GroupInviteAction, GroupInvites, HistoryReadState, HistorySource,
+    LoginFlow, NetworkDescriptor, OutboxPolicy, PlanFile, RiskNotice, ServerRules, Support,
+    TimerRange, TypingPolicy, Window,
 };
 pub use ids::{
     AccountId, AccountUuid, AttachmentId, BackendBlob, CmdId, ContactId, ConvKey, ConversationId,

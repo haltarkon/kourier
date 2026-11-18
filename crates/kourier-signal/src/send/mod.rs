@@ -2440,6 +2440,7 @@ mod tests {
                         body: Body::Text(Text::plain("first words")),
                         reply_to: None,
                         expiry: None,
+                        forward: None,
                     },
                     only: None,
                     is_recipient_update: false,

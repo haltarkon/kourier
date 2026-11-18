@@ -16,6 +16,7 @@ pub use crate::models::attachments::AttachmentsRust;
 pub use crate::models::conversations::ConversationsRust;
 pub use crate::models::emoji::{EmojiListsRust, EmojiModelRust};
 pub use crate::models::filters::FiltersRust;
+pub use crate::models::forward::ForwardTargetsRust;
 pub use crate::models::media::MediaRust;
 pub use crate::models::members::MembersRust;
 pub use crate::models::search::SearchRust;
@@ -430,6 +431,9 @@ pub mod qobject {
         #[qproperty(bool, export_busy)]
         #[qproperty(i64, export_done)]
         #[qproperty(i64, export_total)]
+        #[qproperty(bool, forward_busy)]
+        #[qproperty(i64, forward_done)]
+        #[qproperty(i64, forward_total)]
         #[qproperty(QString, banner_kind)]
         #[qproperty(QString, banner_text)]
         #[qproperty(QString, banner_action)]
@@ -452,6 +456,8 @@ pub mod qobject {
         #[qproperty(*mut MemberListModel, group_preview, READ, CONSTANT)]
         #[qproperty(*mut EmojiLists, emoji_lists, READ, CONSTANT)]
         #[qproperty(*mut ShareTargetListModel, share_targets, READ, CONSTANT)]
+        #[qproperty(*mut ForwardTargetListModel, forward_targets, READ, CONSTANT)]
+        #[qproperty(*mut TimelineModel, forward_rows, READ, CONSTANT)]
         #[qproperty(*mut FilterListModel, filters, READ, CONSTANT)]
         #[qproperty(*mut SearchListModel, search_results, READ, CONSTANT)]
         #[qproperty(*mut MediaListModel, group_media, READ, CONSTANT)]
@@ -459,11 +465,93 @@ pub mod qobject {
         #[qproperty(*mut MediaListModel, media_grid, READ, CONSTANT)]
         #[qproperty(*mut MediaListModel, media_files, READ, CONSTANT)]
         #[qproperty(*mut ConversationListModel, conversations, READ, CONSTANT)]
-        #[qproperty(*mut TimelineModel, timeline, READ, CONSTANT)]
-        #[qproperty(*mut ComposerController, composer, READ, CONSTANT)]
+        #[qproperty(*mut TimelineModel, timeline, READ = pane0_timeline, CONSTANT)]
+        #[qproperty(*mut ComposerController, composer, READ = pane0_composer, CONSTANT)]
+        #[qproperty(*mut TimelineModel, side_timeline, READ = pane1_timeline, CONSTANT)]
+        #[qproperty(*mut ComposerController, side_composer, READ = pane1_composer, CONSTANT)]
+        #[qproperty(bool, split)]
+        #[qproperty(i32, active_pane)]
+        #[qproperty(f64, split_width)]
         #[qproperty(*mut LoginController, login, READ, CONSTANT)]
         #[qproperty(*mut SettingsController, settings, READ, CONSTANT)]
         type App = super::AppRust;
+
+        /// Pane 0's timeline model (`App.timeline`): fixed, whichever pane is active.
+        fn pane0_timeline(self: &App) -> *mut TimelineModel;
+
+        /// Pane 0's composer (`App.composer`).
+        fn pane0_composer(self: &App) -> *mut ComposerController;
+
+        /// Pane 1's timeline model (`App.sideTimeline`).
+        fn pane1_timeline(self: &App) -> *mut TimelineModel;
+
+        /// Pane 1's composer (`App.sideComposer`).
+        fn pane1_composer(self: &App) -> *mut ComposerController;
+
+        /// Split view: opens `conversation` in the second pane and makes that pane active (a
+        /// chat a pane shows already just activates that pane).
+        #[qinvokable]
+        fn open_in_split(self: Pin<&mut App>, conversation: i64);
+
+        /// Split view: closes pane `pane` (0 left, 1 right); the other chat stays as the single
+        /// pane 0. Without a split it closes the open chat.
+        #[qinvokable]
+        fn close_pane(self: Pin<&mut App>, pane: i32);
+
+        /// Split view: makes pane `pane` the active one.
+        #[qinvokable]
+        fn activate_pane(self: Pin<&mut App>, pane: i32);
+
+        /// Split view: the two chats exchange places (the left chat shows on the right and the
+        /// other way round); the active chat stays the active one. The drafts and the files
+        /// waiting in the composers follow their chats; a reply or an edit in progress ends.
+        /// Nothing without a split.
+        #[qinvokable]
+        fn swap_panes(self: Pin<&mut App>);
+
+        /// Split view: whether the pane that is not active is on screen (a window too narrow
+        /// for two chats hides it).
+        #[qinvokable]
+        fn set_side_shown(self: Pin<&mut App>, shown: bool);
+
+        /// Split view: the divider ended a drag; `share` is pane 0's share of the room of the two
+        /// chats (clamped to 0.25..0.75, kept in the `split-width` preference).
+        #[qinvokable]
+        fn store_split_width(self: Pin<&mut App>, share: f64);
+
+        /// Split view: what the preferences hold of the open chats, `open;split;width` (tests).
+        #[qinvokable]
+        fn stored_chats(self: &App) -> QString;
+
+        /// The window's first frame of the list is up: reopens the chats of the last run and
+        /// keeps them from now on. False: the list is not known yet, ask again (`give_up`: no
+        /// more asking, take what is there).
+        #[qinvokable]
+        fn restore_chats(self: Pin<&mut App>, give_up: bool) -> bool;
+
+        /// The start opened a chat of its own: nothing is restored, the chats are kept from here.
+        #[qinvokable]
+        fn restore_skipped(self: Pin<&mut App>);
+
+        /// The pane that shows `conversation` (0 or 1), -1 when none does.
+        #[qinvokable]
+        fn pane_of(self: &App, conversation: i64) -> i32;
+
+        /// `fetchOlder` for pane `pane` (a scroll of the inactive pane needs no press).
+        #[qinvokable]
+        fn fetch_older_in(self: Pin<&mut App>, pane: i32);
+
+        /// `fetchNewer` for pane `pane`.
+        #[qinvokable]
+        fn fetch_newer_in(self: Pin<&mut App>, pane: i32);
+
+        /// `jumpTo` for pane `pane`.
+        #[qinvokable]
+        fn jump_to_in(self: Pin<&mut App>, pane: i32, message: i64);
+
+        /// `jumpToLatest` for pane `pane`.
+        #[qinvokable]
+        fn jump_to_latest_in(self: Pin<&mut App>, pane: i32);
 
         /// A click on an account: the list shows only its conversations (`-1` = all chats,
         /// every account shown).
@@ -752,6 +840,43 @@ pub mod qobject {
         /// Cancel of an export at any stage.
         #[qinvokable]
         fn export_cancel(self: Pin<&mut App>);
+
+        /// "Forward…" (forward line F6): opens the dialog for `messages` of the open chat. The
+        /// chats are filled into `forwardTargets` (search emptied); the dialog's view follows as
+        /// `forwardDialogReady`. `false` when nothing is open or nothing was given.
+        #[qinvokable]
+        fn forward_open(self: Pin<&mut App>, messages: &QStringList) -> bool;
+
+        /// The dialog's ticked chats (conversation ids): the plan is asked again.
+        #[qinvokable]
+        fn forward_tick(self: Pin<&mut App>, targets: &QStringList);
+
+        /// The dialog's Forward: a job for the ticked chats with look `look` (the combo's index)
+        /// and `comment`. `false` when the forward may not go now.
+        #[qinvokable]
+        fn forward_send(self: Pin<&mut App>, look: i32, comment: &QString) -> bool;
+
+        /// The dialog closed without Forward.
+        #[qinvokable]
+        fn forward_abandon(self: Pin<&mut App>);
+
+        /// The answer to `forwardAsk`: send without the files that are gone, or end the job.
+        #[qinvokable]
+        fn forward_without(self: Pin<&mut App>, request: i64, send: bool);
+
+        /// Cancel of the running forward job (the strip's button).
+        #[qinvokable]
+        fn forward_cancel(self: Pin<&mut App>);
+
+        /// The private folder (0700, tmpfs media cache) for the slice pictures of forward job
+        /// `request` (the picture look, F7): its path, empty when none could be made.
+        #[qinvokable]
+        fn forward_pictures_dir(self: Pin<&mut App>, request: i64) -> QString;
+
+        /// The picture look is rendered: the slice files in order (empty: none could be made).
+        /// The job goes on, and `forwardRows` is emptied.
+        #[qinvokable]
+        fn forward_pictures_done(self: Pin<&mut App>, request: i64, paths: &QStringList);
 
         /// The full-size URL of the newest picture in the open timeline (`--page=viewer`).
         #[qinvokable]
@@ -1295,6 +1420,28 @@ pub mod qobject {
         /// `export::flow::DialogView::to_json`).
         #[qsignal]
         fn export_dialog_ready(self: Pin<&mut App>, json: QString);
+
+        /// The forward dialog's view came (open or renewed): `json` is
+        /// `forward::ForwardDialogView::to_json`.
+        #[qsignal]
+        fn forward_dialog_ready(self: Pin<&mut App>, json: QString);
+
+        /// Files of the job `request` are gone from the network: ask whether to send without them.
+        #[qsignal]
+        fn forward_ask(self: Pin<&mut App>, request: i64, count: i32);
+
+        /// The picture look of job `request` is to be drawn: `forwardRows` holds the rows (F7);
+        /// `group`: they are a group's (a column for the senders' pictures).
+        #[qsignal]
+        fn forward_render(self: Pin<&mut App>, request: i64, group: bool);
+
+        /// Job `request` ended while its pictures were being drawn: stop and write nothing.
+        #[qsignal]
+        fn forward_render_stopped(self: Pin<&mut App>, request: i64);
+
+        /// A forward ended or was refused: the notice (never empty).
+        #[qsignal]
+        fn forward_notice(self: Pin<&mut App>, text: QString);
 
         /// The export's save dialog starts at `url` (the last save folder and the suggested
         /// `<chat> <date> <time>.zip`).
@@ -1865,6 +2012,103 @@ pub mod qobject {
         );
     }
 
+    // ---- ForwardTargetListModel -----------------------------------------------------------------
+
+    #[auto_cxx_name]
+    extern "RustQt" {
+        /// The chats of the forward dialog (forward line F6, `App.forwardTargets`).
+        #[qobject]
+        #[base = QAbstractListModel]
+        #[qml_element]
+        #[qml_uncreatable]
+        #[qproperty(i32, count)]
+        #[qproperty(QString, filter, READ, WRITE = set_filter_text, NOTIFY = filter_changed)]
+        type ForwardTargetListModel = super::ForwardTargetsRust;
+
+        #[cxx_override]
+        fn data(self: &ForwardTargetListModel, index: &QModelIndex, role: i32) -> QVariant;
+        #[cxx_override]
+        fn row_count(self: &ForwardTargetListModel, parent: &QModelIndex) -> i32;
+        #[cxx_override]
+        fn role_names(self: &ForwardTargetListModel) -> QHash_i32_QByteArray;
+
+        /// The text of the dialog's search: only the chats whose title contains it are listed.
+        fn set_filter_text(self: Pin<&mut ForwardTargetListModel>, text: &QString);
+
+        /// The filter changed.
+        #[qsignal]
+        fn filter_changed(self: Pin<&mut ForwardTargetListModel>);
+
+        /// The conversation id of listed row `row` (0 when there is none).
+        #[qinvokable]
+        fn conversation_at(self: &ForwardTargetListModel, row: i32) -> i64;
+
+        /// The title of listed chat `conversation` (empty when it is not listed).
+        #[qinvokable]
+        fn title_of(self: &ForwardTargetListModel, conversation: i64) -> QString;
+
+        /// Whether chat `conversation` is listed now.
+        #[qinvokable]
+        fn is_listed(self: &ForwardTargetListModel, conversation: i64) -> bool;
+
+        /// Whether listed chat `conversation` is on the source's account (the network's own
+        /// forward).
+        #[qinvokable]
+        fn is_native(self: &ForwardTargetListModel, conversation: i64) -> bool;
+    }
+
+    #[auto_cxx_name]
+    unsafe extern "RustQt" {
+        #[inherit]
+        unsafe fn begin_insert_rows(
+            self: Pin<&mut ForwardTargetListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_insert_rows(self: Pin<&mut ForwardTargetListModel>);
+        #[inherit]
+        unsafe fn begin_remove_rows(
+            self: Pin<&mut ForwardTargetListModel>,
+            parent: &QModelIndex,
+            first: i32,
+            last: i32,
+        );
+        #[inherit]
+        unsafe fn end_remove_rows(self: Pin<&mut ForwardTargetListModel>);
+        #[inherit]
+        unsafe fn begin_move_rows(
+            self: Pin<&mut ForwardTargetListModel>,
+            source_parent: &QModelIndex,
+            source_first: i32,
+            source_last: i32,
+            destination_parent: &QModelIndex,
+            destination_child: i32,
+        ) -> bool;
+        #[inherit]
+        unsafe fn end_move_rows(self: Pin<&mut ForwardTargetListModel>);
+        #[inherit]
+        unsafe fn begin_reset_model(self: Pin<&mut ForwardTargetListModel>);
+        #[inherit]
+        unsafe fn end_reset_model(self: Pin<&mut ForwardTargetListModel>);
+        #[inherit]
+        fn index(
+            self: &ForwardTargetListModel,
+            row: i32,
+            column: i32,
+            parent: &QModelIndex,
+        ) -> QModelIndex;
+        #[inherit]
+        #[qsignal]
+        fn data_changed(
+            self: Pin<&mut ForwardTargetListModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QVector_i32,
+        );
+    }
+
     // ---- FilterListModel ------------------------------------------------------------------
 
     #[auto_cxx_name]
@@ -2314,6 +2558,10 @@ pub mod qobject {
         #[qinvokable]
         fn export_selected(self: Pin<&mut TimelineModel>);
 
+        /// The selected messages' ids (oldest first), for "Forward…" of the selection bar.
+        #[qinvokable]
+        fn selected_ids(self: &TimelineModel) -> QStringList;
+
         /// How many pictures, videos and files of the rows shown are downloading (a
         /// `--screenshot` waits for 0).
         #[qinvokable]
@@ -2524,6 +2772,37 @@ pub mod qobject {
         #[qinvokable]
         fn cancel_reply(self: Pin<&mut ComposerController>);
 
+        /// THE CONTRACT with the split-view line: stages a forward of the messages `ids` of
+        /// `source` into `target`'s composer (a card shows). `false` when it cannot be staged.
+        #[qinvokable]
+        fn stage_forward(
+            self: Pin<&mut ComposerController>,
+            target: i64,
+            source: i64,
+            ids: &QStringList,
+        ) -> bool;
+
+        /// The staged forward of `conversation` for the card: `count`, `from`, `look` (the
+        /// combo's index), `native`, `waiting`; an empty map when none stands.
+        #[qinvokable]
+        fn forward_of(self: &ComposerController, conversation: i64) -> QVariant;
+
+        /// The card's Look combo: changes the staged forward's look.
+        #[qinvokable]
+        fn set_forward_look(
+            self: Pin<&mut ComposerController>,
+            conversation: i64,
+            look: i32,
+        ) -> bool;
+
+        /// The card's X (and Escape): drops the staged forward.
+        #[qinvokable]
+        fn drop_forward(self: Pin<&mut ComposerController>, conversation: i64) -> bool;
+
+        /// The staged forwards changed (staged, replaced, dropped, waiting, sent).
+        #[qsignal]
+        fn forwards_changed(self: Pin<&mut ComposerController>);
+
         /// Edits `message` of `conversation`: the banner shows, `editStarted(text)` hands its
         /// text (or caption) to the text area, and `send` then replaces it. `false` when the
         /// message cannot be edited (any more).
@@ -2624,6 +2903,7 @@ pub mod qobject {
         #[qproperty(bool, chat_wallpaper, READ, WRITE = set_chat_wallpaper_pref, NOTIFY = changed)]
         #[qproperty(i32, notification_content, READ, WRITE = set_notification_content_pref, NOTIFY = changed)]
         #[qproperty(i32, location_files, READ, WRITE = set_location_files_pref, NOTIFY = changed)]
+        #[qproperty(i32, forward_look, READ, WRITE = set_forward_look_pref, NOTIFY = changed)]
         #[qproperty(QString, expiry_policy, READ, WRITE = set_expiry_policy_pref, NOTIFY = changed)]
         #[qproperty(QString, quiet_notices, READ, WRITE = set_quiet_notices_pref, NOTIFY = changed)]
         #[qproperty(QStringList, networks_on, READ, NOTIFY = changed)]
@@ -2717,6 +2997,10 @@ pub mod qobject {
 
         /// Files with location data: 0 ask each time, 1 always send, 2 never send.
         fn set_location_files_pref(self: Pin<&mut SettingsController>, value: i32);
+
+        /// How a forward to another account looks by default: 0 plain copy, 1 forwarded header,
+        /// 2 header and quoted body, 3 as picture.
+        fn set_forward_look_pref(self: Pin<&mut SettingsController>, value: i32);
     }
 
     // Constructors used by `App` (and tests) to own its sub-objects.
@@ -2739,6 +3023,9 @@ pub mod qobject {
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
         fn new_share_target_list_model() -> UniquePtr<ShareTargetListModel>;
+        #[cxx_name = "make_unique"]
+        #[doc(hidden)]
+        fn new_forward_target_list_model() -> UniquePtr<ForwardTargetListModel>;
         #[cxx_name = "make_unique"]
         #[doc(hidden)]
         fn new_filter_list_model() -> UniquePtr<FilterListModel>;

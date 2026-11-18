@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use kourier_model::{
     AccountId, AccountSettingsPatch, AttachmentId, BackendBlob, BackendError, BlobKey, Body, CmdId,
-    ContactChange, ConvKey, ConversationChange, DownloadId, GroupInviteAction, Identifier,
-    IdentityFingerprint, LocalMsgId, MsgTarget, NetMsgId, OwnDevice, ProfilePatch, ReceiptKind,
-    RecipientState, Redacted, ReplyTo, SafetyAnswer, UserId,
+    ContactChange, ConvKey, ConversationChange, DownloadId, Forwarded, GroupInviteAction,
+    Identifier, IdentityFingerprint, LocalMsgId, MsgTarget, NetMsgId, OwnDevice, ProfilePatch,
+    ReceiptKind, RecipientState, Redacted, ReplyTo, SafetyAnswer, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -768,6 +768,11 @@ pub enum OutgoingKind {
         /// Disappearing timer of the conversation at send time.
         #[serde(default)]
         expiry: Option<Duration>,
+        /// The forward mark to send (the score the core computed): `Some` only for a message
+        /// forwarded inside its own account, on a network that states `forwards`. Backends
+        /// ignore it until their forward step (F4).
+        #[serde(default)]
+        forward: Option<Forwarded>,
     },
     /// An edit of an own message.
     Edit {

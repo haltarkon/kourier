@@ -2,7 +2,7 @@
 //!
 //! The actor opens the store, serves the commands and drives the login machine over a `Session`; the
 //! real client behind that `Session` is built from the parts at the first `Connect` or `StartLogin`
-//! (`session::client`). The app registers it (W2b) in a debug build only, while the user has it on.
+//! (`session::client`). The app registers it (W2b) while the user has it on, in every build.
 //!
 //! It takes the transport factory and the HTTP client as a REQUIRED argument ([`NetParts`], lane
 //! decision 2): there is no constructor without them, so no code path of this crate reaches a real
@@ -15,8 +15,9 @@ use kourier_backend_api::{
     AccountContext, AccountHandle, AllocatedId, Network, spawn_account_thread,
 };
 use kourier_model::{
-    BackendError, ConvKey, EditTarget, HistoryReadState, HistorySource, LoginFlow, MsgIdScope,
-    NetworkDescriptor, NetworkKind, OutboxPolicy, RiskNotice, ServerRules, TypingPolicy, UserId,
+    BackendError, ConvKey, EditTarget, ForwardRules, HistoryReadState, HistorySource, LoginFlow,
+    MsgIdScope, NetworkDescriptor, NetworkKind, OutboxPolicy, RiskNotice, ServerRules,
+    TypingPolicy, UserId,
 };
 use wacore::request::RequestUtils;
 use wacore_binary::Jid;
@@ -126,6 +127,14 @@ impl WhatsAppNetwork {
                 receipts_always_sent: false,
                 // The clients count what is unread and check the deletes (KT-2).
                 server: ServerRules::default(),
+                // WhatsApp's official limits: five chats per forward, one for a message forwarded
+                // many times (WA Web's frequently-forwarded threshold, `wacore`'s
+                // `proto_helpers.rs`). Read it through `ForwardRules`.
+                forwards: Some(ForwardRules {
+                    max_chats: Some(5),
+                    many_from: 5,
+                    many_max_chats: 1,
+                }),
             },
         }
     }

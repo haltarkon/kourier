@@ -347,6 +347,7 @@ fn outgoing() -> OutgoingRequest {
             body: Body::text("synthetic th1 text"),
             reply_to: None,
             expiry: None,
+            forward: None,
         },
         only: None,
         is_recipient_update: false,

@@ -442,3 +442,34 @@ fn a_companion_upload_is_deferred_not_a_second_message() {
     ));
     assert!(!plain.deferred && plain.events.len() == 1, "{plain:?}");
 }
+
+/// Forward line F1: `is_forwarded` with the wire's score becomes `Forwarded { score }` (127 as is), a
+/// message without the flag has none, on a text and on a picture.
+#[test]
+fn a_forwarded_text_and_picture_state_their_score_and_a_plain_one_states_none() {
+    use kourier_model::Forwarded;
+    let state =
+        |message: &wa::Message| message_of(&map(&row_with(message, &meta(), PEER, PEER))).forwarded;
+    for score in [None, Some(2), Some(127)] {
+        let fill = |c: &mut wa::ContextInfo| {
+            c.is_forwarded = Some(true);
+            c.forwarding_score = score;
+        };
+        let want = Some(Forwarded {
+            score: score.unwrap_or(0),
+        });
+        assert_eq!(state(&message_with(picture("p", fill))), want);
+        let mut ext = wa::message::ExtendedTextMessage::default();
+        ext.text = Some("t".into());
+        let mut context = wa::ContextInfo::default();
+        fill(&mut context);
+        ext.context_info = MessageField::some(context);
+        let mut text = wa::Message::default();
+        text.extended_text_message = MessageField::some(ext);
+        assert_eq!(state(&text), want);
+    }
+    assert_eq!(state(&message_with(picture("p", |_| {}))), None);
+    // A score without the flag is not a forward.
+    let flagless = |c: &mut wa::ContextInfo| c.forwarding_score = Some(3);
+    assert_eq!(state(&message_with(picture("p", flagless))), None);
+}

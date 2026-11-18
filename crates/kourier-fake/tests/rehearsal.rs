@@ -942,6 +942,7 @@ fn the_rehearsals_fake_holds_the_ack_of_the_resend_text_once_and_drops_its_repea
             body: kourier_model::Body::Text(kourier_model::Text::plain(body)),
             reply_to: None,
             expiry: None,
+            forward: None,
         };
         let resend = || text(rehearsal::HELD_ACK_TEXT);
         // The first frame: taken by the server (written, counted), never answered.
@@ -1069,6 +1070,7 @@ fn the_rehearsals_fake_says_the_two_count_lines_for_every_frame_it_takes() {
                 body: kourier_model::Body::Text(kourier_model::Text::plain("synthetic hello")),
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
         )
         .await;

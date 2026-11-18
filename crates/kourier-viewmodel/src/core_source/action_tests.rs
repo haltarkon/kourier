@@ -38,6 +38,7 @@ fn own_actions() -> MessageActions {
         delete_for_me: true,
         delete_attachment: false,
         copy: true,
+        forward: true,
         take_back: false,
         cancel_sending: false,
         ask_attachments: Vec::new(),
@@ -2420,4 +2421,26 @@ fn a_chat_still_filling_is_not_cleared_or_deleted_and_says_why() {
         },
     );
     assert_eq!(src.chat(CONV).expect("header").still_filling, "");
+}
+
+/// Forward line F1: the row's forward mark is the core's answer (none, forwarded, forwarded many times),
+/// and a change of it is a change of the row (the Qt model's `forwardMark` role).
+#[test]
+fn the_forward_mark_is_the_cores_answer() {
+    use crate::timeline::ForwardMark;
+    use kourier_core::facade::ForwardedMark;
+    let mut store = store(6);
+    {
+        let rows = store.convs.get_mut(&1).expect("conv");
+        rows[1].forwarded = Some(ForwardedMark { many: false });
+        rows[3].forwarded = Some(ForwardedMark { many: true });
+    }
+    let (src, _) = opened(&store);
+    assert_eq!(row(&src, id(1)).forward_mark, ForwardMark::None);
+    assert_eq!(row(&src, id(2)).forward_mark, ForwardMark::Forwarded);
+    assert_eq!(row(&src, id(4)).forward_mark, ForwardMark::Many);
+    let (a, b) = (row(&src, id(1)), row(&src, id(2)));
+    assert!(a != b);
+    assert_eq!(ForwardMark::Many.as_str(), "many");
+    assert_eq!(ForwardMark::None.as_str(), "");
 }

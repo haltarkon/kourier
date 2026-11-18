@@ -243,6 +243,7 @@ fn every_enum_roundtrips_by_name() {
             body: Body::text("hi"),
             reply_to: Some(ReplyTo { target: target(), author: Some(uid("aci:a")), snapshot: None }),
             expiry: Some(Duration::from_secs(30)),
+            forward: None,
         },
         Edit => OutgoingKind::Edit { target: target(), body: Body::text("fixed") },
         Delete => OutgoingKind::Delete { target: target(), for_everyone: true },
@@ -850,6 +851,7 @@ impl EchoNetwork {
                 cleaned_pictures: None,
                 receipts_always_sent: false,
                 server: ServerRules::default(),
+                forwards: None,
             },
         }
     }

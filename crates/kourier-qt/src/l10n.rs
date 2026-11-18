@@ -8,7 +8,7 @@
 //! its count to choose the form, and KI18n writes that count into `%1` itself.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -118,8 +118,19 @@ impl Translator for KdeTranslator {
 pub fn install() {
     qt::set_application_domain(DOMAIN);
     clear_cache();
+    // The catalogs beside the program, when there are any: the AppImage's and those of an
+    // unpacked archive that runs where it was unpacked.
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(catalog_dir_beside)
+        .filter(|dir| dir.is_dir())
+    {
+        add_catalog_dir(&dir);
+    }
     // A run that is not installed finds the catalogs `cargo xtask i18n build` wrote (debug
-    // builds only: an installed application reads the system's `share/locale`).
+    // builds only: an installed application reads the system's `share/locale`). KI18n keeps one
+    // folder per domain, so this one wins over the one beside the program.
     #[cfg(debug_assertions)]
     if let Some(dir) = std::env::var_os("KOURIER_LOCALE_DIR") {
         add_catalog_dir(Path::new(&dir));
@@ -136,8 +147,16 @@ pub fn setup_engine(engine: Pin<&mut QQmlApplicationEngine>) {
     qt::setup_localized_context(engine, DOMAIN);
 }
 
-/// Catalogs are also looked for under `dir` (`<dir>/<language>/LC_MESSAGES/kourier.mo`):
-/// tests, and a debug run with `KOURIER_LOCALE_DIR` ([`install`]).
+/// Where the catalogs of the program at `exe` lie when it is not installed: `<prefix>/bin/kourier`
+/// has them in `<prefix>/share/locale` (the AppImage's `usr/`, an unpacked archive's top folder;
+/// architecture §14.1). KI18n looks only in the XDG data folders, which hold neither.
+fn catalog_dir_beside(exe: &Path) -> Option<PathBuf> {
+    Some(exe.parent()?.parent()?.join("share/locale"))
+}
+
+/// Catalogs are also looked for under `dir` (`<dir>/<language>/LC_MESSAGES/kourier.mo`) before
+/// the XDG data folders: the folder beside the program, tests, and a debug run with
+/// `KOURIER_LOCALE_DIR` ([`install`]). KI18n keeps one such folder per domain: the last call wins.
 #[doc(hidden)]
 pub fn add_catalog_dir(dir: &Path) {
     qt::add_locale_dir(DOMAIN, &QString::from(dir.to_string_lossy().as_ref()));
@@ -153,4 +172,26 @@ pub fn set_languages(languages: &[&str]) {
     }
     qt::set_languages(&list);
     clear_cache();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The AppImage's mount, an unpacked archive and an installed program each have their
+    /// catalogs in `share/locale` beside `bin/`; a bare name has no folder to look in.
+    #[test]
+    fn the_catalogs_beside_the_program_are_in_share_locale() {
+        assert_eq!(
+            catalog_dir_beside(Path::new("/tmp/.mount_KourieAbC123/usr/bin/kourier")),
+            Some(PathBuf::from("/tmp/.mount_KourieAbC123/usr/share/locale"))
+        );
+        assert_eq!(
+            catalog_dir_beside(Path::new("/home/p/kourier-0.1.0-linux-x86_64/bin/kourier")),
+            Some(PathBuf::from(
+                "/home/p/kourier-0.1.0-linux-x86_64/share/locale"
+            ))
+        );
+        assert_eq!(catalog_dir_beside(Path::new("kourier")), None);
+    }
 }

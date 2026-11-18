@@ -529,9 +529,9 @@ impl Apply<'_> {
                    origin, device, linked_message_id, sort_key, sent_at, server_at, received_at,
                    arrival, body_kind, body, preview, reply_to, out_floor, out_state, read_state,
                    expiry_kind, expiry_timer_ms, expiry_started_at, expires_at, view_once, history,
-                   silent, mentions_me, meta, raw, net_seq)
+                   silent, mentions_me, meta, raw, net_seq, forwarded)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                   ?18, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                   ?18, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             )?
             .execute(params![
                 self.acc.id.0,
@@ -564,6 +564,7 @@ impl Apply<'_> {
                 m.meta.as_ref().map(sql::blob_to_sql),
                 m.raw.as_ref().map(sql::blob_to_sql),
                 m.net_seq,
+                m.forwarded.map(|f| i64::from(f.score)),
             ])?;
         let id = MessageId(self.conn.last_insert_rowid());
         if has_attachments(&m.body) {
@@ -696,7 +697,8 @@ impl Apply<'_> {
             self.conn
                 .prepare_cached(
                     "UPDATE messages SET body_kind = ?2, body = ?3, preview = ?4, reply_to = ?5,
-                       view_once = ?6, mentions_me = ?7, meta = ?8, raw = ?9 WHERE id = ?1",
+                       view_once = ?6, mentions_me = ?7, meta = ?8, raw = ?9,
+                       forwarded = COALESCE(forwarded, ?10) WHERE id = ?1",
                 )?
                 .execute(params![
                     ex.id.0,
@@ -708,6 +710,7 @@ impl Apply<'_> {
                     m.mentions_me,
                     m.meta.as_ref().map(sql::blob_to_sql),
                     m.raw.as_ref().map(sql::blob_to_sql),
+                    m.forwarded.map(|f| i64::from(f.score)),
                 ])?;
             self.delete_attachments(ex.id)?;
             if has_attachments(&m.body) {

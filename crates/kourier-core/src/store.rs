@@ -60,6 +60,9 @@ pub const MIGRATIONS: Migrations = Migrations::new(
         // (3D viewer V2, the model mark of an attachment; the number is settled at the landing,
         // the tests find the step by its name, `_model3d`.)
         migration!(27, "0027_model3d"),
+        // (Forward line F1, the forward state of a message; the number is settled at the landing,
+        // the tests find the step by its name, `_forwarded`.)
+        migration!(28, "0028_forwarded"),
     ],
 );
 
@@ -828,6 +831,7 @@ mod tests {
                             1_700_000_100_000,
                             true,
                             &Default::default(),
+                            None,
                             None,
                         )?;
                         crate::query::page_media(c, &p)?;

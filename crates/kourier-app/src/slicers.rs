@@ -477,8 +477,9 @@ pub fn application_dirs_now(fixture: bool) -> Vec<PathBuf> {
 }
 
 /// The command that starts `entry` with the file at `file` (an absolute path): the `Exec`'s
-/// arguments, no standard streams, a process group of its own, every name of `drop_env` and every
-/// development variable taken out of the CHILD's environment ([`crate::opener`]), the working
+/// arguments, no standard streams, a process group of its own, every name of `drop_env`, every
+/// development variable and what the AppImage runtime set taken out of the CHILD's environment
+/// ([`crate::opener`], [`crate::process::child_env_drop`]), the working
 /// directory `Path=` when it is a folder, else the home folder. Nothing is started. `None` when the
 /// file path is not absolute or the `Exec` cannot be used.
 pub fn command(entry: &DesktopEntry, file: &Path, drop_env: &[&str]) -> Option<Command> {
@@ -496,7 +497,7 @@ pub fn command(entry: &DesktopEntry, file: &Path, drop_env: &[&str]) -> Option<C
     for name in drop_env {
         command.env_remove(name);
     }
-    for name in crate::process::dev_env_names_now() {
+    for name in crate::process::child_env_drop_now() {
         command.env_remove(name);
     }
     let dir = entry.work_dir.clone().filter(|p| p.is_dir()).or_else(|| {

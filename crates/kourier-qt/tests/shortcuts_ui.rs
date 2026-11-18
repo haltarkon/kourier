@@ -101,8 +101,19 @@ MainWindow {
         return win.find(win.pageStack.get(0), i => i.placeholderText === "Search" && i.selectAll !== undefined);
     }
 
+    // The staged forward's card (its Look combo holds a text field of its own) is no text area.
+    function inForwardCard(item: Item): bool {
+        const card = win.chatPage.composer.forwardCard;
+        for (let c = item; c; c = c.parent) {
+            if (c === card) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function composerField(): Item {
-        return win.chatPage ? win.find(win.chatPage.composer, i => i.placeholderText !== undefined && i.cursorPosition !== undefined) : null;
+        return win.chatPage ? win.find(win.chatPage.composer, i => i.placeholderText !== undefined && i.cursorPosition !== undefined && !win.inForwardCard(i)) : null;
     }
 
     // Buttons and text fields on screen that a screen reader would meet without a name.

@@ -45,9 +45,9 @@
 //! 6. Packs it deterministically ([`pack_tree`]), packs `git archive <the commit>` and writes
 //!    `SHA256SUMS`.
 //! 7. Unpacks what it packed and checks it ([`verify`]): the tree holds exactly the expected
-//!    paths, `bin/kourier --version` prints the version and `--fixture` is refused, a profile
-//!    that turns WhatsApp on gets no WhatsApp from the packed binary (`--print-networks`,
-//!    [`check_release_networks`]), the binary is no measuring build, the names archive holds exactly the names file whose build-id, debuglink name and CRC match the packed binary (which has no symbol table), the desktop file claims no link scheme, the notices name SQLCipher
+//!    paths, `bin/kourier --version` prints the version and `--fixture` is refused, the packed
+//!    binary registers WhatsApp on a profile that turns it on and lists it as off on one whose
+//!    file names nothing, with Threema on in both (`--print-networks`, [`check_release_networks`]), the binary is no measuring build, the names archive holds exactly the names file whose build-id, debuglink name and CRC match the packed binary (which has no symbol table), the desktop file claims no link scheme, the notices name SQLCipher
 //!    and BoringSSL, `desktop-file-validate` and `appstreamcli validate` pass, no file holds a
 //!    private name, and the source archive is the commit with plain modes.
 //!
@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use super::appimage;
 use super::install::{self, APP_ID, BINARY, Sources};
 use super::{cargo, root, run, target_dir};
 
@@ -69,7 +70,7 @@ use super::{cargo, root, run, target_dir};
 const PLACEHOLDER_APP_ID: &str = "app.kourier.Kourier";
 
 /// The URI of Kourier's own QML module: not a system requirement.
-const OWN_QML_MODULE: &str = "app.kourier";
+pub(crate) const OWN_QML_MODULE: &str = "app.kourier";
 
 /// The mark of a blank the maintainer has to fill (spelled in two pieces so that this file
 /// does not count itself).
@@ -92,14 +93,18 @@ const MAPPED_TOOLCHAIN: &str = "/rust-toolchain";
 /// named for the tool, because both are removed at the start of a run and at its end.
 const STAGE_DIR: &str = ".dist-stage";
 const VERIFY_DIR: &str = ".dist-verify";
+/// The AppDir the AppImage is made from, with its log: below the output directory, removed
+/// when the run ends.
+pub(crate) const APPIMAGE_DIR: &str = ".dist-appimage";
 /// The checksum file of the names archive. Its own file, so the published `SHA256SUMS` stays
 /// right whether or not the names archive is published beside the others (critic MEDIUM-2).
 const NAMES_SUMS: &str = "SHA256SUMS.names";
 
 /// The cargo arguments that choose the features of the public binary: the Signal backend, the
 /// Threema backend (on by default in every build: the user's decision of 2026-11-09) and the
-/// WhatsApp backend (compiled in since W2b; a release build does not REGISTER it, so the archive
-/// links no real WhatsApp account: `kourier-app` `whatsapp_registration`), and not the scripted
+/// WhatsApp backend (compiled in since W2b; registered while `networks-on` names it, listed as off
+/// otherwise, a release build as a debug one since the user's word of 2026-11-18: `kourier-app`
+/// `whatsapp_registration`), and not the scripted
 /// test network (`--fixture`, `--fixture-link`, the "Test network" on the welcome page;
 /// `crates/kourier/Cargo.toml`).
 const BUILD_FEATURE_ARGS: [&str; 3] = [
@@ -131,14 +136,17 @@ const NETWORKS_LINE_HEAD: &str = "networks";
 /// `Paths::from_env`: `<home>/kourier/config/kourier.toml`; a test compares).
 const NETWORKS_PREFS_PATH: &str = "kourier/config/kourier.toml";
 
-/// The preferences the check writes: the user turned WhatsApp on (the file is meant to be edited
-/// by hand, so the name is lower case here and must still be found) and the file says nothing of
-/// Threema, which is on by default.
+/// The preferences of the check's first profile: the user turned WhatsApp on (the file is meant to
+/// be edited by hand, so the name is lower case here and must still be found) and the file says
+/// nothing of Threema, which is on by default. The second profile's file is empty
+/// ([`NetworksCase::Plain`]).
 const NETWORKS_PREFS: &str = "networks-on = [\"whatsapp\"]\n";
 
-/// The networks a release binary must offer in no list although [`NETWORKS_PREFS`] turns them on
-/// (`kourier-app` `whatsapp_registration`).
-const GATED_NETWORKS: [&str; 1] = ["WhatsApp"];
+/// The networks a release binary registers while the profile's `networks-on` names them and lists
+/// as "compiled in but off" otherwise (`kourier-app` `whatsapp_registration`; until 2026-11-18 a
+/// release build offered WhatsApp in no list, then the user said so: "But I have real runs. I'm
+/// actevelly using it on other PC").
+const SWITCHED_NETWORKS: [&str; 1] = ["WhatsApp"];
 
 /// The networks a release binary must register with nothing in the file (`kourier-app`
 /// `threema_registration`; the user's decision of 2026-11-09).
@@ -164,7 +172,7 @@ const DESKTOP_STYLE_MODULE: &str = "org.kde.desktop";
 const KF6_PROBE: &str = "KF6CoreAddons";
 
 /// How long `bin/kourier --version` may take.
-const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// User names that fixtures and examples use; `/home/<one of them>` names nobody. A name of
 /// one character is one as well.
@@ -183,21 +191,22 @@ const PRIVATE_TILDE_ROOTS: [&str; 2] = [
 ];
 
 const USAGE: &str =
-    "usage: cargo xtask dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build]
+    "usage: cargo xtask dist [--out <dir>] [--release] [--allow-dirty] [--allow-paths] [--no-build] [--no-appimage]
 
   --out <dir>     write the archives below <dir> (default: target/dist)
   --release       the real thing: every finding in NOT-READY.txt is an error and nothing is
                   built or left behind; only this writes names without a suffix; refuses
-                  --allow-dirty, --allow-paths and --no-build
+                  --allow-dirty, --allow-paths, --no-build and --no-appimage
   --allow-dirty   pack a working tree with uncommitted changes (every name ends in -dirty;
                   the source archive is still the last commit)
   --allow-paths   keep going when the binary still holds a private name (the home directory,
                   the user name, /media/, the host name, git's name and address)
   --no-build      pack the binary that target/dist-build holds, if its stamp names this
                   commit and state
+  --no-appimage   do not make the AppImage (the default makes one; a release ships both)
 
 Without --release the names end in -unreleased. The output directory is emptied of earlier
-archives (kourier-*.tar.gz, SHA256SUMS, NOT-READY.txt) first.";
+archives (kourier-*.tar.gz, kourier-*.AppImage, SHA256SUMS, NOT-READY.txt) first.";
 
 // ---------------------------------------------------------------------------------------
 // Options and names
@@ -215,6 +224,8 @@ pub struct Options {
     pub allow_paths: bool,
     /// Pack the binary that is there.
     pub no_build: bool,
+    /// Do not make the AppImage.
+    pub no_appimage: bool,
 }
 
 /// Parses the arguments of `dist`; a relative `--out` is relative to `cwd`.
@@ -247,6 +258,7 @@ fn parse_flags(args: &[String], cwd: &Path) -> Result<Options> {
         allow_dirty: false,
         allow_paths: false,
         no_build: false,
+        no_appimage: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -255,6 +267,7 @@ fn parse_flags(args: &[String], cwd: &Path) -> Result<Options> {
             "--allow-dirty" => opts.allow_dirty = true,
             "--allow-paths" => opts.allow_paths = true,
             "--no-build" => opts.no_build = true,
+            "--no-appimage" => opts.no_appimage = true,
             "--out" => {
                 let dir = it.next().context("--out needs a directory")?;
                 opts.out = out_dir(dir, cwd)?;
@@ -282,6 +295,11 @@ impl Options {
                         "--release and {flag} exclude each other: a release comes from a clean commit, built now, without private paths\n{USAGE}"
                     );
                 }
+            }
+            if self.no_appimage {
+                bail!(
+                    "--release and --no-appimage exclude each other: a release ships the archives and the AppImage\n{USAGE}"
+                );
             }
         }
         Ok(())
@@ -344,6 +362,8 @@ pub struct Names {
     pub source_dir: String,
     /// `kourier-<version>-source[-suffix].tar.gz`.
     pub source_archive: String,
+    /// `<stage>.AppImage`.
+    pub appimage: String,
 }
 
 /// The names for `version` on `arch`: the grade's suffix is in the file name and in the top
@@ -353,6 +373,7 @@ pub fn archive_names(version: &str, arch: &str, grade: Grade) -> Names {
     let stage = format!("kourier-{version}-linux-{arch}{suffix}");
     Names {
         binary_archive: format!("{stage}.tar.gz"),
+        appimage: format!("{stage}.AppImage"),
         names_archive: format!("kourier-{version}-linux-{arch}-names{suffix}.tar.gz"),
         stage,
         source_dir: format!("kourier-{version}{suffix}"),
@@ -436,7 +457,7 @@ fn export_ignored(output: &str) -> Vec<String> {
 }
 
 /// Runs `cmd` and returns its standard output; a failure carries its standard error.
-fn stdout_of(cmd: &mut Command, what: &str) -> Result<String> {
+pub(crate) fn stdout_of(cmd: &mut Command, what: &str) -> Result<String> {
     let out = cmd.output().with_context(|| format!("run {what}"))?;
     if !out.status.success() {
         bail!(
@@ -622,13 +643,23 @@ impl Extra {
     }
 }
 
+/// Whether the host name is the project's own name (ignoring the case of ASCII letters): a
+/// builder container that is called `kourier` makes every "Kourier" string of the program a
+/// private name, so such a host name is not searched ([`extra_needles`]).
+pub fn host_is_project_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case(BINARY)
+}
+
 /// The needles for `extra` and for the project's former name. A value shorter than
 /// [`MIN_NEEDLE_LEN`] bytes is left out (it would match everything); the label of every needle
 /// that is searched is printed by `dist`, so what was left out shows.
 pub fn extra_needles(extra: &Extra) -> Vec<Needle> {
     let mut out = Vec::new();
     for (label, value) in [
-        ("the host name", &extra.host),
+        (
+            "the host name",
+            &extra.host.clone().filter(|h| !host_is_project_name(h)),
+        ),
         ("git's user.name", &extra.git_name),
         ("git's user.email", &extra.git_email),
     ] {
@@ -686,7 +717,7 @@ impl Scan {
 }
 
 /// Offsets where `needle` starts in `hay`.
-fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+pub(crate) fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
     let Some((&first, _)) = needle.split_first() else {
         return out;
@@ -1154,7 +1185,7 @@ fn stamp_path(build: &Path) -> PathBuf {
 }
 
 /// The SHA-256 of a file, by `sha256sum`.
-fn sha256_of(path: &Path) -> Result<String> {
+pub(crate) fn sha256_of(path: &Path) -> Result<String> {
     let out = stdout_of(Command::new("sha256sum").arg(path), "sha256sum")?;
     out.split_whitespace()
         .next()
@@ -1373,7 +1404,7 @@ pub fn parse_dpkg_search(output: &str) -> Vec<String> {
 }
 
 /// The packages that own `path` on this system (none when dpkg is missing or knows no owner).
-fn dpkg_owner(path: &Path) -> Vec<String> {
+pub(crate) fn dpkg_owner(path: &Path) -> Vec<String> {
     Command::new("dpkg")
         .arg("-S")
         .arg(path)
@@ -1494,14 +1525,14 @@ pub fn render_requirements(r: &Requirements) -> String {
 }
 
 /// Where the shared libraries are searched on this machine.
-fn library_dirs(arch: &str) -> [PathBuf; 2] {
+pub(crate) fn library_dirs(arch: &str) -> [PathBuf; 2] {
     [
         PathBuf::from(format!("/usr/lib/{arch}-linux-gnu")),
         PathBuf::from(format!("/lib/{arch}-linux-gnu")),
     ]
 }
 
-fn qmake_query(variable: &str) -> Option<String> {
+pub(crate) fn qmake_query(variable: &str) -> Option<String> {
     let qmake = std::env::var("QMAKE").unwrap_or_else(|_| "/usr/bin/qmake6".to_owned());
     Command::new(qmake)
         .args(["-query", variable])
@@ -1912,7 +1943,7 @@ pub fn checksums(dir: &Path, names: &[&str]) -> Result<String> {
 // Verifying what was packed
 
 /// Runs `cmd` for at most `limit`; kills it (it is our own child) when that is over.
-fn run_limited(mut cmd: Command, limit: Duration) -> Result<std::process::Output> {
+pub(crate) fn run_limited(mut cmd: Command, limit: Duration) -> Result<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1965,11 +1996,24 @@ pub fn check_version_output(
     home: &Path,
     limit: Duration,
 ) -> Result<()> {
+    check_version_output_with(binary, version, home, limit, &[])
+}
+
+/// [`check_version_output`] with more variables in the otherwise empty environment (the
+/// AppImage's own file is started with `APPIMAGE_EXTRACT_AND_RUN`).
+pub fn check_version_output_with(
+    binary: &Path,
+    version: &str,
+    home: &Path,
+    limit: Duration,
+    env: &[(&str, &Path)],
+) -> Result<()> {
     let mut cmd = Command::new(binary);
     cmd.arg("--version")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home);
+    cmd.envs(env.iter().copied());
     let out =
         run_limited(cmd, limit).with_context(|| format!("run {} --version", binary.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2069,43 +2113,101 @@ pub fn parse_networks_line(stdout: &str) -> Result<NetworksLine> {
     })
 }
 
-/// What is wrong with a [`NetworksLine`] of a RELEASE binary whose profile turned the
-/// [`GATED_NETWORKS`] on: it registers one, or lists one as off (the lane decisions: no archive
-/// links a real account of them), or the line does not show that the switch of each was read (then
-/// the empty lists prove nothing); or it does not register one of the [`DEFAULT_ON_NETWORKS`].
-pub fn networks_line_problems(line: &NetworksLine) -> Vec<String> {
+/// One profile [`check_release_networks`] runs the packed binary on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworksCase {
+    /// `kourier.toml` is [`NETWORKS_PREFS`]: the user turned WhatsApp on.
+    WhatsAppOn,
+    /// `kourier.toml` is empty: a profile whose file names nothing.
+    Plain,
+}
+
+impl NetworksCase {
+    /// Both, in the order the check runs them.
+    pub const ALL: [NetworksCase; 2] = [NetworksCase::WhatsAppOn, NetworksCase::Plain];
+
+    /// The text of the profile's `kourier.toml`.
+    fn prefs(self) -> &'static str {
+        match self {
+            NetworksCase::WhatsAppOn => NETWORKS_PREFS,
+            NetworksCase::Plain => "",
+        }
+    }
+
+    /// The profile as the check's messages name it.
+    fn describe(self) -> String {
+        match self {
+            NetworksCase::WhatsAppOn => format!("a profile with {}", NETWORKS_PREFS.trim()),
+            NetworksCase::Plain => "a profile whose kourier.toml is empty".to_owned(),
+        }
+    }
+}
+
+/// What is wrong with a [`NetworksLine`] of a RELEASE binary on the profile of `case`: one of the
+/// [`SWITCHED_NETWORKS`] is not registered although the profile turns it on (or is listed as off
+/// then), or, on the plain profile, is registered or not listed as off (the user turns it on in
+/// Settings, after its risk notice); the line does not show that the switch was read (then the
+/// lists prove nothing); or one of the [`DEFAULT_ON_NETWORKS`] is not registered.
+pub fn networks_line_problems(case: NetworksCase, line: &NetworksLine) -> Vec<String> {
     let mut problems = Vec::new();
-    for network in GATED_NETWORKS {
-        let names = |kinds: &[String]| kinds.iter().any(|k| k.eq_ignore_ascii_case(network));
-        if names(&line.registered) {
-            problems.push(format!(
-                "the packed binary REGISTERS {network} (registered={})",
-                line.registered.join(",")
-            ));
-        }
-        if names(&line.off) {
-            problems.push(format!(
-                "the packed binary lists {network} as off (off={}); a release build offers it in no list",
-                line.off.join(",")
-            ));
-        }
-        if !names(&line.on) {
-            problems.push(format!(
-                "the binary did not read the preferences that turn {network} on (on={}): the check proves nothing",
-                line.on.join(",")
-            ));
+    let names =
+        |kinds: &[String], network: &str| kinds.iter().any(|k| k.eq_ignore_ascii_case(network));
+    for network in SWITCHED_NETWORKS {
+        let registered = names(&line.registered, network);
+        let off = names(&line.off, network);
+        let on = names(&line.on, network);
+        match case {
+            NetworksCase::WhatsAppOn => {
+                if !on {
+                    problems.push(format!(
+                        "the binary did not read the preferences that turn {network} on (on={}): the check proves nothing",
+                        line.on.join(",")
+                    ));
+                }
+                if !registered {
+                    problems.push(format!(
+                        "the packed binary does not register {network} although the profile turns it on (registered={})",
+                        line.registered.join(",")
+                    ));
+                }
+                if off {
+                    problems.push(format!(
+                        "the packed binary lists {network} as off although the profile turns it on (off={})",
+                        line.off.join(",")
+                    ));
+                }
+            }
+            NetworksCase::Plain => {
+                if on {
+                    problems.push(format!(
+                        "the binary names {network} as on although the profile's file names nothing (on={})",
+                        line.on.join(",")
+                    ));
+                }
+                if registered {
+                    problems.push(format!(
+                        "the packed binary REGISTERS {network} although nothing turns it on (registered={})",
+                        line.registered.join(",")
+                    ));
+                }
+                if !off {
+                    problems.push(format!(
+                        "the packed binary does not list {network} as off (off={}); a release build offers it as compiled in but off",
+                        line.off.join(",")
+                    ));
+                }
+            }
         }
     }
     for network in DEFAULT_ON_NETWORKS {
-        let names = |kinds: &[String]| kinds.iter().any(|k| k.eq_ignore_ascii_case(network));
-        if !names(&line.registered) {
+        if !names(&line.registered, network) {
             problems.push(format!(
                 "the packed binary does not register {network}, which is on by default (registered={}, off={})",
                 line.registered.join(","),
                 line.off.join(",")
             ));
         }
-        if !names(&line.on) {
+        if !names(&line.on, network) {
             problems.push(format!(
                 "the binary did not read the preferences that turn {network} on (on={}): the check proves nothing",
                 line.on.join(",")
@@ -2115,16 +2217,30 @@ pub fn networks_line_problems(line: &NetworksLine) -> Vec<String> {
     problems
 }
 
-/// Runs `binary --print-networks` as a user would (an empty environment, a private home) on a
-/// profile whose `kourier.toml` has `networks-on = ["whatsapp"]` (a `KOURIER_HOME` below `work`) and
-/// fails when WhatsApp is registered or listed as off, or Threema is not registered: a RELEASE build
-/// neither registers nor lists WhatsApp (`kourier-app` `whatsapp_registration`, lane decision L1) and
-/// has Threema on by default (`threema_registration`), which no test of a debug build can show. The flag starts nothing: no window, no database, no keyring, no network.
+/// Runs `binary --print-networks` as a user would (an empty environment, a private home) on each
+/// profile of [`NetworksCase::ALL`] (a `KOURIER_HOME` below `work`, removed after each run) and
+/// fails on the first [`networks_line_problems`]: a RELEASE build registers WhatsApp while the
+/// profile turns it on and lists it as off otherwise (`kourier-app` `whatsapp_registration`) and has
+/// Threema on by default (`threema_registration`), which no test of a debug build can show. The
+/// flag starts nothing: no window, no database, no keyring, no network.
 pub fn check_release_networks(binary: &Path, work: &Path, limit: Duration) -> Result<()> {
+    for case in NetworksCase::ALL {
+        check_release_networks_on(binary, work, limit, case)?;
+    }
+    Ok(())
+}
+
+/// One run of [`check_release_networks`], on the profile of `case`.
+fn check_release_networks_on(
+    binary: &Path,
+    work: &Path,
+    limit: Duration,
+    case: NetworksCase,
+) -> Result<()> {
     let home = work.join(NETWORKS_HOME_DIR);
     let prefs = home.join(NETWORKS_PREFS_PATH);
     std::fs::create_dir_all(prefs.parent().context("the preferences' directory")?)?;
-    std::fs::write(&prefs, NETWORKS_PREFS)?;
+    std::fs::write(&prefs, case.prefs())?;
     let mut cmd = Command::new(binary);
     cmd.arg(PRINT_NETWORKS_FLAG)
         .env_clear()
@@ -2133,24 +2249,36 @@ pub fn check_release_networks(binary: &Path, work: &Path, limit: Duration) -> Re
         .env("KOURIER_HOME", &home);
     let out = run_limited(cmd, limit);
     let _ = std::fs::remove_dir_all(&home);
-    let out = out.with_context(|| format!("run {} {PRINT_NETWORKS_FLAG}", binary.display()))?;
+    let out = out.with_context(|| {
+        format!(
+            "run {} {PRINT_NETWORKS_FLAG} on {}",
+            binary.display(),
+            case.describe()
+        )
+    })?;
     if !out.status.success() {
         bail!(
-            "{} {PRINT_NETWORKS_FLAG} exited with {}: {}",
+            "{} {PRINT_NETWORKS_FLAG} on {} exited with {}: {}",
             binary.display(),
+            case.describe(),
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = parse_networks_line(&stdout)
-        .with_context(|| format!("{PRINT_NETWORKS_FLAG} of {}", binary.display()))?;
-    let problems = networks_line_problems(&line);
+    let line = parse_networks_line(&stdout).with_context(|| {
+        format!(
+            "{PRINT_NETWORKS_FLAG} of {} on {}",
+            binary.display(),
+            case.describe()
+        )
+    })?;
+    let problems = networks_line_problems(case, &line);
     if !problems.is_empty() {
         bail!(
-            "{} {PRINT_NETWORKS_FLAG} on a profile with {} said {:?}:\n  {}",
+            "{} {PRINT_NETWORKS_FLAG} on {} said {:?}:\n  {}",
             binary.display(),
-            NETWORKS_PREFS.trim(),
+            case.describe(),
             stdout.trim(),
             problems.join("\n  ")
         );
@@ -2208,13 +2336,14 @@ fn stage_names(parent: &Path, stage: &str, names_file: &Path, build_id: &str) ->
 }
 
 /// The checksum files of a run and the archives each one lists: `SHA256SUMS` the binary and the
-/// source archive, `SHA256SUMS.names` the names archive alone.
-fn checksum_files(names: &Names) -> [(&'static str, Vec<&str>); 2] {
+/// source archive (and the AppImage when one is made), `SHA256SUMS.names` the names archive alone.
+fn checksum_files(names: &Names, appimage: bool) -> [(&'static str, Vec<&str>); 2] {
+    let mut published = vec![&names.binary_archive, &names.source_archive];
+    if appimage {
+        published.push(&names.appimage);
+    }
     [
-        (
-            "SHA256SUMS",
-            vec![&names.binary_archive, &names.source_archive],
-        ),
+        ("SHA256SUMS", published),
         (NAMES_SUMS, vec![&names.names_archive]),
     ]
     .map(|(file, listed)| (file, listed.into_iter().map(String::as_str).collect()))
@@ -2380,7 +2509,7 @@ fn verify_unpacked(
     }
     check_version_output(&binary, version, work, VERSION_TIMEOUT)?;
     check_fixture_refused(&binary, work, VERSION_TIMEOUT)?;
-    // The release arm of the WhatsApp rule: a release binary registers and lists nothing of it.
+    // The WhatsApp rule on a release binary: registered while on, listed as off otherwise.
     check_release_networks(&binary, work, VERSION_TIMEOUT)?;
     // The public archive claims no link scheme (it would compete with a Signal Desktop).
     let layout = install::Layout::new(&root_dir);
@@ -2701,7 +2830,7 @@ pub fn not_ready_findings(
 // ---------------------------------------------------------------------------------------
 // The command
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
@@ -2736,7 +2865,10 @@ pub fn is_dist_output(name: &str) -> bool {
         || name == NAMES_SUMS
         || name == "NOT-READY.txt"
         || (name.starts_with("kourier-")
-            && (name.ends_with(".tar.gz") || name.ends_with(".tar.gz.partial")))
+            && (name.ends_with(".tar.gz")
+                || name.ends_with(".tar.gz.partial")
+                || name.ends_with(".AppImage")
+                || name.ends_with(".AppImage.partial")))
 }
 
 /// Removes from `out` what an earlier run of `dist` left ([`is_dist_output`], and the stage and
@@ -2755,7 +2887,7 @@ pub fn clear_outputs(out: &Path) -> Result<Vec<String>> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         let kind = std::fs::symlink_metadata(&path)?.file_type();
-        if name == STAGE_DIR || name == VERIFY_DIR {
+        if name == STAGE_DIR || name == VERIFY_DIR || name == APPIMAGE_DIR {
             if kind.is_dir() {
                 std::fs::remove_dir_all(&path)
                     .with_context(|| format!("remove {}", path.display()))?;
@@ -2841,7 +2973,11 @@ pub fn dist(args: &[String]) -> Result<()> {
     }
     let version = workspace_version(&std::fs::read_to_string(root().join("Cargo.toml"))?)?;
     std::fs::create_dir_all(&out).with_context(|| format!("create {}", out.display()))?;
-    let _cleanup = Cleanup(vec![out.join(STAGE_DIR), out.join(VERIFY_DIR)]);
+    let _cleanup = Cleanup(vec![
+        out.join(STAGE_DIR),
+        out.join(VERIFY_DIR),
+        out.join(APPIMAGE_DIR),
+    ]);
 
     // The findings first: it is cheap, and a release with findings builds nothing.
     let tracked: Vec<String> = git(&["ls-files", "-z"])?
@@ -2872,6 +3008,7 @@ pub fn dist(args: &[String]) -> Result<()> {
 
     // Past this point a `--release` run has no finding and no tree with changes.
     let grade = grade_of(dirty, opts.release);
+    let make_appimage = !opts.no_appimage;
     let names = archive_names(&version, std::env::consts::ARCH, grade);
     eprintln!(
         "dist: Kourier {version} from commit {} ({}){}",
@@ -2948,6 +3085,11 @@ pub fn dist(args: &[String]) -> Result<()> {
         stamp.rustc
     );
     let needles = all_needles(&who, &extra);
+    if extra.host.as_deref().is_some_and(host_is_project_name) {
+        eprintln!(
+            "dist: the host name equals the project's own name and is not searched (every \"{BINARY}\" string would count)"
+        );
+    }
     eprintln!(
         "dist: searched for: {}",
         needles
@@ -3067,11 +3209,14 @@ pub fn dist(args: &[String]) -> Result<()> {
         out.join(&names.names_archive),
         out.join(&names.source_archive),
     ];
+    let appimage_file = out.join(&names.appimage);
     let remove_archives = || {
         for archive in &archives {
             remove_if_there(archive);
         }
-        for (file, _) in checksum_files(&names) {
+        remove_if_there(&appimage_file);
+        remove_if_there(&out.join(format!("{}.partial", names.appimage)));
+        for (file, _) in checksum_files(&names, make_appimage) {
             remove_if_there(&out.join(file));
         }
     };
@@ -3094,7 +3239,17 @@ pub fn dist(args: &[String]) -> Result<()> {
             &commit.hash,
             &out.join(&names.source_archive),
         )?;
-        for (file, listed) in checksum_files(&names) {
+        if make_appimage {
+            appimage::make(&appimage::Request {
+                out: &out,
+                stage: &stage,
+                name: &names.appimage,
+                version: &version,
+                commit_time: commit.time,
+                arch: std::env::consts::ARCH,
+            })?;
+        }
+        for (file, listed) in checksum_files(&names, make_appimage) {
             std::fs::write(out.join(file), checksums(&out, &listed)?)?;
         }
         let work = out.join(VERIFY_DIR);
@@ -3121,13 +3276,23 @@ pub fn dist(args: &[String]) -> Result<()> {
             verified.scans.push(hit);
         }
         let _ = std::fs::remove_dir_all(&work);
+        if make_appimage {
+            verified.scans.extend(appimage::verify(&appimage::Check {
+                work: &work.join("appimage"),
+                file: &appimage_file,
+                shipped: &split.shipped,
+                version: &version,
+                needles: &needles,
+            })?);
+            let _ = std::fs::remove_dir_all(&work);
+        }
         verify_source(
             &out.join(&names.source_archive),
             &names,
             &commit.hash,
             &hidden,
         )?;
-        for (file, _) in checksum_files(&names) {
+        for (file, _) in checksum_files(&names, make_appimage) {
             let check = Command::new("sha256sum")
                 .current_dir(&out)
                 .args(["--check", "--strict", "--quiet", file])
@@ -3163,17 +3328,20 @@ pub fn dist(args: &[String]) -> Result<()> {
         &commit.hash[..12]
     );
     eprintln!("dist: files in {}:", out.display());
-    for name in [
+    let mut listed = vec![
         names.binary_archive.as_str(),
         names.names_archive.as_str(),
         names.source_archive.as_str(),
-        "SHA256SUMS",
-        NAMES_SUMS,
-    ] {
+    ];
+    if make_appimage {
+        listed.push(names.appimage.as_str());
+    }
+    listed.extend(["SHA256SUMS", NAMES_SUMS]);
+    for name in listed {
         let size = std::fs::metadata(out.join(name))?.len();
         eprintln!("dist:   {name}  {} ({size} bytes)", human(size));
     }
-    for (file, _) in checksum_files(&names) {
+    for (file, _) in checksum_files(&names, make_appimage) {
         eprint!("{}", std::fs::read_to_string(out.join(file))?);
     }
     eprintln!(
@@ -3546,6 +3714,7 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         assert_eq!(n.names_archive, "kourier-0.1.0-linux-x86_64-names.tar.gz");
         assert_eq!(n.source_dir, "kourier-0.1.0");
         assert_eq!(n.source_archive, "kourier-0.1.0-source.tar.gz");
+        assert_eq!(n.appimage, "kourier-0.1.0-linux-x86_64.AppImage");
         // Everything that did not pass the gate says so in the file name AND the top
         // directory of both archives.
         let d = archive_names("0.1.0", "aarch64", Grade::Dirty);
@@ -3569,6 +3738,7 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         );
         assert_eq!(u.source_dir, "kourier-0.1.0-unreleased");
         assert_eq!(u.source_archive, "kourier-0.1.0-source-unreleased.tar.gz");
+        assert_eq!(u.appimage, "kourier-0.1.0-linux-x86_64-unreleased.AppImage");
     }
 
     #[test]
@@ -3613,7 +3783,9 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
         .expect("flags");
         assert!(o.allow_dirty && o.no_build && o.allow_paths && !o.release);
         let o = parse_options(&args(&["--release"]), cwd).expect("release");
-        assert!(o.release);
+        assert!(o.release && !o.no_appimage);
+        let o = parse_options(&args(&["--no-appimage"]), cwd).expect("no appimage");
+        assert!(o.no_appimage && !o.release);
         assert_eq!(
             parse_options(&args(&["--out", "here/out"]), cwd)
                 .expect("out")
@@ -3649,6 +3821,7 @@ docs/a b.md\0export-ignore\0set\0x\0export-ignore\0unset\0";
             vec!["--release", "--allow-dirty"],
             vec!["--allow-paths", "--release"],
             vec!["--release", "--no-build"],
+            vec!["--release", "--no-appimage"],
         ] {
             assert!(parse_options(&args(&bad), cwd).is_err(), "{bad:?}");
         }
@@ -4354,62 +4527,21 @@ Version References:
     }
 
     #[test]
-    fn a_networks_line_that_names_whatsapp_fails() {
+    fn a_networks_line_is_read_in_one_shape() {
         let parse = |text: &str| parse_networks_line(text).expect(text);
-        let ok = parse("networks registered=Signal,Threema off= on=WhatsApp,Threema\n");
+        let ok = parse("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema\n");
         assert_eq!(
             ok,
             NetworksLine {
-                registered: vec!["Signal".to_owned(), "Threema".to_owned()],
+                registered: vec![
+                    "Signal".to_owned(),
+                    "Threema".to_owned(),
+                    "WhatsApp".to_owned()
+                ],
                 off: vec![],
                 on: vec!["WhatsApp".to_owned(), "Threema".to_owned()],
             }
         );
-        assert!(networks_line_problems(&ok).is_empty());
-        // Lists of several kinds, the switch spelled as the file has it.
-        let several = parse("networks registered=Fake,Signal,threema off= on=whatsapp,threema\n");
-        assert_eq!(several.registered, ["Fake", "Signal", "threema"]);
-        assert!(networks_line_problems(&several).is_empty());
-        // WhatsApp registered, or listed as off, in whatever case: the check fails, naming which.
-        let registered =
-            parse("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema\n");
-        let problems = networks_line_problems(&registered);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("REGISTERS WhatsApp"), "{problems:?}");
-        let listed = parse("networks registered=Signal,Threema off=whatsapp on=WhatsApp,Threema\n");
-        let problems = networks_line_problems(&listed);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(
-            problems[0].contains("lists WhatsApp as off"),
-            "{problems:?}"
-        );
-        let both = parse("networks registered=Threema,WhatsApp off=WhatsApp on=WhatsApp,Threema\n");
-        assert_eq!(networks_line_problems(&both).len(), 2);
-        // Threema must be registered: on by default in every build.
-        for line in [
-            "networks registered=Signal off= on=WhatsApp,Threema\n",
-            "networks registered=Signal off=threema on=WhatsApp,Threema\n",
-        ] {
-            let threema = parse(line);
-            let problems = networks_line_problems(&threema);
-            assert_eq!(problems.len(), 1, "{problems:?}");
-            assert!(
-                problems[0].contains("does not register Threema"),
-                "{problems:?}"
-            );
-        }
-        // The switch not shown as read: empty lists would prove nothing (one problem per network).
-        let unread = parse("networks registered=Signal,Threema off= on=\n");
-        let problems = networks_line_problems(&unread);
-        assert_eq!(problems.len(), 2, "{problems:?}");
-        assert!(
-            problems.iter().all(|p| p.contains("did not read")),
-            "{problems:?}"
-        );
-        let half = parse("networks registered=Signal,Threema off= on=WhatsApp\n");
-        let problems = networks_line_problems(&half);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("turn Threema on"), "{problems:?}");
         // A line in another shape is an error, not a pass.
         for bad in [
             "",
@@ -4427,47 +4559,173 @@ Version References:
         }
     }
 
+    /// The profile that turns WhatsApp on: a release binary registers it (the user's word of
+    /// 2026-11-18) and has Threema on; anything else is a problem that names what is wrong.
     #[test]
-    fn the_release_networks_check_runs_the_binary_on_a_profile_that_turns_whatsapp_on() {
+    fn a_profile_that_turns_whatsapp_on_must_register_it() {
+        let parse = |text: &str| parse_networks_line(text).expect(text);
+        let problems = |text: &str| networks_line_problems(NetworksCase::WhatsAppOn, &parse(text));
+        assert!(
+            problems("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema\n")
+                .is_empty()
+        );
+        // Lists of several kinds, the names spelled as the file has them.
+        assert!(
+            problems("networks registered=Fake,Signal,threema,whatsapp off= on=whatsapp,threema\n")
+                .is_empty()
+        );
+        // WhatsApp not registered (what a release build did before 2026-11-18), or listed as off.
+        let gated = problems("networks registered=Signal,Threema off= on=WhatsApp,Threema\n");
+        assert_eq!(gated.len(), 1, "{gated:?}");
+        assert!(gated[0].contains("does not register WhatsApp"), "{gated:?}");
+        let listed =
+            problems("networks registered=Signal,Threema off=whatsapp on=WhatsApp,Threema\n");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed[1].contains("lists WhatsApp as off"), "{listed:?}");
+        let both = problems(
+            "networks registered=Signal,Threema,WhatsApp off=WhatsApp on=WhatsApp,Threema\n",
+        );
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert!(both[0].contains("lists WhatsApp as off"), "{both:?}");
+        // Threema must be registered: on by default in every build.
+        for line in [
+            "networks registered=Signal,WhatsApp off= on=WhatsApp,Threema\n",
+            "networks registered=Signal,WhatsApp off=threema on=WhatsApp,Threema\n",
+        ] {
+            let threema = problems(line);
+            assert_eq!(threema.len(), 1, "{threema:?}");
+            assert!(
+                threema[0].contains("does not register Threema"),
+                "{threema:?}"
+            );
+        }
+        // The switch not shown as read: the lists would prove nothing (one problem per network).
+        let unread = problems("networks registered=Signal,Threema,WhatsApp off= on=\n");
+        assert_eq!(unread.len(), 2, "{unread:?}");
+        assert!(
+            unread.iter().all(|p| p.contains("did not read")),
+            "{unread:?}"
+        );
+        let half = problems("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp\n");
+        assert_eq!(half.len(), 1, "{half:?}");
+        assert!(half[0].contains("turn Threema on"), "{half:?}");
+    }
+
+    /// The profile whose file names nothing: a release binary lists WhatsApp as off (K-A's
+    /// "compiled in but off"; the user turns it on in Settings, after its risk notice), registers
+    /// it not, and has Threema on.
+    #[test]
+    fn a_plain_profile_must_list_whatsapp_as_off() {
+        let parse = |text: &str| parse_networks_line(text).expect(text);
+        let problems = |text: &str| networks_line_problems(NetworksCase::Plain, &parse(text));
+        assert!(
+            problems("networks registered=Signal,Threema off=WhatsApp on=Threema\n").is_empty()
+        );
+        assert!(
+            problems("networks registered=Signal,threema off=whatsapp on=threema\n").is_empty()
+        );
+        // Offered in no list (the old release arm): the person could not turn it on.
+        let absent = problems("networks registered=Signal,Threema off= on=Threema\n");
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        assert!(
+            absent[0].contains("does not list WhatsApp as off"),
+            "{absent:?}"
+        );
+        // Registered although nothing turns it on, or named as on.
+        let registered = problems("networks registered=Signal,Threema,WhatsApp off= on=Threema\n");
+        assert_eq!(registered.len(), 2, "{registered:?}");
+        assert!(
+            registered[0].contains("REGISTERS WhatsApp"),
+            "{registered:?}"
+        );
+        let on = problems("networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema\n");
+        assert_eq!(on.len(), 3, "{on:?}");
+        assert!(on[0].contains("names WhatsApp as on"), "{on:?}");
+        // Threema must be registered and on here too.
+        let threema = problems("networks registered=Signal off=WhatsApp,Threema on=\n");
+        assert_eq!(threema.len(), 2, "{threema:?}");
+        assert!(
+            threema[0].contains("does not register Threema"),
+            "{threema:?}"
+        );
+        assert!(threema[1].contains("turn Threema on"), "{threema:?}");
+    }
+
+    /// A fake binary for [`check_release_networks`]: it insists on the flag alone, an empty
+    /// environment but `KOURIER_HOME` (and `HOME`) and a preferences file of one of the two
+    /// profiles, and answers `on` on the profile that turns WhatsApp on, `plain` on the empty one.
+    fn networks_program(scratch: &Scratch, on: &str, plain: &str) -> PathBuf {
+        script(
+            scratch,
+            &format!(
+                "[ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ] && [ $# = 1 ] || {{ echo \"args: $*\" >&2; exit 9; }}\n\
+                 [ -z \"$USER$QT_QPA_PLATFORM$XDG_RUNTIME_DIR\" ] || {{ echo env >&2; exit 8; }}\n\
+                 f=\"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\"\n\
+                 [ -f \"$f\" ] || {{ echo 'no prefs' >&2; exit 7; }}\n\
+                 if grep -qxF 'networks-on = [\"whatsapp\"]' \"$f\"; then echo '{on}'\n\
+                 elif [ ! -s \"$f\" ]; then echo '{plain}'\n\
+                 else echo prefs >&2; exit 6; fi"
+            ),
+        )
+    }
+
+    /// What a release build says to `--print-networks` on the two profiles of the check.
+    const RELEASE_NETWORKS_ON: &str =
+        "networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema";
+    const RELEASE_NETWORKS_PLAIN: &str =
+        "networks registered=Signal,Threema off=WhatsApp on=Threema";
+
+    #[test]
+    fn the_release_networks_check_runs_the_binary_on_both_profiles() {
         let scratch = Scratch::new("networks");
         let limit = Duration::from_secs(10);
-        // A program that insists on the flag, an empty environment but KOURIER_HOME (and HOME), and
-        // the preferences the check promises, and then answers like a release build.
-        let program = |answer: &str| {
-            script(
-                &scratch,
-                &format!(
-                    "[ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ] && [ $# = 1 ] || {{ echo \"args: $*\" >&2; exit 9; }}\n\
-                     [ -z \"$USER$QT_QPA_PLATFORM$XDG_RUNTIME_DIR\" ] || {{ echo env >&2; exit 8; }}\n\
-                     grep -qF 'networks-on = [\"whatsapp\"]' \"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\" || {{ echo prefs >&2; exit 7; }}\n\
-                     echo '{answer}'"
-                ),
-            )
-        };
-        let release = program("networks registered=Signal,Threema off= on=WhatsApp,Threema");
+        let release = networks_program(&scratch, RELEASE_NETWORKS_ON, RELEASE_NETWORKS_PLAIN);
         check_release_networks(&release, &scratch.0, limit).expect("a release binary");
         assert!(
             !scratch.0.join(NETWORKS_HOME_DIR).exists(),
             "the profile is removed again"
         );
-        // A binary that registers WhatsApp, or lists it as off (a debug build's answers).
-        for answer in [
-            "networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema",
-            "networks registered=Signal,Threema off=WhatsApp on=WhatsApp,Threema",
+        // A binary that gets WhatsApp wrong on either profile is refused, naming the profile.
+        for (on, plain, profile) in [
+            // The old release arm: WhatsApp in no list on the profile that turns it on.
+            (
+                "networks registered=Signal,Threema off= on=WhatsApp,Threema",
+                RELEASE_NETWORKS_PLAIN,
+                "networks-on",
+            ),
+            // ... and so on the plain one (the first profile passes here).
+            (
+                RELEASE_NETWORKS_ON,
+                "networks registered=Signal,Threema off= on=Threema",
+                "is empty",
+            ),
+            // WhatsApp registered with nothing in the file (a binary that ignores the switch).
+            (RELEASE_NETWORKS_ON, RELEASE_NETWORKS_ON, "is empty"),
+            // Listed as off although turned on.
+            (
+                "networks registered=Signal,Threema off=WhatsApp on=WhatsApp,Threema",
+                RELEASE_NETWORKS_PLAIN,
+                "networks-on",
+            ),
         ] {
             let err =
-                check_release_networks(&program(answer), &scratch.0, limit).expect_err(answer);
-            assert!(format!("{err:#}").contains("WhatsApp"), "{err:#}");
+                check_release_networks(&networks_program(&scratch, on, plain), &scratch.0, limit)
+                    .expect_err(on);
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("WhatsApp") && text.contains(profile),
+                "{text}"
+            );
             assert!(!scratch.0.join(NETWORKS_HOME_DIR).exists());
         }
         // Another line, a failing program and a missing one are failures as well.
         for answer in ["Kourier 1.2.3", "networks registered=Signal off= on="] {
-            assert!(check_release_networks(&program(answer), &scratch.0, limit).is_err());
+            let program = networks_program(&scratch, answer, RELEASE_NETWORKS_PLAIN);
+            assert!(check_release_networks(&program, &scratch.0, limit).is_err());
+            let program = networks_program(&scratch, RELEASE_NETWORKS_ON, answer);
+            assert!(check_release_networks(&program, &scratch.0, limit).is_err());
         }
-        let failing = script(
-            &scratch,
-            "echo 'networks registered=Signal,Threema off= on=WhatsApp,Threema'; exit 3",
-        );
+        let failing = script(&scratch, &format!("echo '{RELEASE_NETWORKS_ON}'; exit 3"));
         assert!(check_release_networks(&failing, &scratch.0, limit).is_err());
         assert!(check_release_networks(&scratch.0.join("missing"), &scratch.0, limit).is_err());
     }
@@ -4744,19 +5002,18 @@ Version References:
         false
     }
 
-    /// What a release build says to `--print-networks` on a profile that turns WhatsApp on.
-    const RELEASE_NETWORKS: &str = "networks registered=Signal,Threema off= on=WhatsApp,Threema";
-
     /// The program of a fake release: refuses `--fixture` like a build without the test
-    /// network, answers `--print-networks` like a release build, else runs `body`.
+    /// network, answers `--print-networks` like a release build on each profile of the check, else
+    /// runs `body`.
     fn fake_program(body: &str) -> String {
-        fake_program_saying(RELEASE_NETWORKS, body)
+        fake_program_saying(RELEASE_NETWORKS_ON, RELEASE_NETWORKS_PLAIN, body)
     }
 
-    /// [`fake_program`] with another answer to `--print-networks`.
-    fn fake_program_saying(networks: &str, body: &str) -> String {
+    /// [`fake_program`] with other answers to `--print-networks`: `on` on the profile that turns
+    /// WhatsApp on, `plain` on the one whose file names nothing.
+    fn fake_program_saying(on: &str, plain: &str, body: &str) -> String {
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--fixture\" ]; then echo 'kourier: {FIXTURE_REFUSAL}' >&2; exit 1; fi\nif [ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ]; then echo '{networks}'; exit 0; fi\n{body}\n"
+            "#!/bin/sh\nif [ \"$1\" = \"--fixture\" ]; then echo 'kourier: {FIXTURE_REFUSAL}' >&2; exit 1; fi\nif [ \"$1\" = \"{PRINT_NETWORKS_FLAG}\" ]; then if grep -qF whatsapp \"$KOURIER_HOME/{NETWORKS_PREFS_PATH}\"; then echo '{on}'; else echo '{plain}'; fi; exit 0; fi\n{body}\n"
         )
     }
 
@@ -4959,20 +5216,26 @@ Version References:
             format!("{err:#}").contains("--fixture must be refused"),
             "{err:#}"
         );
-        // A binary that registers WhatsApp, or lists it as off, on a profile that turned it on (what a
-        // debug build does) is refused: the archive could link a real account.
-        for answer in [
-            "networks registered=Signal,Threema,WhatsApp off= on=WhatsApp,Threema",
-            "networks registered=Signal,Threema off=WhatsApp on=WhatsApp,Threema",
+        // A binary that offers WhatsApp in no list (the release arm lifted on 2026-11-18), on
+        // either profile, is refused: the person could not turn it on.
+        for (on, plain) in [
+            (
+                "networks registered=Signal,Threema off= on=WhatsApp,Threema",
+                RELEASE_NETWORKS_PLAIN,
+            ),
+            (
+                RELEASE_NETWORKS_ON,
+                "networks registered=Signal,Threema off= on=Threema",
+            ),
         ] {
             let err = check_fake(&scratch, "echo 'Kourier 0.1.0'", "r\n", &["uk"], &|stage| {
                 std::fs::write(
                     stage.join("bin").join(BINARY),
-                    fake_program_saying(answer, "echo 'Kourier 0.1.0'"),
+                    fake_program_saying(on, plain, "echo 'Kourier 0.1.0'"),
                 )
                 .expect("tamper");
             })
-            .expect_err("WhatsApp offered");
+            .expect_err("WhatsApp not offered");
             assert!(
                 format!("{err:#}").contains("--print-networks")
                     && format!("{err:#}").contains("WhatsApp"),
@@ -5150,7 +5413,15 @@ Version References:
             "kourier-0.1.0-linux-x86_64-names.tar.gz.partial"
         ));
         assert!(is_dist_output(NAMES_SUMS));
+        assert!(is_dist_output(
+            "kourier-0.1.0-linux-x86_64-unreleased.AppImage"
+        ));
+        assert!(is_dist_output(
+            "kourier-0.1.0-linux-x86_64-dirty.AppImage.partial"
+        ));
         for not in [
+            "other.AppImage",
+            "kourier-x.AppImage.zsync",
             "other.tar.gz",
             "kourier-x.zip",
             "SHA256SUMS.asc",
@@ -5378,7 +5649,7 @@ Version References:
         let features = build_features();
         assert!(features.contains("--no-default-features"), "{features}");
         assert_eq!(BUILD_FEATURE_ARGS[1], "--features");
-        // The WhatsApp backend is compiled in (W2b) and, being a release build, not registered.
+        // The WhatsApp backend is compiled in (W2b): registered while on, listed as off otherwise.
         assert_eq!(BUILD_FEATURE_ARGS[2], "signal,whatsapp,threema");
         let manifest =
             std::fs::read_to_string(root().join("crates/kourier/Cargo.toml")).expect("manifest");
@@ -5408,6 +5679,34 @@ Version References:
     }
 
     // ---- the wider search ----------------------------------------------------------------
+
+    #[test]
+    fn a_host_name_equal_to_the_project_name_is_not_searched() {
+        assert!(host_is_project_name("kourier") && host_is_project_name("KOURIER"));
+        assert!(!host_is_project_name("kourier-box") && !host_is_project_name(""));
+        let named = |host: &str| Extra {
+            host: Some(host.into()),
+            ..Extra::default()
+        };
+        assert!(
+            extra_needles(&named("Kourier"))
+                .iter()
+                .all(|n| n.label != "the host name")
+        );
+        // Any other host name, and everything else, stays searched.
+        assert!(
+            extra_needles(&named("build-box"))
+                .iter()
+                .any(|n| n.label == "the host name")
+        );
+        let both = Extra {
+            host: Some("kourier".into()),
+            git_name: Some("Ada Lovelace".into()),
+            git_email: None,
+        };
+        let labels: Vec<&str> = extra_needles(&both).iter().map(|n| n.label).collect();
+        assert_eq!(labels, ["git's user.name", "the former project name"]);
+    }
 
     #[test]
     fn the_wider_search_finds_host_git_identity_and_the_former_name_without_regard_to_case() {
@@ -5854,7 +6153,7 @@ Version References:
     #[test]
     fn each_archive_is_listed_in_one_checksum_file() {
         let names = archive_names("0.1.0", "x86_64", Grade::Release);
-        let files = checksum_files(&names);
+        let files = checksum_files(&names, false);
         // The published SHA256SUMS keeps its two lines whether or not the names archive is
         // published (critic MEDIUM-2); the names archive has its own file.
         assert_eq!(files[0].0, "SHA256SUMS");
@@ -5864,6 +6163,17 @@ Version References:
         );
         assert_eq!(files[1].0, "SHA256SUMS.names");
         assert_eq!(files[1].1, [names.names_archive.as_str()]);
+        // The AppImage joins the published checksums when one is made.
+        let with = checksum_files(&names, true);
+        assert_eq!(
+            with[0].1,
+            [
+                names.binary_archive.as_str(),
+                names.source_archive.as_str(),
+                names.appimage.as_str()
+            ]
+        );
+        assert_eq!(with[1].1, files[1].1);
         // Every archive of the run is in some file.
         let listed: Vec<&str> = files.iter().flat_map(|f| f.1.iter().copied()).collect();
         for archive in [

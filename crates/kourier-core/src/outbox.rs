@@ -471,6 +471,7 @@ pub(crate) fn enqueue_text(
                 body: Body::Text(piece),
                 quotes: i == 0,
                 files: Vec::new(),
+                forward: None,
             })
             .collect())
     })?;
@@ -494,6 +495,7 @@ pub(crate) fn enqueue_contact(
             body: Body::Contact(card),
             quotes: false,
             files: Vec::new(),
+            forward: None,
         }])
     })?;
     Ok(stored.written)
@@ -781,6 +783,145 @@ pub(crate) fn enqueue_files_more(
     ))
 }
 
+/// The G4 gate's refusal of a send in an account that is not active; a forward names it
+/// `ForwardRefusal::AccountNotLinked` by this value.
+pub(crate) const NOT_LINKED: &str = "the account is not linked";
+
+/// One message of a forward to one target, before the target's features split it (F3).
+#[derive(Debug)]
+pub(crate) enum Piece {
+    /// A text; longer than the chat carries, it becomes several messages.
+    Text(Text),
+    /// Files (positions into the forward's imported files) with an optional caption, packed by
+    /// the chat's rule as for a send ([`plan_files`]).
+    Files {
+        /// Positions into the imported files, in order.
+        files: Vec<usize>,
+        /// The caption.
+        caption: Option<Text>,
+    },
+    /// A contact card.
+    Contact(kourier_model::ContactCard),
+}
+
+/// A piece with the forward mark its messages carry.
+#[derive(Debug)]
+pub(crate) struct MarkedPiece {
+    /// The message.
+    pub piece: Piece,
+    /// The mark stored on the message and sent in its request (`None`: no forward).
+    pub forward: Option<kourier_model::Forwarded>,
+}
+
+/// §4.8 step 1 for a forward (F3): the `pieces` of one target become as many messages as the
+/// chat's features need, stored like [`enqueue_files`] (the first transaction is the G4 gate,
+/// `Part::First`; more than [`ENQUEUE_CHUNK`] messages are `Staged` and go on through
+/// [`enqueue_files_more`], `Part::Next`): all of them or none. No quote, no draft is touched.
+pub(crate) fn enqueue_forward(
+    conn: &mut Connection,
+    network: &dyn Network,
+    conv: ConversationId,
+    files: std::sync::Arc<[crate::attachments::import::Imported]>,
+    pieces: Vec<MarkedPiece>,
+    now: i64,
+) -> std::result::Result<FilesStep, FilesError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(CoreError::from)?;
+    let stored = (|| {
+        let mut target = Target::read(&tx, network, conv, Part::First, now)?;
+        let features = target.features.as_ref();
+        let max = features
+            .and_then(|f| f.max_text_bytes)
+            .and_then(|max| usize::try_from(max).ok());
+        let mut rest: std::collections::VecDeque<Outgoing> = std::collections::VecDeque::new();
+        for MarkedPiece { piece, forward } in pieces {
+            match piece {
+                Piece::Text(t) => {
+                    let parts = match max {
+                        Some(max) => t.split(max),
+                        None => vec![t],
+                    };
+                    for p in parts.into_iter().filter(|p| !p.body.trim().is_empty()) {
+                        rest.push_back(Outgoing {
+                            body: Body::Text(p),
+                            quotes: false,
+                            files: Vec::new(),
+                            forward,
+                        });
+                    }
+                }
+                Piece::Contact(card) => rest.push_back(Outgoing {
+                    body: Body::Contact(card),
+                    quotes: false,
+                    files: Vec::new(),
+                    forward,
+                }),
+                Piece::Files { files: at, caption } => {
+                    let subset: Vec<crate::attachments::import::Imported> =
+                        at.iter().filter_map(|i| files.get(*i).cloned()).collect();
+                    if subset.is_empty() {
+                        return Err(CoreError::InvalidInput("no files to send").into());
+                    }
+                    let caption = caption.filter(|t| !t.body.trim().is_empty());
+                    for mut out in plan_files(features, &subset, caption, false)? {
+                        out.files = out
+                            .files
+                            .iter()
+                            .filter_map(|i| at.get(*i).copied())
+                            .collect();
+                        out.quotes = false;
+                        out.forward = forward;
+                        rest.push_back(out);
+                    }
+                }
+            }
+        }
+        if rest.is_empty() {
+            return Err(CoreError::InvalidInput("nothing to forward").into());
+        }
+        let whole = rest.len() <= ENQUEUE_CHUNK;
+        let state = if whole { QUEUED } else { STAGED };
+        let was_hidden = is_hidden(&tx, conv)?;
+        let messages = target.store(
+            network,
+            conv,
+            &mut rest,
+            ENQUEUE_CHUNK,
+            &mut None,
+            state,
+            &files,
+        )?;
+        if !whole && was_hidden {
+            hide_again(&tx, conv)?;
+        }
+        let (account, changes) = target.finish()?;
+        Ok::<_, FilesError>((account, changes, messages, rest))
+    })();
+    let (account, changes, messages, rest) = stored?;
+    tx.commit().map_err(CoreError::from)?;
+    if rest.is_empty() {
+        failpoint::hit(FAILPOINT_AFTER_ENQUEUE);
+        return Ok(FilesStep::Done(
+            Box::new(Written {
+                account,
+                conv,
+                changes,
+            }),
+            messages,
+        ));
+    }
+    failpoint::hit(FAILPOINT_AFTER_STAGED);
+    Ok(FilesStep::More(Box::new(FilesSend {
+        conv,
+        files,
+        rest,
+        messages,
+        changes,
+        clear_draft: false,
+    })))
+}
+
 /// Whether `conv` is hidden from the list (it was deleted and nothing was stored or queued
 /// in it since, `conversations.hidden`).
 fn is_hidden(conn: &Connection, conv: ConversationId) -> Result<bool> {
@@ -842,6 +983,7 @@ fn plan_files(
                 // The first message of the send carries the quote.
                 quotes: out.is_empty(),
                 files: Vec::new(),
+                forward: None,
             });
         }
     }
@@ -861,6 +1003,7 @@ fn plan_files(
             },
             quotes: first,
             files: group,
+            forward: None,
         });
     }
     Ok(out)
@@ -965,6 +1108,8 @@ struct Outgoing {
     quotes: bool,
     /// The files of the selection this message carries, in order (positions).
     files: Vec<usize>,
+    /// The forward mark this message is stored and sent with (a native forward, F3).
+    forward: Option<kourier_model::Forwarded>,
 }
 
 /// The conversation of a send inside its transaction: read, checked, and the ingest state
@@ -1023,7 +1168,7 @@ impl<'c> Target<'c> {
         let rules = NetRules::of(network.descriptor());
         let apply = Apply::under_rules(tx, account, rules, now)?;
         if apply.acc.state != AccountState::Active {
-            return Err(CoreError::InvalidState("the account is not linked"));
+            return Err(CoreError::InvalidState(NOT_LINKED));
         }
         if blocked {
             return Err(CoreError::refused(
@@ -1121,6 +1266,8 @@ impl<'c> Target<'c> {
                     let with_files = f.attachment(true);
                     a.local = with_files.local;
                     a.thumb = with_files.thumb;
+                    // Only a native forward has one: the source's pointer, for the backend.
+                    a.remote = with_files.remote;
                 }
             }
             let mut m = IncomingMessage::new(
@@ -1138,6 +1285,7 @@ impl<'c> Target<'c> {
                 started_at: None,
             });
             m.initial_out_state = Some(OutgoingState::Queued);
+            m.forwarded = out.forward;
             self.apply.message(m, false)?;
             let message = self
                 .apply
@@ -1161,6 +1309,7 @@ impl<'c> Target<'c> {
                     body: request_body,
                     reply_to: request_reply,
                     expiry: self.timer,
+                    forward: out.forward,
                 },
                 only: None,
                 is_recipient_update: false,
@@ -3570,6 +3719,7 @@ mod tests {
                 },
                 reply_to: None,
                 expiry: None,
+                forward: None,
             },
             only: None,
             is_recipient_update: false,
@@ -3646,6 +3796,7 @@ mod tests {
                 mime: "image/png".into(),
             },
             thumb: None,
+            remote: None,
         };
         let files: std::sync::Arc<[Imported]> = (0..3).map(picture).collect();
         match enqueue_files(conn, &net, conv, files, None, None, 1_000) {
@@ -3741,6 +3892,7 @@ mod tests {
                     mime: "text/plain".into(),
                 },
                 thumb: None,
+                remote: None,
             })
             .collect();
         let count = |conn: &Connection, sql: &str| id_of(conn, sql);
@@ -3928,6 +4080,7 @@ mod tests {
                     mime: "text/plain".into(),
                 },
                 thumb: None,
+                remote: None,
             })
             .collect();
         let part = |step: std::result::Result<FilesStep, FilesError>| match step {
@@ -4080,6 +4233,7 @@ mod tests {
                     mime: "text/plain".into(),
                 },
                 thumb: None,
+                remote: None,
             })
             .collect();
         let old_conv = ConversationId(
@@ -4212,6 +4366,7 @@ mod tests {
                     mime: "text/plain".into(),
                 },
                 thumb: None,
+                remote: None,
             })
             .collect()
     }
@@ -4794,6 +4949,7 @@ mod tests {
             body: Body::text(body),
             reply_to: None,
             expiry: None,
+            forward: None,
         }
     }
 

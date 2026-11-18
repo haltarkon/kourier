@@ -55,8 +55,8 @@ use std::collections::BTreeMap;
 use kourier_backend_api::{OutgoingKind, OutgoingRequest};
 use kourier_model::text::MENTION_PLACEHOLDER;
 use kourier_model::{
-    Attachment, AttachmentKind, Body, ConvKey, QuoteSnapshot, RangeKind, ReplyTo, TargetAuthor,
-    Text, UserId,
+    Attachment, AttachmentKind, Body, ConvKey, Forwarded, QuoteSnapshot, RangeKind, ReplyTo,
+    TargetAuthor, Text, UserId,
 };
 use wacore_binary::Jid;
 use waproto::buffa::MessageField;
@@ -135,6 +135,8 @@ pub(crate) fn build(
             body,
             reply_to,
             expiry,
+            forward,
+            ..
         } => {
             let quote = || names.quote(conv, reply_to.as_ref());
             let (mut message, plain) = match body {
@@ -144,7 +146,7 @@ pub(crate) fn build(
                         return Err(Unbuildable::Empty);
                     }
                     let plain = rendered.plain;
-                    (text_message(rendered, quote()?), plain)
+                    (text_message(rendered, quote()?, *forward), plain)
                 }
                 Body::Media {
                     attachments,
@@ -157,7 +159,7 @@ pub(crate) fn build(
                     let mut message =
                         media::file_message(pointer, &FileFacts::of(side.attachment), side.caption)
                             .ok_or(Unbuildable::NoFile)?;
-                    set_context(&mut message, side.quote, side.mentioned);
+                    set_context(&mut message, side.quote, side.mentioned, *forward);
                     (message, side.plain)
                 }
                 _ => return Err(Unbuildable::NotYet),
@@ -190,7 +192,7 @@ pub(crate) fn build(
                         return Err(Unbuildable::Empty);
                     }
                     let plain = rendered.plain;
-                    (text_message(rendered, None), plain)
+                    (text_message(rendered, None, None), plain)
                 }
                 Body::Media {
                     attachments,
@@ -204,7 +206,7 @@ pub(crate) fn build(
                     let mut content =
                         media::file_message(pointer, &FileFacts::of(attachment), caption)
                             .ok_or(Unbuildable::NoFile)?;
-                    set_context(&mut content, None, mentioned);
+                    set_context(&mut content, None, mentioned, None);
                     (content, plain)
                 }
                 _ => return Err(Unbuildable::NotYet),
@@ -418,15 +420,36 @@ fn is_own(author: &TargetAuthor, at: &Addressing<'_>) -> bool {
     }
 }
 
-/// A text as a message: `conversation` when nothing sits beside it, else `extendedTextMessage`.
-fn text_message(rendered: Rendered, quote: Option<wa::ContextInfo>) -> wa::Message {
+/// The `forwardingScore` written for a forward whose source was forwarded `score` times before (F4): the count itself
+/// below 5, and 127 from 5 up (WA Web's "frequently forwarded" sentinel; a source that arrived with 127 has the score
+/// 128 by `Forwarded::next` and stays 127).
+pub(crate) fn forwarding_score(score: u32) -> u32 {
+    if score < 5 { score } else { 127 }
+}
+
+/// The forward mark of a native forward, beside whatever else the context info says.
+fn mark_forward(info: &mut wa::ContextInfo, forward: Option<Forwarded>) {
+    if let Some(f) = forward {
+        info.is_forwarded = Some(true);
+        info.forwarding_score = Some(forwarding_score(f.score));
+    }
+}
+
+/// A text as a message: `conversation` when nothing sits beside it, else `extendedTextMessage` (a forward always: a bare
+/// `conversation` cannot carry a context info).
+fn text_message(
+    rendered: Rendered,
+    quote: Option<wa::ContextInfo>,
+    forward: Option<Forwarded>,
+) -> wa::Message {
     let mut message = wa::Message::default();
-    if quote.is_none() && rendered.mentioned.is_empty() {
+    if quote.is_none() && rendered.mentioned.is_empty() && forward.is_none() {
         message.conversation = Some(rendered.text);
         return message;
     }
     let mut info = quote.unwrap_or_default();
     info.mentioned_jid = rendered.mentioned;
+    mark_forward(&mut info, forward);
     let mut m = wa::message::ExtendedTextMessage::default();
     m.text = Some(rendered.text);
     m.context_info = MessageField::some(info);
@@ -449,9 +472,14 @@ fn rendered_caption(
     }
 }
 
-/// The quote and the mentions of a caption, in the file's own context info.
-fn set_context(message: &mut wa::Message, quote: Option<wa::ContextInfo>, mentioned: Vec<String>) {
-    if quote.is_none() && mentioned.is_empty() {
+/// The quote, the mentions of a caption and a forward's mark, in the file's own context info.
+fn set_context(
+    message: &mut wa::Message,
+    quote: Option<wa::ContextInfo>,
+    mentioned: Vec<String>,
+    forward: Option<Forwarded>,
+) {
+    if quote.is_none() && mentioned.is_empty() && forward.is_none() {
         return;
     }
     let Some(field) = media::file_context(message) else {
@@ -459,6 +487,7 @@ fn set_context(message: &mut wa::Message, quote: Option<wa::ContextInfo>, mentio
     };
     let mut info = quote.unwrap_or_default();
     info.mentioned_jid = mentioned;
+    mark_forward(&mut info, forward);
     *field = MessageField::some(info);
 }
 
